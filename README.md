@@ -107,6 +107,13 @@ Do not infer which source revision was tested from the version label: record the
 exact sibling SHAs. Runtime/Kernel artifacts are additional prerequisites for
 real sandbox tests, not Go-only compilation.
 
+The local `make test-e2e-cluster-stub` flow starts real control-plane processes
+but no MicroVMs. Its run directory is private. Failure output reports diagnostic
+filenames and sizes, not raw responses, logs or capability-bearing objects.
+For local diagnosis, set `CLUSTER_STUB_KEEP_WORK=1` to retain the run directory
+and inspect it privately; do not upload its unredacted files. This does not
+replace the real MicroVM integration suite.
+
 Cross-repository contract changes require linked companion PRs and exact-source
 integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
 

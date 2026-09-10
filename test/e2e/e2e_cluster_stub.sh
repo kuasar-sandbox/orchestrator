@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER_CTL_EXPLICIT="${CLUSTER_CTL+x}"
@@ -38,16 +39,14 @@ fail() {
             curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/nodes" >"$WORK/admin-nodes.json" 2>/dev/null || true
             curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/data-hits" >"$WORK/admin-data-hits.json" 2>/dev/null || true
         fi
-        for f in "$WORK"/*.body "$WORK"/*.json; do
+        # Responses and observations can contain live test capabilities. Keep
+        # their bytes inside this private run directory, never in CI stdout.
+        for f in "$WORK"/*.body "$WORK"/*.json "$WORK"/*.log; do
             [ -f "$f" ] || continue
-            echo "---- $f ----" >&2
-            sed -n '1,220p' "$f" >&2 || true
+            printf 'diagnostic %s: %s bytes (contents withheld)\n' \
+                "${f##*/}" "$(stat -c %s -- "$f")" >&2
         done
-        for f in "$WORK"/*.log; do
-            [ -f "$f" ] || continue
-            echo "---- $f ----" >&2
-            sed -n '1,220p' "$f" >&2 || true
-        done
+        echo 'Use CLUSTER_STUB_KEEP_WORK=1 to retain private diagnostics; do not upload raw files.' >&2
     fi
     exit 1
 }
@@ -198,12 +197,12 @@ sandbox_credentials() {
 import json, sys
 response, expected_route_key = sys.argv[1:]
 created = json.load(open(response))
-assert created.get("routeKey") == expected_route_key, created
+assert created.get("routeKey") == expected_route_key, "stub assertion failed: created.get(\"routeKey\") == expected_route_key"
 sid = created.get("sandboxID")
 envd = created.get("envdAccessToken")
 traffic = created.get("trafficAccessToken")
 forward = created.get("forwardAccessToken")
-assert all(isinstance(value, str) and value for value in (sid, envd, traffic, forward)), created
+assert all(isinstance(value, str) and value for value in (sid, envd, traffic, forward)), "stub assertion failed: all(isinstance(value, str) and value for value in (sid, envd, traffic, forward))"
 print("\t".join((sid, envd)))
 PY
 }
@@ -370,20 +369,20 @@ want = int(sys.argv[2])
 m = json.load(urllib.request.urlopen(base + "/cluster/membership", timeout=2))
 active = m.get("active", m.get("Active"))
 versions = m.get("versions", m.get("Versions", []))
-assert active, m
+assert active, "stub assertion failed: active"
 active_versions = [v for v in versions if v.get("version", v.get("Version")) == active]
-assert len(active_versions) == 1, m
-assert active_versions[0].get("label", active_versions[0].get("Label")), m
+assert len(active_versions) == 1, "stub assertion failed: len(active_versions) == 1"
+assert active_versions[0].get("label", active_versions[0].get("Label")), "stub assertion failed: active_versions[0].get(\"label\", active_versions[0].get(\"Label\"))"
 next_version = m.get("next", m.get("Next"))
 ids = set()
 for v in versions:
     version = v.get("version", v.get("Version"))
     if version not in (active, next_version):
         continue
-    assert v.get("label", v.get("Label")), m
+    assert v.get("label", v.get("Label")), "stub assertion failed: v.get(\"label\", v.get(\"Label\"))"
     for member in v.get("members", v.get("Members", [])):
         ids.add(member.get("id", member.get("ID")))
-assert len(ids) == want, m
+assert len(ids) == want, "stub assertion failed: len(ids) == want"
 PY
 done
 
@@ -422,7 +421,7 @@ for _ in range(200):
                      n.get("api_endpoint") != n.get("data_endpoint") for n in nodes):
         sys.exit(0)
     time.sleep(0.05)
-raise SystemExit(nodes)
+raise SystemExit("stub nodes did not register distinct API/Data endpoints")
 PY
 
 step "starting router"
@@ -458,13 +457,13 @@ for _ in range(200):
         sys.exit(0)
     last = nodes
     time.sleep(0.1)
-raise SystemExit("nodes=%r" % last)
+raise SystemExit("stub nodes did not redirect to their owners")
 PY
 fi
 
 step "checking explicit create -> READY -> data forward"
 code="$(create_sandbox "user1/session1" "$WORK/create-session1.body" || true)"
-[ "$code" = "201" ] || fail "create user1/session1 returned $code: $(cat "$WORK/create-session1.body")"
+[ "$code" = "201" ] || fail "create user1/session1 returned $code"
 IFS=$'\t' read -r SESSION1_SID SESSION1_ENVD_TOKEN \
     < <(sandbox_credentials "$WORK/create-session1.body" "user1/session1") || fail "invalid create response for user1/session1"
 
@@ -475,11 +474,11 @@ code="$(http_code "$WORK/get-session1.body" \
     -H "X-Kuasar-Route-Key: user1/session1" \
     -H "X-API-KEY: $API_KEY" \
     "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SESSION1_SID" || true)"
-[ "$code" = "200" ] || fail "sandbox control GET returned $code: $(cat "$WORK/get-session1.body")"
+[ "$code" = "200" ] || fail "sandbox control GET returned $code"
 python3 - "$WORK/get-session1.body" "$SESSION1_SID" <<'PY' || fail "sandbox control response did not preserve the stable ID"
 import json, sys
 response = json.load(open(sys.argv[1]))
-assert response.get("sandboxID") == sys.argv[2], response
+assert response.get("sandboxID") == sys.argv[2], "stub assertion failed: response.get(\"sandboxID\") == sys.argv[2]"
 PY
 
 step "checking stable SID connect through Registry CmdConnect"
@@ -491,15 +490,15 @@ code="$(http_code "$WORK/connect-session1.body" -X POST \
     -H "Content-Type: application/json" \
     --data '{"timeout":37}' \
     "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SESSION1_SID/connect" || true)"
-[ "$code" = "200" ] || fail "connect user1/session1 returned $code: $(cat "$WORK/connect-session1.body")"
+[ "$code" = "200" ] || fail "connect user1/session1 returned $code"
 
 python3 - "$WORK/create-session1.body" "$WORK/connect-session1.body" <<'PY' || fail "connect response changed stable identity or credentials"
 import json, sys
 created = json.load(open(sys.argv[1]))
 connected = json.load(open(sys.argv[2]))
 for key in ("sandboxID", "envdAccessToken", "trafficAccessToken", "forwardAccessToken"):
-    assert connected.get(key) == created.get(key), (key, created, connected)
-assert isinstance(connected.get("templateID"), str) and connected["templateID"], connected
+    assert connected.get(key) == created.get(key), "stub assertion failed: connected.get(key) == created.get(key)"
+assert isinstance(connected.get("templateID"), str) and connected["templateID"], "stub assertion failed: isinstance(connected.get(\"templateID\"), str) and connected[\"templateID\"]"
 PY
 
 python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "CmdConnect did not preserve the node identity and cluster context"
@@ -508,14 +507,14 @@ admin, group, stable_sid = sys.argv[1:]
 commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2))
 creates = [c for c in commands if c.get("kind") == "create" and c.get("cluster", {}).get("route_key") == "user1/session1"]
 connects = [c for c in commands if c.get("kind") == "connect" and c.get("cluster", {}).get("route_key") == "user1/session1"]
-assert len(creates) == 1, creates
-assert len(connects) == 1, connects
+assert len(creates) == 1, "stub assertion failed: len(creates) == 1"
+assert len(connects) == 1, "stub assertion failed: len(connects) == 1"
 created, connected = creates[0], connects[0]
-assert connected.get("sid") == created.get("sid") == stable_sid + "-g0", (created, connected)
+assert connected.get("sid") == created.get("sid") == stable_sid + "-g0", "stub assertion failed: connected.get(\"sid\") == created.get(\"sid\") == stable_sid + \"-g0\""
 cluster = connected.get("cluster", {})
-assert cluster.get("group") == group, connected
-assert cluster.get("route_key") == "user1/session1", connected
-assert cluster.get("stable_id") == stable_sid, connected
+assert cluster.get("group") == group, "stub assertion failed: cluster.get(\"group\") == group"
+assert cluster.get("route_key") == "user1/session1", "stub assertion failed: cluster.get(\"route_key\") == \"user1/session1\""
+assert cluster.get("stable_id") == stable_sid, "stub assertion failed: cluster.get(\"stable_id\") == stable_sid"
 PY
 
 step "checking cluster exec-session issuance through Registry CmdExecSession"
@@ -533,15 +532,15 @@ python3 - "$WORK/exec-session1.response" "$WORK/exec-session1.headers" <<'PY' ||
 import json, sys
 response_path, headers_path = sys.argv[1:]
 response = json.load(open(response_path))
-assert set(response) == {"execAccessToken"}, response
-assert isinstance(response["execAccessToken"], str) and response["execAccessToken"], response
+assert set(response) == {"execAccessToken"}, "stub assertion failed: set(response) == {\"execAccessToken\"}"
+assert isinstance(response["execAccessToken"], str) and response["execAccessToken"], "stub assertion failed: isinstance(response[\"execAccessToken\"], str) and response[\"execAccessToken\"]"
 headers = {}
 for line in open(headers_path):
     if ":" not in line:
         continue
     name, value = line.split(":", 1)
     headers.setdefault(name.strip().lower(), []).append(value.strip())
-assert headers.get("cache-control") == ["no-store"], headers
+assert headers.get("cache-control") == ["no-store"], "stub assertion failed: headers.get(\"cache-control\") == [\"no-store\"]"
 PY
 
 python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" "$WORK" <<'PY' || \
@@ -557,14 +556,14 @@ exec_commands = [
     if command.get("kind") == "exec_session" and
        command.get("cluster", {}).get("route_key") == "user1/session1"
 ]
-assert len(exec_commands) == 1, exec_commands
+assert len(exec_commands) == 1, "stub assertion failed: len(exec_commands) == 1"
 command = exec_commands[0]
-assert command.get("sid") == stable_sid + "-g0", command
-assert command.get("profile") == "e2b", command
+assert command.get("sid") == stable_sid + "-g0", "stub assertion failed: command.get(\"sid\") == stable_sid + \"-g0\""
+assert command.get("profile") == "e2b", "stub assertion failed: command.get(\"profile\") == \"e2b\""
 cluster = command.get("cluster", {})
-assert cluster.get("group") == group, command
-assert cluster.get("route_key") == "user1/session1", command
-assert cluster.get("stable_id") == stable_sid, command
+assert cluster.get("group") == group, "stub assertion failed: cluster.get(\"group\") == group"
+assert cluster.get("route_key") == "user1/session1", "stub assertion failed: cluster.get(\"route_key\") == \"user1/session1\""
+assert cluster.get("stable_id") == stable_sid, "stub assertion failed: cluster.get(\"stable_id\") == stable_sid"
 observed = json.dumps({"commands": commands, "events": events}, separators=(",", ":"))
 observed += "".join(path.read_text() for path in pathlib.Path(work_dir).glob("*.log"))
 assert token not in observed, "exec access token appeared in node-stub observations"
@@ -602,13 +601,13 @@ def rejected_connect(port, sandbox_id, include_cluster):
         conn.sendall(request)
         stream = conn.makefile("rb")
         status = stream.readline().decode("ascii", "strict").rstrip("\r\n")
-        assert status.startswith("HTTP/1.1 401 "), status
+        assert status.startswith("HTTP/1.1 401 "), "stub assertion failed: status.startswith(\"HTTP/1.1 401 \")"
 
 before = observations()
 rejected_connect(router_port, stable_sid, True)
 rejected_connect(node_port, stable_sid + "-g0", False)
 after = observations()
-assert after == before, (before, after)
+assert after == before, "stub assertion failed: after == before"
 PY
 
 step "checking conditioned service=exec ctl admission and denial"
@@ -652,19 +651,19 @@ def connect(argv):
         conn.shutdown(socket.SHUT_WR)
         stream = conn.makefile("rb")
         outer_status, _ = read_head(stream)
-        assert outer_status.startswith("HTTP/1.1 200 "), outer_status
+        assert outer_status.startswith("HTTP/1.1 200 "), "stub assertion failed: outer_status.startswith(\"HTTP/1.1 200 \")"
         return stream.read()
 
 assert connect(["/bin/true"]) == b"exec-admitted"
 before = len(json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2)))
 denied = connect(["/bin/false"])
-assert len(denied) >= 4, denied
+assert len(denied) >= 4, "stub assertion failed: len(denied) >= 4"
 size = struct.unpack("<I", denied[:4])[0]
 error = json.loads(denied[4:4+size])
-assert error == {"type": "error", "msg": "exec request rejected"}, error
-assert len(denied) == 4 + size, denied
+assert error == {"type": "error", "msg": "exec request rejected"}, "stub assertion failed: error == {\"type\": \"error\", \"msg\": \"exec request rejected\"}"
+assert len(denied) == 4 + size, "stub assertion failed: len(denied) == 4 + size"
 after = len(json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2)))
-assert after == before, (before, after)
+assert after == before, "stub assertion failed: after == before"
 PY
 
 python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "exec tunnel did not reach the current NodeSandboxID"
@@ -672,16 +671,16 @@ import json, sys, urllib.request
 admin, group, stable_sid = sys.argv[1:]
 hits = json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2))
 exec_hits = [hit for hit in hits if hit.get("path") == "/exec-admitted"]
-assert len(exec_hits) == 1, exec_hits
+assert len(exec_hits) == 1, "stub assertion failed: len(exec_hits) == 1"
 hit = exec_hits[0]
-assert hit.get("sid") == stable_sid + "-g0", hit
-assert hit.get("method") == "EXEC", hit
-assert hit.get("host") == "exec", hit
+assert hit.get("sid") == stable_sid + "-g0", "stub assertion failed: hit.get(\"sid\") == stable_sid + \"-g0\""
+assert hit.get("method") == "EXEC", "stub assertion failed: hit.get(\"method\") == \"EXEC\""
+assert hit.get("host") == "exec", "stub assertion failed: hit.get(\"host\") == \"exec\""
 cluster = hit.get("cluster", {})
-assert cluster.get("group") == group, hit
-assert cluster.get("route_key") == "user1/session1", hit
-assert cluster.get("stable_id") == stable_sid, hit
-assert "/bin/true" not in json.dumps(exec_hits, separators=(",", ":")), exec_hits
+assert cluster.get("group") == group, "stub assertion failed: cluster.get(\"group\") == group"
+assert cluster.get("route_key") == "user1/session1", "stub assertion failed: cluster.get(\"route_key\") == \"user1/session1\""
+assert cluster.get("stable_id") == stable_sid, "stub assertion failed: cluster.get(\"stable_id\") == stable_sid"
+assert "/bin/true" not in json.dumps(exec_hits, separators=(",", ":")), "stub assertion failed: \"/bin/true\" not in json.dumps(exec_hits, separators=(\",\", \":\"))"
 PY
 
 code="$(retry_code 204 "$WORK/data1.body" \
@@ -698,8 +697,8 @@ hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2
 assert hits, "no data hits"
 last = hits[-1]
 location = last.get("cluster", {})
-assert location["group"] == sys.argv[2], last
-assert location["route_key"] == "user1/session1", last
+assert location["group"] == sys.argv[2], "stub assertion failed: location[\"group\"] == sys.argv[2]"
+assert location["route_key"] == "user1/session1", "stub assertion failed: location[\"route_key\"] == \"user1/session1\""
 PY
 
 if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ]; then
@@ -707,7 +706,7 @@ if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ]; then
     kill "${SCALER_PIDS[0]}" 2>/dev/null || true
     wait "${SCALER_PIDS[0]}" 2>/dev/null || true
     code="$(create_sandbox "user1/session-placer-failover" "$WORK/create-placer-ha.body" || true)"
-    [ "$code" = "201" ] || fail "create after placer failure returned $code: $(cat "$WORK/create-placer-ha.body")"
+    [ "$code" = "201" ] || fail "create after placer failure returned $code"
     IFS=$'\t' read -r PLACER_HA_SID PLACER_HA_ENVD_TOKEN \
         < <(sandbox_credentials "$WORK/create-placer-ha.body" "user1/session-placer-failover") || \
         fail "invalid create response after placer failure"
@@ -727,7 +726,7 @@ if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the ready route"
 import json, sys
 routes = json.load(open(sys.argv[1]))
-assert any(r.get("sandboxID") and r.get("state") == "ready" for r in routes), routes
+assert any(r.get("sandboxID") and r.get("state") == "ready" for r in routes), "stub assertion failed: any(r.get(\"sandboxID\") and r.get(\"state\") == \"ready\" for r in routes)"
 PY
 
     step "cutting registry membership over to version 2 with old_grace version 1"
@@ -758,7 +757,7 @@ route_link:
   park_timeout: "5s"
 EOF
         code="$(http_code "$WORK/reload-$i.body" -X POST "http://127.0.0.1:$port/cluster/reload" || true)"
-        [ "$code" = "204" ] || fail "registry-$i cutover reload returned $code: $(cat "$WORK/reload-$i.body")"
+        [ "$code" = "204" ] || fail "registry-$i cutover reload returned $code"
     done
 
     step "checking registries report active membership version 2 with old_grace version 1"
@@ -767,15 +766,15 @@ EOF
         python3 - "http://127.0.0.1:$port" <<'PY' || fail "registry cutover membership check failed on $port"
 import json, sys, urllib.request
 m = json.load(urllib.request.urlopen(sys.argv[1] + "/cluster/membership", timeout=2))
-assert m.get("active", m.get("Active")) == 2, m
-assert not m.get("next", m.get("Next", 0)), m
-assert m.get("old_grace", m.get("OldGrace")) == 1, m
+assert m.get("active", m.get("Active")) == 2, "stub assertion failed: m.get(\"active\", m.get(\"Active\")) == 2"
+assert not m.get("next", m.get("Next", 0)), "stub assertion failed: not m.get(\"next\", m.get(\"Next\", 0))"
+assert m.get("old_grace", m.get("OldGrace")) == 1, "stub assertion failed: m.get(\"old_grace\", m.get(\"OldGrace\")) == 1"
 PY
     done
 
     step "checking router/placer refresh through known members after cutover"
     code="$(create_sandbox "user1/session-cutover" "$WORK/create-cutover.body" || true)"
-    [ "$code" = "201" ] || fail "create after registry cutover returned $code: $(cat "$WORK/create-cutover.body")"
+    [ "$code" = "201" ] || fail "create after registry cutover returned $code"
     IFS=$'\t' read -r CUTOVER_SID CUTOVER_ENVD_TOKEN \
         < <(sandbox_credentials "$WORK/create-cutover.body" "user1/session-cutover") || \
         fail "invalid create response after registry cutover"
@@ -793,8 +792,8 @@ hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2
 assert hits, "no data hits"
 last = hits[-1]
 location = last.get("cluster", {})
-assert location["group"] == sys.argv[2], last
-assert location["route_key"] == "user1/session-cutover", last
+assert location["group"] == sys.argv[2], "stub assertion failed: location[\"group\"] == sys.argv[2]"
+assert location["route_key"] == "user1/session-cutover", "stub assertion failed: location[\"route_key\"] == \"user1/session-cutover\""
 PY
 fi
 
@@ -835,14 +834,14 @@ code="$(http_code "$WORK/build.body" -X POST \
     -H "Content-Type: application/json" \
     --data '{"name":"stub-template","cpuCount":1,"memoryMB":128}' \
     "http://127.0.0.1:$ROUTER_PORT/v3/templates" || true)"
-[ "$code" = "202" ] || fail "build register returned $code: $(cat "$WORK/build.body")"
+[ "$code" = "202" ] || fail "build register returned $code"
 
 IFS=$'\t' read -r BUILD_ID TEMPLATE_ID < <(python3 - "$WORK/build.body" <<'PY'
 import json, sys
 response = json.load(open(sys.argv[1]))
 build_id, template_id = response.get("buildID"), response.get("templateID")
-assert isinstance(build_id, str) and build_id, response
-assert isinstance(template_id, str) and template_id, response
+assert isinstance(build_id, str) and build_id, "stub assertion failed: isinstance(build_id, str) and build_id"
+assert isinstance(template_id, str) and template_id, "stub assertion failed: isinstance(template_id, str) and template_id"
 print(build_id + "\t" + template_id)
 PY
 ) || fail "build register response omitted identifiers"
@@ -852,12 +851,12 @@ code="$(retry_code 200 "$WORK/build-status.body" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
     -H "X-API-KEY: $API_KEY" \
     "http://127.0.0.1:$ROUTER_PORT/v2/templates/$TEMPLATE_ID/builds/$BUILD_ID/status" || true)"
-[ "$code" = "200" ] || fail "build status follow-up returned $code: $(cat "$WORK/build-status.body")"
+[ "$code" = "200" ] || fail "build status follow-up returned $code"
 
 python3 - "$ADMIN" <<'PY' || fail "build_register command with default e2b profile was not observed"
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-assert any(c.get("kind") == "build_register" and c.get("profile") == "e2b" for c in cmds), cmds
+assert any(c.get("kind") == "build_register" and c.get("profile") == "e2b" for c in cmds), "stub assertion failed: any(c.get(\"kind\") == \"build_register\" and c.get(\"profile\") == \"e2b\" for c in cmds)"
 PY
 
 step "checking unowned node-local route isolation"
@@ -867,7 +866,7 @@ import json, sys, time, urllib.request
 admin = sys.argv[1]
 time.sleep(1)
 cmds = json.load(urllib.request.urlopen(admin + "/v1/nodes/stub-1/commands", timeout=2))
-assert not any(c.get("kind") == "delete" and c.get("sid") == "sb-orphan" for c in cmds), cmds
+assert not any(c.get("kind") == "delete" and c.get("sid") == "sb-orphan" for c in cmds), "stub assertion failed: not any(c.get(\"kind\") == \"delete\" and c.get(\"sid\") == \"sb-orphan\" for c in cmds)"
 PY
 
 step "checking reboot-empty cleanup"
@@ -914,7 +913,7 @@ for _ in range(100):
     if all(r.get("sandboxID") != sid for r in last):
         sys.exit(0)
     time.sleep(0.1)
-raise SystemExit("routes=%r" % (last,))
+raise SystemExit("route list still contains the rebooted sandbox")
 PY
 
 echo "==> PASS: orchestrator cluster stub e2e"

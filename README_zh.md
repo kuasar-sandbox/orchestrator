@@ -105,6 +105,11 @@ make test-e2e                   # 组件 owner suite,需要项目组装的完整
 变更范围可以限定在本仓，构建仍需上述依赖闭包；跨仓契约变更必须关联 companion PR 并使用精确源码组合的集成测试验证，
 见 [Organization 贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。
 
+本地 `make test-e2e-cluster-stub` 流程启动真实控制面进程,但不启动 MicroVM。
+运行目录保持私有;失败输出只报告诊断文件名和大小,不输出原始响应、日志或含
+capability 的对象。本地排查可设置 `CLUSTER_STUB_KEEP_WORK=1` 保留运行目录,
+并私下检视;不要上传未脱敏文件。它不能替代真实 MicroVM 集成测试。
+
 ## 部署概览
 
 独立节点通常先启动 Conductor 再启动 Proxy;集群增加独立 Registry、Router、Placer。
