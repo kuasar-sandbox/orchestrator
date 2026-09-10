@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER_CTL_EXPLICIT="${CLUSTER_CTL+x}"
@@ -207,6 +206,8 @@ print("\t".join((sid, envd)))
 PY
 }
 
+# Keep the caller's build umask: only run-owned diagnostics need this mask.
+umask 077
 WORK="$(mktemp -d)"
 step "work dir: $WORK"
 PIDS=()
@@ -354,7 +355,7 @@ EOF
 
 for i in $(seq 1 "$REGISTRIES"); do
     port="${CONTROL_PORTS[$((i-1))]}"
-    "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
+    "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" >"$WORK/registry-$i.log" 2>&1 &
     PIDS+=("$!")
     step "starting registry-$i"
     wait_tcp "$port" "registry-$i control"
@@ -390,7 +391,7 @@ SCALER_PIDS=()
 for i in $(seq 1 "$SCALERS"); do
     port="${SCALER_PORTS[$((i-1))]}"
     step "starting placer-$i"
-    "$CLUSTER_CTL" placer --config "$WORK/placer-$i.yaml" > >(tee "$WORK/placer-$i.log" >&2) 2>&1 &
+    "$CLUSTER_CTL" placer --config "$WORK/placer-$i.yaml" >"$WORK/placer-$i.log" 2>&1 &
     pid="$!"
     PIDS+=("$pid")
     SCALER_PIDS+=("$pid")
@@ -406,7 +407,7 @@ step "starting node-stub-ctl with $NODES nodes"
     --api-listen "127.0.0.1:$API_PORT" \
     --data-listen "127.0.0.1:$DATA_PORT" \
     --label pool=stub \
-    --heartbeat 500ms > >(tee "$WORK/node-stub.log" >&2) 2>&1 &
+    --heartbeat 500ms >"$WORK/node-stub.log" 2>&1 &
 PIDS+=("$!")
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
 wait_http "$ADMIN/healthz" "node-stub admin"
@@ -425,7 +426,7 @@ raise SystemExit("stub nodes did not register distinct API/Data endpoints")
 PY
 
 step "starting router"
-"$CLUSTER_CTL" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
+"$CLUSTER_CTL" router --config "$WORK/router.yaml" >"$WORK/router.log" 2>&1 &
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 

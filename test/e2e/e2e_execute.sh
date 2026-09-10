@@ -66,6 +66,18 @@ LOW_ALLOC_REPEATS="${LOW_ALLOC_REPEATS:-2}"
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+run_host_serialized() {
+    local lock_directory="$1" result=0
+    shift
+    # These cases share host routes, forwarding and slice names. Lock the
+    # existing systemd runtime directory without creating/deleting a lock file.
+    # flock owns the descriptor; --close keeps it out of daemons and units.
+    flock --nonblock --exclusive --close --conflict-exit-code 75 \
+        "$lock_directory" env KUASAR_EXECUTE_LOCK_HELD=1 "$@" || result=$?
+    [ "$result" -ne 75 ] || fail "another execute/MMDS case holds the host runtime lock"
+    return "$result"
+}
+
 case "$BIN" in
     /*) ;;
     *) BIN="$(cd "$BIN" 2>/dev/null && pwd)" || skip "BIN directory not found";;
@@ -81,12 +93,17 @@ command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 command -v iptables >/dev/null 2>&1 || skip "iptables not found"
+command -v flock >/dev/null 2>&1 || skip "flock not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
     || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
+if [ "${KUASAR_EXECUTE_LOCK_HELD:-0}" != 1 ]; then
+    run_host_serialized /run/systemd/system "$0" "$@"
+    exit "$?"
+fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
 # Give the outer Builder unit the host's full CPU capacity. The phase Sandbox
@@ -554,6 +571,19 @@ PY
 
 export_argv_count() { argv_log_count "$EXPORT_ARGV_LOG"; }
 run_argv_count() { argv_log_count "$RUN_ARGV_LOG"; }
+
+wait_run_argv() {
+    local index="$1" attempt
+    # Durable starting/Proxy parking precedes the asynchronous runner process.
+    # Wait only for its observation; the separate source assertion still checks
+    # the exact call index, sandbox identity and mutually exclusive launch mode.
+    for ((attempt=0; attempt<120; attempt++)); do
+        [ "$(run_argv_count)" -gt "$index" ] && return 0
+        sleep 0.05
+    done
+    echo "timed out waiting for run call $index" >&2
+    return 1
+}
 
 assert_export_argv() { # $1=index, remaining args=expected argv
     local index="$1"
@@ -1072,8 +1102,8 @@ echo "==> starting vswitch $SWITCH (netns=$SW_NETNS)"
     --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 \
     --mode=tap \
-    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
-    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT \
+    "--mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0" \
+    "--mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT" \
     --tapfd-listen="$TAPFD_SOCKET" --watch-interval=2s >"$WORK/vswitch-start.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 100); do
@@ -2358,6 +2388,7 @@ IMMEDIATE_DATA_PID=$!
 wait_sandbox_state "$SID" starting 120 || fail "Sandbox E traffic Wake was not durably accepted"
 wait_proxy_traffic_stats "$SID" parking \
     || fail "first Sandbox E Wake request was not parked while cold launch was starting"
+wait_run_argv "$E_WAKE_RUN_CALL" || fail "Sandbox E traffic Wake did not start its runner"
 assert_run_source_mode "$E_WAKE_RUN_CALL" "$SID" from \
     || fail "Sandbox E traffic Wake did not execute sandbox-ctl run --from"
 rm -f "$WORK/inject-sandbox-run"

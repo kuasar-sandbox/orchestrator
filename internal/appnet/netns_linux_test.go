@@ -16,6 +16,17 @@ func TestListenTCPInIsolatedNetNS(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("real network-namespace check requires root")
 	}
+	for _, tool := range []string{"unshare", "ip", "sh"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("real network-namespace check requires %s: %v", tool, err)
+		}
+	}
+	// EUID 0 alone does not grant namespace/network capabilities in a container.
+	// Probe the actual setup separately; failures after this probe remain fatal.
+	if output, err := exec.Command("unshare", "--net", "--", "sh", "-c",
+		"ip addr add 192.0.2.2/32 dev lo && ip link set lo up").CombinedOutput(); err != nil {
+		t.Skipf("real network-namespace setup is unavailable: %v: %s", err, output)
+	}
 	command := exec.Command("unshare", "--net", "--", "sh", "-c",
 		"set -eu; ip addr add 192.0.2.2/32 dev lo; ip link set lo up; echo ready; read finish")
 	output, err := command.StdoutPipe()

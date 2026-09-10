@@ -15,6 +15,41 @@ CANARY = "fixture-capability-must-not-enter-ci-diagnostics"
 
 
 class ClusterStubDiagnostics(unittest.TestCase):
+    def test_daemon_output_stays_private_while_the_process_runs(self):
+        redirects = re.findall(r'>(?:[^\n]*tee[^\n]*|"\$WORK/(?:registry-\$i|placer-\$i|node-stub|router)\.log" 2>&1 &)', SOURCE)
+        self.assertEqual(len(redirects), 4)
+        self.assertNotIn("tee ", SOURCE)
+        with tempfile.TemporaryDirectory() as directory:
+            for redirect in redirects:
+                result = subprocess.run(["bash", "-c",
+                    'set -euo pipefail\numask 077\nWORK=$1\ni=1\n'
+                    + '(printf "%s\\n" "$2"; printf "%s\\n" "$2" >&2) '
+                    + redirect + '\nwait\n', "_", directory, CANARY],
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(CANARY, result.stdout + result.stderr)
+            logs = list(Path(directory).glob("*.log"))
+            self.assertEqual(len(logs), 4)
+            for log in logs:
+                self.assertEqual(log.read_text(), (CANARY + "\n") * 2)
+                self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    def test_private_umask_is_applied_only_after_binary_builds(self):
+        mask_position = SOURCE.index("\numask 077\n")
+        self.assertLess(SOURCE.rindex("\nbuild_cluster_stub_binaries\n"), mask_position)
+        self.assertLess(SOURCE.index("make -C"), mask_position)
+        self.assertLess(mask_position, SOURCE.index('WORK="$(mktemp -d)"'))
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = SOURCE[:SOURCE.index('if [ -z "${CLUSTER_STUB_CASE:-}" ]; then')]
+            prefix = prefix.replace('ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"', 'ROOT=$1')
+            script = prefix + '\nmake() { mkdir -p "$ROOT/bin"; printf "fixture\\n" >"$ROOT/bin/fixture"; chmod +x "$ROOT/bin/fixture"; }\n'
+            script += 'build_cluster_stub_binaries\numask 077\nprintf "private\\n" >"$ROOT/diagnostic"\n'
+            result = subprocess.run(["bash", "-c", "umask 022\n" + script, "_", directory],
+                                    env={"PATH": os.defpath}, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((Path(directory) / "bin/fixture").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((Path(directory) / "diagnostic").stat().st_mode & 0o777, 0o600)
+
     def test_failure_withholds_private_file_contents(self):
         function = re.search(r"(?ms)^fail\(\) \{\n.*?^\}", SOURCE).group()
         with tempfile.TemporaryDirectory() as directory:

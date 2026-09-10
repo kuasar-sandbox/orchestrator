@@ -1,5 +1,6 @@
 """Isolate the exact execute-test cleanup functions from host resources."""
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -10,10 +11,89 @@ SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()
 
 
 def function(name):
-    return re.search(r"(?ms)^" + name + r"\(\) \{\n.*?^\}", SOURCE).group()
+    return re.search(r"(?ms)^" + name + r"\(\) \{[^\n]*\n.*?^\}", SOURCE).group()
 
 
 class ExecuteOwnership(unittest.TestCase):
+    def lock_command(self, directory, *command):
+        script = 'set -euo pipefail\nfail() { echo "$*" >&2; exit 1; }\n'
+        script += function("run_host_serialized") + '\nrun_host_serialized "$@"\n'
+        return ["bash", "-c", script, "_", str(directory), *command]
+
+    def test_parallel_case_is_refused_before_touching_host_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            holder = subprocess.Popen(self.lock_command(directory, "python3", "-c",
+                'print("locked", flush=True); input()'), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "locked")
+                marker = Path(directory) / "must-not-run"
+                contender = subprocess.run(self.lock_command(directory, "touch", str(marker)),
+                                           text=True, capture_output=True, timeout=10)
+                self.assertEqual(contender.returncode, 1)
+                self.assertIn("another execute/MMDS case", contender.stderr)
+                self.assertFalse(marker.exists())
+                holder.communicate("done\n", timeout=10)
+                self.assertEqual(holder.returncode, 0)
+                next_case = subprocess.run(self.lock_command(directory, "sh", "-c",
+                    'test "$KUASAR_EXECUTE_LOCK_HELD" = 1'), timeout=10)
+                self.assertEqual(next_case.returncode, 0)
+            finally:
+                if holder.poll() is None:
+                    holder.kill()
+                holder.communicate(timeout=10)
+
+    def test_failed_case_releases_lock_and_does_not_leave_lock_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            failed = subprocess.run(self.lock_command(directory, "sh", "-c", "exit 23"), timeout=10)
+            self.assertEqual(failed.returncode, 23)
+            repeated = subprocess.run(self.lock_command(directory, "true"), timeout=10)
+            self.assertEqual(repeated.returncode, 0)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_lock_descriptor_is_not_inherited_by_test_daemons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program = ('import os, sys; target=os.stat(sys.argv[1]); '
+                       'assert not any((st.st_dev, st.st_ino) == (target.st_dev, target.st_ino) '
+                       'for fd in range(3, 256) if os.path.exists("/proc/self/fd/"+str(fd)) '
+                       'for st in [os.fstat(fd)])')
+            result = subprocess.run(self.lock_command(directory, "python3", "-c", program, directory),
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(SOURCE.index('run_host_serialized /run/systemd/system'),
+                        SOURCE.index('WORK="$(mktemp -d /tmp/e-XXXXXX)"'))
+
+    def wait_case(self, call, delay=0):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.jsonl"
+            log.write_text("")
+            script = "set -euo pipefail\nRUN_ARGV_LOG=$1\n"
+            script += function("argv_log_count") + "\n"
+            script += re.search(r"(?m)^run_argv_count\(\).*", SOURCE).group() + "\n"
+            script += function("wait_run_argv") + "\n" + function("assert_run_source_mode") + "\n"
+            if call is not None:
+                # Real delayed file observation, not a timer-only success stub.
+                script += '(sleep "$2"; printf "%s\\n" "$3" >> "$RUN_ARGV_LOG") &\n'
+            script += "wait_run_argv 0\nassert_run_source_mode 0 fixture-sandbox from\nwait\n"
+            return subprocess.run(["bash", "-c", script, "_", str(log), str(delay), json.dumps(call)],
+                                  text=True, capture_output=True, timeout=20)
+
+    def test_async_starting_waits_for_the_real_run_observation(self):
+        result = self.wait_case(["run", "--sandbox-id", "fixture-sandbox", "--from", "/fixture/ready.sandbox"], 0.15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_run_observation_still_fails(self):
+        result = self.wait_case(None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timed out waiting for run call 0", result.stderr)
+
+    def test_observed_wrong_source_or_identity_is_not_retried_or_accepted(self):
+        for call in (["run", "--sandbox-id", "fixture-sandbox", "--restore", "/fixture/ready.snapshot"],
+                     ["run", "--sandbox-id", "another-sandbox", "--from", "/fixture/ready.sandbox"]):
+            result = self.wait_case(call)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("timed out", result.stderr)
+
     def run_case(self, body, *, collision=False, fail_link=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
