@@ -196,6 +196,25 @@ requested_dependency_version() {
   printf '%s\n' "$result"
 }
 
+validate_dependency_source() {
+  local extract="$1" name="$2" payload="$3" version="$4"
+  local directory_variable="RELEASE_${name^^}_SOURCE_DIR" sha_variable="RELEASE_${name^^}_SOURCE_SHA"
+  local source sha tagged
+  source="${!directory_variable:-$ROOT/../$name}"
+  sha="${!sha_variable:-}"
+  [ -n "$sha" ] || sha="$(git -C "$source" rev-parse HEAD)" \
+    || fail "cannot resolve selected $name dependency source"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "$name dependency source must be an exact commit"
+  if [ -n "$version" ]; then
+    tagged="$(git -C "$source" rev-parse --verify "refs/tags/$version^{commit}")" \
+      || fail "selected $name dependency release tag is unavailable"
+    [ "$tagged" = "$sha" ] || fail "$name dependency source does not match the selected release tag"
+  fi
+  release_materials_require_source "$extract" "$NAME" "$payload" "$name" "$version" \
+    "https://github.com/kuasar-sandbox/$name/commit/$sha" "git:$sha"
+  release_materials_require_git_licenses "$extract" "$NAME" "$source" "$sha" "$name"
+}
+
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
   local version="$1" arch archive bundle="$3"
@@ -234,16 +253,17 @@ validate_bundle() {
   project_sha="$(go version -m "$extract/bin/node-ctl" | \
     awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
   validate_copied_source_files "$extract" "$project_sha"
-  release_materials_validate "$extract" "$NAME"
+  release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
     bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
   local expected_accelerator expected_connector expected_sandboxer
   expected_accelerator="$(requested_dependency_version accelerator)" || fail "invalid accelerator release binding"
   expected_connector="$(requested_dependency_version connector)" || fail "invalid connector release binding"
   expected_sandboxer="$(requested_dependency_version sandboxer)" || fail "invalid sandboxer release binding"
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'accelerator' "$expected_accelerator"
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' 'connector' "$expected_connector"
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'sandboxer' "$expected_sandboxer"
+  validate_dependency_source "$extract" accelerator 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_accelerator"
+  validate_dependency_source "$extract" connector 'bin/node-ctl' "$expected_connector"
+  validate_dependency_source "$extract" sandboxer 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_sandboxer"
+  release_materials_validate "$extract" "$NAME"
   release_materials_require_go "$extract" "$NAME" 'bin/node-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/cluster-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/node-stub-ctl'

@@ -204,6 +204,14 @@ commit is rejected. Deployment files are copied from the fresh selected checkout
 and compared byte-for-byte with that commit's Git blobs during validation.
 Standalone validation needs that exact commit locally; the trusted publisher
 fetches source history for inspection without executing candidate deployment files.
+Validation also compares complete project and internal-dependency license trees
+with their selected Git blobs, including nested `LICENSES`. Local validation uses
+the existing `RELEASE_*_SOURCE_DIR` and optional `RELEASE_*_SOURCE_SHA` selections,
+defaulting to sibling checkouts. Publication fetches only the three dependency
+tags from its validated request, using a read-only source token revoked before
+validation; it never executes those dependency checkouts. Each selected tag must
+resolve to the claimed source commit, URL and integrity value. Changed, missing
+or extra notices and changed dependency provenance fail even after rechecksumming.
 
 Package source records keep the project's or an internal dependency's release
 version only when its local Git tag matches the selected source commit. Untagged

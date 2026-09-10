@@ -261,8 +261,8 @@ fi
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
-  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 2 ] \
-    || fail "release workflow does not pin both $input checkouts"
+  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 3 ] \
+    || fail "release workflow does not pin both build and trusted-validation $input checkouts"
 done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
   || fail "release workflow does not verify dependency releases"
@@ -296,15 +296,22 @@ mkdir -p "$TMP/bin" "$TMP/src" "$TMP/accelerator" "$TMP/connector" "$TMP/sandbox
 printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
 printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
 printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
-accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
-connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
-sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE)"
+for dependency in accelerator connector sandboxer; do
+  mkdir "$TMP/$dependency/LICENSES"
+  printf 'fixture nested notice for %s\n' "$dependency" > "$TMP/$dependency/LICENSES/NOTICE.txt"
+  printf 'fixture attribution for %s\n' "$dependency" > "$TMP/$dependency/NOTICE"
+done
+accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE LICENSES NOTICE)"
+connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE LICENSES NOTICE)"
+sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE LICENSES NOTICE)"
 git -C "$TMP/accelerator" tag v0.1.3 "$accelerator_sha"
 git -C "$TMP/connector" tag v0.1.2 "$connector_sha"
 git -C "$TMP/sandboxer" tag v0.1.3 "$sandboxer_sha"
 fixture_root="$TMP/project"
-mkdir -p "$fixture_root/scripts"
+mkdir -p "$fixture_root/scripts" "$fixture_root/LICENSES"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
+printf 'fixture nested project notice\n' > "$fixture_root/LICENSES/NOTICE.txt"
+printf 'fixture project attribution\n' > "$fixture_root/NOTICE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
@@ -343,7 +350,7 @@ build:
 	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
 	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
 EOF
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod cmd deploy Makefile)"
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts go.mod cmd deploy Makefile)"
 (cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/cmd/node-ctl/main.go"
@@ -393,6 +400,56 @@ SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-private AWS_SECRET_ACCESS_KEY=fixt
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
+for label in project accelerator connector sandboxer; do
+  for mutation in top-level nested missing extra; do
+    candidate="$TMP/git-license-$label-$mutation"
+    cp -a "$TMP/bundle" "$candidate"
+    mkdir "$candidate/root"
+    tar -xzf "$archive" -C "$candidate/root"
+    license_root="$candidate/root/share/licenses/orchestrator/$label"
+    case "$mutation" in
+      top-level) printf 'altered license\n' > "$license_root/LICENSE" ;;
+      nested) printf 'altered nested notice\n' > "$license_root/LICENSES/NOTICE.txt" ;;
+      missing) rm "$license_root/NOTICE" ;;
+      extra) printf 'extra unauthenticated notice\n' > "$license_root/NOTICE.extra" ;;
+    esac
+    release_materials_hash_tree "$candidate/root" orchestrator \
+      "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
+    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+      -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+    (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+    if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+      fail "validator accepted $label $mutation license mutation with regenerated checksums"
+    fi
+    grep -Fq "license bytes differ from selected Git source: $label" "$candidate/result.log" \
+      || fail "Git license mutation failed for an unrelated reason"
+  done
+done
+for dependency in accelerator connector sandboxer; do
+  for column in 4 5; do
+    candidate="$TMP/dependency-source-$dependency-$column"
+    cp -a "$TMP/bundle" "$candidate"
+    mkdir "$candidate/root"
+    tar -xzf "$archive" -C "$candidate/root"
+    source_table="$candidate/root/share/sources/orchestrator/SOURCES.tsv"
+    awk -F '\t' -v OFS='\t' -v name="$dependency" -v column="$column" '
+      NR > 1 && $2 == name { $column = (column == 4 ? "https://example.invalid/unselected-source" : "git:0000000000000000000000000000000000000000") }
+      { print }
+    ' "$source_table" > "$candidate/sources.changed"
+    install -m 0644 "$candidate/sources.changed" "$source_table"
+    release_materials_hash_tree "$candidate/root" orchestrator \
+      "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
+    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+      -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+    (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+    if RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
+      "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+      fail "validator accepted changed $dependency source column $column"
+    fi
+    grep -Fq "missing or inconsistent source record for $dependency" "$candidate/result.log" \
+      || fail "dependency source mutation failed for an unrelated reason"
+  done
+done
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
   "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 for binding in accelerator=v9.0.0,connector=v0.1.2,sandboxer=v0.1.3 \

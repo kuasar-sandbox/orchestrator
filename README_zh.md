@@ -195,6 +195,12 @@ checkout,以 `GOWORK=off` 和只读 module 解析重新构建 Go 载荷。不复
 部署文件从全新选定 checkout 复制,验证时与该 commit 的 Git blob 逐字节比较。
 独立验证需要本地具备该精确 commit;可信发布端获取源码历史以供检视,不执行
 候选部署文件。
+验证还将完整项目和内部依赖许可树与选定的 Git blob 比较,包括嵌套 `LICENSES`。
+本地验证沿用 `RELEASE_*_SOURCE_DIR` 和可选的 `RELEASE_*_SOURCE_SHA` 选择,
+默认使用兄弟 checkout。发布端只按已验证请求获取三个依赖 Tag,使用的只读源码
+Token 在验证前撤销;不会执行这些依赖 checkout。选定 Tag 必须解析为声明的来源
+commit、URL 和完整性值。即使重算校验和,内容变化、缺失或额外许可及改动的依赖
+来源仍会失败。
 
 本仓库独立发布 `vX.Y.Z`。x86_64 组件包包含节点/集群二进制和部署文件;
 文档与 E2E 从所选组件 tag 收集进项目 platform 包,不在组件包重复携带。
