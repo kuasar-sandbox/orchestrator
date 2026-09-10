@@ -245,10 +245,10 @@ validate_bundle() {
   validate_dependency_source "$extract" connector 'bin/node-ctl' "$expected_connector"
   validate_dependency_source "$extract" sandboxer 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_sandboxer"
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_go "$extract" "$NAME" 'bin/node-ctl'
-  release_materials_require_go "$extract" "$NAME" 'bin/cluster-ctl'
-  release_materials_require_go "$extract" "$NAME" 'bin/node-stub-ctl'
-  release_materials_require_go "$extract" "$NAME" 'bin/e2b-key-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/node-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/cluster-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/node-stub-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/e2b-key-ctl'
 }
 
 package_release() {

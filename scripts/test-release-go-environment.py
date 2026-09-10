@@ -119,17 +119,63 @@ class GoSourceEnvironment(unittest.TestCase):
             'release_materials_require_go() { touch "$WORK/authentication-reached"; return 1; }\n'
             'release_materials_validate "' + str(stage) + '" ' + unit)
         marker = self.root / "verification/authentication-reached"
-        for payload, oversized in ((official.replace("bin/", "bin/./", 1), False),
-                                   (official.replace("bin/", "bin//", 1), False),
-                                   (official, True), (official, False)):
+        original_sources = (source / "SOURCES.tsv").read_text()
+        cases = [
+            {"payload": official.replace("bin/", "bin/./", 1)},
+            {"payload": official.replace("bin/", "bin//", 1)},
+            {"oversized": True},
+            {"source_repeats": 2},
+            {"source_rows": 16385},
+            *({"large_table": name} for name in
+              ("SOURCES.tsv", "GO-BUILD-INFO.tsv", "GO-MODULES.tsv", "MATERIALS.sha256")),
+            {"expect_authentication": True},
+        ]
+        for case in cases:
+            payload = case.get("payload", official)
+            oversized = case.get("oversized", False)
+            header, row = original_sources.splitlines(keepends=True)
+            rows = "".join(row.replace("\tfixture\t", "\tfixture-" + str(i) + "\t")
+                           for i in range(case["source_rows"])) if "source_rows" in case else row * case.get("source_repeats", 1)
+            (source / "SOURCES.tsv").write_text(header + rows)
+            (source / "GO-MODULES.tsv").write_text("module\tversion\tchecksum\n")
+            (source / "MATERIALS.sha256").write_text("fixture inventory; authentication must come first\n")
             (source / "GO-BUILD-INFO.tsv").write_text(
                 "payload\trecord\tname\tversion_or_value\tchecksum\n"
                 + (payload + "\ttoolchain\tgo\tgo1.26.4\t-\n") * (16385 if oversized else 1))
             (source / "GO-BUILD-INFO.tsv").chmod(0o644)
+            if "large_table" in case:
+                with (source / case["large_table"]).open("r+b") as contents:
+                    contents.truncate(16777217)
             result = self.run_shell(command)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(marker.exists(), payload == official and not oversized,
+            if "source_repeats" in case or "source_rows" in case:
+                self.assertIn("invalid SOURCES.tsv records", result.stderr)
+            if "large_table" in case:
+                self.assertIn("source material is too large", result.stderr)
+            self.assertEqual(marker.exists(), case.get("expect_authentication", False),
                              "validator did not reject the malformed record before authentication")
+
+    def test_required_payload_keys_do_not_repeat_authentication(self):
+        unit = ALLOWED[0].split(":", 1)[0]
+        payloads = [identity.split(":", 1)[1] for identity in ALLOWED]
+        stage = self.root / "stage"
+        source = stage / "share/sources" / unit
+        source.mkdir(parents=True)
+        info = source / "GO-BUILD-INFO.tsv"
+        for absent in [None, *payloads]:
+            info.write_text("payload\trecord\tname\tversion_or_value\tchecksum\n"
+                            + "".join(payload + "\ttoolchain\tgo\tgo1.26.4\t-\n"
+                                      for payload in payloads if payload != absent))
+            for payload in payloads:
+                command = 'release_materials_require_go_key "' + str(stage) + '" ' + unit + ' ' + payload
+                result = self.run_shell(command)
+                self.assertEqual(result.returncode == 0, payload != absent, result.stderr)
+                if payload == absent:
+                    self.assertIn("missing required Go payload record", result.stderr)
+                self.assertFalse(self.capture.exists())
+        release = (ROOT / "scripts/release.sh").read_text()
+        self.assertNotIn('release_materials_require_go "$extract"', release)
+        self.assertIn('release_materials_require_go_key "$extract"', release)
 
     def test_payload_gate_precedes_expensive_authentication(self):
         source = HELPER.read_text().split("release_materials_validate() {", 1)[1]

@@ -563,6 +563,17 @@ release_materials_require_source() {
     || fail "missing or inconsistent source record for $name ($payload)"
 }
 
+release_materials_require_go_key() {
+  # After release_materials_validate authenticates each observed payload once,
+  # require every official payload without repeating its expensive verification.
+  local root="$1" unit="$2" payload="$3"
+  awk -F '\t' -v payload="$payload" '
+    NR > 1 && $1 == payload { found = 1 }
+    END { exit !found }
+  ' "$root/share/sources/$unit/GO-BUILD-INFO.tsv" \
+    || fail "missing required Go payload record: $payload"
+}
+
 release_materials_require_go() {
   local root="$1" unit="$2" payload="$3" toolchain
   local info="$root/share/sources/$unit/GO-BUILD-INFO.tsv"
@@ -621,6 +632,8 @@ release_materials_validate() {
     [ -s "$source_root/$file" ] || fail "release source material is missing: share/sources/$unit/$file"
     [ "$(stat -c '%a' "$source_root/$file")" = 644 ] \
       || fail "release source material has unsafe mode: share/sources/$unit/$file"
+    [ "$(stat -c '%s' "$source_root/$file")" -le 16777216 ] \
+      || fail "release source material is too large: share/sources/$unit/$file"
   done
   awk -F '\t' '
     NR == 1 {
@@ -629,7 +642,7 @@ release_materials_validate() {
       }
       next
     }
-    NF != 6 { exit 1 }
+    NF != 6 || NR > 16385 || seen[$0]++ { exit 1 }
     {
       for (field = 1; field <= 6; field++) {
         if ($field == "") {

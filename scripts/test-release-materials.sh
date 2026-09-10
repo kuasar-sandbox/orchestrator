@@ -199,7 +199,9 @@ for mismatch in duplicate version source integrity license; do
   if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/source-$mismatch.log" 2>&1); then
     fail "validator accepted an ambiguous source record: $mismatch"
   fi
-  grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/source-$mismatch.log" \
+  expected_error='missing or inconsistent source record for Go toolchain'
+  [ "$mismatch" != duplicate ] || expected_error='invalid SOURCES.tsv records'
+  grep -Fq "$expected_error" "$TMP/source-$mismatch.log" \
     || fail "ambiguous source failed for an unrelated reason"
 done
 
