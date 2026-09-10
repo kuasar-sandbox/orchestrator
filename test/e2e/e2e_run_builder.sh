@@ -7,10 +7,11 @@
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
 # as an envd-managed process. One durable conductor database is exercised
-# across publication-policy restarts, fourteen successful builds, one
+# across publication-policy restarts, fifteen successful builds, one
 # deterministic failed build, and six creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
+#       auto image requires request DNS to resolve the private registry name
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
 #       boots the steps VM from manifest://, applies RUN/ENV/WORKDIR, exports
 #       (config merge), runs startCmd/readyCmd on the production runtime,
@@ -21,6 +22,7 @@
 #   B4  COPY build context (versitygw required)            → e2b-img template
 #       files endpoint → presigned direct-to-bucket PUT → in-build extract via
 #       flatten-ctl; a RUN step asserts content + default/--chown ownership
+#       explicit image also requires request DNS in both Phase A and Phase B
 #   B5  profile=bare + fromImage                            → bare-img template
 #       rejects start/ready, uses bare build network, and remains image-only
 #   B6  fromTemplate(B2, snp), explicit image, no steps     → e2b-img template
@@ -218,6 +220,63 @@ done
     || { cat "$WORK/vswitch.log"; fail "vswitch not ready"; }
 ip addr replace "$MGMT_VIP/32" dev "$SW_MGMT" \
     || fail "configure management VIP on $SW_MGMT"
+
+# This name is resolvable only by the request-selected DNS server. Default
+# networking cannot make these image builds pass if Register drops the header
+# or the worker ignores the resolved network. Use stdlib Python, already
+# required by this suite, rather than depending on an external DNS service.
+BUILD_REGISTRY_HOST="image-build.invalid"
+NETWORK_PULL_REF="$BUILD_REGISTRY_HOST:$ZOT_PORT/e2e/base:v1"
+BUILD_NETWORK_HEADER="{\"dns\":[\"$MGMT_VIP\"]}"
+python3 -u - "$MGMT_VIP" "$BUILD_REGISTRY_HOST" >"$WORK/build-dns.log" 2>&1 <<'PY' &
+import socket, struct, sys
+
+address, hostname = sys.argv[1:]
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((address, 53))
+print("ready", flush=True)
+while True:
+    packet, peer = sock.recvfrom(4096)
+    if len(packet) < 12 or struct.unpack("!H", packet[4:6])[0] != 1:
+        continue
+    try:
+        labels, offset = [], 12
+        while packet[offset]:
+            length = packet[offset]
+            if length > 63:
+                raise ValueError("compressed or invalid query label")
+            offset += 1
+            labels.append(packet[offset:offset + length].decode("ascii"))
+            offset += length
+        offset += 1
+        qtype, qclass = struct.unpack("!HH", packet[offset:offset + 4])
+        name = ".".join(labels).lower()
+        known = name == hostname and qclass == 1
+        answer = b""
+        if known and qtype == 1:
+            answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 1, 4) + socket.inet_aton(address)
+        header = packet[:2] + struct.pack("!HHHHH", 0x8180 if known else 0x8183, 1, bool(answer), 0, 0)
+        sock.sendto(header + packet[12:offset + 4] + answer, peer)
+        print(name, qtype, flush=True)
+    except (IndexError, UnicodeError, ValueError, struct.error):
+        continue
+PY
+BUILD_DNS_PID=$!
+PIDS+=("$BUILD_DNS_PID")
+for _ in $(seq 1 50); do
+    grep -q '^ready$' "$WORK/build-dns.log" && break
+    kill -0 "$BUILD_DNS_PID" 2>/dev/null || { cat "$WORK/build-dns.log"; fail "Build DNS server exited"; }
+    sleep 0.1
+done
+grep -q '^ready$' "$WORK/build-dns.log" || fail "Build DNS server did not bind"
+BUILD_NETWORK_STEP=$(python3 - "$BUILD_REGISTRY_HOST" "$ZOT_PORT" <<'PY'
+import json, shlex, sys
+url = f"http://{sys.argv[1]}:{sys.argv[2]}/v2/"
+program = "import urllib.request; opener = urllib.request.build_opener(urllib.request.ProxyHandler({})); "
+program += f"assert opener.open({url!r}, timeout=5).status == 200"
+print(json.dumps({"type": "RUN", "args": ["python3 -c " + shlex.quote(program)]}))
+PY
+)
 echo "==> vswitch up ($SWITCH; mgmt $SW_MGMT=$MGMT_VIP; tapfd_socket=$TAPFD_SOCKET)"
 
 # ---- manifest config + diff templates ---------------------------------------
@@ -411,6 +470,7 @@ req() { # method path key [body]
     [ -n "${REQ_MMDS_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
     [ -n "${REQ_BUILDER_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Builder: ${REQ_BUILDER_HEADER}")
     [ -n "${REQ_RESOURCE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Resource: ${REQ_RESOURCE_HEADER}")
+    [ -n "${REQ_NETWORK_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NETWORK_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -728,12 +788,16 @@ register() { # name [profile] [target-json] [sandbox-config=0|1] → sets TID/BI
     target_suffix=""
     [ -z "$target_json" ] || target_suffix=",\"target\":$target_json"
     REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"storage\":\"4GiB\"}$target_suffix}"
+    if [ -n "${REQ_NETWORK_HEADER:-}" ]; then
+        # Force the guest import path when testing request network overrides.
+        REQ_BUILDER_HEADER="${REQ_BUILDER_HEADER%?},\"referer\":{\"enabled\":false}}"
+    fi
     if [ "$sandbox_config" = "1" ]; then
         REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"3GiB"},"allocatable":{"cpu":1,"memory":"512MiB"},"startup":{"memory":"3GiB"}}'
         body="${body%?},\"envVars\":{\"BUILD_TARGET_ENV\":\"portable-e2e\"}}"
     fi
     code=$(req POST /v3/templates "$AK" "$body")
-    unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
+    unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER REQ_NETWORK_HEADER
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
     TID=$(json_field "$WORK/resp.body" templateID)
     BID=$(json_field "$WORK/resp.body" buildID)
@@ -1142,10 +1206,11 @@ grep -Fq 'kuasar-sandbox.mmds' "$WORK/bm-snapshot.json" \
 echo "==> PASS: BM real guest MMDS, Trigger immutability, terminal cleanup, and artifact/log secrecy"
 
 # ---- B1: fromImage → e2b-img -----------------------------------------------
-echo "==> B1: fromImage=$PULL_REF (in-guest pull + flatten)"
+echo "==> B1: fromImage=$NETWORK_PULL_REF (auto image, request DNS, in-guest pull + flatten)"
+REQ_NETWORK_HEADER="$BUILD_NETWORK_HEADER"
 register e2e-img
 B1_TID="$TID"; B1_BID="$BID"
-code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
+code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$NETWORK_PULL_REF\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B1 trigger = $code (want 202)"; }
 wait_phase_reservation a "$B1_BID" \
     || fail "B1 phase A never exposed a connected settled nodectl reservation"
@@ -1315,7 +1380,8 @@ echo "==> PASS: B3 ready → $B3_PERSIST (one task-local source preparation; mat
 # with the right ownership. Skipped without versitygw.
 if [ -n "$FILES_STORAGE_YAML" ]; then
     echo "==> B4: COPY build context (files endpoint → presigned PUT → in-build extract)"
-    register e2e-copy
+    REQ_NETWORK_HEADER="$BUILD_NETWORK_HEADER"
+    register e2e-copy e2b '{"kind":"image"}'
     B4_TID="$TID"; B4_BID="$BID"
 
     # Build the COPY context: ./hello.txt + ./sub/nested.txt, gzipped tar with
@@ -1358,36 +1424,38 @@ if [ -n "$FILES_STORAGE_YAML" ]; then
     # file to /opt/ct2/ with --chown 1000:1000, then RUN asserts presence+owner.
     # Reaching ready proves the extract + ownership are correct.
     B4_BODY=$(cat <<EOF
-{"fromImage":"$PULL_REF",
+{"fromImage":"$NETWORK_PULL_REF",
  "steps":[
    {"type":"COPY","args":[".","/opt/ct"],"filesHash":"$HASH"},
    {"type":"COPY","args":["hello.txt","/opt/ct2/","1000:1000"],"filesHash":"$HASH"},
-   {"type":"RUN","args":["test \"\$(cat /opt/ct/hello.txt)\" = \"$MARKER\" && test -f /opt/ct/sub/nested.txt && test \"\$(stat -c %u:%g /opt/ct/hello.txt)\" = 0:0 && test \"\$(stat -c %u:%g /opt/ct2/hello.txt)\" = 1000:1000"]}]}
+   {"type":"RUN","args":["test \"\$(cat /opt/ct/hello.txt)\" = \"$MARKER\" && test -f /opt/ct/sub/nested.txt && test \"\$(stat -c %u:%g /opt/ct/hello.txt)\" = 0:0 && test \"\$(stat -c %u:%g /opt/ct2/hello.txt)\" = 1000:1000"]},
+   $BUILD_NETWORK_STEP]}
 EOF
 )
     code=$(req POST "/v2/templates/$B4_TID/builds/$B4_BID" "$AK" "$B4_BODY")
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B4 trigger = $code (want 202)"; }
-    wait_ready "$B4_TID" "$B4_BID" B4 null img
+    wait_ready "$B4_TID" "$B4_BID" B4 '{"kind":"image"}' img
     B4_PERSIST="$PERSIST"
     case "$B4_PERSIST" in e2b-img-*) : ;; *) fail "B4 persist=$B4_PERSIST (want e2b-img-…)";; esac
-    echo "==> PASS: B4 ready → $B4_PERSIST (COPY extract + default/--chown ownership verified in-build)"
+    echo "==> PASS: B4 ready → $B4_PERSIST (explicit image, A/B request DNS, COPY ownership verified in-build)"
 else
     fail "B4 COPY chain requires files_storage; versitygw was not configured"
 fi
 
 # ---- B5: bare profile fromImage → bare-img -------------------------------
-echo "==> B5: profile=bare fromImage=$PULL_REF (image-only, bare network)"
+echo "==> B5: profile=bare fromImage=$NETWORK_PULL_REF (image-only, request DNS)"
+REQ_NETWORK_HEADER="$BUILD_NETWORK_HEADER"
 register e2e-bare bare
 B5_TID="$TID"; B5_BID="$BID"
 code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" \
-    "{\"fromImage\":\"$PULL_REF\",\"startCmd\":\"sleep 60\"}")
+    "{\"fromImage\":\"$NETWORK_PULL_REF\",\"startCmd\":\"sleep 60\"}")
 [ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "B5 startCmd = $code (want 400)"; }
-code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
+code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" "{\"fromImage\":\"$NETWORK_PULL_REF\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B5 trigger = $code (want 202)"; }
 wait_ready "$B5_TID" "$B5_BID" B5 null img
 B5_PERSIST="$PERSIST"
 case "$B5_PERSIST" in bare-img-*) : ;; *) fail "B5 persist=$B5_PERSIST (want bare-img-…)";; esac
-echo "==> PASS: B5 ready → $B5_PERSIST (bare profile remained image-only)"
+echo "==> PASS: B5 ready → $B5_PERSIST (bare profile, auto image, request DNS)"
 
 # ---- B6: SNP source + explicit Image, no steps → forced B, no C -----------
 echo "==> B6: fromTemplate=$B2_PERSIST (SNP), explicit image, no steps"
@@ -1445,6 +1513,37 @@ assert "e2b.start_cmd" not in metadata and "e2b.ready_cmd" not in metadata, meta
 PY
 echo "==> PASS: B7 direct top-level Sandbox E assembly preserved target resources/env and started no A/B/C VM"
 
+# ---- B9: synchronous rejection, then source-dependent auto Image ----------
+# B7 has no command defaults. An allocatable override larger than its capacity
+# must be ignored once auto resolves to Image, including conductor preparation.
+REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"storage\":\"4GiB\"}}"
+code=$(req POST /v3/templates "$AK" '{"profile":"bare","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"}}')
+[ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "bare auto env registration = $code (want 400)"; }
+REQ_RESOURCE_HEADER='{"allocatable":{"memory":"512GiB"}}'
+code=$(req POST /v3/templates "$AK" '{"name":"e2e-auto-options","profile":"e2b","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"},"secure":true}')
+unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B9 registration = $code (want 202)"; }
+B9_TID=$(json_field "$WORK/resp.body" templateID)
+B9_BID=$(json_field "$WORK/resp.body" buildID)
+code=$(req POST "/v2/templates/$B9_TID/builds/$B9_BID" "$AK" "{\"fromTemplate\":\"$B6_PERSIST\"}")
+[ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "B9 known Image trigger = $code (want 400)"; }
+[ ! -e "$WORK/run/builds/$B9_BID" ] || fail "B9 rejected Trigger started execution"
+# Retry the same registration with an E source whose commands are task-local.
+code=$(req POST "/v2/templates/$B9_TID/builds/$B9_BID" "$AK" "{\"fromTemplate\":\"$B7_PERSIST\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B9 source-dependent Trigger = $code (want 202)"; }
+wait_ready "$B9_TID" "$B9_BID" B9 null img
+B9_PERSIST="$PERSIST"
+assert_phase_history "$B9_BID" b c B9
+B9_REF=$(persist_ref "$B9_PERSIST") || fail "B9 persistent id is invalid"
+MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$B9_REF" >"$WORK/b9-image.json" 2>"$WORK/b9-image.err" \
+    || { cat "$WORK/b9-image.err"; fail "flatten-ctl info B9 image"; }
+python3 - "$WORK/b9-image.json" <<'PY' || fail "B9 injected unsupported registered env into Image"
+import json, sys
+assert "IGNORED_AUTO_ENV" not in json.dumps(json.load(open(sys.argv[1])))
+PY
+echo "==> PASS: B9 rejected known Image synchronously; E-source auto ignored incompatible options and skipped C"
+
 # ---- B8: SBX source + explicit memory Sandbox, no commands -----------------
 echo "==> B8: fromTemplate=$B7_PERSIST (SBX), explicit sandbox memory=true, no steps/start/ready"
 register e2e-memory e2b '{"kind":"sandbox","memory":true}' 1
@@ -1487,7 +1586,7 @@ PY
 echo "==> PASS: B8 SBX source forced B, cold C captured memory after fixed wait, and final S→E excludes source E"
 
 # ---- canonical Create after retention-bounded Build rows are reaped --------
-for terminal_bid in "$B1_BID" "$B5_BID" "$B7_BID" "$B8_BID"; do
+for terminal_bid in "$B1_BID" "$B5_BID" "$B7_BID" "$B8_BID" "$B9_BID"; do
     wait_build_row_deleted "$terminal_bid" \
         || fail "terminal Build row $terminal_bid survived builder.terminal_ttl"
 done
@@ -1733,4 +1832,4 @@ objs=$(find "$WORK/store" -type f | wc -l)
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST P5=$P5_PERSIST)"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST B9=$B9_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST P5=$P5_PERSIST)"

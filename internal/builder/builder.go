@@ -347,11 +347,7 @@ func (p *buildPipeline) resolveTarget() error {
 	if err := p.target.Validate(); err != nil {
 		return err
 	}
-	switch {
-	case p.target.Kind == types.BuildTargetImage && (p.spec.HasSandboxConfig || p.spec.HasInstanceConfig):
-		return fmt.Errorf("image target cannot represent registered Sandbox configuration")
-	case p.target.Kind == types.BuildTargetSandbox && !p.target.Memory && p.spec.HasInstanceConfig:
-		return fmt.Errorf("sandbox target with memory=false cannot apply instance-only configuration")
-	}
+	// Compatibility is validated synchronously whenever the target is known.
+	// Once admitted, target-specific publication consumes only supported inputs.
 	return nil
 }

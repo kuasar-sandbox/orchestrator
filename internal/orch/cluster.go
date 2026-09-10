@@ -292,7 +292,11 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		if err := o.validateBuildOptions(builderOpts, false); err != nil {
 			return err
 		}
-		if err := validateExplicitBuildTargetConfig(builderOpts.Target, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
+		target := builderOpts.Target
+		if target == nil && profile == types.ProfileBare {
+			target = &types.BuildTarget{Kind: types.BuildTargetImage}
+		}
+		if err := validateBuildTargetConfig(target, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
 			return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 		}
 	}

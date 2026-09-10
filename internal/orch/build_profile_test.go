@@ -351,6 +351,8 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 		ImageRepo:      "registry.test/repo",
 		RegistryAuth:   `{"auths":{"registry.test":{"auth":"opaque"}}}`,
 		Config: map[string]string{
+			// Resource projection requires an explicit Sandbox for bare builds.
+			buildcfg.NsBuilder:             `{"target":{"kind":"sandbox","memory":false}}`,
 			sandboxcfg.NsResource:          ` { "capacity" : { "memory" : "8GiB" }, "allocatable" : { "memory" : "512MiB" } } `,
 			clusterstate.ObjectMetadataKey: `{"group":"/test"}`,
 		},

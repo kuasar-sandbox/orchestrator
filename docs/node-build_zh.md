@@ -106,16 +106,20 @@ Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/met
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
 Trigger 不能覆盖注册 metadata、Builder/Resource 或其他通用配置头;非空通用 metadata/header 被拒绝。
 
-- 显式 Image 拒绝归一化后仍存在的 Sandbox resource/traffic/network/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
+- 同步接纳时,已知为 Image 的 target 拒绝归一化后仍存在的 Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
   以及非空 `envVars`、`secure=true`、非零 credential override 或显式 MMDS routes/secrets。
   普通 metadata label 与 Build execution resources 仍允许;空 `envVars`、`secure=false` 本身不构成拒绝条件。
-- 顶层 Sandbox E 接受 portable Create 配置(包括 env),但拒绝 traffic、非零 credentials、
+- 所有 target 均接受 `X-Kuasar-Sandbox-Network` / `kuasar-sandbox.network` 作为 Build 执行网络,
+  包括显式或自动解析的 Image target,也允许空 network 对象。网络输入不要求输出 Sandbox;
+  A/B 使用它完成镜像导入和构建步骤,Sandbox target 还会将其投影到 E。
+- 同步接纳时,显式顶层 Sandbox E 接受 portable Create 配置(包括 env),但拒绝 traffic、非零 credentials、
   显式 MMDS routes/secrets、`secure=true` 与非空 checkpoint 等 instance/action-only 输入。
-- 只有 resolved `sandbox,memory:true` 接受后一类输入。`instance_config_enc` 加密 env/secure/credentials;
+- 只有 resolved `sandbox,memory:true` 应用后一类输入。`instance_config_enc` 加密 env/secure/credentials;
   traffic/checkpoint/MMDS routes 存 metadata,MMDS values 使用独立加密表。实例/动作字段不进入 portable E/S;
   portable env 保留自身投影规则。空对象不是统一豁免:例如 `resource:{}`、`traffic:{}` 仍会被 Image 拒绝;
   空 checkpoint 与零值 credential 经各 namespace 归一化处理。
-- Auto 必须等来源 E 与 effective start/ready 解析后才校验目标兼容性。
+- 尽早同步校验目标兼容性:显式 target 与 bare auto 在 Register 校验;e2b auto 在 Trigger 完成 Hook 和来源别名解析后,若命令或 Image 来源已能确定目标,则立即校验。冲突返回 HTTP 400 并指出参数;Trigger 拒绝后保留 registered,可修正重试,不进入队列。
+- e2b auto 若仍依赖 task-local 来源 E 的命令默认值,则允许同步请求通过。后续 preparation、worker publication、结果校验和 IMG 直接复用均忽略实际目标不支持的配置,保留原始注册定义,不自动升级 target 或额外启动 Phase C。目标、effective commands 和唯一产物的完整性校验继续保留。需要携带 env 可选择 `sandbox,memory:false`;instance-only 输入需要 `sandbox,memory:true`。
 
 
 Build execution resources 与最终 Sandbox resources 独立,不互相默认、比较或推导;
@@ -123,13 +127,13 @@ Trigger `cpuCount`/`memoryMB` 只能断言不可变 Build resources。
 
 Build Register 的 routes 只服务
 可能运行 memory Phase C 的 synthetic builder sandbox；显式 Image/顶层 Sandbox E target
-在注册期拒绝它，auto target 则在 task-local target 解析后 fail closed。initial values 以 build owner 加密保存。build 终态事务同时
+在注册期拒绝它;auto target 能同步确定冲突时返回 400,否则接纳后若来源解析为 Image 则忽略该输入。initial values 以 build owner 加密保存。build 终态事务同时
 从 `builds.metadata_json` 删除 routes namespace 并删除 value blob,因此两者都不进入最终
 template/snapshot/image。Build Trigger 不接受 MMDS 覆盖。
 
 Build register
-只在 resolved `sandbox,memory:true` 时接受 `kuasar-sandbox.checkpoint` policy并用于 Phase C capture，且不写入最终 portable
-config。
+只在 resolved `sandbox,memory:true` 时应用 `kuasar-sandbox.checkpoint` policy并用于 Phase C capture,且不写入最终 portable
+config。已知不兼容时同步拒绝;已接纳且依赖来源解析的 Image 不解析 checkpoint policy 或目标 Sandbox resources。
 
 Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hostname 时临时 VM 用
   `build-<short-build-id>`，成品用 `sandbox.network.hostname`，所以临时 hostname 不进入模板。
@@ -158,16 +162,16 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   支持的 RunRoot 下仍不超过 Linux `sun_path`。
 
 - `POST /internal/task/build/bootstrap`(run-builder;req `{build_id,run_id,version}`)
-  当前 BuildTask schema 为 v5（v5 分离 checkpoint-location 与 image-class Bundle publication，
+  当前 BuildTask schema 为 v6（v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
   删除旧 broad `publish_location_parent`；v4 增加 register-time requested target，并把 SBX/SNP
   source 收敛为通用 cold Sandbox E；v3 以 `run_dir`/`base_dir` 替代混合语义 workdir，
   `checkpoint_mode` 自 v2 起必需),sandbox ArtifactPrepare
-  schema 独立为 v4（v4 增加 Build-only image Bundle publication preflight；v3 增加只供 Build source 使用的 image-config 读取 capability、同一
+  schema 仍独立为 v4（v4 增加 Build-only image Bundle publication preflight；v3 增加只供 Build source 使用的 image-config 读取 capability、同一
   Bundle 内 E/image 的 carrier scope，以及 portable allocatable/deflate resource defaults；v2 以 typed E/S、durable
   LaunchMode 和 bounded network/disk summary 取代旧 v1 Snapshot-only wire),两个版本号独立演进；bootstrap 和 build prepare 的版本不匹配均在读取
   secret-bearing provider 前返回 400,
   防止旧 task 静默忽略必需的 publication 语义。参见 [build_task.go](../internal/configsock/build_task.go)
-  与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。认证后返回 task env 与 exactly one of
+  与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。可选的 Build-only 命令存在性摘要与 digest 字段受 BuildTask v6 gate 保护,不回传命令文本;普通 Sandbox summary 与 digest 保持原样。认证后返回 task env 与 exactly one of
   `Final|Prepare`。Final 是
   **BuildSpec(构建工作单)**:`{build_id, profile, run_dir, base_dir, from_image | from_template
   (+kind), requested_target?, checkpoint_mode, steps[], start_cmd, ready_cmd, paths, net,
@@ -257,7 +261,8 @@ request-only spec/resource policy解析 → 从 builder pool 分配，先设置/
 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经 `connector-ctl vswitch attach` 分配一个网络槽
 (整个构建复用,各阶段顺序交接 tapfd)→ 铸 envd token → 在一个 exact-run SQLite CAS 中原子写入
 port/token 与非秘密 `runtime_prepare_json`(prepare digest、resolved build/template network、
-独立的 A/B execution 与 target Sandbox resources)→ (e2b + `mmds.enabled` 且 target 仍可能为 memory Sandbox 时)
+独立的 A/B execution 与 target Sandbox resources)。runtime preparation schema v4 同时冻结来源命令存在性以保持恢复语义;
+仅实际 Sandbox target 解析目标 resources,仅 memory=true 解析 checkpoint/instance policy → (e2b + `mmds.enabled` 且实际 target 为 memory Sandbox 时)
 先挂一行 synthetic sandbox route → 返回最终
 BuildSpec。route 必须先于 final handoff 可见，避免 task 取得 spec 后立即启动 phase C 时尚无法
 解析自身；该 route 让模板阶段 FC 模式的 envd 能按
