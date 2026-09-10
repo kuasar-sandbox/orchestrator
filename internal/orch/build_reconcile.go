@@ -171,11 +171,12 @@ func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build,
 	}
 	prep.durable = &durable
 	preflightPending := &pendingBuild{
-		build:          build,
-		runDir:         nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID),
-		baseDir:        nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
-		sourceTemplate: prep.sourceTemplate,
-		spec:           prep.spec, resources: durable.Resources, sandboxResources: durable.SandboxResources,
+		build:                  build,
+		runDir:                 nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID),
+		baseDir:                nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
+		sourceTemplate:         prep.sourceTemplate,
+		sourceHasBuildCommands: durable.SourceHasBuildCommands,
+		spec:                   prep.spec, resources: durable.Resources, sandboxResources: durable.SandboxResources,
 		checkpointPolicy: sandboxcfg.CloneSnapshotPolicy(durable.CheckpointPolicy),
 		network:          durable.Network, templateNetwork: durable.TemplateNetwork,
 		tapFD: o.vs.TapFD(build.RuntimeVswitchPort), mac: build.RuntimePortMAC,
@@ -234,6 +235,7 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 	}
 	if prep.durable != nil {
 		pend.network, pend.templateNetwork, pend.resources = prep.durable.Network, prep.durable.TemplateNetwork, prep.durable.Resources
+		pend.sourceHasBuildCommands = prep.durable.SourceHasBuildCommands
 		pend.sandboxResources = prep.durable.SandboxResources
 		pend.checkpointPolicy = sandboxcfg.CloneSnapshotPolicy(prep.durable.CheckpointPolicy)
 		pend.tapFD, pend.mac = o.vs.TapFD(build.RuntimeVswitchPort), build.RuntimePortMAC
@@ -386,7 +388,8 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 			return nil, "", false, nil, buildFailed("artifact_prepare", err)
 		}
 		inherited = inheritedNetwork
-		if buildMayProduceSandbox(build, pend.sourceTemplate) {
+		pend.sourceHasBuildCommands = summary.HasBuildCommands
+		if buildProducesSandbox(build, pend.sourceHasBuildCommands) {
 			pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
 			if err != nil {
 				return nil, "", false, nil, buildFailed("resource_resolve", err)
@@ -401,7 +404,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	if err != nil {
 		return nil, "", false, nil, buildFailed("resource_resolve", err)
 	}
-	if buildMayProduceMemorySandbox(build, pend.sourceTemplate) {
+	if buildProducesMemorySandbox(build, pend.sourceHasBuildCommands) {
 		pend.checkpointPolicy, err = o.resolveSnapshotPolicy(build.Metadata, sandboxcfg.SnapshotPolicy{})
 		if err != nil {
 			return nil, "", false, nil, buildFailed("resource_resolve", err)
@@ -413,7 +416,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	}
 	portID = port.Port
 	envdToken := ""
-	if build.Profile == types.ProfileE2B && buildMayProduceMemorySandbox(build, pend.sourceTemplate) {
+	if build.Profile == types.ProfileE2B && buildProducesMemorySandbox(build, pend.sourceHasBuildCommands) {
 		envdToken = build.EnvdAccessToken
 		if envdToken == "" {
 			envdToken, err = keys.MintToken()
@@ -424,7 +427,8 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	}
 	durable := buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
-		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
+		SourceHasBuildCommands: pend.sourceHasBuildCommands,
+		Network:                pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,
 		CheckpointPolicy: sandboxcfg.CloneSnapshotPolicy(pend.checkpointPolicy),
 	}

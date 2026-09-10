@@ -1263,6 +1263,14 @@ func TestReconcileFailsClosedForPortWithoutDurablePreparation(t *testing.T) {
 }
 
 func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "auto", true: "explicit"}[explicit], func(t *testing.T) {
+			testPreparedSnapshotRecovery(t, explicit)
+		})
+	}
+}
+
+func testPreparedSnapshotRecovery(t *testing.T, explicit bool) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -1284,7 +1292,9 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 		sandboxcfg.NsMetadata: `{"registered":"preserved"}`,
 	}
 	build.Env = map[string]string{"REGISTERED_ENV": "preserved"}
-	build.Builder.Target = &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
+	if explicit {
+		build.Builder.Target = &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
+	}
 	digest := strings.Repeat("9", 64)
 	durableResources := rtconfig.ResourcesConfig{
 		Capacity: rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
@@ -1297,7 +1307,8 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 	}
 	build.RuntimePrepareJSON, err = encodeBuildRuntimePreparation(buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: digest,
-		Network: durableNetwork, TemplateNetwork: durableTemplateNetwork,
+		SourceHasBuildCommands: true,
+		Network:                durableNetwork, TemplateNetwork: durableTemplateNetwork,
 		Resources: durableResources, SandboxResources: durableResources,
 		CheckpointPolicy: durableCheckpointPolicy,
 	})
@@ -1308,6 +1319,7 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 		t.Fatal(err)
 	}
 	cfg := buildReconcileConfig(t.TempDir())
+	cfg.MMDS.Enabled = true
 	// These current defaults deliberately disagree with the values atomically
 	// committed alongside port 17 before the restart.
 	cfg.Sandbox.Network.E2B.InnerIP = "192.0.2.5/24"
@@ -1330,6 +1342,7 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 	}
 	summary := validBuildPrepareSummary()
 	summary.ResolutionDigest = digest
+	summary.HasBuildCommands = true
 	final, err := o.CompleteBuildPrepare(context.Background(), build.BuildID, runID, summary)
 	if err != nil {
 		cancel()
@@ -1341,9 +1354,13 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 		t.Fatalf("recovered final spec drifted: net=%+v template=%+v resources=%+v", final.Net, final.TemplateNetwork, final.Resources)
 	}
 	if final.SandboxSpec.Metadata["registered"] != "preserved" || final.SandboxEnv["REGISTERED_ENV"] != "preserved" ||
-		final.RequestedTarget == nil || *final.RequestedTarget != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) {
+		!reflect.DeepEqual(final.RequestedTarget, build.Builder.Target) {
 		cancel()
 		t.Fatalf("recovered final spec lost immutable registration config: %+v", final)
+	}
+	if o.lookup(buildMMDSID(build.BuildID)) == nil {
+		cancel()
+		t.Fatal("recovery lost the memory target MMDS route")
 	}
 	if !reflect.DeepEqual(final.CheckpointPolicy, durableCheckpointPolicy) {
 		cancel()

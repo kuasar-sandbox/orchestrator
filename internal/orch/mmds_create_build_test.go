@@ -93,6 +93,7 @@ func TestBuildRegisterOwnsMMDSAndTriggerCannotOverride(t *testing.T) {
 
 	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
 		FromImage: "registry.example/base:latest",
+		ReadyCmd:  "true", // MMDS is supported only by the memory target.
 	}, api.BuildAuth{}); err != nil {
 		t.Fatal(err)
 	}

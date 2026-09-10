@@ -50,12 +50,8 @@ func validateBuildResult(build *types.Build, result types.BuildResult) error {
 	if !mayInheritCommands && (result.StartCmd != build.StartCmd || result.ReadyCmd != build.ReadyCmd) {
 		return fmt.Errorf("build result introduced commands without a Sandbox source")
 	}
-	if result.Target.Kind == types.BuildTargetImage && (buildHasSandboxConfig(build) || buildHasInstanceConfig(build)) {
-		return fmt.Errorf("image build result cannot represent registered Sandbox configuration")
-	}
-	if result.Target.Kind == types.BuildTargetSandbox && !result.Target.Memory && buildHasInstanceConfig(build) {
-		return fmt.Errorf("sandbox build result with memory=false cannot apply registered instance configuration")
-	}
+	// Registered options are not result-integrity constraints. A source-dependent
+	// auto target may legitimately omit options it cannot represent.
 
 	var ref string
 	switch {

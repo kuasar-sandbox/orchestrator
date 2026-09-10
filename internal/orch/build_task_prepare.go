@@ -20,19 +20,20 @@ import (
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
 
-const buildRuntimePrepareSchemaVersion = 3
+const buildRuntimePrepareSchemaVersion = 4
 
 // buildRuntimePreparation is the non-secret durable authority committed in the
 // same SQLite UPDATE as the exact connector port. It freezes every node-policy
 // result needed to rebuild an equivalent final BuildSpec after restart.
 type buildRuntimePreparation struct {
-	SchemaVersion    int                       `json:"schema_version"`
-	PrepareDigest    string                    `json:"prepare_digest"`
-	Network          sandboxcfg.NetworkSpec    `json:"network"`
-	TemplateNetwork  sandboxcfg.NetworkSpec    `json:"template_network"`
-	Resources        rtconfig.ResourcesConfig  `json:"resources"` // A/B execution
-	SandboxResources rtconfig.ResourcesConfig  `json:"sandbox_resources"`
-	CheckpointPolicy sandboxcfg.SnapshotPolicy `json:"checkpoint_policy"`
+	SchemaVersion          int                       `json:"schema_version"`
+	PrepareDigest          string                    `json:"prepare_digest"`
+	SourceHasBuildCommands bool                      `json:"source_has_build_commands"`
+	Network                sandboxcfg.NetworkSpec    `json:"network"`
+	TemplateNetwork        sandboxcfg.NetworkSpec    `json:"template_network"`
+	Resources              rtconfig.ResourcesConfig  `json:"resources"` // A/B execution
+	SandboxResources       rtconfig.ResourcesConfig  `json:"sandbox_resources"`
+	CheckpointPolicy       sandboxcfg.SnapshotPolicy `json:"checkpoint_policy"`
 }
 
 func encodeBuildRuntimePreparation(prep buildRuntimePreparation) (string, error) {

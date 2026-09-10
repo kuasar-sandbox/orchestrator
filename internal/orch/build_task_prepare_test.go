@@ -132,9 +132,10 @@ func TestValidateBuildPrepareSummaryIsStrict(t *testing.T) {
 
 func TestBuildRuntimePreparationRoundTripFreezesResolvedInputs(t *testing.T) {
 	want := buildRuntimePreparation{
-		SchemaVersion: buildRuntimePrepareSchemaVersion,
-		PrepareDigest: strings.Repeat("d", 64),
-		Network:       sandboxcfg.NetworkSpec{Hostname: "build", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1"},
+		SchemaVersion:          buildRuntimePrepareSchemaVersion,
+		PrepareDigest:          strings.Repeat("d", 64),
+		SourceHasBuildCommands: true,
+		Network:                sandboxcfg.NetworkSpec{Hostname: "build", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1"},
 		TemplateNetwork: sandboxcfg.NetworkSpec{
 			Hostname: "sandbox", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1",
 		},

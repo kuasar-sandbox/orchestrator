@@ -225,7 +225,7 @@ type BuildSpec struct {
 	SandboxSpec                 sandboxcfg.SandboxSpec    `json:"sandbox_spec"`
 	SandboxNamespaces           []string                  `json:"sandbox_namespaces,omitempty"`
 	SandboxEnv                  map[string]string         `json:"sandbox_env,omitempty"`
-	HasSandboxConfig            bool                      `json:"has_sandbox_config,omitempty"`
+	HasSandboxConfig            bool                      `json:"has_sandbox_config,omitempty"` // advisory input classification, never an asynchronous rejection; excludes execution network
 	HasInstanceConfig           bool                      `json:"has_instance_config,omitempty"`
 	CheckpointPolicy            sandboxcfg.SnapshotPolicy `json:"checkpoint_policy,omitempty"`
 	MMDSEnabled                 bool                      `json:"mmds_enabled"`
