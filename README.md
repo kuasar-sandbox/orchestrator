@@ -110,6 +110,8 @@ real sandbox tests, not Go-only compilation.
 The local `make test-e2e-cluster-stub` flow starts real control-plane processes
 but no MicroVMs. Its run directory is private. Failure output reports diagnostic
 filenames and sizes, not raw responses, logs or capability-bearing objects.
+Daemon output is written directly to private files, not streamed to CI; the
+private diagnostic umask is applied only after any local binary build.
 For local diagnosis, set `CLUSTER_STUB_KEEP_WORK=1` to retain the run directory
 and inspect it privately; do not upload its unredacted files. This does not
 replace the real MicroVM integration suite.
@@ -118,8 +120,13 @@ The real execute/MMDS cases allocate switch, namespace, veth and runner/builder
 unit names from their existing private run directory. Cleanup stops only those
 unit instances and removes only resources created by that run. Explicit names
 that already exist or have inconsistent switch state are refused, not adopted
-or force-deleted. `make test` includes isolated cleanup regressions; those checks
-do not substitute for running both real execute and MMDS cases.
+or force-deleted. The cases hold a host-local lock on the existing systemd runtime
+directory because their routes, forwarding and slice names are shared; a second
+concurrent execute/MMDS invocation is refused before resource creation. The lock
+descriptor is not inherited by daemons. Async launch assertions wait for the
+actual runner observation without relaxing sandbox identity or launch-mode
+checks. `make test` includes isolated cleanup/concurrency regressions; those
+checks do not substitute for running both real execute and MMDS cases.
 
 Cross-repository contract changes require linked companion PRs and exact-source
 integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
@@ -182,6 +189,8 @@ bypasses, Git configuration and caller credentials while retaining validated,
 credential-free routing. Uploaded Go record keys must match the exact official
 payload names before any source or toolchain download; path aliases are rejected.
 These release checks do not change ordinary development module authentication.
+Source inventories reject duplicate or excessive records before per-row work;
+each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
 
 The trusted publisher generates the standard release text and source/Preview
 markers from its validated request. Downloaded `release-notes.md` is a local
