@@ -1118,7 +1118,7 @@ EOF
 ORCH_PID=""
 ORCH_LOG=""
 start_orchestrator() { # $1=log path
-    local log_path="$1" ready=""
+    local log_path="$1" ready="" proxy_ns_before proxy_addresses_before
     ORCH_LOG="$log_path"
     "$ORCH_BIN_DIR/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log_path" 2>&1 &
     ORCH_PID=$!
@@ -1137,11 +1137,27 @@ start_orchestrator() { # $1=log path
         "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" \
         "$PROXY_NETNS" "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" \
         1024 2 enforce 120s -
+    # Preserve the pre-start namespace identity and addresses so a failed bind
+    # can be distinguished from teardown/recreation during Proxy startup.
+    proxy_ns_before=$(stat -Lc '%d:%i' "/var/run/netns/$PROXY_NETNS" 2>&1 || true)
+    proxy_addresses_before=$(ip -n "$PROXY_NETNS" -brief address show 2>&1 || true)
     start_proxy "$ORCH_BIN_DIR/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
     PROXY_PID="$PROXY_HELPER_PID"
     PIDS+=("$PROXY_PID")
-    wait_proxy_ready "$PROXY_PID" 127.0.0.1 "$PROXY_PORT" "$WORK/proxy-stats.sock" "$WORK/proxy.log" \
-        || fail "Proxy did not become ready"
+    if ! wait_proxy_ready "$PROXY_PID" 127.0.0.1 "$PROXY_PORT" "$WORK/proxy-stats.sock" "$WORK/proxy.log"; then
+        printf '==> Proxy startup namespace diagnostics: namespace=%s expected_mmds=%s:%s pid=%s\n' \
+            "$PROXY_NETNS" "$PROXY_NS_IP" "$MMDS_PORT" "$PROXY_PID" >&2
+        printf 'before: namespace=%s\n%s\n' "$proxy_ns_before" "$proxy_addresses_before" >&2
+        stat -Lc 'after: namespace=%d:%i' "/var/run/netns/$PROXY_NETNS" >&2 || true
+        ip -n "$PROXY_NETNS" -brief address show >&2 || true
+        ip -n "$PROXY_NETNS" route show table all >&2 || true
+        ip -brief address show dev "$PROXY_VETH_HOST" >&2 || true
+        sed -n '/^proxy_netns:/p' "$WORK/proxy.yaml" >&2
+        if [ -d "/proc/$PROXY_PID" ]; then
+            stat -Lc 'proxy process namespace=%d:%i' "/proc/$PROXY_PID/ns/net" >&2 || true
+        fi
+        fail "Proxy did not become ready"
+    fi
     return 0
 }
 
