@@ -70,6 +70,12 @@ for flag in assume-unchanged skip-worktree; do
 done
 release_materials_resolve_git_source "$TMP/git-index" "" fixture >/dev/null
 
+# Only this local module fixture has no public checksum entry. Production
+# routing/environment is exercised independently by test-release-go-environment.
+release_materials_validate_go_routing() { :; }
+release_materials_go_payload_allowed() {
+  [ "$1:$2" = fixture:bin/tool ] || fail "unexpected fixture payload"
+}
 export GOWORK=off GOMODCACHE="$TMP/mod-cache" GOPROXY="file://$TMP/proxy"
 # The fixture module is deliberately local and has no public checksum entry.
 export GOSUMDB=off GOFLAGS=
@@ -291,8 +297,21 @@ release_materials_finish
 
 chmod u+w "$directory/LICENSE"
 printf 'locally changed license\n' > "$directory/LICENSE"
-if (release_materials_verified_go_source "$module" "$version" "$checksum" \
-  >"$TMP/tamper-output" 2>"$TMP/tamper-error"); then
+# A new verification must ignore a previous task's extracted/VCS cache.
+fresh_directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
+cmp "$fresh_directory/LICENSE" <(printf 'fixture copyright and license\n') \
+  || fail "fresh source verification inherited a modified extracted cache"
+eval "$(declare -f release_materials_go_command | sed '1s/release_materials_go_command/_fixture_go_command/')"
+if (
+  release_materials_go_command() {
+    _fixture_go_command "$@" || return 1
+    if [ "$2 $3" = 'mod download' ]; then
+      chmod u+w "$1/module-cache/$module@$version/LICENSE"
+      printf 'locally changed license\n' > "$1/module-cache/$module@$version/LICENSE"
+    fi
+  }
+  release_materials_verified_go_source "$module" "$version" "$checksum"
+) >"$TMP/tamper-output" 2>"$TMP/tamper-error"; then
   fail "source verification accepted a modified extracted module license"
 fi
 grep -Fq 'dir has been modified' "$TMP/tamper-error" \

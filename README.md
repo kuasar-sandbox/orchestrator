@@ -168,6 +168,14 @@ payload and material file to that completed build, even if the bundle's own
 checksums are regenerated. Local packaging and standalone validation do not
 require this publication input. The receipt does not attest compiler provenance
 or isolate untrusted candidate code.
+
+Go dependency-source verification uses fresh private module/VCS state and an
+enabled checksum database. It clears persisted Go settings, private-module
+bypasses, Git configuration and caller credentials while retaining validated,
+credential-free routing. Uploaded Go record keys must match the exact official
+payload names before any source or toolchain download; path aliases are rejected.
+These release checks do not change ordinary development module authentication.
+
 The trusted publisher generates the standard release text and source/Preview
 markers from its validated request. Downloaded `release-notes.md` is a local
 bundle aid, not an authority for the public release body or reconciliation.

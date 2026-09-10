@@ -39,6 +39,7 @@ grep -Fq 'invalid release Go toolchain selection' "$TMP/invalid-toolchain.log" \
 export FIXTURE_GO_DISTRIBUTION_CACHE
 FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
 GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 

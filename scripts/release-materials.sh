@@ -278,6 +278,65 @@ release_materials_require_project_source() {
     "https://github.com/kuasar-sandbox/$unit/commit/$sha" "git:$sha"
 }
 
+release_materials_validate_go_routing() {
+  local proxy="$1" sumdb="$2" route identity endpoint extra
+  local -a routes
+  IFS=',|' read -r -a routes <<< "$proxy"
+  for route in "${routes[@]}"; do
+    case "$route" in direct|off) continue ;; esac
+    [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
+      || fail "Go source verification requires credential-free HTTPS module routing"
+  done
+  [ "$sumdb" != off ] || fail "Go source verification requires an enabled checksum database"
+  [[ "$sumdb" != *$'\n'* && "$sumdb" != *$'\r'* ]] \
+    || fail "Go source checksum routing must be a single line"
+  read -r identity endpoint extra <<< "$sumdb"
+  [[ "$identity" =~ ^[A-Za-z0-9._+/:=-]+$ && -z "$extra" ]] \
+    || fail "invalid Go source checksum database identity"
+  if [ -n "$endpoint" ]; then
+    [[ "$endpoint" == https://?* && "$endpoint" != *[@?#[:space:]]* ]] \
+      || fail "Go source checksum routing must use credential-free HTTPS"
+  fi
+}
+
+release_materials_go_command() {
+  local verification="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}"
+  local sumdb="${GOSUMDB:-sum.golang.org}" name value
+  shift
+  release_materials_validate_go_routing "$proxy" "$sumdb" || return 1
+  mkdir -p "$verification/home" "$verification/module-cache"
+  chmod 0700 "$verification/home" "$verification/module-cache"
+  # Fresh module/VCS state cannot inherit a cached Git credential helper.
+  # Go private-module bypasses and all caller authentication are excluded.
+  local -a clean=(env -i "PATH=$PATH" "HOME=$verification/home"
+    "GOMODCACHE=$verification/module-cache" "GOCACHE=$verification/go-cache"
+    "GOENV=off" "GOFLAGS=" "GO111MODULE=on" "GOWORK=off" "GOTOOLCHAIN=local"
+    "GOPROXY=$proxy" "GOSUMDB=$sumdb" "GOPRIVATE=" "GONOPROXY="
+    "GONOSUMDB=" "GOINSECURE=" "GIT_CONFIG_NOSYSTEM=1"
+    "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_SYSTEM=/dev/null"
+    "GIT_TERMINAL_PROMPT=0" "GIT_ASKPASS=/bin/false"
+    "GIT_SSH_COMMAND=/bin/false" "SSH_ASKPASS=/bin/false")
+  for name in LANG LC_ALL TZ SSL_CERT_FILE SSL_CERT_DIR \
+      HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+    value="${!name:-}"
+    [ -n "$value" ] || continue
+    case "$name" in
+      HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)
+        [[ "$value" != *@* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+          || fail "Go source verification does not pass authenticated proxy URLs" ;;
+    esac
+    clean+=("$name=$value")
+  done
+  "${clean[@]}" go "$@"
+}
+
+release_materials_go_payload_allowed() {
+  case "$1:$2" in
+    orchestrator:bin/node-ctl|orchestrator:bin/cluster-ctl|orchestrator:bin/node-stub-ctl|orchestrator:bin/e2b-key-ctl ) return 0 ;;
+    *) fail "unexpected Go payload identity" ;;
+  esac
+}
+
 release_materials_verified_go_source() {
   local module="$1" version="$2" checksum="$3" verify_root json directory
   [[ "$checksum" =~ ^h1:[A-Za-z0-9+/]{43}=$ ]] \
@@ -288,10 +347,10 @@ release_materials_verified_go_source() {
   # not detect edits to an already-extracted LICENSE.
   (
     cd "$verify_root" || exit
-    GOWORK=off go mod init release-material-verification.invalid >/dev/null 2>&1 || exit 1
-    GOWORK=off go mod edit "-require=$module@$version" || exit 1
-    GOWORK=off go mod download -json "$module@$version" > source.json || exit 1
-    GOWORK=off go mod verify > verify.log 2>&1 \
+    release_materials_go_command "$verify_root" mod init release-material-verification.invalid >/dev/null 2>&1 || exit 1
+    release_materials_go_command "$verify_root" mod edit "-require=$module@$version" || exit 1
+    release_materials_go_command "$verify_root" mod download -json "$module@$version" > source.json || exit 1
+    release_materials_go_command "$verify_root" mod verify > verify.log 2>&1 \
       || { cat verify.log >&2; exit 1; }
   ) || fail "Go module cache verification failed for $module@$version"
   json="$(cat "$verify_root/source.json")"
@@ -595,12 +654,17 @@ release_materials_validate() {
     || fail "invalid GO-MODULES.tsv header"
   awk -F '\t' '
     NR == 1 { next }
-    NF != 5 { exit 1 }
+    NF != 5 || NR > 16385 { exit 1 }
     {
       for (field = 1; field <= 5; field++) if ($field == "") exit 1
       if ($2 !~ /^(toolchain|main-package|main-module|module|replacement|build-setting)$/) exit 1
     }
   ' "$source_root/GO-BUILD-INFO.tsv" || fail "invalid Go build records"
+  # Validate every key before any toolchain or dependency fetch. Path aliases
+  # must not multiply verification work for one actual official executable.
+  while IFS= read -r payload; do
+    release_materials_go_payload_allowed "$unit" "$payload" || return 1
+  done < <(awk -F '\t' 'NR > 1 { print $1 }' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u)
   awk -F '\t' '
     NR == 1 { next }
     NF != 3 || $1 == "" || $2 == "" || $3 == "" { exit 1 }
