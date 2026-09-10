@@ -11,9 +11,9 @@ import (
 )
 
 func TestAddRefLocationUsesDeterministicURI(t *testing.T) {
-	// Publication names are entity ids with a publication-date suffix; the
-	// first path segment is that date.
-	name := "0198f7a1-1234-7234-9abc-0123456789ab-20260824"
+	// Publication names are bare entity ids; the SHA fan-out below the parent
+	// bounds directory size.
+	name := "0198f7a1-1234-7234-9abc-0123456789ab"
 	o := &Orchestrator{cfg: &config.Config{Checkpoint: config.CheckpointConfig{
 		Remote: config.CheckpointRemoteConfig{RefLocationParent: "file:///mnt/shared/snapshots"},
 	}}}
@@ -22,7 +22,7 @@ func TestAddRefLocationUsesDeterministicURI(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
-	want := "file:///mnt/shared/snapshots/20260824/" + digest[:2] + "/" + digest[2:4] + "/" + name
+	want := "file:///mnt/shared/snapshots/" + digest[:2] + "/" + digest[2:4] + "/" + name
 	if locations[name] != want {
 		t.Fatalf("location %q = %q, want %q", name, locations[name], want)
 	}

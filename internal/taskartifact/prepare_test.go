@@ -45,19 +45,19 @@ func TestPrepareReadsOnlyRootAndCollectsFlattenedClosure(t *testing.T) {
 metadata:
   kuasar-sandbox.network: '{"hostname":"inherited"}'
 from_refs:
-  - file://parent.snapshot@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824
+  - file://parent.snapshot@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001
 boot:
   runtime_ref: file://runtime.bundle@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   root:
     base: self
     base_from_refs:
-      - file://root.image@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11102-7234-9abc-012345670002-20260824
-      - file://root-old.overlay@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11103-7234-9abc-012345670003-20260824
+      - file://root.image@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11102-7234-9abc-012345670002
+      - file://root-old.overlay@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11103-7234-9abc-012345670003
       - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   disks:
-    - base_ref: file://data.image@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004-20260824
+    - base_ref: file://data.image@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004
       overlay:
-        base: file://data.overlay@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005-20260824
+        base: file://data.overlay@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005
         base_from_refs:
           - manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 `
@@ -91,7 +91,7 @@ boot:
 	if result.Summary.RequiredRefCount != 9 {
 		t.Fatalf("required ref count = %d, want 9", result.Summary.RequiredRefCount)
 	}
-	for _, name := range []string{"0198f7a11101-7234-9abc-012345670001-20260824", "0198f7a11102-7234-9abc-012345670002-20260824", "0198f7a11103-7234-9abc-012345670003-20260824", "0198f7a11104-7234-9abc-012345670004-20260824", "0198f7a11105-7234-9abc-012345670005-20260824"} {
+	for _, name := range []string{"0198f7a11101-7234-9abc-012345670001", "0198f7a11102-7234-9abc-012345670002", "0198f7a11103-7234-9abc-012345670003", "0198f7a11104-7234-9abc-012345670004", "0198f7a11105-7234-9abc-012345670005"} {
 		location, err := reflocation.Resolve("file:///mnt/task-locations", name)
 		if err != nil {
 			t.Fatal(err)
@@ -118,7 +118,7 @@ func TestPrepareLocatedRootBuildsPathMappingBeforeRead(t *testing.T) {
 	base := filepath.Base(rootPath)
 	digest := strings.TrimSuffix(base, filepath.Ext(base))
 	ref := manifest.Ref{
-		Scheme: manifest.RefSchemeFile, Path: base, Location: "0198f7a11107-7234-9abc-012345670007-20260824",
+		Scheme: manifest.RefSchemeFile, Path: base, Location: "0198f7a11107-7234-9abc-012345670007",
 		DigestScheme: "digest", Digest: digest,
 	}
 	location, err := reflocation.Resolve("file:///tmp/task-snapshot-locations", ref.Location)
@@ -204,7 +204,7 @@ func TestPrepareImageBundlePreflightRunsBeforeSourceScan(t *testing.T) {
 
 func TestPrepareDiscoversFlatRootBundleLocations(t *testing.T) {
 	parent := "file://" + filepath.Join(t.TempDir(), "locations")
-	rootLocation, err := reflocation.Resolve(parent, "root-20260824")
+	rootLocation, err := reflocation.Resolve(parent, "root")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +213,8 @@ func TestPrepareDiscoversFlatRootBundleLocations(t *testing.T) {
 	}
 	refs := []string{
 		"file://" + strings.Repeat("1", 64) + ".bundle",
-		"file://" + strings.Repeat("2", 64) + ".bundle@location:A-20260824",
-		"file://" + strings.Repeat("3", 64) + ".bundle@location:B-20260824",
+		"file://" + strings.Repeat("2", 64) + ".bundle@location:A",
+		"file://" + strings.Repeat("3", 64) + ".bundle@location:B",
 	}
 	const snapshotCfg = `resources:
   capacity: {cpu: 2, memory: 512MiB}
@@ -232,7 +232,7 @@ boot:
 		Path:         filepath.Base(rootPath),
 		DigestScheme: "manifest",
 		Digest:       rootKey,
-		Location:     "root-20260824",
+		Location:     "root",
 	}.String()
 
 	result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{RootSourceKind: string(types.ResumeSourceSnapshot), LaunchMode: string(types.LaunchMemory),
@@ -244,7 +244,7 @@ boot:
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"root-20260824", "A-20260824", "B-20260824"} {
+	for _, name := range []string{"root", "A", "B"} {
 		location, err := reflocation.Resolve(parent, name)
 		if err != nil {
 			t.Fatal(err)
@@ -267,7 +267,7 @@ boot:
 
 func TestPrepareSnapshotColdDropsMemoryOnlyBundleLocations(t *testing.T) {
 	parent := "file://" + filepath.Join(t.TempDir(), "locations")
-	rootLocation, err := reflocation.Resolve(parent, "root-20260824")
+	rootLocation, err := reflocation.Resolve(parent, "root")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,13 +275,13 @@ func TestPrepareSnapshotColdDropsMemoryOnlyBundleLocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := []string{
-		"file://" + strings.Repeat("1", 64) + ".bundle@location:memory-a-20260824",
-		"file://" + strings.Repeat("2", 64) + ".bundle@location:memory-b-20260824",
+		"file://" + strings.Repeat("1", 64) + ".bundle@location:memory-a",
+		"file://" + strings.Repeat("2", 64) + ".bundle@location:memory-b",
 	}
 	rootPath, rootKey, manifestConfig := writeTaskManifestBundle(t, rootLocation.Path, refs,
 		"resources:\n  capacity: {cpu: 2, memory: 512MiB}\nboot: {}\n")
 	rootRef := manifest.Ref{
-		Scheme: manifest.RefSchemeFile, Path: filepath.Base(rootPath), Location: "root-20260824",
+		Scheme: manifest.RefSchemeFile, Path: filepath.Base(rootPath), Location: "root",
 		DigestScheme: "manifest", Digest: rootKey,
 	}.String()
 	result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{
@@ -294,13 +294,13 @@ func TestPrepareSnapshotColdDropsMemoryOnlyBundleLocations(t *testing.T) {
 	if result.PreparedSource.Kind != types.ResumeSourceSandbox {
 		t.Fatalf("cold source = %+v", result.PreparedSource)
 	}
-	if len(result.RefLocationURIs) != 1 || result.RefLocationURIs["root-20260824"] == "" {
+	if len(result.RefLocationURIs) != 1 || result.RefLocationURIs["root"] == "" {
 		t.Fatalf("cold ref locations retained memory closure: %#v", result.RefLocationURIs)
 	}
 }
 
 func TestPrepareBundleLocationRequiresConfiguredParent(t *testing.T) {
-	refs := []string{"file://" + strings.Repeat("1", 64) + ".bundle@location:A-20260824"}
+	refs := []string{"file://" + strings.Repeat("1", 64) + ".bundle@location:A"}
 	rootPath, _, _ := writeTaskManifestBundle(t, t.TempDir(), refs, "boot: {}\n")
 	_, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{RootSourceKind: string(types.ResumeSourceSnapshot), LaunchMode: string(types.LaunchMemory), RootRef: rootPath, MaxRefs: 4})
 	if err == nil || !strings.Contains(err.Error(), "Bundle ref") || !strings.Contains(err.Error(), "ref_location_parent is not configured") {

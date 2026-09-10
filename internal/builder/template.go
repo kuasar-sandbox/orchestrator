@@ -276,7 +276,7 @@ func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
 	// Bundle reference. Local mode rewrites only the checkpoint-class graph into
 	// role-specific tarstreams before applying the same checkpoint destination.
 	p.progress("publishing template checkpoint snapshot")
-	args, err := publishCheckpointArtifactArgs(p.spec, p.publication.CheckpointClassTarget, bundle, p.now())
+	args, err := publishCheckpointArtifactArgs(p.spec, p.publication.CheckpointClassTarget, bundle)
 	if err != nil {
 		return "", err
 	}
@@ -293,15 +293,16 @@ func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
 }
 
 // publishCheckpointArtifactArgs builds the sandbox-ctl argv for the Phase-C
-// checkpoint-class graph. The name is minted at this publication, not while the
-// BuildSpec is resolved; image and checkpoint publications may therefore land
-// in different UTC date buckets. now is explicit so tests can cross midnight.
-func publishCheckpointArtifactArgs(spec *configsock.BuildSpec, target CheckpointClassPublicationTarget, artifact string, now time.Time) ([]string, error) {
+// checkpoint-class graph. The name is minted at this publication, not while
+// the BuildSpec is resolved: it is the bare build id, so every publication of
+// one build converges on one directory where content-addressed files
+// accumulate as versions.
+func publishCheckpointArtifactArgs(spec *configsock.BuildSpec, target CheckpointClassPublicationTarget, artifact string) ([]string, error) {
 	args := []string{"publish", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
 	switch target {
 	case CheckpointClassManifestStore:
 	case CheckpointClassRefLocation:
-		locName := reflocation.PublicationName(spec.BuildID, now)
+		locName := reflocation.PublicationName(spec.BuildID)
 		location, err := reflocation.Resolve(spec.CheckpointRefLocationParent, locName)
 		if err != nil {
 			return nil, fmt.Errorf("checkpoint publication location for %s: %w", locName, err)

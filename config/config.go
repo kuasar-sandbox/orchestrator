@@ -820,11 +820,12 @@ type CheckpointRemoteConfig struct {
 }
 
 // RefLocationURI derives the node-local path for a publication name
-// (reflocation.PublicationName — the entity id plus its publication date).
-// The name is self-contained inside the portable ref, so any node resolves
-// the identical path; the parent never enters a portable ref, TemplateID, or
-// migration token. Bucketing rules live in the reflocation package; GC policy
-// and deletion flow are out of scope for this repo.
+// (reflocation.PublicationName — the entity id). The name is self-contained
+// inside the portable ref, so any node resolves the identical path; the parent
+// never enters a portable ref, TemplateID, or migration token. Bucketing rules
+// live in the reflocation package; GC must be reference-aware (age of a
+// publication is not the lifetime of its refs) and is out of scope for this
+// repo.
 func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
 	location, err := reflocation.Resolve(c.Remote.RefLocationParent, name)
 	if err != nil {
