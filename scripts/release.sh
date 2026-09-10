@@ -129,8 +129,9 @@ check_go_binary() {
     $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
     $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
     $2 == "build" && $3 ~ /^CGO_ENABLED=/ { cgo++; if ($3 != "CGO_ENABLED=0") bad=1 }
-    END { exit bad || os != 1 || arch != 1 || cgo != 1 }
-  ' <<< "$info" || fail "Go release payload must target linux/amd64 with CGO_ENABLED=0: $file"
+    $2 == "build" && $3 ~ /^GOAMD64=/ { baseline++; if ($3 != "GOAMD64=v1") bad=1 }
+    END { exit bad || os != 1 || arch != 1 || cgo != 1 || baseline != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64 with CGO_ENABLED=0 and GOAMD64=v1: $file"
 }
 
 validate_copied_source_files() {

@@ -6,7 +6,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
+	"time"
 )
 
 // Use an unnamed, child-owned namespace so this check cannot collide with or
@@ -55,17 +57,36 @@ func TestListenTCPInIsolatedNetNS(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer namespace.Close()
-	if listener, err := net.Listen("tcp4", "192.0.2.2:0"); err == nil {
-		listener.Close()
-		t.Fatal("isolated test address unexpectedly exists in the host namespace")
+	// Address binding is not an ownership test when ip_nonlocal_bind=1.
+	// Keep this goroutine on its original thread and compare namespace inodes.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	original, err := os.Stat("/proc/thread-self/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", command.Process.Pid))
+	if err != nil || os.SameFile(original, child) {
+		t.Fatalf("test namespace is not distinct: %v", err)
 	}
 	listener, err := ListenTCPInNetNS(namespace, "192.0.2.2:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if listener, err := net.Listen("tcp4", "192.0.2.2:0"); err == nil {
-		listener.Close()
+	restored, err := os.Stat("/proc/thread-self/ns/net")
+	if err != nil || !os.SameFile(original, restored) {
 		t.Fatal("calling thread was not restored to its original namespace")
+	}
+	// A host-namespace socket cannot receive this connection through the
+	// child's private loopback interface, even if nonlocal host binds work.
+	if err := namespace.Do(func() error {
+		connection, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second)
+		if err != nil {
+			return err
+		}
+		return connection.Close()
+	}); err != nil {
+		t.Fatalf("listener is not reachable inside the child namespace: %v", err)
 	}
 }

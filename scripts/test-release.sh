@@ -331,6 +331,11 @@ release_materials_download_go_toolchain() {
   for suffix in zip ziphash info mod; do
     [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
   done
+  # Public signed lookup/tile responses still undergo Go's normal signature
+  # verification. Do not reuse caller HOME, authentication or VCS state.
+  if [ -d "$FIXTURE_GO_DISTRIBUTION_CACHE/cache/download/sumdb" ]; then
+    cp -a "$FIXTURE_GO_DISTRIBUTION_CACHE/cache/download/sumdb" "${destination%/golang.org/toolchain/@v}/"
+  fi
   _release_materials_download_go_toolchain "$@"
 }
 EOF
@@ -552,6 +557,55 @@ for target in darwin/amd64 linux/arm64; do
   fi
   grep -Fq 'must target linux/amd64' "$candidate/result.log" || fail "$target failed for an unrelated reason"
 done
+
+for level in v2 v3 v4; do
+  (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64="$level" \
+    go build -trimpath -buildvcs=true -o "$TMP/target-$level" ./cmd/node-ctl)
+  release_materials_require_go_revision "$TMP/target-$level" "$fixture_project_sha"
+  candidate="$TMP/wrong-cpu-$level"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  install -m 0755 "$TMP/target-$level" "$candidate/root/bin/node-ctl"
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted GOAMD64=$level with regenerated metadata and checksums"
+  fi
+  grep -Fq 'GOAMD64=v1' "$candidate/result.log" || fail "$level failed for an unrelated reason"
+done
+
+# An external Go overlay can retain the exact clean VCS metadata. The metadata
+# gate is not producer authentication; the independently recorded build digest
+# must still reject this repack before any GitHub operation.
+printf 'package main\nfunc main() { println("overlay fixture") }\n' > "$TMP/overlay-main.go"
+jq -n --arg original "$TMP/target-source/cmd/node-ctl/main.go" --arg replacement "$TMP/overlay-main.go" \
+  '{Replace: {($original): $replacement}}' > "$TMP/overlay.json"
+(cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 \
+  go build -trimpath -buildvcs=true -overlay="$TMP/overlay.json" -o "$TMP/overlay-node-ctl" ./cmd/node-ctl)
+release_materials_require_go_revision "$TMP/overlay-node-ctl" "$fixture_project_sha"
+candidate="$TMP/overlay-repack"
+cp -a "$TMP/bundle" "$candidate"
+mkdir "$candidate/root" "$TMP/no-publish-network"
+tar -xzf "$archive" -C "$candidate/root"
+install -m 0755 "$TMP/overlay-node-ctl" "$candidate/root/bin/node-ctl"
+repack_candidate "$candidate"
+cat > "$TMP/no-publish-network/gh" <<'EOF'
+#!/usr/bin/env bash
+printf 'unexpected API call\n' >> "${OVERLAY_GH_SENTINEL:?}"
+exit 91
+EOF
+chmod 0755 "$TMP/no-publish-network/gh"
+expected_digest="$(sha256sum "$archive")"
+if PATH="$TMP/no-publish-network:$PATH" OVERLAY_GH_SENTINEL="$TMP/overlay-gh-called" \
+  RELEASE_ARCHIVE_SHA256="${expected_digest%% *}" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator \
+  "$fixture_root/scripts/publish-release.sh" publish v1.2.3 x86_64 "$fixture_project_sha" "$candidate" main \
+    > "$candidate/result.log" 2>&1; then
+  fail "publisher accepted an overlay repack with clean VCS metadata"
+fi
+grep -Fq 'release archive differs from the independently recorded build digest' "$candidate/result.log" \
+  || fail "overlay repack was rejected for an unrelated reason"
+[ ! -e "$TMP/overlay-gh-called" ] || fail "overlay repack reached GitHub before rejection"
+printf 'test-release: real clean-VCS overlay repack rejected by independent build digest before API calls\n'
 
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \

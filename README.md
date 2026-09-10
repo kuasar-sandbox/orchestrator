@@ -183,6 +183,12 @@ checksums are regenerated. Local packaging and standalone validation do not
 require this publication input. The receipt does not attest compiler provenance
 or isolate untrusted candidate code.
 
+Clean VCS fields are consistency checks, not proof of compiled bytes: Go source
+overlays can retain the same revision and clean flag. Standalone validation does
+not rebuild or authenticate an arbitrary producer's binaries. Publication uses
+the independent completed-build digest above, not those fields, to authenticate
+the artifact received from the selected trusted build.
+
 Go dependency and toolchain downloads use fresh private module/VCS state, an
 enabled checksum database and `GOAUTH=off`. They clear persisted Go settings, private-module
 bypasses, Git configuration and caller credentials while retaining validated,
@@ -232,7 +238,8 @@ packages; use versioned module replacements. Existing Kuasar sibling replacement
 and ordinary source development are unchanged.
 
 Each of the four Go executables must identify its own Orchestrator command main
-package and module and target Linux/amd64 with `CGO_ENABLED=0`. Swapping
+package and module and target Linux/amd64 with `CGO_ENABLED=0` and exactly one
+`GOAMD64=v1` baseline setting. Higher CPU levels are rejected. Swapping
 executables from the same commit or enabling CGO is rejected. The archive gate
 requires the four official binaries and ten deployment files, rejects extra
 payloads, aliases, duplicate entries and links, and checks exact modes and numeric
