@@ -172,6 +172,23 @@ and `GOTOOLCHAIN`; the release workflow's `local` policy is not silently replace
 by automatic toolchain download. Without an explicit setting, packaging uses
 `sum.golang.org` and the local Go toolchain.
 
+Release packaging records the Go compiler selected in the fresh build context,
+then compares its distribution inputs before and after building with the matching
+`golang.org/toolchain` archive authenticated by the configured checksum database.
+This covers the compiler, standard-library sources and other files in that
+distribution; extra non-build `api`, `doc`, `misc` and `test` files in a full Go
+installation are not authenticated or used as release license sources. The
+standard `go.mod`/`_go.mod` installation transformation is accounted for.
+Go license/notice bytes, including nested compiler and standard-library dependency
+materials, come from the verified archive with their relative paths retained.
+Standalone validation
+rechecks their bytes, source URL and module h1. A version string or recomputed
+bundle checksum cannot substitute for that source check. Verification requires
+an enabled checksum database and its matching archive/cache; it may fetch
+verification material with `GOTOOLCHAIN=local` but does not switch the build
+compiler or silently enable automatic toolchain selection. These checks assume
+the trusted build host and do not attest a compromised host.
+
 Package source records keep the project's or an internal dependency's release
 version only when its local Git tag matches the selected source commit. Untagged
 sources record `git:<commit>`; the archive name still identifies the requested

@@ -36,7 +36,10 @@ fi
 grep -Fq 'invalid release Go toolchain selection' "$TMP/invalid-toolchain.log" \
   || fail "invalid toolchain selection failed for an unrelated reason"
 
+export FIXTURE_GO_DISTRIBUTION_CACHE
+FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
+GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 
 init_fixture_repo() {
   local directory="$1"
@@ -213,6 +216,17 @@ grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [ac
 grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}' \
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 workflow="$ROOT/.github/workflows/component-release.yml"
+for job in build publish; do
+  for routing in 'GOPROXY: https://goproxy.cn,direct' 'GOSUMDB: sum.golang.google.cn' 'GOTOOLCHAIN: local'; do
+    awk -v job="$job" '
+      $0 == "  " job ":" { inside=1; next }
+      inside && /^  [A-Za-z0-9_-]+:/ { exit }
+      inside && /^    steps:/ { exit }
+      inside { print }
+    ' "$workflow" | grep -Fx "      $routing" >/dev/null \
+      || fail "$workflow $job is missing the verified Go routing policy: $routing"
+  done
+done
 [ "$(grep -Fc 'archive_sha256: ${{ steps.release-archive-digest.outputs.archive_sha256 }}' \
   "$workflow")" -eq 1 ] \
   || fail "$workflow does not expose exactly one independent build archive digest"
@@ -293,6 +307,12 @@ install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
+install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
+cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
+release_materials_download_go_toolchain() {
+  GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
+}
+EOF
 printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
 mkdir -p "$fixture_root/."

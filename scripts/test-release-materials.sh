@@ -8,6 +8,37 @@ fail() { echo "test-release-materials: $*" >&2; exit 1; }
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
+# Reject unsigned/private transport before invoking Go or creating work files.
+for policy in sumdb-off file-proxy authenticated-proxy insecure-proxy authenticated-sumdb; do
+  policy_proxy=https://proxy.golang.org
+  policy_sumdb=sum.golang.org
+  case "$policy" in
+    sumdb-off) policy_sumdb=off ;;
+    file-proxy) policy_proxy=file:///nonexistent-fixture-proxy ;;
+    authenticated-proxy) policy_proxy=https://fixture:placeholder@example.invalid ;;
+    insecure-proxy) policy_proxy=http://example.invalid ;;
+    authenticated-sumdb) policy_sumdb='sum.golang.org https://fixture:placeholder@example.invalid' ;;
+  esac
+  if (
+    GOPROXY="$policy_proxy" GOSUMDB="$policy_sumdb" \
+      _release_materials_download_go_toolchain go1.26.4 > "$TMP/policy-$policy.log" 2>&1
+  ); then
+    fail "Go distribution verification accepted $policy"
+  fi
+  grep -Eq 'requires credential-free HTTPS|requires an enabled checksum database|must use credential-free HTTPS' \
+    "$TMP/policy-$policy.log" || fail "Go distribution policy rejection failed for an unrelated reason"
+done
+
+# Only fixture dependencies use the unsigned file proxy below. Authenticate
+# the real compiler distribution with the caller's unchanged release routing.
+fixture_toolchain_proxy="${GOPROXY:-https://proxy.golang.org,direct}"
+fixture_toolchain_sumdb="${GOSUMDB:-sum.golang.org}"
+fixture_toolchain_cache="$(go env GOMODCACHE)"
+release_materials_download_go_toolchain() {
+  GOPROXY="$fixture_toolchain_proxy" GOSUMDB="$fixture_toolchain_sumdb" GOMODCACHE="$fixture_toolchain_cache" \
+    _release_materials_download_go_toolchain "$@"
+}
+
 # Neither source selection nor copied notices may trust hidden index changes.
 mkdir -p "$TMP/git-index"
 git -C "$TMP/git-index" init -q
@@ -185,6 +216,31 @@ if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP
 fi
 grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/redirect.log" \
   || fail "Go toolchain license redirect failed for an unrelated reason"
+
+for mismatch in source integrity license-bytes nested-license-bytes; do
+  altered="$TMP/toolchain-$mismatch"
+  cp -a "$TMP/replacement-stage" "$altered"
+  if [[ "$mismatch" == *license-bytes ]]; then
+    toolchain="$(awk -F '\t' '$2 == "Go toolchain" {print $3}' "$altered/share/sources/fixture/SOURCES.tsv")"
+    license_file="$altered/share/licenses/fixture/go-toolchain/$toolchain/LICENSE"
+    if [ "$mismatch" = nested-license-bytes ]; then
+      license_file="$(find "$altered/share/licenses/fixture/go-toolchain/$toolchain" -mindepth 2 -type f -name LICENSE -print -quit)"
+      [ -n "$license_file" ] || fail "Go distribution archive omitted nested dependency licenses"
+    fi
+    printf 'changed compiler license\n' > "$license_file"
+  else
+    awk -F '\t' -v OFS='\t' -v mismatch="$mismatch" \
+      '$2 == "Go toolchain" {if (mismatch == "source") $4="https://example.invalid/other-go"; else $5="h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="} {print}' \
+      "$altered/share/sources/fixture/SOURCES.tsv" > "$TMP/toolchain-changed-sources"
+    mv "$TMP/toolchain-changed-sources" "$altered/share/sources/fixture/SOURCES.tsv"
+  fi
+  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/toolchain-$mismatch.log" 2>&1); then
+    fail "validator accepted changed Go toolchain $mismatch with regenerated checksums"
+  fi
+  grep -Eq 'missing or inconsistent source record for Go toolchain|Go toolchain license bytes differ' \
+    "$TMP/toolchain-$mismatch.log" || fail "Go distribution rejection failed for an unrelated reason"
+done
 
 (cd "$TMP/consumer" && GOEXPERIMENT=arenas go build -o "$TMP/experimental-tool" .)
 release_materials_init "$TMP/experiment-stage" "$TMP/experiment-work" fixture

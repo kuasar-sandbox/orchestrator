@@ -139,9 +139,7 @@ release_materials_add_go_binary() {
   printf '%s\ttoolchain\tgo\t%s\t-\n' "$archive_path" "$toolchain_full" \
     >> "$RELEASE_MATERIALS_WORK/go-build-info"
   printf '%s\n' "$toolchain" >> "$RELEASE_MATERIALS_WORK/go-toolchains"
-  release_materials_record_source "$archive_path" "Go toolchain" "$toolchain" \
-    "https://go.dev/dl/$toolchain.src.tar.gz" "go-version:$toolchain" \
-    "go-toolchain/$toolchain"
+
   awk -F '\t' -v payload="$archive_path" \
     -v info="$RELEASE_MATERIALS_WORK/go-build-info" \
     -v modules="$RELEASE_MATERIALS_WORK/go-modules" '
@@ -249,6 +247,82 @@ release_materials_verified_go_source() {
   printf '%s\n' "$directory"
 }
 
+_release_materials_download_go_toolchain() {
+  local toolchain="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}"
+  local sumdb="${GOSUMDB:-sum.golang.org}" route verify_root sumdb_identity sumdb_url sumdb_extra
+  local -a routes
+  [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)$ ]] \
+    || fail "unsupported official Go toolchain version"
+  IFS=',|' read -r -a routes <<< "$proxy"
+  for route in "${routes[@]}"; do
+    case "$route" in direct|off) continue ;; esac
+    [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
+      || fail "Go distribution verification requires credential-free HTTPS module routing"
+  done
+  [ "$sumdb" != off ] || fail "Go distribution verification requires an enabled checksum database"
+  [[ "$sumdb" != *$'\n'* && "$sumdb" != *$'\r'* ]] \
+    || fail "Go distribution checksum routing must be a single line"
+  read -r sumdb_identity sumdb_url sumdb_extra <<< "$sumdb"
+  [[ "$sumdb_identity" =~ ^[A-Za-z0-9._+/:=-]+$ && -z "$sumdb_extra" ]] \
+    || fail "invalid Go distribution checksum database identity"
+  if [ -n "$sumdb_url" ]; then
+    [[ "$sumdb_url" == https://?* && "$sumdb_url" != *[@?#[:space:]]* ]] \
+      || fail "Go distribution checksum routing must use credential-free HTTPS"
+  fi
+  mkdir -p "$RELEASE_MATERIALS_WORK"
+  verify_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/go-distribution.XXXXXX")"
+  (
+    cd "$verify_root" || exit
+    # Toolchain modules require sumdb authentication. Do not inherit Go's
+    # private distpack/proxy bootstrap exceptions, or alter the selected compiler.
+    GOWORK=off GOENV=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on \
+      GOPROXY="$proxy" GOSUMDB="$sumdb" GONOSUMDB='' GOPRIVATE='' GONOPROXY='' \
+      GOINSECURE='' GIT_HTTP_USER_AGENT='' \
+      command go mod download -json "golang.org/toolchain@v0.0.1-$toolchain.linux-amd64" \
+      > source.json 2> download.log
+  ) || fail "could not authenticate the official Go distribution; check module/checksum routing or the verified cache"
+  jq -e --arg version "v0.0.1-$toolchain.linux-amd64" \
+    '.Path == "golang.org/toolchain" and .Version == $version and
+     (.Sum | type == "string") and (.Zip | type == "string") and (.Error == null)' \
+    "$verify_root/source.json" >/dev/null \
+    || fail "Go distribution download returned an invalid identity"
+  printf '%s\n' "$verify_root/source.json"
+}
+
+release_materials_download_go_toolchain() {
+  _release_materials_download_go_toolchain "$@"
+}
+
+release_materials_go_toolchain_materials() {
+  local toolchain="$1" installed_root="$2" destination="$3" json archive checksum
+  local helper="${BASH_SOURCE[0]%/*}/release-go-toolchain.go"
+  json="$(release_materials_download_go_toolchain "$toolchain")" || return 1
+  archive="$(jq -er '.Zip' "$json")" || fail "Go distribution ZIP is missing"
+  checksum="$(jq -er '.Sum' "$json")" || fail "Go distribution h1 is missing"
+  if [ ! -x "$RELEASE_MATERIALS_WORK/verify-go-distribution" ]; then
+    GOWORK=off GOENV=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=off \
+      command go build -o "$RELEASE_MATERIALS_WORK/verify-go-distribution" "$helper" \
+      || fail "could not build the trusted Go distribution verifier"
+  fi
+  "$RELEASE_MATERIALS_WORK/verify-go-distribution" "$archive" \
+    "v0.0.1-$toolchain.linux-amd64" "$checksum" "$installed_root" "$destination" \
+    > "${destination}.verification.log" \
+    || fail "Go distribution, installed build inputs or license material failed verification"
+  printf 'https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-%s.linux-amd64.zip\t%s\n' \
+    "$toolchain" "$checksum"
+}
+
+release_materials_verify_build_go() {
+  local info="$1" toolchain installed_root identity
+  jq -e '.GOHOSTOS == "linux" and .GOHOSTARCH == "amd64"' "$info" >/dev/null \
+    || fail "release Go compiler must run on Linux/amd64"
+  toolchain="$(jq -er '.GOVERSION' "$info")" || fail "selected Go compiler version is missing"
+  installed_root="$(jq -er '.GOROOT' "$info")" || fail "selected Go compiler root is missing"
+  identity="$(release_materials_go_toolchain_materials "$toolchain" "$installed_root" \
+    "$RELEASE_MATERIALS_WORK/build-licenses")" || return 1
+  printf '%s\n' "$identity" > "$RELEASE_MATERIALS_WORK/build-source.tsv"
+}
+
 release_materials_hash_tree() {
   local root="$1" unit="$2" output="$3"
   (
@@ -262,15 +336,33 @@ release_materials_hash_tree() {
 
 release_materials_finish() {
   local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
-  local module version checksum directory toolchain toolchain_root installed_toolchain
+  local module version checksum directory toolchain toolchain_root installed_toolchain identity source payload license_destination
   while IFS= read -r toolchain; do
     [ -n "$toolchain" ] || continue
-    toolchain_root="$(GOTOOLCHAIN="$toolchain" go env GOROOT 2>/dev/null)" \
-      || fail "cannot locate license material for Go toolchain $toolchain"
-    installed_toolchain="$(GOTOOLCHAIN="$toolchain" go version 2>/dev/null | awk '{print $3}')"
+    if [ -n "${RELEASE_MATERIALS_GO_ENV:-}" ]; then
+      toolchain_root="$(jq -er '.GOROOT' "$RELEASE_MATERIALS_GO_ENV")"
+      installed_toolchain="$(jq -er '.GOVERSION' "$RELEASE_MATERIALS_GO_ENV")"
+    else
+      toolchain_root="$(GOWORK=off GOENV=off GOTOOLCHAIN=local command go env GOROOT)"
+      installed_toolchain="$(GOWORK=off GOENV=off GOTOOLCHAIN=local command go env GOVERSION)"
+    fi
     [ "$installed_toolchain" = "$toolchain" ] \
       || fail "resolved Go toolchain $installed_toolchain does not match $toolchain"
-    release_materials_copy_licenses "$toolchain_root" "go-toolchain/$toolchain"
+    directory="$RELEASE_MATERIALS_WORK/licenses-$toolchain"
+    identity="$(release_materials_go_toolchain_materials "$toolchain" "$toolchain_root" "$directory")" \
+      || fail "Go toolchain material authentication failed"
+    IFS=$'\t' read -r source checksum <<< "$identity"
+    # The verifier emits only authenticated, regular license/notice files.
+    # Preserve nested vendor paths instead of filtering this tree a second time.
+    license_destination="$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/go-toolchain/$toolchain"
+    mkdir -p "$license_destination"
+    cp -R "$directory/." "$license_destination/"
+    while IFS= read -r payload; do
+      release_materials_record_source "$payload" "Go toolchain" "$toolchain" \
+        "$source" "$checksum" "go-toolchain/$toolchain"
+    done < <(awk -F '\t' -v version="$toolchain" \
+      '$2 == "toolchain" { selected=$4; sub(/[ -]X:.*/, "", selected); if (selected == version) print $1 }' \
+      "$RELEASE_MATERIALS_WORK/go-build-info" | LC_ALL=C sort -u)
   done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
   LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
     > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
@@ -369,7 +461,19 @@ release_materials_require_go() {
     END { exit rows != 1 }
   ' "$info" || fail "missing or inconsistent Go package record for $payload"
   toolchain="${toolchain%% *}"
+  toolchain="${toolchain%%-X:*}"
   release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "${toolchain%%-X:*}"
+  (
+    local verify_work identity source checksum
+    verify_work="$(mktemp -d "$WORK/verify-toolchain-license.XXXXXX")"
+    release_materials_init "$verify_work/stage" "$verify_work/materials" "$unit"
+    identity="$(release_materials_go_toolchain_materials "$toolchain" - "$verify_work/licenses")" \
+      || fail "Go toolchain source authentication failed"
+    IFS=$'\t' read -r source checksum <<< "$identity"
+    release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "$toolchain" "$source" "$checksum"
+    diff -r "$verify_work/licenses" "$root/share/licenses/$unit/go-toolchain/$toolchain" >/dev/null \
+      || fail "Go toolchain license bytes differ from the authenticated distribution"
+  ) || return 1
   if [[ "$payload" != *:* ]]; then
     (
       local validation_work
@@ -478,7 +582,7 @@ release_materials_validate() {
   done < <(sed -n '2,$p' "$source_root/SOURCES.tsv")
   while IFS= read -r payload; do
     release_materials_validate_payload "$root" "$payload"
-    release_materials_require_go "$root" "$unit" "$payload"
+    release_materials_require_go "$root" "$unit" "$payload" || return 1
   done < <(awk -F '\t' 'NR > 1 { print $1 }' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u)
   while IFS=$'\t' read -r module version checksum || [ -n "$module" ]; do
     case "$module" in github.com/kuasar-sandbox/*) continue ;; esac

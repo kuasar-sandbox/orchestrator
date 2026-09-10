@@ -316,6 +316,10 @@ jobs:
       - preflight
       - build
     runs-on: [self-hosted, Linux, X64, kuasar-control]
+    env:
+      GOPROXY: https://goproxy.cn,direct
+      GOSUMDB: sum.golang.google.cn
+      GOTOOLCHAIN: local
     permissions:
       actions: read
       contents: write

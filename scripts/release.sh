@@ -104,6 +104,12 @@ build_release_go_payloads() {
     esac
     build_env+=("$variable=$value")
   done
+  RELEASE_MATERIALS_GO_ENV="$WORK/go-build-toolchain.json"
+  "${build_env[@]}" go -C "$WORK/go-build/$NAME" env -json GOROOT GOVERSION GOHOSTOS GOHOSTARCH \
+    > "$RELEASE_MATERIALS_GO_ENV"
+  RELEASE_MATERIALS_WORK="$WORK/go-toolchain-before-build" \
+    GOMODCACHE="$WORK/go-mod" GOPROXY="$proxy" GOSUMDB="$sumdb" \
+    release_materials_verify_build_go "$RELEASE_MATERIALS_GO_ENV"
   "${build_env[@]}" make --no-print-directory -C "$WORK/go-build/$NAME" TARGET_ARCH="$arch" build
 }
 
