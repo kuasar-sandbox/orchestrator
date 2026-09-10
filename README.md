@@ -161,6 +161,9 @@ payload and material file to that completed build, even if the bundle's own
 checksums are regenerated. Local packaging and standalone validation do not
 require this publication input. The receipt does not attest compiler provenance
 or isolate untrusted candidate code.
+The trusted publisher generates the standard release text and source/Preview
+markers from its validated request. Downloaded `release-notes.md` is a local
+bundle aid, not an authority for the public release body or reconciliation.
 
 Packaging rebuilds Go payloads in fresh checkouts of the selected Orchestrator, Accelerator, Connector and Sandboxer commits,
 with `GOWORK=off` and read-only module resolution. Ignored development files and

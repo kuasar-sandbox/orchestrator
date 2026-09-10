@@ -52,6 +52,11 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/state"
+cp -a "$BUNDLE" "$TMP/untrusted-notes-bundle"
+BUNDLE="$TMP/untrusted-notes-bundle"
+printf '%s\n' 'untrusted-release-notes https://example.invalid/forged-release' \
+  '<!-- kuasar-release-source {"source_sha":"untrusted-notes"} -->' \
+  '<!-- kuasar-preview-binding {"source_sha":"untrusted-notes"} -->' > "$BUNDLE/release-notes.md"
 
 cat > "$TMP/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -365,6 +370,10 @@ env "${common_env[@]}" "$PUBLISHER" reconcile
 if [ "$EXPECTED_LATEST" = true ]; then
   [ "$(cat "$TMP/state/latest-id")" = 88 ] \
     || { echo "test-publisher: unbounded same-commit SemVer did not win" >&2; exit 1; }
+fi
+if grep -Fq 'untrusted' "$TMP/state/release-notes.md"; then
+  echo "test-publisher: downloaded notes influenced the published body" >&2
+  exit 1
 fi
 binding_lines="$(grep -c '^<!-- kuasar-preview-binding .* -->$' \
   "$TMP/state/release-notes.md" || true)"

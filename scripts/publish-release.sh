@@ -95,10 +95,16 @@ revalidate_preview_line() {
 }
 
 release_notes_file() {
-  local tag="$1" commit="$2" bundle="$3" source_ref="$4"
+  local tag="$1" commit="$2" arch="$3" source_ref="$4"
   local notes="$TMP/release-notes.md" unit source
-  cp "$bundle/release-notes.md" "$notes"
   unit="$(release_unit "$tag")"
+  [ "$arch" != amd64 ] || arch=x86_64
+  # Downloaded notes are not covered by the archive receipt. Generate the
+  # standard body here, before appending authoritative source/binding markers.
+  {
+    printf '%s %s for Linux %s.\n\n' "$unit" "$tag" "$arch"
+    printf '%s\n' "Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. Documentation and E2E suites from this exact tag are collected by the aggregate platform release."
+  } > "$notes"
   source="$(jq -cn --arg source_ref "$source_ref" --arg source_sha "$commit" \
     --arg unit "$unit" \
     '{source_ref: $source_ref, source_sha: $source_sha, unit: $unit}')"
@@ -256,7 +262,7 @@ publish_bundle() {
   local files=() file notes
   while IFS= read -r file; do files+=("$file"); done \
     < <(find "$bundle/assets" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)
-  notes="$(release_notes_file "$tag" "$commit" "$bundle" "$source_ref")"
+  notes="$(release_notes_file "$tag" "$commit" "$arch" "$source_ref")"
   gh release create "$tag" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
     --target "$commit" --title "$tag" --notes-file "$notes" >/dev/null
   wait_for_draft_release "$tag" "$drafts"
