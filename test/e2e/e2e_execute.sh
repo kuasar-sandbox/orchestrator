@@ -279,6 +279,18 @@ setup_proxy_netns() {
     ORIG_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
     sysctl -q -w net.ipv4.ip_forward=1
 }
+check_proxy_netns_address() {
+    local phase="$1"
+    # This is namespace/link metadata only, never conductor configuration or
+    # sandbox credentials. Diagnose address loss at the exact startup boundary.
+    if ! ip -n "$PROXY_NETNS" -o -4 addr show dev "$PROXY_VETH_NS" | \
+        awk -v address="$PROXY_NS_IP/30" '$4 == address { found = 1 } END { exit !found }'; then
+        echo "==> Proxy namespace address missing ($phase)" >&2
+        ip -n "$PROXY_NETNS" -br address >&2 || true
+        fail "expected $PROXY_NS_IP/30 on $PROXY_NETNS/$PROXY_VETH_NS"
+    fi
+    echo "==> Proxy namespace address verified ($phase; netns=$(stat -Lc '%i' "/var/run/netns/$PROXY_NETNS"))"
+}
 allow_proxy_forwarding() {
     iptables -C FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null \
         || iptables -A FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT
@@ -1006,6 +1018,7 @@ echo "==> store-ctl + zot up; built+seeded $REF (user + ionice/nice shims)"
 MGMT_VIP="169.254.169.254"
 MMDS_PORT="$(free_port)"
 setup_proxy_netns
+check_proxy_netns_address before-vswitch
 "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns del "$SWITCH" 2>/dev/null || true
@@ -1034,6 +1047,7 @@ SW_STARTED=1
 ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
     || fail "configure management VIP on ${SWITCH}m0"
 allow_proxy_forwarding
+check_proxy_netns_address after-vswitch
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
 echo "==> vswitch up (build sandboxes pull $GUEST_REF; tapfd_socket=$TAPFD_SOCKET; Proxy netns=$PROXY_NETNS reaches $FIP_CIDR)"
 
@@ -1141,6 +1155,7 @@ start_orchestrator() { # $1=log path
     # can be distinguished from teardown/recreation during Proxy startup.
     proxy_ns_before=$(stat -Lc '%d:%i' "/var/run/netns/$PROXY_NETNS" 2>&1 || true)
     proxy_addresses_before=$(ip -n "$PROXY_NETNS" -brief address show 2>&1 || true)
+    check_proxy_netns_address before-proxy
     start_proxy "$ORCH_BIN_DIR/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
     PROXY_PID="$PROXY_HELPER_PID"
     PIDS+=("$PROXY_PID")
