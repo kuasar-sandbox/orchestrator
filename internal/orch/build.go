@@ -357,6 +357,9 @@ func cloneBuildTarget(target *types.BuildTarget) *types.BuildTarget {
 	return &copy
 }
 
+// buildHasSandboxConfig reports inputs that require a Sandbox artifact.
+// Network is also an execution input for image builds; keep it in the parsed
+// spec and Sandbox projection without making it require a Sandbox target.
 func buildHasSandboxConfig(build *types.Build) bool {
 	if build == nil {
 		return false
@@ -365,7 +368,7 @@ func buildHasSandboxConfig(build *types.Build) bool {
 		return true
 	}
 	for _, namespace := range []string{
-		sandboxcfg.NsResource, sandboxcfg.NsTraffic, sandboxcfg.NsNetwork,
+		sandboxcfg.NsResource, sandboxcfg.NsTraffic,
 		sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
 		sandboxcfg.NsFiles, sandboxcfg.NsMetadata,
 	} {

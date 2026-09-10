@@ -180,8 +180,10 @@ func validateExplicitBuildTargetConfig(target *types.BuildTarget, metadata, env 
 		metadata[sandboxcfg.NsCheckpoint] != ""
 	switch {
 	case target.Kind == types.BuildTargetImage:
+		// Network config also controls the A/B execution sandboxes, even
+		// when the final artifact is an image with no Sandbox config carrier.
 		for _, namespace := range []string{
-			sandboxcfg.NsResource, sandboxcfg.NsTraffic, sandboxcfg.NsNetwork,
+			sandboxcfg.NsResource, sandboxcfg.NsTraffic,
 			sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
 			sandboxcfg.NsFiles, sandboxcfg.NsMetadata, sandboxcfg.NsCheckpoint,
 			sandboxcfg.NsMMDS,

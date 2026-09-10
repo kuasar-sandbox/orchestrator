@@ -106,9 +106,12 @@ Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/met
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
 Trigger 不能覆盖注册 metadata、Builder/Resource 或其他通用配置头;非空通用 metadata/header 被拒绝。
 
-- 显式 Image 拒绝归一化后仍存在的 Sandbox resource/traffic/network/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
+- 显式 Image 拒绝归一化后仍存在的 Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
   以及非空 `envVars`、`secure=true`、非零 credential override 或显式 MMDS routes/secrets。
   普通 metadata label 与 Build execution resources 仍允许;空 `envVars`、`secure=false` 本身不构成拒绝条件。
+- 所有 target 均接受 `X-Kuasar-Sandbox-Network` / `kuasar-sandbox.network` 作为 Build 执行网络,
+  包括显式或自动解析的 Image target,也允许空 network 对象。网络输入不要求输出 Sandbox;
+  A/B 使用它完成镜像导入和构建步骤,Sandbox target 还会将其投影到 E。
 - 顶层 Sandbox E 接受 portable Create 配置(包括 env),但拒绝 traffic、非零 credentials、
   显式 MMDS routes/secrets、`secure=true` 与非空 checkpoint 等 instance/action-only 输入。
 - 只有 resolved `sandbox,memory:true` 接受后一类输入。`instance_config_enc` 加密 env/secure/credentials;
