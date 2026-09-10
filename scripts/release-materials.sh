@@ -182,7 +182,7 @@ release_materials_add_go_binary() {
   awk -F '\t' '
     $2 == "dep" { module=$3 }
     $2 == "=>" && ($3 ~ /^\// || $3 ~ /^\.\.?\// || $4 == "(devel)" || $4 == "") {
-      if (module !~ /^github\.com\/kuasar-sandbox\//) unsupported=1
+      if (module != "github.com/kuasar-sandbox/accelerator" && module != "github.com/kuasar-sandbox/connector" && module != "github.com/kuasar-sandbox/sandboxer") unsupported=1
     }
     END { exit unsupported }
   ' "$raw" || fail "third-party local Go replacements are not supported in release materials; select a versioned module replacement"
@@ -485,8 +485,11 @@ release_materials_finish() {
   fi
   while IFS=$'\t' read -r module version checksum; do
     [ -n "$module" ] || continue
+    # Only exact components authenticated by this package's source contract
+    # have their notices collected separately. Organization membership is not
+    # a license-material exemption.
     case "$module" in
-      github.com/kuasar-sandbox/*) continue ;;
+      github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;;
     esac
     directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
     release_materials_copy_licenses "$directory" "go/$module@$version"
@@ -717,7 +720,7 @@ release_materials_validate() {
     release_materials_require_go "$root" "$unit" "$payload" || return 1
   done < <(awk -F '\t' 'NR > 1 { print $1 }' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u)
   while IFS=$'\t' read -r module version checksum || [ -n "$module" ]; do
-    case "$module" in github.com/kuasar-sandbox/*) continue ;; esac
+    case "$module" in github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;; esac
     [[ "$checksum" =~ ^h1:[A-Za-z0-9+/]{43}=$ ]] \
       || fail "third-party Go source requires an authenticated module checksum: $module@$version"
     directory="share/licenses/$unit/go/$module@$version"

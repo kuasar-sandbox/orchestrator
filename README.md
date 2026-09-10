@@ -195,6 +195,9 @@ bypasses, Git configuration and caller credentials while retaining validated,
 credential-free routing. Uploaded Go record keys must match the exact official
 payload names before any source or toolchain download; path aliases are rejected.
 These release checks do not change ordinary development module authentication.
+Only the exact Accelerator, Connector and Sandboxer modules use separately
+authenticated internal-source notices. Any other organization-owned module must
+pass the same module checksum and notice verification as an external dependency.
 Source inventories reject duplicate or excessive records before per-row work;
 each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
 Only the exact project, selected internal-dependency and per-payload Go toolchain

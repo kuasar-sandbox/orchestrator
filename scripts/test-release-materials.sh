@@ -44,6 +44,10 @@ release_materials_download_go_toolchain() {
   for suffix in zip ziphash info mod; do
     [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
   done
+  # Reuse only public signed lookup/tile data; Go still verifies its signatures.
+  if [ -d "$fixture_toolchain_cache/cache/download/sumdb" ]; then
+    cp -a "$fixture_toolchain_cache/cache/download/sumdb" "${destination%/golang.org/toolchain/@v}/"
+  fi
   GOPROXY="$fixture_toolchain_proxy" GOSUMDB="$fixture_toolchain_sumdb" _release_materials_download_go_toolchain "$@"
 }
 
@@ -87,7 +91,9 @@ release_materials_go_payload_allowed() {
 export GOWORK=off GOMODCACHE="$TMP/mod-cache" GOPROXY="file://$TMP/proxy"
 # The fixture module is deliberately local and has no public checksum entry.
 export GOSUMDB=off GOFLAGS=
-module=example.invalid/license-fixture
+# An additional organization-owned module is not one of the explicitly
+# source-bound internal components and must still ship authenticated notices.
+module=github.com/kuasar-sandbox/license-fixture
 version=v1.0.0
 mkdir -p "$TMP/proxy/$module/@v" "$TMP/consumer" "$TMP/material-work"
 (
@@ -116,12 +122,12 @@ func main() {
 	if err != nil { panic(err) }
 	w := zip.NewWriter(f)
 	files := []struct{ name, body string }{
-		{"go.mod", "module example.invalid/license-fixture\n\ngo 1.24\n"},
+		{"go.mod", "module github.com/kuasar-sandbox/license-fixture\n\ngo 1.24\n"},
 		{"fixture.go", "package fixture\nfunc Value() int { return 1 }\n"},
 		{"LICENSE", "fixture copyright and license\n"},
 	}
 	for _, file := range files {
-		out, err := w.Create("example.invalid/license-fixture@v1.0.0/" + file.name)
+		out, err := w.Create("github.com/kuasar-sandbox/license-fixture@v1.0.0/" + file.name)
 		if err != nil { panic(err) }
 		if _, err = out.Write([]byte(file.body)); err != nil { panic(err) }
 	}
@@ -212,6 +218,16 @@ for mismatch in duplicate version source integrity license; do
   grep -Fq "$expected_error" "$TMP/source-$mismatch.log" \
     || fail "ambiguous source failed for an unrelated reason"
 done
+
+altered="$TMP/missing-published-license"
+cp -a "$TMP/replacement-stage" "$altered"
+rm "$altered/share/licenses/fixture/go/$module@$version/LICENSE"
+release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/missing-license.log" 2>&1); then
+  fail "validator accepted missing organization module notices with regenerated checksums"
+fi
+grep -Fq 'Go module license material is missing' "$TMP/missing-license.log" \
+  || fail "missing organization module notices failed for an unrelated reason"
 
 altered="$TMP/changed-published-license"
 cp -a "$TMP/replacement-stage" "$altered"
