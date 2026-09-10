@@ -91,6 +91,10 @@ release_materials_go_payload_allowed() {
 export GOWORK=off GOMODCACHE="$TMP/mod-cache" GOPROXY="file://$TMP/proxy"
 # The fixture module is deliberately local and has no public checksum entry.
 export GOSUMDB=off GOFLAGS=
+# Keep organization-named fixture modules on this file proxy even when the
+# caller configures private module routes; no fixture may fall back to VCS.
+export GOENV=off GOPRIVATE='' GONOPROXY=none GONOSUMDB=none GOINSECURE=''
+export GOVCS='*:off' GOAUTH=off GOTOOLCHAIN=local
 # An additional organization-owned module is not one of the explicitly
 # source-bound internal components and must still ship authenticated notices.
 module=github.com/kuasar-sandbox/license-fixture

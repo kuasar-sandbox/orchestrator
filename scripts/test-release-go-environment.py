@@ -38,6 +38,31 @@ class GoSourceEnvironment(unittest.TestCase):
              str(self.capture)], env={**self.environment, **(extra or {})},
             text=True, capture_output=True, timeout=10)
 
+    def test_fixture_proxy_ignores_private_routes_and_persistent_configuration(self):
+        fixture = (ROOT / "scripts/test-release-materials.sh").read_text()
+        prelude = fixture.split("export GOWORK=off", 1)[1].split("# An additional organization-owned module", 1)[0]
+        prelude = "export GOWORK=off" + prelude
+        configuration = self.root / "go-environment"
+        private = "github.com/kuasar-sandbox/*"
+        configuration.write_text("GOPRIVATE=" + private + "\nGONOPROXY=" + private
+                                 + "\nGONOSUMDB=" + private + "\nGOINSECURE=" + private + "\n")
+        # Go reports an empty file path when GOENV=off disables persistence.
+        expected = {"GOENV": "", "GOPRIVATE": "", "GONOPROXY": "none", "GONOSUMDB": "none",
+                    "GOINSECURE": "", "GOVCS": "*:off", "GOAUTH": "off", "GOTOOLCHAIN": "local",
+                    "GOWORK": "off", "GOPROXY": "file://" + str(self.root / "proxy")}
+        for ambient in (False, True):
+            environment = dict(os.environ, GOENV=str(configuration))
+            for name in ("GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE"):
+                environment.pop(name, None)
+                if ambient:
+                    environment[name] = private
+            with self.subTest(ambient=ambient):
+                result = subprocess.run(["bash", "-c", 'set -euo pipefail\nTMP="$1"\n' + prelude
+                                         + '\n[ "$GOENV" = off ]\ngo env -json ' + " ".join(expected), "_", str(self.root)],
+                                        env=environment, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+
     def test_caller_credentials_and_private_go_configuration_are_not_inherited(self):
         settings = {name: "fixture-must-not-propagate" for name in (
             "GOENV", "GOFLAGS", "GO111MODULE", "GOWORK", "GOTOOLCHAIN", "GOPRIVATE",
