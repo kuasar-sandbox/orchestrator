@@ -192,6 +192,19 @@ verification material with `GOTOOLCHAIN=local` but does not switch the build
 compiler or silently enable automatic toolchain selection. These checks assume
 the trusted build host and do not attest a compromised host.
 
+License collection refuses unreadable subtrees and incomplete traversals rather
+than publishing only the readable notices. Third-party local Go replacements
+without authenticated module checksums are not supported in official component
+packages; use versioned module replacements. Existing Kuasar sibling replacements
+and ordinary source development are unchanged.
+
+Each of the four Go executables must identify its own Orchestrator command main
+package and module and target Linux/amd64. Swapping executables from the same
+commit is rejected. Deployment files are copied from the fresh selected checkout
+and compared byte-for-byte with that commit's Git blobs during validation.
+Standalone validation needs that exact commit locally; the trusted publisher
+fetches source history for inspection without executing candidate deployment files.
+
 Package source records keep the project's or an internal dependency's release
 version only when its local Git tag matches the selected source commit. Untagged
 sources record `git:<commit>`; the archive name still identifies the requested

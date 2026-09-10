@@ -36,9 +36,10 @@ archive_name() {
 
 copy_file() {
   local source="$1" destination="$2"
-  [ -f "$ROOT/$source" ] || fail "missing release input: $ROOT/$source"
+  local checkout="$WORK/go-build/orchestrator"
+  [ -f "$checkout/$source" ] || fail "missing release input: $source"
   mkdir -p "$(dirname "$STAGE/$destination")"
-  install -m 0644 "$ROOT/$source" "$STAGE/$destination"
+  install -m 0644 "$checkout/$source" "$STAGE/$destination"
 }
 
 copy_executable() {
@@ -114,9 +115,37 @@ build_release_go_payloads() {
 }
 
 check_go_binary() {
-  local file="$1"
-  go version -m "$file" >/dev/null 2>&1 \
+  local file="$1" info name
+  name="$(basename "$file")"
+  case "$name" in node-ctl|cluster-ctl|node-stub-ctl|e2b-key-ctl) ;; *) fail "unexpected Go release payload: $name" ;; esac
+  info="$(go version -m "$file" 2>/dev/null)" \
     || fail "Go build info is missing from $file"
+  awk -F '\t' -v expected="github.com/kuasar-sandbox/orchestrator/cmd/$name" '
+    $2 == "path" { paths++; if ($3 != expected) bad=1 }
+    $2 == "mod" { modules++; if ($3 != "github.com/kuasar-sandbox/orchestrator") bad=1 }
+    END { exit bad || paths != 1 || modules != 1 }
+  ' <<< "$info" || fail "Go release payload must be the $name main package: $file"
+  awk -F '\t' '
+    $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
+    $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
+    END { exit bad || os != 1 || arch != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64: $file"
+}
+
+validate_copied_source_files() {
+  local extract="$1" sha="$2" file
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "selected project source revision is missing"
+  git -C "$ROOT" cat-file -e "$sha^{commit}" 2>/dev/null \
+    || fail "selected source commit is unavailable; fetch that exact commit before validation"
+  for file in deploy/node-ctl.service deploy/node-proxy.service \
+    deploy/cluster-registry.service deploy/cluster-router.service \
+    deploy/cluster-placer.service deploy/conductor.example.yaml \
+    deploy/proxy.example.yaml deploy/registry.example.yaml \
+    deploy/router.example.yaml deploy/placer.example.yaml; do
+    [ -f "$extract/$file" ] || fail "archive is missing $file"
+    git -C "$ROOT" cat-file blob "$sha:$file" | cmp -s - "$extract/$file" \
+      || fail "release deployment bytes differ from selected source: $file"
+  done
 }
 
 validate_archive_paths() {
@@ -197,6 +226,14 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
+  local file project_sha
+  for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+    [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
+    check_go_binary "$extract/bin/$file"
+  done
+  project_sha="$(go version -m "$extract/bin/node-ctl" | \
+    awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
+  validate_copied_source_files "$extract" "$project_sha"
   release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
     bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
@@ -211,18 +248,6 @@ validate_bundle() {
   release_materials_require_go "$extract" "$NAME" 'bin/cluster-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/node-stub-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/e2b-key-ctl'
-  local file
-  for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
-    [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
-    check_go_binary "$extract/bin/$file"
-  done
-  for file in deploy/node-ctl.service deploy/node-proxy.service \
-    deploy/cluster-registry.service deploy/cluster-router.service \
-    deploy/cluster-placer.service deploy/conductor.example.yaml \
-    deploy/proxy.example.yaml deploy/registry.example.yaml \
-    deploy/router.example.yaml deploy/placer.example.yaml; do
-    [ -f "$extract/$file" ] || fail "$archive is missing $file"
-  done
 }
 
 package_release() {
@@ -243,16 +268,6 @@ package_release() {
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
   [ -z "${RELEASE_BIN_DIR:-}" ] || fail "RELEASE_BIN_DIR is not supported: release Go payloads are rebuilt"
-  copy_file deploy/node-ctl.service deploy/node-ctl.service
-  copy_file deploy/node-proxy.service deploy/node-proxy.service
-  copy_file deploy/cluster-registry.service deploy/cluster-registry.service
-  copy_file deploy/cluster-router.service deploy/cluster-router.service
-  copy_file deploy/cluster-placer.service deploy/cluster-placer.service
-  copy_file deploy/conductor.example.yaml deploy/conductor.example.yaml
-  copy_file deploy/proxy.example.yaml deploy/proxy.example.yaml
-  copy_file deploy/registry.example.yaml deploy/registry.example.yaml
-  copy_file deploy/router.example.yaml deploy/router.example.yaml
-  copy_file deploy/placer.example.yaml deploy/placer.example.yaml
 
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
@@ -279,6 +294,16 @@ package_release() {
   stage_release_go_source "$accelerator_source" "$accelerator_sha" "$WORK/go-build/accelerator"
   stage_release_go_source "$connector_source" "$connector_sha" "$WORK/go-build/connector"
   stage_release_go_source "$sandboxer_source" "$sandboxer_sha" "$WORK/go-build/sandboxer"
+  copy_file deploy/node-ctl.service deploy/node-ctl.service
+  copy_file deploy/node-proxy.service deploy/node-proxy.service
+  copy_file deploy/cluster-registry.service deploy/cluster-registry.service
+  copy_file deploy/cluster-router.service deploy/cluster-router.service
+  copy_file deploy/cluster-placer.service deploy/cluster-placer.service
+  copy_file deploy/conductor.example.yaml deploy/conductor.example.yaml
+  copy_file deploy/proxy.example.yaml deploy/proxy.example.yaml
+  copy_file deploy/registry.example.yaml deploy/registry.example.yaml
+  copy_file deploy/router.example.yaml deploy/router.example.yaml
+  copy_file deploy/placer.example.yaml deploy/placer.example.yaml
   build_release_go_payloads "$arch"
   bin_dir="$WORK/go-build/orchestrator/bin/$arch"
   local binary

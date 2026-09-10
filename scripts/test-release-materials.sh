@@ -127,6 +127,30 @@ checksum="$(go version -m "$TMP/tool" | awk -F '\t' -v module="$module" \
 directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
 cmp "$directory/LICENSE" <(printf 'fixture copyright and license\n') \
   || fail "verified source did not return the downloaded license"
+# A real local third-party replacement carries no module h1. Refuse it
+# explicitly, instead of downloading and attributing a different remote source.
+mkdir -p "$TMP/local-consumer"
+printf 'module local-consumer.invalid\n\ngo 1.24\nrequire %s %s\nreplace %s => %s\n' \
+  "$module" "$version" "$module" "$directory" > "$TMP/local-consumer/go.mod"
+printf 'package main\nimport f "%s"\nfunc main() { println(f.Value()) }\n' "$module" \
+  > "$TMP/local-consumer/main.go"
+(cd "$TMP/local-consumer" && go build -o "$TMP/local-tool" .)
+if (
+  release_materials_init "$TMP/local-stage" "$TMP/local-work" fixture
+  release_materials_add_go_binary "$TMP/local-tool" bin/tool
+) > "$TMP/local-replacement.log" 2>&1; then
+  fail "accepted an unsupported third-party local Go replacement"
+fi
+grep -Fq 'third-party local Go replacements are not supported' "$TMP/local-replacement.log" \
+  || fail "local replacement was rejected for an unrelated reason"
+if (
+  go() { fail 'unsigned source unexpectedly reached Go module resolution'; }
+  release_materials_verified_go_source "$module" "$version" -
+) > "$TMP/unsigned-source.log" 2>&1; then
+  fail "accepted a third-party source without an authenticated checksum"
+fi
+grep -Fq 'requires an authenticated module checksum' "$TMP/unsigned-source.log" \
+  || fail "unsigned source reached the network or failed for an unrelated reason"
 if (release_materials_verified_go_source "$module" "$version" \
   h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= >/dev/null 2>&1); then
   fail "source verification accepted a checksum different from the binary"

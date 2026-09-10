@@ -39,6 +39,7 @@ grep -Fq 'invalid release Go toolchain selection' "$TMP/invalid-toolchain.log" \
 export FIXTURE_GO_DISTRIBUTION_CACHE
 FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
+bash "$ROOT/scripts/test-release-license-traversal.sh"
 GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 
 init_fixture_repo() {
@@ -306,6 +307,7 @@ mkdir -p "$fixture_root/scripts"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
+install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
 cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
@@ -313,8 +315,11 @@ release_materials_download_go_toolchain() {
   GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
 }
 EOF
-printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
-printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+printf 'module github.com/kuasar-sandbox/orchestrator\n\ngo 1.24\n' > "$fixture_root/go.mod"
+for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+  mkdir -p "$fixture_root/cmd/$binary"
+  printf 'package main\nfunc main() {}\n' > "$fixture_root/cmd/$binary/main.go"
+done
 mkdir -p "$fixture_root/."
 cp -a "$ROOT/deploy" "$fixture_root/deploy"
 printf 'accelerator_commit := %s\nconnector_commit := %s\nsandboxer_commit := %s\n' \
@@ -333,25 +338,25 @@ build:
 	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
 	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
 	mkdir -p bin/x86_64
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl .
-	cp bin/x86_64/node-ctl bin/x86_64/cluster-ctl
-	cp bin/x86_64/node-ctl bin/x86_64/node-stub-ctl
-	cp bin/x86_64/node-ctl bin/x86_64/e2b-key-ctl
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
 EOF
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go deploy Makefile)"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod cmd deploy Makefile)"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
-printf '// dirty fixture\n' >> "$fixture_root/main.go"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" .)
+printf '// dirty fixture\n' >> "$fixture_root/cmd/node-ctl/main.go"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
-printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+printf 'package main\nfunc main() {}\n' > "$fixture_root/cmd/node-ctl/main.go"
 if (release_materials_require_go_revision "$TMP/go-fixture" \
   0000000000000000000000000000000000000000 >/dev/null 2>&1); then
   fail "release accepted a binary built from another commit"
 fi
-GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/main.go"
+GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/cmd/node-ctl/main.go"
 if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary without source stamping"
 fi
@@ -380,10 +385,10 @@ SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-private AWS_SECRET_ACCESS_KEY=fixt
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
-"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+"$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
   "$fixture_project_sha" main
-"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+"$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
   "$fixture_project_sha" release/v1.2.x
 
@@ -441,6 +446,92 @@ SOURCE_DATE_EPOCH=1700000000 \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
+
+# Refresh actual binary metadata and both local inventories, so rejections below
+# prove payload/source identity rather than relying on stale bundle checksums.
+repack_candidate() (
+  local candidate="$1" binary
+  release_materials_init "$candidate/metadata-stage" "$candidate/materials" orchestrator
+  for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+    release_materials_add_go_binary "$candidate/root/bin/$binary" "bin/$binary"
+  done
+  [ ! -s "$candidate/materials/go-modules" ] || fail "unexpected fixture dependency"
+  {
+    printf 'payload\trecord\tname\tversion_or_value\tchecksum\n'
+    LC_ALL=C sort -u "$candidate/materials/go-build-info"
+  } > "$candidate/root/share/sources/orchestrator/GO-BUILD-INFO.tsv"
+  release_materials_hash_tree "$candidate/root" orchestrator \
+    "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+)
+
+git clone --quiet --no-local "$fixture_root" "$TMP/target-source"
+for target in darwin/amd64 linux/arm64; do
+  (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
+    go build -trimpath -buildvcs=true -o "$TMP/target-${target//\//-}" ./cmd/node-ctl)
+  release_materials_require_go_revision "$TMP/target-${target//\//-}" "$fixture_project_sha"
+  candidate="$TMP/wrong-target-${target//\//-}"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  install -m 0755 "$TMP/target-${target//\//-}" "$candidate/root/bin/node-ctl"
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted a $target payload with regenerated metadata and checksums"
+  fi
+  grep -Fq 'must target linux/amd64' "$candidate/result.log" || fail "$target failed for an unrelated reason"
+done
+
+for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-arguments; do
+  candidate="$TMP/wrong-main-$binary"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  case "$binary" in
+    node-ctl) other=cluster-ctl ;;
+    cluster-ctl) other=node-stub-ctl ;;
+    node-stub-ctl) other=e2b-key-ctl ;;
+    e2b-key-ctl) other=node-ctl ;;
+    command-line-arguments)
+      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 \
+        go build -o "$TMP/command-line-tool" ./cmd/node-ctl/main.go)
+      install -m 0755 "$TMP/command-line-tool" "$candidate/root/bin/node-ctl"
+      binary=node-ctl
+      other=''
+      ;;
+  esac
+  if [ -n "$other" ]; then
+    release_materials_require_go_revision "$candidate/root/bin/$other" "$fixture_project_sha"
+    cp "$candidate/root/bin/$other" "$candidate/root/bin/$binary"
+  fi
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted a swapped main package with regenerated metadata and checksums"
+  fi
+  grep -Fq "must be the $binary main package" "$candidate/result.log" \
+    || fail "wrong main package failed for an unrelated reason"
+done
+
+for copied_file in deploy/node-ctl.service deploy/node-proxy.service \
+  deploy/cluster-registry.service deploy/cluster-router.service \
+  deploy/cluster-placer.service deploy/conductor.example.yaml \
+  deploy/proxy.example.yaml deploy/registry.example.yaml \
+  deploy/router.example.yaml deploy/placer.example.yaml; do
+  candidate="$TMP/changed-source-${copied_file//\//-}"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  printf '\n# fixture modified after source selection\n' >> "$candidate/root/$copied_file"
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted changed deployment bytes with regenerated checksums: $copied_file"
+  fi
+  grep -Fq 'release deployment bytes differ from selected source' "$candidate/result.log" \
+    || fail "changed deployment failed for an unrelated reason: $copied_file"
+done
+printf 'test-release: 4 swapped CLIs, command-line main, 2 targets and 10 deployment mutations rejected\n'
 
 # The archive name is the requested release target; an untagged source record
 # identifies the actual commit and does not pretend that target tag exists.
