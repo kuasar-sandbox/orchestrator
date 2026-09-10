@@ -280,7 +280,9 @@ func TestResolveTargetUsesOnlyEffectiveCommandsAndExplicitTarget(t *testing.T) {
 		{name: "explicit image ignores inherited", requested: &image, start: "inherited", ready: "inherited-ready", want: image},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			p := &buildPipeline{spec: &configsock.BuildSpec{RequestedTarget: test.requested}, startCmd: test.start, readyCmd: test.ready}
+			// Already-admitted configuration cannot change target selection or
+			// turn an otherwise valid target into an asynchronous failure.
+			p := &buildPipeline{spec: &configsock.BuildSpec{RequestedTarget: test.requested, HasSandboxConfig: true, HasInstanceConfig: true}, startCmd: test.start, readyCmd: test.ready}
 			if err := p.resolveTarget(); err != nil {
 				t.Fatal(err)
 			}

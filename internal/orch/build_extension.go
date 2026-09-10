@@ -158,7 +158,12 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err := o.validateBuildOptions(builder, false); err != nil {
 		return nil, err
 	}
-	if err := validateExplicitBuildTargetConfig(builder.Target, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
+	target := builder.Target
+	if target == nil && profile == types.ProfileBare {
+		// Bare auto is known at registration. Keep the requested target intact.
+		target = &types.BuildTarget{Kind: types.BuildTargetImage}
+	}
+	if err := validateBuildTargetConfig(target, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	return &normalizedBuildRegistration{
@@ -171,7 +176,7 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	}, nil
 }
 
-func validateExplicitBuildTargetConfig(target *types.BuildTarget, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
+func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
 	if target == nil {
 		return nil
 	}
@@ -189,16 +194,37 @@ func validateExplicitBuildTargetConfig(target *types.BuildTarget, metadata, env 
 			sandboxcfg.NsMMDS,
 		} {
 			if _, present := metadata[namespace]; present {
-				return fmt.Errorf("explicit image target cannot carry Sandbox configuration %s", namespace)
+				return fmt.Errorf("image target cannot carry Sandbox configuration %s; select builder.target kind=sandbox with memory matching the configuration", namespace)
 			}
 		}
-		if len(env) != 0 || instanceOnly {
-			return fmt.Errorf("explicit image target cannot carry Sandbox instance configuration")
+		if len(env) != 0 {
+			return fmt.Errorf("image target cannot carry envVars; select builder.target kind=sandbox (memory=false is sufficient for envVars)")
+		}
+		if instanceOnly {
+			return fmt.Errorf("image target cannot carry secure, credentials, or MMDS instance configuration; select builder.target kind=sandbox,memory=true")
 		}
 	case target.Kind == types.BuildTargetSandbox && !target.Memory && instanceOnly:
 		return fmt.Errorf("sandbox target with memory=false cannot carry traffic, credentials, MMDS, secure, or checkpoint configuration")
 	}
 	return nil
+}
+
+// Run after Trigger hooks and source alias resolution, before committing waiting.
+// Only e2b auto without explicit commands can still depend on task-local source
+// E metadata. Do not read that artifact in the conductor or reject parameters
+// after its asynchronous target resolution.
+func validateKnownBuildTargetConfig(build *types.Build) error {
+	target := build.Builder.Target
+	if target == nil {
+		if build.Profile == types.ProfileE2B && build.StartCmd == "" && build.ReadyCmd == "" && buildSourceMayInheritCommands(build) {
+			return nil
+		}
+		resolved := types.ResolveBuildTarget(nil, build.StartCmd, build.ReadyCmd)
+		target = &resolved
+	}
+	return validateBuildTargetConfig(target, build.Metadata, build.Env, build.Secure,
+		sandboxcfg.MMDSDocument{RoutesPresent: build.Metadata[sandboxcfg.NsMMDS] != ""},
+		sandboxcfg.Credentials{ServiceSecret: build.ServiceSecret, EnvdAccessToken: build.EnvdAccessToken, TrafficAccessToken: build.TrafficAccessToken})
 }
 
 // mmdsSecretHeader retains request-scoped initial MMDS values entirely inside

@@ -7,7 +7,7 @@
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
 # as an envd-managed process. One durable conductor database is exercised
-# across publication-policy restarts, fourteen successful builds, one
+# across publication-policy restarts, fifteen successful builds, one
 # deterministic failed build, and six creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
@@ -1513,6 +1513,37 @@ assert "e2b.start_cmd" not in metadata and "e2b.ready_cmd" not in metadata, meta
 PY
 echo "==> PASS: B7 direct top-level Sandbox E assembly preserved target resources/env and started no A/B/C VM"
 
+# ---- B9: synchronous rejection, then source-dependent auto Image ----------
+# B7 has no command defaults. An allocatable override larger than its capacity
+# must be ignored once auto resolves to Image, including conductor preparation.
+REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"storage\":\"4GiB\"}}"
+code=$(req POST /v3/templates "$AK" '{"profile":"bare","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"}}')
+[ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "bare auto env registration = $code (want 400)"; }
+REQ_RESOURCE_HEADER='{"allocatable":{"memory":"512GiB"}}'
+code=$(req POST /v3/templates "$AK" '{"name":"e2e-auto-options","profile":"e2b","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"},"secure":true}')
+unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B9 registration = $code (want 202)"; }
+B9_TID=$(json_field "$WORK/resp.body" templateID)
+B9_BID=$(json_field "$WORK/resp.body" buildID)
+code=$(req POST "/v2/templates/$B9_TID/builds/$B9_BID" "$AK" "{\"fromTemplate\":\"$B6_PERSIST\"}")
+[ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "B9 known Image trigger = $code (want 400)"; }
+[ ! -e "$WORK/run/builds/$B9_BID" ] || fail "B9 rejected Trigger started execution"
+# Retry the same registration with an E source whose commands are task-local.
+code=$(req POST "/v2/templates/$B9_TID/builds/$B9_BID" "$AK" "{\"fromTemplate\":\"$B7_PERSIST\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B9 source-dependent Trigger = $code (want 202)"; }
+wait_ready "$B9_TID" "$B9_BID" B9 null img
+B9_PERSIST="$PERSIST"
+assert_phase_history "$B9_BID" b c B9
+B9_REF=$(persist_ref "$B9_PERSIST") || fail "B9 persistent id is invalid"
+MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$B9_REF" >"$WORK/b9-image.json" 2>"$WORK/b9-image.err" \
+    || { cat "$WORK/b9-image.err"; fail "flatten-ctl info B9 image"; }
+python3 - "$WORK/b9-image.json" <<'PY' || fail "B9 injected unsupported registered env into Image"
+import json, sys
+assert "IGNORED_AUTO_ENV" not in json.dumps(json.load(open(sys.argv[1])))
+PY
+echo "==> PASS: B9 rejected known Image synchronously; E-source auto ignored incompatible options and skipped C"
+
 # ---- B8: SBX source + explicit memory Sandbox, no commands -----------------
 echo "==> B8: fromTemplate=$B7_PERSIST (SBX), explicit sandbox memory=true, no steps/start/ready"
 register e2e-memory e2b '{"kind":"sandbox","memory":true}' 1
@@ -1555,7 +1586,7 @@ PY
 echo "==> PASS: B8 SBX source forced B, cold C captured memory after fixed wait, and final S→E excludes source E"
 
 # ---- canonical Create after retention-bounded Build rows are reaped --------
-for terminal_bid in "$B1_BID" "$B5_BID" "$B7_BID" "$B8_BID"; do
+for terminal_bid in "$B1_BID" "$B5_BID" "$B7_BID" "$B8_BID" "$B9_BID"; do
     wait_build_row_deleted "$terminal_bid" \
         || fail "terminal Build row $terminal_bid survived builder.terminal_ttl"
 done
@@ -1801,4 +1832,4 @@ objs=$(find "$WORK/store" -type f | wc -l)
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST P5=$P5_PERSIST)"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST B9=$B9_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST P5=$P5_PERSIST)"

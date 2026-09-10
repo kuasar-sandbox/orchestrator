@@ -257,6 +257,9 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = internalBuildSteps(publicBuildSteps(spec.Steps))
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
+	if err := validateKnownBuildTargetConfig(b); err != nil {
+		return fmt.Errorf("%w: %w", api.ErrBadRequest, err)
+	}
 	// Node builder.insecure_registry (plain HTTP) and a per-build registry TLS
 	// policy address disjoint registry schemes; allowing both would be
 	// contradictory, so reject the combination. (fromTemplate + registry.tls
@@ -838,24 +841,25 @@ func retainBuildCleanup(err, cleanup error, port string, persisted bool) *buildC
 // form before network attachment, then carries the atomically persisted
 // network/resources, final handoff, and result channel for the pipeline.
 type pendingBuild struct {
-	build            *types.Build
-	runDir           string
-	baseDir          string
-	sourceTemplate   bool
-	handoff          *buildTaskHandoff
-	spec             sandboxcfg.SandboxSpec
-	network          sandboxcfg.NetworkSpec
-	templateNetwork  sandboxcfg.NetworkSpec
-	resources        rtconfig.ResourcesConfig
-	sandboxResources rtconfig.ResourcesConfig
-	checkpointPolicy sandboxcfg.SnapshotPolicy
-	tapFD            vswitch.TapFD
-	mac              string
-	floating         string
-	envdToken        string
-	resultMu         sync.Mutex
-	resultClosed     bool
-	result           chan configsock.BuildResult
+	build                  *types.Build
+	runDir                 string
+	baseDir                string
+	sourceTemplate         bool
+	sourceHasBuildCommands bool
+	handoff                *buildTaskHandoff
+	spec                   sandboxcfg.SandboxSpec
+	network                sandboxcfg.NetworkSpec
+	templateNetwork        sandboxcfg.NetworkSpec
+	resources              rtconfig.ResourcesConfig
+	sandboxResources       rtconfig.ResourcesConfig
+	checkpointPolicy       sandboxcfg.SnapshotPolicy
+	tapFD                  vswitch.TapFD
+	mac                    string
+	floating               string
+	envdToken              string
+	resultMu               sync.Mutex
+	resultClosed           bool
+	result                 chan configsock.BuildResult
 }
 
 func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
@@ -1161,7 +1165,8 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			return nil, buildFailed("artifact_prepare", err)
 		}
 		inherited = inheritedNetwork
-		if buildMayProduceSandbox(b, sourceTemplate) {
+		pend.sourceHasBuildCommands = summary.HasBuildCommands
+		if buildProducesSandbox(b, pend.sourceHasBuildCommands) {
 			pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
 			if err != nil {
 				return nil, buildFailed("resource_resolve", err)
@@ -1177,7 +1182,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
-	if buildMayProduceMemorySandbox(b, sourceTemplate) {
+	if buildProducesMemorySandbox(b, pend.sourceHasBuildCommands) {
 		pend.checkpointPolicy, err = o.resolveSnapshotPolicy(b.Metadata, sandboxcfg.SnapshotPolicy{})
 		if err != nil {
 			return nil, buildFailed("resource_resolve", err)
@@ -1188,7 +1193,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		return nil, buildFailed("network_attach", err)
 	}
 	envdTok := ""
-	if b.Profile == types.ProfileE2B && buildMayProduceMemorySandbox(b, sourceTemplate) {
+	if b.Profile == types.ProfileE2B && buildProducesMemorySandbox(b, pend.sourceHasBuildCommands) {
 		envdTok = b.EnvdAccessToken
 		if envdTok == "" {
 			envdTok, err = keys.MintToken()
@@ -1199,7 +1204,8 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	}
 	durable := buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
-		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
+		SourceHasBuildCommands: pend.sourceHasBuildCommands,
+		Network:                pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,
 		CheckpointPolicy: sandboxcfg.CloneSnapshotPolicy(pend.checkpointPolicy),
 	}
@@ -1478,7 +1484,7 @@ func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build, sourceTemplate 
 	// resource resolution until its task-local summary arrives; resolving first
 	// against node defaults can incorrectly reject a request that is valid over
 	// the source capacity (for example a larger startup allocation).
-	if !sourceTemplate && buildMayProduceSandbox(b, false) {
+	if !sourceTemplate && buildProducesSandbox(b, false) {
 		targetResources, err = o.resolveBuildTargetResources(spec, nil)
 		if err != nil {
 			return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
@@ -1487,24 +1493,21 @@ func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build, sourceTemplate 
 	return spec, phaseResources, targetResources, nil
 }
 
-// buildMayProduceSandbox reports whether the request can resolve to either
-// Sandbox target. Auto builds sourced from a Sandbox are deliberately treated
-// as unknown until the task-local E supplies inherited commands.
-func buildMayProduceSandbox(build *types.Build, sourceTemplate bool) bool {
+// buildProducesSandbox is used once command defaults are known, either because
+// there is no Sandbox source or its task-local preparation supplied a summary.
+func buildProducesSandbox(build *types.Build, sourceHasCommands bool) bool {
 	if build.Builder.Target != nil {
 		return build.Builder.Target.Kind == types.BuildTargetSandbox
 	}
-	return sourceTemplate || build.StartCmd != "" || build.ReadyCmd != ""
+	return build.Profile == types.ProfileE2B && (sourceHasCommands || build.StartCmd != "" || build.ReadyCmd != "")
 }
 
-// buildMayProduceMemorySandbox is narrower than buildMayProduceSandbox because
-// top-level Sandbox E builds never capture a checkpoint and must not depend on
-// the node's checkpoint backend configuration.
-func buildMayProduceMemorySandbox(build *types.Build, sourceTemplate bool) bool {
+// Only memory targets consume checkpoint policy and instance credentials.
+func buildProducesMemorySandbox(build *types.Build, sourceHasCommands bool) bool {
 	if build.Builder.Target != nil {
 		return build.Builder.Target.Kind == types.BuildTargetSandbox && build.Builder.Target.Memory
 	}
-	return sourceTemplate || build.StartCmd != "" || build.ReadyCmd != ""
+	return buildProducesSandbox(build, sourceHasCommands)
 }
 
 // resolveBuildExecutionResources derives A/B VM sizing solely from immutable
@@ -1999,7 +2002,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 func (o *Orchestrator) publishBuildFinal(pend *pendingBuild, spec *configsock.BuildSpec) *types.Sandbox {
 	var mmdsRow *types.Sandbox
 	if pend.build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled &&
-		buildMayProduceMemorySandbox(pend.build, pend.sourceTemplate) {
+		buildProducesMemorySandbox(pend.build, pend.sourceHasBuildCommands) {
 		mmdsRow = o.publishRecoveredBuildMMDS(pend.build)
 	}
 	pend.handoff.PublishFinal(spec, nil)

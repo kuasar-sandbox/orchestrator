@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -75,9 +74,6 @@ func TestValidateBuildResultFailsClosedOnTargetOrArtifactMismatch(t *testing.T) 
 		{name: "image with sandbox ref", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: ref, SandboxRef: ref}},
 		{name: "top-level Sandbox E wrong ref", build: &types.Build{Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SnapshotRef: ref}},
 		{name: "memory wrong ref", build: &types.Build{Builder: types.BuildOptions{Target: &memory}}, result: types.BuildResult{Target: memory, SandboxRef: ref}},
-		{name: "auto image drops Sandbox config", build: &types.Build{Metadata: map[string]string{sandboxcfg.NsFiles: `[]`}}, result: types.BuildResult{Target: image, ImageRef: ref}},
-		{name: "top-level Sandbox E drops instance config", build: &types.Build{Secure: true, Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SandboxRef: ref}},
-		{name: "top-level Sandbox E drops traffic config", build: &types.Build{Metadata: map[string]string{sandboxcfg.NsTraffic: `{"max_inflight":{"total":1}}`}, Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SandboxRef: ref}},
 		{name: "malformed portable ref", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: "manifest://short"}},
 		{name: "successful failure stage", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: ref, FailureStage: "runtime"}},
 		{name: "failed result with artifact", build: &types.Build{}, result: types.BuildResult{Error: "failed", Target: image, ImageRef: ref}},

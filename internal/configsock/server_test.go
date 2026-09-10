@@ -445,10 +445,10 @@ func TestBuildBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 	}
 }
 
-func TestBuildBootstrapRejectsPreV4SchemasBeforeProviders(t *testing.T) {
+func TestBuildBootstrapRejectsPreviousVersionsBeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "builder.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	for _, version := range []int{1, 2, 3} {
+	for version := 1; version < BuildTaskSchemaVersion; version++ {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			var authCalls, secretCalls atomic.Int32
 			_, client := startTestServer(t, Deps{Provider: stubProvider{
@@ -512,10 +512,10 @@ func TestBuildPrepareRejectsUnversionedV1BeforeProviders(t *testing.T) {
 	}
 }
 
-func TestBuildPrepareRejectsPreV4BeforeProviders(t *testing.T) {
+func TestBuildPrepareRejectsPreviousVersionsBeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "builder.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	for _, version := range []int{1, 2, 3} {
+	for version := 1; version < BuildTaskSchemaVersion; version++ {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			var authCalls, completionCalls atomic.Int32
 			_, client := startTestServer(t, Deps{Provider: stubProvider{

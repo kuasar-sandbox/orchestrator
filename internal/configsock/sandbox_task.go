@@ -81,13 +81,16 @@ type ArtifactNetwork struct {
 // the one launch worker for its exact run. ResolutionDigest is an idempotency
 // fingerprint, not an authentication credential.
 type ArtifactPrepareSummary struct {
-	SchemaVersion      int                        `json:"schema_version"`
-	PreparedSourceKind string                     `json:"prepared_source_kind"`
-	Capacity           ArtifactCapacity           `json:"capacity"`
-	Network            ArtifactNetwork            `json:"network,omitempty"`
-	DiskTopology       types.ArtifactDiskTopology `json:"disk_topology"`
-	ResolutionDigest   string                     `json:"resolution_digest"`
-	RequiredRefCount   int                        `json:"required_ref_count"`
+	SchemaVersion      int    `json:"schema_version"`
+	PreparedSourceKind string `json:"prepared_source_kind"`
+	// HasBuildCommands is Build-only and gated by BuildTaskSchemaVersion 6.
+	// Source command text stays task-local; ordinary Sandbox summaries omit it.
+	HasBuildCommands bool                       `json:"has_build_commands,omitempty"`
+	Capacity         ArtifactCapacity           `json:"capacity"`
+	Network          ArtifactNetwork            `json:"network,omitempty"`
+	DiskTopology     types.ArtifactDiskTopology `json:"disk_topology"`
+	ResolutionDigest string                     `json:"resolution_digest"`
+	RequiredRefCount int                        `json:"required_ref_count"`
 }
 
 // CloneArtifactPrepareSummary isolates every slice-bearing summary field so an
@@ -106,6 +109,7 @@ func CloneArtifactPrepareSummary(summary ArtifactPrepareSummary) ArtifactPrepare
 func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
 	return a.SchemaVersion == b.SchemaVersion &&
 		a.PreparedSourceKind == b.PreparedSourceKind &&
+		a.HasBuildCommands == b.HasBuildCommands &&
 		equalArtifactCapacity(a.Capacity, b.Capacity) &&
 		a.Network.Hostname == b.Network.Hostname &&
 		slices.Equal(a.Network.DNS, b.Network.DNS) &&

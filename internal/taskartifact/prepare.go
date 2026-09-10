@@ -77,6 +77,7 @@ type canonicalResolution struct {
 	PublicationParent    string                      `json:"publication_parent,omitempty"`
 	PreparedSourceKind   string                      `json:"prepared_source_kind"`
 	PreparedSourceRef    string                      `json:"prepared_source_ref"`
+	HasBuildCommands     bool                        `json:"has_build_commands,omitempty"`
 	Capacity             configsock.ArtifactCapacity `json:"capacity"`
 	Network              configsock.ArtifactNetwork  `json:"network"`
 	DiskTopology         types.ArtifactDiskTopology  `json:"disk_topology"`
@@ -338,6 +339,10 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			Name: name, Path: pathLocations[name], URI: uriLocations[name],
 		})
 	}
+	// This capability is Build-only. Ordinary Sandbox tasks retain their wire
+	// summary and digest, including when E has e2b command metadata.
+	hasBuildCommands := spec.ReadSourceImageConfig && sourceSandboxConfig != nil &&
+		(sourceSandboxConfig.Metadata[sandboxcfg.E2BStartCommandMetadata] != "" || sourceSandboxConfig.Metadata[sandboxcfg.E2BReadyCommandMetadata] != "")
 	canonical := canonicalResolution{
 		SchemaVersion: configsock.ArtifactPrepareSchemaVersion,
 		SourceKind:    string(sourceKind), SourceRef: spec.RootRef, LaunchMode: string(launchMode),
@@ -345,7 +350,8 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		PreflightImageBundle: spec.PreflightImageBundle,
 		PublicationParent:    spec.RefLocationParent,
 		PreparedSourceKind:   string(prepared.Kind), PreparedSourceRef: prepared.Ref,
-		Capacity: capacity, Network: network, DiskTopology: topology, RequiredRefs: requiredRefs,
+		HasBuildCommands: hasBuildCommands,
+		Capacity:         capacity, Network: network, DiskTopology: topology, RequiredRefs: requiredRefs,
 		Locations: canonicalLocations, CarrierBindings: bindings,
 	}
 	encoded, err := json.Marshal(canonical)
@@ -360,7 +366,8 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		Summary: configsock.ArtifactPrepareSummary{
 			SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 			PreparedSourceKind: string(prepared.Kind), Capacity: capacity,
-			Network: network, DiskTopology: topology, ResolutionDigest: hex.EncodeToString(digest[:]),
+			HasBuildCommands: hasBuildCommands,
+			Network:          network, DiskTopology: topology, ResolutionDigest: hex.EncodeToString(digest[:]),
 			RequiredRefCount: len(requiredRefs),
 		},
 		RefLocationURIs: uriLocations, CarrierBindings: bindings,
