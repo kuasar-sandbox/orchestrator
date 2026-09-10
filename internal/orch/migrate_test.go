@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -391,6 +390,40 @@ func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 	}
 }
 
+// TestImportRejectsLocationUnsafeStableID covers admission for the stable id
+// carried by the token: the value later keys the entity's publication
+// location names, so it must satisfy the opaque-id contract (which is also a
+// location-name-safe subset) before the row is inserted.
+func TestImportRejectsLocationUnsafeStableID(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
+	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Portable manifest ref: export skips promote entirely, so the test
+	// isolates the import admission check.
+	source := migrationSandbox(t, dir, "logical-g0", mk, "manifest://"+strings.Repeat("b", 64))
+	source.StableIDValue = "not/a valid id"
+	// Credentials bind the stable id; re-materialize after it is set.
+	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.Put(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "other-target"); err == nil ||
+		!errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "stable ID") {
+		t.Fatalf("import = %v, want a bad-request stable ID rejection", err)
+	}
+}
+
 func TestImportIsInsertOnlyAndMapsDuplicateToAlreadyExists(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
@@ -713,23 +746,19 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	cfg := o.cfg
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
-	// Pin the publication clock so the expected name is a constant even if
-	// the test straddles UTC midnight.
-	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
-	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "0198f7a1-1234-7234-9abc-0123456789ab"
 	localRef := makeLocalSnapshot(t, dir, sid)
-	// The publication name is the sandbox id plus the publication date; the
-	// fake sandbox-ctl echoes a ref carrying whatever name promote passed.
+	// The publication name is the bare sandbox id; the fake sandbox-ctl
+	// echoes a ref carrying whatever name promote passed.
 	argsPath := filepath.Join(dir, "promote.args")
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\n" +
 		"for a in \"$@\"; do\n" +
 		"  case \"$a\" in\n" +
-		"    *-20*=*)\n" +
+		"    *=*)\n" +
 		"      n=${a%%=*}\n" +
 		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ".bundle@location:'\"$n\"\n" +
 		"      ;;\n" +
@@ -768,7 +797,7 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	if locName == "" {
 		t.Fatalf("promote args = %q, want a publication name=uri pair", args)
 	}
-	wantName := reflocation.PublicationName(sid, publishedAt)
+	wantName := reflocation.PublicationName(sid)
 	if locName != wantName {
 		t.Fatalf("publication name = %q, want %q", locName, wantName)
 	}
@@ -979,7 +1008,9 @@ func installPromoteRecordingStub(t *testing.T, mref, argsPath string) {
 
 func installStoreTrigger(t *testing.T, dbPath, statement string) {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+dbPath)
+	// Fault injection can race a cleanup worker's transaction. Use the same
+	// bounded busy wait as the store so trigger removal does not fail spuriously.
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -60,7 +60,6 @@ type Orchestrator struct {
 	executables configresolve.Executables
 
 	sandboxReadyTimeout time.Duration
-	now                 func() time.Time // publication-date clock for promote; overridable in tests
 
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
@@ -212,7 +211,6 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		removeSandboxBaseDir: os.RemoveAll,
 		removeBuildRunDir:    os.RemoveAll,
 		removeBuildBaseDir:   os.RemoveAll,
-		now:                  time.Now,
 		files:                files,
 	}
 	wait := cfg.Units.PoolWaitDuration()
@@ -2816,11 +2814,14 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 	}
 	args := []string{"publish", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		// Publication location name: the sandbox id plus the publication
-		// date. The date suffix is what the time-ordered layout buckets by;
-		// a same-day retry reuses the same name (and directory), while a
-		// cross-midnight retry simply ages out with its own bucket.
-		locName := reflocation.PublicationName(sb.ID, o.now())
+		// Publication location name: the sandbox's stable identity. The name
+		// is the directory key, so every publication of one logical entity —
+		// across renames (import with a new target id), node migrations, and
+		// cluster generations — converges on one directory where
+		// content-addressed files accumulate as versions (same-content files
+		// are deduplicated by the publisher). Rows sharing a stable id (an
+		// identity-preserving copy) publish into that one directory too.
+		locName := reflocation.PublicationName(sb.StableID())
 		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
 		if err != nil {
 			return types.ResumeSource{}, fmt.Errorf("orch: promote %s: %w", sb.ID, err)

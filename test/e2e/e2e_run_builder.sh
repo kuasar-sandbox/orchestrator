@@ -663,11 +663,10 @@ ref, parent = sys.argv[1:]
 match = re.search(r"@location:([A-Za-z0-9][A-Za-z0-9._-]{0,127})$", ref)
 assert match, ref
 name = match.group(1)
-assert len(name) > 9 and name[-9] == "-" and name[-8:].isdigit(), name
 payload = ref.removeprefix("file://").split("@", 1)[0]
 assert payload and "/" not in payload, payload
 digest = hashlib.sha256(name.encode()).hexdigest()
-directory = pathlib.Path(parent, name[-8:], digest[:2], digest[2:4], name)
+directory = pathlib.Path(parent, digest[:2], digest[2:4], name)
 print(f"{name}\t{directory}\t{directory / payload}")
 PY
 }
@@ -680,13 +679,14 @@ artifact_info() { # ref output stderr
     local ref="$1" output="$2" error_output="$3" binding="" location_dir=""
     local args=(info --json --manifest-config "$WORK/manifest.yaml")
     if [[ "$ref" == *"@location:"* ]]; then
-        # Include every currently materialized publication mapping. This makes
-        # the assertion correct even when image and checkpoint publication
-        # straddle UTC midnight and therefore use different location names.
+        # Include every currently materialized publication mapping. With the
+        # undated layout one Build's image and checkpoint publications share
+        # one BuildID-keyed location, but older publications still resolve
+        # through their own names.
         while IFS= read -r -d '' location_dir; do
             binding="$(basename "$location_dir")=file://$location_dir"
             args+=(--ref-location "$binding")
-        done < <(find "$WORK/ref-locations" -mindepth 4 -maxdepth 4 -type d -print0 | sort -z)
+        done < <(find "$WORK/ref-locations" -mindepth 3 -maxdepth 3 -type d -print0 | sort -z)
     fi
     MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" "${args[@]}" "$ref" >"$output" 2>"$error_output"
 }
@@ -1788,14 +1788,12 @@ PY
 assert_located_final "$P5_IMAGE_REF" .bundle
 P5_SNAPSHOT_DIR=$(dirname "$(located_file_path "$P5_REF")")
 P5_IMAGE_DIR=$(dirname "$(located_file_path "$P5_IMAGE_REF")")
-if [ "$P5_SNAPSHOT_DIR" = "$P5_IMAGE_DIR" ]; then
-    assert_bundle_directory_only "$P5_REF" 2
-else
-    # Publication names are intentionally minted at the actual publication
-    # time, so a build crossing UTC midnight has two valid date locations.
-    assert_bundle_directory_only "$P5_REF" 1
-    assert_bundle_directory_only "$P5_IMAGE_REF" 1
+# Undated publication names: image and checkpoint publications of one Build
+# always share one BuildID-keyed directory.
+if [ "$P5_SNAPSHOT_DIR" != "$P5_IMAGE_DIR" ]; then
+    fail "P5 image and checkpoint publications split across directories: $P5_IMAGE_DIR != $P5_SNAPSHOT_DIR"
 fi
+assert_bundle_directory_only "$P5_REF" 2
 assert_phase_history "$P5_BID" a - P5
 assert_phase_history "$P5_BID" - b P5
 assert_phase_history "$P5_BID" c - P5

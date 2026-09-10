@@ -724,7 +724,8 @@ Header `{}` 清除两个低优先级选择，改用正常默认值。
 本次新增 Create 配置的两个非空字段都使用现有 `ValidLocalSandboxID` 契约：
 1..57 字节，只允许小写 ASCII 字母、数字和连字符，首尾必须是字母或数字。
 精确模式是 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。大写、点、斜线、空白、NUL
-和超长值直接拒绝，不做自动转换。这不改变历史迁移 token 或可信集群 StableID 的契约。
+和超长值直接拒绝，不做自动转换。迁移 token 编码层保留历史 StableID 契约；节点 Import
+准入独立执行相同的 1..57 字节格式校验（§7）。
 
 对象只接受 `id` 和 `stable_id`。空 Header、非对象 JSON、null（包括字段值 null）、
 重复 Header、重复或未知 JSON 字段、尾随 JSON、非法 ID 字符串和非字符串字段返回 400。
@@ -1315,6 +1316,9 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
   NodeSandboxID，StableID 等于 Registry 的公开 SandboxID。同节点 resume 保持两者；跨节点
   migration/re-place 只更换 NodeSandboxID。Forward/Exec KAT 的 canonical `sid` claim 始终
   绑定 StableID；这不把 copy 定义为 independently authorized fork。
+  发布位置也按 StableID 键控（§8.1.4）：import 改变 target ID 后再次导出仍进入原目录，
+  各个 cluster generation 也共享该目录。Import 准入使用 `types.ValidLocalSandboxID`
+  校验 token 携带的 StableID，非法身份在导入时拒绝，避免延后到导出时才因 Resolve 失败。
 - SQLite schema 直接使用 `stable_id`，不探测或迁移旧列，也没有双读/双写；不兼容的
   旧 preview database 必须按 schema 边界明确重建；这不是项目未曾发布 Stable Release 的声明。
 - **根凭据分工**:APISecret 与 ManifestKey 是同一租户范围内用途分离的根凭据,都是
@@ -1624,19 +1628,22 @@ sandbox-ctl publish --manifest-config <cfg> [--to-ref-location <name>=<uri>] <ar
 ```
 
 `promoteArtifact` 接受并返回 `ResumeSource`,kind 不变。没有 named location 时发布到 Manifest Store;
-配置 `checkpoint.remote.ref_location_parent` 时,publication name 为
-`<entity-id>-<YYYYMMDD>`,URI 为
-`<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`。local tarstream 可得到 located
+配置 `checkpoint.remote.ref_location_parent` 时,publication name 为实体 id——sandbox 发布用
+StableID、build 发布用 BuildID(见 `reflocation.PublicationName`),URI 为
+`<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`。local tarstream 可得到 located
 `.sandbox`/`.snapshot`:plaintext carrier 使用 `@digest:<digest>`,encrypted carrier 使用
 `@hmac:<digest>`。Bundle 得到使用 `@manifest:<root-key>` 选择 root Manifest 的 located `.bundle`。
 即使发布到 named location 也始终传 `--manifest-config`,因为 Bundle exact publication 仍须验证并
 发布其 Manifest graph。Bundle->Store 验证 recorded admission、physical digest 和 salt domain,
 根 Manifest 最后提交。
 
-首层日期目录按实际 publication 日期有序分区,再用 name 的 SHA-256 两级扇出限制单目录条目;
-晚发布的旧实体落入当前日期分区。GC retention、可达性、在途发布和安全删除策略不属于 node
-生命周期职责。conductor 与 task reader 共用 `internal/reflocation` 的 deterministic 解析,
-location name 自足,恢复不依赖额外 side table。
+name 本身即目录键:同一逻辑 sandbox 的全部 publication——重试、跨进程重启、import 换 target id 后的
+再导出、cluster 各 generation——收敛到同一个 StableID 目录;同一 Build 的 image/checkpoint 等
+named publication 收敛到同一个 BuildID 目录。目录内内容寻址的 `<digest>.<role>` 文件累积成多个
+版本,相同内容由 publisher 去重复用。SHA-256 两级扇出限制单目录条目。GC 不按 publication 年龄或
+日期分区清理,而是基于引用可达性(portable ref / TemplateID / migration token 指向的目录与文件),
+属于未来 management plane 职责。conductor 与 task reader 共用 `internal/reflocation` 的
+deterministic 解析,location name 自足,恢复不依赖额外 side table。
 
 `TemplateID` 为 `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
 
