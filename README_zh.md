@@ -110,6 +110,11 @@ make test-e2e                   # 组件 owner suite,需要项目组装的完整
 capability 的对象。本地排查可设置 `CLUSTER_STUB_KEEP_WORK=1` 保留运行目录,
 并私下检视;不要上传未脱敏文件。它不能替代真实 MicroVM 集成测试。
 
+真实 execute/MMDS 用例从已有私有运行目录生成交换机、netns、veth 和
+runner/builder unit 名称。清理只停止这些 unit 实例,只移除本次创建的资源。
+显式指定的名称若已存在,或交换机状态不一致,会被拒绝,不会接管或强制删除。
+`make test` 包含隔离清理回归;这些检查不能替代真实 execute 和 MMDS 两个用例。
+
 ## 部署概览
 
 独立节点通常先启动 Conductor 再启动 Proxy;集群增加独立 Registry、Router、Placer。

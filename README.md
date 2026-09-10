@@ -114,6 +114,13 @@ For local diagnosis, set `CLUSTER_STUB_KEEP_WORK=1` to retain the run directory
 and inspect it privately; do not upload its unredacted files. This does not
 replace the real MicroVM integration suite.
 
+The real execute/MMDS cases allocate switch, namespace, veth and runner/builder
+unit names from their existing private run directory. Cleanup stops only those
+unit instances and removes only resources created by that run. Explicit names
+that already exist or have inconsistent switch state are refused, not adopted
+or force-deleted. `make test` includes isolated cleanup regressions; those checks
+do not substitute for running both real execute and MMDS cases.
+
 Cross-repository contract changes require linked companion PRs and exact-source
 integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
 
