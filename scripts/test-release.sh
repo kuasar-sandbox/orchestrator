@@ -42,6 +42,7 @@ bash "$ROOT/scripts/test-release-materials.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
 GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
+GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 
 init_fixture_repo() {
   local directory="$1"
@@ -318,6 +319,7 @@ install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
+install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
 release_materials_download_go_toolchain() {
   GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
@@ -542,6 +544,41 @@ for target in darwin/amd64 linux/arm64; do
   grep -Fq 'must target linux/amd64' "$candidate/result.log" || fail "$target failed for an unrelated reason"
 done
 
+for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+  (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -buildvcs=true -o "$TMP/cgo-$binary" "./cmd/$binary")
+  release_materials_require_go_revision "$TMP/cgo-$binary" "$fixture_project_sha"
+  go version -m "$TMP/cgo-$binary" | grep -Fq 'CGO_ENABLED=1' \
+    || fail "CGO fixture did not preserve its actual build setting"
+  candidate="$TMP/wrong-cgo-$binary"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  install -m 0755 "$TMP/cgo-$binary" "$candidate/root/bin/$binary"
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted a CGO_ENABLED=1 payload with regenerated metadata and checksums: $binary"
+  fi
+  grep -Fq 'with CGO_ENABLED=0' "$candidate/result.log" || fail "CGO fixture failed for an unrelated reason"
+done
+
+for extra in bin/unexpected-tool deploy/unexpected.service bin/extra/; do
+  candidate="$TMP/extra-entry-${extra//\//-}"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  case "$extra" in
+    */) mkdir -m 0755 "$candidate/root/$extra" ;;
+    *) printf 'fixture extra payload\n' > "$candidate/root/$extra"
+       case "$extra" in bin/*) chmod 0755 "$candidate/root/$extra" ;; *) chmod 0644 "$candidate/root/$extra" ;; esac ;;
+  esac
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted an uncontracted archive entry: $extra"
+  fi
+  grep -Fq 'unexpected member' "$candidate/result.log" || fail "extra entry failed for an unrelated reason"
+done
+
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-arguments; do
   candidate="$TMP/wrong-main-$binary"
   cp -a "$TMP/bundle" "$candidate"
@@ -589,7 +626,7 @@ for copied_file in deploy/node-ctl.service deploy/node-proxy.service \
   grep -Fq 'release deployment bytes differ from selected source' "$candidate/result.log" \
     || fail "changed deployment failed for an unrelated reason: $copied_file"
 done
-printf 'test-release: 4 swapped CLIs, command-line main, 2 targets and 10 deployment mutations rejected\n'
+printf 'test-release: 4 swapped CLIs, command-line main, 2 targets, 4 CGO builds, 3 extra entries and 10 deployment mutations rejected\n'
 
 # The archive name is the requested release target; an untagged source record
 # identifies the actual commit and does not pretend that target tag exists.

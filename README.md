@@ -221,8 +221,14 @@ packages; use versioned module replacements. Existing Kuasar sibling replacement
 and ordinary source development are unchanged.
 
 Each of the four Go executables must identify its own Orchestrator command main
-package and module and target Linux/amd64. Swapping executables from the same
-commit is rejected. Deployment files are copied from the fresh selected checkout
+package and module and target Linux/amd64 with `CGO_ENABLED=0`. Swapping
+executables from the same commit or enabling CGO is rejected. The archive gate
+requires the four official binaries and ten deployment files, rejects extra
+payloads, aliases, duplicate entries and links, and checks exact modes and numeric
+root ownership before extraction. License/source materials remain component-scoped.
+The bounded reader limits one member to 512 MiB, expanded data to 1 GiB and the
+entry count to 20,000; malformed headers or trailing data fail validation.
+Deployment files are copied from the fresh selected checkout
 and compared byte-for-byte with that commit's Git blobs during validation.
 Standalone validation needs that exact commit locally; the trusted publisher
 fetches source history for inspection without executing candidate deployment files.

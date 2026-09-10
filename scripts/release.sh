@@ -128,8 +128,9 @@ check_go_binary() {
   awk -F '\t' '
     $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
     $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
-    END { exit bad || os != 1 || arch != 1 }
-  ' <<< "$info" || fail "Go release payload must target linux/amd64: $file"
+    $2 == "build" && $3 ~ /^CGO_ENABLED=/ { cgo++; if ($3 != "CGO_ENABLED=0") bad=1 }
+    END { exit bad || os != 1 || arch != 1 || cgo != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64 with CGO_ENABLED=0: $file"
 }
 
 validate_copied_source_files() {
@@ -149,29 +150,9 @@ validate_copied_source_files() {
 }
 
 validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing"
-  tar -tzf "$archive" > "$listing"
-  awk '
-    /^\// { exit 1 }
-    { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
-  ' "$listing" || fail "$archive contains an unsafe path"
-  if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
-    fail "$archive contains release metadata JSON"
-  fi
-  awk '
-    { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^(bin|deploy)\// && path !~ /^share\/(licenses|sources)\/orchestrator\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside the orchestrator release layout"
-  tar --numeric-owner -tvzf "$archive" | awk '
-    $2 != "0/0" { exit 1 }
-    $1 ~ /^d/ { if ($1 != "drwxr-xr-x") exit 1; next }
-    $1 !~ /^-/ { exit 1 }
-    {
-      path=$6; sub(/^\.\//, "", path)
-      expected=(path ~ /^bin\// ? "-rwxr-xr-x" : "-rw-r--r--")
-      if ($1 != expected) exit 1
-    }
-  ' || fail "$archive contains an unsafe type, mode or ownership"
+  local archive="$1"
+  go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
 }
 
 requested_dependency_version() {
