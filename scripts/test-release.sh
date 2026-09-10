@@ -276,6 +276,9 @@ printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
 accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
 connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
 sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE)"
+git -C "$TMP/accelerator" tag v0.1.3 "$accelerator_sha"
+git -C "$TMP/connector" tag v0.1.2 "$connector_sha"
+git -C "$TMP/sandboxer" tag v0.1.3 "$sandboxer_sha"
 fixture_root="$TMP/project"
 mkdir -p "$fixture_root/scripts"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
@@ -357,6 +360,22 @@ SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-private AWS_SECRET_ACCESS_KEY=fixt
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
+RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
+  "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+for binding in accelerator=v9.0.0,connector=v0.1.2,sandboxer=v0.1.3 \
+  accelerator=v0.1.3,connector=v9.0.0,sandboxer=v0.1.3 \
+  accelerator=v0.1.3,connector=v0.1.2,sandboxer=v9.0.0 \
+  accelerator=v0.1.3,connector=v0.1.2 \
+  accelerator=v0.1.3,accelerator=v0.1.3,sandboxer=v0.1.3 \
+  accelerator=v0.1.3,connector=v0.1.2,unexpected=v0.1.3 \
+  'accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3,'; do
+  if RELEASE_DEPENDENCIES="$binding" "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 \
+    "$TMP/bundle" > "$TMP/dependency-binding.log" 2>&1; then
+    fail "validator accepted a conflicting or malformed dependency release request"
+  fi
+  grep -Eq 'source record|release binding|dependency|dependencies' "$TMP/dependency-binding.log" \
+    || fail "dependency binding was rejected for an unrelated reason"
+done
 go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
   ./bin/e2b-key-ctl ./deploy/node-ctl.service \

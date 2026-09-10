@@ -170,6 +170,10 @@ release target. Validation binds all project Go binaries and their project sourc
 URL/digest to the same commit. The publisher supplies its expected commit and
 rejects a different-source bundle before any Tag or Release write. Local packaging
 does not require creating target release tags.
+When `RELEASE_DEPENDENCIES` is supplied, validation requires exactly the requested
+accelerator, connector and sandboxer release versions. Missing, duplicated,
+unexpected or conflicting bindings fail before publication. This does not add
+a remote-tag requirement to ordinary local-replacement source builds.
 
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the node and cluster binaries plus deployment files. Documentation and E2E sources are collected from the selected component tag into the project platform archive rather than duplicated in the component archive.
 

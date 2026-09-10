@@ -139,6 +139,28 @@ validate_archive_paths() {
   ' || fail "$archive contains an unsafe type, mode or ownership"
 }
 
+requested_dependency_version() {
+  local name="$1" binding="${RELEASE_DEPENDENCIES:-}" entry value result=""
+  local -a entries
+  [ -n "$binding" ] || return 0 # Local source packages can use untagged commits.
+  [[ "$binding" != *, && "$binding" != ,* && "$binding" != *,,* ]] \
+    || fail "invalid release dependency list"
+  IFS=, read -r -a entries <<< "$binding"
+  [ "${#entries[@]}" -eq 3 ] || fail "orchestrator release must bind its 3 internal dependencies"
+  for entry in "${entries[@]}"; do
+    case "${entry%%=*}" in accelerator|connector|sandboxer) ;; *) fail "unexpected orchestrator dependency" ;; esac
+    value="${entry#*=}"
+    [[ "$value" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+      || fail "invalid orchestrator dependency version"
+    if [ "${entry%%=*}" = "$name" ]; then
+      [ -z "$result" ] || fail "duplicate orchestrator dependency: $name"
+      result="$value"
+    fi
+  done
+  [ -n "$result" ] || fail "missing orchestrator dependency: $name"
+  printf '%s\n' "$result"
+}
+
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
   local version="$1" arch archive bundle="$3"
@@ -172,9 +194,13 @@ validate_bundle() {
   release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
     bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'accelerator' ""
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' 'connector' ""
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'sandboxer' ""
+  local expected_accelerator expected_connector expected_sandboxer
+  expected_accelerator="$(requested_dependency_version accelerator)" || fail "invalid accelerator release binding"
+  expected_connector="$(requested_dependency_version connector)" || fail "invalid connector release binding"
+  expected_sandboxer="$(requested_dependency_version sandboxer)" || fail "invalid sandboxer release binding"
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'accelerator' "$expected_accelerator"
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' 'connector' "$expected_connector"
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'sandboxer' "$expected_sandboxer"
   release_materials_require_go "$extract" "$NAME" 'bin/node-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/cluster-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/node-stub-ctl'

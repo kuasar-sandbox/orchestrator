@@ -174,6 +174,9 @@ checkout,以 `GOWORK=off` 和只读 module 解析重新构建 Go 载荷。不复
 验证器将所有项目 Go 二进制及项目来源 URL/摘要绑定到同一 commit。发布者传入其
 预期 commit,在任何 Tag/Release 写入前拒绝不同源码产生的包。本地打包不要求创建
 目标发行 Tag。
+提供 `RELEASE_DEPENDENCIES` 时,验证要求 accelerator、connector、sandboxer
+的发行版本与请求完全一致;绑定缺失、重复、包含其他组件或发生冲突时,发布前
+即失败。这不会给普通的本地 replace 源码构建增加远端 Tag 前置要求。
 
 项目聚合版本为 `release-vX.Y.Z`,选择精确组件 tag 并在真实 KVM 基础设施验证组合。
 组件版本与聚合版本通过 selection 关联,不要求版本号相同。
