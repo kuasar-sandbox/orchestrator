@@ -477,13 +477,24 @@ wait_for_reservation_growth() {
     fail "$sid: reservation did not grow above $baseline within ${timeout}s"
 }
 
+# Cold readiness is a fresh guest report with a complete CH observation and an
+# applied memory.high. A legal grow or unchanged reservation need not emit a
+# shrink settlement; the workload's Budget/grow assertions remain separate.
+memory_control_observed() {
+    local sid="$1" high
+    grep -qE 'memory: initial CH observation accepted epoch=[1-9][0-9]* seq=[1-9][0-9]*($|[[:space:]])' \
+        "$WORK/$sid.log" 2>/dev/null || return 1
+    high=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.high" 2>/dev/null) || return 1
+    [[ "$high" =~ ^[1-9][0-9]*$ ]]
+}
+
 wait_for_dynamic_control_ready() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if resource_reservation_matches "$sid" settled \
             && grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
-            && grep -q 'memory: initial CH observation accepted' "$WORK/$sid.log" 2>/dev/null \
+            && memory_control_observed "$sid" \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -542,7 +553,7 @@ wait_for_static_control_ready() {
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
-            && grep -q 'memory: initial CH observation accepted' "$WORK/$sid.log" 2>/dev/null \
+            && memory_control_observed "$sid" \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -891,7 +902,7 @@ phase_b2_dynamic_control() {
     SANDBOX_PIDS+=("$pid")
     b2_timeline_event "$sid" "sandbox_started pid=$pid"
 
-    # Synchronize past launch and the first fresh report-driven steady action.
+    # Synchronize past launch, a fresh report/CH observation and applied high.
     # Boot-time PSI may already reserve and deliver a grow before the workload
     # gate. Otherwise the first workload allocation is the pressure probe. In
     # both cases the allocation remains held until the reservation is reflected
