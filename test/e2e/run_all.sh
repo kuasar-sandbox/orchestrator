@@ -14,6 +14,17 @@ export REQUIRE_PROXY=1
 export REQUIRE_BUILDER=1
 export REQUIRE_RUNTASK=1
 
+# A cancelled execute case may be killed before its EXIT trap. Recover the
+# exact root-owned reservation before an earlier fixed-name case tries to add
+# the same floating-IP return route.
+recovery_status=0
+flock --nonblock --exclusive --close --conflict-exit-code 75 \
+    /run/systemd/system env BIN="$BIN" bash "$SCRIPT_DIR/lib/execute_state.sh" recover \
+    || recovery_status=$?
+[ "$recovery_status" -ne 75 ] \
+    || { echo "another execute/MMDS case holds the host runtime lock" >&2; exit 1; }
+[ "$recovery_status" -eq 0 ] || exit "$recovery_status"
+
 shopt -s nullglob
 cases=("$SCRIPT_DIR"/e2e_*.sh)
 [ "${#cases[@]}" -gt 0 ] || {
