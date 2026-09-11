@@ -1,7 +1,6 @@
-"""Exercise the real filtered subprocess and exact payload gate, without network."""
+"""Check offline Go payload records and isolated local module fixtures."""
 import json
 import os
-import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -48,7 +47,7 @@ class GoSourceEnvironment(unittest.TestCase):
                                  + "\nGONOSUMDB=" + private + "\nGOINSECURE=" + private + "\n")
         # Go reports an empty file path when GOENV=off disables persistence.
         expected = {"GOENV": "", "GOPRIVATE": "", "GONOPROXY": "none", "GONOSUMDB": "none",
-                    "GOINSECURE": "", "GOVCS": "*:off", "GOAUTH": "off", "GOTOOLCHAIN": "local",
+                    "GOINSECURE": "", "GOAUTH": "off", "GOTOOLCHAIN": "local",
                     "GOWORK": "off", "GOPROXY": "file://" + str(self.root / "proxy")}
         for ambient in (False, True):
             environment = dict(os.environ, GOENV=str(configuration))
@@ -62,73 +61,6 @@ class GoSourceEnvironment(unittest.TestCase):
                                         env=environment, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
-
-    def test_caller_credentials_and_private_go_configuration_are_not_inherited(self):
-        settings = {name: "fixture-must-not-propagate" for name in (
-            "GOENV", "GOFLAGS", "GO111MODULE", "GOWORK", "GOTOOLCHAIN", "GOPRIVATE",
-            "GONOPROXY", "GONOSUMDB", "GOINSECURE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_0", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_DIR",
-            "GIT_WORK_TREE", "GH_TOKEN", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
-            "SSH_AUTH_SOCK", "NETRC", "GOAUTH", "GIT_ASKPASS", "GIT_SSH_COMMAND",
-        )}
-        settings["GOMODCACHE"] = str(self.root / "untrusted-cache")
-        result = self.run_shell('release_materials_go_command "$2" "$3"', settings)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        observed = json.loads(self.capture.read_text())
-        self.assertNotIn("fixture-must-not-propagate", observed.values())
-        expected = {
-            "GOENV": "off", "GOAUTH": "off", "GOFLAGS": "", "GO111MODULE": "on", "GOWORK": "off",
-            "GOTOOLCHAIN": "local", "GOPRIVATE": "", "GONOPROXY": "", "GONOSUMDB": "",
-            "GOINSECURE": "", "GOVCS": "*:off", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": "/bin/false", "GIT_SSH_COMMAND": "/bin/false",
-            "GOPROXY": self.environment["GOPROXY"], "GOSUMDB": self.environment["GOSUMDB"],
-        }
-        for key, value in expected.items():
-            self.assertEqual(observed.get(key), value, key)
-        for name in ("home", "module-cache"):
-            directory = self.root / "verification" / name
-            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(observed["GOMODCACHE"], str(self.root / "verification/module-cache"))
-        self.assertEqual(observed["HOME"], str(self.root / "verification/home"))
-
-    def test_toolchain_download_uses_the_same_private_unauthenticated_environment(self):
-        jq = shutil.which("jq")
-        self.assertIsNotNone(jq, "release tests require jq")
-        (self.bin / "jq").symlink_to(jq)
-        executable = self.bin / "go"
-        executable.write_text("#!/usr/bin/python3\nimport json, os\n"
-            + "with open(" + repr(str(self.capture)) + ", 'w') as out: json.dump(dict(os.environ), out)\n"
-            + 'print(json.dumps({"Path":"golang.org/toolchain", "Version":"v0.0.1-go1.26.4.linux-amd64", "Sum":"h1:fixture", "Zip":"/fixture/toolchain.zip"}))\n')
-        executable.chmod(0o755)
-        command = 'WORK="$2"; RELEASE_MATERIALS_WORK="$2"; mkdir -p "$2"; _release_materials_download_go_toolchain go1.26.4'
-        extra = {key: "fixture-secret-must-not-propagate" for key in
-                 ("GOAUTH", "NETRC", "GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_PARAMETERS", "SSH_AUTH_SOCK")}
-        result = self.run_shell(command, extra)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        observed = json.loads(self.capture.read_text())
-        self.assertNotIn("fixture-secret-must-not-propagate", observed.values())
-        self.assertEqual(observed["GOAUTH"], "off")
-        self.assertEqual(observed["HOME"], str(self.root / "verification/toolchain-download/home"))
-        self.assertEqual(observed["GOMODCACHE"], str(self.root / "verification/toolchain-download/module-cache"))
-        self.capture.unlink()
-        result = self.run_shell(command, {"HTTPS_PROXY": "https://fixture:fixture@proxy.example.invalid"})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.capture.exists())
-
-    def test_unsigned_or_credentialed_routing_is_rejected_before_go(self):
-        for values in (
-            {"GOSUMDB": "off"}, {"GOPROXY": "file:///fixture"},
-            {"GOPROXY": "direct"}, {"GOPROXY": "https://proxy.example.invalid,direct"},
-            {"GOPROXY": "http://proxy.example.invalid"},
-            {"GOPROXY": "https://fixture:fixture@proxy.example.invalid"},
-            {"GOSUMDB": "sum.golang.org https://fixture:fixture@sum.example.invalid"},
-            {"HTTPS_PROXY": "http://fixture:fixture@proxy.example.invalid"},
-        ):
-            with self.subTest(setting=next(iter(values))):
-                result = self.run_shell('release_materials_go_command "$2" "$3"', values)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse(self.capture.exists())
 
     def test_only_exact_official_payload_keys_are_accepted(self):
         for identity in ALLOWED:
@@ -145,7 +77,7 @@ class GoSourceEnvironment(unittest.TestCase):
         self.assertNotEqual(self.run_shell(
             "release_materials_go_payload_allowed unknown bin/tool").returncode, 0)
 
-    def test_validator_rejects_aliases_before_authentication(self):
+    def test_validator_rejects_aliases_before_record_check(self):
         unit, official = ALLOWED[0].split(":", 1)
         stage = self.root / "stage"
         source = stage / "share/sources" / unit
@@ -162,51 +94,40 @@ class GoSourceEnvironment(unittest.TestCase):
             + official + "\tfixture\tv1.0.0\thttps://example.invalid\th1:fixture\t"
             + "share/licenses/" + unit + "/project\n")
         (source / "GO-MODULES.tsv").write_text("module\tversion\tchecksum\n")
-        (source / "MATERIALS.sha256").write_text("fixture inventory; authentication must come first\n")
+        (source / "MATERIALS.sha256").write_text("fixture inventory; record_check must come first\n")
         for file in source.iterdir():
             file.chmod(0o644)
         command = (
             'WORK="$2"; mkdir -p "$WORK"\n'
-            'release_materials_require_go() { touch "$WORK/authentication-reached"; return 1; }\n'
+            'release_materials_require_go() { touch "$WORK/record_check-reached"; return 1; }\n'
             'release_materials_validate "' + str(stage) + '" ' + unit)
-        marker = self.root / "verification/authentication-reached"
+        marker = self.root / "verification/record_check-reached"
         original_sources = (source / "SOURCES.tsv").read_text()
         cases = [
             {"payload": official.replace("bin/", "bin/./", 1)},
             {"payload": official.replace("bin/", "bin//", 1)},
-            {"oversized": True},
             {"source_repeats": 2},
-            {"source_rows": 16385},
-            *({"large_table": name} for name in
-              ("SOURCES.tsv", "GO-BUILD-INFO.tsv", "GO-MODULES.tsv", "MATERIALS.sha256")),
-            {"expect_authentication": True},
+            {"expect_record_check": True},
         ]
         for case in cases:
             payload = case.get("payload", official)
-            oversized = case.get("oversized", False)
             header, row = original_sources.splitlines(keepends=True)
-            rows = "".join(row.replace("\tfixture\t", "\tfixture-" + str(i) + "\t")
-                           for i in range(case["source_rows"])) if "source_rows" in case else row * case.get("source_repeats", 1)
+            rows = row * case.get("source_repeats", 1)
             (source / "SOURCES.tsv").write_text(header + rows)
             (source / "GO-MODULES.tsv").write_text("module\tversion\tchecksum\n")
-            (source / "MATERIALS.sha256").write_text("fixture inventory; authentication must come first\n")
+            (source / "MATERIALS.sha256").write_text("fixture inventory; record_check must come first\n")
             (source / "GO-BUILD-INFO.tsv").write_text(
                 "payload\trecord\tname\tversion_or_value\tchecksum\n"
-                + (payload + "\ttoolchain\tgo\tgo1.26.4\t-\n") * (16385 if oversized else 1))
+                + (payload + "\ttoolchain\tgo\tgo1.26.4\t-\n") * 1)
             (source / "GO-BUILD-INFO.tsv").chmod(0o644)
-            if "large_table" in case:
-                with (source / case["large_table"]).open("r+b") as contents:
-                    contents.truncate(16777217)
             result = self.run_shell(command)
             self.assertNotEqual(result.returncode, 0)
-            if "source_repeats" in case or "source_rows" in case:
+            if "source_repeats" in case:
                 self.assertIn("invalid SOURCES.tsv records", result.stderr)
-            if "large_table" in case:
-                self.assertIn("source material is too large", result.stderr)
-            self.assertEqual(marker.exists(), case.get("expect_authentication", False),
-                             "validator did not reject the malformed record before authentication")
+            self.assertEqual(marker.exists(), case.get("expect_record_check", False),
+                             "validator did not reject the malformed record before record_check")
 
-    def test_required_payload_keys_do_not_repeat_authentication(self):
+    def test_required_payload_keys_do_not_repeat_record_check(self):
         unit = ALLOWED[0].split(":", 1)[0]
         payloads = [identity.split(":", 1)[1] for identity in ALLOWED]
         stage = self.root / "stage"
@@ -228,11 +149,11 @@ class GoSourceEnvironment(unittest.TestCase):
         self.assertNotIn('release_materials_require_go "$extract"', release)
         self.assertIn('release_materials_require_go_key "$extract"', release)
 
-    def test_payload_gate_precedes_expensive_authentication(self):
+    def test_payload_gate_precedes_expensive_record_check(self):
         source = HELPER.read_text().split("release_materials_validate() {", 1)[1]
         self.assertLess(source.index('release_materials_go_payload_allowed "$unit" "$payload"'),
                         source.index('release_materials_require_go "$root" "$unit" "$payload"'))
-        self.assertIn("NF != 5 || NR > 16385", source)
+        self.assertIn("NF != 5", source)
 
 
 if __name__ == "__main__":

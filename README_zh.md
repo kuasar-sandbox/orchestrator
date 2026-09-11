@@ -175,93 +175,47 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 ## 发布模型
 
-发行工作流在上传前把已完成归档的 SHA-256 记录为 build job output。发布者通过
-`RELEASE_ARCHIVE_SHA256` 接收这一独立值,在任何 Tag/Release 写入前核对;不能用
-下载后从 bundle 重新计算的值代替。即使重算 bundle 自身的校验和,全部载荷与材料
-仍须匹配该次已完成构建。本地打包和独立验证不要求这个发布输入。该记录不证明
-编译器来源,也不构成对不可信候选代码的隔离。
+使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
+`bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
+不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生
+构建记录与产物应一并保留。
 
-干净的 VCS 字段只是相符性检查,不能证明编译字节:Go 源码 overlay 可以保留同一
-revision 与 clean 标记。独立验证不重建或认证任意生产者的二进制。发布依靠上述
-独立的已完成构建摘要,而非这些字段,认证来自所选可信构建的归档。
+打包记录实际 Go 版本和生效的 module 替换。Go/module LICENSE、NOTICE 取自所选
+编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
+下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
+源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
+需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
 
-发行验证要求无凭据、仅 HTTPS 代理的 module 路由:拒绝 `direct` 回退,
-并用 `GOVCS=*:off` 禁止访问 module 选择的 VCS 主机。收集与验证最多接受
-512 个实际 Go module;每个 Go 验证子进程有五分钟期限,发布 job 有 30 分钟期限。
-每个声明文件及目录都必须属于已验证的源码、module、toolchain 或系统材料根目录;
-布局父目录不允许夹带未声明的兄弟材料。这些限制不改变普通开发的路由配置。
+材料放在 `share/licenses/<component>` 和 `share/sources/<component>`。
+后者包含 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv` 与
+`MATERIALS.sha256`。声明缺失、子目录不可读或遍历不完整时收集失败。
+独立验证检查交付清单、校验和、必需文件、来源记录相符性、载荷身份及归档路径/
+类型/权限。它不获取源码 checkout 或 Go 模块,不与远端源码树比较许可正文,
+也不下载或认证编译器分发。校验和及 VCS 记录是相符性检查,不能证明任意生产者的身份。
 
-Go 依赖及工具链下载使用全新的私有 module/VCS 状态、已启用的 checksum database
-和 `GOAUTH=off`。它们清除持久化 Go 设置、私有 module 绕过规则、Git 配置与调用者凭据,仅保留已验证的
-无凭据路由。下载来源或工具链之前,上传的 Go 记录键必须匹配官方载荷的精确名称;
-路径别名会被拒绝。这些发行检查不改变普通开发中的 module 认证方式。
-只有精确的 Accelerator、Connector 和 Sandboxer module 使用单独认证的内部
-源码声明。组织内的其他 module 与外部依赖一样,必须通过 module 校验和与许可材料验证。
-来源清单在逐行处理前拒绝重复或过量记录;每份元数据表上限为 16 MiB,
-来源清单上限为 16,384 行。
-来源键仅接受项目、选定内部依赖和各 Go 载荷工具链的精确集合;
-额外的归属声明不能作为已验证来源通过检查。
+归档名称标识请求的发行目标。项目及内部依赖记录在本地 Tag 匹配所选 commit 时
+使用发行版本,否则记录 `git:<commit>`;打包不要求创建未来目标 Tag。
+发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
+`release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
+权限分离及拒绝替换已发布资产的要求保持不变。
 
-可信发布端根据已验证请求生成标准发行正文及来源/Preview 标记。下载的
-`release-notes.md` 只是本地 bundle 辅助说明,不能决定公开发行正文或对账来源。
-
-打包从选定的 Orchestrator、Accelerator、Connector、Sandboxer commit 建立全新
-checkout,以 `GOWORK=off` 和只读 module 解析重新构建 Go 载荷。不复用被忽略的开发
-文件或预制二进制,拒绝 `RELEASE_BIN_DIR`。构建命令使用私有 home/缓存,不继承云/
-发布凭据;可保留无凭据的 HTTPS module/network proxy 路由。
-构建保留 `GOSUMDB`(包括无凭据的 HTTPS checksum mirror)与 `GOTOOLCHAIN`,
-不会把发行工作流的 `local` 策略静默改为自动下载工具链。未显式设置时,打包使用
-`sum.golang.org` 和本地 Go 工具链。
-
-发行打包记录全新构建上下文实际选定的 Go 编译器,在构建前后将其分发输入与匹配的
-`golang.org/toolchain` 归档逐项比较;归档由配置的 checksum database 认证。这覆盖
-编译器、标准库源码及该分发中的其他文件。完整 Go 安装中额外的非构建 `api`、
-`doc`、`misc`、`test` 文件不在认证范围,也不作为发行许可来源;核对时处理标准的
-`go.mod`/`_go.mod` 安装转换。Go 许可/NOTICE 正文来自已验证归档,包括编译器和
-标准库内嵌依赖的材料,保留各自相对路径。独立验证还会
-重新核对其字节、来源 URL 和 module h1。版本字符串或重算 bundle 校验和不能替代
-来源核对。验证要求启用 checksum database 并取得匹配的归档/缓存;即使采用
-`GOTOOLCHAIN=local`,也可能获取核验材料,但不切换构建编译器或静默启用工具链
-自动选择。这些检查以可信构建主机为前提,不证明已失陷主机可信。
-
-许可证收集拒绝不可读子目录和不完整遍历,不会仅发布可读的材料。官方组件包
-不支持没有已认证 module 校验和的第三方本地 Go 替换,应选择带版本的 module
-替换。现有 Kuasar 兄弟仓本地替换和普通源码开发不变。
-
-四个 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package、module
-及 `CGO_ENABLED=0` 的 Linux/amd64 目标,并且只有一个 `GOAMD64=v1` 基线设置。
-更高的 CPU 级别会被拒绝。即使来自同一 commit,相互替换或启用
-CGO 的可执行文件也会被拒绝。归档门禁要求四个官方二进制和十个部署文件,拒绝
-额外载荷、路径别名、重复条目与链接,并在解包前核对精确模式及 root 数字属主。
-许可/来源材料仍按组件隔离。有限读取器限制单项 512 MiB、展开数据 1 GiB、
-条目数 20,000;损坏的头部或尾随数据会导致验证失败。
-部署文件从全新选定 checkout 复制,验证时与该 commit 的 Git blob 逐字节比较。
-独立验证需要本地具备该精确 commit;可信发布端获取源码历史以供检视,不执行
-候选部署文件。
-验证还将完整项目和内部依赖许可树与选定的 Git blob 比较,包括嵌套 `LICENSES`。
-本地验证沿用 `RELEASE_*_SOURCE_DIR` 和可选的 `RELEASE_*_SOURCE_SHA` 选择,
-默认使用兄弟 checkout。发布端只按已验证请求获取三个依赖 Tag,使用的只读源码
-Token 在验证前撤销;不会执行这些依赖 checkout。选定 Tag 必须解析为声明的来源
-commit、URL 和完整性值。即使重算校验和,内容变化、缺失或额外许可及改动的依赖
-来源仍会失败。
+四个官方 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package,
+目标为 Linux/amd64 且 `CGO_ENABLED=0`。打包从所选源码树复制十个部署文件,
+通过既有 `RELEASE_*_SOURCE_DIR`、可选 `RELEASE_*_SOURCE_SHA` 及版本选择
+收集实际 Accelerator、Connector、Sandboxer 依赖材料。独立验证只检查 bundle
+中的依赖 URL/commit 字段相互一致,不要求验证主机具备兄弟仓或依赖 Tag。
+解包前拒绝额外载荷、路径别名、重复条目、链接、错误 root 数字属主和错误权限。
+材料目录仍按组件隔离。
 
 本仓库独立发布 `vX.Y.Z`。x86_64 组件包包含节点/集群二进制和部署文件;
-文档与 E2E 从所选组件 tag 收集进项目 platform 包,不在组件包重复携带。
-包内来源记录只有在本地 Git Tag 与所选源码 commit 一致时才保留项目或内部依赖的
-发行版本。未打 Tag 的源码记录 `git:<commit>`,归档名称仍标识请求的发行目标。
-验证器将所有项目 Go 二进制及项目来源 URL/摘要绑定到同一 commit。发布者传入其
-预期 commit,在任何 Tag/Release 写入前拒绝不同源码产生的包。本地打包不要求创建
-目标发行 Tag。
-提供 `RELEASE_DEPENDENCIES` 时,验证要求 accelerator、connector、sandboxer
-的发行版本与请求完全一致;绑定缺失、重复、包含其他组件或发生冲突时,发布前
-即失败。这不会给普通的本地 replace 源码构建增加远端 Tag 前置要求。
+文档与 E2E 从所选组件 Tag 收集到项目平台包,不在组件包中重复携带。
 
-项目聚合版本为 `release-vX.Y.Z`,选择精确组件 tag 并在真实 KVM 基础设施验证组合。
+项目聚合版本为 `release-vX.Y.Z`,选择精确组件 Tag 并在真实 KVM 基础设施验证组合。
 组件版本与聚合版本通过 selection 关联,不要求版本号相同。
 
 完整组件分支、Preview/Stable/Latest、mutation group 与取消重试规则由项目
-[发布文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md) 唯一维护;
-下载见 [最新 Stable 聚合发布](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)。
+[发布文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)唯一维护;
+下载见[最新 Stable 聚合发布](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)。
 
 ## 文档
 

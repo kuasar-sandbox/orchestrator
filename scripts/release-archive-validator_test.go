@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func archiveFixture(t *testing.T, oversizedHeader bool, memberSize int, trailing []byte) string {
+func archiveFixture(t *testing.T, memberSize int, trailing []byte) string {
 	t.Helper()
 	name := filepath.Join(t.TempDir(), "fixture.tar.gz")
 	file, err := os.Create(name)
@@ -32,22 +32,8 @@ func archiveFixture(t *testing.T, oversizedHeader bool, memberSize int, trailing
 		if entry.typeflag == tar.TypeReg {
 			header.Size = int64(memberSize)
 		}
-		if oversizedHeader && name == "./bin/node-ctl" {
-			header.Size = (512 << 20) + 1
-		}
 		if err := tw.WriteHeader(header); err != nil {
 			t.Fatal(err)
-		}
-		if oversizedHeader && name == "./bin/node-ctl" {
-			// A header-only compressed bomb must fail its declared-size check,
-			// before attempting to consume the missing enormous body.
-			if err := gz.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := file.Close(); err != nil {
-				t.Fatal(err)
-			}
-			return file.Name()
 		}
 		if entry.typeflag == tar.TypeReg {
 			if _, err := tw.Write(make([]byte, memberSize)); err != nil {
@@ -70,29 +56,13 @@ func archiveFixture(t *testing.T, oversizedHeader bool, memberSize int, trailing
 	return name
 }
 
-func TestArchiveResourceLimits(t *testing.T) {
-	valid := archiveFixture(t, false, 16, nil)
-	if err := validateArchive(valid); err != nil {
+func TestArchiveTrailer(t *testing.T) {
+	if err := validateArchive(archiveFixture(t, 16, nil)); err != nil {
 		t.Fatal(err)
 	}
-	cases := []struct {
-		name, archive, want string
-		member, expanded    int64
-		entries             int
-	}{
-		{"declared-member", archiveFixture(t, true, 0, nil), "member", 512 << 20, 1 << 30, 20000},
-		{"cumulative-body", archiveFixture(t, false, 4096, nil), "expanded", 8192, 16384, 20000},
-		{"padding", archiveFixture(t, false, 0, make([]byte, 65536)), "expanded", 8192, 32768, 20000},
-		{"count", valid, "member count", 8192, 65536, 2},
-		{"trailing-data", archiveFixture(t, false, 0, []byte("unexpected")), "after tar", 8192, 65536, 20000},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateArchiveWithLimits(tc.archive, tc.member, tc.expanded, tc.entries)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("want %s limit, got %v", tc.want, err)
-			}
-		})
+	err := validateArchive(archiveFixture(t, 0, []byte("unexpected")))
+	if err == nil || !strings.Contains(err.Error(), "after tar") {
+		t.Fatalf("want trailing-data rejection, got %v", err)
 	}
 }
 

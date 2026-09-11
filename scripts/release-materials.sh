@@ -45,7 +45,7 @@ release_materials_resolve_git_source() {
   index_flags="$(git -C "$source" -c core.quotePath=true ls-files -v)" \
     || fail "cannot inspect the $name source index"
   if LC_ALL=C grep -Eq '^[a-zS] ' <<< "$index_flags"; then
-    fail "$name source uses assume-unchanged or skip-worktree; use a fresh checkout"
+    fail "$name source uses assume-unchanged or skip-worktree; select a source tree with normal index flags"
   fi
   status="$(git -C "$source" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
   [ -z "$status" ] || fail "$name source worktree is dirty"
@@ -114,44 +114,6 @@ release_materials_copy_licenses() {
     count=$((count + 1))
   done <<< "$listing"
   [ "$count" -gt 0 ] || fail "no license or notice material found in $source"
-}
-
-release_materials_require_git_licenses() {
-  local root="$1" unit="$2" source="$3" sha="$4" label="$5"
-  local verification entry relative mode type blob count=0
-  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "license source must identify an exact Git commit"
-  release_materials_safe_relative "$label" || fail "unsafe Git license material label"
-  git -C "$source" cat-file -e "$sha^{commit}" 2>/dev/null \
-    || fail "selected license source commit is unavailable; fetch that exact commit before validation"
-  verification="$(mktemp -d "$WORK/verify-git-license.XXXXXX")"
-  mkdir -p "$verification/source"
-  git -C "$source" ls-tree -r -z "$sha" > "$verification/tree" \
-    || fail "cannot enumerate selected license source tree"
-  while IFS= read -r -d '' entry; do
-    relative="${entry#*$'\t'}"
-    case "$relative" in
-      LICENSES/*) ;;
-      */*) continue ;;
-      *)
-        case "${relative,,}" in license*|copying*|notice*|patents*|authors*|credits*|copyright*) ;; *) continue ;; esac
-        ;;
-    esac
-    release_materials_safe_relative "$relative" || fail "unsafe selected license source path"
-    read -r mode type blob <<< "${entry%%$'\t'*}"
-    [[ "$type" = blob && "$mode" =~ ^100(644|755)$ && "$blob" =~ ^[0-9a-f]{40}$ ]] \
-      || fail "selected Git license material must be a regular file"
-    mkdir -p "$verification/source/$(dirname "$relative")"
-    git -C "$source" cat-file blob "$blob" > "$verification/source/$relative" \
-      || fail "cannot read selected license source blob"
-    count=$((count + 1))
-  done < "$verification/tree"
-  [ "$count" -gt 0 ] || fail "selected Git commit has no license material"
-  (
-    release_materials_init "$verification/stage" "$verification/materials" "$unit"
-    release_materials_copy_licenses "$verification/source" "$label"
-    diff -r "$verification/stage/share/licenses/$unit/$label" "$root/share/licenses/$unit/$label" >/dev/null \
-      || fail "license bytes differ from selected Git source: $label"
-  )
 }
 
 release_materials_record_source() {
@@ -278,59 +240,6 @@ release_materials_require_project_source() {
     "https://github.com/kuasar-sandbox/$unit/commit/$sha" "git:$sha"
 }
 
-release_materials_validate_go_routing() {
-  local proxy="$1" sumdb="$2" route identity endpoint extra
-  local -a routes
-  IFS=',|' read -r -a routes <<< "$proxy"
-  for route in "${routes[@]}"; do
-    [ "$route" != direct ] || fail "Go source verification requires proxy-only routing; direct fallback is forbidden"
-    case "$route" in off) continue ;; esac
-    [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
-      || fail "Go source verification requires credential-free HTTPS module routing"
-  done
-  [ "$sumdb" != off ] || fail "Go source verification requires an enabled checksum database"
-  [[ "$sumdb" != *$'\n'* && "$sumdb" != *$'\r'* ]] \
-    || fail "Go source checksum routing must be a single line"
-  read -r identity endpoint extra <<< "$sumdb"
-  [[ "$identity" =~ ^[A-Za-z0-9._+/:=-]+$ && -z "$extra" ]] \
-    || fail "invalid Go source checksum database identity"
-  if [ -n "$endpoint" ]; then
-    [[ "$endpoint" == https://?* && "$endpoint" != *[@?#[:space:]]* ]] \
-      || fail "Go source checksum routing must use credential-free HTTPS"
-  fi
-}
-
-release_materials_go_command() {
-  local verification="$1" proxy="${GOPROXY:-https://proxy.golang.org}"
-  local sumdb="${GOSUMDB:-sum.golang.org}" name value
-  shift
-  release_materials_validate_go_routing "$proxy" "$sumdb" || return 1
-  mkdir -p "$verification/home" "$verification/module-cache"
-  chmod 0700 "$verification/home" "$verification/module-cache"
-  # Fresh module/VCS state cannot inherit a cached Git credential helper.
-  # Go private-module bypasses and all caller authentication are excluded.
-  local -a clean=(env -i "PATH=$PATH" "HOME=$verification/home"
-    "GOMODCACHE=$verification/module-cache" "GOCACHE=$verification/go-cache"
-    "GOENV=off" "GOAUTH=off" "GOFLAGS=" "GO111MODULE=on" "GOWORK=off" "GOTOOLCHAIN=local"
-    "GOPROXY=$proxy" "GOSUMDB=$sumdb" "GOPRIVATE=" "GONOPROXY="
-    "GONOSUMDB=" "GOINSECURE=" "GOVCS=*:off" "GIT_CONFIG_NOSYSTEM=1"
-    "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_SYSTEM=/dev/null"
-    "GIT_TERMINAL_PROMPT=0" "GIT_ASKPASS=/bin/false"
-    "GIT_SSH_COMMAND=/bin/false" "SSH_ASKPASS=/bin/false")
-  for name in LANG LC_ALL TZ SSL_CERT_FILE SSL_CERT_DIR \
-      HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
-    value="${!name:-}"
-    [ -n "$value" ] || continue
-    case "$name" in
-      HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)
-        [[ "$value" != *@* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
-          || fail "Go source verification does not pass authenticated proxy URLs" ;;
-    esac
-    clean+=("$name=$value")
-  done
-  "${clean[@]}" timeout --signal=TERM --kill-after=5s 300s go "$@"
-}
-
 release_materials_go_payload_allowed() {
   case "$1:$2" in
     orchestrator:bin/node-ctl|orchestrator:bin/cluster-ctl|orchestrator:bin/node-stub-ctl|orchestrator:bin/e2b-key-ctl ) return 0 ;;
@@ -338,105 +247,50 @@ release_materials_go_payload_allowed() {
   esac
 }
 
-release_materials_verified_go_source() {
-  local module="$1" version="$2" checksum="$3" verify_root json directory
+release_materials_go_source() {
+  local module="$1" version="$2" checksum="$3" download_root json directory
   [[ "$checksum" =~ ^h1:[A-Za-z0-9+/]{43}=$ ]] \
-    || fail "third-party Go source requires an authenticated module checksum: $module@$version"
-  verify_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/verify-go.XXXXXX")"
-  # Use a temporary module so packaging cannot change the caller's go.mod/sum.
-  # Verify the extracted cache as well as the download sum; download alone does
-  # not detect edits to an already-extracted LICENSE.
-  (
-    cd "$verify_root" || exit
-    release_materials_go_command "$verify_root" mod init release-material-verification.invalid >/dev/null 2>&1 || exit 1
-    release_materials_go_command "$verify_root" mod edit "-require=$module@$version" || exit 1
-    release_materials_go_command "$verify_root" mod download -json "$module@$version" > source.json || exit 1
-    release_materials_go_command "$verify_root" mod verify > verify.log 2>&1 \
-      || { cat verify.log >&2; exit 1; }
-  ) || fail "Go module cache verification failed for $module@$version"
-  json="$(cat "$verify_root/source.json")"
-  if [ "$checksum" = - ] || [ "$(jq -er '.Sum' <<< "$json")" != "$checksum" ]; then
-    fail "Go module source checksum differs from the binary: $module@$version"
-  fi
+    || fail "third-party Go source requires a module checksum: $module@$version"
+  download_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/go-source.XXXXXX")"
+  # Resolve the version recorded in the binary using the normal Go module
+  # cache and routing. A temporary working directory protects the caller's
+  # go.mod/go.sum; standalone archive validation does not fetch module sources.
+  json="$(cd "$download_root" && GOWORK=off GOFLAGS='' GO111MODULE=on go mod download -json "$module@$version")" \
+    || fail "cannot obtain Go module source for $module@$version"
+  [ "$(jq -er '.Sum' <<< "$json")" = "$checksum" ] \
+    || fail "Go module source checksum differs from the binary: $module@$version"
   directory="$(jq -er '.Dir' <<< "$json")" \
     || fail "Go module source directory is missing for $module@$version"
   printf '%s\n' "$directory"
 }
 
-_release_materials_download_go_toolchain() {
-  local toolchain="$1" proxy="${GOPROXY:-https://proxy.golang.org}"
-  local sumdb="${GOSUMDB:-sum.golang.org}" route verify_root sumdb_identity sumdb_url sumdb_extra
-  local -a routes
-  [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)$ ]] \
-    || fail "unsupported official Go toolchain version"
-  IFS=',|' read -r -a routes <<< "$proxy"
-  for route in "${routes[@]}"; do
-    [ "$route" != direct ] || fail "Go distribution verification requires proxy-only routing; direct fallback is forbidden"
-    case "$route" in off) continue ;; esac
-    [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
-      || fail "Go distribution verification requires credential-free HTTPS module routing"
-  done
-  [ "$sumdb" != off ] || fail "Go distribution verification requires an enabled checksum database"
-  [[ "$sumdb" != *$'\n'* && "$sumdb" != *$'\r'* ]] \
-    || fail "Go distribution checksum routing must be a single line"
-  read -r sumdb_identity sumdb_url sumdb_extra <<< "$sumdb"
-  [[ "$sumdb_identity" =~ ^[A-Za-z0-9._+/:=-]+$ && -z "$sumdb_extra" ]] \
-    || fail "invalid Go distribution checksum database identity"
-  if [ -n "$sumdb_url" ]; then
-    [[ "$sumdb_url" == https://?* && "$sumdb_url" != *[@?#[:space:]]* ]] \
-      || fail "Go distribution checksum routing must use credential-free HTTPS"
-  fi
-  mkdir -p "$RELEASE_MATERIALS_WORK"
-  verify_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/go-distribution.XXXXXX")"
-  (
-    cd "$verify_root" || exit
-    # Toolchain modules require sumdb authentication. Do not inherit Go's
-    # private distpack/proxy bootstrap exceptions, or alter the selected compiler.
-    GOPROXY="$proxy" GOSUMDB="$sumdb" \
-      release_materials_go_command "${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download" \
-      mod download -json "golang.org/toolchain@v0.0.1-$toolchain.linux-amd64" \
-      > source.json 2> download.log
-  ) || fail "could not authenticate the official Go distribution; check module/checksum routing or the verified cache"
-  jq -e --arg version "v0.0.1-$toolchain.linux-amd64" \
-    '.Path == "golang.org/toolchain" and .Version == $version and
-     (.Sum | type == "string") and (.Zip | type == "string") and (.Error == null)' \
-    "$verify_root/source.json" >/dev/null \
-    || fail "Go distribution download returned an invalid identity"
-  printf '%s\n' "$verify_root/source.json"
-}
-
-release_materials_download_go_toolchain() {
-  _release_materials_download_go_toolchain "$@"
-}
-
-release_materials_go_toolchain_materials() {
-  local toolchain="$1" installed_root="$2" destination="$3" json archive checksum
-  local helper="${BASH_SOURCE[0]%/*}/release-go-toolchain.go"
-  json="$(release_materials_download_go_toolchain "$toolchain")" || return 1
-  archive="$(jq -er '.Zip' "$json")" || fail "Go distribution ZIP is missing"
-  checksum="$(jq -er '.Sum' "$json")" || fail "Go distribution h1 is missing"
-  if [ ! -x "$RELEASE_MATERIALS_WORK/verify-go-distribution" ]; then
-    GOWORK=off GOENV=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=off \
-      command go build -o "$RELEASE_MATERIALS_WORK/verify-go-distribution" "$helper" \
-      || fail "could not build the trusted Go distribution verifier"
-  fi
-  "$RELEASE_MATERIALS_WORK/verify-go-distribution" "$archive" \
-    "v0.0.1-$toolchain.linux-amd64" "$checksum" "$installed_root" "$destination" \
-    > "${destination}.verification.log" \
-    || fail "Go distribution, installed build inputs or license material failed verification"
-  printf 'https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-%s.linux-amd64.zip\t%s\n' \
-    "$toolchain" "$checksum"
-}
-
-release_materials_verify_build_go() {
-  local info="$1" toolchain installed_root identity
-  jq -e '.GOHOSTOS == "linux" and .GOHOSTARCH == "amd64"' "$info" >/dev/null \
-    || fail "release Go compiler must run on Linux/amd64"
-  toolchain="$(jq -er '.GOVERSION' "$info")" || fail "selected Go compiler version is missing"
-  installed_root="$(jq -er '.GOROOT' "$info")" || fail "selected Go compiler root is missing"
-  identity="$(release_materials_go_toolchain_materials "$toolchain" "$installed_root" \
-    "$RELEASE_MATERIALS_WORK/build-licenses")" || return 1
-  printf '%s\n' "$identity" > "$RELEASE_MATERIALS_WORK/build-source.tsv"
+release_materials_copy_go_licenses() {
+  # Collect notices from the compiler actually selected for this build. This
+  # records distribution material; it does not authenticate the compiler.
+  local source="${1%/}" toolchain="$2" destination file relative base
+  destination="$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/go-toolchain/$toolchain"
+  [ -f "$source/LICENSE" ] || fail "selected Go distribution has no LICENSE"
+  mkdir -p "$destination"
+  while IFS= read -r -d '' file; do
+    relative="${file#"$source"/}"
+    case "$relative" in api/*|doc/*|misc/*|test/*) continue ;; esac
+    base="${relative##*/}"
+    case "${base,,}" in *.go|*.c|*.h|*.s|*.rs|*.py) continue ;; esac
+    case "${base^^}" in
+      LICENSE|LICENSE.*|LICENSE-*|LICENCE|LICENCE.*|LICENCE-*|COPYING|COPYING.*|COPYING-*|NOTICE|NOTICE.*|NOTICE-*|PATENTS|PATENTS.*|PATENTS-*|AUTHORS|AUTHORS.*|AUTHORS-*|CREDITS|CREDITS.*|CREDITS-*|COPYRIGHT|COPYRIGHT.*|COPYRIGHT-*) ;;
+      *) [[ "${relative^^}" == */LICENSES/* ]] || continue ;;
+    esac
+    release_materials_safe_relative "$relative" || fail "unsafe Go notice path"
+    if [ ! -f "$file" ] || [ -L "$file" ]; then
+      fail "Go notice is not a regular file: $relative"
+    fi
+    mkdir -p "$destination/$(dirname "$relative")"
+    if [ -f "$destination/$relative" ]; then
+      cmp -s "$file" "$destination/$relative" || fail "conflicting Go notices for $toolchain: $relative"
+    else
+      install -m 0644 "$file" "$destination/$relative"
+    fi
+  done < <(find "$source/" \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
 }
 
 release_materials_hash_tree() {
@@ -452,7 +306,7 @@ release_materials_hash_tree() {
 
 release_materials_finish() {
   local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
-  local module version checksum directory toolchain toolchain_root installed_toolchain identity source payload license_destination
+  local module version checksum directory toolchain toolchain_root installed_toolchain source payload
   while IFS= read -r toolchain; do
     [ -n "$toolchain" ] || continue
     if [ -n "${RELEASE_MATERIALS_GO_ENV:-}" ]; then
@@ -464,15 +318,9 @@ release_materials_finish() {
     fi
     [ "$installed_toolchain" = "$toolchain" ] \
       || fail "resolved Go toolchain $installed_toolchain does not match $toolchain"
-    directory="$RELEASE_MATERIALS_WORK/licenses-$toolchain"
-    identity="$(release_materials_go_toolchain_materials "$toolchain" "$toolchain_root" "$directory")" \
-      || fail "Go toolchain material authentication failed"
-    IFS=$'\t' read -r source checksum <<< "$identity"
-    # The verifier emits only authenticated, regular license/notice files.
-    # Preserve nested vendor paths instead of filtering this tree a second time.
-    license_destination="$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/go-toolchain/$toolchain"
-    mkdir -p "$license_destination"
-    cp -R "$directory/." "$license_destination/"
+    release_materials_copy_go_licenses "$toolchain_root" "$toolchain"
+    source="https://go.dev/dl/#$toolchain"
+    checksum=-
     while IFS= read -r payload; do
       release_materials_record_source "$payload" "Go toolchain" "$toolchain" \
         "$source" "$checksum" "go-toolchain/$toolchain"
@@ -482,20 +330,18 @@ release_materials_finish() {
   done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
   LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
     > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
-  [ "$(wc -l < "$RELEASE_MATERIALS_WORK/go-modules-sorted")" -le 512 ] \
-    || fail "Go module inventory exceeds the 512-module release work bound"
   if [ -s "$RELEASE_MATERIALS_WORK/go-modules-sorted" ]; then
     command -v jq >/dev/null || fail "jq is required to collect Go module license material"
   fi
   while IFS=$'\t' read -r module version checksum; do
     [ -n "$module" ] || continue
-    # Only exact components authenticated by this package's source contract
+    # Only exact components named in this package's source contract
     # have their notices collected separately. Organization membership is not
     # a license-material exemption.
     case "$module" in
       github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;;
     esac
-    directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
+    directory="$(release_materials_go_source "$module" "$version" "$checksum")"
     release_materials_copy_licenses "$directory" "go/$module@$version"
   done < "$RELEASE_MATERIALS_WORK/go-modules-sorted"
 
@@ -557,6 +403,20 @@ release_materials_require_source() {
     accelerator|connector|sandboxer) label="$name" ;;
   esac
   [ -z "$label" ] || label="share/licenses/$unit/$label"
+  case "$name" in
+    accelerator|connector|sandboxer)
+      # Check the bundle's source identity fields agree; no checkout or remote
+      # tag lookup is required for standalone archive validation.
+      awk -F '\t' -v payload="$payload" -v name="$name" '
+        NR > 1 && $1 == payload && $2 == name {
+          sha=substr($5, 5)
+          if ($5 !~ /^git:/ || length(sha) != 40 || sha ~ /[^0-9a-f]/ ||
+              $4 != "https://github.com/kuasar-sandbox/" name "/commit/" sha) exit 1
+        }
+      ' "$root/share/sources/$unit/SOURCES.tsv" \
+        || fail "missing or inconsistent source record for $name ($payload)"
+      ;;
+  esac
   awk -F '\t' -v payload="$payload" -v name="$name" -v version="$version" \
     -v source="$source" -v integrity="$integrity" -v label="$label" '
     NR > 1 && $1 == payload && $2 == name {
@@ -570,7 +430,7 @@ release_materials_require_source() {
 }
 
 release_materials_require_go_key() {
-  # After release_materials_validate authenticates each observed payload once,
+  # After release_materials_validate checks each observed payload's records once,
   # require every official payload without repeating its expensive verification.
   local root="$1" unit="$2" payload="$3"
   awk -F '\t' -v payload="$payload" '
@@ -595,17 +455,6 @@ release_materials_require_go() {
   toolchain="${toolchain%% *}"
   toolchain="${toolchain%%-X:*}"
   release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "${toolchain%%-X:*}"
-  (
-    local verify_work identity source checksum
-    verify_work="$(mktemp -d "$WORK/verify-toolchain-license.XXXXXX")"
-    release_materials_init "$verify_work/stage" "$verify_work/materials" "$unit"
-    identity="$(release_materials_go_toolchain_materials "$toolchain" - "$verify_work/licenses")" \
-      || fail "Go toolchain source authentication failed"
-    IFS=$'\t' read -r source checksum <<< "$identity"
-    release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "$toolchain" "$source" "$checksum"
-    diff -r "$verify_work/licenses" "$root/share/licenses/$unit/go-toolchain/$toolchain" >/dev/null \
-      || fail "Go toolchain license bytes differ from the authenticated distribution"
-  ) || return 1
   if [[ "$payload" != *:* ]]; then
     (
       local validation_work
@@ -638,8 +487,6 @@ release_materials_validate() {
     [ -s "$source_root/$file" ] || fail "release source material is missing: share/sources/$unit/$file"
     [ "$(stat -c '%a' "$source_root/$file")" = 644 ] \
       || fail "release source material has unsafe mode: share/sources/$unit/$file"
-    [ "$(stat -c '%s' "$source_root/$file")" -le 16777216 ] \
-      || fail "release source material is too large: share/sources/$unit/$file"
   done
   awk -F '\t' '
     NR == 1 {
@@ -648,7 +495,7 @@ release_materials_validate() {
       }
       next
     }
-    NF != 6 || NR > 16385 || seen[$0]++ { exit 1 }
+    NF != 6 || seen[$0]++ { exit 1 }
     {
       for (field = 1; field <= 6; field++) {
         if ($field == "") {
@@ -671,17 +518,15 @@ release_materials_validate() {
     || fail "invalid GO-MODULES.tsv header"
   [ "$header" = $'module\tversion\tchecksum' ] \
     || fail "invalid GO-MODULES.tsv header"
-  awk 'NR > 513 { exit 1 }' "$source_root/GO-MODULES.tsv" \
-    || fail "Go module inventory exceeds the 512-module release work bound"
   awk -F '\t' '
     NR == 1 { next }
-    NF != 5 || NR > 16385 { exit 1 }
+    NF != 5 { exit 1 }
     {
       for (field = 1; field <= 5; field++) if ($field == "") exit 1
       if ($2 !~ /^(toolchain|main-package|main-module|module|replacement|build-setting)$/) exit 1
     }
   ' "$source_root/GO-BUILD-INFO.tsv" || fail "invalid Go build records"
-  # Validate every key before any toolchain or dependency fetch. Path aliases
+  # Validate every key before reading payload metadata. Path aliases
   # must not multiply verification work for one actual official executable.
   while IFS= read -r payload; do
     release_materials_go_payload_allowed "$unit" "$payload" || return 1
@@ -731,26 +576,15 @@ release_materials_validate() {
   while IFS=$'\t' read -r module version checksum || [ -n "$module" ]; do
     case "$module" in github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;; esac
     [[ "$checksum" =~ ^h1:[A-Za-z0-9+/]{43}=$ ]] \
-      || fail "third-party Go source requires an authenticated module checksum: $module@$version"
+      || fail "third-party Go source requires a module checksum: $module@$version"
     directory="share/licenses/$unit/go/$module@$version"
     release_materials_safe_relative "$directory" || fail "unsafe Go module license path"
     if [ ! -d "$root/$directory" ] || [ -z "$(find "$root/$directory" -type f -print -quit)" ]; then
       fail "Go module license material is missing: $module@$version"
     fi
-    if [ "$checksum" != - ]; then
-      (
-        local verify_work verified_source
-        verify_work="$(mktemp -d "$WORK/verify-module-license.XXXXXX")"
-        release_materials_init "$verify_work/stage" "$verify_work/materials" "$unit"
-        verified_source="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
-        release_materials_copy_licenses "$verified_source" "go/$module@$version"
-        diff -r "$verify_work/stage/$directory" "$root/$directory" >/dev/null \
-          || fail "Go module license bytes differ from the verified source: $module@$version"
-      ) || return 1
-    fi
     printf '%s\n' "$directory" >> "$claims"
   done < <(sed -n '2,$p' "$source_root/GO-MODULES.tsv")
-  # All material entries must belong to a source already validated above.
+  # All material entries must belong to a source declared above.
   # Parent directories are layout only, not claims over arbitrary siblings.
   local license_paths_file="$WORK/license-paths-$unit"
   find "$root/share/licenses/$unit" -mindepth 1 \

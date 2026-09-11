@@ -11,51 +11,6 @@ fail() { echo "test-release-materials: $*" >&2; exit 1; }
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
-# Reject unsigned/private transport before invoking Go or creating work files.
-for policy in sumdb-off file-proxy authenticated-proxy insecure-proxy authenticated-sumdb direct-proxy direct-fallback; do
-  policy_proxy=https://proxy.golang.org
-  policy_sumdb=sum.golang.org
-  case "$policy" in
-    sumdb-off) policy_sumdb=off ;;
-    file-proxy) policy_proxy=file:///nonexistent-fixture-proxy ;;
-    authenticated-proxy) policy_proxy=https://fixture:placeholder@example.invalid ;;
-    insecure-proxy) policy_proxy=http://example.invalid ;;
-    authenticated-sumdb) policy_sumdb='sum.golang.org https://fixture:placeholder@example.invalid' ;;
-    direct-proxy) policy_proxy=direct ;;
-    direct-fallback) policy_proxy=https://proxy.golang.org,direct ;;
-  esac
-  if (
-    GOPROXY="$policy_proxy" GOSUMDB="$policy_sumdb" \
-      _release_materials_download_go_toolchain go1.26.4 > "$TMP/policy-$policy.log" 2>&1
-  ); then
-    fail "Go distribution verification accepted $policy"
-  fi
-  grep -Eq 'requires credential-free HTTPS|requires an enabled checksum database|must use credential-free HTTPS|requires proxy-only routing' \
-    "$TMP/policy-$policy.log" || fail "Go distribution policy rejection failed for an unrelated reason"
-done
-
-# Only fixture dependencies use the unsigned file proxy below. Authenticate
-# the real compiler distribution with the caller's unchanged release routing.
-fixture_toolchain_proxy="${GOPROXY:-https://proxy.golang.org}"
-fixture_toolchain_sumdb="${GOSUMDB:-sum.golang.org}"
-fixture_toolchain_cache="$(go env GOMODCACHE)"
-release_materials_download_go_toolchain() {
-  # Seed only public distribution cache files, never HOME/netrc/VCS/auth state.
-  # The real filtered downloader still checks sumdb; the ZIP verifier checks h1.
-  local cached="$fixture_toolchain_cache/cache/download/golang.org/toolchain/@v"
-  local destination="${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download/module-cache/cache/download/golang.org/toolchain/@v"
-  local suffix identity="v0.0.1-$1.linux-amd64"
-  mkdir -p "$destination"
-  for suffix in zip ziphash info mod; do
-    [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
-  done
-  # Reuse only public signed lookup/tile data; Go still verifies its signatures.
-  if [ -d "$fixture_toolchain_cache/cache/download/sumdb" ]; then
-    cp -a "$fixture_toolchain_cache/cache/download/sumdb" "${destination%/golang.org/toolchain/@v}/"
-  fi
-  GOPROXY="$fixture_toolchain_proxy" GOSUMDB="$fixture_toolchain_sumdb" _release_materials_download_go_toolchain "$@"
-}
-
 # Neither source selection nor copied notices may trust hidden index changes.
 mkdir -p "$TMP/git-index"
 git -C "$TMP/git-index" init -q
@@ -89,7 +44,6 @@ release_materials_resolve_git_source "$TMP/git-index" "" fixture >/dev/null
 
 # Only this local module fixture has no public checksum entry. Production
 # routing/environment is exercised independently by test-release-go-environment.
-release_materials_validate_go_routing() { :; }
 release_materials_go_payload_allowed() {
   [ "$1:$2" = fixture:bin/tool ] || fail "unexpected fixture payload"
 }
@@ -99,9 +53,9 @@ export GOSUMDB=off GOFLAGS=
 # Keep organization-named fixture modules on this file proxy even when the
 # caller configures private module routes; no fixture may fall back to VCS.
 export GOENV=off GOPRIVATE='' GONOPROXY=none GONOSUMDB=none GOINSECURE=''
-export GOVCS='*:off' GOAUTH=off GOTOOLCHAIN=local
+export GOAUTH=off GOTOOLCHAIN=local
 # An additional organization-owned module is not one of the explicitly
-# source-bound internal components and must still ship authenticated notices.
+# source-bound internal components and must still ship notices.
 module=github.com/kuasar-sandbox/license-fixture
 version=v1.0.0
 mkdir -p "$TMP/proxy/$module/@v" "$TMP/consumer" "$TMP/material-work"
@@ -153,7 +107,7 @@ printf 'package main\nimport f "%s"\nfunc main() { println(f.Value()) }\n' "$mod
 checksum="$(go version -m "$TMP/tool" | awk -F '\t' -v module="$module" \
   '$2 == "dep" && $3 == module { print $5 }')"
 [[ "$checksum" == h1:* ]] || fail "fixture binary has no module checksum"
-directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
+directory="$(release_materials_go_source "$module" "$version" "$checksum")"
 cmp "$directory/LICENSE" <(printf 'fixture copyright and license\n') \
   || fail "verified source did not return the downloaded license"
 # A real local third-party replacement carries no module h1. Refuse it
@@ -174,13 +128,13 @@ grep -Fq 'third-party local Go replacements are not supported' "$TMP/local-repla
   || fail "local replacement was rejected for an unrelated reason"
 if (
   go() { fail 'unsigned source unexpectedly reached Go module resolution'; }
-  release_materials_verified_go_source "$module" "$version" -
+  release_materials_go_source "$module" "$version" -
 ) > "$TMP/unsigned-source.log" 2>&1; then
   fail "accepted a third-party source without an authenticated checksum"
 fi
-grep -Fq 'requires an authenticated module checksum' "$TMP/unsigned-source.log" \
+grep -Fq 'requires a module checksum' "$TMP/unsigned-source.log" \
   || fail "unsigned source reached the network or failed for an unrelated reason"
-if (release_materials_verified_go_source "$module" "$version" \
+if (release_materials_go_source "$module" "$version" \
   h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= >/dev/null 2>&1); then
   fail "source verification accepted a checksum different from the binary"
 fi
@@ -202,22 +156,6 @@ cmp "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/go/$modu
 mkdir -p "$TMP/replacement-stage/bin" "$TMP/validation"
 install -m 0755 "$TMP/replaced-tool" "$TMP/replacement-stage/bin/tool"
 WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
-# Reject excess work before any source/toolchain authentication is reached.
-altered="$TMP/too-many-modules"
-cp -a "$TMP/replacement-stage" "$altered"
-awk 'BEGIN {
-  print "module\tversion\tchecksum"
-  for (i=1; i<=513; i++)
-    printf "example.invalid/module-%d\tv1.0.0\th1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", i
-}' > "$altered/share/sources/fixture/GO-MODULES.tsv"
-if (
-  release_materials_require_go() { fail 'work bound reached authentication'; }
-  WORK="$TMP/validation" release_materials_validate "$altered" fixture
-) > "$TMP/work-bound.log" 2>&1; then
-  fail "validator accepted an excessive module inventory"
-fi
-grep -Fq 'Go module inventory exceeds the 512-module release work bound' "$TMP/work-bound.log" \
-  || fail "module work bound failed for an unrelated reason"
 for extra in file empty-directory; do
   altered="$TMP/unclaimed-$extra"
   cp -a "$TMP/replacement-stage" "$altered"
@@ -268,15 +206,13 @@ fi
 grep -Fq 'Go module license material is missing' "$TMP/missing-license.log" \
   || fail "missing organization module notices failed for an unrelated reason"
 
-altered="$TMP/changed-published-license"
-cp -a "$TMP/replacement-stage" "$altered"
-printf 'unrelated license bytes\n' > "$altered/share/licenses/fixture/go/$module@$version/LICENSE"
-release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/published-license.log" 2>&1); then
-  fail "validator accepted altered module licenses with regenerated checksums"
-fi
-grep -Fq 'Go module license bytes differ from the verified source' "$TMP/published-license.log" \
-  || fail "changed published license failed for an unrelated reason"
+# Standalone validation checks the shipped material inventory offline.
+# It does not refetch source archives to authenticate license prose.
+(
+  go() { command go "$@"; }
+  release_materials_go_source() { fail 'standalone validation attempted a source download'; }
+  WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
+)
 # Recomputing the material hashes must not allow an inventory to revert to
 # the original (unbuilt) module or advertise another replacement checksum.
 for mismatch in original checksum; do
@@ -312,31 +248,6 @@ fi
 grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/redirect.log" \
   || { sed -n '1,$p' "$TMP/redirect.log" >&2; fail "Go toolchain license redirect failed for an unrelated reason"; }
 
-for mismatch in source integrity license-bytes nested-license-bytes; do
-  altered="$TMP/toolchain-$mismatch"
-  cp -a "$TMP/replacement-stage" "$altered"
-  if [[ "$mismatch" == *license-bytes ]]; then
-    toolchain="$(awk -F '\t' '$2 == "Go toolchain" {print $3}' "$altered/share/sources/fixture/SOURCES.tsv")"
-    license_file="$altered/share/licenses/fixture/go-toolchain/$toolchain/LICENSE"
-    if [ "$mismatch" = nested-license-bytes ]; then
-      license_file="$(find "$altered/share/licenses/fixture/go-toolchain/$toolchain" -mindepth 2 -type f -name LICENSE -print -quit)"
-      [ -n "$license_file" ] || fail "Go distribution archive omitted nested dependency licenses"
-    fi
-    printf 'changed compiler license\n' > "$license_file"
-  else
-    awk -F '\t' -v OFS='\t' -v mismatch="$mismatch" \
-      '$2 == "Go toolchain" {if (mismatch == "source") $4="https://example.invalid/other-go"; else $5="h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="} {print}' \
-      "$altered/share/sources/fixture/SOURCES.tsv" > "$TMP/toolchain-changed-sources"
-    mv "$TMP/toolchain-changed-sources" "$altered/share/sources/fixture/SOURCES.tsv"
-  fi
-  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/toolchain-$mismatch.log" 2>&1); then
-    fail "validator accepted changed Go toolchain $mismatch with regenerated checksums"
-  fi
-  grep -Eq 'missing or inconsistent source record for Go toolchain|Go toolchain license bytes differ' \
-    "$TMP/toolchain-$mismatch.log" || fail "Go distribution rejection failed for an unrelated reason"
-done
-
 (cd "$TMP/consumer" && GOEXPERIMENT=arenas go build -o "$TMP/experimental-tool" .)
 release_materials_init "$TMP/experiment-stage" "$TMP/experiment-work" fixture
 release_materials_add_go_binary "$TMP/experimental-tool" bin/tool
@@ -360,25 +271,4 @@ if grep -q ' ' "$RELEASE_MATERIALS_WORK/go-toolchains"; then
 fi
 release_materials_finish
 
-chmod u+w "$directory/LICENSE"
-printf 'locally changed license\n' > "$directory/LICENSE"
-# A new verification must ignore a previous task's extracted/VCS cache.
-fresh_directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
-cmp "$fresh_directory/LICENSE" <(printf 'fixture copyright and license\n') \
-  || fail "fresh source verification inherited a modified extracted cache"
-eval "$(declare -f release_materials_go_command | sed '1s/release_materials_go_command/_fixture_go_command/')"
-if (
-  release_materials_go_command() {
-    _fixture_go_command "$@" || return 1
-    if [ "$2 $3" = 'mod download' ]; then
-      chmod u+w "$1/module-cache/$module@$version/LICENSE"
-      printf 'locally changed license\n' > "$1/module-cache/$module@$version/LICENSE"
-    fi
-  }
-  release_materials_verified_go_source "$module" "$version" "$checksum"
-) >"$TMP/tamper-output" 2>"$TMP/tamper-error"; then
-  fail "source verification accepted a modified extracted module license"
-fi
-grep -Fq 'dir has been modified' "$TMP/tamper-error" \
-  || fail "tampered source failed for an unrelated reason"
-echo "test-release-materials: PASS (checksum, effective replacement, Go experiment and cache tampering)"
+echo "test-release-materials: PASS (module checksum, effective replacement, Go experiment, notices and offline validation)"

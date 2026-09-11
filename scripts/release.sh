@@ -36,7 +36,7 @@ archive_name() {
 
 copy_file() {
   local source="$1" destination="$2"
-  local checkout="$WORK/go-build/orchestrator"
+  local checkout="$ROOT"
   [ -f "$checkout/$source" ] || fail "missing release input: $source"
   mkdir -p "$(dirname "$STAGE/$destination")"
   install -m 0644 "$checkout/$source" "$STAGE/$destination"
@@ -56,64 +56,6 @@ copy_root_executable() {
   install -m 0755 "$ROOT/$source" "$STAGE/$destination"
 }
 
-stage_release_go_source() {
-  local source="$1" sha="$2" destination="$3"
-  [ ! -e "$destination" ] || fail "fresh release checkout already exists"
-  mkdir -p "$destination"
-  local -a git_env=(env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
-  "${git_env[@]}" git -C "$destination" init --quiet --template=
-  "${git_env[@]}" git -C "$destination" fetch --quiet --depth=1 "$source" "$sha"
-  "${git_env[@]}" git -C "$destination" -c advice.detachedHead=false checkout --quiet --detach "$sha"
-}
-
-build_release_go_payloads() {
-  local arch="$1" proxy="${GOPROXY:-https://proxy.golang.org}" route variable value
-  local sumdb="${GOSUMDB:-sum.golang.org}" sumdb_identity sumdb_url sumdb_extra
-  local toolchain="${GOTOOLCHAIN:-local}"
-  local -a routes build_env
-  IFS=',|' read -r -a routes <<< "$proxy"
-  for route in "${routes[@]}"; do
-    case "$route" in direct|off) continue ;; esac
-    [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
-      || fail "release Go proxy routing must use credential-free HTTPS"
-  done
-  [[ "$sumdb" != *$'\n'* && "$sumdb" != *$'\r'* ]] \
-    || fail "release checksum database routing must be a single line"
-  read -r sumdb_identity sumdb_url sumdb_extra <<< "$sumdb"
-  [[ "$sumdb_identity" =~ ^[A-Za-z0-9._+/:=-]+$ && -z "$sumdb_extra" ]] \
-    || fail "invalid release checksum database identity"
-  if [ -n "$sumdb_url" ]; then
-    [[ "$sumdb_url" == https://?* && "$sumdb_url" != *[@?#[:space:]]* ]] \
-      || fail "release checksum database routing must use credential-free HTTPS"
-  fi
-  [[ "$toolchain" =~ ^(local|auto|path|go[0-9]+\.[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)?(\+(auto|path))?)$ ]] \
-    || fail "invalid release Go toolchain selection"
-  mkdir -p "$WORK/go-home" "$WORK/go-cache" "$WORK/go-mod"
-  chmod 0700 "$WORK/go-home" "$WORK/go-cache" "$WORK/go-mod"
-  build_env=(env -i PATH="$PATH" HOME="$WORK/go-home" LANG=C
-    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOPROXY="$proxy" GOSUMDB="$sumdb" GOTOOLCHAIN="$toolchain"
-    GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod"
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
-  for variable in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy \
-    SSL_CERT_FILE SSL_CERT_DIR; do
-    value="${!variable:-}"
-    [ -n "$value" ] || continue
-    case "$variable" in
-      HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)
-        [[ "$value" != *[@?#[:space:]]* ]] || fail "release build cannot pass an authenticated proxy"
-        ;;
-    esac
-    build_env+=("$variable=$value")
-  done
-  RELEASE_MATERIALS_GO_ENV="$WORK/go-build-toolchain.json"
-  "${build_env[@]}" go -C "$WORK/go-build/$NAME" env -json GOROOT GOVERSION GOHOSTOS GOHOSTARCH \
-    > "$RELEASE_MATERIALS_GO_ENV"
-  RELEASE_MATERIALS_WORK="$WORK/go-toolchain-before-build" \
-    GOMODCACHE="$WORK/go-mod" GOPROXY="$proxy" GOSUMDB="$sumdb" \
-    release_materials_verify_build_go "$RELEASE_MATERIALS_GO_ENV"
-  "${build_env[@]}" make --no-print-directory -C "$WORK/go-build/$NAME" TARGET_ARCH="$arch" build
-}
-
 check_go_binary() {
   local file="$1" info name
   name="$(basename "$file")"
@@ -129,25 +71,8 @@ check_go_binary() {
     $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
     $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
     $2 == "build" && $3 ~ /^CGO_ENABLED=/ { cgo++; if ($3 != "CGO_ENABLED=0") bad=1 }
-    $2 == "build" && $3 ~ /^GOAMD64=/ { baseline++; if ($3 != "GOAMD64=v1") bad=1 }
-    END { exit bad || os != 1 || arch != 1 || cgo != 1 || baseline != 1 }
-  ' <<< "$info" || fail "Go release payload must target linux/amd64 with CGO_ENABLED=0 and GOAMD64=v1: $file"
-}
-
-validate_copied_source_files() {
-  local extract="$1" sha="$2" file
-  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "selected project source revision is missing"
-  git -C "$ROOT" cat-file -e "$sha^{commit}" 2>/dev/null \
-    || fail "selected source commit is unavailable; fetch that exact commit before validation"
-  for file in deploy/node-ctl.service deploy/node-proxy.service \
-    deploy/cluster-registry.service deploy/cluster-router.service \
-    deploy/cluster-placer.service deploy/conductor.example.yaml \
-    deploy/proxy.example.yaml deploy/registry.example.yaml \
-    deploy/router.example.yaml deploy/placer.example.yaml; do
-    [ -f "$extract/$file" ] || fail "archive is missing $file"
-    git -C "$ROOT" cat-file blob "$sha:$file" | cmp -s - "$extract/$file" \
-      || fail "release deployment bytes differ from selected source: $file"
-  done
+    END { exit bad || os != 1 || arch != 1 || cgo != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64 with CGO_ENABLED=0: $file"
 }
 
 validate_archive_paths() {
@@ -157,49 +82,8 @@ validate_archive_paths() {
     || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
 }
 
-requested_dependency_version() {
-  local name="$1" binding="${RELEASE_DEPENDENCIES:-}" entry value result=""
-  local -a entries
-  [ -n "$binding" ] || return 0 # Local source packages can use untagged commits.
-  [[ "$binding" != *, && "$binding" != ,* && "$binding" != *,,* ]] \
-    || fail "invalid release dependency list"
-  IFS=, read -r -a entries <<< "$binding"
-  [ "${#entries[@]}" -eq 3 ] || fail "orchestrator release must bind its 3 internal dependencies"
-  for entry in "${entries[@]}"; do
-    case "${entry%%=*}" in accelerator|connector|sandboxer) ;; *) fail "unexpected orchestrator dependency" ;; esac
-    value="${entry#*=}"
-    [[ "$value" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
-      || fail "invalid orchestrator dependency version"
-    if [ "${entry%%=*}" = "$name" ]; then
-      [ -z "$result" ] || fail "duplicate orchestrator dependency: $name"
-      result="$value"
-    fi
-  done
-  [ -n "$result" ] || fail "missing orchestrator dependency: $name"
-  printf '%s\n' "$result"
-}
-
-validate_dependency_source() {
-  local extract="$1" name="$2" payload="$3" version="$4"
-  local directory_variable="RELEASE_${name^^}_SOURCE_DIR" sha_variable="RELEASE_${name^^}_SOURCE_SHA"
-  local source sha tagged
-  source="${!directory_variable:-$ROOT/../$name}"
-  sha="${!sha_variable:-}"
-  [ -n "$sha" ] || sha="$(git -C "$source" rev-parse HEAD)" \
-    || fail "cannot resolve selected $name dependency source"
-  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "$name dependency source must be an exact commit"
-  if [ -n "$version" ]; then
-    tagged="$(git -C "$source" rev-parse --verify "refs/tags/$version^{commit}")" \
-      || fail "selected $name dependency release tag is unavailable"
-    [ "$tagged" = "$sha" ] || fail "$name dependency source does not match the selected release tag"
-  fi
-  release_materials_require_source "$extract" "$NAME" "$payload" "$name" "$version" \
-    "https://github.com/kuasar-sandbox/$name/commit/$sha" "git:$sha"
-  release_materials_require_git_licenses "$extract" "$NAME" "$source" "$sha" "$name"
-}
-
 validate_source_record_keys() {
-  # Other fields and uniqueness are authenticated by the existing required-row
+  # Other fields and uniqueness are checked by the existing required-row
   # checks. Do not accept extra attributions merely because those rows exist.
   awk -F '\t' '
     NR == 1 { next }
@@ -242,24 +126,16 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
-  local file project_sha
+  local file
   for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
   done
-  project_sha="$(go version -m "$extract/bin/node-ctl" | \
-    awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
-  validate_copied_source_files "$extract" "$project_sha"
-  release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
     bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
-  local expected_accelerator expected_connector expected_sandboxer
-  expected_accelerator="$(requested_dependency_version accelerator)" || fail "invalid accelerator release binding"
-  expected_connector="$(requested_dependency_version connector)" || fail "invalid connector release binding"
-  expected_sandboxer="$(requested_dependency_version sandboxer)" || fail "invalid sandboxer release binding"
-  validate_dependency_source "$extract" accelerator 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_accelerator"
-  validate_dependency_source "$extract" connector 'bin/node-ctl' "$expected_connector"
-  validate_dependency_source "$extract" sandboxer 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_sandboxer"
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' accelerator ""
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' connector ""
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' sandboxer ""
   validate_source_record_keys "$extract"
   release_materials_validate "$extract" "$NAME"
   release_materials_require_go_key "$extract" "$NAME" 'bin/node-ctl'
@@ -285,7 +161,7 @@ package_release() {
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
-  [ -z "${RELEASE_BIN_DIR:-}" ] || fail "RELEASE_BIN_DIR is not supported: release Go payloads are rebuilt"
+  bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
 
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
@@ -308,10 +184,6 @@ package_release() {
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
   sandboxer_sha="$(release_materials_resolve_git_source "$sandboxer_source" \
     "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
-  stage_release_go_source "$ROOT" "$project_sha" "$WORK/go-build/orchestrator"
-  stage_release_go_source "$accelerator_source" "$accelerator_sha" "$WORK/go-build/accelerator"
-  stage_release_go_source "$connector_source" "$connector_sha" "$WORK/go-build/connector"
-  stage_release_go_source "$sandboxer_source" "$sandboxer_sha" "$WORK/go-build/sandboxer"
   copy_file deploy/node-ctl.service deploy/node-ctl.service
   copy_file deploy/node-proxy.service deploy/node-proxy.service
   copy_file deploy/cluster-registry.service deploy/cluster-registry.service
@@ -322,8 +194,6 @@ package_release() {
   copy_file deploy/registry.example.yaml deploy/registry.example.yaml
   copy_file deploy/router.example.yaml deploy/router.example.yaml
   copy_file deploy/placer.example.yaml deploy/placer.example.yaml
-  build_release_go_payloads "$arch"
-  bin_dir="$WORK/go-build/orchestrator/bin/$arch"
   local binary
   for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     copy_executable "$bin_dir/$binary" "bin/$binary"
@@ -354,7 +224,7 @@ package_release() {
   release_materials_add_go_binary "$STAGE/bin/cluster-ctl" bin/cluster-ctl
   release_materials_add_go_binary "$STAGE/bin/node-stub-ctl" bin/node-stub-ctl
   release_materials_add_go_binary "$STAGE/bin/e2b-key-ctl" bin/e2b-key-ctl
-  GOMODCACHE="$WORK/go-mod" release_materials_finish
+  release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \

@@ -174,113 +174,49 @@ Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintai
 
 ## Release model
 
-The release workflow records the completed archive's SHA-256 as a build-job
-output before uploading it. The publisher receives that independent value as
-`RELEASE_ARCHIVE_SHA256` and checks it before any Tag or Release write; a value
-recalculated from the downloaded bundle is not a substitute. This binds every
-payload and material file to that completed build, even if the bundle's own
-checksums are regenerated. Local packaging and standalone validation do not
-require this publication input. The receipt does not attest compiler provenance
-or isolate untrusted candidate code.
+Build from the selected source with the component Makefile. `release.sh package`
+uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
+it collects materials and creates the bundle without rebuilding those binaries
+or resetting source/build caches. Keep the selected source checkouts, dependency
+versions and native build records together with the outputs.
 
-Clean VCS fields are consistency checks, not proof of compiled bytes: Go source
-overlays can retain the same revision and clean flag. Standalone validation does
-not rebuild or authenticate an arbitrary producer's binaries. Publication uses
-the independent completed-build digest above, not those fields, to authenticate
-the artifact received from the selected trusted build.
+Packaging records the actual Go versions and effective module replacements.
+Go/module LICENSE and NOTICE files come from the selected compiler installation
+and matching module sources, preserving nested paths. Module resolution uses the
+normal Go cache and routing; downloaded module checksums must match the binaries.
+Only explicitly collected internal sibling dependencies use their own source
+materials; an organization namespace alone does not exempt other modules.
+Unsupported third-party local replacements need versioned module inputs for
+the official package. Existing Kuasar local `replace` directives remain in use.
 
-Release verification requires credential-free, proxy-only HTTPS module routing:
-`direct` fallback is rejected and `GOVCS=*:off` prevents module-selected VCS hosts.
-Collection and validation permit at most 512 effective Go modules. Each Go
-verification subprocess has a five-minute deadline; publication jobs have a
-30-minute deadline. Every notice file and directory must belong to a validated
-source, module, toolchain or system-material root; layout parents do not authorize
-unclaimed siblings. These limits do not change ordinary development routing.
+Materials live under `share/licenses/<component>` and
+`share/sources/<component>`. The latter contains `SOURCES.tsv`,
+`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
+Collection fails on missing notices, unreadable subtrees or partial traversals.
+Independent validation checks the shipped inventory, checksums, required files,
+source-record consistency, payload identities and archive paths/types/modes.
+It does not fetch source checkouts or Go modules, compare notices with remote
+source trees, or download/authenticate compiler distributions. Checksums and
+VCS records are consistency checks, not proof of an arbitrary producer's identity.
 
-Go dependency and toolchain downloads use fresh private module/VCS state, an
-enabled checksum database and `GOAUTH=off`. They clear persisted Go settings, private-module
-bypasses, Git configuration and caller credentials while retaining validated,
-credential-free routing. Uploaded Go record keys must match the exact official
-payload names before any source or toolchain download; path aliases are rejected.
-These release checks do not change ordinary development module authentication.
-Only the exact Accelerator, Connector and Sandboxer modules use separately
-authenticated internal-source notices. Any other organization-owned module must
-pass the same module checksum and notice verification as an external dependency.
-Source inventories reject duplicate or excessive records before per-row work;
-each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
-Only the exact project, selected internal-dependency and per-payload Go toolchain
-source keys are accepted; extra attributions are not validated provenance.
+The archive name identifies the requested release target. Project and internal
+dependency records use a release version when its local tag matches the selected
+commit, otherwise `git:<commit>`; packaging does not require creating future
+target tags. The publisher passes the selected project SHA to validation before
+Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
+existing source/Preview markers. Trusted source selection, build/publish permission
+separation and the refusal to replace published assets remain required.
 
-The trusted publisher generates the standard release text and source/Preview
-markers from its validated request. Downloaded `release-notes.md` is a local
-bundle aid, not an authority for the public release body or reconciliation.
-
-Packaging rebuilds Go payloads in fresh checkouts of the selected Orchestrator, Accelerator, Connector and Sandboxer commits,
-with `GOWORK=off` and read-only module resolution. Ignored development files and
-prebuilt binaries are not reused; `RELEASE_BIN_DIR` is rejected. Build commands use
-a private home and caches without cloud/release credentials. Credential-free
-HTTPS module/network proxy routing remains available.
-The build preserves `GOSUMDB` (including a credential-free HTTPS checksum mirror)
-and `GOTOOLCHAIN`; the release workflow's `local` policy is not silently replaced
-by automatic toolchain download. Without an explicit setting, packaging uses
-`sum.golang.org` and the local Go toolchain.
-
-Release packaging records the Go compiler selected in the fresh build context,
-then compares its distribution inputs before and after building with the matching
-`golang.org/toolchain` archive authenticated by the configured checksum database.
-This covers the compiler, standard-library sources and other files in that
-distribution; extra non-build `api`, `doc`, `misc` and `test` files in a full Go
-installation are not authenticated or used as release license sources. The
-standard `go.mod`/`_go.mod` installation transformation is accounted for.
-Go license/notice bytes, including nested compiler and standard-library dependency
-materials, come from the verified archive with their relative paths retained.
-Standalone validation
-rechecks their bytes, source URL and module h1. A version string or recomputed
-bundle checksum cannot substitute for that source check. Verification requires
-an enabled checksum database and its matching archive/cache; it may fetch
-verification material with `GOTOOLCHAIN=local` but does not switch the build
-compiler or silently enable automatic toolchain selection. These checks assume
-the trusted build host and do not attest a compromised host.
-
-License collection refuses unreadable subtrees and incomplete traversals rather
-than publishing only the readable notices. Third-party local Go replacements
-without authenticated module checksums are not supported in official component
-packages; use versioned module replacements. Existing Kuasar sibling replacements
-and ordinary source development are unchanged.
-
-Each of the four Go executables must identify its own Orchestrator command main
-package and module and target Linux/amd64 with `CGO_ENABLED=0` and exactly one
-`GOAMD64=v1` baseline setting. Higher CPU levels are rejected. Swapping
-executables from the same commit or enabling CGO is rejected. The archive gate
-requires the four official binaries and ten deployment files, rejects extra
-payloads, aliases, duplicate entries and links, and checks exact modes and numeric
-root ownership before extraction. License/source materials remain component-scoped.
-The bounded reader limits one member to 512 MiB, expanded data to 1 GiB and the
-entry count to 20,000; malformed headers or trailing data fail validation.
-Deployment files are copied from the fresh selected checkout
-and compared byte-for-byte with that commit's Git blobs during validation.
-Standalone validation needs that exact commit locally; the trusted publisher
-fetches source history for inspection without executing candidate deployment files.
-Validation also compares complete project and internal-dependency license trees
-with their selected Git blobs, including nested `LICENSES`. Local validation uses
-the existing `RELEASE_*_SOURCE_DIR` and optional `RELEASE_*_SOURCE_SHA` selections,
-defaulting to sibling checkouts. Publication fetches only the three dependency
-tags from its validated request, using a read-only source token revoked before
-validation; it never executes those dependency checkouts. Each selected tag must
-resolve to the claimed source commit, URL and integrity value. Changed, missing
-or extra notices and changed dependency provenance fail even after rechecksumming.
-
-Package source records keep the project's or an internal dependency's release
-version only when its local Git tag matches the selected source commit. Untagged
-sources record `git:<commit>`; the archive name still identifies the requested
-release target. Validation binds all project Go binaries and their project source
-URL/digest to the same commit. The publisher supplies its expected commit and
-rejects a different-source bundle before any Tag or Release write. Local packaging
-does not require creating target release tags.
-When `RELEASE_DEPENDENCIES` is supplied, validation requires exactly the requested
-accelerator, connector and sandboxer release versions. Missing, duplicated,
-unexpected or conflicting bindings fail before publication. This does not add
-a remote-tag requirement to ordinary local-replacement source builds.
+The four official Go executables must identify their own Orchestrator command
+main packages and target Linux/amd64 with `CGO_ENABLED=0`. Packaging copies
+the ten deployment files from the selected source tree and collects the actual
+Accelerator, Connector and Sandboxer dependency materials using the existing
+`RELEASE_*_SOURCE_DIR`, optional `RELEASE_*_SOURCE_SHA` and version selections.
+Standalone validation checks the bundle's dependency URL/commit fields agree;
+it does not require sibling repositories or dependency tags on the validation host.
+Before extraction the archive gate rejects extra payloads, aliases, duplicate
+entries, links, incorrect numeric root ownership and incorrect modes.
+Material directories remain component-scoped.
 
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the node and cluster binaries plus deployment files. Documentation and E2E sources are collected from the selected component tag into the project platform archive rather than duplicated in the component archive.
 

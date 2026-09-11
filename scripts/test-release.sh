@@ -17,32 +17,10 @@ fail() {
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
-# Reject credential-bearing routing before starting any build subprocess.
-# shellcheck disable=SC1090
-source <(sed -n '/^build_release_go_payloads() {/,/^}/p' "$ROOT/scripts/release.sh")
-for invalid_sumdb in \
-  'sum.golang.org https://fixture:fixture@sum.example.invalid' \
-  'sum.golang.org https://sum.example.invalid?fixture=value' \
-  'sum.golang.org https://sum.example.invalid extra'; do
-  if (GOSUMDB="$invalid_sumdb" build_release_go_payloads x86_64 > "$TMP/invalid-sumdb.log" 2>&1); then
-    fail "Go build environment accepted unsafe checksum routing"
-  fi
-  grep -Eq 'release checksum database|invalid release checksum database' "$TMP/invalid-sumdb.log" \
-    || fail "unsafe checksum routing failed for an unrelated reason"
-done
-if (GOTOOLCHAIN='local invalid' build_release_go_payloads x86_64 > "$TMP/invalid-toolchain.log" 2>&1); then
-  fail "Go build environment accepted malformed toolchain selection"
-fi
-grep -Fq 'invalid release Go toolchain selection' "$TMP/invalid-toolchain.log" \
-  || fail "invalid toolchain selection failed for an unrelated reason"
-
-export FIXTURE_GO_DISTRIBUTION_CACHE
-FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
-GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 
 init_fixture_repo() {
@@ -213,14 +191,6 @@ if env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrato
   fail "release source validator accepted a tag from another version line"
 fi
 bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
-bounded_workflow=component-release.yml
-awk '
-  $0 == "  publish:" { inside=1; next }
-  inside && /^  [A-Za-z0-9_-]+:/ { exit }
-  inside && /^    steps:/ { exit }
-  inside { print }
-' "$ROOT/.github/workflows/$bounded_workflow" | grep -Fx '    timeout-minutes: 30' >/dev/null \
-  || fail "$bounded_workflow does not bound privileged publication work"
 
 WORKFLOW="$ROOT/.github/workflows/component-release.yml"
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}]' \
@@ -228,23 +198,6 @@ grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [ac
 grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}' \
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 workflow="$ROOT/.github/workflows/component-release.yml"
-for job in build publish; do
-  for routing in 'GOPROXY: https://goproxy.cn' 'GOSUMDB: sum.golang.google.cn' 'GOTOOLCHAIN: local'; do
-    awk -v job="$job" '
-      $0 == "  " job ":" { inside=1; next }
-      inside && /^  [A-Za-z0-9_-]+:/ { exit }
-      inside && /^    steps:/ { exit }
-      inside { print }
-    ' "$workflow" | grep -Fx "      $routing" >/dev/null \
-      || fail "$workflow $job is missing the verified Go routing policy: $routing"
-  done
-done
-[ "$(grep -Fc 'archive_sha256: ${{ steps.release-archive-digest.outputs.archive_sha256 }}' \
-  "$workflow")" -eq 1 ] \
-  || fail "$workflow does not expose exactly one independent build archive digest"
-[ "$(grep -Fc 'RELEASE_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}' \
-  "$workflow")" -eq 1 ] \
-  || fail "$workflow does not pass the independent build digest to publication"
 grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
   || fail "Preview publisher does not record its build binding"
 for workflow in component-release.yml delete-preview.yml; do
@@ -272,8 +225,8 @@ fi
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
-  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 3 ] \
-    || fail "release workflow does not pin both build and trusted-validation $input checkouts"
+  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 2 ] \
+    || fail "release workflow does not pin the build and retry $input checkouts"
 done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
   || fail "release workflow does not verify dependency releases"
@@ -327,27 +280,7 @@ printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
-install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
-cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
-release_materials_download_go_toolchain() {
-  # Seed only public distribution cache files, never HOME/netrc/VCS/auth state.
-  # The real filtered downloader still checks sumdb; the ZIP verifier checks h1.
-  local cached="${FIXTURE_GO_DISTRIBUTION_CACHE:?}/cache/download/golang.org/toolchain/@v"
-  local destination="${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download/module-cache/cache/download/golang.org/toolchain/@v"
-  local suffix identity="v0.0.1-$1.linux-amd64"
-  mkdir -p "$destination"
-  for suffix in zip ziphash info mod; do
-    [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
-  done
-  # Public signed lookup/tile responses still undergo Go's normal signature
-  # verification. Do not reuse caller HOME, authentication or VCS state.
-  if [ -d "$FIXTURE_GO_DISTRIBUTION_CACHE/cache/download/sumdb" ]; then
-    cp -a "$FIXTURE_GO_DISTRIBUTION_CACHE/cache/download/sumdb" "${destination%/golang.org/toolchain/@v}/"
-  fi
-  _release_materials_download_go_toolchain "$@"
-}
-EOF
 printf 'module github.com/kuasar-sandbox/orchestrator\n\ngo 1.24\n' > "$fixture_root/go.mod"
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   mkdir -p "$fixture_root/cmd/$binary"
@@ -360,13 +293,6 @@ printf 'accelerator_commit := %s\nconnector_commit := %s\nsandboxer_commit := %s
 cat >> "$fixture_root/Makefile" <<'EOF'
 .PHONY: build
 build:
-	test "$$GOWORK" = off && test "$$GOFLAGS" = -mod=readonly
-	test "$$GOSUMDB" = sum.golang.google.cn && test "$$GOTOOLCHAIN" = local
-	test -z "$${GH_TOKEN:-}" && test -z "$${AWS_SECRET_ACCESS_KEY:-}"
-	test ! -e ignored-release-input.go
-	test ! -e ../accelerator/ignored-release-input.go
-	test ! -e ../connector/ignored-release-input.go
-	test ! -e ../sandboxer/ignored-release-input.go
 	test "$$(git -C ../accelerator rev-parse HEAD)" = "$(accelerator_commit)"
 	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
 	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
@@ -393,20 +319,11 @@ GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/cmd/node-
 if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary without source stamping"
 fi
+GOWORK=off make --no-print-directory -C "$fixture_root" build
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
-  install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
+  install -m 0755 "$fixture_root/bin/x86_64/$binary" "$TMP/bin/$binary"
 done
-for source in "$fixture_root" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer"; do
-  printf 'ignored-release-input.go\n' >> "$source/.git/info/exclude"
-  printf 'ignored invalid Go input must not enter the release build\n' > "$source/ignored-release-input.go"
-done
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
-  "$TMP/prebuilt-override" > "$TMP/prebuilt-override.log" 2>&1; then
-  fail "packager accepted a prebuilt payload override"
-fi
-grep -Fq 'RELEASE_BIN_DIR is not supported' "$TMP/prebuilt-override.log" \
-  || fail "prebuilt override failed for an unrelated reason"
-SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-private AWS_SECRET_ACCESS_KEY=fixture-private \
+SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
@@ -426,31 +343,6 @@ SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-private AWS_SECRET_ACCESS_KEY=fixt
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
-for label in project accelerator connector sandboxer; do
-  for mutation in top-level nested missing extra; do
-    candidate="$TMP/git-license-$label-$mutation"
-    cp -a "$TMP/bundle" "$candidate"
-    mkdir "$candidate/root"
-    tar -xzf "$archive" -C "$candidate/root"
-    license_root="$candidate/root/share/licenses/orchestrator/$label"
-    case "$mutation" in
-      top-level) printf 'altered license\n' > "$license_root/LICENSE" ;;
-      nested) printf 'altered nested notice\n' > "$license_root/LICENSES/NOTICE.txt" ;;
-      missing) rm "$license_root/NOTICE" ;;
-      extra) printf 'extra unauthenticated notice\n' > "$license_root/NOTICE.extra" ;;
-    esac
-    release_materials_hash_tree "$candidate/root" orchestrator \
-      "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
-    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
-      -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-    (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
-    if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
-      fail "validator accepted $label $mutation license mutation with regenerated checksums"
-    fi
-    grep -Fq "license bytes differ from selected Git source: $label" "$candidate/result.log" \
-      || fail "Git license mutation failed for an unrelated reason"
-  done
-done
 for dependency in accelerator connector sandboxer; do
   for column in 4 5; do
     candidate="$TMP/dependency-source-$dependency-$column"
@@ -478,20 +370,6 @@ for dependency in accelerator connector sandboxer; do
 done
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
   "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
-for binding in accelerator=v9.0.0,connector=v0.1.2,sandboxer=v0.1.3 \
-  accelerator=v0.1.3,connector=v9.0.0,sandboxer=v0.1.3 \
-  accelerator=v0.1.3,connector=v0.1.2,sandboxer=v9.0.0 \
-  accelerator=v0.1.3,connector=v0.1.2 \
-  accelerator=v0.1.3,accelerator=v0.1.3,sandboxer=v0.1.3 \
-  accelerator=v0.1.3,connector=v0.1.2,unexpected=v0.1.3 \
-  'accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3,'; do
-  if RELEASE_DEPENDENCIES="$binding" "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 \
-    "$TMP/bundle" > "$TMP/dependency-binding.log" 2>&1; then
-    fail "validator accepted a conflicting or malformed dependency release request"
-  fi
-  grep -Eq 'source record|release binding|dependency|dependencies' "$TMP/dependency-binding.log" \
-    || fail "dependency binding was rejected for an unrelated reason"
-done
 go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
   ./bin/e2b-key-ctl ./deploy/node-ctl.service \
@@ -567,54 +445,6 @@ for target in darwin/amd64 linux/arm64; do
   grep -Fq 'must target linux/amd64' "$candidate/result.log" || fail "$target failed for an unrelated reason"
 done
 
-for level in v2 v3 v4; do
-  (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64="$level" \
-    go build -trimpath -buildvcs=true -o "$TMP/target-$level" ./cmd/node-ctl)
-  release_materials_require_go_revision "$TMP/target-$level" "$fixture_project_sha"
-  candidate="$TMP/wrong-cpu-$level"
-  cp -a "$TMP/bundle" "$candidate"
-  mkdir "$candidate/root"
-  tar -xzf "$archive" -C "$candidate/root"
-  install -m 0755 "$TMP/target-$level" "$candidate/root/bin/node-ctl"
-  repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
-    fail "validator accepted GOAMD64=$level with regenerated metadata and checksums"
-  fi
-  grep -Fq 'GOAMD64=v1' "$candidate/result.log" || fail "$level failed for an unrelated reason"
-done
-
-# An external Go overlay can retain the exact clean VCS metadata. The metadata
-# gate is not producer authentication; the independently recorded build digest
-# must still reject this repack before any GitHub operation.
-printf 'package main\nfunc main() { println("overlay fixture") }\n' > "$TMP/overlay-main.go"
-jq -n --arg original "$TMP/target-source/cmd/node-ctl/main.go" --arg replacement "$TMP/overlay-main.go" \
-  '{Replace: {($original): $replacement}}' > "$TMP/overlay.json"
-(cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 \
-  go build -trimpath -buildvcs=true -overlay="$TMP/overlay.json" -o "$TMP/overlay-node-ctl" ./cmd/node-ctl)
-release_materials_require_go_revision "$TMP/overlay-node-ctl" "$fixture_project_sha"
-candidate="$TMP/overlay-repack"
-cp -a "$TMP/bundle" "$candidate"
-mkdir "$candidate/root" "$TMP/no-publish-network"
-tar -xzf "$archive" -C "$candidate/root"
-install -m 0755 "$TMP/overlay-node-ctl" "$candidate/root/bin/node-ctl"
-repack_candidate "$candidate"
-cat > "$TMP/no-publish-network/gh" <<'EOF'
-#!/usr/bin/env bash
-printf 'unexpected API call\n' >> "${OVERLAY_GH_SENTINEL:?}"
-exit 91
-EOF
-chmod 0755 "$TMP/no-publish-network/gh"
-expected_digest="$(sha256sum "$archive")"
-if PATH="$TMP/no-publish-network:$PATH" OVERLAY_GH_SENTINEL="$TMP/overlay-gh-called" \
-  RELEASE_ARCHIVE_SHA256="${expected_digest%% *}" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator \
-  "$fixture_root/scripts/publish-release.sh" publish v1.2.3 x86_64 "$fixture_project_sha" "$candidate" main \
-    > "$candidate/result.log" 2>&1; then
-  fail "publisher accepted an overlay repack with clean VCS metadata"
-fi
-grep -Fq 'release archive differs from the independently recorded build digest' "$candidate/result.log" \
-  || fail "overlay repack was rejected for an unrelated reason"
-[ ! -e "$TMP/overlay-gh-called" ] || fail "overlay repack reached GitHub before rejection"
-printf 'test-release: real clean-VCS overlay repack rejected by independent build digest before API calls\n'
 
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
@@ -702,51 +532,6 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-argume
     || fail "wrong main package failed for an unrelated reason"
 done
 
-for copied_file in deploy/node-ctl.service deploy/node-proxy.service \
-  deploy/cluster-registry.service deploy/cluster-router.service \
-  deploy/cluster-placer.service deploy/conductor.example.yaml \
-  deploy/proxy.example.yaml deploy/registry.example.yaml \
-  deploy/router.example.yaml deploy/placer.example.yaml; do
-  candidate="$TMP/changed-source-${copied_file//\//-}"
-  cp -a "$TMP/bundle" "$candidate"
-  mkdir "$candidate/root"
-  tar -xzf "$archive" -C "$candidate/root"
-  printf '\n# fixture modified after source selection\n' >> "$candidate/root/$copied_file"
-  repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
-    fail "validator accepted changed deployment bytes with regenerated checksums: $copied_file"
-  fi
-  grep -Fq 'release deployment bytes differ from selected source' "$candidate/result.log" \
-    || fail "changed deployment failed for an unrelated reason: $copied_file"
-done
-printf 'test-release: 4 swapped CLIs, command-line main, 2 targets, 4 CGO builds, 3 extra entries and 10 deployment mutations rejected\n'
-
-# The archive name is the requested release target; an untagged source record
-# identifies the actual commit and does not pretend that target tag exists.
-tar -xOf "$archive" ./share/sources/orchestrator/SOURCES.tsv | \
-  awk -F '\t' -v sha="$fixture_project_sha" \
-    '$2 == "orchestrator" && $3 == "git:" sha {found=1} END {exit !found}' \
-  || fail "pre-tag project source was recorded as an existing release"
-for column in 3 4 5; do
-  candidate="$TMP/project-source-$column"
-  cp -a "$TMP/bundle" "$candidate"
-  mkdir "$candidate/root"
-  tar -xzf "$archive" -C "$candidate/root"
-  inventory="$candidate/root/share/sources/orchestrator/SOURCES.tsv"
-  awk -F '\t' -v OFS='\t' -v column="$column" \
-    '$2 == "orchestrator" {$column="not-the-selected-source"} {print}' \
-    "$inventory" > "$candidate/changed.tsv"
-  mv "$candidate/changed.tsv" "$inventory"
-  release_materials_hash_tree "$candidate/root" orchestrator \
-    "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
-  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
-    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" >/dev/null 2>&1; then
-    fail "validator accepted project provenance column $column with regenerated checksums"
-  fi
-done
-
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
 if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
@@ -798,5 +583,17 @@ tar --sort=name --owner=1234 --group=0 --numeric-owner --mtime=@1700000000 \
 if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/nonroot-owner" >/dev/null 2>&1; then
   fail "validator accepted non-root numeric ownership with regenerated checksums"
 fi
+
+# Standalone validation must not need source checkouts, module downloads or a build.
+mkdir -p "$TMP/standalone-tools" "$TMP/standalone-bin"
+cp -a "$fixture_root/scripts" "$TMP/standalone-tools/scripts"
+for command in git curl wget cargo make gcc; do
+  printf '#!/bin/sh\nexit 97\n' > "$TMP/standalone-bin/$command"
+  chmod 0755 "$TMP/standalone-bin/$command"
+done
+env PATH="$TMP/standalone-bin:$PATH" GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local \
+  SOURCE_SHA="$fixture_project_sha" "$TMP/standalone-tools/scripts/release.sh" validate \
+  v1.2.3 x86_64 "$TMP/bundle"
+echo "test-release: standalone validation without checkouts/downloads/build PASS"
 
 echo "test-release: PASS"

@@ -95,16 +95,10 @@ revalidate_preview_line() {
 }
 
 release_notes_file() {
-  local tag="$1" commit="$2" arch="$3" source_ref="$4"
+  local tag="$1" commit="$2" bundle="$3" source_ref="$4"
   local notes="$TMP/release-notes.md" unit source
   unit="$(release_unit "$tag")"
-  [ "$arch" != amd64 ] || arch=x86_64
-  # Downloaded notes are not covered by the archive receipt. Generate the
-  # standard body here, before appending authoritative source/binding markers.
-  {
-    printf '%s %s for Linux %s.\n\n' "$unit" "$tag" "$arch"
-    printf '%s\n' "Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. Documentation and E2E suites from this exact tag are collected by the aggregate platform release."
-  } > "$notes"
+  cp "$bundle/release-notes.md" "$notes"
   source="$(jq -cn --arg source_ref "$source_ref" --arg source_sha "$commit" \
     --arg unit "$unit" \
     '{source_ref: $source_ref, source_sha: $source_sha, unit: $unit}')"
@@ -225,17 +219,6 @@ publish_bundle() {
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "commit must be a full lowercase SHA"
   [[ "$source_ref" = main || "$source_ref" =~ ^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.x$ ]] \
     || fail "source-ref must be main or release/vMAJOR.MINOR.x"
-  # This digest comes from the completed build job, not downloaded SHA256SUMS.
-  local expected_digest="${RELEASE_ARCHIVE_SHA256:-}" archive digest
-  [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "RELEASE_ARCHIVE_SHA256 must be the independently recorded build digest"
-  archive="$(release_cli archive-name "$tag" "$arch")"
-  if [ ! -f "$bundle/assets/$archive" ] || [ -L "$bundle/assets/$archive" ]; then
-    fail "release build archive is missing or is a symbolic link"
-  fi
-  digest="$(sha256sum -- "$bundle/assets/$archive")"
-  [ "${digest%% *}" = "$expected_digest" ] \
-    || fail "release archive differs from the independently recorded build digest"
   SOURCE_SHA="$commit" release_cli validate "$tag" "$arch" "$bundle"
 
   local tag_state="$TMP/tag"
@@ -262,7 +245,7 @@ publish_bundle() {
   local files=() file notes
   while IFS= read -r file; do files+=("$file"); done \
     < <(find "$bundle/assets" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)
-  notes="$(release_notes_file "$tag" "$commit" "$arch" "$source_ref")"
+  notes="$(release_notes_file "$tag" "$commit" "$bundle" "$source_ref")"
   gh release create "$tag" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
     --target "$commit" --title "$tag" --notes-file "$notes" >/dev/null
   wait_for_draft_release "$tag" "$drafts"
