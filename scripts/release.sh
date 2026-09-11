@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 022
 
 NAME=orchestrator
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
+# shellcheck source=scripts/release-materials.sh
+source "$ROOT/scripts/release-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -33,9 +36,10 @@ archive_name() {
 
 copy_file() {
   local source="$1" destination="$2"
-  [ -f "$ROOT/$source" ] || fail "missing release input: $ROOT/$source"
+  local checkout="$ROOT"
+  [ -f "$checkout/$source" ] || fail "missing release input: $source"
   mkdir -p "$(dirname "$STAGE/$destination")"
-  install -m 0644 "$ROOT/$source" "$STAGE/$destination"
+  install -m 0644 "$checkout/$source" "$STAGE/$destination"
 }
 
 copy_executable() {
@@ -53,25 +57,43 @@ copy_root_executable() {
 }
 
 check_go_binary() {
-  local file="$1"
-  go version -m "$file" >/dev/null 2>&1 \
+  local file="$1" info name
+  name="$(basename "$file")"
+  case "$name" in node-ctl|cluster-ctl|node-stub-ctl|e2b-key-ctl) ;; *) fail "unexpected Go release payload: $name" ;; esac
+  info="$(go version -m "$file" 2>/dev/null)" \
     || fail "Go build info is missing from $file"
+  awk -F '\t' -v expected="github.com/kuasar-sandbox/orchestrator/cmd/$name" '
+    $2 == "path" { paths++; if ($3 != expected) bad=1 }
+    $2 == "mod" { modules++; if ($3 != "github.com/kuasar-sandbox/orchestrator") bad=1 }
+    END { exit bad || paths != 1 || modules != 1 }
+  ' <<< "$info" || fail "Go release payload must be the $name main package: $file"
+  awk -F '\t' '
+    $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
+    $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
+    $2 == "build" && $3 ~ /^CGO_ENABLED=/ { cgo++; if ($3 != "CGO_ENABLED=0") bad=1 }
+    END { exit bad || os != 1 || arch != 1 || cgo != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64 with CGO_ENABLED=0: $file"
 }
 
 validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing"
-  tar -tzf "$archive" > "$listing"
-  awk '
-    /^\// { exit 1 }
-    { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
-  ' "$listing" || fail "$archive contains an unsafe path"
-  if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
-    fail "$archive contains release metadata JSON"
-  fi
-  awk '
-    { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^(bin|deploy)\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/ or deploy/"
+  local archive="$1"
+  GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
+    GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
+}
+
+validate_source_record_keys() {
+  # Other fields and uniqueness are checked by the existing required-row
+  # checks. Do not accept extra attributions merely because those rows exist.
+  awk -F '\t' '
+    NR == 1 { next }
+    $1 == "bin/*,deploy/*" && $2 == "orchestrator" { next }
+    $1 == "bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl" && ($2 == "accelerator" || $2 == "sandboxer") { next }
+    $1 == "bin/node-ctl" && $2 == "connector" { next }
+    $1 ~ /^bin\/(node-ctl|cluster-ctl|node-stub-ctl|e2b-key-ctl)$/ && $2 == "Go toolchain" { next }
+    { exit 1 }
+  ' "$1/share/sources/orchestrator/SOURCES.tsv" \
+    || fail "source inventory contains an undeclared payload attribution"
 }
 
 validate_bundle() {
@@ -109,18 +131,24 @@ validate_bundle() {
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
   done
-  for file in deploy/node-ctl.service deploy/node-proxy.service \
-    deploy/cluster-registry.service deploy/cluster-router.service \
-    deploy/cluster-placer.service deploy/conductor.example.yaml \
-    deploy/proxy.example.yaml deploy/registry.example.yaml \
-    deploy/router.example.yaml deploy/placer.example.yaml; do
-    [ -f "$extract/$file" ] || fail "$archive is missing $file"
-  done
+  release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
+    bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' accelerator ""
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' connector ""
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' sandboxer ""
+  validate_source_record_keys "$extract"
+  release_materials_validate "$extract" "$NAME"
+  release_materials_require_go_key "$extract" "$NAME" 'bin/node-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/cluster-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/node-stub-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/e2b-key-ctl'
 }
 
 package_release() {
   [ "$#" -eq 3 ] || fail "usage: release.sh package <version> <arch> <output-dir>"
-  local version="$1" arch output="$3" archive epoch bin_dir
+  local version="$1" arch output="$3" archive epoch bin_dir project_sha
+  local accelerator_source connector_source sandboxer_source accelerator_version connector_version sandboxer_version
+  local accelerator_sha connector_sha sandboxer_sha
   arch="$(normalize_arch "$2")"
   archive="$(archive_name "$version" "$arch")"
   if [ -z "$output" ] || [ "$output" = / ] || [ "$output" = . ]; then
@@ -134,14 +162,28 @@ package_release() {
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
   bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
-  copy_executable "$bin_dir/node-ctl" bin/node-ctl
-  copy_executable "$bin_dir/cluster-ctl" bin/cluster-ctl
-  copy_executable "$bin_dir/node-stub-ctl" bin/node-stub-ctl
-  copy_executable "$bin_dir/e2b-key-ctl" bin/e2b-key-ctl
-  check_go_binary "$STAGE/bin/node-ctl"
-  check_go_binary "$STAGE/bin/cluster-ctl"
-  check_go_binary "$STAGE/bin/node-stub-ctl"
-  check_go_binary "$STAGE/bin/e2b-key-ctl"
+
+  accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
+  connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
+  sandboxer_source="${RELEASE_SANDBOXER_SOURCE_DIR:-$ROOT/../sandboxer}"
+  accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
+  connector_version="${RELEASE_CONNECTOR_VERSION:-${CONNECTOR_VERSION:-}}"
+  sandboxer_version="${RELEASE_SANDBOXER_VERSION:-${SANDBOXER_VERSION:-}}"
+  [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
+  [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
+  [[ "$sandboxer_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_SANDBOXER_VERSION must identify the selected sandboxer release"
+  project_sha="$(release_materials_resolve_git_source "$ROOT" "" orchestrator)"
+  local project_version
+  project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
+  accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
+    "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
+  connector_sha="$(release_materials_resolve_git_source "$connector_source" \
+    "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
+  sandboxer_sha="$(release_materials_resolve_git_source "$sandboxer_source" \
+    "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
   copy_file deploy/node-ctl.service deploy/node-ctl.service
   copy_file deploy/node-proxy.service deploy/node-proxy.service
   copy_file deploy/cluster-registry.service deploy/cluster-registry.service
@@ -152,6 +194,37 @@ package_release() {
   copy_file deploy/registry.example.yaml deploy/registry.example.yaml
   copy_file deploy/router.example.yaml deploy/router.example.yaml
   copy_file deploy/placer.example.yaml deploy/placer.example.yaml
+  local binary
+  for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+    copy_executable "$bin_dir/$binary" "bin/$binary"
+    check_go_binary "$STAGE/bin/$binary"
+    release_materials_require_go_revision "$STAGE/bin/$binary" "$project_sha"
+  done
+  accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
+  connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
+  sandboxer_version="$(release_materials_git_version "$sandboxer_source" "$sandboxer_version" "$sandboxer_sha")"
+  release_materials_init "$STAGE" "$WORK/materials" "$NAME"
+  release_materials_copy_licenses "$ROOT" project
+  release_materials_copy_licenses "$accelerator_source" accelerator
+  release_materials_copy_licenses "$connector_source" connector
+  release_materials_copy_licenses "$sandboxer_source" sandboxer
+  release_materials_record_source 'bin/*,deploy/*' orchestrator "$project_version" \
+    "https://github.com/kuasar-sandbox/orchestrator/commit/$project_sha" \
+    "git:$project_sha" project
+  release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' accelerator "$accelerator_version" \
+    "https://github.com/kuasar-sandbox/accelerator/commit/$accelerator_sha" \
+    "git:$accelerator_sha" accelerator
+  release_materials_record_source bin/node-ctl connector "$connector_version" \
+    "https://github.com/kuasar-sandbox/connector/commit/$connector_sha" \
+    "git:$connector_sha" connector
+  release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' sandboxer "$sandboxer_version" \
+    "https://github.com/kuasar-sandbox/sandboxer/commit/$sandboxer_sha" \
+    "git:$sandboxer_sha" sandboxer
+  release_materials_add_go_binary "$STAGE/bin/node-ctl" bin/node-ctl
+  release_materials_add_go_binary "$STAGE/bin/cluster-ctl" bin/cluster-ctl
+  release_materials_add_go_binary "$STAGE/bin/node-stub-ctl" bin/node-stub-ctl
+  release_materials_add_go_binary "$STAGE/bin/e2b-key-ctl" bin/e2b-key-ctl
+  release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \

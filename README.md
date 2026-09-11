@@ -107,6 +107,27 @@ Do not infer which source revision was tested from the version label: record the
 exact sibling SHAs. Runtime/Kernel artifacts are additional prerequisites for
 real sandbox tests, not Go-only compilation.
 
+The local `make test-e2e-cluster-stub` flow starts real control-plane processes
+but no MicroVMs. Its run directory is private. Failure output reports diagnostic
+filenames and sizes, not raw responses, logs or capability-bearing objects.
+Daemon output is written directly to private files, not streamed to CI; the
+private diagnostic umask is applied only after any local binary build.
+For local diagnosis, set `CLUSTER_STUB_KEEP_WORK=1` to retain the run directory
+and inspect it privately; do not upload its unredacted files. This does not
+replace the real MicroVM integration suite.
+
+The real execute/MMDS cases allocate switch, namespace, veth and runner/builder
+unit names from their existing private run directory. Cleanup stops only those
+unit instances and removes only resources created by that run. Explicit names
+that already exist or have inconsistent switch state are refused, not adopted
+or force-deleted. The cases hold a host-local lock on the existing systemd runtime
+directory because their routes, forwarding and slice names are shared; a second
+concurrent execute/MMDS invocation is refused before resource creation. The lock
+descriptor is not inherited by daemons. Async launch assertions wait for the
+actual runner observation without relaxing sandbox identity or launch-mode
+checks. `make test` includes isolated cleanup/concurrency regressions; those
+checks do not substitute for running both real execute and MMDS cases.
+
 Cross-repository contract changes require linked companion PRs and exact-source
 integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
 
@@ -152,6 +173,51 @@ Complete commands/configuration/API and cluster entry rules remain in [Node](doc
 Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintained in [Node paths and lifecycle](docs/node.md). Create input identity, stable versus node-local identity, credential binding, conflicts and retry behavior live in [Node §4.1.2](docs/node.md#412-create-identity). The complete Build directory/task/publication/recovery and retention contracts live in [Node Build](docs/node-build.md); retained Registry Build projection and reconnect convergence live in [Cluster](docs/cluster.md). Canonical artifacts remain launch authority independently of retained Build rows. Named publication is a logical commit, without a final-file/parent fsync power-loss guarantee; Build owns the full matrix and failure behavior.
 
 ## Release model
+
+Build from the selected source with the component Makefile. `release.sh package`
+uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
+it collects materials and creates the bundle without rebuilding those binaries
+or resetting source/build caches. Keep the selected source checkouts, dependency
+versions and native build records together with the outputs.
+
+Packaging records the actual Go versions and effective module replacements.
+Go/module LICENSE and NOTICE files come from the selected compiler installation
+and matching module sources, preserving nested paths. Module resolution uses the
+normal Go cache and routing; downloaded module checksums must match the binaries.
+Only explicitly collected internal sibling dependencies use their own source
+materials; an organization namespace alone does not exempt other modules.
+Unsupported third-party local replacements need versioned module inputs for
+the official package. Existing Kuasar local `replace` directives remain in use.
+
+Materials live under `share/licenses/<component>` and
+`share/sources/<component>`. The latter contains `SOURCES.tsv`,
+`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
+Collection fails on missing notices, unreadable subtrees or partial traversals.
+Independent validation checks the shipped inventory, checksums, required files,
+source-record consistency, payload identities and archive paths/types/modes.
+It does not fetch source checkouts or Go modules, compare notices with remote
+source trees, or download/authenticate compiler distributions. Checksums and
+VCS records are consistency checks, not proof of an arbitrary producer's identity.
+
+The archive name identifies the requested release target. Project and internal
+dependency records use a release version when its local tag matches the selected
+commit, otherwise `git:<commit>`; packaging does not require creating future
+target tags. The publisher passes the selected project SHA to validation before
+Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
+existing source/Preview markers. Trusted source selection, build/publish permission
+separation and the refusal to replace published assets remain required.
+Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
+
+The four official Go executables must identify their own Orchestrator command
+main packages and target Linux/amd64 with `CGO_ENABLED=0`. Packaging copies
+the ten deployment files from the selected source tree and collects the actual
+Accelerator, Connector and Sandboxer dependency materials using the existing
+`RELEASE_*_SOURCE_DIR`, optional `RELEASE_*_SOURCE_SHA` and version selections.
+Standalone validation checks the bundle's dependency URL/commit fields agree;
+it does not require sibling repositories or dependency tags on the validation host.
+Before extraction the archive gate rejects extra payloads, aliases, duplicate
+entries, links, incorrect numeric root ownership and incorrect modes.
+Material directories remain component-scoped.
 
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the node and cluster binaries plus deployment files. Documentation and E2E sources are collected from the selected component tag into the project platform archive rather than duplicated in the component archive.
 
