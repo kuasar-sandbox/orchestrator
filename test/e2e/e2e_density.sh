@@ -6,8 +6,8 @@
 #   Phase A   sandbox-local Budget control with node reservation
 #             1 sandbox in dynamic mode runs an intermittent Python
 #             workload with deterministic grow/rest cycles.
-#             Verifies sandbox-originated grow grants and workload liveness;
-#             Phase B2 provides the gated dynamic shrink check.
+#             Verifies sandbox-originated grow, node reservation, CH target
+#             acceptance and workload liveness, including pre-workload grow.
 #
 #   Phase B   static local control vs dynamic reservation (A/B comparison)
 #             B1: static mode, no node controller. Sandbox-local control
@@ -477,6 +477,35 @@ wait_for_reservation_growth() {
     fail "$sid: reservation did not grow above $baseline within ${timeout}s"
 }
 
+# Phase A proves a real dynamic grow, not necessarily another grow after its
+# workload gate. Cold control may already have obtained sufficient Budget.
+# Admission alone is insufficient: require a sandbox-local grow, a precise live
+# reservation above InitialBudget, and a CH-accepted Budget covered by it.
+# As in B2, accepted grow does not require current/target convergence.
+wait_for_phase_a_grant() {
+    local sid="$1" pid="$2" timeout="$3" initial_budget="$4" capacity="$5"
+    local deadline=$((SECONDS + timeout)) reservation=0 state="" target=-1 actual=-1 budget=0
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before a reserved grow target was observed"
+        if grep -q 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null \
+            && reservation=$(resource_reservation_memory "$sid") \
+            && state=$(read_ch_balloon_state "$sid" 2>/dev/null) \
+            && read -r target actual <<<"$state" \
+            && [[ "$reservation" =~ ^[0-9]+$ ]] \
+            && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] \
+            && [ "$reservation" -gt "$initial_budget" ] && [ "$reservation" -le "$capacity" ] \
+            && [ "$target" -le "$capacity" ] && [ "$actual" -le "$capacity" ]; then
+            budget=$((capacity - target))
+            if [ "$budget" -gt "$initial_budget" ] && [ "$budget" -le "$reservation" ]; then
+                echo "$reservation"
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+    fail "$sid: no sandbox-originated reserved grow target above InitialBudget=$initial_budget within ${timeout}s (reservation=$reservation target=$target current=$actual)"
+}
+
 # Cold readiness is a fresh guest report with a complete CH observation and an
 # applied memory.high. A legal grow or unchanged reservation need not emit a
 # shrink settlement; the workload's Budget/grow assertions remain separate.
@@ -746,9 +775,10 @@ phase_a() {
     start_daemon "$WORK/node-ctl.yaml"
 
     local sid=sb-A-1 start_gate=/tmp/e2e-density-a.start
+    local capacity_mib=1024 startup_mib=128
     setup_sb "$sid"
     # Workload: 20s, 3 grow/rest cycles, R 96-192 MiB above headroom=64 MiB.
-    emit_yaml "$sid" dynamic 64 1024 128   20 3 96 192   true "$start_gate"
+    emit_yaml "$sid" dynamic 64 "$capacity_mib" "$startup_mib"   20 3 96 192   true "$start_gate"
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -762,11 +792,10 @@ phase_a() {
     # Bound cold-start and workload completion independently from controller
     # activity so a fast run does not pay the full worst-case allowance.
     wait_for_dynamic_control_ready "$sid" "$pid" 20
-    local node_reservation_baseline node_reservation
-    node_reservation_baseline=$(resource_reservation_memory "$sid") \
-        || fail "$sid: could not read precise node reservation before workload"
+    local node_reservation
     open_workload_gate "$sid" "$start_gate" start
-    node_reservation=$(wait_for_reservation_growth "$sid" "$pid" 20 "$node_reservation_baseline")
+    node_reservation=$(wait_for_phase_a_grant "$sid" "$pid" 20 \
+        "$((startup_mib * 1024 * 1024))" "$((capacity_mib * 1024 * 1024))")
     wait_for_workload "$sid" "$pid" 40
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
@@ -780,7 +809,7 @@ phase_a() {
 
     [ "$oom" -eq 0 ] || fail "A: cgroup oom_count=$oom (Budget grow failed)"
 
-    echo "  Phase A: granted_reservation=$node_reservation local_shrinks=$shrinks oom_count=0"
+    echo "  Phase A: granted_reservation=$node_reservation grow_target_accepted=1 local_shrinks=$shrinks oom_count=0"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
