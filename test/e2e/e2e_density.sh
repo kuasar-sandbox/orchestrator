@@ -477,6 +477,33 @@ wait_for_reservation_growth() {
     fail "$sid: reservation did not grow above $baseline within ${timeout}s"
 }
 
+# Each accepted grow logs the Budget, CH target and reservation of that action.
+# Validate them together, including earlier actions superseded by later shrink.
+# Return 1 until a grow above initial admission exists; 2 for invalid evidence.
+phase_a_grow_events_valid() {
+    local sid="$1" initial_budget="$2" capacity="$3"
+    awk -v initial="$initial_budget" -v capacity="$capacity" '
+        /memory: grow accepted Budget=/ {
+            line=$0
+            sub(/^.*memory: grow accepted /, "", line)
+            sub(/\r$/, "", line)
+            if (line !~ /^Budget=[0-9]+ target=[0-9]+ reservation=[0-9]+$/) {
+                invalid=1
+                next
+            }
+            split(line, fields, " ")
+            split(fields[1], budget, "=")
+            split(fields[2], target, "=")
+            split(fields[3], reservation, "=")
+            b=budget[2]+0; t=target[2]+0; r=reservation[2]+0
+            if (b <= 0 || b > capacity || t > capacity ||
+                b != capacity - t || r < b || r > capacity) invalid=1
+            if (b > initial) grown=1
+        }
+        END { if (invalid) exit 2; if (!grown) exit 1 }
+    ' "$WORK/$sid.log"
+}
+
 # Phase A proves a real dynamic grow, not necessarily another grow after its
 # workload gate. Cold control may already have obtained sufficient Budget.
 # Admission alone is insufficient: require a sandbox-local grow, a precise live
@@ -484,10 +511,13 @@ wait_for_reservation_growth() {
 # As in B2, accepted grow does not require current/target convergence.
 wait_for_phase_a_grant() {
     local sid="$1" pid="$2" timeout="$3" initial_budget="$4" capacity="$5"
-    local deadline=$((SECONDS + timeout)) reservation=0 state="" target=-1 actual=-1 budget=0
+    local deadline=$((SECONDS + timeout)) reservation=0 state="" target=-1 actual=-1 budget=0 grow_status=0
     while [ "$SECONDS" -lt "$deadline" ]; do
         kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before a reserved grow target was observed"
-        if grep -q 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null \
+        grow_status=0
+        phase_a_grow_events_valid "$sid" "$initial_budget" "$capacity" || grow_status=$?
+        [ "$grow_status" -le 1 ] || fail "$sid: invalid or unreserved accepted grow event"
+        if [ "$grow_status" -eq 0 ] \
             && reservation=$(resource_reservation_memory "$sid") \
             && state=$(read_ch_balloon_state "$sid" 2>/dev/null) \
             && read -r target actual <<<"$state" \
@@ -799,6 +829,8 @@ phase_a() {
     node_reservation=$(wait_for_phase_a_grant "$sid" "$pid" 20 \
         "$((startup_mib * 1024 * 1024))" "$((capacity_mib * 1024 * 1024))")
     wait_for_workload "$sid" "$pid" 40
+    phase_a_grow_events_valid "$sid" "$((startup_mib * 1024 * 1024))" "$((capacity_mib * 1024 * 1024))" \
+        || fail "$sid: invalid or missing accepted grow evidence after workload"
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
     local shrinks oom

@@ -46,6 +46,7 @@ read_ch_balloon_state() {
 }
 '''
             script += function("resource_reservation_memory") + "\n"
+            script += function("phase_a_grow_events_valid") + "\n"
             script += function("wait_for_phase_a_grant") + "\n"
             if delayed:
                 (work / "next-reservations.json").write_text(json.dumps([
@@ -67,10 +68,10 @@ read_ch_balloon_state() {
                      "ALIVE": str(int(alive)), "GRANT_TIMEOUT": "5" if delayed else "1"})
             return result
 
-    def assert_rejected(self, **kwargs):
+    def assert_rejected(self, *, expected_error="no sandbox-originated reserved grow target", **kwargs):
         result = self.run_grant(**kwargs)
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("no sandbox-originated reserved grow target", result.stderr)
+        self.assertIn(expected_error, result.stderr)
 
     def test_retained_pre_workload_grant_needs_no_second_growth(self):
         result = self.run_grant()
@@ -105,6 +106,32 @@ read_ch_balloon_state() {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), str(512 * MIB))
 
+    def test_later_safe_state_cannot_hide_an_unreserved_grow(self):
+        unsafe = "memory: grow accepted Budget=805306368 target=268435456 reservation=268435456\n"
+        later_safe = "memory: grow accepted Budget=268435456 target=805306368 reservation=268435456\n"
+        for log in (unsafe, unsafe + later_safe):
+            with self.subTest(log=log):
+                self.assert_rejected(reservation=256 * MIB, target=768 * MIB,
+                                     actual=256 * MIB, log=log,
+                                     expected_error="invalid or unreserved accepted grow event")
+
+    def test_accepted_grow_fields_must_describe_one_valid_action(self):
+        for log in (
+            "memory: grow accepted Budget=536870912 target=805306368 reservation=536870912\n",
+            "memory: grow accepted Budget=536870912 target=536870912 reservation=1073741825\n",
+            "memory: grow accepted Budget=invalid target=536870912 reservation=536870912\n",
+        ):
+            with self.subTest(log=log):
+                self.assert_rejected(log=log, expected_error="invalid or unreserved accepted grow event")
+
+    def test_grow_to_initial_budget_does_not_prove_an_extra_grant(self):
+        self.assert_rejected(log="memory: grow accepted Budget=134217728 target=939524096 reservation=134217728\n")
+
+    def test_full_capacity_reservation_can_cover_a_smaller_grow(self):
+        result = self.run_grant(reservation=1024 * MIB,
+                                log=GROW.replace("reservation=536870912", "reservation=1073741824"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_grow_does_not_require_current_budget_convergence(self):
         result = self.run_grant(actual=128 * MIB)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -136,6 +163,7 @@ read_ch_balloon_state() {
         self.assertIn('wait_for_phase_a_grant "$sid" "$pid" 20', phase)
         self.assertNotIn("wait_for_reservation_growth", phase)
         self.assertIn('wait_for_workload "$sid" "$pid" 40', phase)
+        self.assertGreater(phase.rindex("phase_a_grow_events_valid"), phase.index("wait_for_workload"))
         self.assertIn('[ "$oom" -eq 0 ] || fail', phase)
 
 
