@@ -483,7 +483,7 @@ wait_for_dynamic_control_ready() {
     while [ "$SECONDS" -lt "$deadline" ]; do
         if resource_reservation_matches "$sid" settled \
             && grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
-            && grep -q 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null \
+            && grep -q 'memory: initial CH observation accepted' "$WORK/$sid.log" 2>/dev/null \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -542,7 +542,7 @@ wait_for_static_control_ready() {
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
-            && grep -q 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null \
+            && grep -q 'memory: initial CH observation accepted' "$WORK/$sid.log" 2>/dev/null \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -760,7 +760,7 @@ phase_a() {
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
     local shrinks oom
-    shrinks=$(grep -c 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null) || shrinks=0
+    shrinks=$(grep -c 'memory: shrink settled Budget=' "$WORK/$sid.log" 2>/dev/null) || shrinks=0
     oom=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
         oom=$(awk '$1=="oom" {print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local") || oom=0
