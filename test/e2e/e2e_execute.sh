@@ -44,6 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/vmm_cgroup.sh"
 . "$SCRIPT_DIR/lib/proxy.sh"
+. "$SCRIPT_DIR/lib/execute_state.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -66,6 +67,13 @@ LOW_ALLOC_REPEATS="${LOW_ALLOC_REPEATS:-2}"
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+RECOVERY_PENDING=0
+execute_state_path_absent "$(execute_state_path)" || RECOVERY_PENDING=1
+recovery_prerequisite() {
+    [ "$RECOVERY_PENDING" = 0 ] && skip "$1"
+    fail "$1; interrupted execute state requires recovery"
+}
+
 run_host_serialized() {
     local lock_directory="$1" result=0
     shift
@@ -80,8 +88,27 @@ run_host_serialized() {
 
 case "$BIN" in
     /*) ;;
-    *) BIN="$(cd "$BIN" 2>/dev/null && pwd)" || skip "BIN directory not found";;
+    *) BIN="$(cd "$BIN" 2>/dev/null && pwd)" || recovery_prerequisite "BIN directory not found" ;;
 esac
+
+command -v flock >/dev/null 2>&1 || recovery_prerequisite "flock not found"
+[ -d /run/systemd/system ] || recovery_prerequisite "systemd not PID1"
+if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
+if [ "${KUASAR_EXECUTE_LOCK_HELD:-0}" != 1 ]; then
+    run_host_serialized /run/systemd/system "$0" "$@"
+    exit "$?"
+fi
+
+# Recover only a topology whose names were durably reserved by an earlier
+# e2e_execute run. This also covers direct invocation outside run_all.sh.
+if [ "$RECOVERY_PENDING" = 1 ]; then
+    [ -x "$BIN/connector-ctl" ] || fail "missing $BIN/connector-ctl; interrupted execute state requires recovery"
+    for command in ip iptables systemctl stat sysctl awk grep seq sleep rm rmdir; do
+        command -v "$command" >/dev/null 2>&1 \
+            || fail "$command not found; interrupted execute state requires recovery"
+    done
+fi
+execute_state_recover "$BIN"
 
 for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
@@ -93,17 +120,9 @@ command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 command -v iptables >/dev/null 2>&1 || skip "iptables not found"
-command -v flock >/dev/null 2>&1 || skip "flock not found"
-[ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
     || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
-
-if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
-if [ "${KUASAR_EXECUTE_LOCK_HELD:-0}" != 1 ]; then
-    run_host_serialized /run/systemd/system "$0" "$@"
-    exit "$?"
-fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
 # Give the outer Builder unit the host's full CPU capacity. The phase Sandbox
@@ -127,7 +146,17 @@ TAPFD_SOCKET="$WORK/tapfd.sock"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=("${RUNNER_PREFIX}.service" "${BUILDER_PREFIX}.service" sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()
-for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
+for u in "${UNIT_NAMES[@]}"; do
+    if ! execute_state_path_absent "$UNIT_DIR/$u"; then skip "$UNIT_DIR/$u exists; refusing to clobber"; fi
+    OURS+=("$UNIT_DIR/$u")
+done
+for prefix in "$RUNNER_PREFIX" "$BUILDER_PREFIX"; do
+    execute_state_path_absent "$UNIT_DIR/${prefix}.service.d" || skip "$UNIT_DIR/${prefix}.service.d exists; refusing to clobber"
+done
+execute_state_assert_targets_absent "$BIN" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS"
+execute_state_assert_units_absent "$RUNNER_PREFIX" "$BUILDER_PREFIX"
+execute_state_reserve "$RUN_KEY" "$WORK" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS" -
+EXECUTE_STATE_EXPECTED="$(execute_state_record "$RUN_KEY" "$WORK" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS" -)"
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 
 MMDS_ROUTES_CONFIG=""
@@ -278,6 +307,7 @@ stop_owned_units() {
     done
 }
 cleanup() {
+    local forwarding_clean=1
     set +e
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     stop_owned_units "$RUNNER_PREFIX" "$BUILDER_PREFIX"
@@ -290,11 +320,14 @@ cleanup() {
     [ "$PROXY_VETH_OWNED" = 1 ] && ip link del "$PROXY_VETH_HOST" 2>/dev/null
     [ "$PROXY_NETNS_OWNED" = 1 ] && ip netns del "$PROXY_NETNS" 2>/dev/null
     [ "$SW_NETNS_OWNED" = 1 ] && ip netns del "$SW_NETNS" 2>/dev/null
-    [ -n "$ORIG_IP_FORWARD" ] && sysctl -q -w "net.ipv4.ip_forward=$ORIG_IP_FORWARD" 2>/dev/null
+    execute_state_restore_forwarding "$ORIG_IP_FORWARD" || forwarding_clean=0
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
     [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
+    if [ -n "${EXECUTE_STATE_EXPECTED:-}" ] && [ "$forwarding_clean" = 1 ]; then
+        execute_state_finish "$BIN" "$EXECUTE_STATE_EXPECTED" || true
+    fi
 }
 trap cleanup EXIT
 
@@ -329,6 +362,11 @@ setup_proxy_netns() {
     ip netns exec "$PROXY_NETNS" ip link set "$PROXY_VETH_NS" up
     ip netns exec "$PROXY_NETNS" ip route add "$FIP_CIDR" via "$PROXY_HOST_IP"
     ORIG_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+    case "$ORIG_IP_FORWARD" in 0|1) ;; *) fail "cannot read net.ipv4.ip_forward" ;; esac
+    if [ -n "${EXECUTE_STATE_EXPECTED:-}" ]; then
+        execute_state_remember_forwarding "$ORIG_IP_FORWARD"
+        EXECUTE_STATE_EXPECTED="$(execute_state_record "$RUN_KEY" "$WORK" "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS" "$ORIG_IP_FORWARD")"
+    fi
     sysctl -q -w net.ipv4.ip_forward=1
 }
 check_proxy_netns_address() {
