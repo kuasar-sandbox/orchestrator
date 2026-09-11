@@ -76,6 +76,8 @@ node-stub-ctl:
 test:
 	CGO_ENABLED=0 $(GO) test ./...
 	bash test/e2e/vmm_cgroup_test.sh
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_cluster_stub_diagnostics.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_ownership.py'
 
 vet:
 	CGO_ENABLED=0 $(GO) vet ./...
@@ -96,11 +98,17 @@ test-e2e-cluster-stub:
 	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
 
 VERSION ?= v0.1.0
+ACCELERATOR_VERSION ?= v0.1.3
+CONNECTOR_VERSION ?= v0.1.2
+SANDBOXER_VERSION ?= v0.1.3
 
 release: build
 	@mkdir -p build
 	rm -rf build/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
+	RELEASE_ACCELERATOR_VERSION="$(ACCELERATOR_VERSION)" \
+	RELEASE_CONNECTOR_VERSION="$(CONNECTOR_VERSION)" \
+	RELEASE_SANDBOXER_VERSION="$(SANDBOXER_VERSION)" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
 
 test-release:

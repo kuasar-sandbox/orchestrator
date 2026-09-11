@@ -3,11 +3,11 @@
 # e2e_execute.sh — Phase 2: boot a REAL microVM sandbox from a built template and
 # execute in it, end to end.
 #
-#   vswitch (ip netns + start) -> sw0 (eBPF/TC); builds need it too (the pull
+#   vswitch (run-owned netns + serve) -> eBPF/TC; builds need it too (the pull
 #                                runs INSIDE a build sandbox on the tenant network)
 #   build (native v3)          -> import build sandbox pulls via the mgmt VIP +
 #                                flattens -> a ready e2b-img template in the store
-#   POST /sandboxes            -> sandbox-runner@<run-id> assignment -> sandbox-ctl boots
+#   POST /sandboxes            -> run-owned runner unit assignment -> sandbox-ctl boots
 #                                cloud-hypervisor (KVM) from the template +
 #                                sandbox-runtime.bundle; envd comes up at 49983,
 #                                exposed as envd.sock; after runtime readiness the
@@ -49,15 +49,15 @@ MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 PROXY_PORT="${PROXY_PORT:-}"
-SWITCH="${SWITCH:-sw0}"
+SWITCH="${SWITCH:-}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 if [ -z "${ZOT_BIN:-}" ]; then
     ZOT_BIN="$(command -v zot || true)"
 fi
-SW_NETNS="${SW_NETNS:-e2e_sw}"
-PROXY_NETNS="${PROXY_NETNS:-e2e_proxy}"
-PROXY_VETH_HOST="${PROXY_VETH_HOST:-e2eih0}"
-PROXY_VETH_NS="${PROXY_VETH_NS:-e2ein0}"
+SW_NETNS="${SW_NETNS:-}"
+PROXY_NETNS="${PROXY_NETNS:-}"
+PROXY_VETH_HOST="${PROXY_VETH_HOST:-}"
+PROXY_VETH_NS="${PROXY_VETH_NS:-}"
 PROXY_HOST_IP="${PROXY_HOST_IP:-172.31.253.1}"
 PROXY_NS_IP="${PROXY_NS_IP:-172.31.253.2}"
 FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
@@ -65,6 +65,18 @@ LOW_ALLOC_REPEATS="${LOW_ALLOC_REPEATS:-2}"
 
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
+
+run_host_serialized() {
+    local lock_directory="$1" result=0
+    shift
+    # These cases share host routes, forwarding and slice names. Lock the
+    # existing systemd runtime directory without creating/deleting a lock file.
+    # flock owns the descriptor; --close keeps it out of daemons and units.
+    flock --nonblock --exclusive --close --conflict-exit-code 75 \
+        "$lock_directory" env KUASAR_EXECUTE_LOCK_HELD=1 "$@" || result=$?
+    [ "$result" -ne 75 ] || fail "another execute/MMDS case holds the host runtime lock"
+    return "$result"
+}
 
 case "$BIN" in
     /*) ;;
@@ -81,12 +93,17 @@ command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 command -v iptables >/dev/null 2>&1 || skip "iptables not found"
+command -v flock >/dev/null 2>&1 || skip "flock not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
     || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
+if [ "${KUASAR_EXECUTE_LOCK_HELD:-0}" != 1 ]; then
+    run_host_serialized /run/systemd/system "$0" "$@"
+    exit "$?"
+fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
 # Give the outer Builder unit the host's full CPU capacity. The phase Sandbox
@@ -95,9 +112,20 @@ if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 BUILDER_CPU="$(nproc)"
 
 WORK="$(mktemp -d /tmp/e-XXXXXX)"
+RUN_KEY="${WORK##*/}"
+SWITCH="${SWITCH:-x${RUN_KEY#e-}}"
+SW_NETNS="${SW_NETNS:-${RUN_KEY}-sw}"
+PROXY_NETNS="${PROXY_NETNS:-${RUN_KEY}-proxy}"
+PROXY_VETH_HOST="${PROXY_VETH_HOST:-${RUN_KEY}h}"
+PROXY_VETH_NS="${PROXY_VETH_NS:-${RUN_KEY}p}"
+for name in "$SWITCH" "$SW_NETNS" "$PROXY_NETNS" "$PROXY_VETH_HOST" "$PROXY_VETH_NS"; do
+    [[ "$name" =~ ^[A-Za-z0-9_-]{1,15}$ ]] || fail "invalid E2E network resource name"
+done
+RUNNER_PREFIX="sandbox-runner-${RUN_KEY}@"
+BUILDER_PREFIX="sandbox-builder-${RUN_KEY}@"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 UNIT_DIR="/run/systemd/system"
-UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
+UNIT_NAMES=("${RUNNER_PREFIX}.service" "${BUILDER_PREFIX}.service" sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()
 for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
@@ -231,19 +259,37 @@ declare -a TAGS=()
 IMMEDIATE_DATA_PID=""
 PROXY_PID=""
 SW_STARTED=""
+SW_NETNS_OWNED=0
+PROXY_NETNS_OWNED=0
+PROXY_VETH_OWNED=0
+FORWARD_TO_SWITCH_OWNED=0
+FORWARD_FROM_SWITCH_OWNED=0
 ORIG_IP_FORWARD=""
+stop_owned_units() {
+    local prefix unit
+    for prefix in "$@"; do
+        while IFS= read -r unit; do
+            case "$unit" in
+                "$prefix"*.service)
+                    systemctl stop "$unit" >/dev/null 2>&1 || true
+                    systemctl reset-failed "$unit" >/dev/null 2>&1 || true ;;
+            esac
+        done < <(systemctl list-units --all --plain --no-legend --no-pager "$prefix*.service" | awk '{print $1}')
+    done
+}
 cleanup() {
     set +e
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
-    systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    stop_owned_units "$RUNNER_PREFIX" "$BUILDER_PREFIX"
     [ -n "$IMMEDIATE_DATA_PID" ] && kill "$IMMEDIATE_DATA_PID" 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && wait "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
-    iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null
-    ip link del "$PROXY_VETH_HOST" 2>/dev/null
-    ip netns del "$PROXY_NETNS" 2>/dev/null
-    ip netns del "$SW_NETNS" 2>/dev/null
+    [ "$FORWARD_TO_SWITCH_OWNED" = 1 ] && iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
+    [ "$FORWARD_FROM_SWITCH_OWNED" = 1 ] && iptables -D FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null
+    [ "$PROXY_VETH_OWNED" = 1 ] && ip link del "$PROXY_VETH_HOST" 2>/dev/null
+    [ "$PROXY_NETNS_OWNED" = 1 ] && ip netns del "$PROXY_NETNS" 2>/dev/null
+    [ "$SW_NETNS_OWNED" = 1 ] && ip netns del "$SW_NETNS" 2>/dev/null
     [ -n "$ORIG_IP_FORWARD" ] && sysctl -q -w "net.ipv4.ip_forward=$ORIG_IP_FORWARD" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
@@ -265,10 +311,16 @@ wait_mmds_listener() {
     fail "Proxy MMDS listener did not appear in proxy_netns=$PROXY_NETNS on $PROXY_NS_IP:$MMDS_PORT"
 }
 setup_proxy_netns() {
-    ip link del "$PROXY_VETH_HOST" 2>/dev/null || true
-    ip netns del "$PROXY_NETNS" 2>/dev/null || true
+    if [ -e "/var/run/netns/$PROXY_NETNS" ] || [ -L "/var/run/netns/$PROXY_NETNS" ]; then
+        fail "Proxy netns already exists; refusing foreign resource: $PROXY_NETNS"
+    fi
+    if ip link show "$PROXY_VETH_HOST" >/dev/null 2>&1 || ip link show "$PROXY_VETH_NS" >/dev/null 2>&1; then
+        fail "Proxy veth already exists; refusing foreign resource"
+    fi
     ip netns add "$PROXY_NETNS"
+    PROXY_NETNS_OWNED=1
     ip link add "$PROXY_VETH_HOST" type veth peer name "$PROXY_VETH_NS"
+    PROXY_VETH_OWNED=1
     ip link set "$PROXY_VETH_NS" netns "$PROXY_NETNS"
     ip addr add "$PROXY_HOST_IP/30" dev "$PROXY_VETH_HOST"
     ip link set "$PROXY_VETH_HOST" up
@@ -279,11 +331,27 @@ setup_proxy_netns() {
     ORIG_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
     sysctl -q -w net.ipv4.ip_forward=1
 }
+check_proxy_netns_address() {
+    local phase="$1"
+    # This is namespace/link metadata only, never conductor configuration or
+    # sandbox credentials. Diagnose address loss at the exact startup boundary.
+    if ! ip -n "$PROXY_NETNS" -o -4 addr show dev "$PROXY_VETH_NS" | \
+        awk -v address="$PROXY_NS_IP/30" '$4 == address { found = 1 } END { exit !found }'; then
+        echo "==> Proxy namespace address missing ($phase)" >&2
+        ip -n "$PROXY_NETNS" -br address >&2 || true
+        fail "expected $PROXY_NS_IP/30 on $PROXY_NETNS/$PROXY_VETH_NS"
+    fi
+    echo "==> Proxy namespace address verified ($phase; netns=$(stat -Lc '%i' "/var/run/netns/$PROXY_NETNS"))"
+}
 allow_proxy_forwarding() {
-    iptables -C FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null \
-        || iptables -A FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT
-    iptables -C FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null \
-        || iptables -A FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT
+    if ! iptables -C FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT
+        FORWARD_TO_SWITCH_OWNED=1
+    fi
+    if ! iptables -C FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT
+        FORWARD_FROM_SWITCH_OWNED=1
+    fi
 }
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
@@ -503,6 +571,19 @@ PY
 
 export_argv_count() { argv_log_count "$EXPORT_ARGV_LOG"; }
 run_argv_count() { argv_log_count "$RUN_ARGV_LOG"; }
+
+wait_run_argv() {
+    local index="$1" attempt
+    # Durable starting/Proxy parking precedes the asynchronous runner process.
+    # Wait only for its observation; the separate source assertion still checks
+    # the exact call index, sandbox identity and mutually exclusive launch mode.
+    for ((attempt=0; attempt<120; attempt++)); do
+        [ "$(run_argv_count)" -gt "$index" ] && return 0
+        sleep 0.05
+    done
+    echo "timed out waiting for run call $index" >&2
+    return 1
+}
 
 assert_export_argv() { # $1=index, remaining args=expected argv
     local index="$1"
@@ -868,8 +949,8 @@ PY
 )"
     fi
     if [ -n "$failed_run_id" ]; then
-        echo "==> failed runner unit journal: sandbox-runner@$failed_run_id.service" >&2
-        journalctl -u "sandbox-runner@$failed_run_id.service" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+        echo "==> failed runner unit journal: ${RUNNER_PREFIX}$failed_run_id.service" >&2
+        journalctl -u "${RUNNER_PREFIX}$failed_run_id.service" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
     else
         echo "==> matching sandbox runner journal:" >&2
         journalctl KUASAR_SANDBOX_ID="$sid" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
@@ -1000,16 +1081,20 @@ echo "==> store-ctl + zot up; built+seeded $REF (user + ionice/nice shims)"
 
 # ---- vswitch up (ip netns + start) -----------------------------------------
 # BEFORE the build: the image pull runs INSIDE a build sandbox, so the build
-# needs a network slot and reaches zot via the mgmt VIP. Clear any leftover
-# switch of the same name (eBPF maps are pinned and survive a crash; --force
-# drains orphaned ports), then create the netns fresh.
+# needs a network slot and reaches zot via the mgmt VIP. Use this run's names;
+# stale switch metadata must never delete a new or foreign interface by index.
 MGMT_VIP="169.254.169.254"
 MMDS_PORT="$(free_port)"
+switch_status=0
+"$BIN/connector-ctl" vswitch status "$SWITCH" >/dev/null 2>&1 || switch_status=$?
+[ "$switch_status" -eq 3 ] || fail "vSwitch is not absent; refusing foreign or inconsistent resource: $SWITCH"
+if [ -e "/var/run/netns/$SW_NETNS" ] || [ -L "/var/run/netns/$SW_NETNS" ]; then
+    fail "switch netns already exists; refusing foreign resource: $SW_NETNS"
+fi
+ip netns add "$SW_NETNS"
+SW_NETNS_OWNED=1
 setup_proxy_netns
-"$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
-ip netns del "$SW_NETNS" 2>/dev/null || true
-ip netns del "$SWITCH" 2>/dev/null || true
-ip netns add "$SW_NETNS" 2>/dev/null || true
+check_proxy_netns_address before-vswitch
 echo "==> starting vswitch $SWITCH (netns=$SW_NETNS)"
 "$BIN/connector-ctl" vswitch serve "$SWITCH" \
     --netns="$SW_NETNS" \
@@ -1017,8 +1102,8 @@ echo "==> starting vswitch $SWITCH (netns=$SW_NETNS)"
     --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 \
     --mode=tap \
-    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
-    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT \
+    "--mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0" \
+    "--mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT" \
     --tapfd-listen="$TAPFD_SOCKET" --watch-interval=2s >"$WORK/vswitch-start.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 100); do
@@ -1034,6 +1119,7 @@ SW_STARTED=1
 ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
     || fail "configure management VIP on ${SWITCH}m0"
 allow_proxy_forwarding
+check_proxy_netns_address after-vswitch
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
 echo "==> vswitch up (build sandboxes pull $GUEST_REF; tapfd_socket=$TAPFD_SOCKET; Proxy netns=$PROXY_NETNS reaches $FIP_CIDR)"
 
@@ -1091,7 +1177,7 @@ $MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
-units: { dir: $UNIT_DIR }
+units: { dir: $UNIT_DIR, runner: '${RUNNER_PREFIX}.service', builder: '${BUILDER_PREFIX}.service' }
 sandbox:
   timeout_sec: 120
   resources:
@@ -1141,6 +1227,7 @@ start_orchestrator() { # $1=log path
     # can be distinguished from teardown/recreation during Proxy startup.
     proxy_ns_before=$(stat -Lc '%d:%i' "/var/run/netns/$PROXY_NETNS" 2>&1 || true)
     proxy_addresses_before=$(ip -n "$PROXY_NETNS" -brief address show 2>&1 || true)
+    check_proxy_netns_address before-proxy
     start_proxy "$ORCH_BIN_DIR/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
     PROXY_PID="$PROXY_HELPER_PID"
     PIDS+=("$PROXY_PID")
@@ -1313,7 +1400,7 @@ run_low_allocatable_case() { # $1=iteration
         || fail "low-allocatable[$iteration] static resolved resource YAML"
     LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
     [ -n "$LOW_RUN_ID" ] || fail "low-allocatable[$iteration] sandbox has no run_id"
-    LOW_UNIT="sandbox-runner@$LOW_RUN_ID.service"
+    LOW_UNIT="${RUNNER_PREFIX}$LOW_RUN_ID.service"
     LOW_CG=$(systemctl show "$LOW_UNIT" -p ControlGroup --value)
     LOW_CTL_PID=$(systemctl show "$LOW_UNIT" -p MainPID --value)
     [ -n "$LOW_CG" ] && [ "$LOW_CG" != "/" ] || fail "runner ControlGroup is invalid: $LOW_CG"
@@ -1475,7 +1562,7 @@ echo "==> PASS: real bare KVM launch normalized inherited 256MiB headroom to 192
 # These deterministic injections surround the release-candidate binaries; they
 # exercise the real conductor, sqlite store, run pool, systemd units, network,
 # routes and cleanup without relying on timing races.
-RUNNER_UNIT="$UNIT_DIR/sandbox-runner@.service"
+RUNNER_UNIT="$UNIT_DIR/${RUNNER_PREFIX}.service"
 RUNNER_UNIT_SAVED="$WORK/sandbox-runner@.service.saved"
 cp "$RUNNER_UNIT" "$RUNNER_UNIT_SAVED"
 python3 - "$RUNNER_UNIT" <<'PY'
@@ -1499,8 +1586,7 @@ code=$(DP_MAX_TIME=10 dp "49983-$RUNNER_TIMEOUT_SID" /health "$RUNNER_TIMEOUT_TO
 code=$(req DELETE "/sandboxes/$RUNNER_TIMEOUT_SID" "$AK"); [ "$code" = "204" ] || fail "delete runner-timeout sandbox=$code"
 cp "$RUNNER_UNIT_SAVED" "$RUNNER_UNIT"
 systemctl daemon-reload
-systemctl stop 'sandbox-runner@*.service' >/dev/null 2>&1 || true
-systemctl reset-failed 'sandbox-runner@*.service' >/dev/null 2>&1 || true
+stop_owned_units "$RUNNER_PREFIX"
 echo "==> PASS: runner wait timeout rolled accepted fresh Create to dead + Delete with empty run_id"
 
 printf '%s\n' runtime-wire-failure >"$WORK/inject-sandbox-run"
@@ -1552,7 +1638,7 @@ code=$(req DELETE "/sandboxes/$STARTING_KILL_SID" "$AK")
 [ "$code" = "204" ] || fail "Kill starting=$code (want 204)"
 rm -f "$WORK/inject-sandbox-run"
 wait_sandbox_state "$STARTING_KILL_SID" missing 50 || fail "Kill starting left a durable row"
-if systemctl is-active --quiet "sandbox-runner@$STARTING_KILL_RUN_ID.service"; then
+if systemctl is-active --quiet "${RUNNER_PREFIX}$STARTING_KILL_RUN_ID.service"; then
     fail "Kill starting left runner $STARTING_KILL_RUN_ID active"
 fi
 echo "==> PASS: starting SetTimeout=204, Pause=409, Kill removed row/runner without resurrection"
@@ -1978,7 +2064,7 @@ W_PORTABLE_ARTIFACT="$(readlink -f "$W_PORTABLE_LOCAL")"
 [ "$W_PORTABLE_ARTIFACT" != "$B_ARTIFACT" ] || fail "working-set W reused B memory self"
 "$BIN/sandbox-ctl" info --json "$W_PORTABLE_LOCAL" >"$WORK/w-portable-local.json" \
     || fail "local working-set W is unreadable"
-PORTABLE_W_UNIT="sandbox-runner@$PORTABLE_W_RUN_ID.service"
+PORTABLE_W_UNIT="${RUNNER_PREFIX}$PORTABLE_W_RUN_ID.service"
 wait_unit_journal_contains "$PORTABLE_W_UNIT" \
     'quiesce: guest acked (drop_caches=skipped' "$WORK/w-portable-local.journal" \
     || { tail -40 "$WORK/w-portable-local.journal" | sed 's/^/  unit| /'; fail "working-set Pause did not preserve guest page cache"; }
@@ -2111,7 +2197,7 @@ grep -q "$W_DISK_PERSIST" "$WORK/portable-disk-read.out" \
     || { sed 's/^/  guest| /' "$WORK/portable-disk-read.out"; fail "portable W lost merged W-only disk state"; }
 PORTABLE_RESTORE_RUN_ID=$(sandbox_run_id "$SID")
 [ -n "$PORTABLE_RESTORE_RUN_ID" ] || fail "portable restore runner id is empty"
-PORTABLE_RESTORE_UNIT="sandbox-runner@$PORTABLE_RESTORE_RUN_ID.service"
+PORTABLE_RESTORE_UNIT="${RUNNER_PREFIX}$PORTABLE_RESTORE_RUN_ID.service"
 wait_unit_journal_contains "$PORTABLE_RESTORE_UNIT" \
     "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_W_KEY" \
     "$WORK/portable-w.journal" || { tail -40 "$WORK/portable-w.journal" | sed 's/^/  unit| /'; fail "portable restore did not prefetch W self"; }
@@ -2302,6 +2388,7 @@ IMMEDIATE_DATA_PID=$!
 wait_sandbox_state "$SID" starting 120 || fail "Sandbox E traffic Wake was not durably accepted"
 wait_proxy_traffic_stats "$SID" parking \
     || fail "first Sandbox E Wake request was not parked while cold launch was starting"
+wait_run_argv "$E_WAKE_RUN_CALL" || fail "Sandbox E traffic Wake did not start its runner"
 assert_run_source_mode "$E_WAKE_RUN_CALL" "$SID" from \
     || fail "Sandbox E traffic Wake did not execute sandbox-ctl run --from"
 rm -f "$WORK/inject-sandbox-run"

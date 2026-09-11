@@ -52,7 +52,6 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/state"
-
 cat > "$TMP/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -264,6 +263,31 @@ common_env=(
 )
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
+
+for marker in kuasar-release-source kuasar-preview-binding; do
+  marker_bundle="$TMP/notes-$marker"
+  cp -a "$BUNDLE" "$marker_bundle"
+  printf '\n<!-- %s {"source_ref":"main","source_sha":"0000000000000000000000000000000000000000","unit":"forged"} -->\n' \
+    "$marker" >> "$marker_bundle/release-notes.md"
+  if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 \
+    "$COMMIT" "$marker_bundle" "$SOURCE_REF" > "$TMP/$marker.log" 2>&1; then
+    echo "test-publisher: accepted producer-supplied $marker" >&2
+    exit 1
+  fi
+  grep -Fq 'bundle notes contain a reserved publisher marker' "$TMP/$marker.log" \
+    || { echo "test-publisher: $marker failed for an unrelated reason" >&2; exit 1; }
+  [ ! -e "$TMP/state/tag" ] \
+    || { echo "test-publisher: reserved-marker rejection wrote a tag" >&2; exit 1; }
+done
+if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 \
+  0000000000000000000000000000000000000000 "$BUNDLE" "$SOURCE_REF" > "$TMP/wrong-commit.log" 2>&1; then
+  echo "test-publisher: accepted a bundle from another source commit" >&2
+  exit 1
+fi
+grep -Fq 'Go payload must be built from the clean selected commit' "$TMP/wrong-commit.log" \
+  || { echo "test-publisher: wrong source failed for an unrelated reason" >&2; exit 1; }
+[ ! -e "$TMP/state/tag" ] \
+  || { echo "test-publisher: wrong-source validation wrote a tag" >&2; exit 1; }
 if env "${common_env[@]}" FAKE_GH_FAIL_CREATE_ONCE=1 \
   "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF" >/dev/null 2>&1; then
   echo "test-publisher: interrupted draft creation unexpectedly succeeded" >&2
@@ -300,6 +324,9 @@ if [ "$EXPECTED_LATEST" = true ]; then
   [ "$(cat "$TMP/state/latest-id")" = 88 ] \
     || { echo "test-publisher: unbounded same-commit SemVer did not win" >&2; exit 1; }
 fi
+notes_bytes="$(wc -c < "$BUNDLE/release-notes.md")"
+cmp -n "$notes_bytes" "$BUNDLE/release-notes.md" "$TMP/state/release-notes.md" \
+  || { echo "test-publisher: publisher did not preserve the bundle notes" >&2; exit 1; }
 binding_lines="$(grep -c '^<!-- kuasar-preview-binding .* -->$' \
   "$TMP/state/release-notes.md" || true)"
 source_lines="$(grep -c '^<!-- kuasar-release-source .* -->$' \

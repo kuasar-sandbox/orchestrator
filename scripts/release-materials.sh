@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+
+# Deterministic license and source material support for release archives.
+# This file is sourced by scripts/release.sh; the caller provides fail().
+
+release_materials_safe_relative() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9._+@:/~=-]+$ ]] \
+    && [[ "$value" != . && "$value" != .. ]] \
+    && [[ "$value" != /* && "$value" != ../* && "$value" != */../* && "$value" != */.. ]]
+}
+
+release_materials_init() {
+  [ "$#" -eq 3 ] || fail "release_materials_init requires stage, work and unit"
+  RELEASE_MATERIALS_STAGE="$1"
+  RELEASE_MATERIALS_WORK="$2"
+  RELEASE_MATERIALS_UNIT="$3"
+  release_materials_safe_relative "$RELEASE_MATERIALS_UNIT" \
+    || fail "unsafe release material unit: $RELEASE_MATERIALS_UNIT"
+  mkdir -p "$RELEASE_MATERIALS_WORK" \
+    "$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT" \
+    "$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
+  : > "$RELEASE_MATERIALS_WORK/sources"
+  : > "$RELEASE_MATERIALS_WORK/go-build-info"
+  : > "$RELEASE_MATERIALS_WORK/go-modules"
+  : > "$RELEASE_MATERIALS_WORK/go-toolchains"
+}
+
+release_materials_resolve_git_source() {
+  [ "$#" -eq 3 ] \
+    || fail "release_materials_resolve_git_source requires source directory, expected SHA and name"
+  local source="$1" expected="$2" name="$3" actual source_root status index_flags
+  [ -d "$source" ] || fail "$name source directory is missing: $source"
+  source_root="$(git -C "$source" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$source_root" ] || fail "$name source directory is not a Git worktree: $source"
+  [ "$(cd "$source" && pwd -P)" = "$(cd "$source_root" && pwd -P)" ] \
+    || fail "$name source directory is not the Git worktree root: $source"
+  actual="$(git -C "$source" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$actual" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the $name source commit"
+  if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+    fail "$name source commit $actual does not match the selected commit $expected"
+  fi
+  # Status/diff may trust these index flags and hide changed tracked inputs.
+  # Never clear a developer's flags: require a normal, inspectable checkout.
+  index_flags="$(git -C "$source" -c core.quotePath=true ls-files -v)" \
+    || fail "cannot inspect the $name source index"
+  if LC_ALL=C grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+    fail "$name source uses assume-unchanged or skip-worktree; select a source tree with normal index flags"
+  fi
+  status="$(git -C "$source" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
+  [ -z "$status" ] || fail "$name source worktree is dirty"
+  printf '%s\n' "$actual"
+}
+
+release_materials_git_version() {
+  local source="$1" version="$2" sha="$3" tagged
+  tagged="$(git -C "$source" rev-parse --verify --quiet "refs/tags/$version^{commit}" || true)"
+  if [ -z "$tagged" ]; then
+    # Local source builds may target a release whose tag does not exist yet.
+    # Record the exact source identity instead of claiming that tag's contents.
+    printf 'git:%s\n' "$sha"
+  elif [ "$tagged" = "$sha" ]; then
+    printf '%s\n' "$version"
+  else
+    fail "$version does not identify the selected source commit $sha"
+  fi
+}
+
+release_materials_copy_licenses() {
+  [ "$#" -eq 2 ] || fail "release_materials_copy_licenses requires source directory and destination label"
+  local source="$1" label="$2" destination file relative source_root count=0
+  local links listing nested=''
+  [ -d "$source" ] || fail "license source directory is missing: $source"
+  release_materials_safe_relative "$label" \
+    || fail "unsafe release license label: $label"
+  destination="$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/$label"
+  mkdir -p "$destination"
+  source_root="$(git -C "$source" rev-parse --show-toplevel 2>/dev/null || true)"
+  links="$(find "$source" -mindepth 1 -maxdepth 1 -type l \
+    \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' -o -iname 'PATENTS*' \
+       -o -iname 'AUTHORS*' -o -iname 'CREDITS*' -o -iname 'COPYRIGHT*' \) \
+    -print)" || fail "cannot enumerate top-level license material: $source"
+  if [ -n "$links" ]; then
+    fail "top-level license material must not be a symbolic link: $source"
+  fi
+  if [ -d "$source/LICENSES" ]; then
+    links="$(find "$source/LICENSES" -type l -print)" \
+      || fail "cannot enumerate license directory: $source/LICENSES"
+    [ -z "$links" ] || fail "license directory contains a symbolic link: $source/LICENSES"
+    nested="$(find "$source/LICENSES" -type f -print)" \
+      || fail "cannot enumerate license directory: $source/LICENSES"
+  fi
+  # Capture each traversal status before copying anything. A failed find can
+  # emit valid-looking partial output, which process substitution would hide.
+  listing="$(find "$source" -mindepth 1 -maxdepth 1 -type f \
+    \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' -o -iname 'PATENTS*' \
+       -o -iname 'AUTHORS*' -o -iname 'CREDITS*' -o -iname 'COPYRIGHT*' \) -print)" \
+    || fail "cannot enumerate top-level license material: $source"
+  listing="$(printf '%s\n' "$listing" "$nested" | LC_ALL=C sort)" \
+    || fail "cannot sort license material"
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ ! -L "$file" ] || fail "license material must not be a symbolic link: $file"
+    relative="${file#"$source"/}"
+    if [ "$source_root" = "$(cd "$source" && pwd -P)" ]; then
+      git -C "$source" ls-files --error-unmatch -- "$relative" >/dev/null 2>&1 \
+        || fail "license material is absent from the selected source commit: $relative"
+      git -C "$source" cat-file blob "HEAD:$relative" | cmp -s "$file" - \
+        || fail "license material differs from the selected source commit: $relative"
+    fi
+    mkdir -p "$destination/$(dirname "$relative")"
+    install -m 0644 "$file" "$destination/$relative"
+    count=$((count + 1))
+  done <<< "$listing"
+  [ "$count" -gt 0 ] || fail "no license or notice material found in $source"
+}
+
+release_materials_record_source() {
+  [ "$#" -eq 6 ] || fail "release_materials_record_source requires payload, name, version, source, integrity and license directory"
+  local value
+  for value in "$@"; do
+    [[ "$value" != *$'\t'* && "$value" != *$'\n'* && -n "$value" ]] \
+      || fail "source material fields must be non-empty single-line values"
+  done
+  release_materials_safe_relative "$6" \
+    || fail "unsafe source material license directory: $6"
+  printf '%s\t%s\t%s\t%s\t%s\tshare/licenses/%s/%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$RELEASE_MATERIALS_UNIT" "$6" \
+    >> "$RELEASE_MATERIALS_WORK/sources"
+}
+
+release_materials_add_go_binary() {
+  [ "$#" -eq 2 ] || fail "release_materials_add_go_binary requires binary and archive path"
+  local binary="$1" archive_path="$2" raw toolchain toolchain_full
+  [ -f "$binary" ] || fail "Go release payload is missing: $binary"
+  release_materials_safe_relative "$archive_path" \
+    || fail "unsafe Go payload archive path: $archive_path"
+  raw="$RELEASE_MATERIALS_WORK/go-version-$(( $(find "$RELEASE_MATERIALS_WORK" -maxdepth 1 -name 'go-version-*' | wc -l) + 1 ))"
+  go version -m "$binary" > "$raw" 2>/dev/null \
+    || fail "Go build info is missing from $binary"
+  # Official component packages only support the existing Kuasar sibling
+  # replacements. A third-party local directory has no authenticated module h1.
+  awk -F '\t' '
+    $2 == "dep" { module=$3 }
+    $2 == "=>" && ($3 ~ /^\// || $3 ~ /^\.\.?\// || $4 == "(devel)" || $4 == "") {
+      if (module != "github.com/kuasar-sandbox/accelerator" && module != "github.com/kuasar-sandbox/connector" && module != "github.com/kuasar-sandbox/sandboxer") unsupported=1
+    }
+    END { exit unsupported }
+  ' "$raw" || fail "third-party local Go replacements are not supported in release materials; select a versioned module replacement"
+  toolchain_full="$(awk 'NR == 1 { sub(/^.*: /, ""); print; exit }' "$raw")"
+  toolchain="${toolchain_full%% *}"
+  toolchain="${toolchain%%-X:*}"
+  [[ "$toolchain" =~ ^go[0-9] ]] || fail "cannot read the Go toolchain from $binary"
+  printf '%s\ttoolchain\tgo\t%s\t-\n' "$archive_path" "$toolchain_full" \
+    >> "$RELEASE_MATERIALS_WORK/go-build-info"
+  printf '%s\n' "$toolchain" >> "$RELEASE_MATERIALS_WORK/go-toolchains"
+
+  awk -F '\t' -v payload="$archive_path" \
+    -v info="$RELEASE_MATERIALS_WORK/go-build-info" \
+    -v modules="$RELEASE_MATERIALS_WORK/go-modules" '
+      function flush_module() {
+        if (previous != "") print previous "\t" previous_version "\t" previous_checksum >> modules
+        previous = ""
+      }
+      $2 != "=>" { flush_module() }
+      $2 == "path" {
+        print payload "\tmain-package\t" $3 "\t-\t-" >> info
+      }
+      $2 == "mod" {
+        version = ($4 == "" ? "(devel)" : $4)
+        checksum = ($5 == "" ? "-" : $5)
+        print payload "\tmain-module\t" $3 "\t" version "\t" checksum >> info
+      }
+      $2 == "dep" {
+        version = ($4 == "" ? "-" : $4)
+        checksum = ($5 == "" ? "-" : $5)
+        print payload "\tmodule\t" $3 "\t" version "\t" checksum >> info
+        previous = $3
+        previous_version = version
+        previous_checksum = checksum
+      }
+      $2 == "=>" && previous != "" {
+        previous_module = previous
+        if ($3 ~ /^\// || $3 ~ /^\.\.?\// || $4 == "(devel)" || $4 == "") {
+          target = "local-source"
+          checksum = "-"
+          flush_module()
+        } else {
+          target = $3 "@" $4
+          checksum = ($5 == "" ? "-" : $5)
+          print $3 "\t" $4 "\t" checksum >> modules
+        }
+        print payload "\treplacement\t" previous_module "\t" target "\t" checksum >> info
+        previous = ""
+      }
+      $2 == "build" {
+        split($3, setting, "=")
+        if (setting[1] == "GOOS" || setting[1] == "GOARCH" ||
+            setting[1] == "CGO_ENABLED" || setting[1] == "GOEXPERIMENT" || setting[1] == "-tags" ||
+            setting[1] == "vcs" || setting[1] == "vcs.revision" ||
+            setting[1] == "vcs.time" || setting[1] == "vcs.modified") {
+          print payload "\tbuild-setting\t" setting[1] "\t" substr($3, length(setting[1]) + 2) "\t-" >> info
+        }
+      }
+      END { flush_module() }
+    ' "$raw"
+}
+
+release_materials_require_go_revision() {
+  local binary="$1" sha="$2" revision modified info
+  info="$(go version -m "$binary" 2>/dev/null)" \
+    || fail "Go build info is missing from $binary"
+  revision="$(awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ { print substr($3, 14) }' <<< "$info")"
+  modified="$(awk -F '\t' '$2 == "build" && $3 ~ /^vcs.modified=/ { print substr($3, 14) }' <<< "$info")"
+  if [ "$revision" != "$sha" ] || [ "$modified" != false ]; then
+    fail "Go payload must be built from the clean selected commit $sha: $binary"
+  fi
+}
+
+release_materials_require_project_source() {
+  local root="$1" unit="$2" payload="$3" version="$4"
+  shift 4
+  [ "$#" -gt 0 ] || fail "project source validation requires its Go payloads"
+  local sha="${SOURCE_SHA:-}" info file recorded_version
+  if [ -z "$sha" ]; then
+    info="$(go version -m "$root/$1" 2>/dev/null)" || fail "project Go build info is missing"
+    sha="$(awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}' <<< "$info")"
+  fi
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "project source must bind a full lowercase commit"
+  for file in "$@"; do
+    release_materials_require_go_revision "$root/$file" "$sha"
+  done
+  recorded_version="$(awk -F '\t' -v payload="$payload" -v unit="$unit" \
+    'NR > 1 && $1 == payload && $2 == unit {print $3}' "$root/share/sources/$unit/SOURCES.tsv")"
+  if [ "$recorded_version" != "$version" ] && [ "$recorded_version" != "git:$sha" ]; then
+    fail "project source version differs from its target release or exact pre-tag commit"
+  fi
+  release_materials_require_source "$root" "$unit" "$payload" "$unit" "$recorded_version" \
+    "https://github.com/kuasar-sandbox/$unit/commit/$sha" "git:$sha"
+}
+
+release_materials_go_payload_allowed() {
+  case "$1:$2" in
+    orchestrator:bin/node-ctl|orchestrator:bin/cluster-ctl|orchestrator:bin/node-stub-ctl|orchestrator:bin/e2b-key-ctl ) return 0 ;;
+    *) fail "unexpected Go payload identity" ;;
+  esac
+}
+
+release_materials_go_source() {
+  local module="$1" version="$2" checksum="$3" download_root json directory
+  [[ "$checksum" =~ ^h1:[A-Za-z0-9+/]{43}=$ ]] \
+    || fail "third-party Go source requires a module checksum: $module@$version"
+  download_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/go-source.XXXXXX")"
+  # Resolve the version recorded in the binary using the normal Go module
+  # cache and routing. A temporary working directory protects the caller's
+  # go.mod/go.sum; standalone archive validation does not fetch module sources.
+  json="$(cd "$download_root" && GOWORK=off GOFLAGS='' GO111MODULE=on go mod download -json "$module@$version")" \
+    || fail "cannot obtain Go module source for $module@$version"
+  [ "$(jq -er '.Sum' <<< "$json")" = "$checksum" ] \
+    || fail "Go module source checksum differs from the binary: $module@$version"
+  directory="$(jq -er '.Dir' <<< "$json")" \
+    || fail "Go module source directory is missing for $module@$version"
+  printf '%s\n' "$directory"
+}
+
+release_materials_copy_go_licenses() {
+  # Collect notices from the compiler actually selected for this build. This
+  # records distribution material; it does not authenticate the compiler.
+  local source="${1%/}" toolchain="$2" destination file relative base notices
+  destination="$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/go-toolchain/$toolchain"
+  [ -f "$source/LICENSE" ] || fail "selected Go distribution has no LICENSE"
+  notices="$(mktemp "$RELEASE_MATERIALS_WORK/go-notices.XXXXXX")"
+  find "$source/" \( -type f -o -type l \) -print0 | LC_ALL=C sort -z > "$notices" \
+    || fail "cannot enumerate Go notices"
+  mkdir -p "$destination"
+  while IFS= read -r -d '' file; do
+    relative="${file#"$source"/}"
+    case "$relative" in api/*|doc/*|misc/*|test/*) continue ;; esac
+    base="${relative##*/}"
+    case "${base,,}" in *.go|*.c|*.h|*.s|*.rs|*.py) continue ;; esac
+    case "${base^^}" in
+      LICENSE|LICENSE.*|LICENSE-*|LICENCE|LICENCE.*|LICENCE-*|COPYING|COPYING.*|COPYING-*|NOTICE|NOTICE.*|NOTICE-*|PATENTS|PATENTS.*|PATENTS-*|AUTHORS|AUTHORS.*|AUTHORS-*|CREDITS|CREDITS.*|CREDITS-*|COPYRIGHT|COPYRIGHT.*|COPYRIGHT-*) ;;
+      *) [[ "${relative^^}" == */LICENSES/* ]] || continue ;;
+    esac
+    release_materials_safe_relative "$relative" || fail "unsafe Go notice path"
+    if [ ! -f "$file" ] || [ -L "$file" ]; then
+      fail "Go notice is not a regular file: $relative"
+    fi
+    mkdir -p "$destination/$(dirname "$relative")"
+    if [ -f "$destination/$relative" ]; then
+      cmp -s "$file" "$destination/$relative" || fail "conflicting Go notices for $toolchain: $relative"
+    else
+      install -m 0644 "$file" "$destination/$relative"
+    fi
+  done < "$notices"
+}
+
+release_materials_hash_tree() {
+  local root="$1" unit="$2" output="$3"
+  (
+    cd "$root" || exit
+    find "share/licenses/$unit" "share/sources/$unit" -type f \
+      ! -path "share/sources/$unit/MATERIALS.sha256" -print \
+      | LC_ALL=C sort \
+      | while IFS= read -r file; do sha256sum "$file"; done
+  ) > "$output"
+}
+
+release_materials_finish() {
+  local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
+  local module version checksum directory toolchain toolchain_root installed_toolchain source payload
+  while IFS= read -r toolchain; do
+    [ -n "$toolchain" ] || continue
+    if [ -n "${RELEASE_MATERIALS_GO_ENV:-}" ]; then
+      toolchain_root="$(jq -er '.GOROOT' "$RELEASE_MATERIALS_GO_ENV")"
+      installed_toolchain="$(jq -er '.GOVERSION' "$RELEASE_MATERIALS_GO_ENV")"
+    else
+      toolchain_root="$(GOWORK=off GOENV=off GOTOOLCHAIN=local command go env GOROOT)"
+      installed_toolchain="$(GOWORK=off GOENV=off GOTOOLCHAIN=local command go env GOVERSION)"
+    fi
+    [ "$installed_toolchain" = "$toolchain" ] \
+      || fail "resolved Go toolchain $installed_toolchain does not match $toolchain"
+    release_materials_copy_go_licenses "$toolchain_root" "$toolchain"
+    source="https://go.dev/dl/#$toolchain"
+    checksum=-
+    while IFS= read -r payload; do
+      release_materials_record_source "$payload" "Go toolchain" "$toolchain" \
+        "$source" "$checksum" "go-toolchain/$toolchain"
+    done < <(awk -F '\t' -v version="$toolchain" \
+      '$2 == "toolchain" { selected=$4; sub(/[ -]X:.*/, "", selected); if (selected == version) print $1 }' \
+      "$RELEASE_MATERIALS_WORK/go-build-info" | LC_ALL=C sort -u)
+  done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
+  LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
+    > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
+  if [ -s "$RELEASE_MATERIALS_WORK/go-modules-sorted" ]; then
+    command -v jq >/dev/null || fail "jq is required to collect Go module license material"
+  fi
+  while IFS=$'\t' read -r module version checksum; do
+    [ -n "$module" ] || continue
+    # Only exact components named in this package's source contract
+    # have their notices collected separately. Organization membership is not
+    # a license-material exemption.
+    case "$module" in
+      github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;;
+    esac
+    directory="$(release_materials_go_source "$module" "$version" "$checksum")"
+    release_materials_copy_licenses "$directory" "go/$module@$version"
+  done < "$RELEASE_MATERIALS_WORK/go-modules-sorted"
+
+  {
+    printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
+    LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/sources"
+  } > "$source_root/SOURCES.tsv"
+  {
+    printf 'payload\trecord\tname\tversion_or_value\tchecksum\n'
+    LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-build-info"
+  } > "$source_root/GO-BUILD-INFO.tsv"
+  {
+    printf 'module\tversion\tchecksum\n'
+    cat "$RELEASE_MATERIALS_WORK/go-modules-sorted"
+  } > "$source_root/GO-MODULES.tsv"
+  release_materials_hash_tree "$RELEASE_MATERIALS_STAGE" "$RELEASE_MATERIALS_UNIT" \
+    "$source_root/MATERIALS.sha256"
+  find "$RELEASE_MATERIALS_STAGE/share" -type d -exec chmod 0755 {} +
+  find "$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT" "$source_root" -type f -exec chmod 0644 {} +
+}
+
+release_materials_validate_payload() {
+  local root="$1" payload="$2" path carrier embedded
+  local -a paths
+  IFS=, read -r -a paths <<< "$payload"
+  for path in "${paths[@]}"; do
+    carrier="${path%%:*}"
+    if [[ "$path" == *:* ]]; then
+      embedded="${path#*:}"
+      if [[ "$embedded" != /* ]] || ! release_materials_safe_relative "${embedded#/}"; then
+        fail "unsafe embedded payload path: $path"
+      fi
+    fi
+    case "$carrier" in
+      */\*)
+        carrier="${carrier%/*}"
+        release_materials_safe_relative "$carrier" \
+          || fail "unsafe payload directory: $path"
+        if [ ! -d "$root/$carrier" ] \
+          || [ -z "$(find "$root/$carrier" -type f -print -quit)" ]; then
+          fail "declared payload directory has no files: $path"
+        fi
+        ;;
+      *)
+        release_materials_safe_relative "$carrier" \
+          || fail "unsafe payload path: $path"
+        [ -f "$root/$carrier" ] || fail "declared payload is not shipped: $path"
+        ;;
+    esac
+  done
+}
+
+release_materials_require_source() {
+  local root="$1" unit="$2" payload="$3" name="$4" version="$5" source="${6:-}" integrity="${7:-}"
+  local label=""
+  case "$name" in
+    "Go toolchain") label="go-toolchain/$version" ;;
+    "$unit") label=project ;;
+    accelerator|connector|sandboxer) label="$name" ;;
+  esac
+  [ -z "$label" ] || label="share/licenses/$unit/$label"
+  case "$name" in
+    accelerator|connector|sandboxer)
+      # Check the bundle's source identity fields agree; no checkout or remote
+      # tag lookup is required for standalone archive validation.
+      awk -F '\t' -v payload="$payload" -v name="$name" '
+        NR > 1 && $1 == payload && $2 == name {
+          sha=substr($5, 5)
+          if ($5 !~ /^git:/ || length(sha) != 40 || sha ~ /[^0-9a-f]/ ||
+              $4 != "https://github.com/kuasar-sandbox/" name "/commit/" sha) exit 1
+        }
+      ' "$root/share/sources/$unit/SOURCES.tsv" \
+        || fail "missing or inconsistent source record for $name ($payload)"
+      ;;
+  esac
+  awk -F '\t' -v payload="$payload" -v name="$name" -v version="$version" \
+    -v source="$source" -v integrity="$integrity" -v label="$label" '
+    NR > 1 && $1 == payload && $2 == name {
+      rows++
+      if ((version != "" && $3 != version) || (source != "" && $4 != source) ||
+          (integrity != "" && $5 != integrity) || (label != "" && $6 != label)) invalid=1
+    }
+    END { exit rows != 1 || invalid }
+  ' "$root/share/sources/$unit/SOURCES.tsv" \
+    || fail "missing or inconsistent source record for $name ($payload)"
+}
+
+release_materials_require_go_key() {
+  # After release_materials_validate checks each observed payload's records once,
+  # require every official payload without repeating its expensive verification.
+  local root="$1" unit="$2" payload="$3"
+  awk -F '\t' -v payload="$payload" '
+    NR > 1 && $1 == payload { found = 1 }
+    END { exit !found }
+  ' "$root/share/sources/$unit/GO-BUILD-INFO.tsv" \
+    || fail "missing required Go payload record: $payload"
+}
+
+release_materials_require_go() {
+  local root="$1" unit="$2" payload="$3" toolchain
+  local info="$root/share/sources/$unit/GO-BUILD-INFO.tsv"
+  toolchain="$(awk -F '\t' -v payload="$payload" '
+    NR > 1 && $1 == payload && $2 == "toolchain" && $3 == "go" { print $4 }
+  ' "$info")"
+  [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?(-X:[A-Za-z0-9_,]+|\ X:[A-Za-z0-9_,]+)?$ ]] \
+    || fail "missing or inconsistent Go toolchain for $payload"
+  awk -F '\t' -v payload="$payload" '
+    NR > 1 && $1 == payload && $2 == "main-package" { rows++ }
+    END { exit rows != 1 }
+  ' "$info" || fail "missing or inconsistent Go package record for $payload"
+  toolchain="${toolchain%% *}"
+  toolchain="${toolchain%%-X:*}"
+  release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "$toolchain" \
+    "https://go.dev/dl/#$toolchain" "-"
+  if [[ "$payload" != *:* ]]; then
+    (
+      local validation_work
+      validation_work="$(mktemp -d "$WORK/go-records.XXXXXX")"
+      release_materials_init "$validation_work/stage" "$validation_work/materials" "$unit"
+      release_materials_add_go_binary "$root/$payload" "$payload"
+      LC_ALL=C sort -u "$validation_work/materials/go-build-info" > "$validation_work/expected"
+      awk -F '\t' -v payload="$payload" 'NR > 1 && $1 == payload' "$info" \
+        | LC_ALL=C sort -u > "$validation_work/actual"
+      cmp -s "$validation_work/expected" "$validation_work/actual" \
+        || fail "Go build records differ from the shipped binary: $payload"
+    )
+  fi
+}
+
+release_materials_validate() {
+  [ "$#" -eq 2 ] || fail "release_materials_validate requires extracted root and unit"
+  local root="$1" unit="$2" source_root="$1/share/sources/$2"
+  local file actual header directory payload module version checksum
+  release_materials_safe_relative "$unit" \
+    || fail "unsafe release material unit: $unit"
+  for directory in "$root/share" "$root/share/licenses" "$root/share/sources" \
+    "$root/share/licenses/$unit" "$source_root"; do
+    [ -d "$directory" ] || fail "release material directory is missing: $directory"
+    [ ! -L "$directory" ] || fail "release material directory is a symbolic link: $directory"
+    [ "$(stat -c '%a' "$directory")" = 755 ] \
+      || fail "release material directory has unsafe mode: $directory"
+  done
+  for file in SOURCES.tsv GO-BUILD-INFO.tsv GO-MODULES.tsv MATERIALS.sha256; do
+    [ -s "$source_root/$file" ] || fail "release source material is missing: share/sources/$unit/$file"
+    [ "$(stat -c '%a' "$source_root/$file")" = 644 ] \
+      || fail "release source material has unsafe mode: share/sources/$unit/$file"
+  done
+  awk -F '\t' '
+    NR == 1 {
+      if ($0 != "payload\tname\tversion\tsource\tintegrity\tlicense_directory") {
+        exit 1
+      }
+      next
+    }
+    NF != 6 || seen[$0]++ { exit 1 }
+    {
+      for (field = 1; field <= 6; field++) {
+        if ($field == "") {
+          exit 1
+        }
+      }
+      rows++
+    }
+    END {
+      if (rows < 1) {
+        exit 1
+      }
+    }
+  ' "$source_root/SOURCES.tsv" || fail "invalid SOURCES.tsv records"
+  IFS= read -r header < "$source_root/GO-BUILD-INFO.tsv" \
+    || fail "invalid GO-BUILD-INFO.tsv header"
+  [ "$header" = $'payload\trecord\tname\tversion_or_value\tchecksum' ] \
+    || fail "invalid GO-BUILD-INFO.tsv header"
+  IFS= read -r header < "$source_root/GO-MODULES.tsv" \
+    || fail "invalid GO-MODULES.tsv header"
+  [ "$header" = $'module\tversion\tchecksum' ] \
+    || fail "invalid GO-MODULES.tsv header"
+  awk -F '\t' '
+    NR == 1 { next }
+    NF != 5 { exit 1 }
+    {
+      for (field = 1; field <= 5; field++) if ($field == "") exit 1
+      if ($2 !~ /^(toolchain|main-package|main-module|module|replacement|build-setting)$/) exit 1
+    }
+  ' "$source_root/GO-BUILD-INFO.tsv" || fail "invalid Go build records"
+  # Validate every key before reading payload metadata. Path aliases
+  # must not multiply verification work for one actual official executable.
+  while IFS= read -r payload; do
+    release_materials_go_payload_allowed "$unit" "$payload" || return 1
+  done < <(awk -F '\t' 'NR > 1 { print $1 }' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u)
+  awk -F '\t' '
+    NR == 1 { next }
+    NF != 3 || $1 == "" || $2 == "" || $3 == "" { exit 1 }
+  ' "$source_root/GO-MODULES.tsv" || fail "invalid Go module records"
+  # Records are sorted by payload/type, not by dependency order. Apply each
+  # replacement to the module in that SAME binary before taking the union.
+  awk -F '\t' '
+    NR > 1 && $2 == "module" { modules[$1 SUBSEP $3] = $3 FS $4 FS $5 }
+    NR > 1 && $2 == "replacement" && $4 != "local-source" {
+      separator = index($4, "@")
+      if (separator <= 1 || separator == length($4)) { invalid = 1; next }
+      replacements[$1 SUBSEP $3] = substr($4, 1, separator - 1) FS substr($4, separator + 1) FS $5
+    }
+    END {
+      if (invalid) exit 1
+      for (key in replacements) if (!(key in modules)) exit 1
+      for (key in modules) print (key in replacements ? replacements[key] : modules[key])
+    }
+  ' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u > "$WORK/expected-go-modules-$unit" \
+    || fail "invalid effective Go module records"
+  sed -n '2,$p' "$source_root/GO-MODULES.tsv" > "$WORK/actual-go-modules-$unit"
+  cmp -s "$WORK/expected-go-modules-$unit" "$WORK/actual-go-modules-$unit" \
+    || fail "Go module inventory differs from the build records"
+  local claims="$WORK/license-claims-$unit"
+  : > "$claims"
+  while IFS=$'\t' read -r payload _ _ _ _ file || [ -n "$payload" ]; do
+    release_materials_validate_payload "$root" "$payload"
+    release_materials_safe_relative "$file" \
+      || fail "unsafe declared license directory: $file"
+    case "$file" in
+      "share/licenses/$unit/"?*) ;;
+      *) fail "declared license directory is outside share/licenses/$unit: $file" ;;
+    esac
+    [ -d "$root/$file" ] || fail "declared license directory is missing: $file"
+    [ -n "$(find "$root/$file" -type f -print -quit)" ] \
+      || fail "declared license directory is empty: $file"
+    printf '%s\n' "$file" >> "$claims"
+  done < <(sed -n '2,$p' "$source_root/SOURCES.tsv")
+  while IFS= read -r payload; do
+    release_materials_validate_payload "$root" "$payload"
+    release_materials_require_go "$root" "$unit" "$payload" || return 1
+  done < <(awk -F '\t' 'NR > 1 { print $1 }' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u)
+  while IFS=$'\t' read -r module version checksum || [ -n "$module" ]; do
+    case "$module" in github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;; esac
+    [[ "$checksum" =~ ^h1:[A-Za-z0-9+/]{43}=$ ]] \
+      || fail "third-party Go source requires a module checksum: $module@$version"
+    directory="share/licenses/$unit/go/$module@$version"
+    release_materials_safe_relative "$directory" || fail "unsafe Go module license path"
+    if [ ! -d "$root/$directory" ] || [ -z "$(find "$root/$directory" -type f -print -quit)" ]; then
+      fail "Go module license material is missing: $module@$version"
+    fi
+    printf '%s\n' "$directory" >> "$claims"
+  done < <(sed -n '2,$p' "$source_root/GO-MODULES.tsv")
+  # All material entries must belong to a source declared above.
+  # Parent directories are layout only, not claims over arbitrary siblings.
+  local license_paths_file="$WORK/license-paths-$unit"
+  find "$root/share/licenses/$unit" -mindepth 1 \
+    -printf "share/licenses/$unit/%P\n" > "$license_paths_file" \
+    || fail "cannot enumerate release license paths"
+  [ -s "$claims" ] || [ ! -s "$license_paths_file" ] \
+    || fail "unclaimed release license material"
+  awk '
+    NR == FNR { claims[$0]=1; next }
+    {
+      claimed=0
+      for (root in claims) {
+        if ($0 == root || index($0, root "/") == 1 || index(root, $0 "/") == 1) {
+          claimed=1
+          break
+        }
+      }
+      if (!claimed) exit 1
+    }
+  ' "$claims" "$license_paths_file" || fail "unclaimed release license material"
+  if find "$root/share/licenses/$unit" "$source_root" -type l -print -quit | grep -q .; then
+    fail "release materials contain a symbolic link"
+  fi
+  while IFS= read -r file; do
+    [ "$(stat -c '%a' "$file")" = 644 ] \
+      || fail "release material has unsafe mode: ${file#"$root"/}"
+  done < <(find "$root/share/licenses/$unit" "$source_root" -type f -print)
+  while IFS= read -r file; do
+    [ "$(stat -c '%a' "$file")" = 755 ] \
+      || fail "release material directory has unsafe mode: ${file#"$root"/}"
+  done < <(find "$root/share/licenses/$unit" "$source_root" -type d -print)
+  actual="$WORK/licenses-actual-$unit"
+  release_materials_hash_tree "$root" "$unit" "$actual"
+  cmp -s "$source_root/MATERIALS.sha256" "$actual" \
+    || fail "release material inventory does not match the archive"
+  (cd "$root" && sha256sum --quiet -c "share/sources/$unit/MATERIALS.sha256") \
+    || fail "release material checksum validation failed"
+  if grep -E $'(^|\t)(/home/|/mnt/|/tmp/|[A-Za-z]:\\\\)' \
+    "$source_root/SOURCES.tsv" "$source_root/GO-BUILD-INFO.tsv" >/dev/null; then
+    fail "release source material contains a machine-local path"
+  fi
+}

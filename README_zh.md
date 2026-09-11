@@ -105,6 +105,22 @@ make test-e2e                   # 组件 owner suite,需要项目组装的完整
 变更范围可以限定在本仓，构建仍需上述依赖闭包；跨仓契约变更必须关联 companion PR 并使用精确源码组合的集成测试验证，
 见 [Organization 贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。
 
+本地 `make test-e2e-cluster-stub` 流程启动真实控制面进程,但不启动 MicroVM。
+运行目录保持私有;失败输出只报告诊断文件名和大小,不输出原始响应、日志或含
+capability 的对象。本地排查可设置 `CLUSTER_STUB_KEEP_WORK=1` 保留运行目录,
+并私下检视;不要上传未脱敏文件。它不能替代真实 MicroVM 集成测试。
+守护进程输出直接写入私有文件,不流向 CI;诊断文件的私有 umask 仅在本地
+二进制构建结束后应用。
+
+真实 execute/MMDS 用例从已有私有运行目录生成交换机、netns、veth 和
+runner/builder unit 名称。清理只停止这些 unit 实例,只移除本次创建的资源。
+显式指定的名称若已存在,或交换机状态不一致,会被拒绝,不会接管或强制删除。
+由于主机路由、转发开关和 slice 名称共享,用例在既有 systemd 运行目录上持有
+主机级互斥锁;第二个并行 execute/MMDS 调用在创建资源前被拒绝。锁描述符不会
+传给守护进程。异步启动断言等待实际 runner 调用记录,不放宽 sandbox 身份或
+启动模式检查。`make test` 包含隔离清理及并发回归;这些检查不能替代真实
+execute 和 MMDS 两个用例。
+
 ## 部署概览
 
 独立节点通常先启动 Conductor 再启动 Proxy;集群增加独立 Registry、Router、Placer。
@@ -159,14 +175,48 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 ## 发布模型
 
+使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
+`bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
+不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生
+构建记录与产物应一并保留。
+
+打包记录实际 Go 版本和生效的 module 替换。Go/module LICENSE、NOTICE 取自所选
+编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
+下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
+源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
+需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
+
+材料放在 `share/licenses/<component>` 和 `share/sources/<component>`。
+后者包含 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv` 与
+`MATERIALS.sha256`。声明缺失、子目录不可读或遍历不完整时收集失败。
+独立验证检查交付清单、校验和、必需文件、来源记录相符性、载荷身份及归档路径/
+类型/权限。它不获取源码 checkout 或 Go 模块,不与远端源码树比较许可正文,
+也不下载或认证编译器分发。校验和及 VCS 记录是相符性检查,不能证明任意生产者的身份。
+
+归档名称标识请求的发行目标。项目及内部依赖记录在本地 Tag 匹配所选 commit 时
+使用发行版本,否则记录 `git:<commit>`;打包不要求创建未来目标 Tag。
+发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
+`release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
+权限分离及拒绝替换已发布资产的要求保持不变。
+生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
+
+四个官方 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package,
+目标为 Linux/amd64 且 `CGO_ENABLED=0`。打包从所选源码树复制十个部署文件,
+通过既有 `RELEASE_*_SOURCE_DIR`、可选 `RELEASE_*_SOURCE_SHA` 及版本选择
+收集实际 Accelerator、Connector、Sandboxer 依赖材料。独立验证只检查 bundle
+中的依赖 URL/commit 字段相互一致,不要求验证主机具备兄弟仓或依赖 Tag。
+解包前拒绝额外载荷、路径别名、重复条目、链接、错误 root 数字属主和错误权限。
+材料目录仍按组件隔离。
+
 本仓库独立发布 `vX.Y.Z`。x86_64 组件包包含节点/集群二进制和部署文件;
-文档与 E2E 从所选组件 tag 收集进项目 platform 包,不在组件包重复携带。
-项目聚合版本为 `release-vX.Y.Z`,选择精确组件 tag 并在真实 KVM 基础设施验证组合。
+文档与 E2E 从所选组件 Tag 收集到项目平台包,不在组件包中重复携带。
+
+项目聚合版本为 `release-vX.Y.Z`,选择精确组件 Tag 并在真实 KVM 基础设施验证组合。
 组件版本与聚合版本通过 selection 关联,不要求版本号相同。
 
 完整组件分支、Preview/Stable/Latest、mutation group 与取消重试规则由项目
-[发布文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md) 唯一维护;
-下载见 [最新 Stable 聚合发布](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)。
+[发布文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)唯一维护;
+下载见[最新 Stable 聚合发布](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)。
 
 ## 文档
 
