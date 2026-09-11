@@ -267,9 +267,12 @@ release_materials_go_source() {
 release_materials_copy_go_licenses() {
   # Collect notices from the compiler actually selected for this build. This
   # records distribution material; it does not authenticate the compiler.
-  local source="${1%/}" toolchain="$2" destination file relative base
+  local source="${1%/}" toolchain="$2" destination file relative base notices
   destination="$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/go-toolchain/$toolchain"
   [ -f "$source/LICENSE" ] || fail "selected Go distribution has no LICENSE"
+  notices="$(mktemp "$RELEASE_MATERIALS_WORK/go-notices.XXXXXX")"
+  find "$source/" \( -type f -o -type l \) -print0 | LC_ALL=C sort -z > "$notices" \
+    || fail "cannot enumerate Go notices"
   mkdir -p "$destination"
   while IFS= read -r -d '' file; do
     relative="${file#"$source"/}"
@@ -290,7 +293,7 @@ release_materials_copy_go_licenses() {
     else
       install -m 0644 "$file" "$destination/$relative"
     fi
-  done < <(find "$source/" \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+  done < "$notices"
 }
 
 release_materials_hash_tree() {
@@ -454,7 +457,8 @@ release_materials_require_go() {
   ' "$info" || fail "missing or inconsistent Go package record for $payload"
   toolchain="${toolchain%% *}"
   toolchain="${toolchain%%-X:*}"
-  release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "${toolchain%%-X:*}"
+  release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "$toolchain" \
+    "https://go.dev/dl/#$toolchain" "-"
   if [[ "$payload" != *:* ]]; then
     (
       local validation_work

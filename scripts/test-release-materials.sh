@@ -196,6 +196,26 @@ for mismatch in duplicate version source integrity license; do
     || fail "ambiguous source failed for an unrelated reason"
 done
 
+
+# Replacing a single source field must also disagree with the emitted contract.
+for mismatch in source integrity; do
+  altered="$TMP/single-source-$mismatch"
+  cp -a "$TMP/replacement-stage" "$altered"
+  awk -F '\t' -v mismatch="$mismatch" 'BEGIN { OFS=FS }
+    $2 == "Go toolchain" {
+      if (mismatch == "source") $4="https://example.invalid/other-source"
+      if (mismatch == "integrity") $5="other-integrity"
+    }
+    { print }' "$TMP/replacement-stage/share/sources/fixture/SOURCES.tsv" \
+    > "$altered/share/sources/fixture/SOURCES.tsv"
+  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/single-source-$mismatch.log" 2>&1); then
+    fail "validator accepted a changed Go source $mismatch field"
+  fi
+  grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/single-source-$mismatch.log" \
+    || fail "Go source $mismatch failed for an unrelated reason"
+done
+
 altered="$TMP/missing-published-license"
 cp -a "$TMP/replacement-stage" "$altered"
 rm "$altered/share/licenses/fixture/go/$module@$version/LICENSE"

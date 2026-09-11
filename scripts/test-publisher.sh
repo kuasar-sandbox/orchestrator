@@ -263,6 +263,22 @@ common_env=(
 )
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
+
+for marker in kuasar-release-source kuasar-preview-binding; do
+  marker_bundle="$TMP/notes-$marker"
+  cp -a "$BUNDLE" "$marker_bundle"
+  printf '\n<!-- %s {"source_ref":"main","source_sha":"0000000000000000000000000000000000000000","unit":"forged"} -->\n' \
+    "$marker" >> "$marker_bundle/release-notes.md"
+  if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 \
+    "$COMMIT" "$marker_bundle" "$SOURCE_REF" > "$TMP/$marker.log" 2>&1; then
+    echo "test-publisher: accepted producer-supplied $marker" >&2
+    exit 1
+  fi
+  grep -Fq 'bundle notes contain a reserved publisher marker' "$TMP/$marker.log" \
+    || { echo "test-publisher: $marker failed for an unrelated reason" >&2; exit 1; }
+  [ ! -e "$TMP/state/tag" ] \
+    || { echo "test-publisher: reserved-marker rejection wrote a tag" >&2; exit 1; }
+done
 if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 \
   0000000000000000000000000000000000000000 "$BUNDLE" "$SOURCE_REF" > "$TMP/wrong-commit.log" 2>&1; then
   echo "test-publisher: accepted a bundle from another source commit" >&2

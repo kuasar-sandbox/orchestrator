@@ -198,6 +198,7 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
 `release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
 权限分离及拒绝替换已发布资产的要求保持不变。
+生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
 
 四个官方 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package,
 目标为 Linux/amd64 且 `CGO_ENABLED=0`。打包从所选源码树复制十个部署文件,

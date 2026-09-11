@@ -206,6 +206,7 @@ target tags. The publisher passes the selected project SHA to validation before
 Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
 existing source/Preview markers. Trusted source selection, build/publish permission
 separation and the refusal to replace published assets remain required.
+Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
 
 The four official Go executables must identify their own Orchestrator command
 main packages and target Linux/amd64 with `CGO_ENABLED=0`. Packaging copies

@@ -57,3 +57,32 @@ release_materials_copy_licenses "$fixture" project
 cmp "$fixture/LICENSE" "$test_root/complete-stage/share/licenses/fixture/project/LICENSE"
 cmp "$fixture/LICENSES/nested/NOTICE" "$test_root/complete-stage/share/licenses/fixture/project/LICENSES/nested/NOTICE"
 printf 'test-license-traversal: four partial-output failures and complete collection PASS\n'
+
+# Local compiler notices obey the same complete-traversal contract.
+for failure in find sort; do
+  if (
+    release_materials_init "$test_root/go-stage-$failure" "$test_root/go-work-$failure" fixture
+    find() {
+      command find "$@" || return
+      [ "$failure" != find ]
+    }
+    sort() {
+      command sort "$@" || return
+      [ "$failure" != sort ]
+    }
+    release_materials_copy_go_licenses "$fixture" go1.26.4
+  ) > "$test_root/go-$failure.log" 2>&1; then
+    fail "accepted partial Go notice $failure output"
+  fi
+  grep -Fq 'cannot enumerate Go notices' "$test_root/go-$failure.log" \
+    || fail "Go notice $failure failed for an unrelated reason"
+  [ -z "$(find "$test_root/go-stage-$failure" -type f -print)" ] \
+    || fail "Go notice $failure copied partial material"
+done
+
+release_materials_init "$test_root/go-complete-stage" "$test_root/go-complete-work" fixture
+release_materials_copy_go_licenses "$fixture" go1.26.4
+cmp "$fixture/LICENSE" "$test_root/go-complete-stage/share/licenses/fixture/go-toolchain/go1.26.4/LICENSE"
+cmp "$fixture/LICENSES/nested/NOTICE" \
+  "$test_root/go-complete-stage/share/licenses/fixture/go-toolchain/go1.26.4/LICENSES/nested/NOTICE"
+printf 'test-license-traversal: local Go notice find/sort failures and complete collection PASS\n'

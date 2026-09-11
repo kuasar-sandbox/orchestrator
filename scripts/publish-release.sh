@@ -98,6 +98,9 @@ release_notes_file() {
   local tag="$1" commit="$2" bundle="$3" source_ref="$4"
   local notes="$TMP/release-notes.md" unit source
   unit="$(release_unit "$tag")"
+  if grep -Fq -e "<!-- kuasar-release-source " -e "<!-- kuasar-preview-binding " "$bundle/release-notes.md"; then
+    fail "bundle notes contain a reserved publisher marker"
+  fi
   cp "$bundle/release-notes.md" "$notes"
   source="$(jq -cn --arg source_ref "$source_ref" --arg source_sha "$commit" \
     --arg unit "$unit" \
@@ -220,6 +223,8 @@ publish_bundle() {
   [[ "$source_ref" = main || "$source_ref" =~ ^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.x$ ]] \
     || fail "source-ref must be main or release/vMAJOR.MINOR.x"
   SOURCE_SHA="$commit" release_cli validate "$tag" "$arch" "$bundle"
+  local notes
+  notes="$(release_notes_file "$tag" "$commit" "$bundle" "$source_ref")"
 
   local tag_state="$TMP/tag"
   if api_optional "repos/$REPOSITORY/git/ref/tags/$tag" "$tag_state"; then
@@ -242,10 +247,9 @@ publish_bundle() {
   if [ "$(jq 'length' "$drafts")" -eq 1 ]; then
     gh api --method DELETE "repos/$REPOSITORY/releases/$(jq -er '.[0].id' "$drafts")" >/dev/null
   fi
-  local files=() file notes
+  local files=() file
   while IFS= read -r file; do files+=("$file"); done \
     < <(find "$bundle/assets" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)
-  notes="$(release_notes_file "$tag" "$commit" "$bundle" "$source_ref")"
   gh release create "$tag" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
     --target "$commit" --title "$tag" --notes-file "$notes" >/dev/null
   wait_for_draft_release "$tag" "$drafts"
