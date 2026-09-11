@@ -4,7 +4,6 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-import time
 import unittest
 
 
@@ -21,18 +20,24 @@ def function(name):
 
 class DensityReadiness(unittest.TestCase):
     def run_gate(self, mode, log=OBSERVATION + SENSOR + WORKLOAD, *,
-                 high="671088640", settled=True, observation_delay=0,
-                 alive=True, direct=False, gate_timeout=1):
+                 high="671088640", maximum="1073741824", settled=True, observation_delay=0,
+                 alive=True, direct=False, gate_timeout=1, premature_return=False):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "fixture.log").write_text(log)
             if high is not None:
                 (work / "memory.high").write_text(high + "\n")
+            if maximum is not None:
+                (work / "memory.max").write_text(maximum + "\n")
             script = '''set -euo pipefail
 fail() { printf 'FAIL: %s\\n' "$*" >&2; exit 1; }
 cat() {
-    [ "$#" -eq 1 ] && [ "$1" = /sys/fs/cgroup/sandboxes/fixture/memory.high ] || return 95
-    command cat "$WORK/memory.high"
+    [ "$#" -eq 1 ] || return 95
+    case "$1" in
+        /sys/fs/cgroup/sandboxes/fixture/memory.high) command cat "$WORK/memory.high" ;;
+        /sys/fs/cgroup/sandboxes/fixture/memory.max) command cat "$WORK/memory.max" ;;
+        *) return 95 ;;
+    esac
 }
 resource_reservation_matches() {
     [ "$1" = fixture ] && [ "$2" = settled ] && [ "$SETTLED" = 1 ]
@@ -40,6 +45,8 @@ resource_reservation_matches() {
 '''
             script += function("memory_control_observed") + "\n"
             script += function("wait_for_" + mode + "_control_ready") + "\n"
+            if premature_return:
+                script += "wait_for_" + mode + "_control_ready() { return 0; }\n"
             if observation_delay:
                 script += '''(
     sleep "$OBSERVATION_DELAY"
@@ -47,20 +54,25 @@ resource_reservation_matches() {
     printf '%s\\n' 671088640 > "$WORK/memory.high"
 ) &
 '''
+            script += 'printf "%s\\n" "$EPOCHREALTIME" > "$WORK/gate-started"\n'
             if direct:
                 script += "memory_control_observed fixture\n"
             else:
                 # kill -0 only; never signal any external process in this test.
                 script += 'pid=$$\n[ "$ALIVE" = 1 ] || pid=2147483647\n'
                 script += "wait_for_" + mode + '_control_ready fixture "$pid" "$GATE_TIMEOUT"\n'
-            script += "wait\n"
+            # Record the gate return itself, before joining the delayed writer.
+            script += 'printf "%s\\n" "$EPOCHREALTIME" > "$WORK/gate-completed"\nwait\n'
             env = {**os.environ, "WORK": directory, "SETTLED": str(int(settled)),
                    "OBSERVATION_DELAY": str(observation_delay), "OBSERVATION": OBSERVATION,
                    "ALIVE": str(int(alive)), "GATE_TIMEOUT": str(gate_timeout)}
-            started = time.monotonic()
             result = subprocess.run(["bash", "-c", script], env=env,
                                     text=True, capture_output=True, timeout=gate_timeout + 5)
-            return result, time.monotonic() - started
+            elapsed = None
+            if (work / "gate-completed").exists():
+                elapsed = (float((work / "gate-completed").read_text())
+                           - float((work / "gate-started").read_text()))
+            return result, elapsed
 
     def test_fresh_observation_and_finite_high_do_not_require_shrink(self):
         for mode in ("dynamic", "static"):
@@ -100,6 +112,20 @@ resource_reservation_matches() {
                 result, _ = self.run_gate("static", high=high, direct=True)
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_high_above_hard_limit_is_not_ready(self):
+        result, _ = self.run_gate("static", high="1073741825", direct=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_high_equal_to_hard_limit_is_valid(self):
+        result, _ = self.run_gate("static", high="1073741824", direct=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_or_invalid_hard_limit_is_not_ready(self):
+        for maximum in (None, "max", "0", "-1", "invalid"):
+            with self.subTest(maximum=maximum):
+                result, _ = self.run_gate("static", maximum=maximum, direct=True)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_invalid_or_rejected_report_is_not_a_completed_observation(self):
         for line in ("memory: initial CH observation accepted epoch=0 seq=1\n",
                      "memory: initial CH observation accepted epoch=1 seq=0\n",
@@ -121,6 +147,15 @@ resource_reservation_matches() {
                                                 observation_delay=0.15, gate_timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertGreaterEqual(elapsed, 0.15)
+
+    def test_timing_detects_a_gate_returning_before_its_writer(self):
+        for mode in ("dynamic", "static"):
+            with self.subTest(mode=mode):
+                result, elapsed = self.run_gate(mode, SENSOR + WORKLOAD, high="max",
+                                                observation_delay=0.3, gate_timeout=5,
+                                                premature_return=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertLess(elapsed, 0.15)
 
     def test_exited_sandbox_is_not_waited_until_timeout(self):
         for mode in ("dynamic", "static"):

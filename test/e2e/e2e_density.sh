@@ -510,11 +510,13 @@ wait_for_phase_a_grant() {
 # applied memory.high. A legal grow or unchanged reservation need not emit a
 # shrink settlement; the workload's Budget/grow assertions remain separate.
 memory_control_observed() {
-    local sid="$1" high
+    local sid="$1" high maximum
     grep -qE 'memory: initial CH observation accepted epoch=[1-9][0-9]* seq=[1-9][0-9]*($|[[:space:]])' \
         "$WORK/$sid.log" 2>/dev/null || return 1
     high=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.high" 2>/dev/null) || return 1
-    [[ "$high" =~ ^[1-9][0-9]*$ ]]
+    maximum=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.max" 2>/dev/null) || return 1
+    [[ "$high" =~ ^[1-9][0-9]*$ ]] && [[ "$maximum" =~ ^[1-9][0-9]*$ ]] \
+        && [ "$high" -le "$maximum" ]
 }
 
 wait_for_dynamic_control_ready() {
