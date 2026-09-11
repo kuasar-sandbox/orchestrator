@@ -22,7 +22,7 @@ def function(name):
 class DensityReadiness(unittest.TestCase):
     def run_gate(self, mode, log=OBSERVATION + SENSOR + WORKLOAD, *,
                  high="671088640", settled=True, observation_delay=0,
-                 alive=True, direct=False):
+                 alive=True, direct=False, gate_timeout=1):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "fixture.log").write_text(log)
@@ -52,14 +52,14 @@ resource_reservation_matches() {
             else:
                 # kill -0 only; never signal any external process in this test.
                 script += 'pid=$$\n[ "$ALIVE" = 1 ] || pid=2147483647\n'
-                script += "wait_for_" + mode + '_control_ready fixture "$pid" 1\n'
+                script += "wait_for_" + mode + '_control_ready fixture "$pid" "$GATE_TIMEOUT"\n'
             script += "wait\n"
             env = {**os.environ, "WORK": directory, "SETTLED": str(int(settled)),
                    "OBSERVATION_DELAY": str(observation_delay), "OBSERVATION": OBSERVATION,
-                   "ALIVE": str(int(alive))}
+                   "ALIVE": str(int(alive)), "GATE_TIMEOUT": str(gate_timeout)}
             started = time.monotonic()
             result = subprocess.run(["bash", "-c", script], env=env,
-                                    text=True, capture_output=True, timeout=5)
+                                    text=True, capture_output=True, timeout=gate_timeout + 5)
             return result, time.monotonic() - started
 
     def test_fresh_observation_and_finite_high_do_not_require_shrink(self):
@@ -113,8 +113,12 @@ resource_reservation_matches() {
     def test_waits_for_actual_observation_and_applied_high(self):
         for mode in ("dynamic", "static"):
             with self.subTest(mode=mode):
+                # Bash SECONDS has integer precision; a one-second deadline
+                # may expire before the delayed writer's first observation.
+                # Give this asynchronous positive case margin, while negative
+                # timeout cases retain their short one-second fixture deadline.
                 result, elapsed = self.run_gate(mode, SENSOR + WORKLOAD, high="max",
-                                                observation_delay=0.15)
+                                                observation_delay=0.15, gate_timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertGreaterEqual(elapsed, 0.15)
 
