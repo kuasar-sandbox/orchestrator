@@ -6,8 +6,8 @@
 #   Phase A   sandbox-local Budget control with node reservation
 #             1 sandbox in dynamic mode runs an intermittent Python
 #             workload with deterministic grow/rest cycles.
-#             Verifies sandbox-originated grow grants and workload liveness;
-#             Phase B2 provides the gated dynamic shrink check.
+#             Verifies sandbox-originated grow, node reservation, CH target
+#             acceptance and workload liveness, including pre-workload grow.
 #
 #   Phase B   static local control vs dynamic reservation (A/B comparison)
 #             B1: static mode, no node controller. Sandbox-local control
@@ -477,13 +477,85 @@ wait_for_reservation_growth() {
     fail "$sid: reservation did not grow above $baseline within ${timeout}s"
 }
 
+# Each accepted grow logs the Budget, CH target and reservation of that action.
+# Validate them together, including earlier actions superseded by later shrink.
+# Return 1 until a grow above initial admission exists; 2 for invalid evidence.
+phase_a_grow_events_valid() {
+    local sid="$1" initial_budget="$2" capacity="$3"
+    awk -v initial="$initial_budget" -v capacity="$capacity" '
+        /memory: grow accepted Budget=/ {
+            line=$0
+            sub(/^.*memory: grow accepted /, "", line)
+            sub(/\r$/, "", line)
+            if (line !~ /^Budget=[0-9]+ target=[0-9]+ reservation=[0-9]+$/) {
+                invalid=1
+                next
+            }
+            split(line, fields, " ")
+            split(fields[1], budget, "=")
+            split(fields[2], target, "=")
+            split(fields[3], reservation, "=")
+            b=budget[2]+0; t=target[2]+0; r=reservation[2]+0
+            if (b <= 0 || b > capacity || t > capacity ||
+                b != capacity - t || r < b || r > capacity) invalid=1
+            if (b > initial) grown=1
+        }
+        END { if (invalid) exit 2; if (!grown) exit 1 }
+    ' "$WORK/$sid.log"
+}
+
+# Phase A proves a real dynamic grow, not necessarily another grow after its
+# workload gate. Cold control may already have obtained sufficient Budget.
+# Admission alone is insufficient: require a sandbox-local grow, a precise live
+# reservation above InitialBudget, and a CH-accepted Budget covered by it.
+# As in B2, accepted grow does not require current/target convergence.
+wait_for_phase_a_grant() {
+    local sid="$1" pid="$2" timeout="$3" initial_budget="$4" capacity="$5"
+    local deadline=$((SECONDS + timeout)) reservation=0 state="" target=-1 actual=-1 budget=0 grow_status=0
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before a reserved grow target was observed"
+        grow_status=0
+        phase_a_grow_events_valid "$sid" "$initial_budget" "$capacity" || grow_status=$?
+        [ "$grow_status" -le 1 ] || fail "$sid: invalid or unreserved accepted grow event"
+        if [ "$grow_status" -eq 0 ] \
+            && reservation=$(resource_reservation_memory "$sid") \
+            && state=$(read_ch_balloon_state "$sid" 2>/dev/null) \
+            && read -r target actual <<<"$state" \
+            && [[ "$reservation" =~ ^[0-9]+$ ]] \
+            && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] \
+            && [ "$reservation" -gt "$initial_budget" ] && [ "$reservation" -le "$capacity" ] \
+            && [ "$target" -le "$capacity" ] && [ "$actual" -le "$capacity" ]; then
+            budget=$((capacity - target))
+            if [ "$budget" -gt "$initial_budget" ] && [ "$budget" -le "$reservation" ]; then
+                echo "$reservation"
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+    fail "$sid: no sandbox-originated reserved grow target above InitialBudget=$initial_budget within ${timeout}s (reservation=$reservation target=$target current=$actual)"
+}
+
+# Cold readiness is a fresh guest report with a complete CH observation and an
+# applied memory.high. A legal grow or unchanged reservation need not emit a
+# shrink settlement; the workload's Budget/grow assertions remain separate.
+memory_control_observed() {
+    local sid="$1" high maximum
+    grep -qE 'memory: initial CH observation accepted epoch=[1-9][0-9]* seq=[1-9][0-9]*($|[[:space:]])' \
+        "$WORK/$sid.log" 2>/dev/null || return 1
+    high=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.high" 2>/dev/null) || return 1
+    maximum=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.max" 2>/dev/null) || return 1
+    [[ "$high" =~ ^[1-9][0-9]*$ ]] && [[ "$maximum" =~ ^[1-9][0-9]*$ ]] \
+        && [ "$high" -le "$maximum" ]
+}
+
 wait_for_dynamic_control_ready() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if resource_reservation_matches "$sid" settled \
             && grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
-            && grep -q 'memory: initial CH observation accepted' "$WORK/$sid.log" 2>/dev/null \
+            && memory_control_observed "$sid" \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -542,7 +614,7 @@ wait_for_static_control_ready() {
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
-            && grep -q 'memory: initial CH observation accepted' "$WORK/$sid.log" 2>/dev/null \
+            && memory_control_observed "$sid" \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -735,9 +807,10 @@ phase_a() {
     start_daemon "$WORK/node-ctl.yaml"
 
     local sid=sb-A-1 start_gate=/tmp/e2e-density-a.start
+    local capacity_mib=1024 startup_mib=128
     setup_sb "$sid"
     # Workload: 20s, 3 grow/rest cycles, R 96-192 MiB above headroom=64 MiB.
-    emit_yaml "$sid" dynamic 64 1024 128   20 3 96 192   true "$start_gate"
+    emit_yaml "$sid" dynamic 64 "$capacity_mib" "$startup_mib"   20 3 96 192   true "$start_gate"
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -751,12 +824,13 @@ phase_a() {
     # Bound cold-start and workload completion independently from controller
     # activity so a fast run does not pay the full worst-case allowance.
     wait_for_dynamic_control_ready "$sid" "$pid" 20
-    local node_reservation_baseline node_reservation
-    node_reservation_baseline=$(resource_reservation_memory "$sid") \
-        || fail "$sid: could not read precise node reservation before workload"
+    local node_reservation
     open_workload_gate "$sid" "$start_gate" start
-    node_reservation=$(wait_for_reservation_growth "$sid" "$pid" 20 "$node_reservation_baseline")
+    node_reservation=$(wait_for_phase_a_grant "$sid" "$pid" 20 \
+        "$((startup_mib * 1024 * 1024))" "$((capacity_mib * 1024 * 1024))")
     wait_for_workload "$sid" "$pid" 40
+    phase_a_grow_events_valid "$sid" "$((startup_mib * 1024 * 1024))" "$((capacity_mib * 1024 * 1024))" \
+        || fail "$sid: invalid or missing accepted grow evidence after workload"
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
     local shrinks oom
@@ -769,7 +843,7 @@ phase_a() {
 
     [ "$oom" -eq 0 ] || fail "A: cgroup oom_count=$oom (Budget grow failed)"
 
-    echo "  Phase A: granted_reservation=$node_reservation local_shrinks=$shrinks oom_count=0"
+    echo "  Phase A: granted_reservation=$node_reservation grow_target_accepted=1 local_shrinks=$shrinks oom_count=0"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
@@ -891,7 +965,7 @@ phase_b2_dynamic_control() {
     SANDBOX_PIDS+=("$pid")
     b2_timeline_event "$sid" "sandbox_started pid=$pid"
 
-    # Synchronize past launch and the first fresh report-driven steady action.
+    # Synchronize past launch, a fresh report/CH observation and applied high.
     # Boot-time PSI may already reserve and deliver a grow before the workload
     # gate. Otherwise the first workload allocation is the pressure probe. In
     # both cases the allocation remains held until the reservation is reflected
