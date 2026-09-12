@@ -322,3 +322,50 @@ func TestOTLPRequestCapacitySharedAcrossTransports(t *testing.T) {
 	}
 	release()
 }
+
+func TestOTLPGRPCSlowBodyHasServerDeadline(t *testing.T) {
+	view := NewView(1, time.Second)
+	entry := upsert(t, view, testRoute("sid"))
+	view.Bookmark()
+	defer view.InvalidateSync()
+	r, observed := startOTLP(t, view)
+	ctx, cancel := context.WithCancel(peer.NewContext(context.Background(), &peer.Peer{Addr: identityAddr{Addr: &net.TCPAddr{}, entry: entry}}))
+	defer cancel()
+	bounded, err := r.grpcTap(ctx, &tap.Info{FullMethodName: "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadline, ok := bounded.Deadline(); !ok || time.Until(deadline) > 10*time.Second {
+		t.Fatal("gRPC body decoding has no bounded server deadline")
+	}
+	cancel()
+	connection, err := grpc.NewClient(r.grpcListener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	clientCtx, stop := context.WithTimeout(context.Background(), 15*time.Second)
+	defer stop()
+	// Open a real unary RPC but never send its message body. Header waits for
+	// the server, not the client's longer deadline, to end the stalled stream.
+	stream, err := connection.NewStream(clientCtx, &grpc.StreamDesc{}, "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = stream.Header()
+	if err := stream.RecvMsg(&struct{}{}); status.Code(err) != codes.DeadlineExceeded || clientCtx.Err() != nil {
+		t.Fatal("server did not time out stalled message decoding", err, clientCtx.Err())
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(r.requests) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("stalled gRPC request leaked capacity")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-observed:
+		t.Fatal("incomplete request reached Collector")
+	default:
+	}
+}

@@ -233,11 +233,15 @@ func (r *otlpReceiver) grpcTap(ctx context.Context, info *tap.Info) (context.Con
 	if !ok || r.view.withCurrent(addr.entry, func() error { return nil }) != nil {
 		return nil, status.Error(codes.Unauthenticated, ErrIdentity.Error())
 	}
+	// Include transport message reads in the budget. Starting this deadline in
+	// Export would allow a peer to hold a global slot forever without a body.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	release, err := r.acquire(ctx)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	context.AfterFunc(ctx, release)
+	context.AfterFunc(ctx, func() { release(); cancel() })
 	return ctx, nil
 }
 

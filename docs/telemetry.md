@@ -171,6 +171,8 @@ listener, 32 concurrent requests globally, 4 MiB per encoded/decompressed HTTP
 request and gRPC message by default. Resource/point attributes are limited to 32,
 keys 128 bytes and values 256 bytes; batches allow 128 resources, 16,384 points
 and 4,096 metrics per scope. Excess is rejected, not silently truncated.
+The gRPC server's 10s deadline starts before reading the message body, so a
+stalled client cannot indefinitely retain a global request slot.
 
 ## 5. Primary storage versus extra exporters
 

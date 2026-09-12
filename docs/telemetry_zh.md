@@ -147,6 +147,8 @@ processor 新添加的此类属性。
 请求，HTTP 压缩体/解压体与 gRPC message 各 4 MiB。Resource/point attributes 最多
 32 个，key 128 bytes、value 256 bytes；batch 最多 128 resources、16,384 points，每
 scope 最多 4,096 metrics。超限返回错误，不悄悄截断。
+gRPC server 的 10s deadline 在读取 message body 前就开始，停滞客户端不能无限期
+占用全局请求槽位。
 
 ## 5. Primary storage 与 extra exporters
 
