@@ -680,14 +680,22 @@ index = int(sys.argv[2])
 if index >= len(calls):
     raise SystemExit(f"missing run call {index}; captured {len(calls)}")
 call = calls[index]
-name = sys.argv[3]
-for i, arg in enumerate(call):
-    if arg == name:
-        if call[i + 1] != sys.argv[4]:
-            raise SystemExit(f"run {name}={call[i + 1]!r}, want {sys.argv[4]!r}")
-        break
-else:
-    raise SystemExit(f"run call has no {name}: {call!r}")
+
+def option(name):
+    for i, arg in enumerate(call):
+        if arg == name:
+            if i + 1 >= len(call):
+                raise SystemExit(f"run option {name} has no value: {call!r}")
+            return call[i + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return ""
+
+if option("--sandbox-id") != sys.argv[3]:
+    raise SystemExit(f"run call {index} belongs to {option('--sandbox-id')!r}, want {sys.argv[3]!r}: {call!r}")
+selected = option(sys.argv[4])
+if selected != sys.argv[5]:
+    raise SystemExit(f"run {sys.argv[4]}={selected!r}, want {sys.argv[5]!r}")
 PY
 }
 
