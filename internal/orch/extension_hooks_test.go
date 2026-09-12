@@ -568,8 +568,13 @@ func TestClusterDeleteHookCommitsDeletingBeforeACK(t *testing.T) {
 	}
 	var blockCleanup atomic.Bool
 	blockCleanup.Store(true)
+	cleanupReached := make(chan struct{}, 1)
 	fixture.o.removeSandboxRunDir = func(path string) error {
 		if blockCleanup.Load() {
+			select {
+			case cleanupReached <- struct{}{}:
+			default:
+			}
 			return errors.New("hold finalizer after durable acceptance")
 		}
 		return os.RemoveAll(path)
@@ -590,7 +595,23 @@ func TestClusterDeleteHookCommitsDeletingBeforeACK(t *testing.T) {
 	if ack.Status != routesync.AckAccepted || calls.Load() != 1 {
 		t.Fatalf("cluster Delete ACK/calls = %+v/%d", ack, calls.Load())
 	}
-	assertDeletingOwnership(t, fixture)
+	// ACK must already have a durable deleting owner; do not wait for the
+	// asynchronous finalizer to establish the acceptance condition.
+	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.State != types.StateDeleting {
+		t.Fatal("cluster Delete ACK returned without a durable deleting owner")
+	}
+	select {
+	case <-cleanupReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cluster Hook finalizer did not reach RunDir cleanup")
+	}
+	// RunDir cleanup follows the durable network release. Only pending
+	// runner/path ownership must remain while this injected failure holds.
+	assertDeletingOwnershipState(t, fixture, false)
 
 	blockCleanup.Store(false)
 	waitForSandboxAbsent(t, fixture.o, context.Background(), fixture.sb.ID, "cluster Hook finalizer")
