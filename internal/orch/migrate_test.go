@@ -866,6 +866,179 @@ func TestExportKeepSourceSucceedsWithoutSourceWrites(t *testing.T) {
 	}
 }
 
+// A source that is already portable stays portable: keep-source must not swap
+// in a local artifact that merely exists at the checkpoint path, even when a
+// stale file from an earlier lifecycle is still there (#336).
+func TestExportKeepSourceKeepsPortableSourceDespiteStaleLocalArtifact(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
+	manifestKey := strings.Repeat("7", 64)
+	_, apiKey := defaultTestCredentials(t, manifestKey)
+	portableRef := "manifest://" + strings.Repeat("3", 64)
+	sb := migrationSandbox(t, dir, "portable-kept-source", manifestKey, portableRef)
+	stale := makeLocalArtifact(t, dir, sb.ID, ".snapshot")
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	argsPath := filepath.Join(dir, "publish.args")
+	installPromoteRecordingStub(t, portableRef, argsPath)
+
+	result, err := o.ExportSandbox(ctx, apiKey, sb.ID, true, true)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	template, err := types.ParseTemplateID(result)
+	if err != nil || template.Ref != portableRef {
+		t.Fatalf("template = %+v, %v", template, err)
+	}
+	// A portable source needs no publication; the stub must not have run.
+	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
+		t.Fatalf("portable source unexpectedly ran the publisher: %v", err)
+	}
+	wantSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: portableRef}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != wantSource {
+		t.Fatalf("portable source changed by keep-source export: %+v, %v", stored, err)
+	}
+	if cached := o.lookup(sb.ID); cached == nil || cached.ResumeSource != wantSource {
+		t.Fatal("cached portable source changed by keep-source export")
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("keep-source export removed the stale local artifact: %v", err)
+	}
+}
+
+// Repeated keep-source exports from the same paused state all succeed without
+// changing the source. KMT tokens may differ per mint and the publisher may run
+// once per export; neither is a contract.
+func TestExportKeepSourceRepeatableFromSamePausedState(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
+	manifestKey := strings.Repeat("7", 64)
+	_, apiKey := defaultTestCredentials(t, manifestKey)
+	sid := "repeat-kept-source"
+	localRef := makeLocalArtifact(t, dir, sid, ".snapshot")
+	mref := "manifest://" + strings.Repeat("c", 64)
+	argsPath := filepath.Join(dir, "publish.args")
+	installPromoteRecordingStub(t, mref, argsPath)
+
+	sb := migrationSandbox(t, dir, sid, manifestKey, localRef)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	wantSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}
+
+	first, err := o.ExportSandbox(ctx, apiKey, sid, false, true)
+	if err != nil || !strings.HasPrefix(first, "kmt1.") {
+		t.Fatalf("first export = %q, %v", first, err)
+	}
+	second, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	template, err := types.ParseTemplateID(second)
+	if err != nil || template.Ref != mref {
+		t.Fatalf("second export template = %+v, %v", template, err)
+	}
+	stored, err := o.st.Get(ctx, sid)
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != wantSource {
+		t.Fatalf("source changed by repeated exports: %+v, %v", stored, err)
+	}
+	if cached := o.lookup(sid); cached == nil || cached.ResumeSource != wantSource {
+		t.Fatal("cached source changed by repeated exports")
+	}
+	if _, err := os.Stat(localRef); err != nil {
+		t.Fatalf("repeated exports removed the local artifact: %v", err)
+	}
+	if _, err := os.Stat(argsPath); err != nil {
+		t.Fatalf("publication did not run for the local source: %v", err)
+	}
+}
+
+// A resume -> pause cycle produces a fresh local checkpoint; a following
+// keep-source export still succeeds and keeps that checkpoint as the source.
+func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	shortDir := shortOrchestratorTestDir(t)
+	cfg.Paths.RunRoot = filepath.Join(shortDir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(shortDir, "base")
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	installCheckpointSandboxCtl(t)
+	launcher := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, launcher)
+	installPromoteStub(t, "manifest://"+strings.Repeat("c", 64))
+
+	manifestKey := strings.Repeat("5", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	sid := "resume-pause-export"
+	sb := &types.Sandbox{
+		ID: sid, Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare, Kind: types.KindImg,
+			Ref: "manifest://" + strings.Repeat("6", 64),
+		}.String(),
+		State: types.StateRunning, RunID: "cycle-run", VswitchPort: "cycle-port",
+		RunDir:     nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
+		BaseDir:    nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
+		APISecret:  apiSecret, ManifestKey: manifestKey, CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	checkpointRef := types.ResumeSource{
+		Kind: types.ResumeSourceSnapshot,
+		Ref:  filepath.Join(sb.BaseDir, "checkpoint", sid+".snapshot"),
+	}
+	if err := os.MkdirAll(filepath.Dir(checkpointRef.Ref), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checkpointRef.Ref, []byte("checkpoint"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First pause from running, then resume and pause again: the durable
+	// source is the fresh local checkpoint at the same node-local path.
+	if err := o.Pause(ctx, sid, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.Connect(ctx, sid, apiKey, "", api.ConnectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSandbox(t, o, ctx, sid, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after resume")
+	if err := o.Pause(ctx, sid, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, sid)
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != checkpointRef {
+		t.Fatalf("re-paused source = %+v, %v", stored, err)
+	}
+
+	result, err := o.ExportSandbox(ctx, apiKey, sid, false, true)
+	if err != nil || !strings.HasPrefix(result, "kmt1.") {
+		t.Fatalf("export after resume/pause cycle = %q, %v", result, err)
+	}
+	stored, err = o.st.Get(ctx, sid)
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != checkpointRef {
+		t.Fatalf("source changed by post-cycle export: %+v, %v", stored, err)
+	}
+	if _, err := os.Stat(checkpointRef.Ref); err != nil {
+		t.Fatalf("post-cycle export removed the local checkpoint: %v", err)
+	}
+}
+
 func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")

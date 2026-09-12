@@ -475,6 +475,66 @@ func TestExportKeepSourcePreservesLocalResumeSource(t *testing.T) {
 	}, "running after keep-source export")
 }
 
+// The retention created by keep-source ends at the next unkept export: the
+// drop deletes the durable row and removes the retained local checkpoint.
+func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
+	fixture := newExportResumeFixture(t)
+	if err := os.MkdirAll(fixture.sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	portableRef := "manifest://" + strings.Repeat("1", 64)
+	publisher := newBlockingExportPublisher(portableRef)
+	publisher.Release()
+	fixture.o.artifactPublisher = publisher.Publish
+	events, cancelEvents := fixture.o.Subscribe()
+	defer cancelEvents()
+
+	kept, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := types.ParseTemplateID(kept); err != nil {
+		t.Fatalf("kept export result = %q: %v", kept, err)
+	}
+	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused ||
+		stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+		t.Fatalf("kept source = %+v, %v", stored, err)
+	}
+	if _, err := os.Stat(fixture.localRef); err != nil {
+		t.Fatalf("kept export removed the local snapshot: %v", err)
+	}
+
+	result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := types.ParseTemplateID(result)
+	if err != nil || template.Ref != portableRef || template.Kind != types.KindSnp {
+		t.Fatalf("drop result = %#v, %v", template, err)
+	}
+	if stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID); err != nil || stored != nil {
+		t.Fatalf("dropped source = %+v, %v", stored, err)
+	}
+	if cached := fixture.o.lookup(fixture.sb.ID); cached != nil {
+		t.Fatalf("dropped source remained cached: %+v", cached)
+	}
+	if _, err := os.Stat(filepath.Dir(fixture.localRef)); !os.IsNotExist(err) {
+		t.Fatalf("drop retained the local checkpoint directory: %v", err)
+	}
+	if _, err := os.Stat(fixture.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drop retained the run directory: %v", err)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != "delete" || event.SID != fixture.sb.ID {
+			t.Fatalf("drop route event = %+v", event)
+		}
+	default:
+		t.Fatal("drop export did not publish source deletion")
+	}
+}
+
 func TestDetachedTemplateUploadDoesNotBlockResumeCommitButFencesKill(t *testing.T) {
 	fixture := newExportResumeFixture(t)
 	publisher := newBlockingExportPublisher("manifest://" + strings.Repeat("e", 64))
