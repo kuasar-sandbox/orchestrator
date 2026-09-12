@@ -14,6 +14,7 @@ It provides the northbound API, node-local lifecycle orchestration, data-plane p
 
 - **Conductor** — authoritative control-plane API, sandbox and build lifecycle, node-local routing, credential management, and optional node resource admission;
 - **Proxy** — the single sandbox data ingress for Envd traffic, floating-IP services, native exec, MMDS, and traffic observation;
+- **Telemetry** — independent envd/OTLP metrics collection, trusted sandbox identity, Collector pipelines, embedded TSDB or readable external storage, exporters, and E2B history queries;
 - **Node link** — an optional client that attaches the node to a cluster control plane;
 - **Launch helpers** — systemd-managed sandbox and build runners;
 - **Administration** — resource status/drain, template-build status, configuration inspection, manifest-key management, and sandbox export/import.
@@ -44,6 +45,7 @@ For security architecture and deployment trust boundaries, see the [project syst
 | --- | --- |
 | `node-ctl conductor serve` | Start the authoritative node control-plane API |
 | `node-ctl proxy serve` | Start the node data-plane proxy master/worker |
+| `node-ctl telemetry serve` | Start sandbox metrics collection and history queries |
 | `node-ctl run-sandbox` | Launch one sandbox inside its managed unit |
 | `node-ctl run-builder` | Launch one template-build execution |
 | `node-ctl resource ...` | Inspect or drain node resource reservations |
@@ -65,11 +67,12 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 
 | Path | Role |
 |---|---|
-| `cmd/node-ctl` | Conductor/Proxy serve, managed run-sandbox/run-builder, resource status/list/drain, builder status, config, manifest-key, export/import and version |
+| `cmd/node-ctl` | Conductor/Proxy/Telemetry serve, managed run-sandbox/run-builder, resource status/list/drain, builder status, config, manifest-key, export/import and version |
 | `cmd/cluster-ctl` | Independent Registry/Router/Placer processes, config and version |
 | `cmd/node-stub-ctl` | E2E node-link participants with separate admin/API/data listeners, restart/reset, Sandbox/Build state and fault injection; no microVM |
 | `cmd/e2b-key-ctl` | DB/config-free gen-key, derive-api-secret, gen-apikey, fingerprint and seal-pull-token |
-| `config`, `app/conductor`, `app/proxy` | Public declarative configuration and static custom Apps; sealed-memfd/in-place-exec bootstrap and startup Config/Runtime Hooks |
+| `config`, `app/conductor`, `app/proxy`, `app/telemetry` | Public declarative configuration and static custom Apps; sealed-memfd/in-place-exec bootstrap and startup Config/Runtime Hooks |
+| `internal/telemetry`, `internal/telemetryapp` | Trusted route/peer identity, envd and OTLP Collector receivers, storage/exporters, E2B compatibility and component lifecycle |
 | `internal/orch` | Node lifecycle, Build pools, local route authority, unit generation and restart reconciliation |
 | `internal/nodectl` | Reservation admission, pools/watermarks/grants, inventory/StateSync recovery and audit; not the Sandbox balloon/cgroup loop |
 | `internal/nodelink` | Conductor–Registry registration, heartbeat, events and commands over framed JSON/h2c |
@@ -80,9 +83,10 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 | `internal/{apikey,secretbox,keys,regcreds}` | APISecret/API-key MAC, AES-GCM root storage, Forward/Exec kat1 and data tokens, ManifestKey-wrapped image-pull credentials |
 | `internal/{config,clustercfg,sandboxcfg,store}` | Node/cluster configuration, SANDBOX_CONFIG rendering and node SQLite Sandbox/Build/credential-pair state |
 | `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2/exact routes, worker-master queries, HTTP-over-UDS services, Prometheus, systemd D-Bus, connector-ctl adaptation and utilities |
-| `deploy/` | Per-role example YAML and node/Proxy/Registry/Router/Placer systemd units |
+| `deploy/` | Per-role example YAML and node/Proxy/Telemetry/Registry/Router/Placer systemd units |
 | `examples/custom-conductor` | Buildable xconductor entered through node-ctl conductor serve |
 | `examples/custom-proxy` | Buildable xproxy entered through node-ctl proxy serve; master reexecutes workers |
+| `examples/custom-telemetry` | Buildable static telemetry App with ordinary extension and narrow advanced Collector integration |
 
 ## Build and test
 
@@ -133,7 +137,7 @@ integration validation. See the [organization contribution guide](https://github
 
 ## Deployment overview
 
-A standalone node normally starts Conductor first and Proxy second. A cluster adds independent Registry, Router, and Placer processes. Configuration examples and systemd units are under `deploy/`.
+A standalone node normally starts Conductor, Proxy and Telemetry as separate services. Telemetry uses the existing Plugin Plane without joining Create/Resume barriers; its failure does not change sandbox lifecycle. Default metrics history uses embedded Prometheus TSDB without an external database. A cluster adds independent Registry, Router, and Placer processes. Configuration examples and systemd units are under `deploy/`.
 
 The user-facing, release-based installation path is documented in the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md). Production deployments should use durable storage, production TLS, protected credentials, an explicit network policy, and capacity settings validated against their workloads.
 
@@ -144,6 +148,7 @@ Prepare binaries, kernel/Runtime artifacts, networking and protected configurati
 ```bash
 node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 ```
 
 The examples use plaintext API `:3000` and data `:3443`. Configuration may enable resource_listen and Proxy traffic.max_inflight defaults. Cluster registration requires distinct api_endpoint/data_endpoint values; production ingress TLS and trusted node-link/network boundaries follow the deployment owner.
@@ -210,7 +215,7 @@ Producer-supplied notes may not contain the publisher's reserved source/Preview 
 
 The four official Go executables must identify their own Orchestrator command
 main packages and target Linux/amd64 with `CGO_ENABLED=0`. Packaging copies
-the ten deployment files from the selected source tree and collects the actual
+the twelve deployment files from the selected source tree and collects the actual
 Accelerator, Connector and Sandboxer dependency materials using the existing
 `RELEASE_*_SOURCE_DIR`, optional `RELEASE_*_SOURCE_SHA` and version selections.
 Standalone validation checks the bundle's dependency URL/commit fields agree;
@@ -231,7 +236,8 @@ Detailed design and reference documents provide complete English and Chinese edi
 
 - [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, and reliability;
 - [Node template builds](docs/node-build.md): full Build API, configuration, execution, publication and recovery.
-- [Runtime extensions](docs/extensions.md): complete Conductor/Proxy SDK lifecycle, object sources, Hooks and wrappers.
+- [Runtime extensions](docs/extensions.md): complete Conductor/Proxy/Telemetry SDK lifecycle, sources, Hooks, wrappers and storage/Collector bindings.
+- [Telemetry](docs/telemetry.md) ([Chinese edition](docs/telemetry_zh.md)) — direct FloatingIP OTLP ingress, envd scrape, local/Prometheus/ClickHouse primary storage, exporters, E2B history and identity invariants;
 - [`docs/node-journald.md`](docs/node-journald.md) ([Chinese edition](docs/node-journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;

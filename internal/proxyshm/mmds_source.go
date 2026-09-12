@@ -9,6 +9,7 @@ import (
 
 	connectorvswitch "github.com/kuasar-sandbox/connector/pkg/vswitch"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/routeidentity"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -36,19 +37,7 @@ type mmdsSourceConflict struct {
 }
 
 func parseMMDSSourceIPv4(raw string) (uint32, bool) {
-	if raw == "" {
-		return 0, false
-	}
-	addr, err := netip.ParseAddr(raw)
-	if err != nil {
-		return 0, false
-	}
-	addr = addr.Unmap()
-	if !addr.Is4() {
-		return 0, false
-	}
-	bytes := addr.As4()
-	return binary.BigEndian.Uint32(bytes[:]), true
+	return routeidentity.IPv4(raw)
 }
 
 func mmdsSourceSlotIndex(ipv4 uint32) int {
@@ -62,7 +51,7 @@ func mmdsSourceIPv4String(ipv4 uint32) string {
 }
 
 func activeMMDSSourceRoute(route routesync.RouteEntry) bool {
-	return route.State == routesync.StateStarting || route.State == routesync.StateRunning
+	return routeidentity.Active(route.State)
 }
 
 // lookupMMDSSource performs one fixed-slot lookup, then validates the candidate
@@ -87,8 +76,7 @@ func (t *Table) lookupMMDSSource(ipv4 uint32) (string, bool) {
 		valid := false
 		if sid != "" {
 			route, found := t.Lookup(sid)
-			if routeIPv4, ok := parseMMDSSourceIPv4(route.FloatingIP); found && ok &&
-				activeMMDSSourceRoute(route) && routeIPv4 == ipv4 {
+			if found && routeidentity.Matches(route, ipv4) {
 				valid = true
 			}
 		}

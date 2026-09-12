@@ -85,8 +85,9 @@ profile 编码在 templateID 前缀里（[Build §2](node-build_zh.md#2-模板-i
 - 既可**独立运行**也可**接入集群**:控制面(create/pause/kill/模板构建)始终在本节点;
   接入集群仅多一条 node-link(§10),不改 e2b 契约。
 - 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.3)。
-- 不实现 e2b `/sandboxes/{id}/metrics` 时间序列或 envd metrics 采集;平台另提供只读的
-  `/sandboxes/{id}/stats/resource` 与 `/sandboxes/{id}/stats/traffic` 即时快照(§4.1.1)。
+- 独立 Telemetry 实现 envd/OTLP 采集与 E2B `/sandboxes/{SandboxID}/metrics` 历史；
+  Conductor 只鉴权、检查 ownership 并转发到 live query UDS，完整契约见
+  [Telemetry](telemetry_zh.md)。`/stats/resource`、`/stats/traffic` 仍是独立即时快照(§4.1.1)。
 - 服务端不解析 Dockerfile；客户端展开的结构化 steps 会在构建 guest 内执行，支持镜像拉取、
   展平与最多三阶段流水线（[Build §5](node-build_zh.md#5-按目标执行与发布)）。
 - 节点本地:路由、存储、单元管理都是节点本地的;跨机快照/模板使用 canonical
@@ -99,6 +100,12 @@ profile 编码在 templateID 前缀里（[Build §2](node-build_zh.md#2-模板-i
   Connect+JSON 或 framed JSON，不使用 gRPC transport；不能据此声称整个 go.mod 没有 protobuf。
 
 ### 1.5 架构与数据通路
+
+除下图应用数据通路外，`node-ctl telemetry serve` 还订阅同一 Plugin Plane 的完整
+RouteEntry stream，经 UDS 采集 envd，并在 management namespace 直接接收以 FloatingIP
+识别 guest 的 OTLP。Collector pipeline 写入选定主存储（默认 embedded TSDB）和 extra
+exporter。Conductor 仅把鉴权后的 metrics query 转发到独立注册的 API UDS，不把
+telemetry 加入生命周期 barrier。完整拓扑、故障与身份契约见 [Telemetry](telemetry_zh.md)。
 
 ```
              client / cluster router
@@ -284,6 +291,19 @@ MMDS listen 与 service registry 只配置在 conductor。master 在 plugin 平�
 由握手取得 MMDS policy,维护共享路由视图并把唯一 Data listener fd 传给 worker.拓扑见
 node-proxy.md §2,§5;conductor 与 Proxy 必须成对部署.
 
+### 2.3.1 `node-ctl telemetry`
+
+```sh
+node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
+```
+
+独立组件拥有自身 strict config schema 和 `paths.telemetry_executable` static bootstrap
+入口。以固定 Plugin ID `telemetry` 注册，订阅 `Kind: route`；只有 primary storage
+可读时才注册独立 HTTP query UDS。它不加入 Create/Resume readiness，也不调用 Wake。
+Local TSDB、Prometheus、ClickHouse reader、直接 sandbox OTLP 网络、E2B step/MAX 与
+boundary 契约见 [Telemetry](telemetry_zh.md)。`deploy/node-telemetry.service` 与
+conductor/Proxy 并列部署，不作为它们的 required dependency。
+
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
 systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--run-id` 是 systemd 实例名,
@@ -313,20 +333,21 @@ env(systemd `%i` 接线用)。
 
 ### 2.5 `node-ctl config`
 
-配置诊断 + 生成工具,**按角色**(`conductor` / `proxy`,各自独立文件与 schema):
+配置诊断 + 生成工具,**按角色**(`conductor` / `proxy` / `telemetry`,各自独立文件与 schema):
 
 ```
-node-ctl config <conductor|proxy> --template            # 输出该角色带注释骨架
-node-ctl config <conductor|proxy> --config <file>       # 加载(补默认 + 校验)后重排输出
-node-ctl config <conductor|proxy> --config <file> --resolve   # 再展开 auto/派生(实际生效形态)
+node-ctl config <conductor|proxy|telemetry> --template            # 输出该角色带注释骨架
+node-ctl config <conductor|proxy|telemetry> --config <file>       # 加载(补默认 + 校验)后重排输出
+node-ctl config <conductor|proxy|telemetry> --config <file> --resolve   # 再展开 auto/派生(实际生效形态)
                               -o <file>             # 写文件(默认 stdout)
 ```
 
 角色作首参以消歧 schema:`conductor` 对应 `conductor.yaml`(§3),`proxy` 对应 `proxy.yaml`
-(node-proxy.md §2)。`--resolve` 对 `conductor` 额外展开 `resource_listen` 的 `auto` 内存/CPU
-(并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{conductor,proxy}.example.yaml` 对应。
+(node-proxy.md §2)，`telemetry` 对应 `telemetry.yaml`（[Telemetry](telemetry_zh.md)）。
+`--resolve` 对 `conductor` 额外展开 `resource_listen` 的 `auto` 内存/CPU
+(并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{conductor,proxy,telemetry}.example.yaml` 对应。
 该命令只做严格 declarative decode、默认化与诊断，绝不执行 `conductor_executable` /
-`proxy_executable`，也不接触 custom App 的运行时材料。custom 路径非空时，输出首行明确
+`proxy_executable` / `telemetry_executable`，也不接触 custom App 的运行时材料。custom 路径非空时，输出首行明确
 标记这里只完成 bootstrap 校验；最终配置仍由对应 App 在启动副作用前校验。
 
 ### 2.6 `node-ctl manifest-key`
@@ -519,6 +540,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
+| metrics history | `GET /sandboxes/{SandboxID}/metrics?start=...&end=...` | 精确 SandboxID ownership、opaque live telemetry UDS 转发；不可用为 503，不 Wake/Resume；[E2B 契约](telemetry_zh.md#6-e2b-历史查询) |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,在 allocation fence 内 detach 并 durable exact-clear network tuple,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
@@ -1997,7 +2019,8 @@ plugin 平面,机群路由经 registry 聚合。
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
 | `node-ctl proxy` | UDS routesync(双向 h2c 帧化 JSON)+ 独立 Data listener | 同节点,运维带外起;Proxy master 注册一次,worker 共享继承 Data listener fd + shm 路由视图;master 冻结的 EffectiveConfig 含 `paths.run_root`,worker 不重读 `proxy.yaml`(node-proxy.md §2.1/§3/§4) |
 
-公共导出面仅为 `config`、`app/conductor` 与 `app/proxy` 的启动期契约；
+公共 Config/App/extension 契约位于 `config`、`app/conductor`、`app/proxy`、`app/telemetry`；
+advanced Collector binding 隔离在 `app/telemetry/otel`；
 `CGO_ENABLED=0`;内部 core 继续保持 `internal/*` 依赖边界。
 
 ## 15. 可靠性

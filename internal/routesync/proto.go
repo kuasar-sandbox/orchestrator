@@ -64,6 +64,9 @@ func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/reg
 // ProxyPluginID is the one trusted independent Proxy registration identity.
 const ProxyPluginID = "proxy"
 
+// TelemetryPluginID is the trusted standalone telemetry registration identity.
+const TelemetryPluginID = "telemetry"
+
 // Subscribe kinds (Register.Subscribe.Kind).
 const (
 	KindRoute     = "route"      // route stream only (observer)
@@ -271,6 +274,7 @@ func ValidateHello(m *Msg) error {
 type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // trusted independent proxy registration marker and stats capability
+	Telemetry *Telemetry `json:"telemetry,omitempty"` // independent HTTP query channel, leased by this connection
 	Mmds      bool       `json:"mmds,omitempty"`      // trusted proxy requests MMDS routes/values + policy projection
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
@@ -288,6 +292,11 @@ type Subscribe struct {
 // its master-only traffic stats socket.
 type Proxy struct {
 	StatsSocket *Socket `json:"stats_socket,omitempty"`
+}
+
+// Telemetry advertises an optional local HTTP API. Queries never use route frames.
+type Telemetry struct {
+	API *Socket `json:"api,omitempty"`
 }
 
 type Socket struct {

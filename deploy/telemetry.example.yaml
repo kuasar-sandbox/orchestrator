@@ -1,0 +1,34 @@
+# node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
+# Separate from conductor.yaml/proxy.yaml; never a create/resume barrier.
+config_socket: /run/sandbox/node-ctl.socket
+api_socket: /run/sandbox/telemetry.sock
+# Use the namespace carrying the existing connector management path.
+# sandbox_netns: sandbox-proxy
+route_capacity: 65536
+paths:
+  # telemetry_executable: /opt/kuasar/bin/custom-telemetry
+telemetry:
+  scrape:
+    interval: 5s
+    timeout: 1s
+    concurrency: 64
+  otlp:
+    enabled: true
+    grpc_listen: ":4317"
+    http_listen: ":4318"
+    max_connections: 256
+    max_requests: 32
+    max_request_bytes: 4194304
+  storage:
+    type: local
+    path: /var/lib/sandbox/telemetry
+    retention: 168h
+    max_size: 10GiB
+    max_series: 1000000
+  # Write-only fan-out, never an implicit metrics query backend:
+  # exporters:
+  #   - name: observability
+  #     type: otlphttp
+  #     endpoint: https://collector.example.com
+# See docs/telemetry.md for direct sandbox OTLP networking and readable
+# Prometheus/ClickHouse primary configurations. Do not put OTLP behind Proxy.

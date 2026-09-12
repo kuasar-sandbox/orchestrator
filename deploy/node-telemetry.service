@@ -1,0 +1,17 @@
+# Independent Collector/metrics service. No Requires/BindsTo relationship makes
+# conductor or Proxy lifecycle depend on telemetry availability.
+[Unit]
+Description=kuasar node-ctl sandbox telemetry
+After=network-online.target node-ctl.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+UMask=0077
+ExecStart=/usr/bin/node-ctl telemetry serve --config=/etc/node-ctl/telemetry.yaml
+Restart=always
+RestartSec=1
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

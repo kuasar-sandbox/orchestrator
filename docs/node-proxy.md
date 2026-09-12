@@ -24,6 +24,13 @@ node proxy worker
 <a id="11-设计原则"></a>
 ### 1.1 Design principles
 
+Sandbox metric collection/history is owned by the separate
+[Telemetry component](telemetry.md), not Proxy's traffic counters or MMDS.
+Telemetry reuses the management namespace/packet path and MMDS FloatingIP
+lookup rules, but directly accepts guest OTLP on its own listeners. Do not
+forward OTLP through the application data proxy; Conductor's metrics query uses
+the live telemetry registration's separate API UDS, not Proxy StatsSocket.
+
 - **Separate forwarding and control planes:** the proxy decides routes, applies authentication policy, and forwards bytes. The conductor owns sandbox lifecycle authority.
 - **One subscribing master, multiple forwarding workers:** only the proxy master registers a config-socket plugin. Workers neither connect to the conductor nor hold independent routesync subscriptions.
 - **Separate route views:** fixed-length data-plane fields enter shared memory, which workers mmap read-only. Variable-length `mmds_routes` and `mmds_route_secret_values` remain in the master's bounded heap. Workers query an exact path through inherited local socketpair RPC. Secret-value plaintext never enters mmap.

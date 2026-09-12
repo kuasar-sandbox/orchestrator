@@ -26,6 +26,8 @@ type Plugin struct {
 	cancel context.CancelFunc
 	epoch  uint64
 	ready  bool
+	lease  context.Context
+	revoke context.CancelFunc
 }
 
 // Registry tracks live plugin registrations. The plugin-plane handler Adds on
@@ -55,6 +57,9 @@ func (r *Registry) Add(p *Plugin) {
 	r.mu.Lock()
 	if old := r.m[p.ID]; old != nil && old != p {
 		r.failBarriersLocked(old, ErrProxyRouteLeaseChanged)
+		if old.revoke != nil {
+			old.revoke()
+		}
 		if old.cancel != nil {
 			old.cancel() // ends the prior handler; its deferred Remove sees it is no longer current
 		}
@@ -62,6 +67,10 @@ func (r *Registry) Add(p *Plugin) {
 	r.nextEpoch++
 	p.epoch = r.nextEpoch
 	p.ready = false
+	if p.lease == nil {
+		p.lease = context.Background()
+	}
+	p.lease, p.revoke = context.WithCancel(p.lease)
 	r.m[p.ID] = p
 	r.mu.Unlock()
 }
@@ -72,6 +81,9 @@ func (r *Registry) Remove(p *Plugin) {
 	r.mu.Lock()
 	if r.m[p.ID] == p {
 		r.failBarriersLocked(p, ErrProxyRouteDisconnected)
+		if p.revoke != nil {
+			p.revoke()
+		}
 		delete(r.m, p.ID)
 	}
 	r.mu.Unlock()
@@ -285,9 +297,15 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not authorized (mmds proxy)", http.StatusForbidden)
 		return
 	}
+	if (id == routesync.TelemetryPluginID && (reg.SubscribeKind() != routesync.KindRoute || reg.Proxy != nil || reg.Mmds)) ||
+		(reg.Telemetry != nil && (id != routesync.TelemetryPluginID ||
+			(reg.Telemetry.API != nil && !validLocalSocket(reg.Telemetry.API.Path)))) {
+		http.Error(w, "invalid telemetry registration", http.StatusBadRequest)
+		return
+	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	p := &Plugin{ID: id, Caps: reg, cancel: cancel}
+	p := &Plugin{ID: id, Caps: reg, cancel: cancel, lease: ctx}
 	s.deps.Plugins.Add(p)
 	defer s.deps.Plugins.Remove(p)
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
