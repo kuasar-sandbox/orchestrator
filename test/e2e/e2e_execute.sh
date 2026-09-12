@@ -671,6 +671,24 @@ if want == "restore" and not (".snapshot" in selected or selected.startswith("ma
 PY
 }
 
+assert_run_from_value() { # $1=index, $2=sid, $3=expected --from value
+    python3 - "$RUN_ARGV_LOG" "$1" "$2" "$3" <<'PY'
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+index = int(sys.argv[2])
+if index >= len(calls):
+    raise SystemExit(f"missing run call {index}; captured {len(calls)}")
+call = calls[index]
+for i, arg in enumerate(call):
+    if arg == "--from":
+        if call[i + 1] != sys.argv[3]:
+            raise SystemExit(f"run --from={call[i + 1]!r}, want {sys.argv[3]!r}")
+        break
+else:
+    raise SystemExit(f"run call has no --from: {call!r}")
+PY
+}
+
 assert_snapshot_argv() { # $1=index, remaining args=expected argv
     local index="$1"
     shift
@@ -2154,27 +2172,43 @@ echo "==> PASS: W -> local B is separate; B root disk top was merged and removed
 
 PROMOTION_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
-    || fail "independent export/promote of local W failed"
+    || fail "independent keep-source export of local W failed"
 case "$PROMOTION_TOKEN" in kmt1.*) ;; *) fail "export-sandbox returned a non-KMT result" ;; esac
-PORTABLE_W_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+# The sealed KMT token hides its artifact ref, so publish once more as a
+# template id (plain <profile>-<kind>-<base64url(ref)>) to learn the portable
+# ref the export produced.
+W_TEMPLATE_ID=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
+    --keep-source --to-template --socket "$WORK/node-ctl.socket") \
+    || fail "template export of retained W failed"
+PORTABLE_W_REF=$(python3 - "$W_TEMPLATE_ID" <<'PY'
+import base64, sys
+parts = sys.argv[1].split("-", 2)
+if len(parts) != 3:
+    raise SystemExit(f"template id {sys.argv[1]!r}: want <profile>-<kind>-<base64url-ref>")
+print(base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4)).decode())
+PY
+) || fail "W template id did not decode to a portable ref"
+PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
+[[ "$PORTABLE_W_REF" == manifest://* && "$PORTABLE_W_KEY" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "published W ref is not manifest://<64hex>: $PORTABLE_W_REF"
+# keep-source must leave the paused source row bit-for-bit unchanged after both
+# exports, and must retain the local checkpoint it resumes from (#336).
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$W_PORTABLE_LOCAL" <<'PY' \
+    || fail "keep-source export rewrote the W source row"
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute(
-        "select resume_source_kind, resume_source_ref from sandboxes where id=?",
+        "select state, resume_source_kind, resume_source_ref from sandboxes where id=?",
         (sys.argv[2],),
     ).fetchone()
-if row and row[0] != "snapshot":
-    raise SystemExit(f"promoted W source kind={row[0]!r}, want 'snapshot'")
-print(row[1] if row else "")
+want = ("paused", "snapshot", sys.argv[3])
+if row != want:
+    raise SystemExit(f"keep-source W source row={row!r}, want {want!r}")
 PY
-)
-PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
-[[ "$PORTABLE_W_REF" == manifest://* && "$PORTABLE_W_KEY" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "promoted W ref is not manifest://<64hex>: $PORTABLE_W_REF"
-[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "promotion retained redundant local checkpoint directory"
+[ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "keep-source export removed the retained W checkpoint"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$PORTABLE_W_REF" >"$WORK/w-portable-manifest.json" \
-    || fail "promoted W is not readable from the manifest store"
+    || fail "published W is not readable from the manifest store"
 PORTABLE_LAYER_SUMMARY=$(python3 - "$WORK/w-portable-manifest.json" "$WORK/b-local.json" "$PORTABLE_W_REF" <<'PY'
 import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -2196,7 +2230,7 @@ print(refs[0][len("manifest://"):], len(refs))
 PY
 ) || fail "portable W/B layer validation failed"
 read -r PORTABLE_B_KEY PORTABLE_PARENT_LAYERS <<<"$PORTABLE_LAYER_SUMMARY"
-echo "==> PASS: independent promotion published distinct W self and opaque B memory layer"
+echo "==> PASS: independent keep-source export published distinct W self and opaque B memory layer"
 
 exec_argv_denied_through_connect "$SID" "$EXACT_EXEC_TOKEN"
 wait_sandbox_state "$SID" paused 20 \
@@ -2212,38 +2246,36 @@ for _ in $(seq 1 90); do
     case "$code" in 200|204) resumed=1; break ;; esac
     sleep 0.5
 done
-[ -n "$resumed" ] || fail "portable W did not restore"
-freeze_service_probe || fail "envd freeze service/listener missing after portable W restore"
+[ -n "$resumed" ] || fail "retained W did not resume from its local checkpoint"
+freeze_service_probe || fail "envd freeze service/listener missing after retained W resume"
 FREEZE_COUNTER_AFTER_W=$FREEZE_COUNTER
 FREEZE_DELTA_W=$((FREEZE_COUNTER_AFTER_W - FREEZE_COUNTER_BEFORE_W))
 [ "$FREEZE_DELTA_W" -ge 0 ] && [ "$FREEZE_DELTA_W" -lt 100 ] \
-    || fail "envd service counter advanced across frozen portable W window: before=$FREEZE_COUNTER_BEFORE_W after=$FREEZE_COUNTER_AFTER_W"
+    || fail "envd service counter advanced across frozen W resume window: before=$FREEZE_COUNTER_BEFORE_W after=$FREEZE_COUNTER_AFTER_W"
 sleep 1
-freeze_service_probe || fail "envd freeze service stopped after portable W restore"
+freeze_service_probe || fail "envd freeze service stopped after retained W resume"
 [ "$FREEZE_COUNTER" -gt "$FREEZE_COUNTER_AFTER_W" ] \
-    || fail "envd freeze service did not resume counter after portable W restore"
+    || fail "envd freeze service did not resume counter after retained W resume"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" \
     >"$WORK/portable-read.out" 2>&1 || true
-grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "portable W lost guest state"; }
+grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "retained W lost guest state"; }
 # The working-set memory intentionally retained guest cache, so evict it before
-# reading the W-only file. This makes the assertion prove the published disk
-# artifact, independently of the restored memory self/lower chain.
+# reading the W-only file. This makes the assertion prove the retained local
+# checkpoint's disk artifact, independently of the restored memory self/lower chain.
 "$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$WORK/run/sandboxes" -- /bin/sh -c \
     'sync && echo 3 > /proc/sys/vm/drop_caches && cat /home/user/working-set-disk.txt' \
     >"$WORK/portable-disk-read.out" 2>&1 || true
 grep -q "$W_DISK_PERSIST" "$WORK/portable-disk-read.out" \
-    || { sed 's/^/  guest| /' "$WORK/portable-disk-read.out"; fail "portable W lost merged W-only disk state"; }
-PORTABLE_RESTORE_RUN_ID=$(sandbox_run_id "$SID")
-[ -n "$PORTABLE_RESTORE_RUN_ID" ] || fail "portable restore runner id is empty"
-PORTABLE_RESTORE_UNIT="${RUNNER_PREFIX}$PORTABLE_RESTORE_RUN_ID.service"
-wait_unit_journal_contains "$PORTABLE_RESTORE_UNIT" \
-    "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_W_KEY" \
-    "$WORK/portable-w.journal" || { tail -40 "$WORK/portable-w.journal" | sed 's/^/  unit| /'; fail "portable restore did not prefetch W self"; }
-MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/portable-w.journal" || true)
-[ "$MANIFEST_PREFETCH_COUNT" = "1" ] || fail "portable restore started $MANIFEST_PREFETCH_COUNT manifest prefetches, want W self only"
-grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_B_KEY" \
-    "$WORK/portable-w.journal" && fail "portable restore prefetched B memory lower"
-echo "==> PASS: portable W restored envd-managed PID/listener (frozen delta=$FREEZE_DELTA_W); prefetch targeted W self only"
+    || { sed 's/^/  guest| /' "$WORK/portable-disk-read.out"; fail "retained W lost merged W-only disk state"; }
+W_RESUME_RUN_ID=$(sandbox_run_id "$SID")
+[ -n "$W_RESUME_RUN_ID" ] || fail "retained W resume runner id is empty"
+W_RESUME_UNIT="${RUNNER_PREFIX}$W_RESUME_RUN_ID.service"
+wait_unit_journal_contains "$W_RESUME_UNIT" \
+    "memory prefetch started backend=file" "$WORK/keep-source-w.journal" \
+    || { tail -40 "$WORK/keep-source-w.journal" | sed 's/^/  unit| /'; fail "retained W resume did not restore from the local checkpoint"; }
+MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/keep-source-w.journal" || true)
+[ "$MANIFEST_PREFETCH_COUNT" = "0" ] || fail "retained W resume prefetched $MANIFEST_PREFETCH_COUNT layer(s) from the manifest store, want local-only"
+echo "==> PASS: keep-source W resumed envd-managed PID/listener from its retained local checkpoint (frozen delta=$FREEZE_DELTA_W); manifest store untouched"
 
 if [ "$MMDS_ROUTES_E2E" = 1 ]; then
     source "$SCRIPT_DIR/lib/mmds_static_guest.sh"
@@ -2271,6 +2303,7 @@ code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill fi
 wait_sandbox_state "$SID" missing 120 || fail "Sandbox delete finalizer retained durable row"
 [ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Sandbox delete retained RunDir"
 [ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Sandbox delete retained BaseDir"
+[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Sandbox delete retained the keep-source checkpoint"
 [ -f "$WORK/lib/node-ctl.db" ] || fail "Sandbox cleanup removed node-level database"
 [ -S "$WORK/node-ctl.socket" ] || fail "Sandbox cleanup removed node-level config socket"
 unset EXEC_TOKEN
@@ -2294,7 +2327,20 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.
 grep -q "$PERSIST" "$WORK/kmt-read.out" \
     || { sed 's/^/  guest| /' "$WORK/kmt-read.out"; fail "KMT restore lost portable guest state"; }
 wait_sandbox_state "$SID" running 20 || fail "KMT restore did not commit running"
-echo "==> PASS: KMT Connect returned at $KMT_RETURN_STATE; immediate native exec parked and portable state restored"
+# The source resumed from its retained local checkpoint above; the KMT import
+# is what proves the published portable artifact: it must restore from the
+# manifest store, prefetching exactly the W self layer (#336).
+KMT_RESTORE_RUN_ID=$(sandbox_run_id "$SID")
+[ -n "$KMT_RESTORE_RUN_ID" ] || fail "KMT restore runner id is empty"
+KMT_RESTORE_UNIT="${RUNNER_PREFIX}$KMT_RESTORE_RUN_ID.service"
+wait_unit_journal_contains "$KMT_RESTORE_UNIT" \
+    "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_W_KEY" \
+    "$WORK/kmt-w.journal" || { tail -40 "$WORK/kmt-w.journal" | sed 's/^/  unit| /'; fail "KMT restore did not prefetch W self from the manifest store"; }
+KMT_MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/kmt-w.journal" || true)
+[ "$KMT_MANIFEST_PREFETCH_COUNT" = "1" ] || fail "KMT restore started $KMT_MANIFEST_PREFETCH_COUNT manifest prefetches, want W self only"
+grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_B_KEY" \
+    "$WORK/kmt-w.journal" && fail "KMT restore prefetched B memory lower"
+echo "==> PASS: KMT Connect returned at $KMT_RETURN_STATE; immediate native exec parked, portable state restored, prefetch targeted W self only"
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill KMT-imported sandbox=$code (want 204)"
 wait_sandbox_state "$SID" missing 120 || fail "KMT sandbox delete finalizer retained durable row"
 unset KMT_EXEC_TOKEN
@@ -2712,32 +2758,34 @@ if bad:
 PY
 BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
-    || fail "bundle export/promote failed"
+    || fail "bundle keep-source export failed"
 case "$BUNDLE_TOKEN" in kmt1.*) ;; *) fail "bundle export returned a non-KMT result" ;; esac
-BUNDLE_REMOTE_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+# keep-source must leave the paused source row unchanged and retain its local
+# checkpoint (#336). The published root stays content-addressed under the
+# local bundle's ManifestKey, which the Store lookup below proves.
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$BUNDLE_LOCAL" <<'PY' \
+    || fail "bundle keep-source export rewrote the source row"
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute(
-        "select resume_source_kind, resume_source_ref from sandboxes where id=?",
+        "select state, resume_source_kind, resume_source_ref from sandboxes where id=?",
         (sys.argv[2],),
     ).fetchone()
-if row and row[0] != "snapshot":
-    raise SystemExit(f"promoted Bundle source kind={row[0]!r}, want 'snapshot'")
-print(row[1] if row else "")
+want = ("paused", "snapshot", sys.argv[3])
+if row != want:
+    raise SystemExit(f"keep-source Bundle source row={row!r}, want {want!r}")
 PY
-)
-[ "$BUNDLE_REMOTE_REF" = "manifest://$BUNDLE_ROOT_KEY" ] \
-    || fail "bundle promote changed the root ManifestKey: local=$BUNDLE_ROOT_KEY remote=$BUNDLE_REMOTE_REF"
-[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "bundle promote retained redundant local checkpoint directory"
+[ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "bundle keep-source export removed the retained checkpoint"
+BUNDLE_REMOTE_REF="manifest://$BUNDLE_ROOT_KEY"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
-    || fail "promoted Bundle root is unreadable from Store"
-exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_STORE_RESTORE_$RANDOM"
-wait_sandbox_state "$SID" running 20 || fail "exact-uploaded Bundle C did not restore from Store"
+    || fail "published Bundle root $BUNDLE_REMOTE_REF is unreadable from Store"
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_LOCAL_RESUME_$RANDOM"
+wait_sandbox_state "$SID" running 20 || fail "retained Bundle C did not resume from its local checkpoint"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-store-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-store-read.out" \
-    || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "Store-only Bundle C restore lost A state"; }
+    || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "local Bundle C resume lost A state"; }
 
 E_BUNDLE_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
@@ -2753,31 +2801,66 @@ E_BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID
     --keep-source --socket "$WORK/node-ctl.socket") \
     || fail "Bundle Sandbox E publish failed"
 case "$E_BUNDLE_TOKEN" in kmt1.*) ;; *) fail "Bundle Sandbox E export returned a non-KMT result" ;; esac
-E_BUNDLE_REMOTE_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+# keep-source leaves the paused Bundle E row pointing at its retained local
+# checkpoint (#336); the published artifact lands in the Store under the
+# bundle's content-addressed root key.
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$E_BUNDLE_LOCAL" <<'PY' \
+    || fail "Bundle Sandbox E keep-source export rewrote the source row"
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute(
-        "select resume_source_kind, resume_source_ref from sandboxes where id=?",
+        "select state, resume_source_kind, resume_source_ref from sandboxes where id=?",
         (sys.argv[2],),
     ).fetchone()
-if not row or row[0] != "sandbox" or not row[1].startswith("manifest://"):
-    raise SystemExit(f"published Bundle E source={row!r}")
-print(row[1])
+want = ("paused", "sandbox", sys.argv[3])
+if row != want:
+    raise SystemExit(f"keep-source Bundle E source row={row!r}, want {want!r}")
 PY
-) || fail "Bundle Sandbox E kind/ref was not preserved by publish"
-[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Bundle Sandbox E publish retained redundant local directory"
+[ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E keep-source export removed the retained local symlink"
+[ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Bundle Sandbox E keep-source export removed the retained local directory"
+E_BUNDLE_REMOTE_REF="manifest://$(basename "$E_BUNDLE_TARGET" .bundle)"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$E_BUNDLE_REMOTE_REF" >"$WORK/bundle-e-remote.json" \
+    || fail "published Bundle E root is unreadable from Store"
 E_BUNDLE_RUN_CALL=$(run_argv_count)
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_E_WAKE_$RANDOM"
-wait_sandbox_state "$SID" running 1200 || fail "published Bundle Sandbox E did not cold Wake"
+wait_sandbox_state "$SID" running 1200 || fail "retained Bundle Sandbox E did not cold Wake"
 assert_run_source_mode "$E_BUNDLE_RUN_CALL" "$SID" from \
-    || fail "published Bundle Sandbox E Wake did not execute run --from"
+    || fail "Bundle Sandbox E Wake did not execute run --from"
+assert_run_from_value "$E_BUNDLE_RUN_CALL" "$SID" "$E_BUNDLE_LOCAL" \
+    || fail "Bundle Sandbox E Wake did not select the retained local checkpoint"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-e-read.out" \
-    || { sed 's/^/  guest| /' "$WORK/bundle-e-read.out"; fail "published Bundle Sandbox E lost disk state"; }
+    || { sed 's/^/  guest| /' "$WORK/bundle-e-read.out"; fail "retained Bundle Sandbox E lost disk state"; }
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
+wait_sandbox_state "$SID" missing 120 || fail "Bundle E delete finalizer retained durable row"
 unset EXEC_TOKEN
-echo "==> PASS: Bundle drove self-contained S chain plus E capture, exact publish, and cold Wake from $E_BUNDLE_REMOTE_REF"
+echo "==> KMT import of published Bundle E -> cold restore from the manifest Store"
+E_KMT_RUN_CALL=$(run_argv_count)
+code=$(curl -sS --noproxy '*' --max-time 30 -o "$WORK/resp.body" -w '%{http_code}' \
+    -X POST -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" \
+    -H "X-Kuasar-Migration-Token: $E_BUNDLE_TOKEN" \
+    -H 'Content-Type: application/json' --data '{"timeout":119}' \
+    "http://127.0.0.1:$PORT/sandboxes/$SID/connect")
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "Bundle E KMT Connect=$code (want 200)"; }
+ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+E_KMT_EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue exec capability for imported Bundle E"
+rm -f "$WORK/exec-session.secret"
+exec_through_connect "$SID" "$E_KMT_EXEC_TOKEN" "BUNDLE_E_KMT_$RANDOM"
+wait_sandbox_state "$SID" running 1200 || fail "imported Bundle E did not cold restore from the Store"
+assert_run_source_mode "$E_KMT_RUN_CALL" "$SID" from \
+    || fail "imported Bundle E did not execute run --from"
+assert_run_from_value "$E_KMT_RUN_CALL" "$SID" "$E_BUNDLE_REMOTE_REF" \
+    || fail "imported Bundle E did not select the published Store root"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-kmt-read.out" 2>&1 || true
+grep -q "$BUNDLE_PERSIST" "$WORK/bundle-e-kmt-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-e-kmt-read.out"; fail "Store-only Bundle E restore lost disk state"; }
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill imported Bundle E=$code"
+wait_sandbox_state "$SID" missing 120 || fail "imported Bundle E delete finalizer retained durable row"
+unset E_KMT_EXEC_TOKEN
+echo "==> PASS: Bundle drove self-contained S chain plus E capture, exact publish, retained-local Wake, and cold Store restore via KMT"
 
 echo
 echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle-S $BUNDLE_REMOTE_REF, bundle-E $E_BUNDLE_REMOTE_REF)"
