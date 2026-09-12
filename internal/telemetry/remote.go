@@ -28,7 +28,10 @@ func newRemoteClient(headers map[string]string) *remoteClient {
 			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 5 * time.Second, MaxConnsPerHost: 8, MaxIdleConns: 8, MaxIdleConnsPerHost: 8, IdleConnTimeout: 30 * time.Second, DisableCompression: true},
 	}}
 }
-func (c *remoteClient) request(ctx context.Context, endpoint string, body []byte, protocolHeaders map[string]string) ([]byte, error) {
+
+// open transfers the successful response body to the caller. The HTTP client's
+// deadline still covers reading it, including streamed remote-read responses.
+func (c *remoteClient) open(ctx context.Context, endpoint string, body []byte, protocolHeaders map[string]string) (*http.Response, error) {
 	if len(body) > maxRemoteBytes {
 		return nil, ErrInvalidMetrics
 	}
@@ -46,12 +49,23 @@ func (c *remoteClient) request(ctx context.Context, endpoint string, body []byte
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
 	if exception := response.Header.Get("X-ClickHouse-Exception-Code"); response.StatusCode < 200 || response.StatusCode >= 300 || (exception != "" && exception != "0") {
+		response.Body.Close()
 		// Do not reflect database diagnostics, query text or credentials to guests.
 		return nil, fmt.Errorf("telemetry backend HTTP status %d", response.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxRemoteBytes+1))
+	return response, nil
+}
+func (c *remoteClient) request(ctx context.Context, endpoint string, body []byte, protocolHeaders map[string]string) ([]byte, error) {
+	response, err := c.open(ctx, endpoint, body, protocolHeaders)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	return readRemoteBody(response.Body)
+}
+func readRemoteBody(body io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxRemoteBytes+1))
 	if err != nil {
 		return nil, err
 	}

@@ -203,6 +203,8 @@ func TestExternalReadCancellationRedirectsAndLimits(t *testing.T) {
 		t.Fatal("credential-bearing redirect followed", err)
 	}
 	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Encoding", "snappy")
 		buffer := make([]byte, binary.MaxVarintLen64)
 		n := binary.PutUvarint(buffer, maxRemoteBytes+1)
 		_, _ = w.Write(buffer[:n])
@@ -211,6 +213,38 @@ func TestExternalReadCancellationRedirectsAndLimits(t *testing.T) {
 	backend.endpoint = oversized.URL
 	if _, _, _, err := backend.Bounds(context.Background(), "sid"); err == nil {
 		t.Fatal("snappy expansion limit not enforced")
+	}
+}
+
+func TestPrometheusLongRetentionEmptySingleRead(t *testing.T) {
+	var reads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		response := prompb.ReadResponse{Results: []*prompb.QueryResult{{}}}
+		raw, _ := response.Marshal()
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Encoding", "snappy")
+		_, _ = w.Write(snappy.Encode(nil, raw))
+	}))
+	defer server.Close()
+	backend, err := NewPrometheus(config.TelemetryStorage{Retention: "8760h", Prometheus: config.TelemetryRemote{Endpoint: server.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Shutdown(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, found, err := backend.Bounds(ctx, "new-sandbox"); err != nil || found {
+		t.Fatal("empty history", found, err)
+	}
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("empty one-year history required %d requests, want one", got)
+	}
+	response := httptest.NewRecorder()
+	QueryHandler(backend).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/new-sandbox/metrics", nil))
+	if response.Code != 200 || response.Body.String() != "[]\n" || reads.Load() != 2 {
+		t.Fatal("empty E2B query", response.Code, response.Body.String(), reads.Load())
 	}
 }
 

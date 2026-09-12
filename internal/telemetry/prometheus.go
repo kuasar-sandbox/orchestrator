@@ -1,10 +1,15 @@
 package telemetry
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"math"
+	"mime"
 	"net/url"
 	"sort"
 	"time"
@@ -14,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
 // Prometheus is a readable primary using the standard Snappy/protobuf remote
@@ -95,10 +101,8 @@ func (p *Prometheus) Write(ctx context.Context, samples []extension.Sample) erro
 	return err
 }
 
-const remoteReadWindow = 6 * time.Hour
-
 func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visit func(extension.Field, int64, float64) error) error {
-	request := prompb.ReadRequest{AcceptedResponseTypes: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_SAMPLES}}
+	request := prompb.ReadRequest{AcceptedResponseTypes: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS, prompb.ReadRequest_SAMPLES}}
 	query := &prompb.Query{StartTimestampMs: start, EndTimestampMs: end}
 	for _, matcher := range resourceMatchers(id) {
 		kind := prompb.LabelMatcher_EQ
@@ -116,7 +120,22 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 	if err != nil {
 		return err
 	}
-	raw, err = p.request(ctx, endpoint, snappy.Encode(nil, raw), map[string]string{"Content-Type": "application/x-protobuf", "Content-Encoding": "snappy", "X-Prometheus-Remote-Read-Version": "0.1.0"})
+	response, err := p.open(ctx, endpoint, snappy.Encode(nil, raw), map[string]string{"Content-Type": "application/x-protobuf", "Content-Encoding": "snappy", "X-Prometheus-Remote-Read-Version": "0.1.0"})
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	media, params, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil {
+		return fmt.Errorf("invalid Prometheus response content type: %w", err)
+	}
+	if media == "application/x-streamed-protobuf" && params["proto"] == "prometheus.ChunkedReadResponse" && response.Header.Get("Content-Encoding") == "" {
+		return readPrometheusChunks(ctx, response.Body, id, start, end, visit)
+	}
+	if media != "application/x-protobuf" || response.Header.Get("Content-Encoding") != "snappy" {
+		return errors.New("unsupported Prometheus response format")
+	}
+	raw, err = readRemoteBody(response.Body)
 	if err != nil {
 		return err
 	}
@@ -128,32 +147,28 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 	if err != nil {
 		return err
 	}
-	var response prompb.ReadResponse
-	if err := response.Unmarshal(raw); err != nil {
+	var samples prompb.ReadResponse
+	if err := samples.Unmarshal(raw); err != nil {
 		return err
 	}
-	if len(response.Results) != 1 || response.Results[0] == nil {
+	if len(samples.Results) != 1 || samples.Results[0] == nil {
 		return errors.New("unexpected Prometheus query result count")
 	}
-	for _, series := range response.Results[0].Timeseries {
+	for _, series := range samples.Results[0].Timeseries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if series == nil {
 			return ErrInvalidMetrics
 		}
-		attrs := make(map[string]string, len(series.Labels))
-		for _, label := range series.Labels {
-			if _, exists := attrs[label.Name]; exists {
-				return ErrInvalidMetrics
-			}
-			attrs[label.Name] = label.Value
-		}
-		field, ok := metricField(attrs[labels.MetricName])
-		if !ok || attrs[SandboxIDAttribute] != id || attrs[sourceAttribute] != "envd" || attrs["otel.kind"] != "Gauge" {
-			return fmt.Errorf("Prometheus returned a series outside the requested sandbox resource scope")
+		field, err := remoteResourceField(series.Labels, id)
+		if err != nil {
+			return err
 		}
 		for _, sample := range series.Samples {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if sample.Timestamp < start || sample.Timestamp > end {
 				continue
 			}
@@ -165,51 +180,125 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 	return nil
 }
 
+// The standard remote-read stream is uvarint length, big-endian CRC32C, then
+// ChunkedReadResponse protobuf. Decode one bounded frame at a time; importing
+// storage/remote just for its framing helper would also link the scrape manager.
+// https://github.com/prometheus/prometheus/blob/main/prompb/remote.proto
+func readPrometheusChunks(ctx context.Context, body io.Reader, id string, start, end int64, visit func(extension.Field, int64, float64) error) error {
+	reader := bufio.NewReader(body)
+	checksumTable := crc32.MakeTable(crc32.Castagnoli)
+	var buffer []byte
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		size, err := binary.ReadUvarint(reader)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if size == 0 || size > maxRemoteBytes {
+			return errors.New("invalid or oversized Prometheus stream frame")
+		}
+		var checksum uint32
+		if err := binary.Read(reader, binary.BigEndian, &checksum); err != nil {
+			return err
+		}
+		if uint64(cap(buffer)) < size {
+			buffer = make([]byte, size)
+		}
+		buffer = buffer[:size]
+		if _, err := io.ReadFull(reader, buffer); err != nil {
+			return err
+		}
+		if crc32.Checksum(buffer, checksumTable) != checksum {
+			return errors.New("invalid Prometheus stream checksum")
+		}
+		var frame prompb.ChunkedReadResponse
+		if err := frame.Unmarshal(buffer); err != nil {
+			return err
+		}
+		if frame.QueryIndex != 0 {
+			return errors.New("unexpected Prometheus stream query index")
+		}
+		for _, series := range frame.ChunkedSeries {
+			if series == nil {
+				return ErrInvalidMetrics
+			}
+			field, err := remoteResourceField(series.Labels, id)
+			if err != nil {
+				return err
+			}
+			for _, encoded := range series.Chunks {
+				if encoded.Type != prompb.Chunk_XOR || len(encoded.Data) < 2 {
+					return errors.New("invalid Prometheus resource chunk encoding")
+				}
+				chunk, err := chunkenc.FromData(chunkenc.EncXOR, encoded.Data)
+				if err != nil {
+					return err
+				}
+				iterator := chunk.Iterator(nil)
+				for kind := iterator.Next(); kind != chunkenc.ValNone; kind = iterator.Next() {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if kind != chunkenc.ValFloat {
+						return ErrInvalidMetrics
+					}
+					stamp, value := iterator.At()
+					// Edge chunks can include observations outside requested bounds.
+					if stamp >= start && stamp <= end {
+						if err := visit(field, stamp, value); err != nil {
+							return err
+						}
+					}
+				}
+				if err := iterator.Err(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+func remoteResourceField(seriesLabels []prompb.Label, id string) (extension.Field, error) {
+	attrs := make(map[string]string, len(seriesLabels))
+	for _, label := range seriesLabels {
+		if _, exists := attrs[label.Name]; exists {
+			return 0, ErrInvalidMetrics
+		}
+		attrs[label.Name] = label.Value
+	}
+	field, ok := metricField(attrs[labels.MetricName])
+	if !ok || attrs[SandboxIDAttribute] != id || attrs[sourceAttribute] != "envd" || attrs["otel.kind"] != "Gauge" {
+		return 0, errors.New("Prometheus returned a series outside the requested sandbox resource scope")
+	}
+	return field, nil
+}
+
 func (p *Prometheus) Bounds(ctx context.Context, id string) (start, end time.Time, found bool, err error) {
 	if id == "" {
 		return
 	}
-	last := time.Now().Add(time.Minute).UnixMilli()
-	first := time.Now().Add(-p.retention).UnixMilli()
-	// Two bounded directional scans usually need one request apiece. Sparse
-	// histories still obey the caller deadline and use constant response memory.
-	for begin := first; begin <= last; {
-		finish := min(last, begin+remoteReadWindow.Milliseconds()-1)
-		err = p.read(ctx, id, begin, finish, func(_ extension.Field, stamp int64, _ float64) error {
-			value := time.UnixMilli(stamp).UTC()
-			if !found || value.Before(start) {
-				start = value
-			}
-			found = true
-			return nil
-		})
-		if err != nil || found {
-			break
+	now := time.Now()
+	// One streaming request, including for empty or sparse long-retention
+	// histories. Neither request count nor response memory grows with retention.
+	err = p.read(ctx, id, now.Add(-p.retention).UnixMilli(), now.Add(time.Minute).UnixMilli(), func(_ extension.Field, stamp int64, value float64) error {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil // Prometheus stale markers are not observations.
 		}
-		begin = finish + 1
-	}
-	if err != nil || !found {
-		return
-	}
-	var haveEnd bool
-	for finish := last; finish >= start.UnixMilli(); {
-		begin := max(start.UnixMilli(), finish-remoteReadWindow.Milliseconds()+1)
-		err = p.read(ctx, id, begin, finish, func(_ extension.Field, stamp int64, _ float64) error {
-			value := time.UnixMilli(stamp).UTC()
-			if !haveEnd || value.After(end) {
-				end = value
-			}
-			haveEnd = true
-			return nil
-		})
-		if err != nil || haveEnd {
-			break
+		observed := time.UnixMilli(stamp).UTC()
+		if !found || observed.Before(start) {
+			start = observed
 		}
-		finish = begin - 1
-	}
-	if err == nil && !haveEnd {
-		found = false
-	} // Retention may advance between requests.
+		if !found || observed.After(end) {
+			end = observed
+		}
+		found = true
+		return nil
+	})
 	return
 }
 
@@ -222,12 +311,10 @@ func (p *Prometheus) Query(ctx context.Context, query extension.Query) ([]extens
 		return nil, err
 	}
 	start, end := max(query.Start.UnixMilli(), time.Now().Add(-p.retention).UnixMilli()), min(query.End.UnixMilli(), time.Now().Add(time.Minute).UnixMilli())
-	for begin := start; begin <= end; {
-		finish := min(end, begin+remoteReadWindow.Milliseconds()-1)
-		if err := p.read(ctx, query.SandboxID, begin, finish, buckets.add); err != nil {
+	if start <= end {
+		if err := p.read(ctx, query.SandboxID, start, end, buckets.add); err != nil {
 			return nil, err
 		}
-		begin = finish + 1
 	}
 	return buckets.points(), nil
 }

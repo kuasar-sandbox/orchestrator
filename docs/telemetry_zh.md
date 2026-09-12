@@ -209,7 +209,12 @@ telemetry:
 ```
 
 Adapter 使用标准 Snappy/protobuf remote-write v1 写入 `<endpoint>/api/v1/write`，
-通过 `<endpoint>/api/v1/read` 分有界窗口读取原始 SAMPLES，再执行相同的 field-wise MAX。
+通过 `<endpoint>/api/v1/read` 协商 `STREAMED_XOR_CHUNKS`，再执行相同的 field-wise MAX。
+每次历史边界查找和数据查询各使用一次请求，包括长 retention 下的空历史和稀疏历史。
+Frame 校验 checksum，大小限制为 32 MiB，每次仅保留一个 frame；10s HTTP deadline
+覆盖整个 response body。完整 edge chunk 中的 sample 按精确、包含端点的范围过滤。
+只支持 `SAMPLES` 的后端可回退到单个 Snappy response，压缩前后均限制为 32 MiB；
+更大的历史需要 streaming。
 Backend 必须同时启用两个 API 并接受 Prometheus 3 UTF-8 metric/label 名；只有 query
 server 或 write-only exporter 不够。Remote read 保留精确观测，不引入 PromQL 的
 lookback/step interpolation。参见 [remote read API](https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/)。
@@ -287,7 +292,11 @@ Reader，再按 epoch 对齐桶对七个字段分别取 MAX：
 起止边界均包含。不对齐的 start 可导致 bucket timestamp 早于 start，但参与聚合的
 sample 仍必须位于请求范围内。不做平均或 last-sample selection。只有七个字段齐全
 的 resource bucket 才输出 E2B 对象，不把缺失字段编造成零。合法空历史/范围返回 `[]`。
-无效/重复 boundary 或 start > end 返回 400；Reader 失败返回脱敏 503。不插值、不填零、
+无效/重复 boundary 或 start > end 返回 400。与
+[E2B 的范围解析](https://github.com/e2b-dev/infra/blob/87968fc1e1fa57d896378249ae14d09916382d75/packages/api/internal/clusters/resources_local.go)
+一致，验证发生在补齐省略边界之后：历史存在时，仅提供晚于最后 sample 的 start，
+或仅提供早于第一条 sample 的 end，返回 400；同时提供两端、合法但不相交的范围返回 `[]`。
+Reader 失败返回脱敏 503。不插值、不填零、
 不 Wake。每个查询有 15s context budget，最多八个并发 reader、100,000 output buckets；
 超过查询容量返回带 Retry-After 的 503。
 
@@ -327,11 +336,15 @@ GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
 TELEMETRY_CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 GOWORK=off go test ./internal/telemetry -run TestClickHouseIntegration -count=1
+TELEMETRY_PROMETHEUS_TEST_URL=http://127.0.0.1:9090 GOWORK=off go test ./internal/telemetry -run TestPrometheusIntegration -count=1
 make test vet build
 make test-e2e # 要求组装的项目 BIN 与真实 KVM host
 ```
 
-可选 live ClickHouse test 只创建/删除唯一命名测试表，应使用可丢弃 endpoint。
+可选 live-engine test 应使用可丢弃 endpoint。ClickHouse test 只创建/删除唯一命名测试表。
+Prometheus test 写入唯一命名 sandbox series（由后端 retention 回收），要求启用 remote
+write、配置至少 5m 的 out-of-order window，验证 streaming、UTF-8 label、重复/乱序 sample、
+field MAX 和精确时间边界。
 Density benchmark 对 1k/10k/50k synthetic targets 测真实 5s 周期，报告 scrape count、
 goroutine/FD 峰值（含 fixture server）、allocation、TSDB batch write 与 local query
 成本。Receiver 与 TSDB 分开测量，不声称是端到端生产容量。时间数字不作为普通 CI gate，

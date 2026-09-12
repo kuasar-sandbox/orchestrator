@@ -98,6 +98,11 @@ func TestQueryBoundaries(t *testing.T) {
 	}{
 		{"none", "", 200, 100, 1000, true}, {"start", "?start=200", 200, 200, 1000, true}, {"end", "?end=900", 200, 100, 900, true},
 		{"both", "?start=20&end=2000", 200, 20, 2000, false}, {"equal", "?start=0&end=0", 200, 0, 0, false},
+		// E2B resolves omitted boundaries before ValidateRange. A supplied bound
+		// outside existing history can therefore produce a reversed range.
+		{"start after history", "?start=1001", 400, 0, 0, true}, {"end before history", "?end=99", 400, 0, 0, true},
+		{"start at last", "?start=1000", 200, 1000, 1000, true}, {"end at first", "?end=100", 200, 100, 100, true},
+		{"explicit before history", "?start=0&end=99", 200, 0, 99, false}, {"explicit after history", "?start=1001&end=2000", 200, 1001, 2000, false},
 		{"reversed", "?start=2&end=1", 400, 0, 0, false}, {"negative", "?start=-1", 400, 0, 0, false},
 		{"duplicate", "?start=1&start=2", 400, 0, 0, false}, {"empty", "?end=", 400, 0, 0, false},
 		{"nan", "?start=NaN", 400, 0, 0, false}, {"fractional", "?start=1.1", 400, 0, 0, false},
@@ -111,6 +116,9 @@ func TestQueryBoundaries(t *testing.T) {
 			if response.Code != tc.status {
 				t.Fatalf("status %d: %s", response.Code, response.Body.String())
 			}
+			if (len(reader.boundsIDs) != 0) != tc.bounds {
+				t.Fatalf("bounds: %v", reader.boundsIDs)
+			}
 			if tc.status != 200 {
 				if len(reader.queries) != 0 {
 					t.Fatal("invalid range queried reader")
@@ -122,9 +130,6 @@ func TestQueryBoundaries(t *testing.T) {
 			}
 			if len(reader.queries) != 1 || reader.queries[0].SandboxID != "exact-sandbox" || reader.queries[0].Start.Unix() != tc.start || reader.queries[0].End.Unix() != tc.end {
 				t.Fatalf("queries: %+v", reader.queries)
-			}
-			if (len(reader.boundsIDs) != 0) != tc.bounds {
-				t.Fatalf("bounds: %v", reader.boundsIDs)
 			}
 		})
 	}

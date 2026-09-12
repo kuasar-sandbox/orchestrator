@@ -242,8 +242,14 @@ telemetry:
 ```
 
 The adapter writes standard Snappy/protobuf remote-write v1 to
-`<endpoint>/api/v1/write` and reads bounded raw SAMPLES windows from
-`<endpoint>/api/v1/read`, then applies the same field-wise MAX behavior. The
+`<endpoint>/api/v1/write` and negotiates `STREAMED_XOR_CHUNKS` from
+`<endpoint>/api/v1/read`, then applies the same field-wise MAX behavior. Each
+history-boundary lookup and data query uses one request, including empty or sparse
+long-retention histories. Frames are checksum-verified and limited to 32 MiB;
+only one frame is retained at a time, with a 10s HTTP deadline covering the body.
+Complete edge chunks are filtered to the exact inclusive sample range. A backend
+that only supports `SAMPLES` can fall back to a single Snappy response, with both
+compressed and decoded sizes capped at 32 MiB; use streaming for larger histories. The
 backend must enable both APIs and accept Prometheus 3 UTF-8 metric/label names;
 a query-only server or write-only exporter is not sufficient. Remote read
 preserves exact observations instead of PromQL lookback/step interpolation. See
@@ -330,7 +336,11 @@ Bounds are inclusive. A bucket timestamp may precede an unaligned start while
 its contributing samples still satisfy the requested bounds. Neither averaging
 nor last-sample selection is used. Only complete resource buckets produce an
 E2B object; missing fields are not fabricated as zero. Legal empty history/ranges
-return `[]`. Invalid/repeated boundaries or reversed ranges return 400. Reader
+return `[]`. Invalid/repeated boundaries or reversed ranges return 400. As in
+[E2B's range resolution](https://github.com/e2b-dev/infra/blob/87968fc1e1fa57d896378249ae14d09916382d75/packages/api/internal/clusters/resources_local.go),
+validation follows omitted-boundary resolution: start-only after the last retained
+sample, or end-only before the first, returns 400 when history exists. Supplying
+both boundaries for a valid nonoverlapping range returns `[]`. Reader
 failure returns sanitized 503. There is no interpolation, zero filling or Wake.
 Queries have a 15s context budget, eight concurrent readers and 100,000 output
 buckets maximum; exceeding query capacity returns 503 with Retry-After.
@@ -375,12 +385,17 @@ GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
 TELEMETRY_CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 GOWORK=off go test ./internal/telemetry -run TestClickHouseIntegration -count=1
+TELEMETRY_PROMETHEUS_TEST_URL=http://127.0.0.1:9090 GOWORK=off go test ./internal/telemetry -run TestPrometheusIntegration -count=1
 make test vet build
 make test-e2e # assembled project BIN and real KVM host required
 ```
 
-The optional live ClickHouse test creates/drops only a unique test table; use a
-disposable endpoint. Density benchmarks measure real 5s periods for 1k/10k/50k
+Use disposable endpoints for optional live-engine tests. The ClickHouse test
+creates/drops only a unique test table. The Prometheus test writes a uniquely
+named sandbox series (removed by backend retention), requires remote write and
+an out-of-order window of at least 5m, and verifies streaming, UTF-8 labels,
+duplicate/out-of-order samples, field MAX and exact time bounds. Density
+benchmarks measure real 5s periods for 1k/10k/50k
 synthetic targets, scrape counts, peak goroutines/FDs (including fixture server),
 allocations, TSDB batch writes and local query cost. Receiver and TSDB benchmarks
 are separate diagnostics, not a claim of end-to-end production capacity. Timing
