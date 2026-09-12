@@ -32,6 +32,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
+. "$SCRIPT_DIR/lib/telemetry.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -473,7 +474,7 @@ dp() {
 }
 dump_logs() {
     local log
-    for log in "$WORK"/orch*.log "$WORK"/proxy*.log; do
+    for log in "$WORK"/orch*.log "$WORK"/proxy*.log "$WORK"/telemetry.log; do
         [ -f "$log" ] || continue
         echo "==> $(basename "$log"):"
         sed 's/^/  /' "$log"
@@ -552,7 +553,9 @@ ip netns add "$SW_NETNS" 2>/dev/null || true
 "$BIN/connector-ctl" vswitch start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 --mode=tap \
     --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
-    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
+    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT \
+    --mgmt-service=$MGMT_VIP:4317:$PROXY_NS_IP:4317 \
+    --mgmt-service=$MGMT_VIP:4318:$PROXY_NS_IP:4318 >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
 SW_STARTED=1
 ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
     || fail "configure management VIP on ${SWITCH}m0"
@@ -877,6 +880,7 @@ sys.stdout.write("\nOUTPUT_END\n")
 PY
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
+run_telemetry_guest_probe
 ok=""
 for _ in $(seq 1 20); do
     code=$(dp "49983-$SID" /health "$ENVD_TOKEN")
@@ -1070,6 +1074,7 @@ echo "==> PASS: real sandbox-ctl CONNECT through the Proxy verified stdin/stdout
 echo "==> pause $SID, then reuse the same exec KAT through the Proxy"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
+    telemetry_paused_restart_probe
     exec_argv_denied_through_proxy "$SID" "$EXEC_TOKEN"
     wait_traffic_stats "$SID" paused \
         || { dump_logs; fail "condition-denied Proxy exec changed paused state or traffic"; }

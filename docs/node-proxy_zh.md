@@ -25,6 +25,12 @@ node proxy worker
 
 ### 1.1 设计原则
 
+Sandbox metric 采集/历史由独立 [Telemetry 组件](telemetry_zh.md) 负责，不是 Proxy
+traffic counter 或 MMDS。Telemetry 复用 management namespace/packet path 和 MMDS
+FloatingIP lookup 规则，但在自身 listener 直接接收 guest OTLP。不要把 OTLP 经应用
+data proxy 转发；Conductor metrics query 使用 live telemetry registration 的独立
+API UDS，不使用 Proxy StatsSocket。
+
 - **转发层与控制面分离**:proxy 只做路由判定、鉴权和字节转发;沙箱生命周期权威在
   conductor。
 - **单订阅 master,多 worker 数据面**:只有 proxy master 注册

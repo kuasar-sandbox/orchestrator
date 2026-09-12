@@ -2,10 +2,11 @@
 //
 //	node-ctl conductor serve --config <conductor.yaml>          # run the node conductor
 //	node-ctl proxy serve --config <proxy.yaml>                  # independent data-plane Proxy master
+//	node-ctl telemetry serve --config <telemetry.yaml>          # independent sandbox metrics Collector
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	                                                                    # in-unit launchers (not for humans)
-//	node-ctl config <conductor|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
+//	node-ctl config <conductor|proxy|telemetry> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain>                      # node reservation controller inspection (hosted in serve via resource_listen)
@@ -59,6 +60,8 @@ func main() {
 		err = conductorCmd(os.Args[2:], log)
 	case "proxy":
 		err = proxyCmd(os.Args[2:], log)
+	case "telemetry":
+		err = telemetryCmd(os.Args[2:], log)
 	case "run-sandbox":
 		err = runSandbox(os.Args[2:], log)
 	case "run-builder":
@@ -87,7 +90,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|builder|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|builder|version} [args]")
 	os.Exit(2)
 }
 

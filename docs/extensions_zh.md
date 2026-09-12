@@ -4,9 +4,9 @@
 
 Create 身份在 Hook 前已选定，`SandboxOperation.SandboxID` 不可变；把 `kuasar-sandbox.identity` 重新加入已清理的可变 metadata 会被拒绝。完整契约见 [Node Create 身份](node_zh.md#412-create-身份)。
 
-Conductor 和独立 Proxy 支持静态链接的运行期扩展，使部署能在进程内集成而不必长期维护 fork。扩展是编入 xconductor 或 xproxy 的受信代码，共享 core 的地址空间、UID、生命周期、文件系统及网络权限。API 组织 ownership 与并发，不构成安全沙箱。
+Conductor、独立 Proxy 和 Telemetry 支持静态链接的运行期扩展，使部署能在进程内集成而不必长期维护 fork。扩展是编入 xconductor、xproxy 或 xtelemetry 的受信代码，共享 core 的地址空间、UID、生命周期、文件系统及网络权限。API 组织 ownership 与并发，不构成安全沙箱。
 
-每个 Conductor/Proxy master 进程持有一个扩展对象，每个 Proxy worker epoch 新建一个对象。框架不在运行期发现或加载插件，不维护扩展 registry，不设 priority、DI container 或 URL namespace。私有项目可在各角色单一对象后自行组合模块。
+每个 Conductor/Telemetry/Proxy master 进程持有一个扩展对象，每个 Proxy worker epoch 新建一个对象。框架不在运行期发现或加载插件，不维护扩展 registry，不设 priority、DI container 或 URL namespace。私有项目可在各角色单一对象后自行组合模块。
 
 ## 组件 bootstrap 与进程内材料
 
@@ -255,6 +255,81 @@ Core 固定最低 TLS 1.2 与 `h2`/`http/1.1` ALPN。
 `Hooks.BindRuntime` 为 `(context.Context, Process, *Runtime) error`,如上例。
 映射与传输清理统一见 [Proxy worker 生命周期](node-proxy_zh.md#91-worker-生命周期与传输取消);
 下述 source、Hook 与 wrapper 接口不构成另一套数据面实现。
+
+### Telemetry bootstrap 与扩展
+
+唯一操作入口为 `node-ctl telemetry serve --config telemetry.yaml`。
+`config.LoadTelemetry`/`DecodeTelemetry` 返回 `*config.Telemetry`，沿用有界 strict YAML
+decode 和一次默认化。省略的 external endpoint 可由 Configure 提供；显式非法值在
+decode 阶段就失败。`ValidateTelemetryFinal` 校验完整声明，不重新套用默认值。`Clone`
+深拷贝 pointer/map/exporter 声明。`node-ctl config telemetry` 只诊断声明和 executable
+metadata，不运行 extension 或 material provider。
+
+`paths.telemetry_executable` 为空使用内置组件；否则 node-ctl 校验并打开受保护静态
+executable，把 file identity 放入已有 sealed memfd bootstrap，并原地 exec 同一已校验
+文件。Component/role 为 `telemetry`，不是 Proxy master/worker。直接执行、无效/缺失
+bootstrap、executable identity 不匹配和不安全 runtime owner 均 fail closed。Config bytes
+不进入 argv/environment。Custom App 将当前 executable 与 bootstrap 对比，保留不可变
+dispatch path；Hook 不能把它重定向到另一个 executable。
+
+```go
+app := telemetry.New(telemetry.Hooks{
+    Configure: func(ctx context.Context, cfg *telemetry.Config, rt *telemetry.Runtime) error {
+        rt.Extension = myExtension
+        // 可选绑定 rt.Storage、rt.StorageHeaders、rt.ExporterHeaders。
+        return nil
+    },
+})
+err := app.Run() // RunContext(ctx) 使用显式父生命周期。
+```
+
+New 无副作用，App 只能运行一次。Configure 是唯一 startup hook，早于 store/listener/
+receiver 副作用。Core 冻结 config，解析 authoritative material provider、最终校验，
+然后打开 primary storage，启动 extension、Collector、query listener、Plugin subscriber。
+`Runtime` 拒绝 JSON 序列化/反序列化，包含进程内 Logger、Extension、Storage、StorageHeaders、
+ExporterHeaders 及可选 advanced Collector binding。私有协议也不要序列化 Runtime，
+Hook 返回后不要保留并修改 Configure 的声明。
+
+`app/telemetry/extension` 是普通 provider-neutral 叶包：
+
+| Binding | 契约 |
+|---|---|
+| `Extension.Start(ctx, Host)` / `Shutdown(ctx)` | 每进程一个对象。Start 早于 ingress；Start 失败也执行 Shutdown。保留工作属于传入 context，必须随取消停止 |
+| `Host.Reader()` | 选定主存储的 Reader；forwarding-only 为 nil；不提供 lifecycle、raw RouteEntry、secret 或 receiver handle |
+| `Reader.Bounds(ctx, SandboxID)` | 精确 sandbox 的首末保留观测、found/error；不 fallback StableID |
+| `Reader.Query(ctx, Query)` | Query 包含精确 SandboxID、Start/End/Step；返回 Field/Point 观测，可为 raw 或按 epoch 对齐桶各字段独立 MAX |
+| `Storage` | Reader 加 `Write(ctx, []Sample)` 与 Shutdown；canonical Sample 包含 metric、labels、timestamp、value。Core 仅由 Collector exporter 调用 Write |
+| `HealthReporter.Errors()` | 可选不可恢复后台错误 channel；收到报告或 channel 关闭时撤销查询可用性并停止组件 |
+
+`Runtime.Storage` 是接收 context 和独立 storage 声明副本的 factory，只与
+`storage.type: custom` 配对。错误或 nil 结果不回退 local。如果构造返回已拥有的 backend
+同时返回 error，core 仍关闭该 backend。`Runtime.StorageHeaders(ctx)` 为内建
+Prometheus/ClickHouse primary 替换整个 credential map；`Runtime.ExporterHeaders(ctx, name)`
+为每个配置的 OTLP/HTTP extra exporter 做相同替换。空 map 也 authoritative，provider
+错误不使用旧 YAML 凭据，返回 map 会被复制。Custom storage 自己管理其他私有材料。
+
+普通 extension 契约不导入 OTel 类型。只有 advanced integration 使用
+`app/telemetry/otel`：`Components.Processors`/`Components.Exporters` 接收实际 Collector
+factory，以及可选的 fresh default component config Configure callback。Core 校验配置，
+拒绝重复/reserved type。它是明确有序的启动列表，不是 runtime discovery 或 DI；不暴露
+core receiver 替换或新 routing/identity authority。私有 component 使用本次构建选定的
+Collector 版本，不承诺跨版本 binary plugin ABI。
+
+定制 processor 保留私有 ingress context，不能把不同 sandbox identity 合并到同一个
+resource；它们位于初始 enrichment 与最终 current-route identity guard 之间。Context
+丢失/过期 fail closed；进入 storage/exporter 前，guest 或 custom 提供的
+`sandbox.id`/`sandbox.stable_id` 被覆盖，RunID 属性被移除。不支持丢弃 context 或混合
+不同身份的 asynchronous processor；有界 queue 应放在 final guard 后的 exporter。
+Extra exporter 只写，不开启 E2B query。Custom primary 必须同时实现 read/write，
+坚持精确 SandboxID、遵守 cancellation/bounds、返回缺失观测而非编造零值。这是受信
+进程内 API，不是对恶意静态链接代码的安全沙箱。
+
+关闭时先撤销 Plugin lease、drain query/ingress，再依次关闭 Collector、Extension、
+primary storage；每步 cleanup 都有有界 context。Extension 在 Shutdown 后不能继续使用
+Reader。Core identity、Collector-only primary write、SandboxID lookup 和 no-Wake 规则
+不可配置。完整默认值、storage/network/query 契约由 [Telemetry](telemetry_zh.md) 维护；
+可构建 [custom telemetry 示例](../examples/custom-telemetry/README_zh.md) 将普通 lifecycle/
+material 代码与 advanced Collector 代码分开。
 
 ## Conductor 对象源
 
@@ -525,8 +600,8 @@ Worker IngressWrapper 只在 Proxy data_listen 可达。Conductor 公共 listene
 
 ## 边界
 
-Conductor、Proxy master 或 worker 扩展为 nil 时保留内置启动与请求行为，不创建 event hub、watcher goroutine、lifecycle callback 或 wrapper。Cluster router、registry、placer 没有扩展对象；节点本地 Hook 和观察不改变 node-link ACK、exact replay、幂等或 stable SandboxID → NodeSandboxID 的权威关系。
+Conductor、Telemetry、Proxy master 或 worker 扩展为 nil 时保留内置启动与请求行为，不创建 event hub、watcher goroutine、lifecycle callback 或 wrapper。Cluster router、registry、placer 没有扩展对象；节点本地 Hook 和观察不改变 node-link ACK、exact replay、幂等或 stable SandboxID → NodeSandboxID 的权威关系。
 
 此 API 没有 namespace、固定 extension URI、动态加载、热更新或 component compatibility version。WebSocket 属于共享 core transport，不增加扩展专用 API。
 
-可构建程序见 [`examples/custom-conductor`](../examples/custom-conductor) 与 [`examples/custom-proxy`](../examples/custom-proxy)。
+可构建程序见 [`examples/custom-conductor`](../examples/custom-conductor)、[`examples/custom-proxy`](../examples/custom-proxy) 与 [`examples/custom-telemetry`](../examples/custom-telemetry)。

@@ -186,11 +186,13 @@ package_release() {
     "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
   copy_file deploy/node-ctl.service deploy/node-ctl.service
   copy_file deploy/node-proxy.service deploy/node-proxy.service
+  copy_file deploy/node-telemetry.service deploy/node-telemetry.service
   copy_file deploy/cluster-registry.service deploy/cluster-registry.service
   copy_file deploy/cluster-router.service deploy/cluster-router.service
   copy_file deploy/cluster-placer.service deploy/cluster-placer.service
   copy_file deploy/conductor.example.yaml deploy/conductor.example.yaml
   copy_file deploy/proxy.example.yaml deploy/proxy.example.yaml
+  copy_file deploy/telemetry.example.yaml deploy/telemetry.example.yaml
   copy_file deploy/registry.example.yaml deploy/registry.example.yaml
   copy_file deploy/router.example.yaml deploy/router.example.yaml
   copy_file deploy/placer.example.yaml deploy/placer.example.yaml

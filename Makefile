@@ -1,6 +1,6 @@
 # orchestrator — node orchestration, e2b-compatible control plane, independent
 # sandbox data Proxy, and node-level resource control. The node-ctl executable
-# provides the separately deployed conductor and Proxy roles.
+# provides the separately deployed conductor, Proxy, and telemetry roles.
 #
 # node-ctl, cluster-ctl, node-stub-ctl, and e2b-key-ctl are pure-Go binaries
 # (CGO_ENABLED=0). Guest runtime images are built by the guest-runtime repo.
@@ -54,7 +54,7 @@ e2b-key-ctl:
 	$(call link_bin,e2b-key-ctl)
 
 # node-ctl: the node executable — e2b-compatible conductor (serve), independent
-# data plane (proxy), sandbox/build runners, and node resource controller.
+# data plane (proxy), telemetry, sandbox/build runners, and resource controller.
 node-ctl:
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/node-ctl ./cmd/node-ctl
@@ -118,7 +118,7 @@ test-release:
 
 help:
 	@echo "orchestrator. Targets:"
-	@echo "  build / node-ctl           build the conductor, Proxy, runners, and resource controller"
+	@echo "  build / node-ctl           build conductor, Proxy, telemetry, runners, and resource controller"
 	@echo "  cluster-ctl                build registry/router/placer control plane"
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
