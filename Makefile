@@ -92,7 +92,7 @@ clean:
 
 # Orchestrator owns both its self-contained cluster stub and the full node,
 # proxy, builder, and cluster integration cases. The latter use the assembled
-# platform binary set supplied by the platform BMS.
+# platform binary set supplied by Integration E2E.
 test-e2e:
 	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" bash test/e2e/run_all.sh
 

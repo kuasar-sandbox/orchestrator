@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run source regressions on the exact orchestrator module assembled by BMS.
+# Run source regressions on the exact orchestrator module assembled by CI.
 # Binary-only packages exercise native identities through the owner lifecycle cases.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
