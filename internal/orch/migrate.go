@@ -209,36 +209,28 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	o.log.Info("export won source finalization", "sid", sid, "export_kind", exportKind, "keep_source", keepSource)
 
 	if keepSource {
-		if localArtifactDir != "" {
-			changed, err := o.st.ReplacePausedResumeSource(finalizeCtx, sid, attempt.source, artifact)
-			if err != nil {
-				return "", fmt.Errorf("export-sandbox: persist promoted artifact source for %s: %w", sid, err)
-			}
-			if !changed {
-				return "", exportPreemptedError(sid)
-			}
-			current.ResumeSource = artifact
-			o.cache(current)
-			o.publishUpsert(current)
-			o.observeSandboxUpsert(current)
-		}
-	} else {
-		cleanupCtx, cancelCleanup := cleanupContext()
-		cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current, false)
-		cancelCleanup()
-		if cleanupErr != nil {
-			return "", fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
-		}
-		if err := o.st.Delete(finalizeCtx, sid); err != nil {
-			o.cache(current)
-			return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
-		}
-		o.releaseDetachedPortFence(current.VswitchPort)
-		o.uncache(sid)
-		o.clearDeadlineIntent(sid)
-		o.publishDelete(sid)
-		o.observeSandboxDelete(current)
+		// Retain the source unchanged: keep-source produces an export result
+		// (template id or KMT token) but does not modify the source sandbox's
+		// ResumeSource, row, cache, or route, and does not remove its
+		// checkpoint. The source resumes from exactly where it would have
+		// resumed without the export (#336).
+		return result, nil
 	}
+	cleanupCtx, cancelCleanup := cleanupContext()
+	cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current, false)
+	cancelCleanup()
+	if cleanupErr != nil {
+		return "", fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
+	}
+	if err := o.st.Delete(finalizeCtx, sid); err != nil {
+		o.cache(current)
+		return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
+	}
+	o.releaseDetachedPortFence(current.VswitchPort)
+	o.uncache(sid)
+	o.clearDeadlineIntent(sid)
+	o.publishDelete(sid)
+	o.observeSandboxDelete(current)
 	if localArtifactDir != "" {
 		if err := os.RemoveAll(localArtifactDir); err != nil {
 			o.log.Warn("export-sandbox: remove finalized local artifact", "sid", sid, "path", localArtifactDir, "err", err)

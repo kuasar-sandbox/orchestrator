@@ -585,7 +585,7 @@ func TestMintSandboxTokenRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
 	}
 }
 
-func TestExportPromotesLocalSandboxAndSnapshotState(t *testing.T) {
+func TestExportKeepSourceProducesPortableResultWithoutChangingSource(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		sourceKind   types.ResumeSourceKind
@@ -632,24 +632,24 @@ func TestExportPromotesLocalSandboxAndSnapshotState(t *testing.T) {
 				strings.Contains(string(args), "upload-snapshot") {
 				t.Fatalf("publication argv = %q", args)
 			}
-			wantSource := types.ResumeSource{Kind: test.sourceKind, Ref: mref}
+			// The export produces a portable result but leaves the source
+			// unchanged: original local ResumeSource, no upsert event,
+			// checkpoint retained (#336).
+			wantSource := types.ResumeSource{Kind: test.sourceKind, Ref: localRef}
 			stored, err := o.st.Get(ctx, sid)
-			if err != nil || stored == nil || stored.ResumeSource != wantSource {
-				t.Fatalf("stored resume source was not promoted: %+v, %v", stored, err)
+			if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != wantSource {
+				t.Fatalf("stored source changed by keep-source export: %+v, %v", stored, err)
 			}
 			if cached := o.lookup(sid); cached == nil || cached.ResumeSource != wantSource {
-				t.Fatal("cached resume source was not promoted")
+				t.Fatal("cached source changed by keep-source export")
 			}
 			select {
 			case ev := <-events:
-				if ev.Kind != "upsert" || ev.Route.ArtifactLocation != "remote" {
-					t.Fatal("promote published the wrong route event")
-				}
+				t.Fatalf("keep-source export published an unexpected route event: %+v", ev)
 			default:
-				t.Fatal("promote did not publish a remote upsert")
 			}
-			if _, err := os.Stat(filepath.Dir(localRef)); !os.IsNotExist(err) {
-				t.Fatalf("redundant local artifact directory still exists: %v", err)
+			if _, err := os.Stat(localRef); err != nil {
+				t.Fatalf("keep-source removed the local artifact: %v", err)
 			}
 		})
 	}
@@ -816,7 +816,11 @@ func mustRefLocationURI(t *testing.T, cfg *config.Config, name string) string {
 	return uri
 }
 
-func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
+// TestExportKeepSourceSucceedsWithoutSourceWrites proves that a keep-source
+// export performs no UPDATE or DELETE on the source row — even when those
+// operations are forbidden, the export still succeeds and the source is
+// bit-for-bit unchanged (#336).
+func TestExportKeepSourceSucceedsWithoutSourceWrites(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
 	cfg := &config.Config{}
@@ -835,26 +839,29 @@ func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_resume_source BEFORE UPDATE OF resume_source_kind, resume_source_ref ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced resume source failure'); END`)
+	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_source_update BEFORE UPDATE ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced source update failure'); END`)
+	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_source_delete BEFORE DELETE ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced source delete failure'); END`)
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil || !strings.Contains(err.Error(), "persist promoted artifact source") {
-		t.Fatalf("export error = %v; want persisted-ref failure", err)
+	templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	if err != nil || templateID == "" {
+		t.Fatalf("keep-source export should succeed without source writes: %q, %v", templateID, err)
 	}
 	stored, err := o.st.Get(ctx, sid)
-	if err != nil || stored == nil || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
-		t.Fatalf("stored snapshot changed after failure: %v", err)
+	if err != nil || stored == nil || stored.State != types.StatePaused ||
+		stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
+		t.Fatalf("stored source changed: %+v, %v", stored, err)
 	}
 	if cached := o.lookup(sid); cached == nil || cached.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
-		t.Fatal("cached snapshot changed after failure")
+		t.Fatal("cached source changed")
 	}
 	if _, err := os.Stat(localRef); err != nil {
-		t.Fatalf("local snapshot removed after failed store update: %v", err)
+		t.Fatalf("local snapshot removed: %v", err)
 	}
 	select {
 	case <-events:
-		t.Fatal("unexpected route event after failed store update")
+		t.Fatal("unexpected route event after keep-source export")
 	default:
 	}
 }
