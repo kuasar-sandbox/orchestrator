@@ -595,6 +595,15 @@ func TestClusterDeleteHookCommitsDeletingBeforeACK(t *testing.T) {
 	if ack.Status != routesync.AckAccepted || calls.Load() != 1 {
 		t.Fatalf("cluster Delete ACK/calls = %+v/%d", ack, calls.Load())
 	}
+	// ACK must already have a durable deleting owner; do not wait for the
+	// asynchronous finalizer to establish the acceptance condition.
+	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.State != types.StateDeleting {
+		t.Fatal("cluster Delete ACK returned without a durable deleting owner")
+	}
 	select {
 	case <-cleanupReached:
 	case <-time.After(2 * time.Second):
