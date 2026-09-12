@@ -29,9 +29,10 @@
 #                                Captures are real local bundles and are restored
 #                                before teardown.
 #   portable working set      -> restore local B, capture W -> local B, remove
-#                                B's merged disk top, explicitly export/promote
-#                                W, then restore the portable W with self-only
-#                                memory prefetch.
+#                                B's merged disk top, export W --keep-source,
+#                                then resume W from its retained local
+#                                checkpoint while the KMT import restores the
+#                                portable W with self-only memory prefetch.
 #   DELETE                    -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
@@ -671,21 +672,22 @@ if want == "restore" and not (".snapshot" in selected or selected.startswith("ma
 PY
 }
 
-assert_run_from_value() { # $1=index, $2=sid, $3=expected --from value
-    python3 - "$RUN_ARGV_LOG" "$1" "$2" "$3" <<'PY'
+assert_run_option_value() { # $1=index, $2=sid, $3=option name, $4=expected value
+    python3 - "$RUN_ARGV_LOG" "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 index = int(sys.argv[2])
 if index >= len(calls):
     raise SystemExit(f"missing run call {index}; captured {len(calls)}")
 call = calls[index]
+name = sys.argv[3]
 for i, arg in enumerate(call):
-    if arg == "--from":
-        if call[i + 1] != sys.argv[3]:
-            raise SystemExit(f"run --from={call[i + 1]!r}, want {sys.argv[3]!r}")
+    if arg == name:
+        if call[i + 1] != sys.argv[4]:
+            raise SystemExit(f"run {name}={call[i + 1]!r}, want {sys.argv[4]!r}")
         break
 else:
-    raise SystemExit(f"run call has no --from: {call!r}")
+    raise SystemExit(f"run call has no {name}: {call!r}")
 PY
 }
 
@@ -2238,6 +2240,7 @@ wait_sandbox_state "$SID" paused 20 \
 wait_proxy_traffic_stats "$SID" paused \
     || fail "condition-denied direct exec changed paused traffic accounting"
 RESUME_MARK="PORTABLE_W_RESUME_$RANDOM"
+W_RESUME_RUN_CALL=$(run_argv_count)
 exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
 resumed=""
 for _ in $(seq 1 90); do
@@ -2269,10 +2272,21 @@ grep -q "$W_DISK_PERSIST" "$WORK/portable-disk-read.out" \
     || { sed 's/^/  guest| /' "$WORK/portable-disk-read.out"; fail "retained W lost merged W-only disk state"; }
 W_RESUME_RUN_ID=$(sandbox_run_id "$SID")
 [ -n "$W_RESUME_RUN_ID" ] || fail "retained W resume runner id is empty"
+# The runner must restore from the retained local checkpoint — the same ref the
+# source row kept — and never from the manifest store. A local artifact stream
+# does not expose the prefetch capability, so accept either backend=file
+# prefetch log variant (started or skipped).
+assert_run_source_mode "$W_RESUME_RUN_CALL" "$SID" restore \
+    || fail "retained W resume did not execute run --restore"
+assert_run_option_value "$W_RESUME_RUN_CALL" "$SID" "--restore" "$W_PORTABLE_LOCAL" \
+    || fail "retained W resume did not select the retained local checkpoint"
 W_RESUME_UNIT="${RUNNER_PREFIX}$W_RESUME_RUN_ID.service"
+# The prefetch identity ("backend=file parent_layers=N") is emitted whether or
+# not the local stream exposes the prefetch capability; vhost disk stats also
+# log "backend=...", so anchor on parent_layers to match the memory line only.
 wait_unit_journal_contains "$W_RESUME_UNIT" \
-    "memory prefetch started backend=file" "$WORK/keep-source-w.journal" \
-    || { tail -40 "$WORK/keep-source-w.journal" | sed 's/^/  unit| /'; fail "retained W resume did not restore from the local checkpoint"; }
+    "backend=file parent_layers=" "$WORK/keep-source-w.journal" \
+    || { tail -40 "$WORK/keep-source-w.journal" | sed 's/^/  unit| /'; fail "retained W resume did not use the local checkpoint as its memory backend"; }
 MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/keep-source-w.journal" || true)
 [ "$MANIFEST_PREFETCH_COUNT" = "0" ] || fail "retained W resume prefetched $MANIFEST_PREFETCH_COUNT layer(s) from the manifest store, want local-only"
 echo "==> PASS: keep-source W resumed envd-managed PID/listener from its retained local checkpoint (frozen delta=$FREEZE_DELTA_W); manifest store untouched"
@@ -2827,7 +2841,7 @@ exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_E_WAKE_$RANDOM"
 wait_sandbox_state "$SID" running 1200 || fail "retained Bundle Sandbox E did not cold Wake"
 assert_run_source_mode "$E_BUNDLE_RUN_CALL" "$SID" from \
     || fail "Bundle Sandbox E Wake did not execute run --from"
-assert_run_from_value "$E_BUNDLE_RUN_CALL" "$SID" "$E_BUNDLE_LOCAL" \
+assert_run_option_value "$E_BUNDLE_RUN_CALL" "$SID" "--from" "$E_BUNDLE_LOCAL" \
     || fail "Bundle Sandbox E Wake did not select the retained local checkpoint"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-read.out" 2>&1 || true
@@ -2851,7 +2865,7 @@ exec_through_connect "$SID" "$E_KMT_EXEC_TOKEN" "BUNDLE_E_KMT_$RANDOM"
 wait_sandbox_state "$SID" running 1200 || fail "imported Bundle E did not cold restore from the Store"
 assert_run_source_mode "$E_KMT_RUN_CALL" "$SID" from \
     || fail "imported Bundle E did not execute run --from"
-assert_run_from_value "$E_KMT_RUN_CALL" "$SID" "$E_BUNDLE_REMOTE_REF" \
+assert_run_option_value "$E_KMT_RUN_CALL" "$SID" "--from" "$E_BUNDLE_REMOTE_REF" \
     || fail "imported Bundle E did not select the published Store root"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-kmt-read.out" 2>&1 || true
