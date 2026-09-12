@@ -15,7 +15,7 @@ import (
 )
 
 // configCmd implements `node-ctl config <role>` — a per-role config diagnose +
-// generate tool (role ∈ {conductor, proxy}; cluster-ctl has its own registry/router/
+// generate tool (role ∈ {conductor, proxy, telemetry}; cluster-ctl has its own registry/router/
 // placer). The role disambiguates the schema, so the skeleton + validation are
 // role-specific:
 //
@@ -25,7 +25,7 @@ import (
 //	  [-o <file>]                                        # write to file (default stdout)
 func configCmd(args []string, _ *slog.Logger) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: node-ctl config <conductor|proxy> [--template | --config <f> [--resolve]] [-o <f>]")
+		return fmt.Errorf("usage: node-ctl config <conductor|proxy|telemetry> [--template | --config <f> [--resolve]] [-o <f>]")
 	}
 	role := args[0]
 	fs := flag.NewFlagSet("config "+role, flag.ExitOnError)
@@ -44,8 +44,10 @@ func configCmd(args []string, _ *slog.Logger) error {
 		output, err = renderConductorConfig(*template, *resolve, *cfgPath)
 	case "proxy":
 		output, err = renderProxyConfig(*template, *cfgPath)
+	case "telemetry":
+		output, err = renderTelemetryConfig(*template, *cfgPath)
 	default:
-		return fmt.Errorf("config: unknown role %q (conductor|proxy)", role)
+		return fmt.Errorf("config: unknown role %q (conductor|proxy|telemetry)", role)
 	}
 	if err != nil {
 		return err

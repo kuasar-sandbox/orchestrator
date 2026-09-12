@@ -99,7 +99,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	if err != nil {
 		return err
 	}
-	apiHandler := newAPIHandler(cfg, core, logger)
+	apiHandler := newAPIHandler(cfg, core, logger, plugins.TelemetryAPI())
 	if startedExtension != nil && startedExtension.api != nil {
 		apiHandler, err = wrapExtensionAPI(startedExtension.api, apiHandler)
 		if err != nil {
@@ -248,7 +248,7 @@ func wrapExtensionAPI(wrapper conductorextension.APIWrapper, next http.Handler) 
 	return wrapped, nil
 }
 
-func newAPIHandler(cfg *publicconfig.Conductor, core api.Core, logger *slog.Logger) http.Handler {
+func newAPIHandler(cfg *publicconfig.Conductor, core api.Core, logger *slog.Logger, metricsProxy http.Handler) http.Handler {
 	diskMB := 0
 	if info, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
 		diskMB = int(info.Size() >> 20)
@@ -257,5 +257,5 @@ func newAPIHandler(cfg *publicconfig.Conductor, core api.Core, logger *slog.Logg
 		VCPU:     configresolve.SandboxResources(cfg.Sandbox.Resources).Capacity.CPU,
 		MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB,
 	}
-	return api.New(core, cfg.API.Domain, resources, logger).Handler()
+	return api.New(core, cfg.API.Domain, resources, logger).WithMetricsProxy(metricsProxy).Handler()
 }

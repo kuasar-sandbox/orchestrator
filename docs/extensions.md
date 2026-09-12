@@ -4,14 +4,14 @@
 
 Create identity is selected before the Hook. `SandboxOperation.SandboxID` stays immutable, and reintroducing `kuasar-sandbox.identity` into the cleaned mutable metadata is rejected. See [Sandbox identity on Create](node.md#412-create-identity).
 
-Kuasar's conductor and independent Proxy support statically linked runtime
+Kuasar's conductor, independent Proxy and Telemetry support statically linked runtime
 extensions for deployments that need process-local integration without carrying
-a long-lived fork. An extension is trusted code compiled into `xconductor` or
-`xproxy`. It shares the core process address space, UID, lifetime, filesystem,
+a long-lived fork. An extension is trusted code compiled into `xconductor`,
+`xproxy` or `xtelemetry`. It shares the core process address space, UID, lifetime, filesystem,
 and network capabilities. The API organizes ownership and concurrency; it is
 not a security sandbox.
 
-There is one extension object per conductor or Proxy master process,
+There is one extension object per conductor, Telemetry or Proxy master process,
 and one fresh object per Proxy worker epoch. The framework does not
 discover or load plugins at runtime, maintain an extension registry, assign
 priorities, provide a dependency-injection container, or reserve URL
@@ -123,6 +123,95 @@ Proxy's [public material types](../app/proxy/proxy.go) are deliberately differen
 `RoleMaster = "master"` and `RoleWorker = "worker"`. Certificate/signer matching, paired presence, empty-material TLS disablement and required verified client certificates with `ClientCAs` follow the same server-material constraints. Core retains minimum TLS 1.2 and `h2`/`http/1.1` ALPN. `Hooks.Configure` takes `(context.Context, *Config) error`; `Hooks.BindRuntime` takes `(context.Context, Process, *Runtime) error`, as shown above.
 
 Process-owned mapping and transport cleanup are defined once in the [Proxy worker lifetime contract](node-proxy.md#91-worker-lifetime-and-transport-cancellation). Public source, Hook and wrapper interfaces follow below; those are not another data-plane implementation.
+
+### Telemetry bootstrap and extension
+
+The only operator entry is `node-ctl telemetry serve --config telemetry.yaml`.
+`config.LoadTelemetry`/`DecodeTelemetry` return `*config.Telemetry`, using the
+same bounded strict YAML decode and once-only defaults. Omitted external
+endpoints may be supplied by Configure; malformed explicit values already fail
+decoding. `ValidateTelemetryFinal` validates complete declarations without
+reapplying defaults. `Clone` deep-copies pointers, maps and exporter declarations.
+`node-ctl config telemetry` only diagnoses declarations/executable metadata;
+it never runs an extension or material provider.
+
+Empty `paths.telemetry_executable` uses the built-in component. Otherwise
+node-ctl validates and opens the protected static executable, records its file
+identity in the existing sealed memfd bootstrap, and execs the same validated
+file in place. Component/role is `telemetry`, not Proxy master/worker. Direct
+execution, invalid/missing bootstrap, executable identity mismatch and unsafe
+runtime ownership fail closed. Config bytes are not placed in argv/environment.
+The custom App verifies the current executable against bootstrap and preserves
+the immutable dispatch path; no hook can redirect it to a different executable.
+
+```go
+app := telemetry.New(telemetry.Hooks{
+    Configure: func(ctx context.Context, cfg *telemetry.Config, rt *telemetry.Runtime) error {
+        rt.Extension = myExtension
+        // Optionally bind rt.Storage, rt.StorageHeaders, rt.ExporterHeaders.
+        return nil
+    },
+})
+err := app.Run() // RunContext(ctx) supports an explicit parent lifecycle.
+```
+
+New is side-effect-free; an App can run only once. Configure is the sole startup
+hook and runs before store/listener/receiver side effects. Core freezes config,
+resolves authoritative material providers, performs final validation, then opens
+primary storage and starts the extension, Collector, query listener and Plugin
+subscriber. `Runtime` rejects JSON serialization/deserialization and contains
+process-local Logger, Extension, Storage, StorageHeaders, ExporterHeaders and
+optional advanced Collector bindings. Never serialize it in a private protocol
+or retain/mutate Configure's declarations after the hook returns.
+
+`app/telemetry/extension` is the ordinary provider-neutral leaf surface:
+
+| Binding | Contract |
+|---|---|
+| `Extension.Start(ctx, Host)` / `Shutdown(ctx)` | One object per process. Start runs before ingress; Shutdown also runs after a failed Start. Retained work belongs to the supplied context and must stop on cancellation |
+| `Host.Reader()` | Selected primary Reader, or nil in forwarding-only mode; no lifecycle, raw RouteEntry, secret or receiver handle |
+| `Reader.Bounds(ctx, SandboxID)` | Exact sandbox's first/last retained observation plus found/error; never StableID fallback |
+| `Reader.Query(ctx, Query)` | Query contains exact SandboxID, Start/End/Step; returns typed Field/Point observations, raw or independently MAX-aggregated in epoch-aligned buckets |
+| `Storage` | Reader plus `Write(ctx, []Sample)` and Shutdown; canonical Sample contains metric, labels, timestamp and value. Core calls Write only from its Collector exporter |
+| `HealthReporter.Errors()` | Optional irrecoverable background-error channel; a report or closed channel revokes query availability and stops the component |
+
+`Runtime.Storage` is a factory receiving context and a copied storage declaration;
+bind it exactly with `storage.type: custom`. Errors/nil result do not fall back
+to local. If construction returns an owned backend plus an error, core still
+shuts it down. `Runtime.StorageHeaders(ctx)` replaces the entire credential map
+for a built-in Prometheus/ClickHouse primary. `Runtime.ExporterHeaders(ctx, name)`
+does the same for each configured OTLP/HTTP extra exporter. Empty maps are
+authoritative; provider errors never use stale YAML credentials. Returned maps
+are copied. Custom storage owns any other private material it requires.
+
+Ordinary extension contracts import no OTel types. Advanced integration alone
+uses `app/telemetry/otel`: `Components.Processors` and `Components.Exporters`
+accept actual Collector factories and optional Configure callbacks over fresh
+default component configs. Core validates configurations and rejects duplicate
+or reserved types. This is an explicit ordered startup list, not runtime
+discovery or DI. It deliberately exposes neither replacement core receivers nor
+custom routing/identity authority. A private component must use the Collector
+versions selected by this build; no cross-version binary plugin ABI is promised.
+
+Custom processors preserve the private ingress context, cannot merge different
+sandbox identities into one resource, and sit between initial enrichment and
+the final current-route identity guard. Context loss/staleness fails closed;
+guest or custom `sandbox.id`/`sandbox.stable_id` is overwritten before storage
+and exporters, and RunID attributes are excluded. Asynchronous processors that
+discard context or combine identities are unsupported. Use bounded queues in
+exporters after the final guard instead. An extra exporter is write-only and
+does not enable E2B queries. A custom primary must implement both read and write,
+preserve exact SandboxID, respect cancellation/bounds and return missing
+observations rather than fabricating zeros. This is a trusted in-process API,
+not a sandbox against deliberately malicious statically linked code.
+
+Shutdown first revokes the Plugin lease and drains query/ingress, then shuts
+down Collector, Extension and primary storage, in that order; each cleanup has
+a bounded context. Extensions may not keep using Reader after Shutdown. Core
+identity, Collector-only primary writes, SandboxID lookup and no-Wake rules are
+not configurable. Complete defaults/storage/network/query contracts live in
+[Telemetry](telemetry.md); the buildable [custom telemetry example](../examples/custom-telemetry/README.md)
+separates ordinary lifecycle/material code from advanced Collector code.
 
 ## Conductor object sources
 
@@ -556,7 +645,7 @@ before using the existing canonical cluster path.
 
 ## Boundaries
 
-A nil conductor, proxy-master, or proxy-worker extension preserves the built-in
+A nil conductor, telemetry, proxy-master, or proxy-worker extension preserves the built-in
 startup and request behavior: no event hub, watcher goroutine, lifecycle
 callback, or wrapper is created. Cluster router, registry, and placer do not
 have extension objects; node-local Hooks and observation do not change
@@ -567,5 +656,6 @@ This API has no namespace, fixed extension URI, dynamic loading, hot reload, or
 component compatibility version. WebSocket support belongs to the shared core
 transport and adds no extension-specific API.
 
-See [`examples/custom-conductor`](../examples/custom-conductor) and
-[`examples/custom-proxy`](../examples/custom-proxy) for buildable programs.
+See [`examples/custom-conductor`](../examples/custom-conductor),
+[`examples/custom-proxy`](../examples/custom-proxy) and
+[`examples/custom-telemetry`](../examples/custom-telemetry) for buildable programs.

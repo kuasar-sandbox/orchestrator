@@ -38,6 +38,7 @@ type Component string
 const (
 	ComponentConductor Component = "conductor"
 	ComponentProxy     Component = "proxy"
+	ComponentTelemetry Component = "telemetry"
 )
 
 // Role is the process role encoded by a top-level component bootstrap.
@@ -46,6 +47,7 @@ type Role string
 const (
 	RoleConductor Role = "conductor"
 	RoleMaster    Role = "master"
+	RoleTelemetry Role = "telemetry"
 )
 
 // Bootstrap is the verified, one-use component handoff. Config is the exact
@@ -371,7 +373,8 @@ func ClearEnvironment() {
 
 func validComponentRole(component Component, role Role) bool {
 	return (component == ComponentConductor && role == RoleConductor) ||
-		(component == ComponentProxy && role == RoleMaster)
+		(component == ComponentProxy && role == RoleMaster) ||
+		(component == ComponentTelemetry && role == RoleTelemetry)
 }
 
 func writeAll(w io.Writer, payload []byte) error {

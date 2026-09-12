@@ -23,6 +23,7 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	customTelemetryProcess()
 	switch os.Getenv(customProxyProcessMode) {
 	case "node-ctl":
 		_ = os.Setenv(customProxyProcessMode, "xproxy")

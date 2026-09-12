@@ -1,5 +1,5 @@
 // Package config defines the public declarative configuration for the node
-// conductor and independent proxy.
+// conductor, independent proxy, and telemetry component (telemetry.go).
 //
 // The YAML is grouped by concern: api / proxy / paths / units / sandbox (the
 // sandbox-instance defaults, sub-grouped resources/network/boot) / builder /

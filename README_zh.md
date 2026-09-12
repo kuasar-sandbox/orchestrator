@@ -15,6 +15,7 @@
 
 - **Conductor**:权威控制 API、Sandbox/Build 生命周期、本地路由、凭据管理与可选节点资源准入。
 - **Proxy**:唯一沙箱数据入口,负责 Envd、floating-IP 服务、native exec、MMDS 与 traffic observation。
+- **Telemetry**：独立 envd/OTLP 指标采集、可信沙箱身份、Collector pipeline、embedded TSDB 或 readable external storage、exporter 与 E2B 历史查询。
 - **Node link**:可选客户端,把节点接入集群控制面。
 - **Launch helpers**:systemd 管理的 Sandbox/Build runner。
 - **Administration**:资源状态/drain、模板构建状态、配置检查、manifest-key 管理与 Sandbox export/import。
@@ -46,6 +47,7 @@
 |---|---|
 | `node-ctl conductor serve` | 启动权威节点控制 API |
 | `node-ctl proxy serve` | 启动数据面 Proxy master/worker |
+| `node-ctl telemetry serve` | 启动沙箱指标采集与历史查询 |
 | `node-ctl run-sandbox` | 在受管 unit 中启动一个 Sandbox |
 | `node-ctl run-builder` | 启动一次模板构建执行 |
 | `node-ctl resource ...` | 检查或 drain 节点资源 reservation |
@@ -68,11 +70,12 @@
 
 | 路径 | 角色 |
 |---|---|
-| `cmd/node-ctl` | Conductor/Proxy serve、受管 run-sandbox/run-builder、resource status/list/drain、builder status、config、manifest-key、export/import 与 version |
+| `cmd/node-ctl` | Conductor/Proxy/Telemetry serve、受管 run-sandbox/run-builder、resource status/list/drain、builder status、config、manifest-key、export/import 与 version |
 | `cmd/cluster-ctl` | 独立 Registry/Router/Placer、config 与 version |
 | `cmd/node-stub-ctl` | node-link E2E 参与方,独立 admin/API/data listener、restart/reset、Sandbox/Build 状态与故障注入;不启动 microVM |
 | `cmd/e2b-key-ctl` | 无 DB/config 的 gen-key、derive-api-secret、gen-apikey、fingerprint、seal-pull-token |
-| `config`, `app/conductor`, `app/proxy` | 公共 declarative Config 与静态 custom App;sealed-memfd/原地 exec bootstrap、启动期 Config/Runtime Hook |
+| `config`, `app/conductor`, `app/proxy`, `app/telemetry` | 公共 declarative Config 与静态 custom App;sealed-memfd/原地 exec bootstrap、启动期 Config/Runtime Hook |
+| `internal/telemetry`, `internal/telemetryapp` | 可信 route/peer 身份、envd/OTLP Collector receiver、storage/exporter、E2B compatibility 与组件生命周期 |
 | `internal/orch` | 节点生命周期、Build pool、本地路由权威、单元生成与重启对账 |
 | `internal/nodectl` | reservation 准入、pool/水位/grant、inventory/StateSync 恢复与审计;不接管 Sandbox balloon/cgroup 闭环 |
 | `internal/nodelink` | Conductor–Registry 注册、心跳、事件与命令,帧化 JSON/h2c |
@@ -83,9 +86,10 @@
 | `internal/{apikey,secretbox,keys,regcreds}` | APISecret/API-key MAC、AES-GCM 根凭据存储、Forward/Exec kat1 与 data token、ManifestKey 封装的 image-pull 凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点/集群配置、SANDBOX_CONFIG 渲染与节点 SQLite Sandbox/Build/凭据对状态 |
 | `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2/exact route、worker-master 查询、HTTP-over-UDS service、Prometheus、systemd D-Bus、connector-ctl 适配与工具 |
-| `deploy/` | 各角色 example YAML 与 node/Proxy/Registry/Router/Placer systemd unit |
+| `deploy/` | 各角色 example YAML 与 node/Proxy/Telemetry/Registry/Router/Placer systemd unit |
 | `examples/custom-conductor` | 可编译 xconductor,由 node-ctl conductor serve 进入 |
 | `examples/custom-proxy` | 可编译 xproxy,由 node-ctl proxy serve 进入,master reexec worker |
+| `examples/custom-telemetry` | 可编译静态 telemetry App，演示普通扩展与窄 advanced Collector integration |
 
 <a id="构建"></a>
 ## 构建与测试
@@ -123,7 +127,9 @@ execute 和 MMDS 两个用例。
 
 ## 部署概览
 
-独立节点通常先启动 Conductor 再启动 Proxy;集群增加独立 Registry、Router、Placer。
+独立节点通常分别启动 Conductor、Proxy、Telemetry 服务。Telemetry 复用 Plugin Plane，
+不加入 Create/Resume barrier，其故障不改变 sandbox lifecycle。默认历史使用 embedded
+Prometheus TSDB，不依赖外部数据库；集群增加独立 Registry、Router、Placer。
 配置样例与 systemd unit 位于 `deploy/`。面向用户的发布件安装流程见项目
 [快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)。
 生产部署应使用持久存储、生产 TLS、受保护凭据、明确网络策略及基于实际 workload 验证的容量设置。
@@ -138,6 +144,7 @@ execute 和 MMDS 两个用例。
 ```bash
 node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 ```
 
 样例明文 API 为 `:3000`,data 为 `:3443`。配置可启用 resource_listen 与 Proxy traffic.max_inflight 默认值。
@@ -201,7 +208,7 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
 
 四个官方 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package,
-目标为 Linux/amd64 且 `CGO_ENABLED=0`。打包从所选源码树复制十个部署文件,
+目标为 Linux/amd64 且 `CGO_ENABLED=0`。打包从所选源码树复制十二个部署文件,
 通过既有 `RELEASE_*_SOURCE_DIR`、可选 `RELEASE_*_SOURCE_SHA` 及版本选择
 收集实际 Accelerator、Connector、Sandboxer 依赖材料。独立验证只检查 bundle
 中的依赖 URL/commit 字段相互一致,不要求验证主机具备兄弟仓或依赖 Tag。
@@ -224,7 +231,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 - [Node](docs/node_zh.md):节点架构、命令、配置、E2B API、生命周期、凭据与可靠性。
 - [Node Build](docs/node-build_zh.md):完整 Build API、配置、执行、发布与恢复。
-- [Runtime extensions](docs/extensions_zh.md):完整 Conductor/Proxy SDK 生命周期、对象源、Hook 与 wrapper。
+- [Runtime extensions](docs/extensions_zh.md):完整 Conductor/Proxy/Telemetry SDK 生命周期、source、Hook、wrapper 与 storage/Collector 绑定。
+- [Telemetry](docs/telemetry_zh.md)：直接 FloatingIP OTLP ingress、envd 采集、local/Prometheus/ClickHouse 主存储、exporter、E2B 历史与身份不变量。
 - [Journal 身份](docs/node-journald_zh.md):独立 Sandbox/Build 输出身份、StableID、查询与验证。
 - [Node Proxy](docs/node-proxy_zh.md):独立数据面、路由、鉴权、MMDS 与 native exec。
 - [Node resource](docs/node-resource_zh.md):节点准入、reservation、水位、inventory 恢复与统计。

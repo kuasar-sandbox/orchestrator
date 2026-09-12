@@ -51,13 +51,21 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 - Northbound clients use e2b SDK/CLI directly. In a cluster, cluster-ctl Router forwards traffic and node-link carries control commands. Platform administration can also use the e2b API.
 - Standalone and cluster modes keep create/pause/kill/template execution on the node. Joining adds node-link (§10) without replacing the e2b contract.
 - The data plane forwards upstream guest envd protocols rather than implementing envd (§4.3).
-- There is no compatible `/sandboxes/{id}/metrics` time series or envd metrics collection. The platform instead exposes read-only instantaneous `/sandboxes/{id}/stats/resource` and `/sandboxes/{id}/stats/traffic` (§4.1.1).
+- The independent Telemetry component implements envd/OTLP collection and E2B `/sandboxes/{SandboxID}/metrics` history; Conductor only authenticates, checks ownership and forwards to a live registered query UDS. See [Telemetry](telemetry.md). Instantaneous `/stats/resource` and `/stats/traffic` remain separate (§4.1.1).
 - The server does not parse Dockerfiles. It pulls/flattens existing images and executes the supported structured Build steps supplied by clients inside phase microVMs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 - Routing, storage and units are node-local. Cross-node snapshots/templates use canonical portable refs in Manifest Store or uniformly mounted named locations (§8.1); cluster-ctl orchestrates through node-link (§10).
 - Dependencies include the standard library, pure-Go `modernc.org/sqlite`, `golang.org/x/net/http2` for config-socket/node-link h2c, `golang.org/x/sys` for pidfile locks/SO_PEERCRED/mmap, `coreos/go-systemd`, `google/uuid` v7 and `gopkg.in/yaml.v3`. The module also includes CEL/protobuf, AWS SDK and sibling public packages; see [go.mod](../go.mod). The hand-written envd client and node-link use JSON rather than a gRPC wire protocol.
 
 <a id="15-架构与数据通路"></a>
 ### 1.5 Architecture and data paths
+
+Alongside the application data path below, `node-ctl telemetry serve` subscribes
+to the same full Plugin Plane RouteEntry stream. It scrapes envd over UDS and
+directly accepts FloatingIP-identified guest OTLP in the management namespace.
+Its Collector pipeline writes the selected primary (embedded TSDB by default)
+and extra exporters. Conductor forwards authenticated metrics queries over the
+independent registered API UDS; no telemetry work enters lifecycle barriers.
+The complete topology, failure and identity contracts are in [Telemetry](telemetry.md).
 
 ```
              client / cluster router
@@ -194,6 +202,21 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 `proxy.yaml` configures process endpoints/bootstrap policy: `config_socket`, `data_listen`, `proxy_netns`, `stats_socket`, `shm_path`, `workers`, `tls`, `auth` and `park_timeout`. Only conductor configures MMDS listening and the service registry. Master registers once on the plugin plane, receives MMDS policy in the handshake, maintains the shared route view and passes the sole Data listener FD to workers. See [node-proxy.md](node-proxy.md) §2 and §5; conductor and Proxy must be deployed together.
 
+### 2.3.1 `node-ctl telemetry`
+
+```sh
+node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
+```
+
+This is an independent component with its own strict config schema and
+`paths.telemetry_executable` static bootstrap option. It registers fixed Plugin
+ID `telemetry`, subscribes with `Kind: route`, and registers a separate HTTP
+query UDS only when primary storage is readable. It does not join Create/Resume
+readiness or call Wake. Local TSDB, Prometheus and ClickHouse readers, direct
+sandbox OTLP networking, E2B steps/MAX behavior and bounds are specified in
+[Telemetry](telemetry.md). Use `deploy/node-telemetry.service` alongside, not as
+a required dependency of, conductor/Proxy.
+
 <a id="24-node-ctl-run-sandbox--run-builder"></a>
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
@@ -212,18 +235,18 @@ Missing flags fall back to `TASK_PIDFILE`, `TASK_CONFIG_SOCKET` and `TASK_RUN_ID
 <a id="25-node-ctl-config"></a>
 ### 2.5 `node-ctl config`
 
-Configuration generation and diagnosis are **role-specific** (`conductor`/`proxy`, separate files and schemas):
+Configuration generation and diagnosis are **role-specific** (`conductor`/`proxy`/`telemetry`, separate files and schemas):
 
 ```
-node-ctl config <conductor|proxy> --template            # Print the role-specific commented template
-node-ctl config <conductor|proxy> --config <file>       # Load, default, validate and normalize
-node-ctl config <conductor|proxy> --config <file> --resolve   # Also resolve auto/derived effective values
+node-ctl config <conductor|proxy|telemetry> --template            # Print the role-specific commented template
+node-ctl config <conductor|proxy|telemetry> --config <file>       # Load, default, validate and normalize
+node-ctl config <conductor|proxy|telemetry> --config <file> --resolve   # Also resolve auto/derived effective values
                               -o <file>             # Write a file (default stdout)
 ```
 
-The first argument selects schema: conductor uses `conductor.yaml` (§3), proxy uses `proxy.yaml` ([node-proxy.md](node-proxy.md) §2). Conductor `--resolve` additionally expands `resource_listen` auto memory/CPU and deeply validates watermarks; for other roles it is equivalent to `--config`. Templates correspond to `deploy/{conductor,proxy}.example.yaml`.
+The first argument selects schema: conductor uses `conductor.yaml` (§3), proxy uses `proxy.yaml` ([node-proxy.md](node-proxy.md) §2), telemetry uses `telemetry.yaml` ([Telemetry](telemetry.md)). Conductor `--resolve` additionally expands `resource_listen` auto memory/CPU and deeply validates watermarks; for other roles it is equivalent to `--config`. Templates correspond to `deploy/{conductor,proxy,telemetry}.example.yaml`.
 
-The command performs strict declarative decoding, defaulting and diagnosis. It never executes `conductor_executable`/`proxy_executable` or accesses custom App runtime materials. With a custom executable, the first output line explicitly marks bootstrap-only validation; that App validates final configuration before startup side effects.
+The command performs strict declarative decoding, defaulting and diagnosis. It never executes `conductor_executable`/`proxy_executable`/`telemetry_executable` or accesses custom App runtime materials. With a custom executable, the first output line explicitly marks bootstrap-only validation; that App validates final configuration before startup side effects.
 
 <a id="26-node-ctl-manifest-key"></a>
 ### 2.6 `node-ctl manifest-key`
@@ -372,6 +395,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 | Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only controller reservation/report, sparse JSON, no envd access |
+| Metrics history | GET /sandboxes/{SandboxID}/metrics?start=...&end=... | Exact SandboxID ownership, opaque live telemetry UDS forwarding; 503 when unavailable, no Wake/Resume; [E2B contract](telemetry.md#6-e2b-history-query) |
 | Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/egress and conservative idleSince; no Wake/Resume |
 | List | GET /v2/sandboxes | Tenant-scoped state/limit/nextToken query. Omitted state lists running/paused; explicit states support diagnosis. x-next-token pagination; items include cpuCount/memoryMB/diskSizeMB and ISO-8601 startedAt/endAt. CPU/memory retain capacity/SKU meaning, not headroom |
 | Kill | DELETE /sandboxes/{id} → 204 | Non-owner returns 404. Atomically transfer complete ownership into deleting, exclude from cache/full snapshots and publish route Delete before response. Finalizer cancels launch, fences runner, detaches under allocation fence, exactly clears durable network ownership, removes RunDir/BaseDir and hard-deletes row. Route Delete only withdraws projection; pending repeats are idempotent |
@@ -1303,7 +1327,7 @@ Production uses operator-provided wildcard DNS/TLS for *.<domain> and api.<domai
 | Systemd | D-Bus StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload. | Process management and unit installation (§5). |
 | Node-ctl proxy serve | Bidirectional framed-JSON h2c routesync UDS plus separate data listener. | Independently operated on the same node. Master registers once; workers inherit data-listener FDs and shared routes. Frozen EffectiveConfig includes paths.run_root; workers never reread proxy.yaml (node-proxy.md §2.1/§3/§4). |
 
-Public exports are only the startup contracts in config, app/conductor and app/proxy. CGO_ENABLED=0 remains supported; internal core retains internal/* dependency boundaries.
+Public Config/App/extension contracts live in config and app/conductor, app/proxy and app/telemetry; advanced Collector bindings are isolated in app/telemetry/otel. CGO_ENABLED=0 remains supported; internal core retains internal/* dependency boundaries.
 
 <a id="15-可靠性"></a>
 ## 15. Reliability

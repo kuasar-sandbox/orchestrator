@@ -452,14 +452,21 @@ type TrafficStats struct {
 }
 
 type API struct {
-	core   Core
-	domain string
-	res    Resources
-	log    *slog.Logger
+	core         Core
+	domain       string
+	res          Resources
+	log          *slog.Logger
+	metricsProxy http.Handler
 }
 
 func New(core Core, domain string, res Resources, log *slog.Logger) *API {
 	return &API{core: core, domain: domain, res: res, log: log}
+}
+
+// WithMetricsProxy installs the opaque telemetry query channel at construction.
+func (a *API) WithMetricsProxy(handler http.Handler) *API {
+	a.metricsProxy = handler
+	return a
 }
 
 // Handler returns the routed http.Handler for api.<domain>.
@@ -469,6 +476,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes", a.auth(a.create))
 	mux.HandleFunc("GET /sandboxes/{id}", a.auth(a.get))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/resource", a.auth(a.resourceStats))
+	mux.HandleFunc("GET /sandboxes/{id}/metrics", a.auth(a.sandboxMetrics))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/traffic", a.auth(a.trafficStats))
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))

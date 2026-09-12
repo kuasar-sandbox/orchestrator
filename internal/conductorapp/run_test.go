@@ -16,7 +16,7 @@ type untouchedAPICore struct{ api.Core }
 func TestConductorPublicHandlerDoesNotDispatchSandboxData(t *testing.T) {
 	cfg := &publicconfig.Conductor{}
 	cfg.API.Domain = "test.local"
-	handler := newAPIHandler(cfg, untouchedAPICore{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler := newAPIHandler(cfg, untouchedAPICore{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	for _, request := range []*http.Request{
 		func() *http.Request {
 			r := httptest.NewRequest(http.MethodGet, "http://49983-sb-1.test.local/sandbox-data", nil)
