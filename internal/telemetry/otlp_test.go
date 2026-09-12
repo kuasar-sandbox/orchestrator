@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/tap"
 )
 
 func startOTLP(t *testing.T, view *View) (*otlpReceiver, <-chan pmetric.Metrics) {
@@ -231,4 +234,91 @@ func TestOTLPPersistentConnectionRevokedOnRemap(t *testing.T) {
 	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatal("old connection not closed", err)
 	}
+}
+
+func TestOTLPHTTPBodyLimitsBeforeCollector(t *testing.T) {
+	view := NewView(1, time.Second)
+	entry := upsert(t, view, testRoute("sid"))
+	view.Bookmark()
+	defer view.InvalidateSync()
+	r := &otlpReceiver{view: view, requests: make(chan struct{}, 1), next: metricsConsumer(t, func(context.Context, pmetric.Metrics) error {
+		t.Error("invalid/oversized request reached Collector")
+		return nil
+	})}
+	r.cfg.Telemetry.OTLP.MaxRequestBytes = 1024
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	_, _ = gz.Write(bytes.Repeat([]byte("x"), 1025))
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, encoding, contentType string
+		body                        []byte
+		status                      int
+	}{
+		{"encoded-limit", "identity", "application/x-protobuf", bytes.Repeat([]byte("x"), 1025), 413},
+		{"decompressed-limit", "gzip", "application/x-protobuf", compressed.Bytes(), 413},
+		{"bad-gzip", "gzip", "application/x-protobuf", []byte("bad"), 400},
+		{"bad-proto", "identity", "application/x-protobuf", []byte{255}, 400},
+		{"bad-json", "identity", "application/json", []byte("{"), 400},
+		{"bad-encoding", "br", "application/json", []byte("{}"), 415},
+		{"bad-type", "identity", "text/plain", []byte("{}"), 415},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest("POST", "/v1/metrics", bytes.NewReader(tc.body))
+			request = request.WithContext(withIdentity(request.Context(), entry, "otlp"))
+			request.Header.Set("Content-Type", tc.contentType)
+			request.Header.Set("Content-Encoding", tc.encoding)
+			response := httptest.NewRecorder()
+			r.httpHandler().ServeHTTP(response, request)
+			if response.Code != tc.status || len(r.requests) != 0 {
+				t.Fatal("status/capacity", response.Code, len(r.requests))
+			}
+		})
+	}
+}
+
+type unreadBody struct{ t *testing.T }
+
+func (r unreadBody) Read([]byte) (int, error) {
+	r.t.Error("body read despite exhausted capacity")
+	return 0, io.EOF
+}
+
+func TestOTLPRequestCapacitySharedAcrossTransports(t *testing.T) {
+	view := NewView(1, time.Second)
+	entry := upsert(t, view, testRoute("sid"))
+	view.Bookmark()
+	defer view.InvalidateSync()
+	r := &otlpReceiver{view: view, requests: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(peer.NewContext(context.Background(), &peer.Peer{Addr: identityAddr{Addr: &net.TCPAddr{}, entry: entry}}))
+	defer cancel()
+	info := &tap.Info{FullMethodName: "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"}
+	if _, err := r.grpcTap(ctx, info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.grpcTap(ctx, info); status.Code(err) != codes.ResourceExhausted {
+		t.Fatal("gRPC exceeded global capacity", err)
+	}
+	request := httptest.NewRequest("POST", "/v1/metrics", unreadBody{t})
+	request = request.WithContext(withIdentity(request.Context(), entry, "otlp"))
+	response := httptest.NewRecorder()
+	r.httpHandler().ServeHTTP(response, request)
+	if response.Code != 429 || response.Header().Get("Retry-After") != "1" {
+		t.Fatal("HTTP did not share gRPC capacity", response.Code)
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for len(r.requests) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("canceled gRPC request leaked capacity")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	release, err := r.acquire(context.Background())
+	if err != nil {
+		t.Fatal("capacity did not recover", err)
+	}
+	release()
 }

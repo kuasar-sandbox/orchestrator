@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,5 +216,58 @@ func TestTelemetryInFlightCancellation(t *testing.T) {
 				t.Fatalf("status = %d", response.Code)
 			}
 		})
+	}
+}
+
+func TestTelemetryReplacementAbortsBodyAndUsesOnlySuccessor(t *testing.T) {
+	var oldCalls, newCalls atomic.Int32
+	stopped := make(chan struct{})
+	oldPath := telemetryTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oldCalls.Add(1)
+		_, _ = w.Write([]byte("prefix"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(stopped)
+	}))
+	newPath := telemetryTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		newCalls.Add(1)
+		_, _ = w.Write([]byte("successor"))
+	}))
+	registry := NewRegistry()
+	old := telemetryPlugin(oldPath)
+	registry.Add(old)
+	// A real HTTP server handles ReverseProxy's ErrAbortHandler when a lease
+	// ends after headers were sent; it must not finish a truncated body as 200.
+	server := httptest.NewServer(registry.TelemetryAPI())
+	defer server.Close()
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get(server.URL + "/sandboxes/sid/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.ReadFull(response.Body, make([]byte, len("prefix"))); err != nil {
+		t.Fatal(err)
+	}
+	successor := telemetryPlugin(newPath)
+	registry.Add(successor)
+	registry.Remove(old)
+	if _, err := io.ReadAll(response.Body); err == nil {
+		t.Fatal("revoked body was completed successfully")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old UDS body stream retained after replacement")
+	}
+	for range 3 {
+		response := httptest.NewRecorder()
+		registry.TelemetryAPI().ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
+		if response.Code != 200 || response.Body.String() != "successor" {
+			t.Fatal("replacement did not use successor", response.Code, response.Body.String())
+		}
+	}
+	if oldCalls.Load() != 1 || newCalls.Load() != 3 {
+		t.Fatal("stale endpoint was reused", oldCalls.Load(), newCalls.Load())
 	}
 }
