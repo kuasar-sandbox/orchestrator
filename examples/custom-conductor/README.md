@@ -57,7 +57,9 @@ Native accounting stays in `cfg.Sandbox.Usage`; for example, declare
 through bootstrap and all three native launch paths. The final Configure-hook
 validation rejects invalid intervals even when usage is disabled.
 
-Trusted private tasks can read `e.host.Stats()` after Start. Use the exact
+Trusted private tasks can read `e.host.Stats()` after Start. Until core startup
+and provider wiring complete, reads return unavailable immediately; retry with
+the task context instead of waiting inside Start. Use the exact
 `SandboxView.ID`, with a cancellable context, outside the Watch callback:
 
 ```go

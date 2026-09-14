@@ -47,7 +47,8 @@ clamp 行为. Config snapshot 和 `Clone` 保留这一差别.
 经 bootstrap 和全部三条原生启动路径传递此策略. Configure hook 后的最终校验
 拒绝无效周期, usage 关闭时也一样.
 
-可信私有任务可以在 Start 后读取 `e.host.Stats()`. 使用精确 `SandboxView.ID`
+可信私有任务可以在 Start 后读取 `e.host.Stats()`. Core 启动及 provider 装配完成
+之前, 读取立即返回 unavailable; 应使用任务 context 重试, 不在 Start 内等待. 使用精确 `SandboxView.ID`
 和可取消 context, 在 Watch callback 之外调用:
 
 ```go

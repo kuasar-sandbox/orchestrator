@@ -108,7 +108,10 @@ or lifecycle behavior.
 ## 5. Trusted conductor reading surface
 
 Statically linked conductor extensions use `Host.Stats().ReadStats(ctx,
-StatsRequest)`. The existing `paths.config_socket` carries the corresponding
+StatsRequest)`. During Start and until core reconciliation/provider wiring
+completes, reads return the existing unavailable error immediately. They do not
+block Start or expose partially configured sources. After startup they call the
+same domain Reader. The existing `paths.config_socket` carries the corresponding
 internal `POST /internal/plugin/telemetry/stats`, selecting explicit native
 sections for SandboxIDs already discovered from the full RouteEntry stream:
 

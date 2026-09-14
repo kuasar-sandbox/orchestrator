@@ -94,7 +94,9 @@ saved 边界. 离线 recovery 找到完整存活记录, 不证明前一 writer �
 ## 5. 可信 conductor 读取面
 
 静态链接的 conductor extension 使用 `Host.Stats().ReadStats(ctx, StatsRequest)`.
-对应的内部 `POST /internal/plugin/telemetry/stats` 复用现有
+Start 期间及 core reconciliation/provider 装配完成之前, 读取立即返回既有
+unavailable 错误, 不阻塞 Start, 也不暴露未完成装配的来源. 启动完成后调用同一
+领域 Reader. 对应的内部 `POST /internal/plugin/telemetry/stats` 复用现有
 `paths.config_socket`, 对完整 RouteEntry 流已发现的 SandboxID 显式选择原生
 section:
 

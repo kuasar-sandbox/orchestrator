@@ -187,6 +187,10 @@ paths:
 sandbox:                                          # sandbox-instance defaults
   timeout_sec: 300
   dead_ttl: 24h                                   # owner-free dead-row diagnostic retention
+  usage:                                         # node policy for cold/from/restore; independent of telemetry
+    enabled: false
+    sample_interval: 1s
+    flush_interval: 5m                            # native append schedule; no fsync
   resources:
     capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B SKU
     allocatable:

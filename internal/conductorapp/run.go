@@ -166,6 +166,11 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	}
 
 	core.SetSandboxTrafficProvider(&ExternalTrafficProvider{Plugins: plugins})
+	if startedExtension != nil {
+		// Publish immutable provider wiring before extension goroutines can
+		// enter the native reader. Start itself must never wait for startup.
+		close(startedExtension.statsReady)
+	}
 	configServer := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, BuilderAdmissionAdmin: core,
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
@@ -220,14 +225,30 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 }
 
 type startedExtension struct {
-	api conductorextension.APIWrapper
+	api        conductorextension.APIWrapper
+	statsReady chan struct{}
+}
+
+type startupStatsReader struct {
+	source conductorextension.StatsReader
+	ready  <-chan struct{}
+}
+
+func (s startupStatsReader) ReadStats(ctx context.Context, request conductorextension.StatsRequest) ([]conductorextension.SandboxStats, error) {
+	select {
+	case <-s.ready:
+		return s.source.ReadStats(ctx, request)
+	default:
+		return nil, api.ErrStatsUnavailable
+	}
 }
 
 func startExtension(ctx context.Context, runtime *Runtime, storage *store.Store, core *orch.Orchestrator) (*startedExtension, error) {
 	if runtime.Extension == nil {
 		return nil, nil
 	}
-	host, observer := conductorext.New(storage, core)
+	ready := make(chan struct{})
+	host, observer := conductorext.New(storage, startupStatsReader{source: core, ready: ready})
 	core.SetExtensionObserver(observer)
 	if err := runtime.Extension.Start(ctx, host); err != nil {
 		return nil, fmt.Errorf("conductor extension start: %w", err)
@@ -238,7 +259,7 @@ func startExtension(ctx context.Context, runtime *Runtime, storage *store.Store,
 	buildHook, _ := runtime.Extension.(conductorextension.BuildHook)
 	apiWrapper, _ := runtime.Extension.(conductorextension.APIWrapper)
 	core.SetExtensionHooks(sandboxHook, buildHook)
-	return &startedExtension{api: apiWrapper}, nil
+	return &startedExtension{api: apiWrapper, statsReady: ready}, nil
 }
 
 func wrapExtensionAPI(wrapper conductorextension.APIWrapper, next http.Handler) (http.Handler, error) {
