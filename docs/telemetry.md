@@ -472,9 +472,11 @@ pause or wake sandboxes. See [static extensions](extensions.md#telemetry-bootstr
 `extension.Reader` accepts `Selection{SandboxID, Metrics, Attributes}` and
 `Query{Selection, Start, End, Step, Aggregation}`, returning `[]Series` with metric
 name, complete attributes and timestamp/value points. Metrics are exact names,
-attributes are equality predicates, and an empty metric list selects all names
+attributes require an existing key with an equal value (empty does not match
+missing), and an empty metric list selects all names
 within that exact sandbox. There is no seven-field enum, source allowlist or
-public SQL/PromQL input. `Raw` (or omitted aggregation) requires zero Step;
+public SQL/PromQL input. Omitted aggregation is normalized to `Raw` before
+dispatch to any backend. `Raw` requires zero Step;
 `Max` requires a positive whole-millisecond Step. Queries accept 1970–2299,
 up to 64 metric names, 110 equality attributes, 100,000 series and 700,000 points.
 Absent points stay absent; negative Gauges are legal. Bounds applies the same

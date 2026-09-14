@@ -67,6 +67,22 @@ func TestClickHouseIntegration(t *testing.T) {
 	if err != nil || len(series) != 1 || len(series[0].Points) != 1 || series[0].Points[0].Value != -7.25 || series[0].Attributes["resource.application.run_id"] != "keep-this-application-label" {
 		t.Fatal("arbitrary metric/source/negative Gauge/native attributes", series, err)
 	}
+	requireMissingAttributeUnmatched(t, backend, generic)
+	// The native Map schema retains explicitly empty attributes. They remain
+	// selectable, unlike missing keys whose Map lookup also returns "".
+	generic.Attributes["otel.scope.name"] = ""
+	for _, aggregation := range []extension.Aggregation{extension.Raw, extension.Max} {
+		generic.Aggregation, generic.Step = aggregation, 0
+		if aggregation == extension.Max {
+			generic.Step = time.Second
+		}
+		if result, err := backend.Query(ctx, generic); err != nil || len(result) != 1 {
+			t.Fatal("explicit empty attribute was lost", aggregation, result, err)
+		}
+	}
+	if _, _, found, err := backend.Bounds(ctx, generic.Selection); err != nil || !found {
+		t.Fatal("explicit empty attribute lost its bounds", found, err)
+	}
 	generic.Attributes["otel.kind"] = "absent-kind"
 	if series, err := backend.Query(ctx, generic); err != nil || len(series) != 0 {
 		t.Fatal("absent attribute selection must return empty history", series, err)

@@ -171,8 +171,8 @@ or retain/mutate Configure's declarations after the hook returns.
 |---|---|
 | `Extension.Start(ctx, Host)` / `Shutdown(ctx)` | One object per process. Start runs before ingress; Shutdown also runs after a failed Start. Retained work belongs to the supplied context and must stop on cancellation |
 | `Host.Reader()` | Selected query Reader, or nil in write-only mode; no lifecycle, raw RouteEntry, secret or receiver handle |
-| `Reader.Bounds(ctx, Selection)` | First/last retained observation for exact SandboxID, metric names and equality attributes, plus found/error; no StableID fallback |
-| `Reader.Query(ctx, Query)` | Selection plus Start/End, Raw or independent per-series Max and Step; returns `[]Series` with metric, complete attributes and timestamp/value points |
+| `Reader.Bounds(ctx, Selection)` | First/last retained observation for exact SandboxID, metric names and existing equality attributes (empty does not match missing), plus found/error; no StableID fallback |
+| `Reader.Query(ctx, Query)` | Selection plus Start/End, Raw (normalized default) or independent per-series Max and Step; returns `[]Series` with metric, complete attributes and timestamp/value points |
 | `QueryBackend` | Reader plus Shutdown; no Write requirement |
 | `MetricsHandler(QueryScope)` | Creates a standard HTTP handler with the authorized SandboxID and permanently scoped Reader; custom output is a separate HTTP contract |
 | `HealthReporter.Errors()` | Optional irrecoverable background-error channel; a report or closed channel revokes query availability and stops the component |

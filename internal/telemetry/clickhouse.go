@@ -110,7 +110,7 @@ func (c *ClickHouse) source(selection extension.Selection, start, end int64) (st
 		suffix := strconv.Itoa(i)
 		params.Set("param_key"+suffix, key)
 		params.Set("param_value"+suffix, selection.Attributes[key])
-		predicates = append(predicates, "attributes[{key"+suffix+":String}] = {value"+suffix+":String}")
+		predicates = append(predicates, "mapContains(attributes,{key"+suffix+":String}) AND attributes[{key"+suffix+":String}] = {value"+suffix+":String}")
 	}
 	return strings.Join(sources, " UNION ALL "), strings.Join(predicates, " AND "), params, nil
 }

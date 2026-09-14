@@ -38,11 +38,34 @@ func selectedSeries(selection extension.Selection, name string, attributes map[s
 		return false
 	}
 	for key, value := range selection.Attributes {
-		if attributes[key] != value {
+		if actual, present := attributes[key]; !present || actual != value {
 			return false
 		}
 	}
 	return true
+}
+
+// Prometheus equality with an empty value also retrieves absent labels. Filter
+// those physical matches, while still rejecting any other out-of-scope result.
+// Local TSDB and remote read use the same physical matcher semantics.
+func matchPrometheusSeries(selection extension.Selection, name string, attributes map[string]string) (bool, error) {
+	object := selection
+	object.Attributes = nil
+	if !selectedSeries(object, name, attributes) {
+		return false, errors.New("Prometheus returned a series outside the selected scope")
+	}
+	matched := true
+	for key, value := range selection.Attributes {
+		actual, present := attributes[key]
+		if !present && value == "" {
+			matched = false
+			continue
+		}
+		if !present || actual != value {
+			return false, errors.New("Prometheus returned a series outside the selected scope")
+		}
+	}
+	return matched, nil
 }
 
 // A scan visits a series once per returned frame/chunk, then streams its points.

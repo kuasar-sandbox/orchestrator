@@ -294,7 +294,15 @@ func (l *Local) scan(ctx context.Context, selection extension.Selection, start, 
 				attributes[label.Name] = label.Value
 			}
 		})
-		point, err := visit(series.Labels().Get(labels.MetricName), attributes)
+		name := series.Labels().Get(labels.MetricName)
+		matched, err := matchPrometheusSeries(selection, name, attributes)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			continue
+		}
+		point, err := visit(name, attributes)
 		if err != nil {
 			return err
 		}

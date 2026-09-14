@@ -296,8 +296,8 @@ Hook 返回后不要保留并修改 Configure 的声明。
 |---|---|
 | `Extension.Start(ctx, Host)` / `Shutdown(ctx)` | 每进程一个对象。Start 早于 ingress；Start 失败也执行 Shutdown。保留工作属于传入 context，必须随取消停止 |
 | `Host.Reader()` | 选定查询 backend 的 Reader; write-only 为 nil;不提供 lifecycle、raw RouteEntry、secret 或 receiver handle |
-| `Reader.Bounds(ctx, Selection)` | 对精确 SandboxID、metric 名和相等属性返回首末保留观测及 found/error; 不 fallback StableID |
-| `Reader.Query(ctx, Query)` | Selection 加 Start/End、Raw 或逐 series 独立 Max 与 Step; 返回含 metric、完整属性和时间/数值点的 `[]Series` |
+| `Reader.Bounds(ctx, Selection)` | 对精确 SandboxID、metric 名和存在且相等的属性 (空字符串不匹配缺失) 返回首末保留观测及 found/error; 不 fallback StableID |
+| `Reader.Query(ctx, Query)` | Selection 加 Start/End、Raw (规范化后的默认值) 或逐 series 独立 Max 与 Step; 返回含 metric、完整属性和时间/数值点的 `[]Series` |
 | `QueryBackend` | Reader 加 Shutdown, 不要求 Write |
 | `MetricsHandler(QueryScope)` | 创建标准 HTTP handler, 接收已授权 SandboxID 与永久限定 scope 的 Reader; 定制输出属于独立 HTTP 合同 |
 | `HealthReporter.Errors()` | 可选不可恢复后台错误 channel；收到报告或 channel 关闭时撤销查询可用性并停止组件 |

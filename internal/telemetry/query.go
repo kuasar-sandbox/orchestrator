@@ -123,9 +123,11 @@ func (r scopedReader) Query(ctx context.Context, query extension.Query) ([]exten
 		return nil, err
 	}
 	query.Selection = selection
-	if _, err := newSeriesBuckets(query); err != nil {
+	validated, err := newSeriesBuckets(query)
+	if err != nil {
 		return nil, err
 	}
+	query = validated.query
 	series, err := r.reader.Query(ctx, query)
 	if err != nil {
 		return nil, err

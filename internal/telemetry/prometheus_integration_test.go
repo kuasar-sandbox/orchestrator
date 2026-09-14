@@ -82,6 +82,7 @@ func TestPrometheusIntegration(t *testing.T) {
 	if err != nil || len(series) != 1 || len(series[0].Points) != 1 || series[0].Points[0].Value != -7.25 || series[0].Attributes["application_run_id"] != "keep-this-application-label" {
 		t.Fatal("arbitrary metric/source/negative Gauge/attributes", series, err)
 	}
+	requireMissingAttributeUnmatched(t, backend, generic)
 	if streams < 6 {
 		t.Fatal("expected real remote read requests", streams)
 	}

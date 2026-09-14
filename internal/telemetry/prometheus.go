@@ -67,10 +67,11 @@ func (p *Prometheus) read(ctx context.Context, selection extension.Selection, st
 				attributes[logical] = value
 			}
 		}
-		if !selectedSeries(physicalSelection, name, attributes) {
-			return nil, errors.New("Prometheus returned a series outside the selected sandbox scope")
+		matched, err := matchPrometheusSeries(physicalSelection, name, attributes)
+		if err != nil {
+			return nil, err
 		}
-		if !selectedSeries(selection, name, attributes) {
+		if !matched || !selectedSeries(selection, name, attributes) {
 			return func(int64, float64) error { return nil }, nil
 		}
 		return visitor(name, attributes)

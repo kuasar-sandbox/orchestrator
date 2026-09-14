@@ -397,9 +397,11 @@ routing 和两个带 queue/retry 的 OTLP HTTP sink. 添加 `local.enabled` 和
 
 `extension.Reader` 接受 `Selection{SandboxID, Metrics, Attributes}` 和
 `Query{Selection, Start, End, Step, Aggregation}`, 返回包含 metric 名、完整属性及
-时间/数值点的 `[]Series`. Metrics 使用精确名称, attributes 使用相等条件, 空 metric
+时间/数值点的 `[]Series`. Metrics 使用精确名称, attributes 要求 key 存在且值相等
+(空字符串不匹配缺失属性), 空 metric
 列表选择该精确沙箱内所有名称. 不存在公共七字段 enum、来源白名单或公开 SQL/PromQL
-输入. `Raw` 或省略 aggregation 时 Step 必须为零; `Max` 要求正数整毫秒 Step.
+输入. 省略的 aggregation 在调用任意 backend 前规范化为 `Raw`. `Raw` 的 Step
+必须为零; `Max` 要求正数整毫秒 Step.
 查询支持 1970–2299 年、最多 64 个 metric 名、110 个相等属性、100,000 条 series 与
 700,000 个点. 缺失点保持缺失, 负 Gauge 合法. Bounds 对保留观测应用同一 Selection.
 

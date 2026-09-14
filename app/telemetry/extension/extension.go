@@ -31,6 +31,7 @@ type Point struct {
 // Selection uses exact metric names and equality attributes. Empty Metrics
 // selects all metrics within the exact SandboxID; there is no SQL/PromQL input.
 // Attribute names follow the selected backend's documented label mapping.
+// Each selected attribute must exist: an empty value does not match absence.
 type Selection struct {
 	SandboxID  string
 	Metrics    []string
@@ -44,6 +45,8 @@ const (
 	Max Aggregation = "max"
 )
 
+// Query defaults an omitted Aggregation to Raw. The scoped Reader passes this
+// normalized value to custom backends after validating the range and Step.
 type Query struct {
 	Selection
 	Start, End  time.Time
