@@ -83,7 +83,7 @@ profile 编码在 templateID 前缀里（[Build §2](node-build_zh.md#2-模板-i
 - 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.2)。
 - 独立 Telemetry 实现 envd/OTLP 采集与 E2B `/sandboxes/{SandboxID}/metrics` 历史；
   Conductor 只鉴权、检查 ownership 并转发到 live query UDS，完整契约见
-  [Telemetry](telemetry_zh.md)。`/stats/resource`、`/stats/traffic` 仍是独立即时快照(§4.1.1)。
+  [Telemetry](telemetry_zh.md)。`/stats/resource`、`/stats/traffic` 和 `/stats/usage` 均保持独立; 参见 §4.1.1 和[原生 usage](node-usage_zh.md).
 - 服务端不解析 Dockerfile；客户端展开的结构化 steps 会在构建 guest 内执行，支持镜像拉取、
   展平与最多三阶段流水线（[Build §5](node-build_zh.md#5-按目标执行与发布)）。
 - 节点本地:路由、存储、单元管理都是节点本地的;跨机快照/模板使用 canonical
@@ -463,6 +463,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
+| `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | image cold、`run --from`、`run --restore` 共用的原生生命周期计量策略; 严格校验, 不进入 portable artifact, 独立于 telemetry. 参见[原生 usage](node-usage_zh.md) |
 | `sandbox.dead_ttl` | `24h` | 已完成全部本地 cleanup、无任何 owner 的 `dead` Sandbox 诊断记录保留期；必须为正 Go duration |
 | `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 Capacity。img 冷启可由 create/group 覆盖;restore Capacity 由 snapshot 固定 |
 | `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / 省略时继承 `256MiB` | CPU 是相对调度权重，不是硬性小数核保证；memory 是 settled guest headroom,不是 total Budget。conductor 配置省略 memory 时可随最终 Capacity 收敛；operator/custom 显式值（即使等于 `256MiB`）不得静默收敛，越界直接拒绝。request patch 的 pointer schema 与规则不变 |
@@ -536,6 +537,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 |---|---|---|
 | create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
+| usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
 | metrics history | `GET /sandboxes/{SandboxID}/metrics?start=...&end=...` | 精确 SandboxID ownership、opaque live telemetry UDS 转发；不可用为 503，不 Wake/Resume；[E2B 契约](telemetry_zh.md#6-e2b-历史查询) |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
@@ -694,6 +696,8 @@ route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 
 stats 的 503 窗口不影响 Proxy master 的 route/admission authority 或 Create barrier。完整共享
 admission算法、误差证明、worker-local状态机、绝对快照 stream 和故障窗口见
 [node-proxy.md](node-proxy_zh.md) §8。
+
+原生生命周期计量通过 `/sandboxes/{id}/stats/usage` 发布, paused 对象也可读取. 它独立选择 current/saved/history, 完整保留原生无损记录, 不用 resource counter 替代. 参见[原生 usage 与可信 batch 读取](node-usage_zh.md).
 
 #### 4.1.2 Create 身份
 
@@ -1234,6 +1238,8 @@ pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CL
 这不保证 journal/storage 故障下零丢失、恰好一次持久化或零阻塞发送。
 
 ## 6. 本机控制 socket(run / task / admin / plugin / api 平面)
+
+同一 plugin 平面通过 `POST /internal/plugin/telemetry/stats` 提供有界原生读取. 只有当前 ready telemetry 注册的真实 PID 可调用, 并受既有 plugin 白名单约束; 能连接 UDS 不自动获得普通 API 或 native batch 权限. Lease 撤销取消正在执行的读取. 参见[原生读取上限与 ownership](node-usage_zh.md#5-可信-conductor-读取面).
 
 serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600**)
 跑一个 h2c HTTP 服务(兼容 HTTP/1.1):单 socket 复用五个平面、各自鉴权。连接建立时

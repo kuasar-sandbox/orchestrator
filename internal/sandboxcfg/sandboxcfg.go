@@ -360,6 +360,7 @@ type Params struct {
 	TapFD          TapFD
 	EnvVars        map[string]string        // create-time launch env
 	Resources      rtconfig.ResourcesConfig // fully resolved node + tenant + restore policy
+	Usage          rtconfig.UsageConfig     // current node policy, never artifact inheritance
 	Network        NetworkSpec              // resolved logical network (request over artifact over node defaults)
 	MMDSEnabled    bool
 	Spec           SandboxSpec // parsed tenant override except resources, resolved above
@@ -412,6 +413,7 @@ type hostBootConfig struct {
 // fields are unrepresentable.
 type SandboxHostConfig struct {
 	Resources      rtconfig.ResourcesConfig `yaml:"resources"`
+	Usage          rtconfig.UsageConfig     `yaml:"usage"`
 	Network        rtconfig.NetworkConfig   `yaml:"network"`
 	Boot           hostBootConfig           `yaml:"boot"`
 	Restore        rtconfig.RestoreConfig   `yaml:"restore,omitempty"`
@@ -429,6 +431,7 @@ type SandboxHostConfig struct {
 // graph field, making those forbidden values unrepresentable here.
 type SnapshotHostConfig struct {
 	Resources rtconfig.ResourcesConfig `yaml:"resources"`
+	Usage     rtconfig.UsageConfig     `yaml:"usage"`
 	Network   rtconfig.NetworkConfig   `yaml:"network"`
 	Boot      hostBootConfig           `yaml:"boot"`
 	Restore   rtconfig.RestoreConfig   `yaml:"restore,omitempty"`
@@ -478,6 +481,11 @@ func (p Params) buildImageColdConfig() (*rtconfig.SandboxConfig, error) {
 	// runner assignment. The renderer installs that single authoritative value;
 	// run-sandbox adds only the inherited cgroup capability at exec time.
 	c.Resources = p.Resources
+	usage, err := p.runtimeUsage()
+	if err != nil {
+		return nil, err
+	}
+	c.Usage = usage
 
 	// --- boot ---
 	c.Boot.Kernel = "file://" + p.Kernel
@@ -529,12 +537,17 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 	if p.Sandbox == nil || p.Sandbox.LaunchMode != types.LaunchCold {
 		return nil, fmt.Errorf("sandboxcfg: Sandbox host config requires cold launch mode")
 	}
+	usage, err := p.runtimeUsage()
+	if err != nil {
+		return nil, err
+	}
 	boot, err := p.buildArtifactHostBoot()
 	if err != nil {
 		return nil, err
 	}
 	c := &SandboxHostConfig{
 		Resources:      p.Resources,
+		Usage:          usage,
 		Network:        p.buildRuntimeNetwork(),
 		Boot:           boot,
 		Restore:        rtconfig.RestoreConfig{Prefetch: p.Spec.Restore.Prefetch},
@@ -563,12 +576,17 @@ func (p Params) BuildSnapshotHostConfig() (*SnapshotHostConfig, error) {
 	if p.Sandbox == nil || p.Sandbox.LaunchMode != types.LaunchMemory {
 		return nil, fmt.Errorf("sandboxcfg: Snapshot host config requires memory launch mode")
 	}
+	usage, err := p.runtimeUsage()
+	if err != nil {
+		return nil, err
+	}
 	boot, err := p.buildArtifactHostBoot()
 	if err != nil {
 		return nil, err
 	}
 	return &SnapshotHostConfig{
 		Resources: p.Resources,
+		Usage:     usage,
 		Network:   p.buildRuntimeNetwork(),
 		Boot:      boot,
 		Restore:   rtconfig.RestoreConfig{Prefetch: p.Spec.Restore.Prefetch},

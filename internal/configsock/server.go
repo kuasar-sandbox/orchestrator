@@ -389,6 +389,7 @@ type AdminKeyResponse struct {
 
 // Deps wires the planes for New.
 type Deps struct {
+	Stats                        NativeStatsReader
 	Provider                     Provider // exact-run task bootstrap/prepare and reports
 	Admin                        Admin    // admin plane (manifest-key allowlist)
 	MMDSRouteSecretAdmin         MMDSRouteSecretAdmin
@@ -465,6 +466,7 @@ func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
 
 func (s *Server) router() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST "+PathTelemetryStats, s.handleTelemetryStats)
 	mux.HandleFunc("POST "+PathTaskSandboxBootstrap, s.handleSandboxBootstrap)
 	mux.HandleFunc("POST "+PathTaskSandboxPrepare, s.handleSandboxPrepare)
 	mux.HandleFunc("POST "+PathTaskBuildBootstrap, s.handleBuildBootstrap)

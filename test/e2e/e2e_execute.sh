@@ -46,6 +46,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/vmm_cgroup.sh"
 . "$SCRIPT_DIR/lib/proxy.sh"
 . "$SCRIPT_DIR/lib/execute_state.sh"
+. "$SCRIPT_DIR/lib/native_usage.sh"
+NATIVE_USAGE_SAMPLE=1s
+NATIVE_USAGE_FLUSH=2s
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -1246,6 +1249,10 @@ paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ct
 units: { dir: $UNIT_DIR, runner: '${RUNNER_PREFIX}.service', builder: '${BUILDER_PREFIX}.service' }
 sandbox:
   timeout_sec: 120
+  usage:
+    enabled: true
+    sample_interval: $NATIVE_USAGE_SAMPLE
+    flush_interval: $NATIVE_USAGE_FLUSH
   resources:
     capacity: { cpu: 2, memory: 2GiB }
   network:
@@ -1564,6 +1571,7 @@ code=$(DP_MAX_TIME=65 dp "49983-$DEFAULT_SID" /health "$DEFAULT_TOKEN" || true)
 { [ "$code" = "204" ] || [ "$code" = "200" ]; } \
     || { cat "$WORK/dp.body"; fail "default-policy cold health=$code"; }
 wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy cold sandbox not running"
+assert_native_usage "$DEFAULT_SID" live
 assert_resolved_resource_yaml "$WORK/run/sandboxes/$DEFAULT_SID/$DEFAULT_SID.yaml" \
     2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy dynamic resolved resource YAML"
 wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing"
@@ -2052,6 +2060,7 @@ wait_proxy_traffic_stats "$SID" paused || fail "paused traffic stats were not st
 # the still-real report is valid; the stable paused state must converge to 409.
 wait_resource_status "$SID" 409 || fail "paused resource stats did not converge to 409"
 wait_paused_cleanup "$SID" || fail "paused runtime ownership did not durably clear"
+assert_native_usage "$SID" paused
 # Keep the sandbox durably paused for longer than several service counter ticks.
 # On restore the counter must resume from the frozen snapshot rather than track
 # this host wall-clock interval.
@@ -2084,6 +2093,7 @@ for _ in $(seq 1 90); do
 done
 [ -n "$resumed" ] || fail "envd did not become ready after local restore"
 wait_resource_stats "$SID" || fail "resource stats did not recover after restore"
+assert_native_usage "$SID" live
 echo "==> PASS: Connect returned after durable starting acceptance (observed $CONNECT_RETURN_STATE); immediate native exec parked to running"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
 sed 's/^/  guest2| /' "$WORK/exec2.out"
@@ -2506,6 +2516,7 @@ code=$(cat "$WORK/e-wake-data.code")
 { [ "$code" = "204" ] || [ "$code" = "200" ]; } \
     || { cat "$WORK/dp.body"; fail "parked Sandbox E Wake request=$code"; }
 wait_sandbox_state "$SID" running 1200 || fail "Sandbox E cold Wake did not reach running"
+assert_native_usage "$SID" live
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/policy-persist.txt" >"$WORK/e-wake-read.out" 2>&1 || true
 grep -q "$POLICY_PERSIST" "$WORK/e-wake-read.out" \
     || { sed 's/^/  guest| /' "$WORK/e-wake-read.out"; fail "Sandbox E Wake lost disk state"; }

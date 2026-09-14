@@ -41,7 +41,7 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 - Northbound clients use e2b SDK/CLI directly. In a cluster, cluster-ctl Router forwards traffic and node-link carries control commands. Platform administration can also use the e2b API.
 - Standalone and cluster modes keep create/pause/kill/template execution on the node. Joining adds node-link (§10) without replacing the e2b contract.
 - The data plane forwards upstream guest envd protocols rather than implementing envd (§4.2).
-- The independent Telemetry component implements envd/OTLP collection and E2B `/sandboxes/{SandboxID}/metrics` history; Conductor only authenticates, checks ownership and forwards to a live registered query UDS. See [Telemetry](telemetry.md). Instantaneous `/stats/resource` and `/stats/traffic` remain separate (§4.1.1).
+- The independent Telemetry component implements envd/OTLP collection and E2B `/sandboxes/{SandboxID}/metrics` history; Conductor only authenticates, checks ownership and forwards to a live registered query UDS. See [Telemetry](telemetry.md). Native `/stats/resource`, `/stats/traffic` and `/stats/usage` remain independent; see §4.1.1 and [Native usage](node-usage.md).
 - The server does not parse Dockerfiles. It pulls/flattens existing images and executes the supported structured Build steps supplied by clients inside phase microVMs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 - Routing, storage and units are node-local. Cross-node snapshots/templates use canonical portable refs in Manifest Store or uniformly mounted named locations (§8.1); cluster-ctl orchestrates through node-link (§10).
 - Dependencies include the standard library, pure-Go `modernc.org/sqlite`, `golang.org/x/net/http2` for config-socket/node-link h2c, `golang.org/x/sys` for pidfile locks/SO_PEERCRED/mmap, `coreos/go-systemd`, `google/uuid` v7 and `gopkg.in/yaml.v3`. The module also includes CEL/protobuf, AWS SDK and sibling public packages; see [go.mod](../go.mod). The hand-written envd client and node-link use JSON rather than a gRPC wire protocol.
@@ -308,6 +308,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `units.pool_wait_timeout` | `5s` | Positive budget from StartUnit through entry into WaitAssignment; timeout cleans that RunID and replenishes the pool |
 | `units.install` | `true` | False delegates unit installation to operations |
 | `sandbox.timeout_sec` | `300` | Default sandbox TTL in seconds |
+| `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | Native lifecycle accounting policy for image cold, `run --from` and `run --restore`; strict validation, excluded from portable artifacts and independent of telemetry. See [Native usage](node-usage.md) |
 | `sandbox.dead_ttl` | `24h` | Positive Go duration retaining completely cleaned, owner-free dead diagnostic rows |
 | `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | Guest-visible VM ceiling/SKU; E2B cpuCount/memoryMB still mean capacity. img cold starts accept create/group overrides; artifact capacity constrains restore |
 | `sandbox.resources.allocatable.cpu` / `.memory` | Final capacity CPU / inherited `256MiB` when absent | CPU is relative scheduling weight, not a hard fractional-core guarantee; memory is settled guest headroom, not total Budget. Omitted node memory can clamp to final capacity, but explicit operator/custom values, even `256MiB`, must not silently clamp. Out-of-range values fail; request pointer semantics are unchanged |
@@ -368,6 +369,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 |---|---|---|
 | Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata |
+| Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
 | Metrics history | GET /sandboxes/{SandboxID}/metrics?start=...&end=... | Exact SandboxID ownership, opaque live telemetry UDS forwarding; 503 when unavailable, no Wake/Resume; [E2B contract](telemetry.md#6-e2b-history-query) |
 | Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/egress and conservative idleSince; no Wake/Resume |
@@ -472,6 +474,8 @@ maxInflight comes from master’s currently applied route and destination-node e
 e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/exec. Top-level inflight sums services. Each service includes idleSince only when both counters are zero. Top-level idleSince appears only for running with all-zero counts and is the maximum of all applicable service idle times. Starting/paused returns inflight but no top-level idle. V1 omits idle boolean/duration, last open/close, cumulative connections, bytes/latency/port details and worker information.
 
 Conductor queries the current trusted Proxy registration's stats_socket master cache, without worker fan-out. Unregistered master, unsynchronized route, mismatched RunID/profile/state, failed worker stream or unready replacement returns 503. This stats window does not alter master route/admission authority or Create barrier. The complete shared-admission algorithm, error proof, worker state machine, absolute snapshots and failure windows are in [node-proxy.md](node-proxy.md) §8.
+
+Native lifecycle accounting is available at `/sandboxes/{id}/stats/usage`, including paused objects. It has its own current/saved/history selection and preserves the native lossless record rather than replacing it with resource counters. See [Native usage and trusted batch reads](node-usage.md).
 
 #### 4.1.2 Create identity
 
@@ -893,6 +897,8 @@ DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}
 Name must be referenced by a current secret route. PUT replaces opaque bytes within max_secret_value_bytes; DELETE is idempotent. Success is 204 without plaintext. There is no TTL/expiry input or Content-Type-derived value metadata; response content type belongs to the route. Only successful store CAS publishes Upsert. Logs record SID/name/outcome, never body. Authentication remains socket 0600, SO_PEERCRED and optional admin pidfile.
 
 **③ Plugin plane:** PUT /internal/plugin/{id}/register registers Proxy master or an observer and holds the h2c connection as both lease and routesync stream ([node-proxy.md](node-proxy.md) §4). First body frame is register{caps}; route_wake subscriptions can later send wake/route_barrier_ack. Response is hello(policy) → initial upserts → bookmark → live upsert/delete/barrier. Wake/ACK share a serialized upstream writer.
+
+The same plugin plane exposes bounded native stats at `POST /internal/plugin/telemetry/stats`. Only the actual PID of the current ready telemetry registration may read it, subject to the existing plugin allowlist; UDS access alone does not grant ordinary API or native-batch rights. Lease revocation cancels active reads. See [Native reading bounds and ownership](node-usage.md#5-trusted-conductor-reading-surface).
 
 Capabilities are independent: subscribe route/route_wake, proxy marker with optional stats_socket, and mmds. Barrier participation requires exact proxy ID, route_wake subscription and proxy marker, not stats_socket. Disconnect unregisters; a new same-ID registration unregisters/disconnects its predecessor. Optional plugin_pidfile checks peer PID, otherwise socket 0600 applies. Proxy and agents subscribe locally, independently of cross-network node-link mTLS.
 

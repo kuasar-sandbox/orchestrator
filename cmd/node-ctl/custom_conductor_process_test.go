@@ -62,7 +62,7 @@ func TestMain(m *testing.M) {
 		os.Exit(92)
 	case "xconductor":
 		app := conductor.New(conductor.Hooks{Configure: func(_ context.Context, cfg *conductor.Config, _ *conductor.Runtime) error {
-			fmt.Printf("%d\n%s\n", os.Getpid(), cfg.Cluster.Labels["process-test"])
+			fmt.Printf("%d\n%s\n%t,%s,%s\n", os.Getpid(), cfg.Cluster.Labels["process-test"], cfg.Sandbox.Usage.Enabled, cfg.Sandbox.Usage.SampleInterval, cfg.Sandbox.Usage.FlushInterval)
 			return errors.New("stop before core")
 		}})
 		err := app.RunContext(context.Background())
@@ -125,7 +125,7 @@ func TestNodeCtlExecsCustomConductorAppInPlace(t *testing.T) {
 	component := filepath.Join(dir, "xconductor")
 	copyExecutable(t, source, component)
 	configPath := filepath.Join(dir, "conductor.yaml")
-	body := "paths:\n  conductor_executable: " + component + "\ncluster:\n  labels:\n    process-test: bootstrap-received\n"
+	body := "paths:\n  conductor_executable: " + component + "\ncluster:\n  labels:\n    process-test: bootstrap-received\nsandbox:\n  usage: {enabled: true, sample_interval: 2s, flush_interval: 8m}\n"
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestNodeCtlExecsCustomConductorAppInPlace(t *testing.T) {
 		t.Fatalf("custom conductor process: %v\n%s", err, output.String())
 	}
 	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
-	if len(lines) != 2 || lines[1] != "bootstrap-received" {
+	if len(lines) != 3 || lines[1] != "bootstrap-received" || lines[2] != "true,2s,8m" {
 		t.Fatalf("output=%q", output.String())
 	}
 	gotPID, err := strconv.Atoi(lines[0])

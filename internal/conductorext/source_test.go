@@ -29,7 +29,7 @@ func TestSourcesGetReturnIndependentRedactedViews(t *testing.T) {
 	if err := storage.PutBuild(ctx, build); err != nil {
 		t.Fatal(err)
 	}
-	host, _ := New(storage)
+	host, _ := New(storage, nil)
 
 	firstSandbox, found, err := host.Sandboxes().Get(ctx, sandbox.ID)
 	if err != nil || !found {
@@ -341,7 +341,7 @@ func TestSlowSandboxWatcherOnlyResyncsItself(t *testing.T) {
 
 func TestWatchCallbackErrorAndContextCancellation(t *testing.T) {
 	storage := testStore(t)
-	host, _ := New(storage)
+	host, _ := New(storage, nil)
 	want := errors.New("callback stopped")
 	err := host.Sandboxes().Watch(context.Background(), func(event conductorextension.SandboxEvent) error {
 		if event.Kind == conductorextension.SandboxSyncBegin {
@@ -378,7 +378,7 @@ func TestBuildWatchErrorRemovalIsLiveOnly(t *testing.T) {
 	if err := storage.PutBuild(ctx, historical); err != nil {
 		t.Fatal(err)
 	}
-	host, observer := New(storage)
+	host, observer := New(storage, nil)
 	ready := make(chan struct{})
 	removed := make(chan conductorextension.BuildEvent, 1)
 	done := make(chan error, 1)

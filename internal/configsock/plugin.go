@@ -21,13 +21,14 @@ import (
 
 // Plugin is one live registration on the plugin plane.
 type Plugin struct {
-	ID     string
-	Caps   routesync.Register
-	cancel context.CancelFunc
-	epoch  uint64
-	ready  bool
-	lease  context.Context
-	revoke context.CancelFunc
+	ID      string
+	Caps    routesync.Register
+	peerPID int
+	cancel  context.CancelFunc
+	epoch   uint64
+	ready   bool
+	lease   context.Context
+	revoke  context.CancelFunc
 }
 
 // Registry tracks live plugin registrations. The plugin-plane handler Adds on
@@ -305,7 +306,7 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	p := &Plugin{ID: id, Caps: reg, cancel: cancel, lease: ctx}
+	p := &Plugin{ID: id, Caps: reg, peerPID: peer, cancel: cancel, lease: ctx}
 	s.deps.Plugins.Add(p)
 	defer s.deps.Plugins.Remove(p)
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
