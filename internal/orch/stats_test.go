@@ -2,12 +2,16 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 type resourceStatsProviderStub struct {
@@ -37,68 +41,136 @@ func (p *resourceStatsProviderStub) SandboxResourceStats(string) (api.ResourceSt
 	return p.stats, p.found
 }
 
-func TestResourceStatsAuthenticatesAndMapsControllerState(t *testing.T) {
-	o := testOrch(t)
-	sb := &types.Sandbox{
-		ID: "resource", Profile: types.ProfileBare, State: types.StateRunning,
-		APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64),
+func startResourceOwner(t *testing.T, sb *types.Sandbox, handler func(ctl.Request) (ctl.Response, error)) {
+	t.Helper()
+	server := &ctl.Server{Path: filepath.Join(sb.RunDir, "ctl.sock"), ResourceStatsHandler: handler,
+		SnapshotHandler: func(ctl.Request) (ctl.Response, error) {
+			t.Error("stats triggered snapshot")
+			return ctl.Response{}, errors.New("unexpected snapshot")
+		}}
+	if err := server.Listen(); err != nil {
+		t.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func TestResourceStatsAuthenticatesAndCombinesNativeWithReservation(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{ID: "resource", StableIDValue: "alias", RunID: "run-1", RunDir: t.TempDir(),
+		Profile: types.ProfileBare, State: types.StateRunning, APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64)}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
-	apiKey := mintTestAPIKey(t, sb.APISecret)
-	mem := uint64(128 << 20)
-	provider := &resourceStatsProviderStub{stats: api.ResourceStats{MemUsed: &mem}, found: true}
+	used, reserved, cpu, stamp := uint64(512<<20), uint64(1<<30), uint64(9007199254740993), int64(123)
+	var calls atomic.Int64
+	startResourceOwner(t, sb, func(ctl.Request) (ctl.Response, error) {
+		calls.Add(1)
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID, CPUCapacity: 2, CPUAllocatable: .5, MemoryCapacity: 4 << 30, MemoryHeadroom: 256 << 20,
+			MemoryUsed: &used, CPUUsageUsec: &cpu, TimestampUnix: &stamp}}, nil
+	})
+	provider := &resourceStatsProviderStub{stats: api.ResourceStats{MemoryReserved: &reserved}, found: true}
 	o.SetSandboxResourceProvider(provider)
-
 	if _, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, strings.Repeat("3", 64))); !errors.Is(err, api.ErrNotFound) {
-		t.Fatalf("wrong owner error = %v", err)
+		t.Fatal(err)
 	}
-	if provider.calls != 0 {
-		t.Fatal("provider was queried before ownership validation")
+	key := mintTestAPIKey(t, sb.APISecret)
+	if _, err := o.ResourceStats(context.Background(), "alias", key); !errors.Is(err, api.ErrNotFound) {
+		t.Fatal("StableID fallback", err)
 	}
-	stats, err := o.ResourceStats(context.Background(), sb.ID, apiKey)
-	if err != nil || stats.MemUsed == nil || *stats.MemUsed != mem || provider.calls != 1 {
-		t.Fatalf("ResourceStats = %+v err=%v calls=%d", stats, err, provider.calls)
+	if calls.Load() != 0 || provider.calls != 0 {
+		t.Fatal("native source read before ownership validation")
+	}
+	for _, dynamic := range []bool{true, false} {
+		if !dynamic {
+			o.SetSandboxResourceProvider(nil)
+		}
+		stats, err := o.ResourceStats(context.Background(), sb.ID, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *stats.CPUCapacity != 2 || *stats.CPUAllocatable != .5 || *stats.MemoryCapacity != 4<<30 || *stats.MemoryHeadroom != 256<<20 || *stats.MemoryUsed != used || *stats.TimestampUnix != stamp {
+			t.Fatalf("native resource semantics: %+v", stats)
+		}
+		if dynamic && (stats.MemoryReserved == nil || *stats.MemoryReserved != reserved) {
+			t.Fatal("reservation lost")
+		}
+		if !dynamic && stats.MemoryReserved != nil {
+			t.Fatal("static mode fabricated reservation")
+		}
+		if stats.CPUSeconds == nil || stats.CPUSeconds.String() != "9007199254.740993" {
+			t.Fatal("CPU precision", stats.CPUSeconds)
+		}
+		raw, err := json.Marshal(stats)
+		if err != nil || !strings.Contains(string(raw), `"cpuSeconds":9007199254.740993`) {
+			t.Fatal(string(raw), err)
+		}
+		for _, old := range []string{"cpuCount", "memTotal", "memAllocatable", "runId", "run_id"} {
+			if strings.Contains(string(raw), old) {
+				t.Fatal("obsolete/private field", string(raw))
+			}
+		}
 	}
 }
 
-func TestResourceStatsDisabledAndMissingReservationStates(t *testing.T) {
-	for _, tc := range []struct {
-		state types.State
-		want  error
-	}{
-		{types.StateStarting, api.ErrStatsUnavailable},
-		{types.StateRunning, api.ErrStatsUnavailable},
-		{types.StatePaused, api.ErrStatsConflict},
-	} {
-		t.Run(string(tc.state), func(t *testing.T) {
+func TestResourceStatsMissingRuntimeAndPaused(t *testing.T) {
+	for _, state := range []types.State{types.StateStarting, types.StateRunning, types.StatePaused} {
+		t.Run(string(state), func(t *testing.T) {
 			o := testOrch(t)
-			sb := &types.Sandbox{
-				ID: "resource-" + string(tc.state), Profile: types.ProfileBare, State: tc.state,
+			sb := &types.Sandbox{ID: "resource-" + string(state), Profile: types.ProfileBare, State: state,
 				TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-				APISecret:  strings.Repeat("4", 64), ManifestKey: strings.Repeat("5", 64),
-			}
-			if tc.state == types.StateStarting {
+				APISecret:  strings.Repeat("4", 64), ManifestKey: strings.Repeat("5", 64)}
+			if state == types.StateStarting {
 				sb.LaunchMode = types.LaunchImage
 			}
-			if tc.state == types.StatePaused {
+			if state == types.StatePaused {
 				sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
 			}
 			materializeTestSandboxCredentials(t, sb)
 			if err := o.st.Put(context.Background(), sb); err != nil {
 				t.Fatal(err)
 			}
-			apiKey := mintTestAPIKey(t, sb.APISecret)
-			if _, err := o.ResourceStats(context.Background(), sb.ID, apiKey); !errors.Is(err, api.ErrStatsUnsupported) {
-				t.Fatalf("disabled provider error = %v", err)
+			want := api.ErrStatsUnavailable
+			if state == types.StatePaused {
+				want = api.ErrStatsConflict
 			}
-			o.SetSandboxResourceProvider(&resourceStatsProviderStub{})
-			if _, err := o.ResourceStats(context.Background(), sb.ID, apiKey); !errors.Is(err, tc.want) {
-				t.Fatalf("missing reservation error = %v, want %v", err, tc.want)
+			if _, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret)); !errors.Is(err, want) {
+				t.Fatal(err, want)
+			}
+			current, err := o.st.Get(context.Background(), sb.ID)
+			if err != nil || current.State != state {
+				t.Fatal("resource query changed lifecycle", err)
 			}
 		})
+	}
+}
+
+func TestResourceStatsRejectsChangedRuntimeBinding(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{ID: "changing", RunID: "old-run", RunDir: t.TempDir(), Profile: types.ProfileBare, State: types.StateRunning,
+		APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64)}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	startResourceOwner(t, sb, func(ctl.Request) (ctl.Response, error) {
+		replacement := *sb
+		replacement.RunID = "new-run"
+		if err := o.st.Put(context.Background(), &replacement); err != nil {
+			return ctl.Response{}, err
+		}
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID}}, nil
+	})
+	if _, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret)); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatal("old runtime published as current", err)
 	}
 }
 

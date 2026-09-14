@@ -368,7 +368,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 |---|---|---|
 | Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata |
-| Resource stats | GET /sandboxes/{id}/stats/resource | Read-only controller reservation/report, sparse JSON, no envd access |
+| Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
 | Metrics history | GET /sandboxes/{SandboxID}/metrics?start=...&end=... | Exact SandboxID ownership, opaque live telemetry UDS forwarding; 503 when unavailable, no Wake/Resume; [E2B contract](telemetry.md#6-e2b-history-query) |
 | Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/egress and conservative idleSince; no Wake/Resume |
 | List | GET /v2/sandboxes | Tenant-scoped state/limit/nextToken query. Omitted state lists running/paused; explicit states support diagnosis. x-next-token pagination; items include cpuCount/memoryMB/diskSizeMB and ISO-8601 startedAt/endAt. CPU/memory retain capacity/SKU meaning, not headroom |
@@ -417,20 +417,28 @@ It returns no session ID, expiry, ServiceSecret or other route/credential fields
 
 Both endpoints first read the Sandbox business row and verify API-key ownership; failure returns 404. They observe without Connect/Wake/Resume/Pause/envd calls and set Cache-Control: no-store.
 
-Resource stats consume only the embedded controller's current reservation and sandbox-ctl host-charge reports:
+Resource stats read the current sandbox-ctl owner's effective resource specification and host VMM cgroup through its existing control socket. Conductor adds the embedded resource controller's reservation when available:
 
 ```json
 {
-  "timestampUnix": 1786482600,
-  "cpuCount": 2,
+  "cpuCapacity": 2,
   "cpuAllocatable": 0.5,
-  "memUsed": 536870912,
-  "memTotal": 2147483648,
-  "memAllocatable": 1073741824
+  "memoryCapacity": 2147483648,
+  "memoryHeadroom": 268435456,
+  "memoryReserved": 1073741824,
+  "memoryUsed": 536870912,
+  "cpuSeconds": 12.345678,
+  "timestampUnix": 1786482600
 }
 ```
 
-Every field is optional; unobserved values are omitted, not invented as zero. timestampUnix is the latest Settled/Heartbeat carrying nonzero host VMM charge. memUsed is sandboxer's VMM cgroup memory.current, not guest demand/working set. memTotal is Capacity; the existing name memAllocatable contains node reservation. Disabled controller returns 501; starting with a reservation can return sparse 200; paused without a live reservation returns 409; running without one returns 503. Before a host-charge report, other known fields still appear. This is not a guest /metrics compatibility implementation.
+`cpuCapacity` is `capacity.cpu` in cores. `cpuAllocatable` is the existing relative scheduling specification mapped to `cpu.weight`, not a fractional-core hard quota or performance guarantee. `memoryCapacity` is `capacity.memory` in bytes. `memoryHeadroom` is the final effective `resources.allocatable.memory`: the balloon controller's headroom, distinct from Budget, guest free memory and NodeReservation. `memoryReserved` is the observed reservation actually charged to the node; it is omitted when the dynamic controller or its observation is absent.
+
+`memoryUsed` reads `memory.current` and `cpuSeconds` reads `cpu.stat.usage_usec / 1e6` from the same pinned host VMM cgroup. These values do not add the ctl process or guest CPU, subtract inactive file/balloon memory, or cap host memory at guest capacity. CPU seconds are cumulative for that current source and can reset when it is rebuilt; lifecycle accumulation belongs to native usage. The native JSON preserves integer bytes and emits CPU seconds as an exact decimal with microsecond precision. Consumers converting these numbers to binary floating point may lose precision.
+
+Each host observation has independent validity: a valid zero is returned, while missing memory or CPU observations are omitted. `timestampUnix` is the actual read time and is omitted if neither host value exists. It is not a refreshed heartbeat/cache timestamp. Effective specifications remain readable from an owner without a live VMM, but no current host observation is fabricated. Starting/running without a reachable owner returns 503; paused and other states without a current runtime return 409. Concurrent runtime or binding replacement invalidates the read.
+
+This works with static or dynamic resource control, with usage disabled and with telemetry stopped. Reading does not Wake, sample/save usage, call the guest or Cloud Hypervisor, or change control policy. It creates no resource history. The former native `cpuCount`, `memTotal`, `memAllocatable` and `memUsed` fields are removed; the old reservation-valued `memAllocatable` is replaced by `memoryReserved`, while `memoryHeadroom` is a separate explicit concept. E2B `/metrics` and list/SKU compatibility fields retain their existing meanings.
 
 Traffic stats report authenticated logical ingress accepted by final node Proxy:
 

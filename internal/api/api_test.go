@@ -1713,7 +1713,7 @@ func (c *trafficStatsCoreStub) TrafficStats(context.Context, string, string) (*T
 func TestResourceStatsSparseJSONAndStatusMapping(t *testing.T) {
 	cpu := 2.0
 	handler, apiKey := newSandboxContractHandler(t, &resourceStatsCoreStub{
-		stats: &ResourceStats{CPUCount: &cpu},
+		stats: &ResourceStats{CPUCapacity: &cpu},
 	}, Resources{})
 	req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/resource", nil)
 	req.Header.Set("X-API-KEY", apiKey)
@@ -1726,7 +1726,7 @@ func TestResourceStatsSparseJSONAndStatusMapping(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body) != 1 || body["cpuCount"] == nil {
+	if len(body) != 1 || body["cpuCapacity"] == nil {
 		t.Fatalf("sparse resource JSON = %s", resp.Body.String())
 	}
 

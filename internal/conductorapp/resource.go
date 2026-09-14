@@ -44,21 +44,8 @@ func (p ResourceProbe) SandboxResourceStats(sandboxID string) (api.ResourceStats
 	if !found {
 		return api.ResourceStats{}, false
 	}
-	cpuCount := float64(snapshot.Capacity.CPUMilli) / 1000
-	cpuAllocatable := float64(snapshot.CPUAllocatable) / 1000
-	memTotal := snapshot.Capacity.MemoryBytes
 	reservationMemory := snapshot.ReservationMemory
-	stats := api.ResourceStats{
-		CPUCount: &cpuCount, CPUAllocatable: &cpuAllocatable,
-		MemTotal: &memTotal, MemAllocatable: &reservationMemory,
-	}
-	if !snapshot.LastReportAt.IsZero() {
-		timestamp := snapshot.LastReportAt.Unix()
-		memUsed := snapshot.HostMemoryCurrent
-		stats.TimestampUnix = &timestamp
-		stats.MemUsed = &memUsed
-	}
-	return stats, true
+	return api.ResourceStats{MemoryReserved: &reservationMemory}, true
 }
 
 var _ orch.ResourceProbe = ResourceProbe{}
