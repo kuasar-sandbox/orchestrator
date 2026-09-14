@@ -447,7 +447,7 @@ The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services
 
 Conductor batches at most 64 current ports per switch through connector's Go `Stats(ports)` API, with no per-sandbox CLI processes or second lifecycle authority. It reuses its allocation/detach fence; connector reuses the pin-directory shared lock, current pinned-map ID and reset-confirmation flag. The existing Proxy stats socket also accepts a bounded batch. Configured-source read errors, unconfirmed reset, control contention, incomplete results or changed bindings return 503 for the whole read, never zero or an older complete-looking response. The same domain reads serve the public API, trusted local batch and conductor extension. Stats remains available independently of telemetry and does not participate in Create/Resume readiness.
 
-Traffic collection requires the matching connector control binary, TC programs and current counter-map ABI. Recreate older PERCPU_ARRAY/64-byte counter maps before enabling collection; the current map is a locked ARRAY/80-byte value. A failed reset affects stats availability only. See [connector operations](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md) for switch lifecycle and deployment.
+Traffic collection requires the matching connector control binary, TC programs and current counter-map ABI. Recreate older PERCPU_ARRAY/64-byte counter maps before enabling collection; the current map is a locked ARRAY/80-byte value. A failed reset affects stats availability only. See [connector operations](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch-operations.md) for switch lifecycle and deployment.
 
 Each worker reports through one Unix socketpair:
 

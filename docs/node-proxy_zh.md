@@ -688,7 +688,7 @@ RunID/profile/state 不匹配或 worker 集不可信时返回 503。state 参与
 
 Conductor 每个 switch 最多批量读取 64 个当前端口,调用 connector Go `Stats(ports)`,不逐沙箱启动 CLI,不维护第二套生命周期权威. 它复用原有 allocation/detach fence;connector 复用 pin 目录共享锁、当前 pinned-map ID 和清零确认标记. 既有 Proxy stats socket 也支持有界批量. 已配置来源读取失败、清零未确认、控制锁占用、结果不完整或绑定变化时,整个读取返回 503,不会用 0 或旧样本伪装完整响应. 公开 API、可信本机 batch 与 conductor extension 共用相同领域读取. Stats 独立于 telemetry,不参与 Create/Resume readiness.
 
-流量采集需要相互匹配的 connector control binary、TC program 和当前 counter-map ABI. 开启采集前需重建旧 PERCPU_ARRAY/64-byte counter map;当前为带锁的 ARRAY/80-byte value. 清零失败仅影响 stats 可用性. switch 生命周期与部署见 [connector 操作说明](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch_zh.md).
+流量采集需要相互匹配的 connector control binary、TC program 和当前 counter-map ABI. 开启采集前需重建旧 PERCPU_ARRAY/64-byte counter map;当前为带锁的 ARRAY/80-byte value. 清零失败仅影响 stats 可用性. switch 生命周期与部署见 [connector 操作说明](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch-operations_zh.md).
 
 每个 worker 使用一条 Unix socketpair 上报:
 
