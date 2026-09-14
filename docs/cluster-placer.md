@@ -1,16 +1,10 @@
 [English](cluster-placer.md) | [简体中文](cluster-placer_zh.md)
 
-<a id="cluster-placer--group-导入watch_list-与放置"></a>
-
 # cluster-placer — group import, WATCH_LIST, and placement
 
 `cluster-ctl placer` is an independent placement scheduler. It holds no node connections, owns no sandbox lifecycle, and does not replicate registry state. It obtains group configuration and key material through `SandboxGroupProvider` / `SandboxGroupImporter`, consumes the registry's `node_list` WATCH_LIST, and provides `PlaceSandbox` / `PlaceBuild` / `verify-key` to the registry.
 
-<a id="1-概述"></a>
-
 ## 1. Overview
-
-<a id="11-职责"></a>
 
 ### 1.1 Responsibilities
 
@@ -43,8 +37,6 @@ The placer does not:
 - Maintain route/build execution state.
 - Store the registry's group/route records.
 
-<a id="12-原则"></a>
-
 ### 1.2 Principles
 
 1. **The registry does not implement a group provider**: Provider/Importer belongs to the placer or an external platform.
@@ -54,8 +46,6 @@ The placer does not:
 5. **Shuffle affects new placement only**: it does not migrate running sandboxes.
 6. **Credential-pair distribution affects create/build prerequisites only**: dropping a pair, lease expiry, or provider updates do not modify pairs already copied into existing sandbox/build records.
 
-<a id="2-命令行"></a>
-
 ## 2. Command line
 
 ```text
@@ -63,8 +53,6 @@ cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
 A standalone placer must configure at least one `import_groups` source. Embedded or production integrations can directly inject custom `SandboxGroupProvider` / `SandboxGroupImporter` implementations.
-
-<a id="3-配置"></a>
 
 ## 3. Configuration
 
@@ -196,8 +184,6 @@ WATCH_LIST semantics:
 
 The node_list shard is fully replicated across its owners. The placer neither needs nor may merge results from multiple node_list owners. If its current owner disconnects, the placer clears that source view, fails over to another candidate owner, and repeats reset + bookmark. It must not declare ready before bookmark completes.
 
-<a id="6-placer-memberlist-域"></a>
-
 ## 6. Placer memberlist domain
 
 At startup, the placer joins the memberlist selected by `placer.memberlist_label` and periodically registers a seed with active / next registry members:
@@ -227,11 +213,7 @@ The registry selects ready placers from memberlist metadata only:
 
 `placer_link/register` is neither the readiness source nor a placer directory store.
 
-<a id="7-import-reconcile"></a>
-
 ## 7. Import reconciliation
-
-<a id="71-source-owner-选择"></a>
 
 ### 7.1 Source-owner selection
 
@@ -255,8 +237,6 @@ recordKey = state
 ```
 
 A lease request carries `source_id`, `owner_id`, `run_id`, and `ttl_ms`. Only the lease winner executes that source's `Importer.Range(cursor, limit)`.
-
-<a id="72-page-处理"></a>
 
 ### 7.2 Page processing
 
@@ -288,8 +268,6 @@ A selector patch must carry `import_source_id/import_owner_id/import_run_id/impo
 At `placement.selector_patch_refresh_interval`, the placer resends unchanged selector patches to keep the node_link credential-pair cache alive. A group disappearing from the provider does not actively delete the cache; entries expire by TTL.
 
 ## 8. Placement
-
-<a id="81-registry-选择-placer"></a>
 
 ### 8.1 Registry selection of a placer
 
@@ -367,8 +345,6 @@ The placer owns selector patches and APISecret/ManifestKey pair-cache refresh:
 
 Credential pairs are create/build prerequisites. Cache removal, key_drop, lease expiry, or later provider updates do not affect pairs already copied into existing sandbox/build business records.
 
-<a id="10-可靠性"></a>
-
 ## 10. Reliability
 
 | Event | Behavior |
@@ -382,8 +358,6 @@ Credential pairs are create/build prerequisites. Cache removal, key_drop, lease 
 | Build registration timeout or lost ACK | Keep the persisted selected-node/BuildID intent and query/retry that same node. Durable registration usage remains node-owned; the placer has no admission-lease timer that frees it. The node releases registration usage on its ready/error transition; terminal-history deletion later removes the Registry projection. These are separate events. See the [durable usage query](../internal/store/build_admission.go). |
 
 See the authoritative [registration dispatch and projection reconciliation](../internal/registry/build.go) and [placement predicates](../internal/placer/scaler.go). In particular, ambiguous delivery cannot be treated as proof of a side-effect-free rejection.
-
-<a id="11-性能"></a>
 
 ## 11. Performance
 

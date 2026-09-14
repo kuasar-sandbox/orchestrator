@@ -71,6 +71,8 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 `node-ctl` 运行内置 master，或按 `paths.proxy_executable` 原地 exec 静态定制 master；master
 始终 reexec 自己当前的 executable 启动 worker。内部 worker 模式不作为运维接口。
 
+静态定制接口、配置 Hook、运行期绑定、私有路由及授权转发见 [扩展指南](extensions_zh.md#proxy-bootstrap)。
+
 `proxy.yaml` 字段:
 
 | 字段 | 默认 | 说明 |
@@ -96,12 +98,6 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 `proxy.yaml` 不含 `mmds_listen` 或 `services`:两者唯一来源是 conductor
 `mmds.listen` / `mmds.services`,经可信 plugin registration 的 `Hello{Policy}` 下发。
-
-### 2.1 静态定制 Proxy
-
-静态定制的完整接口、配置 Hook、运行期绑定、私有路由以及授权转发说明统一见 [扩展指南](extensions_zh.md#proxy-bootstrap)。本篇继续定义 Core 的路由、凭据和进程所有权不变量。
-
-进程退出、mmap 与传输取消的完整规则见 [§9.1](#91-worker-生命周期与传输取消)。
 
 ## 3. 部署拓扑
 
@@ -739,7 +735,7 @@ Proxy worker 是专用、单次运行的子进程。内置入口及定制 App �
 
 流量限制只决定是否接纳新 flow，不决定已接纳 flow 的转发行为。普通 HTTP 请求取消和 HTTP/2 CONNECT stream 取消，无论是否配置有效限制，都关闭对应 backend。HTTP/1 hijacked CONNECT 保持半关闭语义，原 HTTP request context 不是通用的隧道关闭信号。native exec 保持既有 KAT、首帧、CEL、traffic admission 顺序。
 
-本修正不新增 worker 优雅排空、连接池、全局限流或公开配置，也不修改内部 wire/layout。
+
 
 
 ## 10. 性能

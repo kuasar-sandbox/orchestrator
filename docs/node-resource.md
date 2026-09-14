@@ -1,16 +1,10 @@
 [English](node-resource.md) | [简体中文](node-resource_zh.md)
 
-<a id="node-resource--节点-reservation-控制器"></a>
-
 # node-resource — node reservation controller
 
 `node-ctl conductor serve` optionally embeds the node resource controller. It owns node-side reservation, admission, pools, watermarks, recovery inventory and statistics projection. Sandboxer owns the sandbox-local loop for guest memory observations, Cloud Hypervisor ballooning, `memory.high` and cold/restore/snapshot lifecycle; those operations do not belong to the node controller.
 
-<a id="1-概述"></a>
-
 ## 1. Overview
-
-<a id="11-责任边界"></a>
 
 ### 1.1 Responsibility boundaries
 
@@ -31,8 +25,6 @@ node reservation loop
 
 The normal reservation loop neither samples nor writes sandbox cgroups, calls CH APIs, receives guest `MemReport`, nor sends balloon targets. Recovery inventory does read process/cgroup identity, liveness and conservative limits (§8.1); it does not use those reads to implement the guest Budget loop. The controller atomically handles sandbox-initiated reservation requests. Heartbeat returns a reservation echo, not an execution command.
 
-<a id="12-术语"></a>
-
 ### 1.2 Terminology
 
 | Name | Definition | Owner |
@@ -49,8 +41,6 @@ Headroom is not the total Budget. CPU `allocatable` still expresses scheduling w
 
 Sandbox-local state also includes `TargetBudget`, `CurrentBudget`, `ObservedBudget` and `DemandMemory`; the node neither needs nor stores them. On the normal controlled path, the sandbox obtains enough NodeReservation before increasing Budget and releases reservation only after shrink converges. Emergency guest `deflate_on_oom` is an exception to the phased soft guarantee: it changes neither target nor reservation. Existing `memory.high` continues bounding host VMM charge, while the sandbox marks target/current unstable and prohibits shrink. Snapshot still computes BudgetAtSnapshot from the safe upper bound of both sides.
 
-<a id="13-核心不变量"></a>
-
 ### 1.3 Core invariants
 
 - `0 < NodeReservation <= Capacity`.
@@ -61,8 +51,6 @@ Sandbox-local state also includes `TargetBudget`, `CurrentBudget`, `ObservedBudg
 - `Settled` is a lifecycle fact; it does not derive or rewrite reservation from memory.current.
 - Controller restart provisionally charges Capacity, then atomically replaces that charge after StateSync.
 - Stale heartbeats, host charge and node administrative commands cannot alter an individual sandbox's reservation.
-
-<a id="2-命令行接口"></a>
 
 ## 2. Command-line interface
 
@@ -77,8 +65,6 @@ node-ctl resource drain  [--socket PATH] [--disable]
 `status` shows node budget, host reserved, operational margin, allocatable pool, reserved memory, startup in-flight, zone and recovery counts. `list` shows each sandbox reservation. `drain` prevents new admission without altering live reservations.
 
 There is no `resource grant` or `resource reclaim`. Headroom is a sandbox-policy input: select it through supported sandbox configuration/lifecycle inputs, and let the sandbox's existing loop converge from observations. This does not introduce a node command for live policy reload or direct balloon/cgroup adjustment.
-
-<a id="3-配置"></a>
 
 ## 3. Configuration
 
@@ -142,13 +128,9 @@ Preflight requires `host_reserved.memory < physical_memory` and validates `0 <= 
 
 `resource_listen.socket` is the sole endpoint configuration. Node-ctl binds an absolute path and canonicalizes parent-directory symlinks into the identity shared by owner lock, lease inventory and sandbox client. A symlink at the final socket, dangling path or ambiguous alias fails closed. Sandbox YAML does not carry `control.cgroup_path`; the runner injects that host capability through an inherited cgroup FD. `resource_listen.state_path` is deprecated and ignored; it does not enable state.json recovery (§8.1).
 
-<a id="33-requesttemplate-所有权"></a>
-
 ### 3.3 Request/template ownership
 
 Tenant resource patches allow only `capacity`, `allocatable` and `startup`. The node resolver owns `control`, `overhead`, `watermark_high`, sensors and deflate_on_oom. The parser rejects unknown or unauthorized fields instead of silently ignoring them.
-
-<a id="4-node-reservation-模型"></a>
 
 ## 4. Node reservation model
 
@@ -181,8 +163,6 @@ Zone derives solely from Reserved / AllocatablePool:
 
 Zone does not consume MemAvailable, balloon current, memory.current or sandbox lifecycle details.
 
-<a id="43-runtime-grant"></a>
-
 ### 4.3 Runtime grants
 
 RequestBudget is a reservation transaction with an absolute baseline and delta:
@@ -199,17 +179,11 @@ Partial grants are allowed. Sandboxer accumulates reservation first and deflates
 
 Shrink uses the same message with RequestedDelta=0. After local balloon inflation, current convergence and ordered memory.high adjustment, the sandbox submits a smaller absolute baseline to release reservation. The node neither polls CH nor decides whether shrink has completed.
 
-<a id="5-reservation-协议"></a>
-
 ## 5. Reservation protocol
-
-<a id="51-传输与认证"></a>
 
 ### 5.1 Transport and authentication
 
 Sandboxer `pkg/resource` defines length-prefixed JSON over Unix sockets. Each sandbox uses a persistent connection and token. Controller restart/reconnect rebuilds sessions with lifecycle leases, SO_PEERCRED, managed pidfile/cgroup identity and StateSync.
-
-<a id="52-现役消息"></a>
 
 ### 5.2 Current messages
 
@@ -225,8 +199,6 @@ Sandboxer `pkg/resource` defines length-prefixed JSON over Unix sockets. Each sa
 | AdminDrain/Status/List | Admin → node. | Admission drain and observation. |
 
 There are no node-to-sandbox balloon/cgroup commands or administrative grant/reclaim operations.
-
-<a id="53-现有-wire-字段语义"></a>
 
 ### 5.3 Existing wire-field semantics
 
@@ -244,8 +216,6 @@ The current implementation retains the existing reservation message shape; it do
 | `CurrentRSS` | Diagnostic HostMemoryCurrent, the host VMM cgroup charge. |
 
 These fields do not mean guest RSS, demand, balloon current or a memory.high target. Keeping the message shape is the architecture boundary, not two old/new semantic paths. The implementation has no negotiation, version gate, alias decoder or mixed-version branch for this model; this does not establish an arbitrary cross-version compatibility guarantee.
-
-<a id="6-生命周期"></a>
 
 ## 6. Lifecycle
 
@@ -293,8 +263,6 @@ sandbox RequestBudget(smaller baseline, delta=0) -> node release
 
 Node and sandbox do not share a state machine. Reservation requests/responses are their sole coordination boundary.
 
-<a id="7-admission-与调度投影"></a>
-
 ## 7. Admission and scheduling projection
 
 ### 7.1 Admission
@@ -309,8 +277,6 @@ Cold uses StartupBudgetMemory; restore uses AllocatableAtSnapshot. The selected 
 
 Temporary shortages can enter the FIFO queue. Requests beyond node limits, or disallowed by node-protection conditions, are rejected. No path proceeds with a smaller initial grant for startup/restore.
 
-<a id="72-resourceprobe-与-cluster-load"></a>
-
 ### 7.2 ResourceProbe and cluster load
 
 ResourceProbe.Allocated and cluster projected memory load use reservedMemory, not host charge. E2B memoryMB still means Capacity/SKU.
@@ -323,11 +289,7 @@ Per-sandbox resource statistics:
 
 MemUsed is not DemandMemory and does not participate in RequestBudget, admission or recovery charge.
 
-<a id="8-可靠性"></a>
-
 ## 8. Reliability
-
-<a id="81-inventory-与-controller-restart"></a>
 
 ### 8.1 Inventory and controller restart
 
@@ -340,8 +302,6 @@ Lifecycle leases retain sandbox identity, Capacity, headroom, cold-start headroo
 
 The controller does not read the old persistent state schema or reconstruct guest Budget from memory.current. Read-only recovery checks include cgroup.events, cgroup.procs, process cgroup identity and memory.max; these establish liveness/conservative accounting, not a second guest-memory controller.
 
-<a id="82-response-loss-与-reconnect"></a>
-
 ### 8.2 Lost responses and reconnects
 
 - If a growth response is lost, the sandbox has not raised high/deflated based on that response and retains its old local baseline. StateSync atomically replaces provisional node charge without undercounting.
@@ -349,13 +309,9 @@ The controller does not read the old persistent state schema or reconstruct gues
 - A heartbeat mismatch triggers reconnect/StateSync; its echo is not an execution command.
 - Stale heartbeats and host charge can update diagnostic times/values only, never reservation.
 
-<a id="83-reservation-生命周期"></a>
-
 ### 8.3 Reservation lifecycle
 
 Startup TTL cleans failed creations that never reached Settled. Heartbeat timeout, Release and inventory cleanup atomically remove indices/aggregate charge by reservation identity/token. Unknown or provisional reservations cannot use ordinary growth transactions.
-
-<a id="9-性能与可观测性"></a>
 
 ## 9. Performance and observability
 

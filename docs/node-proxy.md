@@ -1,9 +1,7 @@
 [English](node-proxy.md) | [简体中文](node-proxy_zh.md)
 
-<a id="node-proxy--节点数据面转发层"></a>
 # node-proxy — Node data-plane forwarding
 
-<a id="1-概述"></a>
 ## 1. Overview
 
 The data-plane proxy is the L7 forwarding layer for sandbox traffic. It routes requests from external e2b SDKs/CLIs, port forwarding, or the cluster router by `(sid, target)` to guest envd/CI UDS endpoints, user ports at a sandbox floating IP, or the native exec `ctl.sock`. Ordinary HTTP retains the legacy port target; CONNECT can explicitly select a logical service with `E2b-Sandbox-Service`. The control-plane API, lifecycle, keys, and builds belong to `node-ctl conductor serve`; see [node.md](node.md). This document covers the data-plane forwarding layer.
@@ -21,7 +19,6 @@ node proxy worker
   └─ exec ──────────────────► <run_root>/sandboxes/<sid>/ctl.sock
 ```
 
-<a id="11-设计原则"></a>
 ### 1.1 Design principles
 
 Sandbox metric collection/history is owned by the separate
@@ -42,7 +39,6 @@ the live telemetry registration's separate API UDS, not Proxy StatsSocket.
 - **Exec authenticates before activation:** `service=exec` always validates a KAT bound to `StableID`. After CONNECT 200, it must also authorize the complete first ExecRequest. Failure cannot trigger parking, Wake/resume, or a backend dial. The final node proxy gives the ctl tunnel helper only requests that pass both gates; it exposes neither arbitrary UDS endpoints nor other ctl capabilities to tenants.
 - **Deterministic MMDS keys:** `MmdsSecret = HMAC-SHA256(manifest_key, "kuasar-mmds-v1:" + sid)`, with the hex manifest key decoded to bytes. PUT and GET therefore agree even when different workers serve them.
 
-<a id="2-cli"></a>
 ## 2. CLI
 
 Start the node data plane as one proxy master process:
@@ -52,6 +48,8 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
 `node-ctl` runs the built-in master or replaces itself with a statically customized master selected by `paths.proxy_executable`. The master always reexecutes its own current executable to start workers. The internal worker mode is not an operator interface.
+
+Static customization interfaces, configuration hooks, runtime binding, private route sources and authorized forwarding are defined in [Extensions](extensions.md#proxy-bootstrap).
 
 `proxy.yaml` fields:
 
@@ -78,14 +76,6 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 `proxy.yaml` contains neither `mmds_listen` nor `services`. Their sole sources are conductor `mmds.listen` and `mmds.services`, delivered in `Hello{Policy}` through trusted plugin registration.
 
-<a id="21-静态定制-proxy"></a>
-### 2.1 Statically customized Proxy
-
-The full static customization interfaces, configuration hooks, runtime binding, private route sources and authorized forwarding contract is maintained in [Extensions](extensions.md#proxy-bootstrap). This specification retains the core routing, credential and process-ownership invariants.
-
-Process exit, mapping ownership and transport cancellation are defined in [§9.1](#91-worker-lifetime-and-transport-cancellation).
-
-<a id="3-部署拓扑"></a>
 ## 3. Deployment topology
 
 Every sandbox-capable node runs both conductor and Proxy. The conductor API listener carries only the control plane; the Proxy's required `data_listen` is the node's only sandbox data ingress. The two advertised endpoints point to these separate listeners, with no cross-plane fallback.
@@ -114,7 +104,6 @@ Key points:
 - Master exit takes its workers down. After systemd restarts the master, it registers again and rebuilds shared tables.
 - The plugin ID must be exactly `proxy`, and registration must satisfy `subscribe.kind=route_wake`, `proxy!=nil`, and `mmds=true` before the conductor projects MMDS policy, routes, and secret values. Ordinary observers and node-link never receive these confidential values.
 
-<a id="4-routesync-与共享路由视图"></a>
 ## 4. routesync and shared route views
 
 routesync remains framed JSON over h2c; the proxy master dials the conductor:
@@ -171,7 +160,6 @@ On the routesync wire, `MaxInflightPatch` carries only explicit sandbox leaves. 
 
 The initial durable starting Upsert may lack a FloatingIP, UDS, or any other backend endpoint. Workers park by state and never attempt those empty fields. After the node persists network ownership and completes YAML/ready.sock preparation, it publishes enriched starting; only then can MMDS identify it by FloatingIP. Ordinary data traffic still waits for running.
 
-<a id="5-转发路径"></a>
 ## 5. Forwarding paths
 
 Ordinary HTTP parses `(sid, port)` from `Host: <port>-<sid>.<domain>` or `E2b-Sandbox-Id` / `E2b-Sandbox-Port`. It does not select a backend from `E2b-Sandbox-Service`; that header is forwarded unchanged as an application header, except that the exact value `exec` returns 405 before activation. CONNECT parses `(sid, service?, port?)`. The second cluster hop must use the current NodeSandboxID as `sid`.
@@ -257,7 +245,6 @@ there is no second WebSocket implementation or replay of the inner request.
 No new configuration, extension API, frame processing, or HTTP/2 extended CONNECT
 is introduced.
 
-<a id="6-数据面鉴权"></a>
 ## 6. Data-plane authentication
 
 All data-plane requests use `X-Access-Token`, with the expected value selected by target:
@@ -281,7 +268,6 @@ This table applies only to ordinary data traffic. Exec always enforces authentic
 
 For e2b legacy 49983 `GET/POST /files` without `X-Access-Token`, the node can verify envd's signature query with EnvdAccessToken. In `enforce`, the proxy verifies before forwarding, and envd independently verifies the same original request. A nonempty wrong `X-Access-Token` never falls back to a signature. These checks follow the ordinary node policy: `log` can forward a mismatch and `off` skips verification. Explicit logical services and bare port 49983 do not inherit the legacy signed-file exception.
 
-<a id="7-mmds"></a>
 ## 7. MMDS
 
 With `mmds.enabled=true`, envd in FC mode obtains the current identity's access-token hash through Firecracker MMDS v2. `mmds.routes.enabled=true` additionally exposes explicitly declared static/secret/service exact routes. Only Proxy workers serve HTTP; the master supplies the bounded route view. With `proxy_netns`, the master binds the conductor-projected `mmds.listen` in that namespace and passes the same listener FD to all workers. Workers read no proxy/MMDS YAML.
@@ -315,10 +301,8 @@ The security boundary distinguishes portable route declarations from secret valu
 
 Sandbox-local MMDS is a local object/route mechanism, not a cluster Secret API, generic CONNECT configuration surface or placement/admission feature. Standalone CONNECT parses secrets-only import only when the target is absent and actually imported; an existing target skips it. The complete migration boundary is in [Node §8.1.4](node.md#814-publication-templates-and-migration). Request-scoped Build Register MMDS remains encrypted under Build ownership on the selected node ([Build §3.1](node-build.md#31-request-scoped-builder-input)). Incidental ordinary metadata propagation is not a cluster-wide MMDS support or E2E acceptance claim.
 
-<a id="8-per-sandbox-traffic-admission-与-stats"></a>
 ## 8. Per-sandbox traffic admission and stats
 
-<a id="81-配置与合并"></a>
 ### 8.1 Configuration and merging
 
 `traffic.max_inflight` specifies each sandbox's admitted logical inflight concurrency across the whole node Proxy. It is not QPS, bandwidth, worker capacity, or global Proxy capacity. A configured `M` is neither independently applied to each worker nor statically split into `ceil(M/N)`:
@@ -350,7 +334,6 @@ Build registration traffic applies only to the Build runtime and its synthetic r
 
 Destination-node defaults are not written into sandbox metadata/structs/SQLite, Registry records, or MigrationToken. MigrationToken retains existing Metadata: absent traffic remains absent after migration and resolves against destination Proxy defaults; explicit patches migrate unchanged and override those defaults. V1 cannot modify metadata at runtime. Lowering a limit does not evict existing connections and affects only later acquire attempts.
 
-<a id="82-共享-admission-arena-与误差证明"></a>
 ### 8.2 Shared admission arena and error-bound proof
 
 Route mmap is separate from the mutable admission arena. For a valid route whose effective limits are all zero, the master publishes a zero binding. Workers take the existing `BeginParking` path without scanning the arena or IPC. Limited routes receive `{slot,generation,effective limits}` in route SHM. Arena v2 stores only a master-written active generation per slot and generation-tagged `counters[worker][forward/envd/CI/exec]`. Each live worker alone writes its rows. Its process-local per-slot mutex serializes row initialization, acquire and release; master never acquires that mutex or clears a live row. There is no shared guard, identity hash, draining state, or duplicate mutable limit policy. Local locks are indexed by slot, not merely by SandboxID.
@@ -396,7 +379,6 @@ Ordinary HTTP/non-exec CONNECT first follows the existing credential policy, the
 
 Exhaustion for ordinary HTTP/non-exec CONNECT returns 429, `X-Kuasar-Proxy-Error: max_inflight_reached`, and a fixed body. It sets no `Retry-After`, performs no Wake/Activate/dial, emits no per-rejection log, and increments low-cardinality `data_requests_total{result="max_inflight_reached"}`. See §5 for exec's behavior after CONNECT 200.
 
-<a id="83-traffic-stats-与统一-worker-stream"></a>
 ### 8.3 Traffic stats and the unified worker stream
 
 The public API is `GET /sandboxes/{sid}/stats/traffic`. It counts logical ingress admitted by the final node proxy's authentication policy, not physical client TCP connections:
@@ -468,7 +450,6 @@ Master queries read a continuously maintained aggregate cache, without GET-time 
 
 Workers send absolute state to the master over socketpairs; the conductor queries only the currently registered `stats_socket`. Route SHM remains master-write/worker-read-only, without a stats area or worker writes. Mutable worker admission columns exist only in the separate arena, never in route records that can move during backshift.
 
-<a id="9-可靠性"></a>
 ## 9. Reliability
 
 - **Worker crash:** a stats fault first terminates the old worker. The master waits for `cmd.Wait`, clears its admission column, and restarts the same index with a new epoch. Stale-high counts only conservatively reject while waiting. Other workers keep accepting on the same listener FD. Routes, sandbox state, and Create barriers do not change. The kernel closes existing connections on the crashed worker.
@@ -509,7 +490,6 @@ universal tunnel-close signal. Native exec keeps its existing KAT / first-frame 
 CEL / traffic-admission ordering.
 
 
-<a id="10-性能"></a>
 ## 10. Performance
 
 - Ordinary data-plane lookup is a worker-local mmap hash lookup, with no conductor call or cross-process RPC. Only custom guest MMDS paths use local worker→master socketpair RPC.
@@ -522,7 +502,6 @@ CEL / traffic-admission ordering.
 
 Here running proves only that the orchestrator readiness wire and mandatory e2b `/init` succeeded. It does not guarantee that the code interpreter, forwarded business port, or user application is listening/healthy. [#125](https://github.com/kuasar-sandbox/orchestrator/issues/125) separately tracks business-backend readiness; the proxy adds no generic dial retry in this phase.
 
-<a id="11-see-also"></a>
 ## 11. See Also
 
 - [node.md](node.md) — conductor control plane, Proxy deployment, lifecycle, and key model.

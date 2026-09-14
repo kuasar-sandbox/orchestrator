@@ -65,7 +65,6 @@
 - **e2b**:guest 运行 Envd,提供完整 E2B 兼容数据面。
 - **bare**:guest 不要求 Envd,通过自身网络服务与原生平台集成访问。
 
-<a id="组成"></a>
 ## 源码职责
 
 | 路径 | 角色 |
@@ -91,7 +90,6 @@
 | `examples/custom-proxy` | 可编译 xproxy,由 node-ctl proxy serve 进入,master reexec worker |
 | `examples/custom-telemetry` | 可编译静态 telemetry App，演示普通扩展与窄 advanced Collector integration |
 
-<a id="构建"></a>
 ## 构建与测试
 
 Go 源码构建需要 Go 1.24+，并将 `accelerator`、`connector`、`sandboxer` 放在本仓的兄弟目录；修改范围仅在本仓也不免除构建依赖。内部 `require` 使用各组件目标正式版本（Daily Preview 去掉预发布后缀），目标 Tag 可以尚不存在，因为实际构建由本地 `replace` 选择兄弟仓源码。`GOWORK=off` 不会禁用这些替换。验证必须记录实际源码 SHA，不能把版本标签当作已编译提交。运行真实沙箱还需 Runtime/Kernel 等运行工件，不能与 Go 编译前置混同。
@@ -134,7 +132,6 @@ Prometheus TSDB，不依赖外部数据库；集群增加独立 Registry、Route
 [快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)。
 生产部署应使用持久存储、生产 TLS、受保护凭据、明确网络策略及基于实际 workload 验证的容量设置。
 
-<a id="快速开始"></a>
 ## 开发示例
 
 先按项目快速开始准备二进制、Kernel/Runtime 制品、网络与受保护配置。下面每个常驻角色分别使用服务或独立终端,
@@ -170,8 +167,6 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("<canonical-template-id>"
 
 完整命令、配置、API 与集群接入规则见 [Node](docs/node_zh.md) 和 [Cluster](docs/cluster_zh.md)。
 
-<a id="节点目录与身份"></a>
-<a id="build-制品发布"></a>
 ## 契约归属
 
 节点 roots、对象 RunDir/BaseDir、RunID/PathID 与 cleanup 顺序由 [Node 路径与生命周期](docs/node_zh.md) 维护。

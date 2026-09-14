@@ -1,6 +1,5 @@
 [English](cluster.md) | [简体中文](cluster_zh.md)
 
-<a id="cluster--registry-自聚簇路由与放置控制面"></a>
 # cluster — Registry clustering, routing and placement control plane
 
 `cluster-ctl` is the cluster control plane for large deployments, with three independent roles:
@@ -11,10 +10,8 @@
 
 Registry's foundation is a consistent KV organized by `namespace + shard key + recordSet + record key`. All `node_link`, `route_link`, `node_list` and `placer_link` records share this model: no traversal across shards, full replication within a shard, and convergence through quorum reads/writes, CAS, WATCH and read repair.
 
-<a id="1-概述"></a>
 ## 1. Overview
 
-<a id="11-总体拓扑"></a>
 ### 1.1 Overall topology
 
 ```text
@@ -45,7 +42,6 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 - Registry sends create/connect/exec_session/delete/build/key commands through the node owner.
 - Nodes report sandbox/build state and the low-frequency node directory through node_link.
 
-<a id="12-设计原则"></a>
 ### 1.2 Design principles
 
 1. **Group is the business shard key**: every northbound cluster request must include `X-Kuasar-Sandbox-Group` or equivalent group identity. A cluster data-plane entry without a group is currently unsupported.
@@ -57,7 +53,6 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 7. **Placer does not own lifecycle**: it imports groups, patches selectors, applies shuffle sharding/P2C and proposes placements. The node owner checks current connectivity/usage; the node's durable transaction makes the authoritative Build registration admission decision.
 8. **Router does not subscribe to huge numbers of groups**: create/data Reserve returns READY or an error; connect/exec-session Reserve returns after synchronous node preparation, without waiting for asynchronous resume. Router keeps only a bounded route cache; in-flight requests do not provide routes for new requests.
 
-<a id="13-角色边界"></a>
 ### 1.3 Role boundaries
 
 | Role | Responsibility |
@@ -67,7 +62,6 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 | Placer | Consumes `node_list` WATCH_LIST; imports groups through providers/importers; maintains placement and selector patches; offers Place / verify-key |
 | Node | Runs sandboxes/builds; reports full inventories and events through node_link; receives create/connect/exec_session/delete/build/key commands |
 
-<a id="2-配置与监听"></a>
 ## 2. Configuration and listeners
 
 Registry uses one control-plane listener by default. A separate node_link listener can isolate long-lived node connections without changing owner rules. The following three-member example shows membership and timing fields; `https://` advertisements also require the matching `member.tls` configuration and peer trust. They do not enable TLS by themselves. The built-in default has one member and one owner per namespace.
@@ -128,10 +122,8 @@ Default paths:
 
 Registry's advertised address is `membership.versions[].members[].advertise`; redirect-capable nodes use `membership.versions[].members[].node_advertise`.
 
-<a id="3-membership-与健康检测"></a>
 ## 3. Membership and health detection
 
-<a id="31-版本化成员表"></a>
 ### 3.1 Versioned membership
 
 Registry membership comes only from an operator-distributed configuration file. Each version has a stable label:
@@ -157,7 +149,6 @@ stable(v1)
 
 Reload can load/cancel `next` from a stable state, or promote an already configured `next` to the new `active`. It cannot jump directly from stable(v1) to stable(v2).
 
-<a id="32-memberlist-边界"></a>
 ### 3.2 Memberlist boundaries
 
 ```text
@@ -188,7 +179,6 @@ Memberlist does not:
 - Replicate data.
 - Turn suspect/dead states into resharding.
 
-<a id="33-placer-memberlist-域"></a>
 ### 3.3 Placer memberlist domain
 
 Placer uses a separate label, `placer.default` by default. Registry has no configured placer list; it joins the placer memberlist with `role=observer`. `POST /placer-link/register` supplies only a seed for Registry's initial join. Placer memberlist metadata expresses readiness:
@@ -199,10 +189,8 @@ Placer uses a separate label, `placer.default` by default. Registry has no confi
 
 Registry considers only members satisfying `role=placer && alive && ready=true && ready_label==active_registry_label` for Place / verify-key.
 
-<a id="4-registry-状态模型"></a>
 ## 4. Registry state model
 
-<a id="41-数据层级"></a>
 ### 4.1 Data hierarchy
 
 ```text
@@ -222,7 +210,6 @@ namespace
 
 A shard is the unit of member sharding; a recordSet is the unit of data replication. Rev does not belong at the shard level, which would unnecessarily couple independently evolving profile/sandbox/build/key domains within that shard.
 
-<a id="42-owner-解析"></a>
 ### 4.2 Owner resolution
 
 ```text
@@ -241,7 +228,6 @@ owner set
 
 `membership.owners.route_link/node_link/placer_link/node_list` controls the owner count for each namespace. Owner count is Registry's internal replication factor. `placer_link.placer_replica_count` controls only the number of ready-placer failover candidates called by Registry; it is not the owner count of the `placer_link` namespace.
 
-<a id="43-namespace-schema"></a>
 ### 4.3 Namespace schema
 
 | Namespace | Shard key | RecordSet | Record key | Contents |
@@ -257,7 +243,6 @@ owner set
 
 A fixed schema defines the current recordSet collection. If a namespace introduces dynamic recordSet names in the future, its recordSet directory must itself be a reserved recordSet in the same shard, following the same CAS/WATCH rules.
 
-<a id="44-读写协议"></a>
 ### 4.4 Read/write protocol
 
 Shardkv must let any receiving Registry member perform CAS, reads and WATCH within the target shard's owner set without introducing a primary for every group/node. It must also preserve a monotonically consistent recordSet committed history across a member failure, joint membership, partial repair and tombstone collection.
@@ -298,7 +283,6 @@ coordinator
           quorum installed, laggards repaired best-effort
 ```
 
-<a id="441-不变量"></a>
 #### 4.4.1 Invariants
 
 Shardkv correctness rests on these invariants:
@@ -311,7 +295,6 @@ Shardkv correctness rests on these invariants:
 
 The system assumes crash/fail-stop Registry members that do not forge peer responses. Communication can time out, disconnect or duplicate requests, but request bodies are not Byzantine-tampered. `UpdatedAt` serves only TTL/GC; it does not order consistency.
 
-<a id="442-提交证书"></a>
 #### 4.4.2 Commit certificates
 
 An accept quorum has already decided the value of a Rev. Keeping only in-memory accepted state would create an availability problem: if an accepting member then fails, the surviving quorum may see just one current replica and one older replica, making it impossible to recover the latest commit by requiring an identical snapshot from a quorum.
@@ -352,7 +335,6 @@ Install must also obey local monotonicity:
 - Different canonical digests at the same `Rev` represent different committed histories and must be rejected so the caller can retry/report a conflict.
 - An uncertified local view is only a cache awaiting repair and can be replaced by the quorum-chosen committed snapshot.
 
-<a id="443-写正确性"></a>
 #### 4.4.3 Write correctness
 
 A successful CAS linearizes when the accept quorum decides that Rev. Returning success additionally requires an install quorum to have saved the committed snapshot/certificate, so the commit remains recoverable after another member fails.
@@ -367,7 +349,6 @@ Two different values cannot both commit at the same Rev because:
 
 The recordSet's committed history is therefore a linear sequence. CAS `expectRev` matches the target record's last-modified Rev. If other keys advance the recordSet Rev while the target key stays unchanged, those unrelated writes do not invalidate its `expectRev`.
 
-<a id="444-读正确性"></a>
 #### 4.4.4 Read correctness
 
 Point reads use a quorum by default, without always fetching a full snapshot:
@@ -392,7 +373,6 @@ Snapshot/EnsureReady always chooses the committed head first, installs it locall
 
 Only `EnsureReady` / `Snapshot` / `Watch` establishes a complete local view. Ordinary accept stores only pending accepted state. Read repair can install one committed record without marking that recordSet complete and ready.
 
-<a id="445-watch-正确性"></a>
 #### 4.4.5 WATCH correctness
 
 WATCH uses only committed records:
@@ -404,7 +384,6 @@ WATCH uses only committed records:
 
 WATCH is therefore an incremental cache of the committed view, not the replication protocol itself. Quorum read/CAS/install still provides replication and repair.
 
-<a id="446-效率边界"></a>
 #### 4.4.6 Efficiency boundaries
 
 The current implementation prioritizes very many shards with small-to-medium recordSets:
@@ -426,7 +405,6 @@ Design constraints:
 - If a future recordSet needs frequent large-table writes, use a delta certificate based on the preceding digest or split the recordSet; do not continue relying on full-snapshot install.
 - Member readiness provides only fail-fast/liveness signals and does not change quorum calculation. With owner count 3, the runtime guarantee is one member failure from the logical shard's perspective.
 
-<a id="45-watch"></a>
 ### 4.5 WATCH
 
 WATCH operates at recordSet level. Initial frames provide reset/snapshot, followed by a bookmark marking completion of the initial view, then live deltas.
@@ -442,7 +420,6 @@ The watch token encodes local epoch, shard-view label, recordSet identity and Re
 
 The route owner also uses the shardkv watch log to wake its own process's waiters. This is not a Router watch: Router does not subscribe to routes.
 
-<a id="46-gc"></a>
 ### 4.6 GC
 
 GC addresses local storage and WATCH reset-snapshot growth, not data migration. It must preserve two boundaries:
@@ -460,7 +437,6 @@ Compactor rules:
 
 GC does not trigger migration. Active records are still reached through the namespace's authority and reads/writes to the same shard.
 
-<a id="5-membership-变更"></a>
 ## 5. Membership changes
 
 For one shard key:
@@ -495,10 +471,8 @@ A membership transition is not a global migration job. Registry does not scan ev
 
 On first access to an old recordSet, its old membership certificate can prove the old head; that same operation then repairs it to current `WriteSets`. Joint/cutover therefore needs no cross-shard scan. After cutover, `old_grace` remains a read-only `ReadSets` source so empty active replicas cannot incorrectly declare a cold recordSet absent. Cutover must still be controlled: all new writes during active/next joint mode must use the joint view. If some members write using only next early, the protocol no longer guarantees intersection across membership quorums.
 
-<a id="6-node_link"></a>
 ## 6. node_link
 
-<a id="61-接入redirect-与-relay"></a>
 ### 6.1 Connection, redirect and relay
 
 A node can connect to any Registry member. The receiving member first resolves its node owner set with `LocateN(node_id,N)`.
@@ -528,7 +502,6 @@ Relay must try owners sequentially in owner order; the first successful responde
 
 During `old_grace`, old members are excluded from owner sets but can remain `link_owner` and receive forwarded commands. When the node disconnects and reconnects, it resolves owners using current membership.
 
-<a id="62-node-记录"></a>
 ### 6.2 Node records
 
 Node_link maintains these recordSets:
@@ -557,7 +530,6 @@ The node returns CmdCreate `cmd_ack` only after claiming the unique launch attem
 
 High-frequency usage and liveness are not projected to node_list. That directory contains registration-time labels/capacity/endpoints/runtime and draining changes. The node owner's current node-link connection is the sole liveness authority. Before create/build dispatch, the route owner checks connectivity; failed candidates enter the current placement's exclusion set before reselection. Failure to persist the node_link profile rejects the subscription. A node_list projection failure does not disconnect node_link; later register/heartbeat/resync retries the pending directory projection.
 
-<a id="63-增量订阅"></a>
 ### 6.3 Incremental subscriptions
 
 When starting a subscription, the node owner can supply an opaque revision string. The current format is `source_fingerprint:seq`, parsed privately by the node; callers must treat the token as opaque. Matching fingerprints and available changelog history permit incremental replay; otherwise a full resync occurs. A randomly staggered 1–6 hour full-resync cycle was a design recommendation, not an implemented periodic timer. Current full sync is driven by connection/resume-token and replay-window conditions.
@@ -566,7 +538,6 @@ Before full subscription starts, the nodelink owner captures that node's sandbox
 
 Build projections do not use the route replay window. Every node-link session requires `BuildSyncBegin → BuildUpsert* → BuildSyncEnd`. The snapshot contains all cluster Builds still retained in node SQLite: registered/waiting/building and ready/error within retention. The node subscribes to live deltas before ranging the snapshot, so Upsert/Delete during synchronization follows End without being lost. The nodelink owner likewise cleans only post-registration baseline refs captured before connection establishment, still bound to the exact `(NodeID, BuildID)` at End, and absent from this snapshot. A Registry-owned `BuildStarting` ambiguous dispatch intent is not a node projection and cannot be deleted by an empty snapshot. Reconnection repairs a lost live Delete, while newly registered/rebound work remains protected from an older snapshot. Missing Begin/End, duplicate brackets or Bookmark before End fails closed. Registry has no independent Build terminal TTL.
 
-<a id="7-node_list"></a>
 ## 7. node_list
 
 Node_list is a special namespace with a fixed shard key:
@@ -597,10 +568,8 @@ The node_list owner shard is fully replicated. Placer neither needs nor is allow
 
 When node_list is not ready, it may list + repair only from the same node_list owner set. It cannot scan across node shards or create a second authoritative propagation path by rebuilding from node_link.
 
-<a id="8-route_link"></a>
 ## 8. route_link
 
-<a id="81-身份"></a>
 ### 8.1 Identity
 
 - Route lookup key: `(group, route_key)`.
@@ -610,7 +579,6 @@ When node_list is not ready, it may list + repair only from the same node_list o
 - Node execution identity: `node_sandbox_id = <sandbox_id>-g<sandbox_generation>`. The first candidate is g0; candidate conflict/failure or cross-node migration consumes the next generation. Same-node resume keeps the current NodeSandboxID. NodeSandboxID is an opaque node-local ID; Registry ownership maps are authoritative, and components do not reverse-parse the string.
 - Node events carry no group/route_key/SandboxGeneration. Registry looks up `(node_id,node_sandbox_id)` to recover stable identity and group context. There is no cross-group SandboxID index.
 
-<a id="82-route-记录"></a>
 ### 8.2 Route record
 
 | Field | Meaning |
@@ -645,7 +613,6 @@ ready/paused/reserved -> dead/tombstone
 
 An actually emptied node, a killed sandbox, or a sandbox missing after restart converges through dead-route cleanup. A later explicit create/recovery Reserve can place it again. A host/conductor restart alone does not mean every durable paused or recovering sandbox is missing; the node's reconciled report and exact ownership determine cleanup.
 
-<a id="83-reserve"></a>
 ### 8.3 Reserve
 
 ```text
@@ -669,10 +636,8 @@ CmdConnect/CmdExecSession `CmdID` correlates only the current Command and ACK wa
 
 The nodelink owner and route owner jointly converge orphan cleanup. They first look up `(node_id,node_sandbox_id)`. If the ownership entry is absent, or its `(group,route_key)` is gone/replaced by another instance, they send delete/kill to that node. This does not traverse the data plane or depend on access tokens or global sandbox-ID lookup. Full sync, orphan cleanup and node reclamation compare complete `(group,route_key,sandbox_id,node_sandbox_id,sandbox_generation,profile,api_secret_fingerprint)` ownership so late events cannot delete new records across generations or credential bindings.
 
-<a id="9-placer_link-与-placer"></a>
 ## 9. placer_link and placer
 
-<a id="91-placer-发现"></a>
 ### 9.1 Placer discovery
 
 ```text
@@ -696,7 +661,6 @@ try candidates in order until success
 
 Registry does not apply P2C to placers. P2C belongs inside placer, where it chooses a target from node candidates.
 
-<a id="92-importsource"></a>
 ### 9.2 Import/source
 
 ```text
@@ -722,14 +686,12 @@ node_link key_pair cache refreshed
 
 `source_id` is the importer's sole execution unit. Placers configured with the same `source_id` compete for one `placer_link` source-execution record. Provider point lookups may deduplicate across sources; an Importer Range does not combine multiple sources into one view.
 
-<a id="93-group-provider-边界"></a>
 ### 9.3 Group provider boundary
 
 Registry does not implement `SandboxGroupProvider` / `SandboxGroupImporter`. Group configuration, placement hints, APISecret and ManifestKey belong to placer/provider. Registry retains only execution state and the credential-pair cache needed by each node.
 
 Once a group disappears from its provider, new Place/verify-key calls treat it as nonexistent. Credential pairs already cached in node_link are not proactively deleted; Registry/node TTLs evict them. Credential pairs already copied into existing sandbox/build records are unaffected.
 
-<a id="10-router-1"></a>
 ## 10. Router
 
 Router is the stateless northbound E2B control/data entry. Registry supplies authenticated, group-scoped route and Build state through the protocols defined in this document; the node remains lifecycle/resource authority. Public clients retain stable SandboxID, while the selected node target may change. Protected route credentials must not be exposed through public observation or ordinary watch/list responses (§11).
@@ -738,7 +700,6 @@ The complete [Router contract](cluster-router.md) owns cache keys/revisions, mem
 
 Read these as two ends of one protocol: this document defines what Registry accepts, persists and returns; the Router guide defines how its caller uses those results. Neither ordinary data lookup nor stale-route retry is permission to create an unknown Sandbox, skip authentication, or replay admitted exec bytes.
 
-<a id="11-密钥与鉴权"></a>
 ## 11. Keys and authentication
 
 A group/tenant has two root credential domains with separate purposes:
@@ -779,7 +740,6 @@ ForwardAccessToken and ExecAccessToken both use `kat1`, with separate audiences.
 
 When Registry materializes a protected route from a node route event, it accepts APISecret, both root fingerprints, StableID, ServiceSecret and Envd/Traffic/Forward tokens. It does not accept raw ManifestKey or the existing node-link wire's MmdsSecret intended for node proxy/MMDS. Registry currently stores protected route credentials as plaintext structured fields without an extra encryption layer. They may be returned only by protected Reserve/Resolve to trusted routers, never by ordinary route watch/list, public create/get/list, logs or observation interfaces. Reserve separates `kuasar-sandbox.credentials` from ordinary config at entry, freezes it only with the RESERVED record, temporarily encodes it before CmdCreate, and clears it after READY.
 
-<a id="12-build"></a>
 ## 12. Build
 
 Build records live in the group-scoped `route_link` `build` recordSet. The node owns durable registration/execution claims and usage; its node-link owner holds the current connectivity/profile projection for Registry checks.
@@ -820,7 +780,6 @@ BuildUpsert/Delete carries only a node-local projection. The nodelink owner obta
 
 Ready/error status, transient TemplateID, name/alias and local/Registry Build lists remain available only within the node's `builder.terminal_ttl` retention window. A canonical TemplateID self-encodes profile, kind and portable artifact ref, so it can be reused for img/sbx/snp Create after the Build row is deleted. Create does not recover IMG config from old Build projections or metadata; canonical `fromTemplate` likewise needs no old projection. Registry has no separate timer and does not extend node retention. During overlapping connections, Registry accepts Build frames only from the current active node-link session. Session replacement and Build store mutation share one NodeID fence so an old connection cannot delete a new generation's same-ID Build. During reconnect snapshot, the node still interleaves bounded command ACKs/heartbeats through the same stream writer. Live Build changes stay buffered in their independent subscription until after `build_sync_end`.
 
-<a id="13-状态所有权与灾备边界"></a>
 ## 13. State ownership and disaster-recovery boundaries
 
 The node is the authority for sandbox/build execution state. Sandbox/build records in `route_link`, reverse ownership in `node_link`, and admission-related projections derive from node facts for routing, queries or scheduling; operator files cannot create or transfer them. A terminal Build remains a projection of one node execution. Its produced template/manifest is durably reusable; the BuildRecord is not.
@@ -833,7 +792,6 @@ Manifest Bundle does not change migration-token/KMT wire format: the token still
 
 Sandbox-group configuration, placement hints, APISecret and ManifestKey remain the placer/provider's responsibility for persistence and disaster recovery. Before #33/#34 is implemented, complete Registry execution-state loss has no operator runtime-import fallback. It must be reported as unrecoverable through the current protocol, instead of constructing route/build ownership that could conflict with nodes.
 
-<a id="14-可靠性"></a>
 ## 14. Reliability
 
 | Event | Behavior |
@@ -849,7 +807,6 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 | Membership change | active/next joint write quorums + old_grace read-only certificates/snapshots |
 | Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. If Registry execution state is lost, provider data, portable templates/manifests and future migration-token routes (#33) are the disaster-recovery inputs, not an execution-row import |
 
-<a id="15-性能"></a>
 ## 15. Performance
 
 - Hot data path: a complete node-target cache hit forwards directly to the node, including paused/starting, without Registry access.
@@ -858,7 +815,6 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 - Very many nodes: node_link shards by node_id; node_list holds only a low-frequency directory, not high-frequency usage.
 - Membership changes: no global promoter; node reports, group requests, source imports and read repair drive convergence.
 
-<a id="16-集群-stub-e2e"></a>
 ## 16. Cluster stub e2e
 
 `node-stub-ctl` is this repository's cluster e2e node stub. It connects to Registry using real node_link; one process can simulate multiple nodes without starting microVMs. Each process has distinct admin, API and Data listeners. Ready JSON returns `admin`, `api`, `data`, and each node registers APIEndpoint and DataEndpoint. It simulates node control behavior except microVM/application execution:
@@ -872,7 +828,6 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 
 `make test-e2e` does not build binaries: it passes `E2E_BIN` (defaulting to the sibling project repository’s assembled binary directory) to `test/e2e/run_all.sh` and requires that multi-repository artifact set beforehand. For the local stub-only flow, run `make build` followed by `make test-e2e-cluster-stub`; this target uses the local `BINDIR` to start real `cluster-ctl registry/router/placer` and `node-stub-ctl`. See [Makefile](../Makefile). `test/e2e/e2e_cluster_stub.sh` covers N=1 and multi-member Registry, joint/old_grace membership cutover, group import, key distribution, explicit create/Reserve, stable-SandboxID CmdConnect, SandboxID↔NodeSandboxID translation, control/build reaching the API listener, data/exec reaching the Data listener, ExecSession Reserve/CmdExecSession issuance, `service=exec` KAT rejection/two-hop validation and the second-hop buffered tunnel, route cache, BuildRegister, orphan-route cleanup, reconnect full-sync convergence after a lost Build Delete, and emptied-node convergence. The stub's `reboot-empty` deliberately empties simulated state; it is not proof that real conductor startup deletes durable SQLite rows.
 
-<a id="17-see-also"></a>
 ## 17. See also
 
 - [Cluster router](cluster-router.md) — Router ingress, route cache and data forwarding.
