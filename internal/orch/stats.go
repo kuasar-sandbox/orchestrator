@@ -81,13 +81,18 @@ func (o *Orchestrator) readResourceStats(ctx context.Context, sb *types.Sandbox)
 
 // Keep the existing object/run fence internal. A read racing pause, deletion,
 // restart or binding reuse cannot publish the former runtime as the current one.
+// Paused replacements may share paths, an empty RunID and CreatedUnix; retain
+// the existing insert-bound credentials and identity in this check as well.
 func (o *Orchestrator) statsBindingCurrent(ctx context.Context, expected *types.Sandbox) error {
 	current, err := o.st.Get(ctx, expected.ID)
 	if err != nil {
 		return fmt.Errorf("%w: validate current binding: %v", api.ErrStatsUnavailable, err)
 	}
 	if current == nil || current.RunID != expected.RunID || current.RunDir != expected.RunDir || current.BaseDir != expected.BaseDir || current.State != expected.State ||
-		current.VswitchPort != expected.VswitchPort || current.FloatingIP != expected.FloatingIP || current.CreatedUnix != expected.CreatedUnix {
+		current.VswitchPort != expected.VswitchPort || current.FloatingIP != expected.FloatingIP || current.CreatedUnix != expected.CreatedUnix ||
+		current.Profile != expected.Profile || current.StableIDValue != expected.StableIDValue || !sameClusterSandboxOwner(current.Cluster, expected.Cluster) ||
+		current.APISecret != expected.APISecret || current.ManifestKey != expected.ManifestKey || current.ServiceSecret != expected.ServiceSecret ||
+		current.EnvdAccessToken != expected.EnvdAccessToken || current.TrafficAccessToken != expected.TrafficAccessToken || current.ForwardAccessToken != expected.ForwardAccessToken {
 		return api.ErrStatsUnavailable
 	}
 	return nil

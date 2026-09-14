@@ -1,6 +1,7 @@
 package configsock
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -231,5 +232,103 @@ func TestNativeStatsClientRejectsIncompleteOrOversizedBody(t *testing.T) {
 	cancel()
 	if _, err := ReadNativeStats(ctx, "/unreachable.sock", conductorextension.StatsRequest{}); !errors.Is(err, context.Canceled) {
 		t.Fatal("client lost cancellation", err)
+	}
+}
+
+func TestNativeStatsOperationTimeoutReturns503(t *testing.T) {
+	t.Parallel()
+	registry := NewRegistry()
+	stopped := make(chan struct{})
+	socket, _ := startTestServer(t, Deps{Plugins: registry, RouteSource: nativeStatsSource{}, Stats: nativeStatsFunc(func(ctx context.Context, _ conductorextension.StatsRequest) ([]conductorextension.SandboxStats, error) {
+		<-ctx.Done()
+		close(stopped)
+		return nil, ctx.Err()
+	})})
+	registerStatsPlugin(t, socket, registry)
+	_, err := ReadNativeStats(context.Background(), socket, conductorextension.StatsRequest{SandboxIDs: []string{"exact"}, Sections: []string{"usage"}})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatal("operation timeout lost its HTTP error response", err)
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("timeout did not cancel the source read")
+	}
+}
+
+func TestNativeStatsIncompleteBodyTimeoutReturns503(t *testing.T) {
+	t.Parallel()
+	registry := NewRegistry()
+	var calls atomic.Int64
+	socket, _ := startTestServer(t, Deps{Plugins: registry, RouteSource: nativeStatsSource{}, Stats: nativeStatsFunc(func(context.Context, conductorextension.StatsRequest) ([]conductorextension.SandboxStats, error) {
+		calls.Add(1)
+		return nil, errors.New("incomplete request reached native source")
+	})})
+	registerStatsPlugin(t, socket, registry)
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(conductorextension.StatsTimeout + 3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n", PathTelemetryStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil || response.StatusCode != http.StatusContinue {
+		t.Fatal("handler did not begin reading", response, err)
+	}
+	response.Body.Close()
+	response, err = http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal("request timeout lost its HTTP response", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	var failure struct{ Message string }
+	if err != nil || response.StatusCode != http.StatusServiceUnavailable || json.Unmarshal(body, &failure) != nil || failure.Message == "" {
+		t.Fatal("timeout returned an incomplete error", response.StatusCode, string(body), err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("incomplete body reached the native reader")
+	}
+}
+
+func TestNativeStatsSlowResponseIsBounded(t *testing.T) {
+	t.Parallel()
+	finished := make(chan struct{})
+	socket := telemetryTestSocket(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeStatsResponse(w, http.StatusOK, []byte(strings.Repeat(" ", conductorextension.MaxStatsResponseBytes)))
+		close(finished)
+	}))
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(nativeStatsReplyTimeout + 3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Do not drain the actual UDS until the bounded writer has returned.
+	select {
+	case <-finished:
+	case <-time.After(nativeStatsReplyTimeout + 2*time.Second):
+		t.Fatal("non-reading client retained the response writer")
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	_, err = io.Copy(io.Discard, response.Body)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal("stalled write did not terminate with an incomplete response", err)
 	}
 }

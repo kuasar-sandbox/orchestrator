@@ -141,8 +141,11 @@ No tenant API-key collection, new permission model or socket is introduced.
 Each batch contains 1–64 distinct nonempty SandboxIDs and 1–3 distinct
 sections from `resource`, `traffic`, `usage`. Usage options are accepted only
 when usage is selected. Request bodies are limited to 64 KiB, responses to
-4 MiB and total time to 5 seconds; underlying native readers retain their
-smaller limits. At most eight batch objects are read concurrently across
+4 MiB and source work to 5 seconds; the config-socket response has a separate
+one-second write budget, including the 503 response after a read timeout.
+The local client allows both budgets; an earlier caller deadline still cancels
+the call. Underlying native readers retain their smaller limits.
+At most eight batch objects are read concurrently across
 batch calls. Parent cancellation and lease revocation reach source reads;
 slots and connections are released. Invalid requests return 400, missing
 objects 404, conflicting lifecycle states 409 and unavailable reads 503,
@@ -150,7 +153,9 @@ using the same domain errors as the public APIs.
 
 These values are fetched on demand, outside the RouteEntry subscription.
 Public reads, local batches and in-process extensions share conductor's
-domain implementation and final current-binding checks. Neither stats nor
+domain implementation and final current-binding checks, including the existing
+insert-bound credentials and system identity when a paused SandboxID is reused.
+Neither stats nor
 telemetry creates a Create/Resume barrier. The density benchmark measures
 bounded reads and FD/goroutine behavior without a machine-specific gate;
 native sampling and history append algorithms remain unchanged.

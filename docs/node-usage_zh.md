@@ -120,13 +120,16 @@ mode 0600 保持既有可信本机 plugin 边界; 普通 API 请求仍需要 API
 
 每批包含 1–64 个不重复的非空 SandboxID, 并从 `resource`、`traffic`、`usage` 选择
 1–3 个不重复 section. 仅选中 usage 时接受 usage 参数. 请求 body 上限 64 KiB,
-响应上限 4 MiB, 总超时 5 秒; 底层原生 Reader 保留各自更小的上限. 所有 batch
+响应上限 4 MiB, 来源读取超时 5 秒; config socket 响应另有一秒写入上限,
+包括读取超时后的 503 响应. 本机 client 为两段操作保留时间; 调用方更早的截止
+时间仍会取消请求. 底层原生 Reader 保留各自更小的上限. 所有 batch
 调用之间最多并发读取八个对象. 父 context 取消和 lease 撤销会传递到底层读取,
 并释放槽位和连接. 无效请求返回 400, 对象不存在返回 404, 生命周期状态冲突返回
 409, 读取不可用返回 503, 与公开 API 共用同一领域错误体系.
 
 这些值按需读取, 不进入 RouteEntry 订阅流. 公开读取、本机 batch 和进程内
-extension 共用 conductor 领域实现及最终当前绑定校验. Stats 和 telemetry 均不
+extension 共用 conductor 领域实现及最终当前绑定校验, 包括 paused SandboxID
+被复用时既有的插入绑定凭据和系统身份校验. Stats 和 telemetry 均不
 创建 Create/Resume barrier. 密度 benchmark 测量有界读取及 FD/goroutine 行为,
 不设置机器相关门槛; 原生采样和 history append 算法保持不变.
 

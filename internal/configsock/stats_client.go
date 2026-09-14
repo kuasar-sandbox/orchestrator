@@ -26,7 +26,7 @@ func ReadNativeStats(ctx context.Context, socket string, query conductorextensio
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := HTTPClientWithTimeout(socket, conductorextension.StatsTimeout).Do(req)
+	resp, err := HTTPClientWithTimeout(socket, conductorextension.StatsTimeout+nativeStatsReplyTimeout).Do(req)
 	if err != nil {
 		return nil, err
 	}

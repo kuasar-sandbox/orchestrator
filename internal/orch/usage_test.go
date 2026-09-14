@@ -187,3 +187,51 @@ func TestUsageStatsRejectsReplacedBaseBinding(t *testing.T) {
 		t.Fatal("accepted a sample after its base binding changed", string(body), err)
 	}
 }
+
+func TestUsageStatsRejectsPausedIdentityReuse(t *testing.T) {
+	for _, change := range []string{"tenant", "stable-label", "cluster-owner"} {
+		t.Run(change, func(t *testing.T) {
+			o := testOrch(t)
+			expected, _, before := usageSandbox(t, o)
+			ctx := context.Background()
+			key := mintTestAPIKey(t, expected.APISecret)
+			if !ownsSandbox(expected, key) {
+				t.Fatal("initial read was not authorized")
+			}
+			// Resume a read after its initial ownership check. A delete and
+			// insert may reuse every path and the second-resolution timestamp;
+			// the saved file remains readable throughout the replacement.
+			replacement := *expected
+			switch change {
+			case "tenant":
+				replacement.APISecret = strings.Repeat("3", 64)
+			case "stable-label":
+				replacement.StableIDValue = "replacement-label"
+			case "cluster-owner":
+				replacement.Cluster = &types.ClusterSandboxContext{Group: "/replacement", RouteKey: "route"}
+			}
+			materializeTestSandboxCredentials(t, &replacement)
+			if err := o.st.Delete(ctx, expected.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.st.Put(ctx, &replacement); err != nil {
+				t.Fatal(err)
+			}
+			if body, err := o.readUsageStats(ctx, expected, conductorextension.UsageQuery{}); body != nil || !errors.Is(err, api.ErrStatsUnavailable) {
+				t.Fatal("published usage under a replaced identity", string(body), err)
+			}
+			if change == "tenant" {
+				if _, err := o.UsageStats(ctx, expected.ID, key, conductorextension.UsageQuery{}); !errors.Is(err, api.ErrNotFound) {
+					t.Fatal("old tenant still owns reused SandboxID", err)
+				}
+			}
+			if _, err := o.UsageStats(ctx, replacement.ID, mintTestAPIKey(t, replacement.APISecret), conductorextension.UsageQuery{}); err != nil {
+				t.Fatal("current owner could not read saved usage", err)
+			}
+			after, err := os.ReadFile(filepath.Join(expected.BaseDir, expected.ID+".usage"))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("read changed saved usage", err)
+			}
+		})
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
@@ -15,6 +16,10 @@ import (
 )
 
 const PathTelemetryStats = "/internal/plugin/telemetry/stats"
+
+// Source work has its own deadline. Reserve bounded time to deliver its result,
+// including a 503 after that deadline has expired.
+const nativeStatsReplyTimeout = time.Second
 
 type NativeStatsReader = conductorextension.StatsReader
 
@@ -48,9 +53,9 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 	stop := context.AfterFunc(lease, cancel)
 	defer stop()
 	controller := http.NewResponseController(w)
-	deadline := time.Now().Add(conductorextension.StatsTimeout)
+	deadline, _ := ctx.Deadline()
 	_ = controller.SetReadDeadline(deadline)
-	_ = controller.SetWriteDeadline(deadline)
+	_ = controller.SetWriteDeadline(deadline.Add(nativeStatsReplyTimeout))
 	bodyClosed := make(chan struct{})
 	stopBody := context.AfterFunc(ctx, func() {
 		_ = controller.SetReadDeadline(time.Now())
@@ -67,7 +72,7 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 	const maxRequestBytes = 64 << 10
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err != nil {
-		if ctx.Err() != nil || lease.Err() != nil {
+		if ctx.Err() != nil || lease.Err() != nil || !time.Now().Before(deadline) {
 			writeStatsError(w, api.ErrStatsUnavailable)
 		} else {
 			writeStatsError(w, api.ErrBadRequest)
@@ -92,12 +97,24 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 		writeStatsError(w, fmt.Errorf("%w: native stats response encoding", api.ErrStatsUnavailable))
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(encoded)
+	writeStatsResponse(w, http.StatusOK, encoded)
 }
 
 func writeStatsError(w http.ResponseWriter, err error) {
 	status, message := api.StatsErrorStatus(err)
-	writeJSON(w, status, map[string]string{"message": message})
+	encoded, _ := json.Marshal(map[string]string{"message": message})
+	writeStatsResponse(w, status, append(encoded, '\n'))
+}
+
+func writeStatsResponse(w http.ResponseWriter, status int, body []byte) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetWriteDeadline(time.Now().Add(nativeStatsReplyTimeout))
+	defer controller.SetWriteDeadline(time.Time{})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+	// Flush the complete, length-delimited response while the deadline applies,
+	// before restoring the connection's deadline for another config-socket call.
+	_ = controller.Flush()
 }
