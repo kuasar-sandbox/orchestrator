@@ -168,6 +168,8 @@ func TestSandboxStatsReceiverUsesConductorLeaseAndBoundedBatches(t *testing.T) {
 	// The subscriber returning does not synchronize with server-side socket
 	// teardown. Wait for the actual HTTP authorization denial with a healthy
 	// source, so a source failure cannot masquerade as lease revocation.
+	// A request admitted just before teardown can instead finish with 503 when
+	// its captured lease is canceled; that is not proof of subsequent denial.
 	deadline = time.Now().Add(3 * time.Second)
 	request := conductorextension.StatsRequest{SandboxIDs: []string{"sid-00"}, Sections: []string{"usage"}, Usage: conductorextension.UsageQuery{View: "saved"}}
 	for {
@@ -175,13 +177,13 @@ func TestSandboxStatsReceiverUsesConductorLeaseAndBoundedBatches(t *testing.T) {
 		if err != nil && strings.Contains(err.Error(), "403") {
 			break
 		}
-		if err != nil || time.Now().After(deadline) {
+		if (err != nil && !strings.Contains(err.Error(), "HTTP 503")) || time.Now().After(deadline) {
 			t.Fatal("lease did not revoke native read authorization", err)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := r.read(t.Context(), "usage", []string{"sid-00"}); err == nil {
-		t.Fatal("revoked lease retained native read access")
+	if err := r.read(t.Context(), "usage", []string{"sid-00"}); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatal("revoked lease did not deny a subsequent native read", err)
 	}
 }
 
