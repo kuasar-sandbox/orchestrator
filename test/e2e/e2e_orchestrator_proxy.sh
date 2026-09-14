@@ -822,8 +822,15 @@ wait_traffic_stats "$SID" idle || { dump_logs; fail "Proxy traffic did not conve
 echo "==> PASS: Proxy master cache converged parking/egress to idle"
 
 code=$(req GET "/sandboxes/$SID/stats/resource" "$AK")
-[ "$code" = "501" ] || { cat "$WORK/resp.body"; fail "disabled resource controller stats=$code (want 501)"; }
-echo "==> PASS: resource stats reports 501 when the controller is disabled"
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "static resource stats=$code (want 200)"; }
+python3 - "$WORK/resp.body" <<'PY_RESOURCE'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+required = {"cpuCapacity", "cpuAllocatable", "memoryCapacity", "memoryHeadroom", "memoryUsed", "cpuSeconds", "timestampUnix"}
+assert set(stats) == required, stats
+assert all(stats[key] > 0 for key in required), stats
+PY_RESOURCE
+echo "==> PASS: static resource stats observes VMM memory/CPU with controller, usage and telemetry disabled"
 
 ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done

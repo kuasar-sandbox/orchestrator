@@ -420,17 +420,10 @@ type Resources struct {
 	DiskMB   int
 }
 
-// ResourceStats is a sparse snapshot sourced exclusively from the node resource
-// controller. Pointer fields distinguish an observed zero from an unavailable
-// sample; JSON must not fabricate uncollected values.
-type ResourceStats struct {
-	TimestampUnix  *int64   `json:"timestampUnix,omitempty"`
-	CPUCount       *float64 `json:"cpuCount,omitempty"`
-	CPUAllocatable *float64 `json:"cpuAllocatable,omitempty"`
-	MemUsed        *uint64  `json:"memUsed,omitempty"`
-	MemTotal       *uint64  `json:"memTotal,omitempty"`
-	MemAllocatable *uint64  `json:"memAllocatable,omitempty"`
-}
+// ResourceStats combines the native owner's effective specification and VMM
+// observations with the node's observed reservation. Pointer fields distinguish
+// an observed zero from an unavailable sample.
+type ResourceStats = conductorextension.ResourceStats
 
 type TrafficInflight struct {
 	Parking uint64 `json:"parking"`

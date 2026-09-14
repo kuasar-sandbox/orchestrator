@@ -536,7 +536,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 |---|---|---|
 | create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
-| resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
+| resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
 | metrics history | `GET /sandboxes/{SandboxID}/metrics?start=...&end=...` | 精确 SandboxID ownership、opaque live telemetry UDS 转发；不可用为 503，不 Wake/Resume；[E2B 契约](telemetry_zh.md#6-e2b-历史查询) |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
@@ -629,27 +629,28 @@ credential 读取/签发或异步 resume 任务接受失败统一对外返回脱
 两个接口都先读取 Sandbox 业务记录并验证 API key ownership;失败统一 404。它们是只读观察,
 不调用 Connect、Wake、Resume、Pause 或 envd,响应带 `Cache-Control: no-store`。
 
-`GET /sandboxes/{id}/stats/resource` 只消费 node-ctl 内置 resource controller 的当前
-reservation 和 sandbox-ctl 已上报的 host charge 样本。示例:
+resource stats 经既有 ctl socket 读取当前 sandbox-ctl owner 的最终资源规格和宿主 VMM cgroup. conductor 在有观测时组合内置 resource controller 的 reservation:
 
 ```json
 {
-  "timestampUnix": 1786482600,
-  "cpuCount": 2,
+  "cpuCapacity": 2,
   "cpuAllocatable": 0.5,
-  "memUsed": 536870912,
-  "memTotal": 2147483648,
-  "memAllocatable": 1073741824
+  "memoryCapacity": 2147483648,
+  "memoryHeadroom": 268435456,
+  "memoryReserved": 1073741824,
+  "memoryUsed": 536870912,
+  "cpuSeconds": 12.345678,
+  "timestampUnix": 1786482600
 }
 ```
 
-每个字段都可省略:未采集就不序列化,不以零值伪造。`timestampUnix` 是最近一次携带
-非零 host VMM charge 的 Settled/Heartbeat 时间;`memUsed` 是 sandboxer 报告的 VMM
-cgroup `memory.current`,不是 guest demand/working set。`memTotal` 是 Capacity;
-`memAllocatable` 是现有 API 名称,其值为 node reservation。controller 未启用为 501;
-starting 且 reservation 已存在可返回 sparse 200;paused 无 live reservation 为 409;running
-但 reservation 缺失为 503。reservation 存在而尚无 host-charge report 时仍返回其它可得字段。
-它不是 guest `/metrics` 的兼容实现。
+`cpuCapacity` 是 `capacity.cpu`,单位为核. `cpuAllocatable` 是映射到 `cpu.weight` 的既有相对调度规格,不是 fractional-core 硬 quota 或性能保证. `memoryCapacity` 是以字节表示的 `capacity.memory`. `memoryHeadroom` 是最终生效的 `resources.allocatable.memory`,表示气球控制的 headroom,与 Budget、guest free memory 和 NodeReservation 不同. `memoryReserved` 是节点实际承担的 reservation 观测;动态 controller 未启用或没有观测时省略.
+
+`memoryUsed` 读取 `memory.current`,`cpuSeconds` 读取 `cpu.stat.usage_usec / 1e6`,两者来自同一个已 pin 的宿主 VMM cgroup. 不增加 ctl 进程或 guest CPU,不扣 inactive file/balloon,也不把宿主 memory 限制在 guest capacity 内. CPU seconds 是当前来源的累计值,来源重建可以重置;生命周期累计由 native usage 负责. 原生 JSON 保留整数字节,CPU seconds 以具有微秒精度的精确十进制输出. 消费端转为二进制浮点时可能损失精度.
+
+各宿主字段分别保留有效性:合法零值正常返回,缺失的 memory 或 CPU 观测分别省略. `timestampUnix` 是实际读取时间;两个宿主字段都没有观测时省略,不把 heartbeat/cache 时间刷新为当前时间. 没有 live VMM 时仍可从 owner 读取最终规格,但不伪造当前宿主观测. starting/running 没有可达 owner 为 503;paused 和其它没有当前 runtime 的状态为 409. 与 runtime 或 binding replacement 并发的读取失效.
+
+静态/动态资源控制、usage 关闭、telemetry 停止时均可独立使用. 读取不 Wake,不采样/保存 usage,不调用 guest 或 Cloud Hypervisor,不修改控制策略,也不创建 resource 历史. 原生 API 的 `cpuCount`、`memTotal`、`memAllocatable` 和 `memUsed` 已删除;旧的 reservation 值 `memAllocatable` 由 `memoryReserved` 替代,`memoryHeadroom` 单独表达 headroom. E2B `/metrics` 和 list/SKU 兼容字段保持原有含义.
 
 `GET /sandboxes/{id}/stats/traffic` 返回最终 node proxy 已鉴权接纳的逻辑 ingress:
 

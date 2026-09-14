@@ -457,7 +457,7 @@ wait_resource_stats() { # $1=sid
         if [ "$code" = "200" ] && python3 - "$WORK/resp.body" <<'PY'
 import json, sys
 stats = json.load(open(sys.argv[1]))
-allowed = {"timestampUnix", "cpuCount", "cpuAllocatable", "memUsed", "memTotal", "memAllocatable"}
+allowed = {"cpuCapacity", "cpuAllocatable", "memoryCapacity", "memoryHeadroom", "memoryReserved", "memoryUsed", "cpuSeconds", "timestampUnix"}
 if not stats or set(stats) - allowed:
     raise SystemExit(1)
 required = allowed

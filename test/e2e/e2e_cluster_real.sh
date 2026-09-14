@@ -986,8 +986,15 @@ run_cluster_flow() {
     step "PASS: explicit create -> SID route -> real envd /health ($code)"
 
     code="$(router_req GET "/sandboxes/$sid/stats/resource" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
-    [ "$code" = "501" ] || { cat "$WORK/router-resp.body"; fail "disabled cluster resource controller stats=$code (want 501)"; }
-    step "PASS: cluster stats control path reached the node (resource controller disabled -> 501)"
+    [ "$code" = "200" ] || { cat "$WORK/router-resp.body"; fail "static cluster resource stats=$code (want 200)"; }
+    python3 - "$WORK/router-resp.body" <<'PY_RESOURCE'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+required = {"cpuCapacity", "cpuAllocatable", "memoryCapacity", "memoryHeadroom", "memoryUsed", "cpuSeconds", "timestampUnix"}
+assert set(stats) == required, stats
+assert all(stats[key] > 0 for key in required), stats
+PY_RESOURCE
+    step "PASS: cluster stats control path returned current VMM memory/CPU with the resource controller disabled"
 
     step "checking group-local sandbox list through router"
     code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"

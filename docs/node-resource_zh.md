@@ -341,13 +341,15 @@ InitialBudget 必须同时满足:
 `ResourceProbe.Allocated` 和 cluster projected memory load 使用
 `reservedMemory`,不是 host charge。E2B `memoryMB` 继续表示 Capacity/SKU。
 
-per-sandbox resource stats 中:
+per-sandbox resource stats 读取当前 sandbox-ctl owner,独立于 controller heartbeat/reservation 路径:
 
-- `memTotal` 是 Capacity。
-- `memAllocatable` 是现有 API 名称,值为 NodeReservation。
-- `memUsed` 是 HostMemoryCurrent/VMM cgroup charge。
+- `cpuCapacity`: 生效 capacity,单位为核;`cpuAllocatable`: 映射到 `cpu.weight` 的相对调度规格,不表示 fractional-core 硬 quota 或性能保证.
+- `memoryCapacity`: 生效 Capacity 字节数;`memoryHeadroom`: 最终 `resources.allocatable.memory`,表示气球 headroom,不是 Budget、guest free memory 或 NodeReservation.
+- `memoryReserved`: 动态 controller 有观测时的当前 NodeReservation,否则省略.
+- `memoryUsed`: 宿主 VMM `memory.current`;`cpuSeconds`: 同一个 cgroup 的 `cpu.stat.usage_usec / 1e6`. 不额外增加 ctl/guest CPU,不扣 inactive-file/balloon,不按 guest capacity 截断.
+- `timestampUnix`: 实际观测时间. 缺失的宿主字段分别省略,合法零值仍可见. 来源重建时 CPU seconds 可以重置;native usage 负责生命周期累计.
 
-`memUsed` 不是 DemandMemory,也不参与 RequestBudget、admission 或 recovery charge。
+静态/动态模式以及 usage 或 telemetry 关闭时均可读取. 读取不修改 RequestBudget、admission、recovery charge、heartbeat 采样和已有 build-phase reservation 释放 fence. 原生 API 删除 `cpuCount`/`memTotal`/`memAllocatable`/`memUsed`,reservation 和 headroom 使用各自明确名称. [Node §4.1.1](node_zh.md#411-即时-resource--traffic-stats) 定义响应有效性、错误和数值精度. E2B 兼容 metrics 保持自己的字段名和含义.
 
 ## 8. 可靠性
 

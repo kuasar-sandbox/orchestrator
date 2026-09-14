@@ -4,6 +4,7 @@ import conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/
 
 type Extension = conductorextension.Extension
 type Host = conductorextension.Host
+type ResourceStats = conductorextension.ResourceStats
 type APIWrapper = conductorextension.APIWrapper
 type SandboxHook = conductorextension.SandboxHook
 type BuildHook = conductorextension.BuildHook
