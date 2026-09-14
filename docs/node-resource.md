@@ -289,7 +289,7 @@ Per-sandbox resource statistics use the current sandbox-ctl owner independently 
 - `memoryUsed`: host VMM `memory.current`; `cpuSeconds`: the same cgroup's `cpu.stat.usage_usec / 1e6`. No ctl/guest CPU addition, inactive-file/balloon subtraction or guest-capacity clipping occurs.
 - `timestampUnix`: actual observation time; missing host fields are independently omitted and valid zeros remain visible. A source rebuild may reset CPU seconds; native usage owns lifecycle accumulation.
 
-These reads work in static/dynamic mode with usage or telemetry disabled. They do not alter RequestBudget, admission, recovery charge, heartbeat sampling or the existing build-phase reservation release fence. The native API removes `cpuCount`/`memTotal`/`memAllocatable`/`memUsed`; reservation and headroom now have separate explicit names. [Node §4.1.1](node.md#411-即时-resource--traffic-stats) defines response validity, errors and numeric precision. E2B compatibility metrics keep their own field names and meanings.
+These reads work in static/dynamic mode with usage or telemetry disabled. They do not alter RequestBudget, admission, recovery charge, heartbeat sampling or the existing build-phase reservation release fence. The native API removes `cpuCount`/`memTotal`/`memAllocatable`/`memUsed`; reservation and headroom now have separate explicit names. [Node §4.1.1](node.md#411-instantaneous-resource-and-traffic-stats) defines response validity, errors and numeric precision. E2B compatibility metrics keep their own field names and meanings.
 
 ## 8. Reliability
 
