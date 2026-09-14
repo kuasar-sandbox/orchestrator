@@ -95,4 +95,19 @@ if PATH="$TMP/bin:$PATH" FAKE_MANIFEST="$OUTSIDE_COMPONENT_MANIFEST" \
   exit 1
 fi
 
+REVISION_MANIFEST="$(printf '%s' "$FAKE_MANIFEST" | base64 -d \
+  | sed 's/preview.20260831/preview.20260831.1/g' | base64 -w0)"
+PATH="$TMP/bin:$PATH" FAKE_MANIFEST="$REVISION_MANIFEST" \
+  bash "$SCRIPT_DIR/validate-preview-line.sh" \
+    orchestrator v1.2.3-preview.20260831.1 \
+    release-v9.8.7-preview.20260831.1 "$AGGREGATE_SHA"
+if PATH="$TMP/bin:$PATH" FAKE_MANIFEST="$REVISION_MANIFEST" \
+  bash "$SCRIPT_DIR/validate-preview-line.sh" \
+    orchestrator v1.2.3-preview.20260831.2 \
+    release-v9.8.7-preview.20260831.1 "$AGGREGATE_SHA" \
+    >/dev/null 2>&1; then
+  echo "test-preview-line: accepted mismatched revisions" >&2
+  exit 1
+fi
+
 echo "test-preview-line: PASS"
