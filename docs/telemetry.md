@@ -576,7 +576,7 @@ GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/confi
 GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
-bash test/e2e/e2e_telemetry_backends.sh # requires Go, Docker and exact component sources
+bash test/e2e/e2e_telemetry_backends.sh # source: Go + Docker; installed package: BIN + Docker
 make test vet build
 make test-e2e # assembled project BIN and real KVM host required
 ```
@@ -585,17 +585,27 @@ The component-owned backend case creates disposable Prometheus 3.5.0 and
 ClickHouse 25.8 containers from pinned manifest digests, publishes loopback-only
 ports, records actual versions and image identities, and removes its containers
 and volumes on exit. Both engines and every named case are required; missing
-prerequisites, skips and failures are errors. Set `TELEMETRY_SOURCE_ROOT` only
-when sources are outside the ordinary source/assembled layout, and optionally
-`TELEMETRY_BACKEND_OUT_DIR` for retained JSON test events and engine logs. The
-case runs from `test/e2e/run_all.sh` in capable source CI. It creates/drops only
-five uniquely named standard-exporter tables per ClickHouse fixture, and the
-Prometheus test data exists only in the disposable server.
+prerequisites, skips and failures are errors. Source CI locates the exact sibling
+checkout from the assembled `BIN` directory; missing sources remain an error.
+Set `TELEMETRY_SOURCE_ROOT` only for another source layout. The same case runs
+from `test/e2e/run_all.sh` in source and exact-assets validation. Exact-assets uses
+the shipped `BIN/node-ctl`, without Go or rebuilding component sources.
+`TELEMETRY_BACKEND_OUT_DIR` optionally selects retained configurations, JSON test
+events, executable hashes and engine logs; CI defaults to its uploaded metadata
+directory. Fixture tables and Prometheus samples exist only in disposable
+containers, whose volumes are removed on exit.
+
+Both layouts run the installed node-ctl with a trusted infrastructure OTLP
+fixture, native batch/queue, the standard remote exporter and the matching Reader
+through the private E2B query UDS. Assertions cover exact SID/source isolation,
+StableID as a label only, independent MAX, inclusive boundaries, incomplete
+buckets, no Gauge extension, no local DB and clean shutdown. This backend case
+does not replace the real guest/conductor authentication and namespace cases.
 
 Coverage includes actual native deployment startup, name/unit/resource-label
 conversion, all metric kinds, duplicate/out-of-order samples, raw/MAX edges,
 gaps, exact SID, local/remote fan-out and accepted batches after route deletion.
-It also builds and executes node-ctl and custom-telemetry from the exact sources,
+Source validation additionally builds and executes node-ctl and custom-telemetry from the exact sources,
 passes sealed bootstrap, queries a non-E2B metric from real Prometheus through
 the actual Plugin lease/query UDS, and verifies query-only cleanup with no
 Collector graph or local DB. Ordinary unit invocations may skip these external

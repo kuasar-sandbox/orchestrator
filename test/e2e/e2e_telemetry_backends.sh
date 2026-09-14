@@ -4,22 +4,56 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ci_mode=""
+if [ -n "${KUASAR_CI_DIR:-}" ]; then
+    ci_mode="$(python3 - "$KUASAR_CI_DIR/run.tsv" <<'PY'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1]), delimiter='\t'))
+assert len(rows) == 1 and rows[0]['mode'] in ('source', 'exact-assets'), 'invalid CI execution mode'
+print(rows[0]['mode'])
+PY
+)"
+fi
+if [ -n "${BIN:-}" ]; then
+    BIN="$(cd "$BIN" && pwd)"
+    [ -x "$BIN/node-ctl" ] || { echo 'FAIL: BIN/node-ctl is required' >&2; exit 1; }
+fi
 TELEMETRY_SOURCE_ROOT="${TELEMETRY_SOURCE_ROOT:-}"
-if [ -z "$TELEMETRY_SOURCE_ROOT" ]; then
-    for candidate in "$SCRIPT_DIR/../.." "$SCRIPT_DIR/../../../../orchestrator"; do
+if [ "$ci_mode" = exact-assets ]; then
+    # Release validation runs the shipped binary without rebuilding from any
+    # adjacent checkout. The binary/backend acceptance below is still required.
+    TELEMETRY_SOURCE_ROOT=""
+elif [ -z "$TELEMETRY_SOURCE_ROOT" ]; then
+    candidates=("$SCRIPT_DIR/../..")
+    # Source CI invokes the assembled owner suite and supplies platform/bin/ARCH,
+    # just as the existing custom Proxy and guest telemetry cases expect.
+    if [ -n "${BIN:-}" ]; then candidates+=("$BIN/../../../orchestrator"); fi
+    for candidate in "${candidates[@]}"; do
         if [ -f "$candidate/internal/telemetry/deploy_integration_test.go" ]; then
             TELEMETRY_SOURCE_ROOT="$(cd "$candidate" && pwd)"
             break
         fi
     done
 fi
-[ -f "$TELEMETRY_SOURCE_ROOT/internal/telemetry/deploy_integration_test.go" ] \
-    || { echo 'FAIL: exact orchestrator sources required (TELEMETRY_SOURCE_ROOT)' >&2; exit 1; }
-for tool in go docker curl python3; do
+if [ "$ci_mode" = source ] || [ -n "$TELEMETRY_SOURCE_ROOT" ]; then
+    [ -f "$TELEMETRY_SOURCE_ROOT/internal/telemetry/deploy_integration_test.go" ] \
+        || { echo 'FAIL: exact orchestrator sources required (TELEMETRY_SOURCE_ROOT)' >&2; exit 1; }
+    command -v go >/dev/null || { echo 'FAIL: Go is required for source validation' >&2; exit 1; }
+elif [ -z "${BIN:-}" ]; then
+    echo 'FAIL: BIN is required for validation without component sources' >&2
+    exit 1
+fi
+for tool in docker curl python3; do
     command -v "$tool" >/dev/null || { echo "FAIL: $tool is required" >&2; exit 1; }
 done
 docker info >/dev/null
-TELEMETRY_BACKEND_OUT_DIR="${TELEMETRY_BACKEND_OUT_DIR:-$(mktemp -d /tmp/telemetry-backends-XXXXXX)}"
+if [ -z "${TELEMETRY_BACKEND_OUT_DIR:-}" ]; then
+    if [ -n "${KUASAR_CI_DIR:-}" ]; then
+        TELEMETRY_BACKEND_OUT_DIR="$KUASAR_CI_DIR/telemetry-backends"
+    else
+        TELEMETRY_BACKEND_OUT_DIR="$(mktemp -d /tmp/telemetry-backends-XXXXXX)"
+    fi
+fi
 mkdir -p "$TELEMETRY_BACKEND_OUT_DIR"
 TELEMETRY_BACKEND_OUT_DIR="$(cd "$TELEMETRY_BACKEND_OUT_DIR" && pwd)"
 prometheus_id=""
@@ -80,6 +114,7 @@ done
 curl --noproxy '*' --silent --show-error --fail "$TELEMETRY_PROMETHEUS_TEST_URL/api/v1/status/buildinfo" >"$TELEMETRY_BACKEND_OUT_DIR/prometheus-version.json"
 curl --noproxy '*' --silent --show-error --fail --get --data-urlencode 'query=SELECT version()' \
     "$TELEMETRY_CLICKHOUSE_TEST_URL" >"$TELEMETRY_BACKEND_OUT_DIR/clickhouse-version.txt"
+if [ -n "$TELEMETRY_SOURCE_ROOT" ]; then
 (
     cd "$TELEMETRY_SOURCE_ROOT"
     env -u GOTMPDIR GOWORK=off CGO_ENABLED=0 REQUIRE_TELEMETRY_BACKENDS=1 go test -json -count=1 -timeout=3m \
@@ -99,6 +134,16 @@ export TELEMETRY_CUSTOM_TEST_BIN="$telemetry_bin/custom-telemetry"
     sha256sum "$TELEMETRY_NODE_TEST_BIN" "$TELEMETRY_CUSTOM_TEST_BIN" >>"$TELEMETRY_BACKEND_OUT_DIR/executables.txt"
 ) >"$TELEMETRY_BACKEND_OUT_DIR/executable-build.log" 2>&1 \
     || { cat "$TELEMETRY_BACKEND_OUT_DIR/executable-build.log"; exit 1; }
+fi
+# Always exercise the actual assembled/released node-ctl when BIN is supplied.
+# Standalone source runs use the exact binary built above. This needs no Go or
+# component sources in exact-assets mode and never substitutes a mock backend.
+probe_binary="${TELEMETRY_NODE_TEST_BIN:-}"
+if [ -n "${BIN:-}" ]; then probe_binary="$BIN/node-ctl"; fi
+sha256sum "$probe_binary" >"$TELEMETRY_BACKEND_OUT_DIR/probe-executable.txt"
+python3 "$SCRIPT_DIR/lib/telemetry_backend_probe.py" "$probe_binary" "$TELEMETRY_BACKEND_OUT_DIR" \
+    "$TELEMETRY_PROMETHEUS_TEST_URL" "$TELEMETRY_CLICKHOUSE_TEST_URL"
+if [ -n "$TELEMETRY_SOURCE_ROOT" ]; then
 (
     cd "$TELEMETRY_SOURCE_ROOT"
     env -u GOTMPDIR GOWORK=off CGO_ENABLED=0 REQUIRE_TELEMETRY_BACKENDS=1 go test -json -count=1 -timeout=90s \
@@ -118,3 +163,4 @@ assert required <= passed, f'missing backend cases: {required - passed}'
 for name in sorted(passed - {None}):
     print('PASS telemetry/backend/' + name)
 PY
+fi

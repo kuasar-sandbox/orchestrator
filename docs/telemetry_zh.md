@@ -488,7 +488,7 @@ GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/confi
 GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
-bash test/e2e/e2e_telemetry_backends.sh # requires Go, Docker and exact component sources
+bash test/e2e/e2e_telemetry_backends.sh # source: Go + Docker; installed package: BIN + Docker
 make test vet build
 make test-e2e # 要求组装的项目 BIN 与真实 KVM host
 ```
@@ -496,15 +496,23 @@ make test-e2e # 要求组装的项目 BIN 与真实 KVM host
 组件自有 backend case 从固定 manifest digest 创建临时 Prometheus 3.5.0 和
 ClickHouse 25.8 容器, 只向 loopback 发布端口, 记录实际版本与镜像身份, 并在退出时
 删除自己创建的容器和 volume. 两个引擎与所有具名 case 均必须执行; 缺少前提条件、
-skip 和失败均报错. 仅当源码不在普通 source/assembled 布局时设置
-`TELEMETRY_SOURCE_ROOT`; 可选 `TELEMETRY_BACKEND_OUT_DIR` 用于保留 JSON test
-event 和引擎日志. 具备能力的 source CI 通过 `test/e2e/run_all.sh` 执行此 case.
-每个 ClickHouse fixture 只创建/删除五张唯一命名的标准 exporter 表, Prometheus
-测试数据只存在于可丢弃的 server 内.
+skip 和失败均报错. Source CI 从组装的 `BIN` 目录定位精确 sibling checkout;
+源码缺失仍报错. 仅在其他源码布局中设置 `TELEMETRY_SOURCE_ROOT`. Source 与
+exact-assets 验证均通过 `test/e2e/run_all.sh` 执行同一 case. Exact-assets 使用
+发布的 `BIN/node-ctl`, 不要求 Go, 不重新构建组件源码.
+`TELEMETRY_BACKEND_OUT_DIR` 可指定保留配置、JSON test event、可执行文件 hash
+和引擎日志的位置; CI 默认写入会上传的 metadata 目录. Fixture 表与 Prometheus
+sample 只存在于临时容器内, 退出时删除其 volume.
+
+两种布局均运行实际 node-ctl, 由可信基础设施 OTLP fixture 经原生 batch/queue、
+标准远端 exporter 和匹配 Reader, 通过私有 E2B query UDS 验证读取. 断言覆盖
+精确 SID/source 隔离、StableID 仅作 label、独立 MAX、包含端点的时间边界、
+不完整 bucket、不延长 Gauge、不创建本地 DB 和正常退出清理. 此 backend case
+不替代真实 guest/conductor 认证与 namespace 用例.
 
 覆盖实际原生部署启动、名称/unit/resource label 转换、五类指标、重复/乱序 sample、
 raw/MAX 边界、缺测、精确 SID、local/remote fan-out, 以及路由删除后已接纳 batch
-仍可发布. Case 还从精确源码构建并执行 node-ctl 和 custom-telemetry, 经过 sealed
+仍可发布. Source 验证还从精确源码构建并执行 node-ctl 和 custom-telemetry, 经过 sealed
 bootstrap, 沿真实 Plugin lease/query UDS 从真实 Prometheus 查询非 E2B 指标, 并
 验证 query-only 无 Collector graph/本地 DB 的退出清理. 普通 unit 调用可以跳过
 这些外部 fixture, 但 skip 不计为 backend 验收. Density benchmark 对 1k/10k/50k synthetic targets 测真实 5s 周期，报告 scrape count、
