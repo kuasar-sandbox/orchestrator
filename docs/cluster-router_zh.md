@@ -149,7 +149,7 @@ Header 覆盖同名完整 object,checkpoint Header 按字段覆盖。router 始�
 `off` 均为关闭;只有本次 create 显式提供 `memory` 才启用。create body 上限为 16 MiB,
 超限返回 **413**。
 
-Router 按 [Registry Reserve 协议](cluster_zh.md) 为共同的 `POST /route-link/reserve` 端点组装请求，传递对应操作的已认证上下文并保留期望的稳定身份。Create 在准入前严格归一化；Connect 保留可选 memory 选择及其缺省状态；exec-session 先严格解析公共 TTL/conditions 再转换为 Registry typed request；Data 使用既有 access-token/service/port 上下文。
+Router 按 [Registry Reserve 协议](cluster_zh.md#83-reserve) 为共同的 `POST /route-link/reserve` 端点组装请求，传递对应操作的已认证上下文并保留期望的稳定身份。Create 在准入前严格归一化；Connect 保留可选 memory 选择及其缺省状态；exec-session 先严格解析公共 TTL/conditions 再转换为 Registry typed request；Data 使用既有 access-token/service/port 上下文。
 
 精确 query/Header/body schema 由 Registry 规范唯一维护，并在其边界重复校验。Conditions 不借无关 metadata、query 参数或配置 Header 传递；本篇只定义转换边界，不再维护一份可能失步的 schema 表。
 

@@ -155,7 +155,7 @@ tuple. This is packet-level delivery to telemetry, not a forwarded identity
 header. Existing loopback management deployments need their management interface
 `route_localnet=1`; a routable namespace interface listener instead uses its
 address in the mappings and the existing FloatingIP return route. See the
-[connector management network](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md).
+[connector management network](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md#23-packet-paths).
 Use the actual management namespace/device names of the node, not a second switch.
 The [deployment template](../deploy/telemetry.example.yaml) includes the matching
 management-service mappings. Both protocols are exercised through that existing

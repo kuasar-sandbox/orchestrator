@@ -1,11 +1,6 @@
 [English](node.md) | [简体中文](node_zh.md)
 
-<a id="node--节点-e2b-兼容沙箱主机与集群接入"></a>
 # node — An e2b-compatible sandbox host and cluster member
-
-For optional direct-Create IDs, Header/metadata precedence and insert-only conflicts, see [Sandbox identity on Create](#412-create-identity).
-
-`kuasar-sandbox.identity` is a direct Create request-only namespace (`id`, optional `stable_id`), also accepted through `X-Kuasar-Sandbox-Identity`. It is extracted before the Create Hook and never inherited or persisted as configuration. Template Build registration rejects it. The internal Build MMDS route cache uses a disjoint namespace, so legal caller IDs beginning with `build-` remain supported.
 
 `node-ctl` runs one resident conductor per compute node and exposes its microVM sandboxes through an **e2b-compatible API**. The supported operations can be used by unmodified Python/JavaScript `e2b`, `@e2b/code-interpreter` SDKs and the e2b CLI, subject to the compatibility boundaries and pinned versions below. `node-ctl conductor serve` provides the **API** (control-plane REST for sandbox lifecycle, template builds and authentication), **host orchestration** (systemd template units for `sandbox-ctl`/builder tasks and `connector-ctl vswitch` networking), an optional **resource controller** (node arbitration through `resource_listen`; see [node-resource.md](node-resource.md)), and the **node-link client** that joins cluster-ctl orchestration (§10). The separately deployed `node-ctl proxy serve` owns guest data-plane forwarding; conductor does not serve it.
 
@@ -15,27 +10,23 @@ A node can run **standalone**, serving e2b SDK/CLI clients on one machine, or **
 
 The outputs are **`node-ctl`** (daemon, launchers, resource controller and administration CLI, §2) and **`e2b-key-ctl`** (credential derivation without DB/config/orchestration state, §2.8).
 
-<a id="1-概述"></a>
 ## 1. Overview
 
-<a id="11-业务问题"></a>
 ### 1.1 The service problem
 
 The runtime/accelerator/builder/vswitch stack exposes individual CLI primitives: start a microVM, flatten an image, attach a port. Clients need a northbound service that composes them: an existing e2b SDK/CLI and API key should let them create, execute in, pause, resume and kill sandboxes and build custom templates, without managing microVMs, Manifests or the eBPF switch.
 
 node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosystem, including code interpreters and agent integrations, can use the supported contract without client modifications. Endpoints, tokens and state machines have reference implementations, and real SDK/CLI E2E tests check compatibility. At scale, node-link connects many nodes to cluster-ctl for session-affine routing and on-demand placement (§10 and [cluster.md](cluster.md)); one node can also serve independently.
 
-<a id="12-设计原则"></a>
 ### 1.2 Design principles
 
-1. **Compose at explicit boundaries.** Lifecycle and networking use subprocess CLIs such as `sandbox-ctl` and `connector-ctl vswitch`; units use systemd D-Bus and envd forwarding uses UDS. The code also imports sibling repositories' public packages for typed artifact preparation, configuration, assembly and publication (§14), so this is not a CLI-only dependency graph. The binaries support pure-Go `CGO_ENABLED=0` builds.
+1. **Compose at explicit boundaries.** Lifecycle and networking use subprocess CLIs such as `sandbox-ctl` and `connector-ctl vswitch`; units use systemd D-Bus and envd forwarding uses UDS. The code also imports sibling repositories' public packages for typed artifact preparation, configuration, assembly and publication (§13), so this is not a CLI-only dependency graph. The binaries support pure-Go `CGO_ENABLED=0` builds.
 2. **Keep resource arbitration separable.** `sandbox-ctl`'s `pkg/resource` client negotiates sandbox admission and quota with the node resource controller. `node-ctl conductor serve` embeds it through `resource_listen`, with inline configuration ([node-resource.md](node-resource.md)). It remains separate from API, host and Proxy logic. Conductor manages the Build admission pool itself ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 3. **Delegate process supervision to systemd.** Runner/builder template instances use RunID and may start early to wait for config-socket assignment. Runner `ctl/vmm` subgroups separate the supervisor from sandbox resources; the entire builder unit is accounted. StopUnit and its completion checks reclaim the unit; conductor does not replace systemd as a process supervisor.
 4. **Keep root credentials encrypted at rest.** Tenant APISecret/ManifestKey pairs use AES-256-GCM in SQLite. Authenticated task bootstrap supplies authoritative ManifestKey environment values to single-tenant runner/builder processes. Conductor's managed sandbox/build preparation does not open or parse tenant artifacts with that key, and ManifestKey does not enter the guest (§6–7). Pairs received over node-link are also stored encrypted (§10).
 5. **Separate local and cluster routing authority.** Conductor owns local routes and lifecycle; independent Proxy is the sole sandbox data ingress (§9). Registry owns cluster routes. Node-link reports node events and accepts cluster commands (§10) without creating competing cluster authority.
-6. **Reconcile after restart.** SQLite and systemd unit inventory preserve enough state to adopt or clean up execution after a conductor restart (§15). In cluster mode, node-link reconnects and reports the node's sandboxes so Registry converges.
+6. **Reconcile after restart.** SQLite and systemd unit inventory preserve enough state to adopt or clean up execution after a conductor restart (§14). In cluster mode, node-link reconnects and reports the node's sandboxes so Registry converges.
 
-<a id="13-两类沙箱profile"></a>
 ### 1.3 Two sandbox profiles
 
 | Profile | Meaning | Data plane | Exposed services |
@@ -45,18 +36,16 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 
 `bare` reuses `sandbox-runtime.bundle` and exposes the base sandbox through the northbound API. Build registration defaults to **e2b**, but explicitly accepts **bare** ([Build §1](node-build.md#1-build-api)); the output profile is immutable. The templateID prefix encodes profile ([Build §2](node-build.md#2-template-ids-and-artifact-authority)), which selects guest launch behavior and data services within the shared runtime Bundle.
 
-<a id="14-边界与依赖"></a>
 ### 1.4 Boundaries and dependencies
 
 - Northbound clients use e2b SDK/CLI directly. In a cluster, cluster-ctl Router forwards traffic and node-link carries control commands. Platform administration can also use the e2b API.
 - Standalone and cluster modes keep create/pause/kill/template execution on the node. Joining adds node-link (§10) without replacing the e2b contract.
-- The data plane forwards upstream guest envd protocols rather than implementing envd (§4.3).
+- The data plane forwards upstream guest envd protocols rather than implementing envd (§4.2).
 - The independent Telemetry component implements envd/OTLP collection and E2B `/sandboxes/{SandboxID}/metrics` history; Conductor only authenticates, checks ownership and forwards to a live registered query UDS. See [Telemetry](telemetry.md). Instantaneous `/stats/resource` and `/stats/traffic` remain separate (§4.1.1).
 - The server does not parse Dockerfiles. It pulls/flattens existing images and executes the supported structured Build steps supplied by clients inside phase microVMs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 - Routing, storage and units are node-local. Cross-node snapshots/templates use canonical portable refs in Manifest Store or uniformly mounted named locations (§8.1); cluster-ctl orchestrates through node-link (§10).
 - Dependencies include the standard library, pure-Go `modernc.org/sqlite`, `golang.org/x/net/http2` for config-socket/node-link h2c, `golang.org/x/sys` for pidfile locks/SO_PEERCRED/mmap, `coreos/go-systemd`, `google/uuid` v7 and `gopkg.in/yaml.v3`. The module also includes CEL/protobuf, AWS SDK and sibling public packages; see [go.mod](../go.mod). The hand-written envd client and node-link use JSON rather than a gRPC wire protocol.
 
-<a id="15-架构与数据通路"></a>
 ### 1.5 Architecture and data paths
 
 Alongside the application data path below, `node-ctl telemetry serve` subscribes
@@ -93,13 +82,12 @@ Synchronous Create performs request validation and pure parsing, selects the req
 
 The cold-image background path retains its single-stage fast path: prepare resources/network/YAML, then allocate a RunID from the runner pool. Artifact launch first creates directories and binds `ready.sock`; the pool commit callback binds an exact RunID with `starting AND run_id=''` CAS. The assigned task immediately connects readiness, locks its task pidfile and obtains bootstrap. After authentication, ManifestKey overrides its environment. Based on E/S kind and LaunchMode, the task opens the root, selects PreparedSource and submits a non-secret capacity/network/ref-closure summary. The sole launch worker then resolves resources/network, attaches networking, persists ownership with `starting AND run_id=<exact>` CAS, writes root-credential-free YAML and returns the final LaunchSpec. The runner appends its retained ref-locations and replaces itself with `sandbox-ctl run` under the same PID. After microVM startup and the strict runtime readiness wire, e2b performs direct `POST /init` for environment/default user. Exact-RunID CAS commits `running` and opens traffic.
 
-Cluster Create arrives as a node-link `create` command. Profile, group, route-key and optional authentication identity use structured system context and separate durable fields. Events report profile, node-owned execution facts and protected routing credentials; Registry recovers cluster identity from its existing node ownership records (§10 and §4.6).
+Cluster Create arrives as a node-link `create` command. Profile, group, route-key and optional authentication identity use structured system context and separate durable fields. Events report profile, node-owned execution facts and protected routing credentials; Registry recovers cluster identity from its existing node ownership records (§10 and §4.4).
 
 Legacy data routing parses `(sid,port)` from `Host` (`<port>-<sid>.<domain>`) or `E2b-Sandbox-Id`/`E2b-Sandbox-Port`. For e2b, ports 49983/49999 authenticate with EnvdAccessToken and dial sandbox-ctl `--connect` host UDS endpoints for envd/CI. For bare, these numbers are ordinary legal ports: ForwardAccessToken authorizes `floatingip:port`. CONNECT may explicitly carry `E2b-Sandbox-Service: forward|e2b:envd|e2b:code-interpreter|exec`; this is the authoritative backend selector. Ordinary HTTP otherwise uses legacy routing, but explicitly naming `exec` returns 405. Native exec uses an explicitly minted ExecAccessToken, verifies KAT before any resume side effects and ultimately reaches `<RunRoot>/sandboxes/<NodeSandboxID>/ctl.sock`.
 
 TrafficAccessToken is for external gateways/e2b data components; node's platform layer does not consume it. Authorized requests to paused sandboxes trigger automatic resume through the shared launch owner (§8). Independent Proxy is the sole node data plane; see [node-proxy.md](node-proxy.md). In a cluster, Router maps the stable public SandboxID to current NodeSandboxID, injects `E2b-Sandbox-Id` and `X-Access-Token`, and forwards to node Proxy ([cluster-router.md](cluster-router.md)).
 
-<a id="16-节点目录与身份"></a>
 ### 1.6 Node directories and identities
 
 `paths.run_root`/`paths.base_root` are node-level **RunRoot/BaseRoot**; an object's actual directories are **RunDir/BaseDir**. RunRoot holds pid/lock files, Unix sockets, readiness, Sandbox YAML, runtime config, bounded CH snapshot staging state and small temporary JSON. BaseRoot holds writable diffs, local checkpoints, Build images and Sandbox/Snapshot artifacts, and other large data:
@@ -129,10 +117,8 @@ An ordinary Sandbox row stores exact `RunDir=<RunRoot>/sandboxes/<SandboxID>` an
 
 BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<BuildID>`. BuildRunDir/BuildBaseDir derive uniquely from the roots and BuildID; they are not stored in Build rows, hashed or sanitized, and have no legacy-path fallback/migration. Registered/waiting Builds create no directories; execution claims precede creation. All Build images and Sandbox/Snapshot artifacts use `BuildBaseDir/checkpoint`; ordinary local captures use `BaseDir/checkpoint`. Validation requires custom RunRoot to fit sandboxer's longest socket under the maximum SandboxID and the longest phase socket under a 48-byte BuildID, within Linux's 107-byte pathname limit. The identity-length contract does not vary with the chosen root.
 
-<a id="2-命令行接口"></a>
 ## 2. Command-line interface
 
-<a id="21-子命令总览"></a>
 ### 2.1 Subcommands
 
 **`node-ctl`:**
@@ -170,13 +156,12 @@ node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # 2) Point e2b SDK/CLI at this node
-export E2B_DOMAIN=sandboxes.example.com        # Production (TLS, §13)
+export E2B_DOMAIN=sandboxes.example.com        # Production (TLS, §12)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3443
 ```
 
 In cluster mode, Registry distributes leased keys through node-link (§10 and [cluster.md](cluster.md)); manual `manifest-key add` is unnecessary.
 
-<a id="22-node-ctl-conductor-serve"></a>
 ### 2.2 `node-ctl conductor serve`
 
 ```
@@ -187,11 +172,10 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 |---|---|---|
 | `--config` | `/etc/node-ctl/conductor.yaml` | Conductor configuration (§3) |
 
-Startup opens SQLite with file mode 0600, generates/installs systemd templates (§5), reconciles restart state (§15), starts the 5-second TTL reaper and optional embedded resource controller, binds and confirms the local control socket (§6), starts runner/builder pools and Build admission ([Build §5](node-build.md#5-target-aware-execution-and-publication)), optionally dials `cluster.node_link.endpoint` (§10), then listens on `api.listen`. That listener serves only the wrapped control API; sandbox data Host requests and CONNECT do not reach backends. With no TLS certificates it serves plaintext h2c; development SDK control uses `E2B_API_URL`.
+Startup opens SQLite with file mode 0600, generates/installs systemd templates (§5), reconciles restart state (§14), starts the 5-second TTL reaper and optional embedded resource controller, binds and confirms the local control socket (§6), starts runner/builder pools and Build admission ([Build §5](node-build.md#5-target-aware-execution-and-publication)), optionally dials `cluster.node_link.endpoint` (§10), then listens on `api.listen`. That listener serves only the wrapped control API; sandbox data Host requests and CONNECT do not reach backends. With no TLS certificates it serves plaintext h2c; development SDK control uses `E2B_API_URL`.
 
 The supplied systemd service is [deploy/node-ctl.service](../deploy/node-ctl.service).
 
-<a id="23-node-ctl-proxy"></a>
 ### 2.3 `node-ctl proxy`
 
 This is the independent data-plane master, deployed separately on the conductor's node. Its `proxy.yaml` has its own schema ([node-proxy.md](node-proxy.md) §2). Master internally reexecs and supervises workers using its current executable; workers neither enter the node-ctl CLI dispatcher nor reread configuration:
@@ -217,7 +201,6 @@ sandbox OTLP networking, E2B steps/MAX behavior and bounds are specified in
 [Telemetry](telemetry.md). Use `deploy/node-telemetry.service` alongside, not as
 a required dependency of, conductor/Proxy.
 
-<a id="24-node-ctl-run-sandbox--run-builder"></a>
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
 These are systemd ExecStart launchers. Their common entry uses `--run-id` as the unit instance name and `--pidfile=<RunRoot>/runners/<RunID>.pid`. An exclusive `fcntl(F_SETLK)` lock prevents duplicate execution; the launcher writes its PID, then calls WaitAssignment over `--config-socket` to obtain its business ID (§6). They then diverge:
@@ -232,7 +215,6 @@ node-ctl run-builder --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 
 Missing flags fall back to `TASK_PIDFILE`, `TASK_CONFIG_SOCKET` and `TASK_RUN_ID`, used for systemd `%i` wiring.
 
-<a id="25-node-ctl-config"></a>
 ### 2.5 `node-ctl config`
 
 Configuration generation and diagnosis are **role-specific** (`conductor`/`proxy`/`telemetry`, separate files and schemas):
@@ -248,7 +230,6 @@ The first argument selects schema: conductor uses `conductor.yaml` (§3), proxy 
 
 The command performs strict declarative decoding, defaulting and diagnosis. It never executes `conductor_executable`/`proxy_executable`/`telemetry_executable` or accesses custom App runtime materials. With a custom executable, the first output line explicitly marks bootstrap-only validation; that App validates final configuration before startup side effects.
 
-<a id="26-node-ctl-manifest-key"></a>
 ### 2.6 `node-ctl manifest-key`
 
 This thin client manages create/build credential-pair allowlisting (`manifest_keys`) through conductor's local **admin plane** (§6). Daemon is the table's sole writer; CLI opens no DB and reads no config. It needs only `--socket`, or `NODE_CTL_SOCKET`, defaulting to `/run/sandbox/node-ctl.socket`.
@@ -271,7 +252,6 @@ node-ctl manifest-key list   [--socket S]
 - `add/remove/check` prints `STATUS api=<64-hex> manifest=<64-hex>`; `list` prints both full fingerprints per row.
 - Authentication uses `SO_PEERCRED`: with `paths.admin_pidfile`, peer PID must be listed; otherwise socket mode 0600 is the boundary (same UID/root).
 
-<a id="27-node-ctl-export-sandbox--import-sandbox"></a>
 ### 2.7 `node-ctl export-sandbox` / `import-sandbox`
 
 These clients use conductor's local **API plane** for `POST /sandboxes/{id}/export` and `POST /sandboxes/import`. `E2B_API_KEY` must authenticate the owner. See §8.1.
@@ -286,7 +266,6 @@ node-ctl import-sandbox <token> [--socket S]
 - Resume remains allowed during local-artifact upload. If Resume wins first, KMT Export cancels upload and returns 409, whereas Template Export continues and returns templateID. Both abandon the source finalizer without updating/deleting source or local artifact.
 - `import-sandbox <token>` defaults to source NodeSandboxID, inserts a paused row without overwriting and prints SID; an existing target returns 409. API body may choose another node-local `sandboxID`, retaining logical authentication identity and service credentials. A subsequent Connect accepts asynchronous resume.
 
-<a id="28-e2b-key-ctl"></a>
 ### 2.8 `e2b-key-ctl`
 
 See §2.1 for the command list. Full `seal-pull-token` syntax:
@@ -298,7 +277,6 @@ e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-p
 
 The opaque `kpt_` token contains image-pull credentials sealed with AES-GCM using a tenant ManifestKey-derived key. SDK `api_headers` sends it as `X-Kuasar-Pull-Token` with the Build request; conductor opens it using the tenant's stored key ([Build §5](node-build.md#5-target-aware-execution-and-publication)). ManifestKey comes from the first positional argument or `MANIFEST_KEY`.
 
-<a id="3-配置"></a>
 ## 3. Configuration
 
 Conductor uses `conductor.yaml`. The fully commented [deploy/conductor.example.yaml](../deploy/conductor.example.yaml) matches the shape of `node-ctl config conductor --template`. The authoritative type is `config.Conductor` in public package `github.com/kuasar-sandbox/orchestrator/config`; internal code reuses that schema. It provides strict `LoadConductor`/`DecodeConductor`, `LoadProxy`/`DecodeProxy`, final validators that do not reapply defaults after hooks, and genuinely deep `Clone` operations. Decode/Load perform bounded strict decoding, declarative defaulting and enum/duration/range/format validation of supplied values. They do not inspect environment, component files or executable-dependent startup requirements. Identical input produces identical results regardless of `NODE_CONFIG_ENCRYPTION_KEY`. Unknown YAML fields and multiple documents fail. Config JSON/YAML contains only serializable declarations, never loggers, providers or runtime handles.
@@ -311,7 +289,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 |---|---|---|
 | `api.domain` | Required | Service domain, e.g. `sandboxes.example.com`; control plane is `api.<domain>` |
 | `api.listen` | `:443` | Northbound listener; development can use plaintext h2c on `:3000` |
-| `api.tls.cert/key` | Empty | Wildcard certificate for `*.<domain>` and `api.<domain>` (§13); empty means plaintext. A non-nil custom Runtime TLS provider is authoritative; core still fixes TLS version/ALPN/client-auth policy |
+| `api.tls.cert/key` | Empty | Wildcard certificate for `*.<domain>` and `api.<domain>` (§12); empty means plaintext. A non-nil custom Runtime TLS provider is authoritative; core still fixes TLS version/ALPN/client-auth policy |
 | `proxy.park_timeout` | `30s` | Request parking budget while waiting for route synchronization or paused-sandbox resume ([node-proxy.md](node-proxy.md) §4) |
 | `proxy.auth` | `enforce` | Data authentication policy: `off`/`log`/`enforce`, checking `X-Access-Token` ([node-proxy.md](node-proxy.md) §6) |
 | `proxy.metrics_listen` | Empty/off | Conductor's global Prometheus text endpoint; Proxy's separately configured `metrics_listen` aggregates worker data-plane metrics |
@@ -320,7 +298,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `paths.conductor_executable` | Empty | Absolute custom conductor executable; empty selects built-in. Config diagnosis checks regular/executable, not group/world-writable and not the same file as node-ctl, without applying diagnostic EUID ownership policy. Runtime root node-ctl accepts only root-owned executables; non-root accepts root or its own EUID. Dispatch executes the same opened/validated FD and never falls back |
 | `paths.run_root` | `/run/sandbox` | Small node files plus `runners/`, `sandboxes/`, `builds/`, usually tmpfs; must leave the 107-byte Linux socket pathname budget for the longest phase path at maximum BuildID (§1.6) |
 | `paths.base_root` | `/var/lib/sandbox` | Persistent node files and large Sandbox/Build data (§1.6) |
-| `paths.db_path` | `<base_root>/node-ctl.db` | SQLite path (§15) |
+| `paths.db_path` | `<base_root>/node-ctl.db` | SQLite path (§14) |
 | `paths.config_socket` | `/run/sandbox/node-ctl.socket` | Local run assignment/result and task/admin/plugin/API planes (§6); connects manifest-key/export/import CLI, Proxy and platform agents |
 | `paths.admin_pidfile` | Empty | Multiline PID allowlist for admin, allowing `#` comments; otherwise socket mode 0600 alone |
 | `paths.plugin_pidfile` | Empty | Multiline PID allowlist for Proxy/agent plugin registration; otherwise socket mode 0600 alone |
@@ -364,30 +342,26 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `cluster.data_endpoint` | Required in cluster mode | Explicit advertised Proxy host:port; never inferred from its bind listener |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource §3.2. Omitted/disabled means static cgroups |
 
-<a id="31-静态定制-conductor"></a>
 ### 3.1 Statically customized conductor
 
 The complete custom Conductor construction, protected configuration, runtime binding and provider contracts are maintained in [Extensions](extensions.md#conductor-bootstrap). Authorization, persisted records and lifecycle invariants remain core-owned and cannot be bypassed by configuration hooks.
 
-<a id="32-静态定制-proxy"></a>
 ### 3.2 Statically customized Proxy
 
 The complete Proxy configuration/binding lifecycle, Master/Worker hooks, public route sources and authorized-forwarding SDK are maintained in [Extensions](extensions.md#proxy-bootstrap). Core process, shared-memory and cancellation invariants remain in [node-proxy.md](node-proxy.md).
 
 Build configuration and its legacy-schema boundary are defined in [Build configuration](node-build.md#3-build-configuration).
 
-There is no node-global remote-memory prefetch switch. Each Sandbox's kuasar-sandbox.restore namespace selects it (§4.6).
+There is no node-global remote-memory prefetch switch. Each Sandbox's kuasar-sandbox.restore namespace selects it (§4.4).
 
 Configuration consistency requires proxy.auth=enforce when mmds.enabled=false, since nonsecure envd relies on Proxy's data gate. mmds.routes.enabled requires mmds.enabled; service endpoints must be absolute Unix socket URIs. Only proxy.yaml configures proxy_netns and worker count. Cluster endpoint requires node_id plus separate api_endpoint/data_endpoint. With resource_listen.enabled, startup resolves one canonical controller identity and writes it into every dynamic Sandbox YAML; there is no second sandbox.resources.control_socket source. Startup headroom has identical static/dynamic semantics, independent of controller enablement.
 
-<a id="4-e2b-api-契约"></a>
 ## 4. e2b API contract
 
 Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDKs or **Authorization: Bearer** for CLI builds, parsing both identically. APISecret signs keys through e2b-key-ctl gen-apikey; conductor verifies their MAC to identify tenants without a static api_keys table (§7).
 
 **Ownership:** ID-based operations verify the API-key MAC against the resource row's decrypted APISecret. Mismatch returns **404**, hiding another tenant's existence. Create/build/import additionally require the complete APISecret/ManifestKey pair to be allowlisted, otherwise **403**.
 
-<a id="41-控制面沙箱生命周期"></a>
 ### 4.1 Control plane: sandbox lifecycle
 
 | Operation | Method and path | Contract |
@@ -439,7 +413,6 @@ Existing targets ignore migration token. Missing targets may synchronously impor
 
 It returns no session ID, expiry, ServiceSecret or other route/credential fields. Authentication retains existing 401/403; missing/non-owned sandboxes return 404. Synchronous import, credential read/mint or asynchronous-resume admission failures expose sanitized 503, omitting fingerprints, ServiceSecret, NodeSandboxID, socket paths and KAT payload.
 
-<a id="411-即时-resource--traffic-stats"></a>
 #### 4.1.1 Instantaneous resource and traffic stats
 
 Both endpoints first read the Sandbox business row and verify API-key ownership; failure returns 404. They observe without Connect/Wake/Resume/Pause/envd calls and set Cache-Control: no-store.
@@ -493,6 +466,8 @@ e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/e
 Conductor queries the current trusted Proxy registration's stats_socket master cache, without worker fan-out. Unregistered master, unsynchronized route, mismatched RunID/profile/state, failed worker stream or unready replacement returns 503. This stats window does not alter master route/admission authority or Create barrier. The complete shared-admission algorithm, error proof, worker state machine, absolute snapshots and failure windows are in [node-proxy.md](node-proxy.md) §8.
 
 #### 4.1.2 Create identity
+
+The internal Build MMDS route cache uses a disjoint namespace, so legal caller IDs beginning with `build-` remain supported.
 
 A direct conductor `POST /sandboxes` can select its node-local SandboxID and,
 optionally, an independent StableID. This is a creation-time configuration input,
@@ -637,17 +612,11 @@ for this durable acceptance, not guest readiness. Node-link returns its accepted
 ACK at the same boundary; `CreateCluster` remains a synchronous wrapper waiting
 for that exact attempt.
 
-See [Node](node.md), [Cluster Router](cluster-router.md) and
+See [Cluster Router](cluster-router.md) and
 [Extensions](extensions.md) for the surrounding contracts.
 
 
-<a id="42-控制面模板构建-api"></a>
-### 4.2 Control plane: template Build API
-
-The complete registration, trigger, status and upload contracts are maintained in [Build API](node-build.md#1-build-api).
-
-<a id="43-数据面协议envd-与-native-exec"></a>
-### 4.3 Data protocols: envd and native exec
+### 4.2 Data protocols: envd and native exec
 
 envd uses port **49983**, HTTP/1.1 plus h2c and unversioned Connect-RPC process.Process/filesystem.Filesystem packages. Filesystem RPC handles metadata; contents use GET/POST /files with signed query. Other endpoints include /health, /init and /metrics. Per-operation user uses `Authorization: Basic base64("user:")`. Code-interpreter POSTs NDJSON to `https://49999-<sid>.<domain>/execute`, reaching guest FastAPI on 49999 and Jupyter on 8888. Envd exec is POST /process.Process/Start with X-Access-Token. Tenant traffic is forwarded, not reimplemented; Build supplies a minimal hand-written connect+JSON process.Start client for steps/startCmd/readyCmd, without generated protobuf/gRPC stubs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 
@@ -664,13 +633,7 @@ X-Access-Token: kat1.<payload>.<signature>
 
 Authority port 443 is a transport placeholder, not a guest port. Even an accompanying E2b-Sandbox-Port cannot select exec backend. service=exec requires CONNECT and always enforces KAT regardless of ordinary off/log/enforce policy. After CONNECT 200, final Proxy reads and authorizes the complete exec_request first frame. Only successful conditions permit paused activation, ctl.sock dial and exact raw-frame forwarding; see [node-proxy.md](node-proxy.md) §5.
 
-<a id="44-templateid-与模板形态transient--persist无-templates-表"></a>
-### 4.4 Template IDs and transient/persistent forms
-
-Persistent/transient TemplateID, artifact kinds and retention boundaries are defined in [Template IDs and artifact authority](node-build.md#2-template-ids-and-artifact-authority).
-
-<a id="45-sdk--cli-对接与协议-pin"></a>
-### 4.5 SDK/CLI integration and protocol pins
+### 4.3 SDK/CLI integration and protocol pins
 
 - Production TLS uses E2B_DOMAIN and E2B_API_KEY. Development uses HTTP/h2c E2B_API_URL/E2B_SANDBOX_URL. Control Host must match api.*.
 - API keys are `e2b_` plus 72 hex digits, 76 characters total. SDK syntax checking uses `/^e2b_[0-9a-f]+$/`; server separately checks MAC (§7).
@@ -678,8 +641,7 @@ Persistent/transient TemplateID, artifact kinds and retention boundaries are def
 - X-Access-Token carries envdAccessToken. Secure Sandbox behavior is enabled by default from SDK v2.0.0, which attaches it to data requests.
 - Routesync for Proxy/observers is version 8: four-byte little-endian length followed by JSON. Messages include register/hello/upsert/delete/bookmark/wake/route_barrier/route_barrier_ack, over PUT /internal/plugin/{id}/register on config-socket's plugin plane (§6; node-proxy §4).
 
-<a id="46-沙箱配置传递链"></a>
-### 4.6 Sandbox configuration propagation
+### 4.4 Sandbox configuration propagation
 
 Each instance receives configuration through reserved e2b metadata namespaces `kuasar-sandbox.<ns>`, each encoded as a JSON object string, without SDK/API changes. These typed tenant-facing schemas define the permitted subset and are rendered into sandboxer configuration; conductor does not blindly import a complete runtime YAML as tenant policy.
 
@@ -830,7 +792,6 @@ The complete request-scoped `kuasar-sandbox.builder` input and target rules are 
 - **Host policy stays outside artifacts/templates:** restore/checkpoint originate in Create metadata. Image cold boot does not render them into runtime YAML. snp Create, later resume and migration rerender restore policy when restoring S. Checkpoint is read only by host Pause and never enters SANDBOX_CONFIG/snapshot.cfg. Connect/resume offers no temporary override.
 - **Persistence:** sandboxes.metadata_json holds launch input. Build metadata/builder JSON are retention-bounded execution records, never a second template authority.
 
-<a id="5-进程管理systemd-模板单元启动时自动生成安装"></a>
 ## 5. Process management through systemd template units
 
 At startup, conductor generates two templates and sandbox-runner.slice/sandbox-builder.slice under units.dir; it calls D-Bus Reload only when content changes. With units.install=false, operations manages them. Generated ExecStart uses the exact original node-ctl path retained by runtime resolution/bootstrap, including custom conductor mode (§3).
@@ -867,10 +828,9 @@ Runner assignment budget begins at pool Assign and covers queuing, on-demand Sta
 
 - **Kill:** under the SID fence, exact-CAS full ownership into deleting, cancel active launch, withdraw cache and publish route Delete. Asynchronous finalization stops the unit and all CH descendants, resets failed state, releases TAPFD or detaches vswitch, removes directories and hard-deletes row. Route withdrawal does not await cleanup. The old launch claim remains until its attempt finishes local cleanup, preventing late CAS resurrection or an early same-SID successor. Guest restart policy cannot block host unit termination.
 - **Readiness:** before assigning a runner, conductor binds `<RunDir>/ready.sock` with directory 0700/socket 0600. Runner immediately connects. Conductor waits for artifact completion, readiness EOF, cancellation and absolute deadline together, so a task exiting during root reads fails immediately. The one-shot stream must be `control_ready\nready\nEOF`. Bare is ready then; e2b next sends mandatory POST /init as the first envd request, without /health as a startup gate. Health is for external checks after initialization. Artifact-launch absolute budget begins at successful Assign and covers root read, completion RPC, host resource/network preparation, final-spec wait, exec/startup, runtime wire and /init; final spec does not reset it. Cold fast path retains its post-handoff runtime budget. /init starts immediately, retries only connection/transport errors at 1ms/2ms/4ms/capped-5ms backoff, with at most 50ms per request. Only 204 succeeds; other statuses expose the status code without potentially sensitive response body. Protocol errors, early EOF, cancellation or total timeout fail launch: fresh starting becomes dead; resume returns paused. After durable acceptance but before runner assignment, failure uses the empty-RunID fence. Only /init success commits starting→running with the exact RunID and publishes running route.
-- **Liveness authority:** one ListUnitsByPatterns call for runner templates obtains the authoritative active RunID set for reconciliation with stored sandboxes.run_id (§15).
+- **Liveness authority:** one ListUnitsByPatterns call for runner templates obtains the authoritative active RunID set for reconciliation with stored sandboxes.run_id (§14).
 - Host Restart=no and guest envd restart=always under sandbox-init are separate layers.
 
-<a id="51-cgroupctlvmm-隔离与-fd-capability"></a>
 ### 5.1 Cgroup separation and FD capability
 
 The runner unit root is an empty delegation boundary:
@@ -887,7 +847,6 @@ sandbox-ctl restores CLOEXEC immediately, configures limits and creates CH atomi
 
 KillMode=control-group covers ctl/vmm recursively. systemd reclaims the delegated subtree after StopUnit; conductor need not move processes or remove cgroups itself. Delegation/hierarchy/controller/FD failures precede CH startup.
 
-<a id="52-日志journald-单汇--标签词表"></a>
 ### 5.2 Journald and log labels
 
 Conductor constructs independent journald targets for runtime component diagnostics, app stdio and guest console. Every managed Sandbox target explicitly carries `KUASAR_STABLE_ID`, `KUASAR_SANDBOX_ID` and `KUASAR_RUN_ID`; Build phase targets carry `KUASAR_BUILD_ID` and `KUASAR_RUN_ID`. Fields are not inferred from environment, units or artifacts and do not inherit across outputs. Complete identity, encoding, query and delivery rules live in the [journal identity guide](node-journald.md); runtime argument syntax belongs to [sandboxer's journal guide](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/journald.md).
@@ -901,7 +860,6 @@ Conductor constructs independent journald targets for runtime component diagnost
 
 Native streams write directly to journal without temporary log files. Run-builder milestones and envd RUN replay use pure-Go `go-systemd/journal`. `--log-to` does not replace original process stderr: early CLI output, CH stderr, panics and failed-send fallback retain their existing sinks. Builder units set `LogRateLimitIntervalSec=0`; runners keep default rate limits. Neither policy guarantees lossless storage under journal/storage failure, exactly-once durability or nonblocking sends.
 
-<a id="6-本机控制-socketrun--task--admin--plugin--api-平面"></a>
 ## 6. Local control socket: run, task, admin, plugin and API planes
 
 Conductor serves h2c/HTTP1.1 on paths.config_socket, default `/run/sandbox/node-ctl.socket`, mode **0600**. One socket multiplexes five independently authenticated planes. SO_PEERCRED injects peer PID into request context; same UID/root can connect, with additional plane checks. SDKs do not use /internal/*, which is separate from API paths.
@@ -936,7 +894,6 @@ Confidential MMDS projection cannot be self-granted by arbitrary plugins. Only e
 
 Host root/daemon UID are trusted; tenant code runs inside guests and cannot reach host UDS.
 
-<a id="7-密钥与归属模型apisecret--manifestkey-凭据对加密存-sqlite"></a>
 ## 7. Credentials and ownership: encrypted APISecret/ManifestKey pairs
 
 - **Stable and local identity:** Sandbox.ID is the node-local store/runtime/route lookup key. StableID() preserves sandbox identity across local-ID changes. Ordinary standalone Create leaves StableIDValue empty, so the helper falls back to Sandbox.ID. Standalone import with another target ID changes only Sandbox.ID and preserves source StableID/service credentials. Identity-preserving migration/copy may produce several local rows sharing StableID; stable_id is neither UNIQUE nor a reverse-lookup index. In a cluster, local ID is NodeSandboxID and StableID is Registry's public SandboxID. Same-node resume retains both; cross-node migration/replacement changes only NodeSandboxID. Forward/Exec KAT sid always binds StableID; a copy is not thereby an independently authorized fork. Publication locations are also keyed by StableID (§8.1.4): a re-export after an import changed the target ID lands in the same directory, and every cluster generation shares one directory. Import admission validates a token-carried StableID as an opaque id (types.ValidLocalSandboxID), rejecting malformed identities at import instead of failing export-time Resolve.
@@ -970,7 +927,6 @@ Host root/daemon UID are trusted; tenant code runs inside guests and cannot reac
   MmdsSecret is HMAC-SHA256 using decoded ManifestKey and `kuasar-mmds-v1:` plus SID. This deterministic per-sandbox MMDS session-signing key is projected to trusted Proxy when enabled, authenticating envd (§7 of [node-proxy.md](node-proxy.md)).
 - **Separate MMDS route-value storage:** MmdsSecret signs/verifies MMDSv2 tokens; MMDSRouteSecretValues contains sensitive response values. Each Sandbox/Build owner has one encrypted JSON blob containing actual name→opaque bytes only, without version, Content-Type, TTL or configured/wait state. AAD binds at least owner kind/ID, canonical route digest and revision. Updates use revision CAS; key rotation retains old secretbox decrypt keys. Create/Register transaction writes business row, routes-only metadata and initial blob together. Sandbox deletion cascades; Build terminal/cleanup removes its blob. Database contains ciphertext; plaintext exists only for bounded trusted conductor/Proxy heap lifetimes.
 
-<a id="8-生命周期与状态机"></a>
 ## 8. Lifecycle and state machine
 
 Four fixed rules govern lifecycle:
@@ -1026,10 +982,8 @@ After durable acceptance, finalizer waits for late launch ownership to finish, t
 
 CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains only BaseDir/checkpoint and source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
-<a id="81-artifact-lifecycle转模板与迁移"></a>
 ### 8.1 Artifact capture, templates and migration
 
-<a id="811-capture-与-pause"></a>
 #### 8.1.1 Capture and Pause
 
 Create autoPauseMemory has tri-state parsing:
@@ -1066,7 +1020,6 @@ CaptureSandbox:
 
 Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. RunDir removal failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
 
-<a id="812-resume-admissionconnect-与-wake"></a>
 #### 8.1.2 Resume admission, Connect and Wake
 
 Connect accepts a bounded strict JSON object with timeout and optional bool/null memory. The upstream Connect reference checked on 2026-09-07 also exposes memory; Kuasar's exact source-dependent rules below define local behavior rather than claiming complete upstream policy equivalence. Omitted/null maps to ResumeAuto, true to ResumeMemory, false to ResumeCold:
@@ -1086,7 +1039,6 @@ BeginResume(id, deadline, LaunchMode, RunDir, EnvdUDS, CiUDS) requires fully cle
 
 Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. A future autoResume=false must be separate traffic policy, not inferred from E/S kind; complete E2B autoResume is not implemented.
 
-<a id="813-task-local-artifact-prepare-与三种-config"></a>
 #### 8.1.3 Task-local preparation and three configuration types
 
 Artifact launch runs internal/taskartifact inside its tenant task. ArtifactPrepareSpec includes source kind/ref, durable mode, manifest config, location parent, relative directory, max refs and absolute deadline. With its MANIFEST_KEY, the task uses sandboxer's real readers to open/decrypt artifacts; conductor does not.
@@ -1108,7 +1060,6 @@ Runtime uses three explicit DTOs:
 
 Node-generated hosts/resolv.conf use ephemeral_files during cold launch, not portable C0; memory restore does not reinject them. Persistent env/files follow deliberate C0 overrides; ephemeral input affects this cold invocation only. Rendered YAML must pass LoadMergedWithPresence and the corresponding ApplyFromRules/ApplyRestoreRules, retaining E's data-disk name/order/mount authority.
 
-<a id="814-publishtemplate-与-migration"></a>
 #### 8.1.4 Publication, templates and migration
 
 Both local E/S use:
@@ -1139,12 +1090,10 @@ Standalone import defaults to source NodeSandboxID; an explicit target changes o
 
 Running means runtime readiness and mandatory e2b /init, not application-port health. Generic backend health/dial retry is separate work. Cluster Create/Connect reuse node primitives. Secrets-only CONNECT import remains standalone-only; node-link carries no MMDS route-value plaintext.
 
-<a id="9-数据面边界"></a>
 ## 9. Data-plane boundaries
 
 The data-plane **forwarding layer**—L7 reverse proxy routing `(sid, port)` to guest envd/floating IP, per-request authentication, CONNECT tunnels, MMDS and the routesync wire format—is specified in [node-proxy.md](node-proxy.md). Conductor serves only control APIs, lifecycle and local route authority. It creates no proxy, listens on no data port and receives or forwards no Sandbox data. The independent `node-ctl proxy serve` process's mandatory `data_listen` is the node's sole data ingress.
 
-<a id="91-apiendpoint-与-dataendpoint"></a>
 ### 9.1 APIEndpoint and DataEndpoint
 
 Standalone and cluster deployments must separate the endpoints:
@@ -1160,7 +1109,6 @@ Router→node currently uses plaintext HTTP/CONNECT. The two registered endpoint
 
 Proxy master can register an optional stats_socket. Each worker pushes Prometheus counters and per-Sandbox absolute traffic values through its own socketpair. Conductor's traffic API queries only the current trusted Proxy registration's stats endpoint. Route-barrier participation is independent of this socket. Each logical ingress is counted once, at the final node worker.
 
-<a id="92-路由权威与广播"></a>
 ### 9.2 Route authority and broadcast
 
 Conductor serve is this node's route and lifecycle authority. Create/resume/pause/kill update routes immediately and broadcast routesync Upsert/Delete to plugin-plane subscribers: Proxy masters and read-only observers such as platform agents. Master projects routes into shared memory; workers read them, while observers maintain read-only state caches. Full broadcast sends individual upserts followed by a bookmark, keeping sender memory bounded at high density. See node-proxy.md §4 for framed JSON over h2c, resynchronization and RouteEntry fields, including migration's artifact_location, MMDS's mmds_secret and presence-aware max_inflight patches; §6 covers plugin registration/authentication. Registry owns fleet-wide routes (cluster.md). Node-link reports local Sandbox events to Registry (§10), independently of local plugin broadcasts.
@@ -1171,7 +1119,6 @@ Server-side projection precedes broadcast. Trusted MMDS proxies receive mmds_rou
 - **Starting projection:** broadcast immediately after durable insertion of `starting,run_id=""`, before any FloatingIP or usable endpoint exists. Publish enriched starting after network ownership is durably CAS-written and YAML/ready.sock are prepared, allowing Proxy MMDS to support envd /init. Starting permits neither ordinary data access nor Wake. Each Create follows its initial Upsert with an ordered route barrier. Master validates and merges node defaults with explicit patches, then transactionally publishes admission bindings and route SHM before ACK. The barrier does not wait for worker readiness, statistics or a healthy-worker count: successful master apply can ACK with no serving workers. Admission/route apply failure neither ACKs nor leaves half-published state. Only successful apply+ACK and a lease recheck permit 201 and launch. Thus the first valid request after 201 should see starting and park, without treating the normal propagation gap as missing. Launch success broadcasts running; failed Create broadcasts Delete, while failed Resume broadcasts paused.
 - **Envd authentication posture (`mmds.enabled`):** determines whether Create supplies an envd token and Proxy hosts MMDS. False means non-secure envd and one proxy gate, with `proxy.auth=enforce` required. True enables FC MMDS v2 inside Proxy and re-keys a fresh token per identity through /init, making snapshot fan-out data access possible. See node-proxy.md §7 for the posture comparison and two-stage MMDS protocol.
 
-<a id="10-集群接入node-link"></a>
 ## 10. Cluster integration (node-link)
 
 With cluster.node_link.endpoint (§3), `node-ctl conductor serve` dials Registry to join the cluster orchestrated by `cluster-ctl registry/router/placer`. Node-link reuses routesync's framed JSON over h2c engine (node-proxy.md §4), with reversed roles: node owns local routes/builds; Registry subscribes and sends commands.
@@ -1194,7 +1141,6 @@ There are two cluster→node paths:
 - **Node-link:** registration, heartbeats, Sandbox route events, Build snapshots/deltas, commands and manifest-key leases.
 - **Router forwarding to local e2b control/data planes:** pause/kill/timeout and Build status/files use local e2b control; data enters local Proxy after Router injects E2b-Sandbox-Id and X-Access-Token (node-proxy.md).
 
-<a id="101-注册与-redirect"></a>
 ### 10.1 Registration and redirect
 
 After dialing Registry's node_link endpoint, the first node frame is:
@@ -1215,7 +1161,6 @@ register{
 
 If the accepting member does not own this node_link and the node supports redirect, Registry may return the owners' node_advertise list. Node tries owners in order, advancing on failure. With no redirect target or redirect disabled, the accepting member may relay to the first available owner.
 
-<a id="102-心跳与低频目录"></a>
 ### 10.2 Heartbeats and the low-frequency directory
 
 Node periodically sends:
@@ -1227,7 +1172,6 @@ heartbeat{zone, allocated, pool, build_registration_usage,
 
 Both Build capacity levels travel in the initial register frame. Sandbox watermarks come from the resource controller (node-resource.md). Allocated memory sums all local NodeReservations, while pool is node allocatable capacity; neither is host memory.current, VMM charge or guest demand. Both Build usage levels exactly sum each nonterminal SQLite Build.Resources/execution claim, never active count × a default vector. Node resource drain or maintenance policy sets draining. Ordinary heartbeats update node_link liveness and local watermarks without changing node_list. Initial registration and draining changes drive low-frequency directory projection. At placement commit, only the current connection held by the Registry node owner establishes liveness.
 
-<a id="103-sandbox-与-build-投影"></a>
 ### 10.3 Sandbox and Build projections
 
 Node reports authoritative local execution state:
@@ -1258,7 +1202,6 @@ The bookmark ending a full Sandbox Range carries full_sync=true. Node-link owner
 
 Existing post-registration Build projection has an independent bracket. Node subscribes to live Build changes, sends build_sync_begin, every retained local cluster Build row, then build_sync_end. The set includes registered/waiting/building and ready/error within retention. Registry fences these frames by NodeID session: once a new link takes effect, an overlapping old connection cannot alter projection. An unconditional per-Build fence orders each durable transition and live publication, independently of conductor Extension. Changes during snapshot follow end in order; slow subscribers disconnect and rebuild a complete snapshot. At build_sync_end, Registry deletes only unseen post-registration projection/refs from the preconnection immutable `(NodeID, BuildID)` baseline that still belong exactly to that node. Registry-owned BuildStarting ambiguous-dispatch intent is not node projection; an empty snapshot cannot establish definitive rejection. This protects new registrations and converges lost live build_delete on reconnection. Registry runs no separate terminal TTL. Long snapshots do not block control replies: the shared writer drains bounded command ACKs and coalesced heartbeats between items; live Build changes still wait for build_sync_end.
 
-<a id="104-命令受理"></a>
 ### 10.4 Command acceptance
 
 Registry sends commands to serve, which reuses e2b lifecycle primitives (§8/§8.1). Every Sandbox sid is an exact NodeSandboxID. Normal commands return cmd_ack on acceptance and report terminal state through route or BuildUpsert events. CmdCreate ACK requires the unique launch owner, inserted starting row, published cache/route, successful ordered route-applied barrier and lease recheck. It proves durable acceptance, not READY. Before ACK, CmdConnect cleans old runner/network/RunDir ownership, atomically restores canonical RunDir/UDS on paused→starting acceptance, commits the final deadline and publishes cache/route. CmdExecSession first completes optional import, authorization/signing and the same resume acceptance. All three then launch asynchronously under the common lifecycle root:
@@ -1280,7 +1223,6 @@ Standalone and cluster Delete share the same local finalizer. Node-link has no a
 
 Each exec-session API call is a separate authorization with a new CmdID and KAT; Resume can still join the SID's current attempt. CmdID correlates only the current command and ACK waiter. Node persists neither command digest nor typed result; Registry does not automatically resend that CmdID after disconnect, timeout or node restart. An API retry is a new operation: Connect revalidates/retries recovery and Exec Session may issue a new KAT.
 
-<a id="105-断线与安全"></a>
 ### 10.5 Disconnection and security
 
 Node reconnects with exponential backoff and registers again. Registry supplies its retained Sandbox route revision in Hello.resume_from; node replays from that subscriber cursor when its retention permits, otherwise sends individual full routes plus bookmark. This is not a node registration field. Build projection performs a complete bracket in every new session, independently of the route token, including after Registry restart.
@@ -1289,7 +1231,6 @@ Production node-link uses cluster.node_link.tls mTLS. Distributed APISecret+Mani
 
 Cluster integration and the local plugin plane share the routesync engine/wire format, with different subscriber kinds. Router never subscribes to node plugins; Registry aggregates fleet routes.
 
-<a id="11-guest-profileenvd-与工具链"></a>
 ## 11. Guest profiles: envd and the toolchain
 
 - Guest-runtime builds one sandbox-runtime.bundle: sandboxer's sandbox-init in a virtio-pmem/DAX runtime, with pinned envd, flatten-ctl and mkfs.erofs under /opt/sandbox-runtime/bin/. Raw EROFS starts at offset zero, followed by zero padding and a ZIP containing only an empty .kuasar.digest.<hex> marker. Runtime identity covers EROFS+padding and is computed once during construction; launch/restore reads it directly from EOF. Total length is aligned to 2 MiB for virtio-pmem, otherwise Cloud Hypervisor reports PmemSizeNotAligned. EROFS describes its own extent, so guest mounts ignore trailing padding/ZIP.
@@ -1300,18 +1241,11 @@ Cluster integration and the local plugin plane share the routesync engine/wire f
 - **Guest /etc/hosts is required:** flattened Docker images omit Docker's runtime-injected hosts file. Calls such as socket.getfqdn(hostname), including Python http.server.server_bind between bind and listen, can fall through to DNS and stall hostname resolution; approximately 20 seconds has been observed, rather than a fixed timeout guarantee. This can look like broken host→floating-IP application forwarding. Cold-launch SANDBOX_CONFIG injects /etc/hosts with `127.0.1.1 <hostname>` and /etc/resolv.conf from sandbox.network.dns through ephemeral_files, and sets the hostname through network.hostname. These node-derived files never enter portable C0 and are not reinjected on memory restore.
 - After runtime readiness, host directly calls mandatory POST /init over UDS to set envVars, default user/workdir user:/home/user and timestamp; accessToken appears only with MMDS (node-proxy.md §7). The short transport backoff described above covers an envd socket not yet dialable. Startup does not probe /health.
 
-<a id="12-模板构建target-aware最多三阶段的流水线构建在沙箱内进行"></a>
-## 12. Template builds (target-aware, up to three phases, inside Sandboxes)
-
-The complete Build execution, resource admission, steps, publication and recovery contract is in [Node template builds](node-build.md#5-target-aware-execution-and-publication). Conductor retains node process/shared-resource ownership; this section does not duplicate the pipeline.
-
-<a id="13-dns--tls"></a>
-## 13. DNS / TLS
+## 12. DNS / TLS
 
 Production uses operator-provided wildcard DNS/TLS for *.<domain> and api.<domain>, including on-premises/offline deployments. Conductor api.listen serves control; independent Proxy data_listen serves data. They must be different listeners. Standalone can terminate TLS on both; using port 443 for both requires distinct addresses or an external hostname-routing load balancer. Development E2B_API_URL/E2B_SANDBOX_URL point separately at plaintext HTTP/h2c. In clusters, Router owns the public wildcard certificate and currently forwards plaintext to node APIEndpoint/DataEndpoint; node-link separately uses cluster.node_link.tls mTLS (§10).
 
-<a id="14-契约边界"></a>
-## 14. Contract boundaries
+## 13. Contract boundaries
 
 | Object | Mechanism | Contract |
 |---|---|---|
@@ -1323,17 +1257,15 @@ Production uses operator-provided wildcard DNS/TLS for *.<domain> and api.<domai
 | Sandboxer pkg/artifact + pkg/sandbox | Direct Manifest ingest/single-root Bundle publication of image/E logical sources; local IMG→top-level E has no intermediate file. | Sandboxer owns typed roles, customer keys, write admission, root-last, sparse rules and named-location atomic/reuse validation. Finalization never invokes manifest-ctl store. |
 | Manifest-ctl (accelerator) | Independent Manifest Store CLI, outside Builder final publication. | Calling-process environment supplies MANIFEST_KEY. |
 | Mkfs.erofs (deps) | Guest-runtime make sandbox-runtime and guest flatten backend. | Deterministic runtime packaging; guest exports EROFS images (§11/[Build §5](node-build.md#5-target-aware-execution-and-publication)). |
-| Guest envd | UDS mapped by sandbox-ctl --connect. Build uses a minimal Connect+JSON process.Start client for steps/startCmd/readyCmd ([Build §5](node-build.md#5-target-aware-execution-and-publication)). | Unmodified upstream; protocol pins in §4.3/§4.5. |
+| Guest envd | UDS mapped by sandbox-ctl --connect. Build uses a minimal Connect+JSON process.Start client for steps/startCmd/readyCmd ([Build §5](node-build.md#5-target-aware-execution-and-publication)). | Unmodified upstream; protocol pins in §4.2/§4.3. |
 | Systemd | D-Bus StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload. | Process management and unit installation (§5). |
 | Node-ctl proxy serve | Bidirectional framed-JSON h2c routesync UDS plus separate data listener. | Independently operated on the same node. Master registers once; workers inherit data-listener FDs and shared routes. Frozen EffectiveConfig includes paths.run_root; workers never reread proxy.yaml (node-proxy.md §2.1/§3/§4). |
 
 Public Config/App/extension contracts live in config and app/conductor, app/proxy and app/telemetry; advanced Collector bindings are isolated in app/telemetry/otel. CGO_ENABLED=0 remains supported; internal core retains internal/* dependency boundaries.
 
-<a id="15-可靠性"></a>
-## 15. Reliability
+## 14. Reliability
 
-<a id="151-状态存储sqlite"></a>
-### 15.1 SQLite state
+### 14.1 SQLite state
 
 One SQLite file at paths.db_path uses WAL, mode 0600 and a pure-Go driver. Core tables:
 
@@ -1361,8 +1293,7 @@ Root/service credentials in *_enc use AES-256-GCM; both *_hash values are full S
 
 Each MMDS owner has at most one secretbox ciphertext row; §7 owns AAD/transaction/CAS/cleanup. Build schema markers, additive migration and terminal timestamp initialization are in [Build §6](node-build.md#6-persistence-recovery-and-retention).
 
-<a id="152-重启对账"></a>
-### 15.2 Restart reconciliation
+### 14.2 Restart reconciliation
 
 Before opening APIs, config-socket routesync or node-link, conductor reconciles `ListUnitsByPatterns("sandbox-runner@*.service")`:
 
@@ -1381,8 +1312,7 @@ These local finalizers implement #132/#133's cleanup contract. Export #196 retai
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 
-<a id="153-故障域"></a>
-### 15.3 Failure domains
+### 14.3 Failure domains
 
 | Failure | Impact | Recovery |
 |---|---|---|
@@ -1394,8 +1324,7 @@ RouteSource.Range and later full snapshots therefore never mispublish abandoned 
 | Cluster node-link disconnect | Registry temporarily loses fresh node view. | Node reconnects/registers/reports with exponential backoff (§10/cluster.md); local Sandboxes continue. |
 | SQLite corruption | Control unavailable. | File-level backup/rebuild; operators can still discover Sandbox units through ListUnits. |
 
-<a id="16-测试"></a>
-## 16. Tests
+## 15. Tests
 
 `make test` covers strict MMDS parsing/top-level merge/minimal persistence; encrypted owner values, AAD/CAS/cleanup; admin UDS/service relay/confidential projection; master/worker resync/rotation; HTTP routing; apikey/secretbox/regcreds; routesync registration/bookmarks; proxyshm route sharing/park/wake/generation sweep; proxyadmission multiworker bounded error, generation reuse and crash cleanup after Wait; same-ID plugin replacement; CONNECT tunnels; Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gates and buffered half-close; deterministic MMDS keys; launch ownership; namespace parsing/capacity folding/network merge; migration; and node-link registration/event/command round trips.
 
@@ -1420,8 +1349,7 @@ Feature E2E lives with implementation in orchestrator/test/e2e/. Lightweight clu
 
 Make test-e2e executes test/e2e/run_all.sh. The project repository supplies the common environment, aggregate entry and genuinely cross-component combinations without copying these scripts.
 
-<a id="17-see-also"></a>
-## 17. See also
+## 16. See also
 
 - [Node Proxy](node-proxy.md): independent forwarding, routing/routesync, authentication, MMDS and CONNECT; §9's sole data ingress, reached through Router in clusters.
 - [Node resources](node-resource.md): resource protocol, Sandbox policy and controller organization, embedded in serve at the sole resource_listen endpoint.

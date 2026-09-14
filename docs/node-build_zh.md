@@ -4,8 +4,6 @@
 
 本篇完整定义 Build 注册、目标选择、不可变执行资源、任务准备、顺序阶段执行、发布及恢复。[节点规范](node_zh.md) 维护共享进程、socket、凭据与节点恢复边界；[Registry 规范](cluster_zh.md) 维护集群构建意图和放置。
 
-<a id="42-控制面模板构建-api"></a>
-<a id="42-control-plane-template-build-api"></a>
 ## 1. Build API
 
 实现 e2b **v2 build system** 的端点族(SDK `Template.build` / CLI 走它);构建语义与
@@ -19,8 +17,6 @@
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [§5](#5-按目标执行与发布) |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile`、requested `target` 和 resolved artifact `kind` |
 
-<a id="44-templateid-与模板形态transient--persist无-templates-表"></a>
-<a id="44-template-ids-and-transientpersistent-forms"></a>
 ## 2. 模板 ID 与工件权威
 
 ```
@@ -58,7 +54,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
 | `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行([§5](#5-按目标执行与发布)) |
-| `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用([§4.6](node_zh.md#46-沙箱配置传递链)、[§5](#5-按目标执行与发布)) |
+| `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用([§4.4](node_zh.md#44-沙箱配置传递链)、[§5](#5-按目标执行与发布)) |
 | `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元不设置 `TimeoutStartSec`;另有独立的 60 秒 fencing/宿主清理窗口,见 §6) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw([§5](#5-按目标执行与发布)) |
@@ -100,7 +96,7 @@ target 和这些 build-only 字段解析后均从模板 metadata 中剥离,
 
 Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/metadata、
 `envVars` 和实例选项的共享 typed parser,各 namespace 的字段与 Header/metadata 合并规则
-见 [Node §4.6](node_zh.md#46-沙箱配置传递链)。Register 始终拒绝 `kuasar-sandbox.identity`、
+见 [Node §4.4](node_zh.md#44-沙箱配置传递链)。Register 始终拒绝 `kuasar-sandbox.identity`、
 租户提供的 node-managed cluster metadata、`restore` 与 `autoPauseMemory`。
 普通 Build runtime 输入存 `builds.metadata_json`,build-only 输入存 `builds.builder_json`;
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
@@ -194,7 +190,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
 
 单元安装、共享 pool 分配与 cgroup 基础设施见 [Node §5](node_zh.md#5-进程管理systemd-模板单元启动时自动生成安装);下方单元日志注释中的 §5.2 指 [Node journald](node_zh.md#52-日志journald-单汇--标签词表)。
 
-**builder 单元**(`%i` = run-id,§5):
+**builder 单元**(`%i` = run-id):
 
 ```ini
 # sandbox-builder@.service (生成内容)
@@ -231,8 +227,6 @@ Builder execution 配置 CPU 或 memory 聚合上限时不允许保留长期 idl
 属性。这样未 claim 的 idle RSS/CPU 不会侵占 `sandbox-builder.slice` 为 active Build 保留的
 完整 aggregate ceiling，也不需要引入隐藏的 idle 资源预算。
 
-<a id="12-模板构建target-aware最多三阶段的流水线构建在沙箱内进行"></a>
-<a id="12-template-builds-target-aware-up-to-three-phases-inside-sandboxes"></a>
 ## 5. 按目标执行与发布
 
 构建经 e2b API 提交(端点见 [§1](#1-build-api);无独立构建 CLI),落 `builds` 表,由资源池调度,
@@ -613,4 +607,4 @@ execution claim。phase 子进程的自清理不是最终正确性
 依据。节点级数据库、config socket 与 runner pidfile 不位于对象目录内，不受 Sandbox/Build
 `RemoveAll` 影响。
 
-共享 SQLite 基础设施与终态 reaper 由 [节点可靠性](node_zh.md#15-可靠性) 维护;Build schema 与恢复由本节维护。Build 行是有保留期的执行/status/alias 记录，不是永久模板目录；已发布 canonical template ref 不依赖原 Build 行。
+共享 SQLite 基础设施与终态 reaper 由 [节点可靠性](node_zh.md#14-可靠性) 维护;Build schema 与恢复由本节维护。Build 行是有保留期的执行/status/alias 记录，不是永久模板目录；已发布 canonical template ref 不依赖原 Build 行。

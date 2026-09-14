@@ -17,7 +17,7 @@
 #                                until runtime readiness + /init complete.
 #                                The create injects sandbox config via the
 #                                X-Kuasar-Sandbox-Network header (hostname), checked
-#                                in the guest below (§4.6 config passing chain).
+#                                in the guest below (docs/node.md §4.4 config passing chain).
 #   exec-session + CONNECT     -> issue an explicit exec capability, then use the
 #                                real sandbox-ctl HTTP CONNECT client against the
 #                                guest (stdio, PTY resize, exit status, pause wake).
@@ -395,7 +395,7 @@ allow_proxy_forwarding() {
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
-    # Optional sandbox-config injection header (§4.6): set REQ_NET_HEADER to a JSON
+    # Optional sandbox-config injection header (docs/node.md §4.4): set REQ_NET_HEADER to a JSON
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
     [ -n "${REQ_RESOURCE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Resource: ${REQ_RESOURCE_HEADER}")
@@ -1710,7 +1710,7 @@ fi
 echo "==> PASS: starting SetTimeout=204, Pause=409, Kill removed row/runner without resurrection"
 
 # ---- create the sandbox (boots the microVM) -------------------------------
-# Inject sandbox config via the X-Kuasar-Sandbox-Network header (§4.6): the guest
+# Inject sandbox config via the X-Kuasar-Sandbox-Network header (docs/node.md §4.4): the guest
 # hostname should become CFG_HOST, verified by `hostname` in the exec below.
 CFG_HOST="e2e-cfg-host"
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE; inject hostname=$CFG_HOST via header)"
@@ -1899,7 +1899,7 @@ sed 's/^/  guest| /' "$WORK/exec.out"
 grep -q "$MARK" "$WORK/exec.out" || fail "guest command output missing $MARK (envd exec failed; see above)"
 grep -q 'EXIT_CODE 0' "$WORK/exec.out" || fail "guest command exit code != 0"
 echo "==> PASS: command executed in guest (saw $MARK, exit 0)"
-# Sandbox-config injection (§4.6): the X-Kuasar-Sandbox-Network header set the guest
+# Sandbox-config injection (docs/node.md §4.4): the X-Kuasar-Sandbox-Network header set the guest
 # hostname. Best-effort (the main flow already passed); a note rather than a failure.
 if grep -q "$CFG_HOST" "$WORK/exec.out"; then echo "==> PASS: config injected (guest hostname=$CFG_HOST via X-Kuasar-Sandbox-Network)"
 else echo "    (note: guest hostname != $CFG_HOST; config-injection check inconclusive)"; fi

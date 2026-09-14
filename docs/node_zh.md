@@ -2,10 +2,6 @@
 
 # node — 节点 e2b 兼容沙箱主机与集群接入
 
-直连 Create 的可选 ID、Header/metadata 优先级和 insert-only 冲突语义参见[创建时指定沙箱身份](#412-create-身份)。
-
-`kuasar-sandbox.identity` 是直连 Create 的请求级命名空间（`id` 和可选 `stable_id`），也接受等价的 `X-Kuasar-Sandbox-Identity` Header。核心在 Create Hook 前提取它，不继承或原样持久化为配置；模板 Build 注册拒绝该项。Build 内部 MMDS 路由索引使用独立命名空间，因此合法的 `build-` 前缀用户 ID 仍然受支持。
-
 `node-ctl conductor serve` 是计算节点上的单实例控制 daemon,对外提供一套 **e2b 兼容 API**,把节点上的
 microVM 沙箱以 e2b 协议暴露给客户端——在本文协议与已验证版本支持的操作范围内，未改造的 e2b SDK（python/js `e2b`、
 `@e2b/code-interpreter`）与 e2b CLI 可直接指向本机运行。`node-ctl conductor serve` 一身兼数职:
@@ -65,7 +61,7 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
    路由权威是 registry——serve 经 node-link 上报沙箱事件、受理集群命令(§10),不与
    集群争路由权威。
 6. **重启可对账**:状态在 sqlite + systemd 单元集,serve 重启后以单元集为
-   存活权威对账收养/清理(§15);集群下另经 node-link 重连重报本节点沙箱集让 registry 收敛。
+   存活权威对账收养/清理(§14);集群下另经 node-link 重连重报本节点沙箱集让 registry 收敛。
 
 ### 1.3 两类沙箱(profile)
 
@@ -84,7 +80,7 @@ profile 编码在 templateID 前缀里（[Build §2](node-build_zh.md#2-模板-i
   下发命令(控制),平台管理面亦可经 e2b API 对接。
 - 既可**独立运行**也可**接入集群**:控制面(create/pause/kill/模板构建)始终在本节点;
   接入集群仅多一条 node-link(§10),不改 e2b 契约。
-- 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.3)。
+- 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.2)。
 - 独立 Telemetry 实现 envd/OTLP 采集与 E2B `/sandboxes/{SandboxID}/metrics` 历史；
   Conductor 只鉴权、检查 ownership 并转发到 live query UDS，完整契约见
   [Telemetry](telemetry_zh.md)。`/stats/resource`、`/stats/traffic` 仍是独立即时快照(§4.1.1)。
@@ -151,7 +147,7 @@ create 由 node-link 的
 `create` 命令触发;profile、group、route-key
 和可选认证主体通过结构化系统上下文下发并独立持久化。事件回报 profile、node-owned
 执行事实和受保护路由凭据投影,registry 从既有节点归属记录恢复其 cluster identity
-(§10、§4.6)。
+(§10、§4.4)。
 
 数据面按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id`/`E2b-Sandbox-Port` 头解析
 legacy `(sid, port)`.e2b profile 的 49983/49999 使用 EnvdAccessToken,拨 sandbox-ctl
@@ -249,7 +245,7 @@ node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # 2) e2b SDK/CLI 直接指向本机
-export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
+export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §12)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3443
 ```
 
@@ -267,7 +263,7 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 | `--config` | `/etc/node-ctl/conductor.yaml` | conductor 配置文件(§3) |
 
 启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
-重启对账(§15)→ 起 reaper(TTL,5s 周期)→(配 `resource_listen` 则起内置资源控制器,
+重启对账(§14)→ 起 reaper(TTL,5s 周期)→(配 `resource_listen` 则起内置资源控制器,
 node-resource.md)→ 起本机控制 socket并确认监听成功(§6)→ 起 runner/builder 预启动池与
 构建准入循环([Build §5](node-build_zh.md#5-按目标执行与发布))→(配 `cluster.node_link.endpoint` 则拨 registry 起 node-link 客户端,§10)→
 监听 `api.listen`.该 listener 只服务 wrapped control API;sandbox data Host 或 CONNECT
@@ -448,7 +444,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 |---|---|---|
 | `api.domain` | (必填) | 服务域,如 `sandboxes.example.com`;控制面 = `api.<domain>` |
 | `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
-| `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文。custom Runtime TLS provider 非 nil 时为权威材料源，core 仍固定 TLS version/ALPN/client-auth 策略 |
+| `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§12);空 = 明文。custom Runtime TLS provider 非 nil 时为权威材料源，core 仍固定 TLS version/ALPN/client-auth 策略 |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §4) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §6) |
 | `proxy.metrics_listen` | 空(关) | conductor 进程的全局 Prometheus 文本端点;Proxy worker 数据面指标在 `proxy.yaml` 的 `metrics_listen` |
@@ -457,7 +453,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。`node-ctl config` 只诊断 regular/executable、非 group/world-writable、非 node-ctl same-file 元数据，不按诊断 EUID 判断 owner；实际 dispatch 中 root node-ctl 只接受 root-owned，非 root node-ctl 接受 root-owned 或本 EUID-owned。它执行已打开并校验的同一 FD，失败绝不回退 |
 | `paths.run_root` | `/run/sandbox` | 节点 RunRoot:node-level 小文件、`runners/`、`sandboxes/`、`builds/`；通常为 tmpfs；必须为最大 BuildID 的最长 phase UDS 留出 107-byte Linux pathname 预算(§1.6) |
 | `paths.base_root` | `/var/lib/sandbox` | 节点 BaseRoot:node-level 持久文件与 `sandboxes/`、`builds/` 大体积数据(§1.6) |
-| `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
+| `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§14) |
 | `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);manifest-key/export/import CLI,Proxy 与平台 agent 的连接点 |
 | `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
@@ -512,7 +508,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 Builder 配置与 legacy schema 边界见 [Build 配置](node-build_zh.md#3-build-配置)。
 
 远程内存 Prefetch 没有节点统一开关。是否请求 Prefetch 由每个 sandbox 的
-`kuasar-sandbox.restore` 命名空间决定(§4.6)。
+`kuasar-sandbox.restore` 命名空间决定(§4.4)。
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 Proxy 是唯一数据面闸门);`mmds.routes.enabled=true` 还要求 `mmds.enabled=true`,service endpoint
@@ -700,6 +696,8 @@ admission算法、误差证明、worker-local状态机、绝对快照 stream 和
 
 #### 4.1.2 Create 身份
 
+Build 内部 MMDS 路由索引使用独立命名空间，因此合法的 `build-` 前缀用户 ID 仍然受支持。
+
 直连 conductor 的 `POST /sandboxes` 可以指定节点本地 SandboxID，并可选指定独立的
 StableID。这是创建时的配置输入，不是身份预约接口，也不提供幂等结果重放。
 
@@ -818,15 +816,11 @@ starting、等待 Proxy 路由应用屏障，再调度异步启动。单机 HTTP
 acceptance，不表示 guest 已就绪。node-link 在同一边界返回 accepted ACK；
 `CreateCluster` 仍只是等待本次具体 attempt 的同步包装。
 
-周边契约参见[节点规范](node_zh.md)、[集群 Router](cluster-router_zh.md)与
+周边契约参见[集群 Router](cluster-router_zh.md)与
 [扩展指南](extensions_zh.md)。
 
 
-### 4.2 控制面:模板构建 API
-
-完整的模板注册、触发、状态与上下文上传契约见 [Build API](node-build_zh.md#1-build-api)。
-
-### 4.3 数据面协议(envd 与 native exec)
+### 4.2 数据面协议(envd 与 native exec)
 
 envd 单端口 **49983**,HTTP/1.1 与 h2c 双栈,Connect-RPC(proto 包无版本):
 `process.Process`、`filesystem.Filesystem`(仅元数据);文件内容走 HTTP
@@ -857,11 +851,7 @@ CONNECT 200 后严格读取并授权完整 `exec_request` 首帧;条件通过后
 sandbox、连接 `ctl.sock` 并原样转发首帧;详见
 [node-proxy.md](node-proxy_zh.md) §5.
 
-### 4.4 templateID 与模板形态(transient / persist,无 templates 表)
-
-Persistent/transient templateID、工件类型与保留期边界见 [模板 ID 与工件权威](node-build_zh.md#2-模板-id-与工件权威)。
-
-### 4.5 SDK / CLI 对接与协议 pin
+### 4.3 SDK / CLI 对接与协议 pin
 
 - 重定向:`E2B_DOMAIN=<domain>` + `E2B_API_KEY`(生产,TLS);dev 走
   `E2B_API_URL`/`E2B_SANDBOX_URL`(http/h2c)。控制面要求 Host 命中 `api.*`。
@@ -875,7 +865,7 @@ Persistent/transient templateID、工件类型与保留期边界见 [模板 ID �
   `register|hello|upsert|delete|bookmark|wake|route_barrier|route_barrier_ack`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §4).
 
-### 4.6 沙箱配置传递链
+### 4.4 沙箱配置传递链
 
 每实例沙箱配置经**命名空间化的 e2b metadata 保留键** `kuasar-sandbox.<ns>`(各值一个
 JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定义可配置子集，再由 renderer 生成 sandboxer 配置；
@@ -1187,7 +1177,7 @@ pool loop 唯一回复,每个请求恰有一次结果。
   只有 `/init` 成功后才以同一 run-id 把
   starting CAS 为 running 并发布 running route.
 - **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
-  run-id 集,再与库内 `sandboxes.run_id` 对账(§15)。
+  run-id 集,再与库内 `sandboxes.run_id` 对账(§14)。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
   互不相干。
 
@@ -1991,11 +1981,7 @@ plugin 平面,机群路由经 registry 聚合。
   `accessToken`(node-proxy.md §7).envd socket 尚未可拨由上述短退避传输重试吸收,
   无启动期 `/health` 探测.
 
-## 12. 模板构建(target-aware、最多三阶段的流水线,构建在沙箱内进行)
-
-完整的构建执行、资源准入、steps、发布与恢复见 [节点模板构建](node-build_zh.md#5-按目标执行与发布)。Conductor 保留节点进程与共享资源边界，不在此维护第二份流水线。
-
-## 13. DNS / TLS
+## 12. DNS / TLS
 
 生产:`*.<domain>` + `api.<domain>` 通配 DNS + TLS(operator 提供,on-prem/离线
 友好).控制面由 conductor `api.listen` 承载,数据面由独立 Proxy `data_listen` 承载;
@@ -2005,7 +1991,7 @@ plugin 平面,机群路由经 registry 聚合。
 `APIEndpoint`/`DataEndpoint` 跳当前为明文,node-link 则用独立的
 `cluster.node_link.tls` mTLS(§10).
 
-## 14. 契约边界
+## 13. 契约边界
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
@@ -2017,7 +2003,7 @@ plugin 平面,机群路由经 registry 聚合。
 | sandboxer `pkg/artifact` + `pkg/sandbox` | Builder 的 image/Sandbox logical source 直接 Manifest ingest 或 single-root Bundle publication；本地 IMG→顶层 E 无中间文件 | typed role、customer key、write admission、root-last、sparse semantics、named-location atomic/reuse validation 均由 sandboxer 统一实现；Build finale 不调用 `manifest-ctl store` |
 | `manifest-ctl`(accelerator) | 独立的 Manifest store CLI；Builder final publication 不经该 CLI | `MANIFEST_KEY` 经调用进程环境 |
 | `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、[Build §5](node-build_zh.md#5-按目标执行与发布)) |
-| guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,[Build §5](node-build_zh.md#5-按目标执行与发布)) | 原版不改;协议 pin 见 §4.3/§4.5 |
+| guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,[Build §5](node-build_zh.md#5-按目标执行与发布)) | 原版不改;协议 pin 见 §4.2/§4.3 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
 | `node-ctl proxy` | UDS routesync(双向 h2c 帧化 JSON)+ 独立 Data listener | 同节点,运维带外起;Proxy master 注册一次,worker 共享继承 Data listener fd + shm 路由视图;master 冻结的 EffectiveConfig 含 `paths.run_root`,worker 不重读 `proxy.yaml`(node-proxy.md §2.1/§3/§4) |
 
@@ -2025,9 +2011,9 @@ plugin 平面,机群路由经 registry 聚合。
 advanced Collector binding 隔离在 `app/telemetry/otel`；
 `CGO_ENABLED=0`;内部 core 继续保持 `internal/*` 依赖边界。
 
-## 15. 可靠性
+## 14. 可靠性
 
-### 15.1 状态存储(sqlite)
+### 14.1 状态存储(sqlite)
 
 单文件 sqlite(`paths.db_path`,WAL,文件 0600),纯 Go 驱动。核心表:
 
@@ -2059,7 +2045,7 @@ AES-256-GCM、两项 `*_hash` 均为
 完整 SHA-256。`substr(api_secret_hash,1,24)` 仅建候选预筛索引(§7)。
 MMDS value 表每 owner 最多一行 secretbox ciphertext;AAD/事务/CAS/cleanup 见 §7。Build schema marker、additive migration 与终态时间补入见 [Build §6](node-build_zh.md#6-持久化恢复与保留)。
 
-### 15.2 重启对账
+### 14.2 重启对账
 
 conductor 在开放 API、config-socket routesync 和 node-link 前先以
 `ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
@@ -2110,7 +2096,7 @@ cleanup stage 或第二份路径权威。
 因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
 已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。
 
-### 15.3 故障域
+### 14.3 故障域
 
 | 故障 | 影响 | 自愈 |
 |---|---|---|
@@ -2122,7 +2108,7 @@ cleanup stage 或第二份路径权威。
 | node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md);本节点沙箱不受影响 |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
 
-## 16. 测试
+## 15. 测试
 
 单元测试:`make test`(MMDS strict parser/top-level merge/minimal persistence、route value
 encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
@@ -2163,7 +2149,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 `make test-e2e` 即执行 `test/e2e/run_all.sh`;项目主仓只提供统一环境、聚合入口及真正跨组件
 组合本身的用例,不复制上述脚本。
 
-## 17. See Also
+## 16. See Also
 
 - [node-proxy.md](node-proxy_zh.md) —— 独立数据面转发层:路由判定 / routesync /
   数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 的唯一数据入口,集群下 router 转发进入)
