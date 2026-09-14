@@ -133,7 +133,7 @@ namespace、监听 loopback 时，保留现有 MMDS mapping，并在部署的 vs
 恢复 guest tuple。这是数据包直接送达 telemetry，不是转发身份 header。已有 loopback
 management 部署要求 management interface 的 `route_localnet=1`；也可在可路由的
 namespace interface 地址监听，把 mapping target 换成该地址，并沿用 FloatingIP return
-route。参见 [connector management network](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md)。
+route。参见 [connector management network](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch_zh.md#23-数据包流向)。
 使用节点实际的 management namespace/device 名，不另建第二套交换机。
 [部署模板](../deploy/telemetry.example.yaml) 包含对应 management-service 映射.
 组件真实 guest E2E 通过这条已有路径验证两个协议. 特权 Collector 回归同时占用宿主相同端口,

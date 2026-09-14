@@ -1,18 +1,12 @@
 [English](cluster-router.md) | [简体中文](cluster-router_zh.md)
 
-<a id="cluster-router--e2b-统一入口与路由缓存"></a>
-
 # cluster-router — unified e2b ingress and route cache
 
 The standalone `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` extension is rejected by public cluster Create and Build registration; Registry keeps allocation authority. See [Sandbox identity on Create](node.md#412-create-identity).
 
 `cluster-ctl router` is the cluster's northbound ingress for both the e2b control plane and data plane. It is not a routing authority and subscribes to neither routes nor node_list. It locates route owners by group. Explicit create/connect/exec-session calls use their corresponding Reserve operation; a data-plane cache miss starts with Resolve. RouteResolve returns both `APIEndpoint` and `DataEndpoint`, each with a fixed purpose. Once a route has `NodeSandboxID + DataEndpoint`, ordinary data traffic connects directly to the final node proxy even in paused/starting states; the node handles authorized parking, Wake, and backend connection. Exec CONNECT is the exception: after public 200, the router reads and authorizes the first ctl frame before connecting to the final node. `Reserve(operation=data)` remains only a fallback for a missing target after request admission, a typed stale target before sending Raw, or the ordinary data-plane compatibility path.
 
-<a id="1-概述"></a>
-
 ## 1. Overview
-
-<a id="11-请求路径"></a>
 
 ### 1.1 Request path
 
@@ -37,8 +31,6 @@ route_link owner
 node owner / placer / node
 ```
 
-<a id="12-原则"></a>
-
 ### 1.2 Principles
 
 1. **Every request requires a group**: `X-Kuasar-Sandbox-Group` shards both the cluster control plane and data plane.
@@ -48,15 +40,11 @@ node owner / placer / node
 5. **Data-plane bytes do not enter the registry**: the registry participates only in explicit create/connect/exec-session, cache-miss Resolve, and data Reserve fallback for a missing target or typed stale response.
 6. **Root credentials have separate purposes**: Reserve requires the original API key for create/connect/exec-session. Create group admission uses a ready placer's provider APISecret; connect/exec-session use the APISecret already bound to the Sandbox record. For other control operations, the router calls the route owner's verify-key, and the registry fails over to ready placers for verification. Protected READY route results also project the sandbox's bound APISecret, ServiceSecret, and purpose-specific access tokens to trusted routers. Raw ManifestKey never enters the registry/router routing chain.
 
-<a id="2-命令行"></a>
-
 ## 2. Command line
 
 ```text
 cluster-ctl router --config /etc/cluster-ctl/router.yaml
 ```
-
-<a id="3-配置"></a>
 
 ## 3. Configuration
 
@@ -107,8 +95,6 @@ During refresh, it tries bootstrap and known members and selects the result with
 
 The router does not participate in registry member health detection and subscribes to neither routes nor node_list.
 
-<a id="5-寻址"></a>
-
 ## 5. Addressing
 
 | Request | Required identity | Behavior |
@@ -135,11 +121,7 @@ The Registry specification owns the exact query/header/body schemas and repeats 
 
 For connect/exec-session/data, `sid` is the customer's expected stable SandboxID. It prevents requests from crossing lineage when a route_key is deleted and recreated.
 
-<a id="6-缓存模型"></a>
-
 ## 6. Cache model
-
-<a id="61-决策顺序"></a>
 
 ### 6.1 Decision order
 
@@ -182,8 +164,6 @@ This cache is protected state inside the router process. Root credentials and to
 
 Ports are not parsed from route_key. A legacy port comes from `E2b-Sandbox-Port`, the `<port>-<sandbox_id>` Host, CONNECT authority, or route_link's `target_port`. `target_port>0` enforces that port: use it when the request omits a port, and reject an explicitly conflicting port with 400. If all sources are missing, legacy requests return 400; the router does not default to 49983. `exec` is a portless logical service. A request may carry a port, but the router does not use it to select the backend and does not reject an omitted port. Port contracts for other explicit services remain within the [#63](https://github.com/kuasar-sandbox/orchestrator/issues/63) scope.
 
-<a id="63-在途请求"></a>
-
 ### 6.3 In-flight requests
 
 The in-flight count only indicates that `(group, route_key, stable sandbox_id)` is being forwarded. Once forwarding starts, each request owns a route copy and no longer depends on the cache entry. The count is not a routing source for new requests, does not retain/reuse/share data-plane TCP connections, and does not prevent a higher RouteRevision from replacing the current NodeSandboxID.
@@ -196,13 +176,9 @@ client C ── CONNECT ───────┘
 
 New requests for a route take their current decision only from the route cache and always create a fresh one-use CONNECT to the node proxy. Ordinary HTTP requests also start with CONNECT to the node proxy, then send one HTTP request inside the tunnel. External CONNECT requests receive the tunnel directly. A router-to-node TCP connection is therefore never shared across sandboxes or ports.
 
-<a id="64-reserve-并发"></a>
-
 ### 6.4 Reserve concurrency
 
 The router does not coalesce Reserve requests, avoiding a shared call across different operations, credentials, timeouts, or migration tokens. The registry coalesces the creation state machine only for concurrent create. Data converges on one activation through route CAS and stable-lineage waits. Each connect independently dispatches CmdConnect to the current NodeSandboxID. Each exec-session API call also has its own CmdID and ExecSessionResult and does not share a token. Data requests for unknown routes only Resolve; they never implicitly create a sandbox.
-
-<a id="65-失效"></a>
 
 ### 6.5 Invalidation
 
@@ -213,8 +189,6 @@ Evict a cached route when:
 - Route TTL or cache idle timeout expires.
 
 After a successful handshake, HTTP 401/403/404 comes from the sandbox application or envd and does not evict the route. A handshake failure with the typed errors above evicts the old target, calls `ReserveData` with the same request credential to revalidate and obtain a fresh route, then retries once. Ordinary connection failure only evicts the cache; subsequent requests Resolve again. No router route subscription is maintained for this purpose.
-
-<a id="7-控制面"></a>
 
 ## 7. Control plane
 
@@ -248,8 +222,6 @@ Content-Type: application/json
 ```
 
 The response contains no session ID, exp, NodeSandboxID, ServiceSecret, or route. Runtime failures return fixed, sanitized errors rather than raw node Ack reasons or internal paths. An asynchronous resume failure after Ack does not retroactively alter the returned token; later connections fail according to current route/state.
-
-<a id="8-数据面"></a>
 
 ## 8. Data plane
 
@@ -315,8 +287,6 @@ When ordinary HTTP/non-exec CONNECT reaches the final node proxy's per-Sandbox l
 
 Long-lived CONNECT uses the same route resolution, but tunnels are never reused. After disconnect, the route cache remains until idle/TTL expiry or fail-fast invalidation. Bytes prefetched by the router-to-node CONNECT response reader remain available in the tunnel. One-way EOF propagates a half-close only; the relay waits for the opposite direction's complete `exec_ack`, stdout/stderr, and exit status rather than truncating the tunnel on the first `io.Copy` return. One typed stale retry is allowed before Raw has been written to any node. Once Raw reaches a node, retry/reroute/replay is prohibited; node ctl errors pass through transparently without a second synthesized error.
 
-<a id="9-可靠性"></a>
-
 ## 9. Reliability
 
 | Event | Behavior |
@@ -330,8 +300,6 @@ Long-lived CONNECT uses the same route resolution, but tunnels are never reused.
 | Node API endpoint failure | Fail the current control/build request; subsequent requests Resolve again without switching to DataEndpoint. |
 | Node data endpoint failure | Evict the route cache; the next request Resolves again without switching to APIEndpoint. |
 | Late old-generation result | A lower RouteRevision or equal revision with another NodeSandboxID cannot overwrite the cache; an old request's failure cannot evict the new generation. |
-
-<a id="10-性能"></a>
 
 ## 10. Performance
 

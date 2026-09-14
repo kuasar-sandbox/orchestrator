@@ -4,8 +4,6 @@
 
 This is the complete node Build contract: registration and target selection, immutable execution resources, task preparation, sequential phase execution, publication and recovery. Shared process/socket/credential ownership remains in [node.md](node.md); Registry-owned cluster scheduling and intent remain in [cluster.md](cluster.md).
 
-<a id="42-控制面模板构建-api"></a>
-<a id="42-control-plane-template-build-api"></a>
 ## 1. Build API
 
 These implement the e2b v2 Build-system endpoint family used by SDK Template.build and CLI; pipeline/resource semantics are in §5.
@@ -18,8 +16,6 @@ These implement the e2b v2 Build-system endpoint family used by SDK Template.bui
 | Files | GET /templates/{tid}/files/{hash} → 201 | Resolve tid→Build→owner, then return present/url. present skips duplicate upload; URL is a direct-bucket presigned PUT, never bytes through control plane. No files_storage returns 501; missing/non-owned tid returns 404 ([§5](#5-target-aware-execution-and-publication)) |
 | List | GET /templates | Tenant's ready templates with persistent templateID, immutable profile, requested target and resolved artifact kind |
 
-<a id="44-templateid-与模板形态transient--persist无-templates-表"></a>
-<a id="44-template-ids-and-transientpersistent-forms"></a>
 ## 2. Template IDs and artifact authority
 
 ```
@@ -47,7 +43,7 @@ These Conductor configuration fields govern the Build service. Shared process, p
 | `builder.insecure_registry` | `false` | Allow plaintext HTTP for base-image pulls, e.g. a local development registry |
 | `builder.platform` | Empty | Pull platform, e.g. linux/amd64 |
 | `builder.image_uri_mask` | Empty | Client-pushed image naming convention with templateID/buildID placeholders; match CLI E2B_IMAGE_URI_MASK. Used when trigger omits fromImage; must be reachable inside Build guests ([§5](#5-target-aware-execution-and-publication)) |
-| `builder.referer` | Disabled | fromImage OCI Referrers cache: enabled defaults false; fallback/writeback true. Public owner desc is required when enabled; empty key equals desc; validity is optional Go duration. Request Builder options may further disable lookup/writeback, never enable disallowed behavior ([§4.6](node.md#46-sandbox-configuration-propagation), [§5](#5-target-aware-execution-and-publication)) |
+| `builder.referer` | Disabled | fromImage OCI Referrers cache: enabled defaults false; fallback/writeback true. Public owner desc is required when enabled; empty key equals desc; validity is optional Go duration. Request Builder options may further disable lookup/writeback, never enable disallowed behavior ([§4.4](node.md#44-sandbox-configuration-propagation), [§5](#5-target-aware-execution-and-publication)) |
 | `builder.diff_template` | — | Preformatted sparse ext4 for pull cache, step changes and export scratch; suggested size at least three times the largest expected image |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | Guest pull/flatten, each RUN step, readyCmd polling and whole Build. Step budget also reaches the guest as Connect-Timeout-Ms. Ready polling interval is 2s; absent readyCmd waits 20s. The unit sets no TimeoutStartSec; fencing/host cleanup has a separate 60-second window (§6) |
 | `builder.files_storage` | Empty | COPY context S3/OBS storage: endpoint/region/bucket (required)/prefix/access_key/secret_key/force_path_style/presign_expiry. Empty returns 501 for COPY. Conductor only presigns/HEADs. Custom Runtime credentials override YAML/AWS defaults, support session token/expiry/refresh and never fall back after error. force_path_style defaults false; versitygw/minio use true. PUT expiry defaults 1h; GET uses total+5m. Local deployments may use versitygw ([§5](#5-target-aware-execution-and-publication)) |
@@ -79,7 +75,7 @@ Target allows image, sandbox+memory:false or sandbox+memory:true. Omission means
 
 Build resources govern execution/admission only; referer/registry govern this Build. Parsed target/build-only fields leave template metadata and persist in builds.builder_json, never in later create/resume runtime config.
 
-Create and Register share the typed parser for resource/network/traffic/launch/init/mounts/files/metadata, `envVars` and instance options; namespace fields and Header/metadata merge rules remain in [Node §4.6](node.md#46-sandbox-configuration-propagation). Register always rejects `kuasar-sandbox.identity`, tenant-supplied node-managed cluster metadata, `restore` and `autoPauseMemory`. Build runtime inputs use `builds.metadata_json`; build-only input uses `builds.builder_json`. They serve this execution and artifact generation, not long-term canonical TemplateID lookup. Trigger cannot replace registered metadata, Builder/Resource or other general configuration headers; nonempty general metadata/headers are rejected.
+Create and Register share the typed parser for resource/network/traffic/launch/init/mounts/files/metadata, `envVars` and instance options; namespace fields and Header/metadata merge rules remain in [Node §4.4](node.md#44-sandbox-configuration-propagation). Register always rejects `kuasar-sandbox.identity`, tenant-supplied node-managed cluster metadata, `restore` and `autoPauseMemory`. Build runtime inputs use `builds.metadata_json`; build-only input uses `builds.builder_json`. They serve this execution and artifact generation, not long-term canonical TemplateID lookup. Trigger cannot replace registered metadata, Builder/Resource or other general configuration headers; nonempty general metadata/headers are rejected.
 
 - At synchronous admission, a known Image target rejects any remaining normalized Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace, nonempty `envVars`, `secure=true`, nonzero credential overrides or explicit MMDS routes/secrets. Ordinary metadata labels and Build execution resources remain allowed; empty `envVars` or `secure=false` alone is not a rejection condition.
 - Every target accepts `X-Kuasar-Sandbox-Network` / `kuasar-sandbox.network` for the Build execution network, including explicit or automatically resolved Image targets and an empty network object. Network input does not require a Sandbox output; A/B use it for image import and build steps, and Sandbox targets also project it into E.
@@ -113,7 +109,7 @@ Use the authenticated [node config socket and run plane](node.md#6-local-control
 
 Unit installation, shared pool assignment and cgroup infrastructure remain in [Node §5](node.md#5-process-management-through-systemd-template-units); §5.2 in the unit logging comment refers to [Node journald](node.md#52-journald-and-log-labels).
 
-**Builder unit** (`%i` is RunID, §5):
+**Builder unit** (`%i` is RunID):
 
 ```ini
 # sandbox-builder@.service (Generated)
@@ -141,8 +137,6 @@ Builder locks `<BuildRunDir>/builder.pid`, obtains exact-run bootstrap and, for 
 
 Aggregate Builder CPU/memory limits require builder_pool_size=0. On-demand units still enter WaitAssignment but already have a durable execution claim. Before publishing assignment, orchestrator sets and reads back unit properties. This prevents unclaimed idle CPU/RSS from occupying the slice's active-Build ceiling without hidden idle budgets.
 
-<a id="12-模板构建target-aware最多三阶段的流水线构建在沙箱内进行"></a>
-<a id="12-template-builds-target-aware-up-to-three-phases-inside-sandboxes"></a>
 ## 5. Target-aware execution and publication
 
 Builds arrive through e2b APIs ([§1](#1-build-api); there is no separate build-submission CLI), enter the builds table and are scheduled by resource pools. Each execution binds one sandbox-builder@<run-id> unit. Image pulls and build steps execute inside microVMs. Host run-builder relays artifact streams, fetches/decompresses COPY contexts and publishes outputs; therefore the boundary is guest execution of tenant build commands, not absence of tenant bytes from host userspace.
@@ -270,4 +264,4 @@ Builder reconciles in the same startup gate. All live ownership is reconstructed
 
 Build rows store no directory paths. Derive both Build directories from BuildID and current RunRoot/BaseRoot. Every terminal path first fences exact unit/cgroup, detaches, clears runtime ownership and removes both directories; terminal commit atomically clears RunID/result and releases execution claim. Phase child cleanup is not final correctness authority. Node database, config socket and runner pidfile are outside object directories and unaffected by object RemoveAll.
 
-Shared SQLite infrastructure and the terminal reaper remain in [node reliability](node.md#15-reliability); this section owns the Build schema and recovery. Build rows are retention-bounded execution/status/alias records, not a permanent template catalog. Published canonical template references remain usable independently of their Build row.
+Shared SQLite infrastructure and the terminal reaper remain in [node reliability](node.md#14-reliability); this section owns the Build schema and recovery. Build rows are retention-bounded execution/status/alias records, not a permanent template catalog. Published canonical template references remain usable independently of their Build row.
