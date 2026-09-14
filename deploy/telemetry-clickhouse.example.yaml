@@ -1,0 +1,43 @@
+# Remote read + write using the linked Collector clickhouse exporter's schema.
+# Reader credentials need SELECT only; configure exporter schema/write grants
+# separately, or pre-create its schema and set create_schema: false.
+config_socket: /run/sandbox/node-ctl.socket
+# proxy_netns: sandbox-proxy
+query:
+  backend: clickhouse
+  handler: e2b
+  lookback: 168h
+  clickhouse:
+    endpoint: https://clickhouse.example.com:8443
+    database: default
+    tables:
+      gauge: otel_metrics_gauge
+      sum: otel_metrics_sum
+      summary: otel_metrics_summary
+      histogram: otel_metrics_histogram
+      exponential_histogram: otel_metrics_exponential_histogram
+collector:
+  receivers:
+    envd: {collection_interval: 5s}
+    sandboxstats: {resource_interval: 5s, traffic_interval: 10s, usage_interval: 1m}
+    sandboxotlp: {http_listen: ':4318', grpc_listen: ':4317'}
+  processors:
+    batch: {timeout: 1s, send_batch_size: 8192, send_batch_max_size: 8192}
+  exporters:
+    clickhouse:
+      endpoint: https://clickhouse.example.com:8443
+      database: default
+      create_schema: true
+      ttl: 168h
+      metrics_tables:
+        gauge: {name: otel_metrics_gauge}
+        sum: {name: otel_metrics_sum}
+        summary: {name: otel_metrics_summary}
+        histogram: {name: otel_metrics_histogram}
+        exponential_histogram: {name: otel_metrics_exponential_histogram}
+      sending_queue: {enabled: true, queue_size: 256, num_consumers: 2}
+      retry_on_failure: {enabled: true, max_elapsed_time: 30s}
+  service:
+    telemetry: {metrics: {level: none}}
+    pipelines:
+      metrics: {receivers: [envd, sandboxstats, sandboxotlp], processors: [batch], exporters: [clickhouse]}

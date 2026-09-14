@@ -1,0 +1,16 @@
+# Query-only example. No Collector graph, local DB or dummy receiver is started.
+config_socket: /run/sandbox/node-ctl.socket
+api_socket: /run/sandbox/telemetry.sock
+paths:
+  telemetry_executable: /opt/kuasar/bin/custom-telemetry
+query:
+  backend: prometheus
+  handler: custom
+  lookback: 168h
+  prometheus:
+    endpoint: https://prometheus.example.com
+    # Supply read-only credentials through protected config or Runtime.QueryHeaders.
+    labels:
+      sandbox.id: sandbox_id
+      sandbox.stable_id: sandbox_stable_id
+      sandbox.telemetry.source: sandbox_telemetry_source

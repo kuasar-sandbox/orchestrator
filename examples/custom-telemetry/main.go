@@ -12,12 +12,15 @@ import (
 )
 
 func main() {
-	app := telemetry.New(telemetry.Hooks{Configure: func(_ context.Context, _ *telemetry.Config, runtime *telemetry.Runtime) error {
+	app := telemetry.New(telemetry.Hooks{Configure: func(_ context.Context, cfg *telemetry.Config, runtime *telemetry.Runtime) error {
 		runtime.Logger = slog.Default()
 		runtime.Extension = &lifecycle{logger: runtime.Logger}
 		// Native Collector config providers supply exporter credentials; keep
 		// them in the corresponding component config, e.g. ${env:OTLP_TOKEN}.
 		bindCollector(runtime)
+		if cfg.Query.Handler == "custom" {
+			runtime.MetricsHandler = metricSeriesHandler
+		}
 		return nil
 	}})
 	if err := app.Run(); err != nil {
@@ -29,7 +32,7 @@ func main() {
 type lifecycle struct{ logger *slog.Logger }
 
 func (e *lifecycle) Start(ctx context.Context, host extension.Host) error {
-	e.logger.Info("private telemetry extension started", "readable_primary", host.Reader() != nil)
+	e.logger.Info("private telemetry extension started", "query_reader", host.Reader() != nil)
 	return ctx.Err()
 }
 func (e *lifecycle) Shutdown(ctx context.Context) error {

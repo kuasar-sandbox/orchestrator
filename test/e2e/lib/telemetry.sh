@@ -54,12 +54,12 @@ config_socket: $WORK/node-ctl.socket
 api_socket: $WORK/telemetry.sock
 proxy_netns: $PROXY_NETNS
 route_capacity: 1024
-telemetry:
-  storage:
-    type: local
-    path: $WORK/telemetry-db
-    retention: 1h
-    max_size: 64MiB
+query: {backend: local, handler: e2b}
+local:
+  enabled: true
+  path: $WORK/telemetry-db
+  retention: 1h
+  max_size: 64MiB
 collector:
   receivers:
     envd: {collection_interval: 1s}
@@ -70,7 +70,7 @@ collector:
   processors:
     batch: {timeout: 200ms}
   exporters:
-    sandboxstorage: {}
+    sandboxlocal: {}
     otlp_http/probe: {endpoint: 'http://127.0.0.1:$STATS_SINK_PORT', encoding: json, compression: none}
   service:
     telemetry: {metrics: {level: none}}
@@ -78,7 +78,7 @@ collector:
       metrics:
         receivers: [envd, sandboxstats, sandboxotlp]
         processors: [batch]
-        exporters: [sandboxstorage, otlp_http/probe]
+        exporters: [sandboxlocal, otlp_http/probe]
 EOF
     local code command section
     code=$(req GET "/sandboxes/$SID/metrics" "$AK")

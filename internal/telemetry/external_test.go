@@ -9,156 +9,78 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/golang/snappy"
 	"github.com/kuasar-sandbox/orchestrator/app/telemetry/extension"
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/prometheus/prometheus/prompb"
 )
 
-func TestPrometheusPrimaryWriteReadMAXAndIdentity(t *testing.T) {
-	var mu sync.Mutex
-	var series []prompb.TimeSeries
-	var reads atomic.Int32
+func TestPrometheusGenericSelectionAndResponseScope(t *testing.T) {
+	stamp := time.Now().Add(-time.Minute).Truncate(time.Second).UnixMilli()
+	var wrong atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer private" || r.Header.Get("Content-Encoding") != "snappy" {
-			t.Error("missing protocol/credential headers")
+		if r.URL.Path != "/tenant/api/v1/read" || r.Header.Get("Authorization") != "Bearer private" {
+			t.Error("read endpoint/credentials")
 		}
-		raw, err := io.ReadAll(r.Body)
+		raw, _ := io.ReadAll(r.Body)
+		raw, err := snappy.Decode(nil, raw)
+		requireNoQueryError(t, err)
+		var request prompb.ReadRequest
+		if err := request.Unmarshal(raw); err != nil || len(request.Queries) != 1 {
+			t.Error("invalid read", err)
+			w.WriteHeader(400)
+			return
+		}
+		got := map[string]string{}
+		for _, matcher := range request.Queries[0].Matchers {
+			got[matcher.Name] = matcher.Value
+		}
+		if got["sandbox_id"] != "sid" || got["sandbox_telemetry_source"] != "custom-source" || got["rack"] != "west" || got["otel.kind"] != "" || strings.Contains(got["__name__"], "sandbox.cpu") {
+			t.Error("generic selection changed", got)
+		}
+		id := "sid"
+		if wrong.Load() {
+			id = "different"
+		}
+		response := prompb.ReadResponse{Results: []*prompb.QueryResult{{Timeseries: []*prompb.TimeSeries{{Labels: []prompb.Label{{Name: "__name__", Value: "custom_temperature"}, {Name: "sandbox_id", Value: id}, {Name: "sandbox_telemetry_source", Value: "custom-source"}, {Name: "rack", Value: "west"}}, Samples: []prompb.Sample{{Timestamp: stamp, Value: -8}, {Timestamp: stamp + 1000, Value: -4}}}}}}}
+		raw, err = response.Marshal()
 		if err != nil {
 			t.Error(err)
 			return
 		}
-		raw, err = snappy.Decode(nil, raw)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		switch r.URL.Path {
-		case "/tenant/api/v1/write":
-			var request prompb.WriteRequest
-			if err := request.Unmarshal(raw); err != nil {
-				t.Error(err)
-				return
-			}
-			for _, item := range request.Timeseries {
-				if !sort.SliceIsSorted(item.Labels, func(i, j int) bool { return item.Labels[i].Name < item.Labels[j].Name }) {
-					t.Error("labels not canonical")
-				}
-				for _, label := range item.Labels {
-					if forbiddenAttribute(label.Name) {
-						t.Error("run label escaped")
-					}
-				}
-			}
-			series = append(series, request.Timeseries...)
-			w.WriteHeader(204)
-		case "/tenant/api/v1/read":
-			reads.Add(1)
-			var request prompb.ReadRequest
-			if err := request.Unmarshal(raw); err != nil {
-				t.Error(err)
-				return
-			}
-			if len(request.Queries) != 1 {
-				t.Error("unexpected queries")
-				return
-			}
-			query := request.Queries[0]
-			id := ""
-			for _, matcher := range query.Matchers {
-				if matcher.Name == SandboxIDAttribute {
-					id = matcher.Value
-				}
-				if matcher.Name == StableIDAttribute {
-					t.Error("StableID queried")
-				}
-			}
-			result := &prompb.QueryResult{}
-			for i := range series {
-				var same bool
-				for _, label := range series[i].Labels {
-					if label.Name == SandboxIDAttribute && label.Value == id {
-						same = true
-					}
-				}
-				if same {
-					item := &prompb.TimeSeries{Labels: series[i].Labels}
-					for _, sample := range series[i].Samples {
-						if sample.Timestamp >= query.StartTimestampMs && sample.Timestamp <= query.EndTimestampMs {
-							item.Samples = append(item.Samples, sample)
-						}
-					}
-					if len(item.Samples) != 0 {
-						result.Timeseries = append(result.Timeseries, item)
-					}
-				}
-			}
-			response := prompb.ReadResponse{Results: []*prompb.QueryResult{result}}
-			raw, err := response.Marshal()
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			w.Header().Set("Content-Type", "application/x-protobuf")
-			w.Header().Set("Content-Encoding", "snappy")
-			_, _ = w.Write(snappy.Encode(nil, raw))
-		default:
-			t.Error("wrong endpoint", r.URL.Path)
-			w.WriteHeader(404)
-		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Encoding", "snappy")
+		_, _ = w.Write(snappy.Encode(nil, raw))
 	}))
 	defer server.Close()
-	cfg := localConfig(t)
-	cfg.Type = "prometheus"
-	cfg.Retention = "1h"
-	cfg.Prometheus = config.TelemetryRemote{Endpoint: server.URL + "/tenant", Headers: map[string]string{"Authorization": "Bearer private"}}
+	cfg := prometheusQueryConfig(server.URL + "/tenant")
+	cfg.Prometheus.Headers = map[string]string{"Authorization": "Bearer private"}
 	backend, err := NewPrometheus(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoQueryError(t, err)
 	defer backend.Shutdown(context.Background())
-	stamp := time.Now().Add(-time.Minute).Truncate(5 * time.Second).Add(123456789 * time.Nanosecond)
-	first, second := resourceSamples(t, "sid", stamp), resourceSamples(t, "sid", stamp.Add(time.Second))
-	first[1].Value = 90
-	second[2].Value = 9999
-	second[4].Value = 256
-	if err := backend.Write(context.Background(), append(first, second...)); err != nil {
-		t.Fatal(err)
+	query := extension.Query{Selection: extension.Selection{SandboxID: "sid", Metrics: []string{"custom_temperature"}, Attributes: map[string]string{sourceAttribute: "custom-source", "rack": "west"}}, Start: time.UnixMilli(stamp), End: time.UnixMilli(stamp + 1000), Aggregation: extension.Raw}
+	series, err := backend.Query(context.Background(), query)
+	if err != nil || len(series) != 1 || len(series[0].Points) != 2 || series[0].Points[0].Value != -8 {
+		t.Fatal("arbitrary raw series", series, err)
 	}
-	start, end, found, err := backend.Bounds(context.Background(), "sid")
-	if err != nil || !found || start.UnixMilli() != stamp.UnixMilli() || end.UnixMilli() != stamp.Add(time.Second).UnixMilli() {
-		t.Fatal("bounds", start, end, found, err)
+	query.Aggregation, query.Step = extension.Max, 5*time.Second
+	series, err = backend.Query(context.Background(), query)
+	if err != nil || len(series) != 1 || series[0].Attributes[SandboxIDAttribute] != "sid" {
+		t.Fatal("generic MAX", series, err)
 	}
-	query := extension.Query{SandboxID: "sid", Start: start, End: end, Step: 5 * time.Second}
-	points, err := backend.Query(context.Background(), query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := aggregate(points, query)
-	if err != nil || len(result) != 1 || result[0].CPUUsedPct != 90 || result[0].MemTotal != 9999 || result[0].MemCache != 256 {
-		t.Fatal("MAX", result, err)
-	}
-	if _, _, found, err := backend.Bounds(context.Background(), "stable-sid"); err != nil || found {
-		t.Fatal("StableID fallback", found, err)
-	}
-	if reads.Load() == 0 {
-		t.Fatal("no reader requests")
+	wrong.Store(true)
+	if _, err := backend.Query(context.Background(), query); err == nil {
+		t.Fatal("wrong SandboxID response accepted")
 	}
 }
 
 func TestExternalReadCancellationRedirectsAndLimits(t *testing.T) {
-	started := make(chan struct{})
-	cancelled := make(chan struct{})
+	started, cancelled := make(chan struct{}), make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		close(started)
@@ -166,17 +88,13 @@ func TestExternalReadCancellationRedirectsAndLimits(t *testing.T) {
 		close(cancelled)
 	}))
 	defer server.Close()
-	cfg := localConfig(t)
-	cfg.Type = "prometheus"
-	cfg.Prometheus.Endpoint = server.URL
-	backend, err := NewPrometheus(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	backend, err := NewPrometheus(prometheusQueryConfig(server.URL))
+	requireNoQueryError(t, err)
 	defer backend.Shutdown(context.Background())
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, _, _, err := backend.Bounds(ctx, "sid"); done <- err }()
+	go func() { _, _, _, err := backend.Bounds(ctx, envdSelection("sid")); done <- err }()
 	<-started
 	cancel()
 	select {
@@ -205,13 +123,11 @@ func TestExternalReadCancellationRedirectsAndLimits(t *testing.T) {
 	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		w.Header().Set("Content-Encoding", "snappy")
-		buffer := make([]byte, binary.MaxVarintLen64)
-		n := binary.PutUvarint(buffer, maxRemoteBytes+1)
-		_, _ = w.Write(buffer[:n])
+		_, _ = w.Write(binary.AppendUvarint(nil, maxRemoteBytes+1))
 	}))
 	defer oversized.Close()
 	backend.endpoint = oversized.URL
-	if _, _, _, err := backend.Bounds(context.Background(), "sid"); err == nil {
+	if _, _, _, err := backend.Bounds(context.Background(), envdSelection("sid")); err == nil {
 		t.Fatal("snappy expansion limit not enforced")
 	}
 }
@@ -228,118 +144,81 @@ func TestPrometheusLongRetentionEmptySingleRead(t *testing.T) {
 		_, _ = w.Write(snappy.Encode(nil, raw))
 	}))
 	defer server.Close()
-	backend, err := NewPrometheus(config.TelemetryStorage{Retention: "8760h", Prometheus: config.TelemetryRemote{Endpoint: server.URL}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := prometheusQueryConfig(server.URL)
+	cfg.Lookback = "8760h"
+	backend, err := NewPrometheus(cfg)
+	requireNoQueryError(t, err)
 	defer backend.Shutdown(context.Background())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, _, found, err := backend.Bounds(ctx, "new-sandbox"); err != nil || found {
+	if _, _, found, err := backend.Bounds(ctx, envdSelection("new-sandbox")); err != nil || found {
 		t.Fatal("empty history", found, err)
 	}
-	if got := reads.Load(); got != 1 {
-		t.Fatalf("empty one-year history required %d requests, want one", got)
+	if reads.Load() != 1 {
+		t.Fatal("one-year empty history did not use one read", reads.Load())
 	}
 	response := httptest.NewRecorder()
-	QueryHandler(backend).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/new-sandbox/metrics", nil))
+	queryHandlerForTest(backend).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/new-sandbox/metrics", nil))
 	if response.Code != 200 || response.Body.String() != "[]\n" || reads.Load() != 2 {
-		t.Fatal("empty E2B query", response.Code, response.Body.String(), reads.Load())
+		t.Fatal(response.Code, response.Body.String(), reads.Load())
 	}
 }
 
-func TestClickHousePrimarySQLAndJSONContract(t *testing.T) {
-	var creates, alters, writes atomic.Int32
-	stamp := time.Now().Add(-time.Minute).Truncate(time.Second)
-	sandbox := "sid' OR 1=1 --"
+func TestClickHouseReadOnlySQLAndJSONContract(t *testing.T) {
+	var requests atomic.Int32
+	stamp := time.Now().Add(-time.Minute).Truncate(5 * time.Second).Add(123 * time.Millisecond)
+	sid := "sid' OR 1=1 --"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-ClickHouse-Key") != "private" || r.URL.Query().Get("wait_end_of_query") != "1" {
-			t.Error("missing auth/buffering policy")
+		requests.Add(1)
+		params := r.URL.Query()
+		query := params.Get("query")
+		if r.Header.Get("X-ClickHouse-Key") != "private" || params.Get("wait_end_of_query") != "1" || params.Get("readonly") != "1" || params.Get("cancel_http_readonly_queries_on_client_close") != "1" {
+			t.Error("auth/read-only/cancellation policy")
 		}
-		query := r.URL.Query().Get("query")
-		switch {
-		case strings.HasPrefix(query, "CREATE TABLE"):
-			creates.Add(1)
-			if !strings.Contains(query, "DateTime64(3, 'UTC')") || !strings.Contains(query, "ENGINE = MergeTree") {
-				t.Error("table schema", query)
-			}
-		case strings.HasPrefix(query, "ALTER TABLE"):
-			alters.Add(1)
-			if !strings.Contains(query, "MODIFY TTL") {
-				t.Error(query)
-			}
-		case strings.HasPrefix(query, "INSERT INTO"):
-			writes.Add(1)
-			decoder := json.NewDecoder(r.Body)
-			count := 0
-			for {
-				var row map[string]any
-				if err := decoder.Decode(&row); err != nil {
-					if err != io.EOF {
-						t.Error(err)
-					}
-					break
-				}
-				count++
-				if row["sandbox_id"] != "sid" || row["stable_id"] != "stable-sid" || row["source"] != "envd" {
-					t.Error("untrusted write identity", row)
-				}
-			}
-			if count != 7 {
-				t.Error("write batch", count)
-			}
-		case strings.HasPrefix(query, "SELECT"):
-			if r.URL.Query().Get("param_sid") != sandbox || strings.Contains(query, sandbox) || !strings.Contains(query, "sandbox_id = {sid:String}") {
-				t.Error("non-parameterized sandbox lookup")
-			}
-			if r.URL.Query().Get("readonly") != "1" || r.URL.Query().Get("cancel_http_readonly_queries_on_client_close") != "1" {
-				t.Error("query cancellation policy")
-			}
-			if strings.Contains(query, "count()") {
-				_ = json.NewEncoder(w).Encode(map[string]any{"count": 7, "first": stamp.UnixMilli(), "last": stamp.UnixMilli()})
-			} else {
-				if !strings.Contains(query, "max(value)") || strings.Contains(query, "avg(") || r.URL.Query().Get("param_step") != "5" {
-					t.Error("not field MAX", query)
-				}
-				for field, metric := range resourceMetrics {
-					_ = json.NewEncoder(w).Encode(map[string]any{"stamp": stamp.UnixMilli() / 5000 * 5000, "metric": metric.name, "value": field + 1})
-				}
-			}
-		default:
-			t.Error("unexpected SQL", query)
-			w.WriteHeader(400)
+		if !strings.HasPrefix(query, "SELECT") || strings.Contains(query, sid) || !strings.Contains(query, "ResourceAttributes['sandbox.id'] = {sid:String}") || params.Get("param_sid") != sid {
+			t.Error("non-parameterized or non-read query", query)
 		}
+		if !strings.Contains(query, "bitAnd(Flags,1)=0") {
+			t.Error("no-recorded-value was not filtered")
+		}
+		if strings.HasPrefix(query, "SELECT count()") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "first": stamp.UnixMilli(), "last": stamp.UnixMilli()})
+			return
+		}
+		if !strings.Contains(query, "max(value)") || params.Get("param_step") != "5000" {
+			t.Error("not epoch millisecond MAX", query)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"bucket": stamp.UnixMilli() / 5000 * 5000, "metric": "custom.temperature", "attributes": map[string]string{SandboxIDAttribute: sid, "otel.kind": "Gauge", "point.rack": "west"}, "value": -1})
 	}))
 	defer server.Close()
-	cfg := localConfig(t)
-	cfg.Type = "clickhouse"
-	cfg.ClickHouse = config.TelemetryClickHouse{Endpoint: server.URL, Database: "default", Table: "sandbox_metrics", Headers: map[string]string{"X-ClickHouse-Key": "private"}}
-	backend, err := OpenClickHouse(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := clickhouseQueryConfig(server.URL, "test_read_only")
+	cfg.ClickHouse.Headers = map[string]string{"X-ClickHouse-Key": "private"}
+	backend, err := NewClickHouse(cfg)
+	requireNoQueryError(t, err)
 	defer backend.Shutdown(context.Background())
-	if err := backend.Write(context.Background(), resourceSamples(t, "sid", stamp)); err != nil {
-		t.Fatal(err)
+	if requests.Load() != 0 {
+		t.Fatal("query constructor created a schema")
 	}
-	start, end, found, err := backend.Bounds(context.Background(), sandbox)
-	if err != nil || !found || start.UnixMilli() != stamp.UnixMilli() || end.UnixMilli() != stamp.UnixMilli() {
+	selection := extension.Selection{SandboxID: sid, Metrics: []string{"custom.temperature"}, Attributes: map[string]string{"point.rack": "west"}}
+	start, end, found, err := backend.Bounds(context.Background(), selection)
+	if err != nil || !found || !start.Equal(stamp) || !end.Equal(stamp) {
 		t.Fatal(start, end, found, err)
 	}
-	points, err := backend.Query(context.Background(), extension.Query{SandboxID: sandbox, Start: start, End: end, Step: 5 * time.Second})
-	if err != nil || len(points) != 7 {
-		t.Fatal(points, err)
+	series, err := backend.Query(context.Background(), extension.Query{Selection: selection, Start: start, End: end, Step: 5 * time.Second, Aggregation: extension.Max})
+	if err != nil || len(series) != 1 || series[0].Points[0].Value != -1 {
+		t.Fatal(series, err)
 	}
-	if creates.Load() != 1 || alters.Load() != 1 || writes.Load() != 1 {
-		t.Fatal("table/write lifecycle")
+	if requests.Load() != 2 {
+		t.Fatal("unexpected schema/write request")
 	}
 }
 
 func TestClickHouseRejectsErrorAfterHTTP200(t *testing.T) {
-	for _, raw := range []string{"Code: 60. DB::Exception: unknown table", "{\"stamp\":" + strconv.FormatInt(time.Now().UnixMilli(), 10) + ",\"metric\":\"sandbox.cpu.count\",\"value\":2}\nCode: 241. DB::Exception: memory limit"} {
+	for _, raw := range []string{"Code: 60. DB::Exception: unknown table", `{"stamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"metric":"sandbox.cpu.count","value":2}` + "\nCode: 241. DB::Exception: memory limit"} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.Copy(w, bytes.NewBufferString(raw)) }))
-		backend := &ClickHouse{remoteClient: newRemoteClient(nil), endpoint: server.URL, table: "`default`.`sandbox_metrics`", retention: time.Hour}
-		_, err := backend.Query(context.Background(), extension.Query{SandboxID: "sid", Start: time.Now().Add(-time.Minute), End: time.Now(), Step: 5 * time.Second})
+		backend, err := NewClickHouse(clickhouseQueryConfig(server.URL, "test"))
+		requireNoQueryError(t, err)
+		_, err = backend.Query(context.Background(), extension.Query{Selection: envdSelection("sid"), Start: time.Now().Add(-time.Minute), End: time.Now(), Step: 5 * time.Second, Aggregation: extension.Max})
 		if err == nil {
 			t.Fatal("HTTP 200 error body accepted")
 		}

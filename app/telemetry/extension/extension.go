@@ -5,6 +5,7 @@ package extension
 
 import (
 	"context"
+	"net/http"
 	"time"
 )
 
@@ -17,62 +18,86 @@ type Extension interface {
 }
 
 type Host interface {
-	// Reader returns the selected primary reader, or nil in forwarding-only mode.
+	// Reader returns the selected query reader, or nil in write-only mode.
 	Reader() Reader
 }
 
-// Field is an envd/E2B guest resource observation, not a host resource quota.
-type Field uint8
-
-const (
-	CPUCount Field = iota
-	CPUUsedPct
-	MemTotal
-	MemUsed
-	MemCache
-	DiskTotal
-	DiskUsed
-	FieldCount
-)
-
 // Point contains an observed value; absent points never mean zero.
 type Point struct {
-	Timestamp time.Time
-	Field     Field
-	Value     float64
+	Timestamp time.Time `json:"timestamp"`
+	Value     float64   `json:"value"`
 }
 
-type Query struct {
+// Selection uses exact metric names and equality attributes. Empty Metrics
+// selects all metrics within the exact SandboxID; there is no SQL/PromQL input.
+// Attribute names follow the selected backend's documented label mapping.
+// Each selected attribute must exist: an empty value does not match absence.
+type Selection struct {
 	SandboxID  string
-	Start, End time.Time
-	Step       time.Duration
+	Metrics    []string
+	Attributes map[string]string
 }
 
-// Reader is the metrics history domain boundary. SandboxID is always exact;
-// implementations must not fall back to StableID. Query may return raw points
-// or independently MAX-aggregated fields in epoch-aligned Step buckets.
+type Aggregation string
+
+const (
+	Raw Aggregation = "raw"
+	Max Aggregation = "max"
+)
+
+// Query defaults an omitted Aggregation to Raw. The scoped Reader passes this
+// normalized value to custom backends after validating the range and Step.
+type Query struct {
+	Selection
+	Start, End  time.Time
+	Step        time.Duration
+	Aggregation Aggregation
+}
+
+// Series contains one complete attribute set. Raw points retain observed time;
+// Max independently aggregates this series in epoch-aligned Step buckets after
+// filtering raw points to the inclusive range. No gap filling or lookback occurs.
+type Series struct {
+	Metric     string            `json:"metric"`
+	Attributes map[string]string `json:"attributes"`
+	Points     []Point           `json:"points"`
+}
+
+// Reader is independent of ingestion. SandboxID is always exact, never a
+// StableID alias. Bounds applies the same selection to retained observations.
 type Reader interface {
-	Bounds(context.Context, string) (start, end time.Time, found bool, err error)
-	Query(context.Context, Query) ([]Point, error)
+	Bounds(context.Context, Selection) (start, end time.Time, found bool, err error)
+	Query(context.Context, Query) ([]Series, error)
 }
 
-// Sample is the canonical scalar storage representation produced exclusively
-// by the core Collector exporter. Labels include the trusted sandbox.id and
-// sandbox.stable_id. Histogram components are represented as scalar series.
+// QueryBackend owns only a reader and its resources. A remote/custom query
+// backend is never required to implement Collector writes.
+type QueryBackend interface {
+	Reader
+	Shutdown(context.Context) error
+}
+
+// QueryScope is supplied by the HTTP adapter after conductor authorization.
+// Reader is permanently bound to SandboxID for this request: a client selector
+// cannot replace it, even if the handler uses a different context.
+type QueryScope struct {
+	SandboxID string
+	Reader    Reader
+}
+
+// MetricsHandler creates a standard HTTP handler for the trusted request scope.
+// Factories are statically linked and should keep request construction cheap.
+// A custom response is its own HTTP contract, not automatically E2B compatible.
+type MetricsHandler func(QueryScope) http.Handler
+
+// Sample is the local Collector exporter's scalar representation. Sandbox
+// sources include accepted identity labels; infrastructure sources may omit them.
+// Histogram components are represented as scalar series.
 type Sample struct {
 	Metric    string
 	Labels    map[string]string
 	Timestamp time.Time
 	Value     float64
-}
-
-// Storage is a primary backend: both Collector writes and history reads are
-// required. Core calls Write only from its Collector exporter, never a receiver.
-// Shutdown is called after all query readers and Collector exporters stop.
-type Storage interface {
-	Reader
-	Write(context.Context, []Sample) error
-	Shutdown(context.Context) error
 }
 
 // HealthReporter optionally reports an unrecoverable background storage error.

@@ -18,22 +18,27 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-// primaryFactory is the only bridge from Collector pdata to primary storage.
-// Receivers do not receive a Storage handle. The backend's lifetime is owned by
-// the app so it outlives both the Collector and outstanding history readers.
-func primaryFactory(backend extension.Storage) exporter.Factory {
-	return exporter.NewFactory(component.MustNewType("sandboxstorage"), func() component.Config { return &emptyConfig{} },
+// sampleWriter belongs only to the local exporter. Query backends have no Write
+// requirement, and receivers cannot obtain a writer from their component host.
+type sampleWriter interface {
+	Write(context.Context, []extension.Sample) error
+}
+
+// localFactory bridges Collector pdata to the explicitly enabled local TSDB.
+// App lifetime management keeps it alive until queries and the graph drain.
+func localFactory(backend sampleWriter) exporter.Factory {
+	return exporter.NewFactory(component.MustNewType("sandboxlocal"), func() component.Config { return &emptyConfig{} },
 		exporter.WithMetrics(func(context.Context, exporter.Settings, component.Config) (exporter.Metrics, error) {
-			return &primaryExporter{backend: backend}, nil
+			return &localExporter{backend: backend}, nil
 		}, component.StabilityLevelStable))
 }
 
-type primaryExporter struct{ backend extension.Storage }
+type localExporter struct{ backend sampleWriter }
 
-func (*primaryExporter) Start(context.Context, component.Host) error { return nil }
-func (*primaryExporter) Shutdown(context.Context) error              { return nil }
-func (*primaryExporter) Capabilities() consumer.Capabilities         { return consumer.Capabilities{} }
-func (e *primaryExporter) ConsumeMetrics(ctx context.Context, metrics pmetric.Metrics) error {
+func (*localExporter) Start(context.Context, component.Host) error { return nil }
+func (*localExporter) Shutdown(context.Context) error              { return nil }
+func (*localExporter) Capabilities() consumer.Capabilities         { return consumer.Capabilities{} }
+func (e *localExporter) ConsumeMetrics(ctx context.Context, metrics pmetric.Metrics) error {
 	samples, err := canonicalSamples(metrics)
 	if err != nil {
 		return consumererror.NewPermanent(err)

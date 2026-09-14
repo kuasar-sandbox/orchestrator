@@ -99,8 +99,9 @@ profile 编码在 templateID 前缀里（[Build §2](node-build_zh.md#2-模板-i
 
 除下图应用数据通路外，`node-ctl telemetry serve` 还订阅同一 Plugin Plane 的完整
 RouteEntry stream，经 UDS 采集 envd，并在 management namespace 直接接收以 FloatingIP
-识别 guest 的 OTLP。Collector pipeline 写入选定主存储（默认 embedded TSDB）和 extra
-exporter。Conductor 仅把鉴权后的 metrics query 转发到独立注册的 API UDS，不把
+识别 guest 的 OTLP。Collector pipeline 按标准组件配置写入 exporter; 本地 TSDB 仅在
+显式启用时打开。查询 backend 和 HTTP handler 独立选择, query-only 无需 Collector graph。
+Conductor 仅把鉴权后的 metrics query 转发到独立注册的 API UDS, 不把
 telemetry 加入生命周期 barrier。完整拓扑、故障与身份契约见 [Telemetry](telemetry_zh.md)。
 
 ```
@@ -294,8 +295,8 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 ```
 
 独立组件拥有自身 strict config schema 和 `paths.telemetry_executable` static bootstrap
-入口。以固定 Plugin ID `telemetry` 注册，订阅 `Kind: route`；只有 primary storage
-可读时才注册独立 HTTP query UDS。它不加入 Create/Resume readiness，也不调用 Wake。
+入口。以固定 Plugin ID `telemetry` 注册，订阅 `Kind: route`；只有同时选定 Reader 和 HTTP handler
+时才注册独立 query UDS. 写入与查询独立; query-only 不要求 Collector 或 local TSDB.它不加入 Create/Resume readiness，也不调用 Wake。
 原生 Collector 配置选择 envd、sandboxstats、sandboxotlp receiver, 标准 processor、
 exporter、connector、extension 及多 pipeline. Sandboxstats 只经 conductor config_socket
 上的当前 telemetry lease 读取, 原生 stats 不依赖 telemetry. Local TSDB、Prometheus、ClickHouse reader、直接 sandbox OTLP 网络、E2B step/MAX 与

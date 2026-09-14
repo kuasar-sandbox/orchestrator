@@ -41,13 +41,15 @@ func testConfig(t *testing.T) *config.Telemetry {
 	}
 	cfg.ConfigSocket = filepath.Join(directory, "plugin.sock")
 	cfg.APISocket = filepath.Join(directory, "query.sock")
-	cfg.Telemetry.Storage.Type = "local"
-	cfg.Telemetry.Storage.Path = filepath.Join(directory, "db")
-	cfg.Telemetry.Storage.MaxSize = "64MiB"
+	cfg.Query.Backend = "local"
+	cfg.Query.Handler = "e2b"
+	cfg.Local.Enabled = true
+	cfg.Local.Path = filepath.Join(directory, "db")
+	cfg.Local.MaxSize = "64MiB"
 	cfg.Collector = map[string]any{
 		"receivers": map[string]any{"envd": map[string]any{"collection_interval": "1s"}},
-		"exporters": map[string]any{"sandboxstorage": map[string]any{}},
-		"service":   map[string]any{"telemetry": map[string]any{"metrics": map[string]any{"level": "none"}}, "pipelines": map[string]any{"metrics": map[string]any{"receivers": []any{"envd"}, "exporters": []any{"sandboxstorage"}}}},
+		"exporters": map[string]any{"sandboxlocal": map[string]any{}},
+		"service":   map[string]any{"telemetry": map[string]any{"metrics": map[string]any{"level": "none"}}, "pipelines": map[string]any{"metrics": map[string]any{"receivers": []any{"envd"}, "exporters": []any{"sandboxlocal"}}}},
 	}
 	return cfg
 }
@@ -244,7 +246,7 @@ func TestStartupFailuresCleanUpStorageExtensionAndSockets(t *testing.T) {
 			if ext.start.Load() != 1 || ext.stop.Load() != 1 {
 				t.Fatal("extension cleanup", ext.start.Load(), ext.stop.Load())
 			}
-			backend, err := telemetry.OpenLocal(cfg.Telemetry.Storage, logger())
+			backend, err := telemetry.OpenLocal(cfg.Local, logger())
 			if err != nil {
 				t.Fatal("DB left locked", err)
 			}
@@ -286,16 +288,18 @@ func TestQuerySocketExclusiveOwnershipAndRestart(t *testing.T) {
 
 func TestRuntimeProvidersAreAuthoritative(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Telemetry.Storage.Type = "prometheus"
-	cfg.Telemetry.Storage.Prometheus = config.TelemetryRemote{Endpoint: "https://example.com", Headers: map[string]string{"Authorization": "fallback"}}
-	if _, err := ResolveRuntime(context.Background(), cfg, Bindings{StorageHeaders: func(context.Context) (map[string]string, error) { return nil, errors.New("credential failure") }}); err == nil {
+	cfg.Query.Backend = "prometheus"
+	cfg.Query.Prometheus = config.TelemetryPrometheus{Endpoint: "https://example.com", Headers: map[string]string{"Authorization": "fallback"}}
+	if _, err := ResolveRuntime(context.Background(), cfg, Bindings{QueryHeaders: func(context.Context) (map[string]string, error) { return nil, errors.New("credential failure") }}); err == nil {
 		t.Fatal("credentials fell back")
 	}
-	cfg.Telemetry.Storage.Type = "custom"
+	cfg.Query.Backend = "custom"
 	if _, err := ResolveRuntime(context.Background(), cfg, Bindings{}); err == nil {
 		t.Fatal("custom storage fell back")
 	}
-	cfg.Telemetry.Storage.Type = "none"
+	cfg.Query.Backend = "none"
+	cfg.Query.Handler = "none"
+	cfg.Local.Enabled = false
 	cfg.Collector = nil
 	if err := Run(context.Background(), cfg, &Runtime{Bindings: Bindings{Logger: logger()}}); err == nil {
 		t.Fatal("no output accepted")
@@ -303,7 +307,7 @@ func TestRuntimeProvidersAreAuthoritative(t *testing.T) {
 }
 
 type failedStorage struct {
-	extension.Storage
+	extension.QueryBackend
 	stops atomic.Int32
 }
 
@@ -312,10 +316,10 @@ func (s *failedStorage) Shutdown(context.Context) error { s.stops.Add(1); return
 func TestCustomStorageConstructionFailureCleanup(t *testing.T) {
 	for _, typedNil := range []bool{false, true} {
 		cfg := testConfig(t)
-		cfg.Telemetry.Storage.Type = "custom"
+		cfg.Query.Backend = "custom"
 		backend := &failedStorage{}
 		var nilBackend *failedStorage
-		resolved, err := ResolveRuntime(context.Background(), cfg, Bindings{Logger: logger(), Storage: func(context.Context, config.TelemetryStorage) (extension.Storage, error) {
+		resolved, err := ResolveRuntime(context.Background(), cfg, Bindings{Logger: logger(), QueryBackend: func(context.Context, config.TelemetryQuery) (extension.QueryBackend, error) {
 			if typedNil {
 				return nilBackend, nil
 			}
@@ -335,7 +339,9 @@ func TestCustomStorageConstructionFailureCleanup(t *testing.T) {
 
 func TestForwardOnlyRegistersWithoutReadableEndpoint(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Telemetry.Storage.Type = "none"
+	cfg.Query.Backend = "none"
+	cfg.Query.Handler = "none"
+	cfg.Local.Enabled = false
 	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
 	defer sink.Close()
 	cfg.Collector["exporters"] = map[string]any{"otlp_http/extra": map[string]any{"endpoint": sink.URL}}
@@ -389,11 +395,11 @@ func (s *unhealthyStorage) Errors() <-chan error { return s.errors }
 
 func TestStorageHealthFailureRevokesQueryLease(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Telemetry.Storage.Type = "custom"
+	cfg.Query.Backend = "custom"
 	backend := &unhealthyStorage{errors: make(chan error, 1)}
 	src := &source{route: routesync.RouteEntry{SandboxID: "sid", StableID: "stable-sid", State: routesync.StatePaused}, events: make(chan routesync.Event), syncs: make(chan struct{}, 1)}
 	registry := servePlugins(t, cfg, src)
-	resolved, err := ResolveRuntime(context.Background(), cfg, Bindings{Logger: logger(), Storage: func(context.Context, config.TelemetryStorage) (extension.Storage, error) { return backend, nil }})
+	resolved, err := ResolveRuntime(context.Background(), cfg, Bindings{Logger: logger(), QueryBackend: func(context.Context, config.TelemetryQuery) (extension.QueryBackend, error) { return backend, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,5 +427,159 @@ func TestStorageHealthFailureRevokesQueryLease(t *testing.T) {
 	registry.TelemetryAPI().ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
 	if response.Code != 503 || backend.stops.Load() != 1 {
 		t.Fatal("failed primary retained lease/resources")
+	}
+}
+
+// This backend deliberately has no Write method. Query-only startup must not
+// build a dummy Collector graph or create a local TSDB.
+type onlyReader struct {
+	stops atomic.Int32
+	calls atomic.Int32
+}
+
+func (r *onlyReader) Shutdown(context.Context) error { r.stops.Add(1); return nil }
+func (r *onlyReader) Bounds(context.Context, extension.Selection) (time.Time, time.Time, bool, error) {
+	return time.Unix(10, 0), time.Unix(10, 0), true, nil
+}
+func (r *onlyReader) Query(_ context.Context, q extension.Query) ([]extension.Series, error) {
+	r.calls.Add(1)
+	return []extension.Series{{Metric: "application.requests", Attributes: map[string]string{"sandbox.id": q.SandboxID}, Points: []extension.Point{{Timestamp: time.Unix(10, 0), Value: 12}}}}, nil
+}
+
+func TestQueryOnlyCustomHTTPWithoutLocalOrCollector(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Local.Enabled = false
+	cfg.Collector = nil
+	cfg.Query.Backend = "custom"
+	cfg.Query.Handler = "custom"
+	cfg.ProxyNetNS = "unused-query-only-namespace"
+	backend := &onlyReader{}
+	src := &source{route: routesync.RouteEntry{SandboxID: "sid", StableID: "stable-sid", State: routesync.StatePaused}, events: make(chan routesync.Event), syncs: make(chan struct{}, 1)}
+	registry := servePlugins(t, cfg, src)
+	resolved, err := ResolveRuntime(context.Background(), cfg, Bindings{Logger: logger(), QueryBackend: func(context.Context, config.TelemetryQuery) (extension.QueryBackend, error) { return backend, nil }, MetricsHandler: func(scope extension.QueryScope) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			query := extension.Query{Selection: extension.Selection{SandboxID: r.URL.Query().Get("sid"), Metrics: []string{"application.requests"}}, Start: time.Unix(10, 0), End: time.Unix(10, 0)}
+			series, err := scope.Reader.Query(r.Context(), query)
+			if err != nil {
+				http.Error(w, "bad scope", 400)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Metrics-Contract", "custom-series-v1")
+			_ = json.NewEncoder(w).Encode(series)
+		})
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg, resolved) }()
+	select {
+	case <-src.syncs:
+	case err := <-done:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no query-only lease")
+	}
+	if _, err := os.Stat(cfg.Local.Path); !os.IsNotExist(err) {
+		t.Fatal("query-only created local storage", err)
+	}
+	for _, query := range []string{"", "?sid=other"} {
+		response := httptest.NewRecorder()
+		registry.TelemetryAPI().ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics"+query, nil))
+		if query != "" {
+			if response.Code != 400 {
+				t.Fatal("query-only scope override", response.Code)
+			}
+			continue
+		}
+		if response.Code != 200 || response.Header().Get("X-Metrics-Contract") != "custom-series-v1" || !strings.Contains(response.Body.String(), "application.requests") {
+			t.Fatal("opaque custom handler", response.Code, response.Header(), response.Body.String())
+		}
+	}
+	if backend.calls.Load() != 1 || src.wakes.Load() != 0 {
+		t.Fatal("bad scope queried backend or history woke paused sandbox")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("query-only cleanup")
+	}
+	if backend.stops.Load() != 1 {
+		t.Fatal("query-only backend not closed")
+	}
+	response := httptest.NewRecorder()
+	registry.TelemetryAPI().ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
+	if response.Code != 503 {
+		t.Fatal("query-only disconnect retained API lease")
+	}
+}
+
+func TestRemoteReadFailureDoesNotFallbackToPopulatedLocal(t *testing.T) {
+	cfg := testConfig(t)
+	stamp := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	local, err := telemetry.OpenLocal(cfg.Local, logger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Write(t.Context(), []extension.Sample{{Metric: "fallback.sentinel", Labels: map[string]string{"sandbox.id": "sid"}, Timestamp: stamp, Value: 99}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(503)
+	}))
+	defer remote.Close()
+	cfg.Collector = nil
+	cfg.Query.Backend, cfg.Query.Handler = "prometheus", "custom"
+	cfg.Query.Prometheus.Endpoint = remote.URL
+	src := &source{route: routesync.RouteEntry{SandboxID: "sid", State: routesync.StatePaused}, events: make(chan routesync.Event), syncs: make(chan struct{}, 1)}
+	registry := servePlugins(t, cfg, src)
+	runtime, err := ResolveRuntime(t.Context(), cfg, Bindings{Logger: logger(), MetricsHandler: func(scope extension.QueryScope) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			series, err := scope.Reader.Query(r.Context(), extension.Query{Selection: extension.Selection{Metrics: []string{"fallback.sentinel"}}, Start: stamp, End: stamp})
+			if err != nil {
+				http.Error(w, "query unavailable", 503)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(series)
+		})
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg, runtime) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("query-only cleanup")
+		}
+	})
+	select {
+	case <-src.syncs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("query-only lease missing")
+	}
+	response := httptest.NewRecorder()
+	registry.TelemetryAPI().ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
+	if response.Code != 503 || requests.Load() != 1 || strings.Contains(response.Body.String(), "99") || src.wakes.Load() != 0 {
+		t.Fatal("remote failure hidden by local data or empty success", response.Code, response.Body.String(), requests.Load())
 	}
 }

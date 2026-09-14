@@ -148,7 +148,7 @@ the immutable dispatch path; no hook can redirect it to a different executable.
 app := telemetry.New(telemetry.Hooks{
     Configure: func(ctx context.Context, cfg *telemetry.Config, rt *telemetry.Runtime) error {
         rt.Extension = myExtension
-        // Optionally bind rt.Storage, rt.StorageHeaders, rt.Collector.
+        // Optionally bind rt.QueryBackend, rt.QueryHeaders, rt.MetricsHandler, rt.Collector.
         return nil
     },
 })
@@ -158,9 +158,10 @@ err := app.Run() // RunContext(ctx) supports an explicit parent lifecycle.
 New is side-effect-free; an App can run only once. Configure is the sole startup
 hook and runs before store/listener/receiver side effects. Core freezes config,
 resolves authoritative material providers, performs final validation, then opens
-primary storage and starts the extension, Collector, query listener and Plugin
+the explicit local TSDB and selected query backend, then starts the extension,
+optional Collector graph, selected HTTP query handler and Plugin
 subscriber. `Runtime` rejects JSON serialization/deserialization and contains
-process-local Logger, Extension, Storage, StorageHeaders and
+process-local Logger, Extension, QueryBackend, QueryHeaders, MetricsHandler and
 optional advanced Collector bindings. Never serialize it in a private protocol
 or retain/mutate Configure's declarations after the hook returns.
 
@@ -169,18 +170,26 @@ or retain/mutate Configure's declarations after the hook returns.
 | Binding | Contract |
 |---|---|
 | `Extension.Start(ctx, Host)` / `Shutdown(ctx)` | One object per process. Start runs before ingress; Shutdown also runs after a failed Start. Retained work belongs to the supplied context and must stop on cancellation |
-| `Host.Reader()` | Selected primary Reader, or nil in forwarding-only mode; no lifecycle, raw RouteEntry, secret or receiver handle |
-| `Reader.Bounds(ctx, SandboxID)` | Exact sandbox's first/last retained observation plus found/error; never StableID fallback |
-| `Reader.Query(ctx, Query)` | Query contains exact SandboxID, Start/End/Step; returns typed Field/Point observations, raw or independently MAX-aggregated in epoch-aligned buckets |
-| `Storage` | Reader plus `Write(ctx, []Sample)` and Shutdown; canonical Sample contains metric, labels, timestamp and value. Core calls Write only from its Collector exporter |
+| `Host.Reader()` | Selected query Reader, or nil in write-only mode; no lifecycle, raw RouteEntry, secret or receiver handle |
+| `Reader.Bounds(ctx, Selection)` | First/last retained observation for exact SandboxID, metric names and existing equality attributes (empty does not match missing), plus found/error; no StableID fallback |
+| `Reader.Query(ctx, Query)` | Selection plus Start/End, Raw (normalized default) or independent per-series Max and Step; returns `[]Series` with metric, complete attributes and timestamp/value points |
+| `QueryBackend` | Reader plus Shutdown; no Write requirement |
+| `MetricsHandler(QueryScope)` | Creates a standard HTTP handler with the authorized SandboxID and permanently scoped Reader; custom output is a separate HTTP contract |
 | `HealthReporter.Errors()` | Optional irrecoverable background-error channel; a report or closed channel revokes query availability and stops the component |
 
-`Runtime.Storage` is a factory receiving context and a copied storage declaration;
-bind it exactly with `storage.type: custom`. Errors/nil result do not fall back
-to local. If construction returns an owned backend plus an error, core still
-shuts it down. `Runtime.StorageHeaders(ctx)` replaces the entire credential map
-for a built-in Prometheus/ClickHouse primary. Empty maps are authoritative;
-provider errors never use stale YAML credentials. Returned maps are copied.
+`Runtime.QueryBackend` receives context and a copied `TelemetryQuery` declaration;
+bind it exactly with `query.backend: custom`. Errors/nil results do not fall back
+to local. If construction returns an owned backend and an error, core still
+closes it. `Runtime.QueryHeaders(ctx)` replaces the entire read-credential map
+for built-in Prometheus/ClickHouse backends. Empty maps are authoritative;
+provider errors do not use prior YAML credentials. Returned maps are copied.
+`Runtime.MetricsHandler` pairs exactly with `query.handler: custom`. A handler
+receives `QueryScope.Reader`, which enforces the authorized exact SandboxID even
+with another context or an identity attribute selector. Generic readers have no
+seven-field enum or fixed source list. The default E2B adapter owns its seven
+configurable mappings and default envd source. Query-only omits Collector; only
+`local.enabled` opens a TSDB, and only the Collector `sandboxlocal` exporter
+writes it. A custom backend never needs an exporter or dummy Write method.
 Native exporter credentials use native confmap providers, such as `${env:NAME}`
 or `${file:/path}` in component configuration. The former ExporterHeaders binding
 and per-component Configure wrappers are removed; a static configuration provider
@@ -209,9 +218,9 @@ ownership when deliberately transforming resource attributes. They do not receiv
 an additional discovery, lifecycle or network-binding authority.
 
 Shutdown first revokes the Plugin lease and drains query/ingress, then shuts
-down Collector, Extension and primary storage, in that order; each cleanup has
+down Collector, Extension, the query backend and optional local TSDB, in that order; each cleanup has
 a bounded context. Extensions may not keep using Reader after Shutdown. Core
-identity, Collector-only primary writes, SandboxID lookup and no-Wake rules are
+identity, Collector-only collection writes, SandboxID lookup and no-Wake rules are
 not configurable. Complete defaults/storage/network/query contracts live in
 [Telemetry](telemetry.md); the buildable [custom telemetry example](../examples/custom-telemetry/README.md)
 separates ordinary lifecycle/material code from advanced Collector code.

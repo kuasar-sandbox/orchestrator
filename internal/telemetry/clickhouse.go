@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,43 +17,26 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/config"
 )
 
-// ClickHouse uses a dedicated, ordinary MergeTree table. Each canonical
-// Collector sample is one row; E2B fields are independently MAX-aggregated by
-// metric and time bucket. Duplicate/out-of-order inserts preserve that result.
+// ClickHouse reads the linked standard Collector exporter's five metrics tables.
+// It never creates or alters schemas and owns no write/exporter connection.
 type ClickHouse struct {
 	*remoteClient
-	endpoint, table string
-	retention       time.Duration
+	endpoint string
+	database string
+	tables   config.TelemetryClickHouseTables
+	lookback time.Duration
 }
 
-func OpenClickHouse(ctx context.Context, cfg config.TelemetryStorage) (*ClickHouse, error) {
-	retention, err := time.ParseDuration(cfg.Retention)
+func NewClickHouse(cfg config.TelemetryQuery) (*ClickHouse, error) {
+	lookback, err := time.ParseDuration(cfg.Lookback)
 	if err != nil {
 		return nil, err
 	}
-	// Database/table identifiers were strictly validated by final config validation.
-	c := &ClickHouse{remoteClient: newRemoteClient(cfg.ClickHouse.Headers), endpoint: cfg.ClickHouse.Endpoint,
-		table: "`" + cfg.ClickHouse.Database + "`.`" + cfg.ClickHouse.Table + "`", retention: retention}
-	ttl := "toDateTime(timestamp) + toIntervalSecond(" + strconv.FormatInt(int64(retention/time.Second), 10) + ")"
-	statement := "CREATE TABLE IF NOT EXISTS " + c.table + ` (
-sandbox_id String, stable_id String, source LowCardinality(String), metric LowCardinality(String),
-labels Map(String, String), timestamp DateTime64(3, 'UTC'), value Float64
-) ENGINE = MergeTree PARTITION BY toDate(timestamp)
-ORDER BY (sandbox_id, source, metric, timestamp) TTL ` + ttl
-	for _, sql := range []string{statement, "ALTER TABLE " + c.table + " MODIFY TTL " + ttl} {
-		raw, err := c.execute(ctx, sql, nil, nil, false)
-		if err == nil && len(bytes.TrimSpace(raw)) != 0 {
-			err = errors.New("unexpected ClickHouse DDL response")
-		}
-		if err != nil {
-			_ = c.Shutdown(context.Background())
-			return nil, fmt.Errorf("initialize telemetry ClickHouse table: %w", err)
-		}
-	}
-	return c, nil
+	return &ClickHouse{remoteClient: newRemoteClient(cfg.ClickHouse.Headers), endpoint: cfg.ClickHouse.Endpoint,
+		database: cfg.ClickHouse.Database, tables: cfg.ClickHouse.Tables, lookback: lookback}, nil
 }
 
-func (c *ClickHouse) execute(ctx context.Context, sql string, params url.Values, data []byte, readonly bool) ([]byte, error) {
+func (c *ClickHouse) execute(ctx context.Context, sql string, params url.Values) ([]byte, error) {
 	endpoint, err := url.Parse(c.endpoint)
 	if err != nil {
 		return nil, err
@@ -67,80 +50,78 @@ func (c *ClickHouse) execute(ctx context.Context, sql string, params url.Values,
 	params.Set("max_execution_time", "9")
 	params.Set("max_threads", "2")
 	params.Set("max_memory_usage", "268435456")
-	params.Set("max_result_rows", "700000")
+	params.Set("max_result_rows", strconv.Itoa(maxQueryPoints))
 	params.Set("max_result_bytes", strconv.Itoa(maxRemoteBytes))
 	params.Set("result_overflow_mode", "throw")
 	params.Set("output_format_json_quote_64bit_integers", "0")
-	if readonly {
-		params.Set("readonly", "1")
-		params.Set("cancel_http_readonly_queries_on_client_close", "1")
-	}
+	params.Set("readonly", "1")
+	params.Set("cancel_http_readonly_queries_on_client_close", "1")
 	endpoint.RawQuery = params.Encode()
-	return c.request(ctx, endpoint.String(), data, map[string]string{"Content-Type": "application/octet-stream"})
+	return c.request(ctx, endpoint.String(), nil, map[string]string{"Content-Type": "application/octet-stream"})
 }
 
-func (c *ClickHouse) Write(ctx context.Context, samples []extension.Sample) error {
-	if len(samples) > maxWriteSamples {
-		return ErrInvalidMetrics
+// Scalar labels match local storage for numbers, summaries and explicit buckets.
+// The standard schema omits histogram HasSum and exponential ZeroThreshold;
+// those absent facts are not reconstructed. Histogram sums are omitted, and
+// exponential buckets expose their stored index/scale instead of invented bounds.
+func (c *ClickHouse) source(selection extension.Selection, start, end int64) (string, string, url.Values, error) {
+	if err := validateSelection(selection); err != nil {
+		return "", "", nil, err
 	}
-	var body bytes.Buffer
-	encoder := json.NewEncoder(&body)
+	params := url.Values{"param_sid": {selection.SandboxID}, "param_start": {strconv.FormatInt(start, 10)}, "param_end": {strconv.FormatInt(end, 10)}}
+	predicate := "ResourceAttributes['sandbox.id'] = {sid:String} AND bitAnd(Flags,1)=0 AND toUnixTimestamp64Milli(TimeUnix) >= {start:Int64} AND toUnixTimestamp64Milli(TimeUnix) <= {end:Int64}"
+	if len(selection.Metrics) > 0 {
+		names := make([]string, len(selection.Metrics))
+		for i, name := range selection.Metrics {
+			key := "metric" + strconv.Itoa(i)
+			names[i] = "{" + key + ":String}"
+			params.Set("param_"+key, name)
+		}
+		predicate += " AND MetricName IN (" + strings.Join(names, ",") + ")"
+	}
+	common := `mapConcat(
+ mapFilter((k,v)-> k IN ('sandbox.id','sandbox.stable_id','sandbox.telemetry.source'),ResourceAttributes),
+ mapApply((k,v)->(concat('resource.',k),v),mapFilter((k,v)-> k NOT IN ('sandbox.id','sandbox.stable_id','sandbox.telemetry.source'),ResourceAttributes)),
+ map('otel.scope.name',ScopeName,'otel.scope.version',ScopeVersion,'otel.unit',MetricUnit),
+ mapApply((k,v)->(concat('scope.',k),v),ScopeAttributes),
+ mapApply((k,v)->(concat('point.',k),v),Attributes)`
+	temporality := "'otel.temporality',multiIf(AggregationTemporality=2,'Cumulative',AggregationTemporality=1,'Delta','Unspecified')"
+	type source struct{ kind, table, labels, parts string }
+	// Each tuple is (part, bound/index, value); numbers have no part labels.
+	definitions := []source{
+		{"Gauge", c.tables.Gauge, "", "[tuple('','',Value)]"},
+		{"Sum", c.tables.Sum, "," + temporality + ",'otel.monotonic',if(IsMonotonic,'true','false')", "[tuple('','',Value)]"},
+		{"Summary", c.tables.Summary, "", "arrayConcat([tuple('count','',toFloat64(Count)),tuple('sum','',Sum)],arrayMap((q,v)->tuple('quantile',toString(q),v),`ValueAtQuantiles.Quantile`,`ValueAtQuantiles.Value`))"},
+		{"Histogram", c.tables.Histogram, "," + temporality, "arrayConcat([tuple('count','',toFloat64(Count))],arrayMap((bound,count)->tuple('bucket',bound,toFloat64(count)),arrayConcat(arrayMap(x->toString(x),ExplicitBounds),['+Inf']),arrayCumSum(BucketCounts)))"},
+		{"ExponentialHistogram", c.tables.ExponentialHistogram, "," + temporality + ",'otel.scale',toString(Scale)", "arrayConcat([tuple('count','',toFloat64(Count)),tuple('zero_count','',toFloat64(ZeroCount))],arrayMap((i,v)->tuple('positive_bucket',toString(PositiveOffset+toInt64(i)-1),toFloat64(v)),arrayEnumerate(PositiveBucketCounts),PositiveBucketCounts),arrayMap((i,v)->tuple('negative_bucket',toString(NegativeOffset+toInt64(i)-1),toFloat64(v)),arrayEnumerate(NegativeBucketCounts),NegativeBucketCounts))"},
+	}
+	var sources []string
+	for _, definition := range definitions {
+		attrs := common + ",map('otel.kind','" + definition.kind + "'" + definition.labels + "),if(part.1='',map(),map('otel.part',part.1)),if(part.2='',map(),map('otel.bound',part.2)))"
+		sources = append(sources, "SELECT MetricName AS metric,mapSort("+attrs+") AS attributes,toUnixTimestamp64Milli(TimeUnix) AS stamp,part.3 AS value FROM `"+c.database+"`.`"+definition.table+"` ARRAY JOIN "+definition.parts+" AS part WHERE "+predicate)
+	}
+	keys := make([]string, 0, len(selection.Attributes))
+	for key := range selection.Attributes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	predicates := []string{"isFinite(value)"}
+	for i, key := range keys {
+		suffix := strconv.Itoa(i)
+		params.Set("param_key"+suffix, key)
+		params.Set("param_value"+suffix, selection.Attributes[key])
+		predicates = append(predicates, "mapContains(attributes,{key"+suffix+":String}) AND attributes[{key"+suffix+":String}] = {value"+suffix+":String}")
+	}
+	return strings.Join(sources, " UNION ALL "), strings.Join(predicates, " AND "), params, nil
+}
+
+func (c *ClickHouse) Bounds(ctx context.Context, selection extension.Selection) (start, end time.Time, found bool, err error) {
 	now := time.Now()
-	for _, sample := range samples {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if sample.Timestamp.Before(now.Add(-c.retention)) {
-			continue
-		}
-		if sample.Timestamp.After(now.Add(time.Minute)) || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
-			return ErrInvalidMetrics
-		}
-		row := struct {
-			SandboxID string            `json:"sandbox_id"`
-			StableID  string            `json:"stable_id"`
-			Source    string            `json:"source"`
-			Metric    string            `json:"metric"`
-			Labels    map[string]string `json:"labels"`
-			Timestamp string            `json:"timestamp"`
-			Value     float64           `json:"value"`
-		}{sample.Labels[SandboxIDAttribute], sample.Labels[StableIDAttribute], sample.Labels[sourceAttribute], sample.Metric,
-			sample.Labels, sample.Timestamp.UTC().Truncate(time.Millisecond).Format("2006-01-02 15:04:05.000"), sample.Value}
-		if err := encoder.Encode(row); err != nil {
-			return err
-		}
-		if body.Len() > maxRemoteBytes {
-			return ErrInvalidMetrics
-		}
+	source, predicate, params, err := c.source(selection, now.Add(-c.lookback).UnixMilli(), now.Add(time.Minute).UnixMilli())
+	if err != nil {
+		return start, end, false, err
 	}
-	if body.Len() == 0 {
-		return nil
-	}
-	// Let ClickHouse coalesce concurrent scrapes instead of creating one tiny
-	// MergeTree part per sandbox. Wait for the flush: errors/backpressure must
-	// reach the Collector, not disappear behind a fire-and-forget acknowledgement.
-	params := url.Values{"async_insert": {"1"}, "wait_for_async_insert": {"1"},
-		"async_insert_use_adaptive_busy_timeout": {"0"}, "async_insert_busy_timeout_ms": {"20"},
-		"async_insert_max_data_size": {"1048576"}, "async_insert_max_query_number": {"128"}}
-	raw, err := c.execute(ctx, "INSERT INTO "+c.table+" (sandbox_id, stable_id, source, metric, labels, timestamp, value) FORMAT JSONEachRow", params, body.Bytes(), false)
-	if err == nil && len(bytes.TrimSpace(raw)) != 0 {
-		return errors.New("unexpected ClickHouse insert response")
-	}
-	return err
-}
-
-func (c *ClickHouse) predicate(id string, start, end int64) (string, url.Values) {
-	params := url.Values{"param_sid": {id}, "param_start": {strconv.FormatInt(start, 10)}, "param_end": {strconv.FormatInt(end, 10)}}
-	var names []string
-	for _, metric := range resourceMetrics {
-		names = append(names, "'"+metric.name+"'")
-	}
-	return "sandbox_id = {sid:String} AND source = 'envd' AND labels['otel.kind'] = 'Gauge' AND metric IN (" + strings.Join(names, ",") + ") AND timestamp >= fromUnixTimestamp64Milli({start:Int64}) AND timestamp <= fromUnixTimestamp64Milli({end:Int64})", params
-}
-
-func (c *ClickHouse) Bounds(ctx context.Context, id string) (start, end time.Time, found bool, err error) {
-	predicate, params := c.predicate(id, time.Now().Add(-c.retention).UnixMilli(), time.Now().Add(time.Minute).UnixMilli())
-	raw, err := c.execute(ctx, "SELECT count() AS count, toUnixTimestamp64Milli(min(timestamp)) AS first, toUnixTimestamp64Milli(max(timestamp)) AS last FROM "+c.table+" WHERE "+predicate+" FORMAT JSONEachRow", params, nil, true)
+	raw, err := c.execute(ctx, "SELECT count() AS count,min(stamp) AS first,max(stamp) AS last FROM ("+source+") WHERE "+predicate+" FORMAT JSONEachRow", params)
 	if err != nil {
 		return start, end, false, err
 	}
@@ -152,6 +133,9 @@ func (c *ClickHouse) Bounds(ctx context.Context, id string) (start, end time.Tim
 	if err := json.Unmarshal(raw, &row); err != nil {
 		return start, end, false, err
 	}
+	if ctx.Err() != nil {
+		return start, end, false, ctx.Err()
+	}
 	if row.Count == 0 {
 		return start, end, false, nil
 	}
@@ -162,32 +146,41 @@ func (c *ClickHouse) Bounds(ctx context.Context, id string) (start, end time.Tim
 	return start, end, true, nil
 }
 
-func (c *ClickHouse) Query(ctx context.Context, query extension.Query) ([]extension.Point, error) {
-	if err := ValidateRange(query.Start, query.End); err != nil {
+func (c *ClickHouse) Query(ctx context.Context, query extension.Query) ([]extension.Series, error) {
+	buckets, err := newSeriesBuckets(query)
+	if err != nil {
 		return nil, err
 	}
-	if query.Step < time.Second || query.Step%time.Second != 0 {
-		return nil, errors.New("ClickHouse query step must use positive whole seconds")
+	start, end := max(query.Start.UnixMilli(), time.Now().Add(-c.lookback).UnixMilli()), min(query.End.UnixMilli(), time.Now().Add(time.Minute).UnixMilli())
+	if start > end {
+		return []extension.Series{}, ctx.Err()
 	}
-	predicate, params := c.predicate(query.SandboxID, max(query.Start.UnixMilli(), time.Now().Add(-c.retention).UnixMilli()), query.End.UnixMilli())
-	params.Set("param_step", strconv.FormatInt(int64(query.Step/time.Second), 10))
-	// Use integer epoch buckets to preserve milliseconds and avoid timezone or
-	// server settings changing the DateTime64 return type of time functions.
-	sql := "SELECT intDiv(toUnixTimestamp64Milli(timestamp), {step:Int64} * 1000) * {step:Int64} * 1000 AS stamp, metric, max(value) AS value FROM " + c.table + " WHERE " + predicate + " GROUP BY stamp, metric ORDER BY stamp, metric FORMAT JSONEachRow"
-	raw, err := c.execute(ctx, sql, params, nil, true)
+	source, predicate, params, err := c.source(query.Selection, start, end)
+	if err != nil {
+		return nil, err
+	}
+	sql := "SELECT metric,attributes,stamp,value FROM (" + source + ") WHERE " + predicate + " ORDER BY metric,attributes,stamp"
+	if query.Aggregation == extension.Max {
+		params.Set("param_step", strconv.FormatInt(query.Step.Milliseconds(), 10))
+		// Filter actual observations before independent per-series epoch MAX. The
+		// first returned bucket may precede Start; no lookback sample enters it.
+		sql = "SELECT metric,attributes,bucket,aggregate_value AS value FROM (SELECT metric,attributes,intDiv(stamp,{step:Int64})*{step:Int64} AS bucket,max(value) AS aggregate_value FROM (" + source + ") WHERE " + predicate + " GROUP BY metric,attributes,bucket) ORDER BY metric,attributes,bucket"
+	}
+	raw, err := c.execute(ctx, sql+" FORMAT JSONEachRow", params)
 	if err != nil {
 		return nil, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	points := make([]extension.Point, 0)
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	for count := 0; ; count++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		var row struct {
-			Stamp  int64   `json:"stamp"`
-			Metric string  `json:"metric"`
-			Value  float64 `json:"value"`
+			Metric     string            `json:"metric"`
+			Attributes map[string]string `json:"attributes"`
+			Stamp      *int64            `json:"stamp"`
+			Bucket     *int64            `json:"bucket"`
+			Value      *float64          `json:"value"`
 		}
 		if err := decoder.Decode(&row); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -195,13 +188,33 @@ func (c *ClickHouse) Query(ctx context.Context, query extension.Query) ([]extens
 			}
 			return nil, err
 		}
-		field, ok := metricField(row.Metric)
-		if !ok || len(points) >= 700000 {
+		if count >= maxQueryPoints || row.Value == nil {
 			return nil, ErrInvalidMetrics
 		}
-		points = append(points, extension.Point{Timestamp: time.UnixMilli(row.Stamp).UTC(), Field: field, Value: row.Value})
+		var appendPoint func(int64, float64) error
+		if query.Aggregation == extension.Max {
+			if row.Bucket == nil || row.Stamp != nil {
+				return nil, ErrInvalidMetrics
+			}
+			appendPoint, err = buckets.visitBucket(row.Metric, row.Attributes)
+			if err == nil {
+				err = appendPoint(*row.Bucket, *row.Value)
+			}
+		} else {
+			if row.Stamp == nil || row.Bucket != nil {
+				return nil, ErrInvalidMetrics
+			}
+			appendPoint, err = buckets.visit(row.Metric, row.Attributes)
+			if err == nil {
+				err = appendPoint(*row.Stamp, *row.Value)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid ClickHouse observation: %w", err)
+		}
 	}
-	return points, nil
+	result := buckets.result()
+	return result, ctx.Err()
 }
 
-var _ extension.Storage = (*ClickHouse)(nil)
+var _ extension.QueryBackend = (*ClickHouse)(nil)

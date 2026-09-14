@@ -13,7 +13,7 @@ import (
 )
 
 type fakeReader struct {
-	points     []extension.Point
+	points     []e2bPoint
 	found      bool
 	start, end time.Time
 	boundsIDs  []string
@@ -26,14 +26,14 @@ type blockingReader struct {
 	entered chan struct{}
 }
 
-func (r blockingReader) Bounds(ctx context.Context, _ string) (time.Time, time.Time, bool, error) {
+func (r blockingReader) Bounds(ctx context.Context, _ extension.Selection) (time.Time, time.Time, bool, error) {
 	r.entered <- struct{}{}
 	<-ctx.Done()
 	return time.Time{}, time.Time{}, false, ctx.Err()
 }
 func TestQueryCapacityAndBackendCancellation(t *testing.T) {
 	reader := blockingReader{entered: make(chan struct{}, 8)}
-	handler := QueryHandler(reader)
+	handler := queryHandlerForTest(reader)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var requests sync.WaitGroup
@@ -66,13 +66,17 @@ func TestQueryCapacityAndBackendCancellation(t *testing.T) {
 	}
 }
 
-func (f *fakeReader) Bounds(_ context.Context, id string) (time.Time, time.Time, bool, error) {
-	f.boundsIDs = append(f.boundsIDs, id)
+func (f *fakeReader) Bounds(_ context.Context, selection extension.Selection) (time.Time, time.Time, bool, error) {
+	f.boundsIDs = append(f.boundsIDs, selection.SandboxID)
 	return f.start, f.end, f.found, f.err
 }
-func (f *fakeReader) Query(_ context.Context, q extension.Query) ([]extension.Point, error) {
+func (f *fakeReader) Query(_ context.Context, q extension.Query) ([]extension.Series, error) {
 	f.queries = append(f.queries, q)
-	return f.points, f.err
+	var series []extension.Series
+	for _, point := range f.points {
+		series = append(series, extension.Series{Metric: resourceMetrics[point.Field].name, Attributes: map[string]string{SandboxIDAttribute: q.SandboxID, sourceAttribute: "envd"}, Points: []extension.Point{{Timestamp: point.Timestamp, Value: point.Value}}})
+	}
+	return series, f.err
 }
 
 func TestCalculateStepBoundaries(t *testing.T) {
@@ -112,7 +116,7 @@ func TestQueryBoundaries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := &fakeReader{found: true, start: time.Unix(100, 0), end: time.Unix(1000, 0)}
 			response := httptest.NewRecorder()
-			QueryHandler(reader).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/exact-sandbox/metrics"+tc.query, nil))
+			queryHandlerForTest(reader).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/exact-sandbox/metrics"+tc.query, nil))
 			if response.Code != tc.status {
 				t.Fatalf("status %d: %s", response.Code, response.Body.String())
 			}
@@ -136,14 +140,14 @@ func TestQueryBoundaries(t *testing.T) {
 }
 
 func TestIndependentMAXAndExactE2BSchema(t *testing.T) {
-	first := [extension.FieldCount]float64{2, 90.5, 1000, 400, 300, 8000, 2000}
-	second := [extension.FieldCount]float64{4, 5.5, 900, 800, 100, 7000, 4000}
+	first := [e2bFieldCount]float64{2, 90.5, 1000, 400, 300, 8000, 2000}
+	second := [e2bFieldCount]float64{4, 5.5, 900, 800, 100, 7000, 4000}
 	reader := &fakeReader{found: true, start: time.Unix(100, 0), end: time.Unix(104, 0)}
-	for field := range extension.FieldCount {
-		reader.points = append(reader.points, extension.Point{Timestamp: time.Unix(101, 0), Field: field, Value: first[field]}, extension.Point{Timestamp: time.Unix(104, 0), Field: field, Value: second[field]})
+	for field := range e2bFieldCount {
+		reader.points = append(reader.points, e2bPoint{Timestamp: time.Unix(101, 0), Field: field, Value: first[field]}, e2bPoint{Timestamp: time.Unix(104, 0), Field: field, Value: second[field]})
 	}
 	response := httptest.NewRecorder()
-	QueryHandler(reader).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
+	queryHandlerForTest(reader).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
 	if response.Code != 200 {
 		t.Fatal(response.Body.String())
 	}
@@ -162,7 +166,7 @@ func TestQueryEmptyAndSandboxIDOnly(t *testing.T) {
 	for _, query := range []string{"", "?start=10", "?end=20", "?start=10&end=20"} {
 		reader := &fakeReader{}
 		response := httptest.NewRecorder()
-		QueryHandler(reader).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/not-stable-id/metrics"+query, nil))
+		queryHandlerForTest(reader).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/not-stable-id/metrics"+query, nil))
 		if response.Code != 200 || response.Body.String() != "[]\n" {
 			t.Fatal(response.Code, response.Body.String())
 		}
@@ -176,11 +180,11 @@ func TestQueryEmptyAndSandboxIDOnly(t *testing.T) {
 		}
 	}
 	response := httptest.NewRecorder()
-	QueryHandler(nil).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
+	queryHandlerForTest(nil).ServeHTTP(response, httptest.NewRequest("GET", "/sandboxes/sid/metrics", nil))
 	if response.Code != 503 {
 		t.Fatal(response.Code)
 	}
-	result, err := aggregate([]extension.Point{{Timestamp: time.Unix(10, 0), Field: extension.MemCache, Value: 42}}, extension.Query{Start: time.Unix(0, 0), End: time.Unix(20, 0), Step: 5 * time.Second})
+	result, err := aggregate([]e2bPoint{{Timestamp: time.Unix(10, 0), Field: e2bMemCache, Value: 42}}, extension.Query{Start: time.Unix(0, 0), End: time.Unix(20, 0), Step: 5 * time.Second})
 	if err != nil || len(result) != 0 {
 		t.Fatalf("incomplete bucket must not fill zeros: %v %v", result, err)
 	}

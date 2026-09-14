@@ -14,7 +14,7 @@ It provides the northbound API, node-local lifecycle orchestration, data-plane p
 
 - **Conductor** — authoritative control-plane API, sandbox and build lifecycle, node-local routing, credential management, and optional node resource admission;
 - **Proxy** — the single sandbox data ingress for Envd traffic, floating-IP services, native exec, MMDS, and traffic observation;
-- **Telemetry** — independent envd/OTLP metrics collection, trusted sandbox identity, Collector pipelines, embedded TSDB or readable external storage, exporters, and E2B history queries;
+- **Telemetry** — independent envd/native stats/OTLP collection, trusted sandbox identity, native Collector pipelines, optional local TSDB, separate remote writes and queries, and E2B/custom HTTP handlers;
 - **Node link** — an optional client that attaches the node to a cluster control plane;
 - **Launch helpers** — systemd-managed sandbox and build runners;
 - **Administration** — resource status/drain, template-build status, configuration inspection, manifest-key management, and sandbox export/import.
@@ -236,8 +236,8 @@ Detailed design and reference documents provide complete English and Chinese edi
 
 - [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, and reliability;
 - [Node template builds](docs/node-build.md): full Build API, configuration, execution, publication and recovery.
-- [Runtime extensions](docs/extensions.md): complete Conductor/Proxy/Telemetry SDK lifecycle, sources, Hooks, wrappers and storage/Collector bindings.
-- [Telemetry](docs/telemetry.md) ([Chinese edition](docs/telemetry_zh.md)) — direct FloatingIP OTLP ingress, envd scrape, local/Prometheus/ClickHouse primary storage, exporters, E2B history and identity invariants;
+- [Runtime extensions](docs/extensions.md): complete Conductor/Proxy/Telemetry SDK lifecycle, sources, Hooks, wrappers and query/Collector bindings.
+- [Telemetry](docs/telemetry.md) ([Chinese edition](docs/telemetry_zh.md)) — direct FloatingIP OTLP ingress, envd scrape, native stats collection, standard Collector pipelines, optional local TSDB, independent Prometheus/ClickHouse queries, generic HTTP extensions, E2B history and identity invariants;
 - [`docs/node-journald.md`](docs/node-journald.md) ([Chinese edition](docs/node-journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;

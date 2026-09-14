@@ -3,8 +3,7 @@ config_socket: /run/sandbox/node-ctl.socket
 api_socket: /run/sandbox/telemetry.sock
 paths:
   telemetry_executable: /opt/kuasar/bin/custom-telemetry
-telemetry:
-  storage: {type: none}
+query: {backend: none, handler: none}
 collector:
   receivers:
     envd: {collection_interval: 5s}

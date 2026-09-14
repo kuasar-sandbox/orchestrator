@@ -36,12 +36,22 @@ resource, 标准 batch、queue、retry 可以丢失原请求 context, 也可以�
 connector、Collector extension、config provider、converter; 实例与 pipeline 边仍由
 声明配置决定.
 
-定制主存储使用 `storage.type: custom` 并绑定 `Runtime.Storage`，实现
-`extension.Storage`：canonical Collector 写入、精确 SandboxID 的 Bounds/Query、
-Shutdown。它不是 extra exporter。`Runtime.StorageHeaders` 为内建 Prometheus/
-ClickHouse 主存储提供材料。额外 Collector exporter 通过独立
-`otel.Components.Exporters` 列表绑定，不自动使历史可查询。普通 `extension` 包没有
-OTel 类型，也没有动态 registry 或 DI container。
+[query.yaml](query.yaml) 是独立 query-only 配置: 选择 Prometheus Reader 和
+[query.go](query.go) 中真正的 HTTP handler, 不启动 Collector 或本地存储. 配置
+query endpoint 和受保护的读凭据. 请求
+`/sandboxes/{SandboxID}/metrics?metric=task_temperature` 返回 raw 通用 `Series`
+JSON, 响应 header 为 `X-Metrics-Contract: kuasar-example-series-v1`. 重复 `metric`
+参数最多选择 64 个精确后端名称. 此响应是独立合同; E2B SDK 必须选择
+`query.handler: e2b`. Conductor 对两者都保持透明转发. Handler 的 Reader 绑定
+已授权精确 SandboxID, client 参数或替换 context 都不能让它查询其他沙箱.
+
+定制 Reader 使用 `query.backend: custom` 并绑定 `Runtime.QueryBackend`, 实现
+`extension.QueryBackend`: 基于 Selection 的 Bounds、通用 Series Query 与 Shutdown.
+不要求 Write 或 Collector graph. `Runtime.QueryHeaders` 为内建 Prometheus/ClickHouse
+backend 提供读凭据; 原生 Collector config provider 独立提供 exporter 凭据.
+Provider 失败不会回退 YAML 或本地 DB. `local.enabled` 显式创建可选 TSDB,
+`sandboxlocal` 经 Collector 写入它. `extension` 包没有 OTel 类型、动态 registry
+或 DI container.
 
 完整契约见 [telemetry 规范](../../docs/telemetry_zh.md) 和
 [扩展指南](../../docs/extensions_zh.md#telemetry-bootstrap-与扩展)。

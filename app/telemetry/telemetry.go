@@ -29,8 +29,9 @@ type Config = config.Telemetry
 type Runtime struct {
 	Logger         *slog.Logger
 	Extension      extension.Extension
-	Storage        func(context.Context, config.TelemetryStorage) (extension.Storage, error)
-	StorageHeaders func(context.Context) (map[string]string, error)
+	QueryBackend   func(context.Context, config.TelemetryQuery) (extension.QueryBackend, error)
+	MetricsHandler extension.MetricsHandler
+	QueryHeaders   func(context.Context) (map[string]string, error)
 	// Collector is optional advanced integration, isolated in app/telemetry/otel.
 	Collector customotel.Components
 }
@@ -109,7 +110,7 @@ func (a *App) RunContext(ctx context.Context) error {
 	}
 	frozen := cfg.Clone()
 	resolved, err := telemetryapp.ResolveRuntime(ctx, frozen, telemetryapp.Bindings{Logger: bindings.Logger, Extension: bindings.Extension,
-		Storage: bindings.Storage, StorageHeaders: bindings.StorageHeaders, Collector: bindings.Collector.Clone()})
+		QueryBackend: bindings.QueryBackend, MetricsHandler: bindings.MetricsHandler, QueryHeaders: bindings.QueryHeaders, Collector: bindings.Collector.Clone()})
 	if err != nil {
 		return err
 	}
