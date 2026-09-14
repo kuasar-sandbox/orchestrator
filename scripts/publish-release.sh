@@ -110,7 +110,7 @@ release_notes_file() {
     local dependencies binding
     dependencies="${RELEASE_DEPENDENCIES:-}"
     if [ -n "$dependencies" ] \
-      && ! [[ "$dependencies" =~ ^[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?(,[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?)*$ ]]; then
+      && ! [[ "$dependencies" =~ ^[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?(,[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?)*$ ]]; then
       fail "invalid RELEASE_DEPENDENCIES"
     fi
     binding="$(jq -cn \

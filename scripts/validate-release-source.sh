@@ -24,19 +24,19 @@ fail() {
 
 case "$UNIT" in
   accelerator|connector|sandboxer|orchestrator)
-    [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+    [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
       || fail "invalid $UNIT tag: $TAG"
     TAG_MAJOR="${BASH_REMATCH[1]}"
     TAG_MINOR="${BASH_REMATCH[2]}"
     ;;
   runtime)
-    [[ "$TAG" =~ ^runtime-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+    [[ "$TAG" =~ ^runtime-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
       || fail "invalid runtime tag: $TAG"
     TAG_MAJOR="${BASH_REMATCH[1]}"
     TAG_MINOR="${BASH_REMATCH[2]}"
     ;;
   vmlinux)
-    [[ "$TAG" =~ ^vmlinux-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+    [[ "$TAG" =~ ^vmlinux-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
       || fail "invalid vmlinux tag: $TAG"
     TAG_MAJOR="${BASH_REMATCH[1]}"
     TAG_MINOR="${BASH_REMATCH[2]}"

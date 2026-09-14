@@ -15,8 +15,8 @@ if [[ "$TAG" != *-preview.* ]]; then
   exit 0
 fi
 
-[[ "$AGGREGATE" =~ ^release-v[0-9]+\.[0-9]+\.[0-9]+-preview\.([0-9]{8})$ ]] || {
-  echo "preview releases require aggregate_version=release-vX.Y.Z-preview.YYYYMMDD" >&2
+[[ "$AGGREGATE" =~ ^release-v[0-9]+\.[0-9]+\.[0-9]+-preview\.([0-9]{8}(\.[1-9][0-9]*)?)$ ]] || {
+  echo "preview releases require aggregate_version=release-vX.Y.Z-preview.YYYYMMDD[.N]" >&2
   exit 1
 }
 AGGREGATE_DATE="${BASH_REMATCH[1]}"
@@ -24,12 +24,12 @@ AGGREGATE_DATE="${BASH_REMATCH[1]}"
   echo "aggregate-sha must be a full lowercase SHA" >&2
   exit 1
 }
-[[ "$TAG" =~ -preview\.([0-9]{8})$ ]] || {
-  echo "component Preview tag must end in -preview.YYYYMMDD" >&2
+[[ "$TAG" =~ -preview\.([0-9]{8}(\.[1-9][0-9]*)?)$ ]] || {
+  echo "component Preview tag must end in -preview.YYYYMMDD[.N]" >&2
   exit 1
 }
 [ "${BASH_REMATCH[1]}" = "$AGGREGATE_DATE" ] || {
-  echo "component and aggregate Preview dates must match" >&2
+  echo "component and aggregate Preview dates and revisions must match" >&2
   exit 1
 }
 STABLE="${AGGREGATE%-preview.*}"
