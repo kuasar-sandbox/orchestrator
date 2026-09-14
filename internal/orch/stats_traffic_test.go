@@ -123,7 +123,7 @@ func TestTrafficFlatBatchUsesCurrentSwitchAndProxyBatches(t *testing.T) {
 }
 
 func TestTrafficReadRejectsIncompleteOrChangedBindings(t *testing.T) {
-	for _, kind := range []string{"source", "nil", "missing", "duplicate", "switch", "floating-ip", "inner-ip", "invalid-inner-cidr", "reset", "changed-run", "changed-port", "changed-inner-ip", "pending-detach", "control-lock"} {
+	for _, kind := range []string{"source", "nil", "missing", "duplicate", "switch", "floating-ip", "inner-ip", "invalid-inner-cidr", "reset", "changed-run", "changed-port", "changed-inner-ip", "changed-port-mac", "pending-detach", "control-lock"} {
 		t.Run(kind, func(t *testing.T) {
 			o := testOrch(t)
 			ids := trafficBindings(t, o, 2)
@@ -151,7 +151,7 @@ func TestTrafficReadRejectsIncompleteOrChangedBindings(t *testing.T) {
 					result.Ports[0].FloatingIP = "198.18.0.99"
 				case "inner-ip":
 					result.Ports[0].InnerIP = "169.254.1.99"
-				case "changed-run", "changed-port", "changed-inner-ip":
+				case "changed-run", "changed-port", "changed-inner-ip", "changed-port-mac":
 					sb, err := o.st.Get(context.Background(), ids[0])
 					if err != nil {
 						t.Fatal(err)
@@ -160,6 +160,8 @@ func TestTrafficReadRejectsIncompleteOrChangedBindings(t *testing.T) {
 						sb.RunID = "replacement"
 					} else if kind == "changed-port" {
 						sb.VswitchPort = "3"
+					} else if kind == "changed-port-mac" {
+						sb.PortMAC = "02:00:00:00:00:01"
 					} else {
 						sb.InnerIP = "169.254.1.99/31"
 					}
@@ -221,5 +223,46 @@ func TestTrafficNoPortAndSingleSourceFailure(t *testing.T) {
 	provider.err = errors.New("configured Proxy read failed")
 	if _, err := o.TrafficStats(context.Background(), sb.ID, key); !errors.Is(err, api.ErrStatsUnavailable) {
 		t.Fatal("configured failure not unavailable", err)
+	}
+}
+
+func TestTrafficRejectsPartialBindingWithoutPort(t *testing.T) {
+	for _, field := range []string{"floating-ip", "inner-ip", "port-mac"} {
+		t.Run(field, func(t *testing.T) {
+			o := testOrch(t)
+			ids := batchSandboxes(t, o, 2)
+			sb, err := o.st.Get(context.Background(), ids[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch field {
+			case "floating-ip":
+				sb.FloatingIP = "198.18.0.1"
+			case "inner-ip":
+				sb.InnerIP = "169.254.1.1/31"
+			case "port-mac":
+				sb.PortMAC = "02:00:00:00:00:01"
+			}
+			if err := o.st.Put(context.Background(), sb); err != nil {
+				t.Fatal(err)
+			}
+			o.SetSandboxTrafficProvider(nativeTrafficFunc(func(context.Context, string) (*api.TrafficStats, error) {
+				t.Fatal("partial network ownership reached the ingress reader")
+				return nil, nil
+			}))
+			o.vs = &trafficSwitchStub{vsClient: o.vs, read: func(context.Context, []int) (*connector.StatsOutput, error) {
+				t.Fatal("partial network ownership reached connector")
+				return nil, nil
+			}}
+			if stats, err := o.TrafficStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret)); stats != nil || !errors.Is(err, api.ErrStatsUnavailable) {
+				t.Fatal("public read published incomplete binding", stats, err)
+			}
+			for _, batch := range [][]string{ids[:1], ids} {
+				rows, err := o.ReadStats(context.Background(), conductorextension.StatsRequest{SandboxIDs: batch, Sections: []string{"traffic"}})
+				if rows != nil || !errors.Is(err, api.ErrStatsUnavailable) {
+					t.Fatal("batch published incomplete binding", rows, err)
+				}
+			}
+		})
 	}
 }

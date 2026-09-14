@@ -111,6 +111,9 @@ func (o *Orchestrator) readNetworkTraffic(ctx context.Context, sandboxes []*type
 	indices := make(map[int]int, len(sandboxes))
 	for i, sb := range sandboxes {
 		if sb.VswitchPort == "" {
+			if sb.FloatingIP != "" || sb.InnerIP != "" || sb.PortMAC != "" {
+				return nil, api.ErrStatsUnavailable
+			}
 			continue // No attached port: empty observations, not observed zero.
 		}
 		port, err := strconv.ParseUint(sb.VswitchPort, 10, 32)
