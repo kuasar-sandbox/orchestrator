@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Orchestrator version in vX.Y.Z or vX.Y.Z-preview.YYYYMMDD form
+        description: Orchestrator version in vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N] form
         required: true
         type: string
       accelerator_version:
@@ -87,12 +87,12 @@ jobs:
           TARGET_ARCH: x86_64
         run: |
           set -euo pipefail
-          [[ "$ACCELERATOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
-            || { echo "accelerator_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
-          [[ "$CONNECTOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
-            || { echo "connector_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
-          [[ "$SANDBOXER_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
-            || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
+          [[ "$ACCELERATOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+            || { echo "accelerator_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N]" >&2; exit 1; }
+          [[ "$CONNECTOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+            || { echo "connector_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N]" >&2; exit 1; }
+          [[ "$SANDBOXER_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+            || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N]" >&2; exit 1; }
           bash scripts/validate-release-source.sh \
             "$SOURCE_REF" "$SOURCE_SHA" "$VERSION" orchestrator
           bash scripts/validate-preview-line.sh \

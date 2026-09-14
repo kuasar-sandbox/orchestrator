@@ -26,14 +26,14 @@ fail() {
 
 case "$UNIT" in
   accelerator|connector|sandboxer|orchestrator)
-    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}$ ]]       || fail "invalid $UNIT preview tag: $TAG"
+    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}(\.[1-9][0-9]*)?$ ]]       || fail "invalid $UNIT preview tag: $TAG"
     ;;
   runtime)
-    [[ "$TAG" =~ ^runtime-v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}$ ]]       || fail "invalid runtime preview tag: $TAG"
+    [[ "$TAG" =~ ^runtime-v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}(\.[1-9][0-9]*)?$ ]]       || fail "invalid runtime preview tag: $TAG"
     export RELEASE_KIND=runtime
     ;;
   vmlinux)
-    [[ "$TAG" =~ ^vmlinux-v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}$ ]]       || fail "invalid vmlinux preview tag: $TAG"
+    [[ "$TAG" =~ ^vmlinux-v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}(\.[1-9][0-9]*)?$ ]]       || fail "invalid vmlinux preview tag: $TAG"
     export RELEASE_KIND=vmlinux
     ;;
   *) fail "unknown release unit: $UNIT" ;;
