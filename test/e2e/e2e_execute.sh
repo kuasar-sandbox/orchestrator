@@ -2280,10 +2280,10 @@ grep -q "$W_DISK_PERSIST" "$WORK/portable-disk-read.out" \
     || { sed 's/^/  guest| /' "$WORK/portable-disk-read.out"; fail "retained W lost merged W-only disk state"; }
 W_RESUME_RUN_ID=$(sandbox_run_id "$SID")
 [ -n "$W_RESUME_RUN_ID" ] || fail "retained W resume runner id is empty"
-# The runner must restore from the retained local checkpoint — the same ref the
-# source row kept — and never from the manifest store. A local artifact stream
-# does not expose the prefetch capability, so accept either backend=file
-# prefetch log variant (started or skipped).
+# The runner's restore source must be the retained local checkpoint — the same
+# ref the source row kept. Its memory prefetch must not be manifest-backed; a
+# local artifact stream does not expose the prefetch capability, so accept
+# either backend=file prefetch log variant (started or skipped).
 assert_run_source_mode "$W_RESUME_RUN_CALL" "$SID" restore \
     || fail "retained W resume did not execute run --restore"
 assert_run_option_value "$W_RESUME_RUN_CALL" "$SID" "--restore" "$W_PORTABLE_LOCAL" \
@@ -2296,8 +2296,8 @@ wait_unit_journal_contains "$W_RESUME_UNIT" \
     "backend=file parent_layers=" "$WORK/keep-source-w.journal" \
     || { tail -40 "$WORK/keep-source-w.journal" | sed 's/^/  unit| /'; fail "retained W resume did not use the local checkpoint as its memory backend"; }
 MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/keep-source-w.journal" || true)
-[ "$MANIFEST_PREFETCH_COUNT" = "0" ] || fail "retained W resume prefetched $MANIFEST_PREFETCH_COUNT layer(s) from the manifest store, want local-only"
-echo "==> PASS: keep-source W resumed envd-managed PID/listener from its retained local checkpoint (frozen delta=$FREEZE_DELTA_W); manifest store untouched"
+[ "$MANIFEST_PREFETCH_COUNT" = "0" ] || fail "retained W resume prefetched $MANIFEST_PREFETCH_COUNT memory layer(s) from the manifest store, want no manifest memory prefetch"
+echo "==> PASS: keep-source W resumed envd-managed PID/listener from its retained local checkpoint (frozen delta=$FREEZE_DELTA_W); no manifest-backed memory prefetch"
 
 if [ "$MMDS_ROUTES_E2E" = 1 ]; then
     source "$SCRIPT_DIR/lib/mmds_static_guest.sh"
