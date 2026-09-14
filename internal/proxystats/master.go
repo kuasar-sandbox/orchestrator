@@ -232,11 +232,11 @@ func (m *MasterStats) recomputeLocked(sandboxID string) error {
 		found = true
 		for service, state := range snapshot.Services {
 			current := aggregate.services[service]
-			if math.MaxUint64-current.parking < state.Parking || math.MaxUint64-current.egress < state.Egress {
+			if math.MaxUint64-current.parking < state.Parking || math.MaxUint64-current.egress < state.Connected {
 				return fmt.Errorf("proxystats: aggregate overflow for sandbox %q", sandboxID)
 			}
 			current.parking += state.Parking
-			current.egress += state.Egress
+			current.egress += state.Connected
 			current.idle = laterPoint(current.idle, pointFromSnapshot(state))
 			aggregate.services[service] = current
 		}
@@ -337,9 +337,9 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	var topIdle timePoint
 	for _, service := range services {
 		current := aggregate.services[service]
-		item := api.ServiceTrafficStats{Parking: current.parking, Egress: current.egress}
+		item := api.ServiceTrafficStats{Parking: current.parking, Connected: current.egress}
 		result.Inflight.Parking += current.parking
-		result.Inflight.Egress += current.egress
+		result.Inflight.Connected += current.egress
 		if current.parking == 0 && current.egress == 0 {
 			idle := laterPoint(baseline, current.idle)
 			wall := idle.wall.UTC()
@@ -348,7 +348,7 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 		}
 		result.Services[service] = item
 	}
-	if state == types.StateRunning && result.Inflight.Parking == 0 && result.Inflight.Egress == 0 {
+	if state == types.StateRunning && result.Inflight.Parking == 0 && result.Inflight.Connected == 0 {
 		wall := topIdle.wall.UTC()
 		result.IdleSince = &wall
 	}

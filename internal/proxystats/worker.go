@@ -414,7 +414,7 @@ func (w *WorkerStats) nextBatch(epoch, sequence uint64) (pendingBatch, bool) {
 func snapshotEntry(sandboxID string, entry *trafficEntry) SandboxSnapshot {
 	snapshot := SandboxSnapshot{SandboxID: sandboxID, Services: make(map[string]ServiceSnapshot, len(entry.services))}
 	for service, state := range entry.services {
-		item := ServiceSnapshot{Parking: state.parking, Egress: state.egress}
+		item := ServiceSnapshot{Parking: state.parking, Connected: state.egress}
 		if state.parking == 0 && state.egress == 0 {
 			item.IdleSince, item.IdleSinceBootNS = snapshotIdle(state.idle)
 		}

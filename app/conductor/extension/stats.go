@@ -24,14 +24,24 @@ type ResourceStats struct {
 }
 
 type TrafficInflight struct {
-	Parking uint64 `json:"parking"`
-	Egress  uint64 `json:"egress"`
+	Parking   uint64 `json:"parking"`
+	Connected uint64 `json:"connected"`
 }
 
 type ServiceTrafficStats struct {
 	Parking   uint64     `json:"parking"`
-	Egress    uint64     `json:"egress"`
+	Connected uint64     `json:"connected"`
 	IdleSince *time.Time `json:"idleSince,omitempty"`
+}
+
+// TrafficCounters describes one connector observation point, from the sandbox
+// viewpoint. All four values are present together, including observed zero;
+// an empty object means there is no applicable current port observation.
+type TrafficCounters struct {
+	RXPackets *uint64 `json:"rxPackets,omitempty"`
+	RXBytes   *uint64 `json:"rxBytes,omitempty"`
+	TXPackets *uint64 `json:"txPackets,omitempty"`
+	TXBytes   *uint64 `json:"txBytes,omitempty"`
 }
 
 type TrafficStats struct {
@@ -40,6 +50,9 @@ type TrafficStats struct {
 	Inflight    TrafficInflight                `json:"inflight"`
 	IdleSince   *time.Time                     `json:"idleSince,omitempty"`
 	Services    map[string]ServiceTrafficStats `json:"services"`
+	Platform    TrafficCounters                `json:"platform"`
+	Transit     TrafficCounters                `json:"transit"`
+	Egress      struct{}                       `json:"egress"` // No publishable egress statistics.
 }
 
 const (

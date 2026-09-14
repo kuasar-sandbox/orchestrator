@@ -238,7 +238,7 @@ Both readers' prefetched bytes survive. A clean EOF half-closes the peer and
 drains its tail; request cancellation closes both sides and joins the relay.
 
 One upgraded connection retains the original tracked backend, admission lease
-and egress count until relay completion. Frames do not create new ingress or
+and connected count until relay completion. Frames do not create new ingress or
 request-result counts. The cluster router uses this same HTTP exchange over its
 existing node CONNECT tunnel, retaining its buffered reader and identity rewrite;
 there is no second WebSocket implementation or replay of the inner request.
@@ -359,7 +359,7 @@ Concurrent releases do not enlarge this bound. Fix any observation time `T`. Rem
 actual admitted inflight <= M + N - 1
 ```
 
-The parking→egress transition does not change shared counts. Activation/dial/HTTP-forward failure, context cancellation, an ordinary response, and final Close of complete CONNECT/exec relay all release through the same flow/lease exactly once. Half-close does not release it.
+The parking→connected transition does not change shared counts. Activation/dial/HTTP-forward failure, context cancellation, an ordinary response, and final Close of complete CONNECT/exec relay all release through the same flow/lease exactly once. Half-close does not release it.
 
 Delete or identity replacement revokes the old active generation without waiting for a live worker, including one stopped inside acquire. The master's allocation transaction retains one spare slot: revoke the old binding and allocate the new binding before publishing the route; commit retires the old slot, while rollback retires the unpublished slot and reactivates the old generation without clearing outstanding counts. On first use of a new generation, each worker initializes only its own row: store tag=0, reset all four counters, then publish the new tag. Scans read tag/counters/tag and include only unchanged tags matching the current generation. A late release either precedes that worker's initialization or sees the new tag and does nothing; it cannot decrement the new identity. Acquire rechecks generation before and after publishing its increment and undoes a revoked increment under the same local slot mutex. Complete RouteBinding/ExecIdentity equality still fences activation credentials and policy; arena Valid checks generation liveness only. Ordinary starting/running/paused updates and unchanged full-sync replay preserve generation and counts.
 
@@ -384,13 +384,13 @@ Exhaustion for ordinary HTTP/non-exec CONNECT returns 429, `X-Kuasar-Proxy-Error
 The public API is `GET /sandboxes/{sid}/stats/traffic`. It counts logical ingress admitted by the final node proxy's authentication policy, not physical client TCP connections:
 
 ```text
-ingress = parking + egress
+ingress = parking + connected
 
 parking: after authentication-policy and ExecRequest admission; ActivateRoute/ActivateExec and final backend dial are incomplete
-egress:  final node proxy → sandbox backend is established and has not reached final Close
+connected:  final node proxy → sandbox backend is established and has not reached final Close
 ```
 
-Services are fixed to `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b returns all four; bare returns only forward/exec. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/egress++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending egress; only the tracked backend's final `Close`, guarded by `sync.Once`, ends egress. Token or ExecRequest rejection does not enter parking/egress or refresh sandbox activity/`idleSince`.
+Services are fixed to `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b returns all four; bare returns only forward/exec. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
 
 Example idle response for a bare sandbox (inapplicable e2b limits are zero):
 
@@ -406,27 +406,48 @@ Example idle response for a bare sandbox (inapplicable e2b limits are zero):
   },
   "inflight": {
     "parking": 0,
-    "egress": 0
+    "connected": 0
   },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
     "forward": {
       "parking": 0,
-      "egress": 0,
+      "connected": 0,
       "idleSince": "2026-08-12T14:03:21.123456789Z"
     },
     "exec": {
       "parking": 0,
-      "egress": 0,
+      "connected": 0,
       "idleSince": "2026-08-12T14:00:00Z"
     }
-  }
+  },
+  "platform": {
+    "rxPackets": 57,
+    "rxBytes": 5108,
+    "txPackets": 39,
+    "txBytes": 8042
+  },
+  "transit": {
+    "rxPackets": 2,
+    "rxBytes": 196,
+    "txPackets": 3,
+    "txBytes": 294
+  },
+  "egress": {}
 }
 ```
 
 The Proxy master injects `maxInflight` from the current applied route's effective policy, not the conductor Sandbox row. An all-zero object explicitly means unlimited. Unavailable worker stats can still make this API return 503, without affecting master route/admission authority or the Create barrier.
 
-Top-level `idleSince` appears only for state=running with all inflight counts zero. Starting/paused omits it even with zero connections. A service's `idleSince` likewise appears only when both of its counts are zero. The API returns no `idle`, `idleForSeconds`, last-open/close, cumulative connection counts, bytes, latency, port breakdown, or worker identity, and sets `Cache-Control: no-store`. Unsynchronized Proxy routes, RunID/profile/state mismatches, or an untrusted worker set return 503. State participates in the conductor→master query identity, preventing a stale top-level `idleSince` after Pause commits while the asynchronous route view still says running.
+Top-level `idleSince` appears only for state=running with all inflight counts zero. Starting/paused omits it even with zero connections. A service's `idleSince` likewise appears only when both of its counts are zero. The API returns no `idle`, `idleForSeconds`, last-open/close, cumulative connection counts, rates, latency, port breakdown, or worker identity, and sets `Cache-Control: no-store`. Unsynchronized Proxy routes, RunID/profile/state mismatches, or an untrusted worker set return 503. State participates in the conductor→master query identity, preventing a stale top-level `idleSince` after Pause commits while the asynchronous route view still says running.
+
+The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services`, `platform`, `transit`, and `egress`. Conductor owns this native API and composes the existing Proxy observation with the current Sandbox-to-switch/port binding. `platform` maps connector Mgmt RX/TX packets/bytes; `transit` maps Transit RX/TX. Both use the sandbox viewpoint. Each configured current port supplies all four unsigned integer counters, including valid zero. A sandbox without an attached port has empty `platform`/`transit` objects, meaning no applicable current observation. `egress: {}` always means no publishable egress statistics; it does not mean observed zero traffic. There are no per-service packet counters, source groups or network API alias.
+
+`connected` replaces the former native `inflight.egress` and `services[*].egress`, preserving the established-backend-until-final-Close meaning. Top-level `idleSince` describes only admitted Proxy ingress; management monitoring packets do not refresh it and it makes no claim about sandbox computation or network idleness. Packets are packet counts, not application request counts; bytes are observed frame bytes, not throughput. Management uses the existing port/management ingress frame length; transit uses the frame before encapsulation or after removal of outer GENEVE headers, retaining Ethernet. Different observation points are not added into a traffic total. The cumulative counters belong to the current attachment and can reset on reuse; the API creates no network history.
+
+Conductor batches at most 64 current ports per switch through connector's Go `Stats(ports)` API, with no per-sandbox CLI processes or second lifecycle authority. It reuses its allocation/detach fence; connector reuses the pin-directory shared lock, current pinned-map ID and reset-confirmation flag. The existing Proxy stats socket also accepts a bounded batch. Configured-source read errors, unconfirmed reset, control contention, incomplete results or changed bindings return 503 for the whole read, never zero or an older complete-looking response. The same domain reads serve the public API, trusted local batch and conductor extension. Stats remains available independently of telemetry and does not participate in Create/Resume readiness.
+
+Traffic collection requires the matching connector control binary, TC programs and current counter-map ABI. Recreate older PERCPU_ARRAY/64-byte counter maps before enabling collection; the current map is a locked ARRAY/80-byte value. A failed reset affects stats availability only. See [connector operations](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md) for switch lifecycle and deployment.
 
 Each worker reports through one Unix socketpair:
 

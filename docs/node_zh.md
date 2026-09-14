@@ -540,7 +540,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
 | metrics history | `GET /sandboxes/{SandboxID}/metrics?start=...&end=...` | 精确 SandboxID ownership、opaque live telemetry UDS 转发；不可用为 503，不 Wake/Resume；[E2B 契约](telemetry_zh.md#6-e2b-历史查询) |
-| traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
+| traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/connected 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,在 allocation fence 内 detach 并 durable exact-clear network tuple,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
 | resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool\|null}`;`memory` 在本实现中 nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
@@ -657,9 +657,9 @@ resource stats 经既有 ctl socket 读取当前 sandbox-ctl owner 的最终资�
 `GET /sandboxes/{id}/stats/traffic` 返回最终 node proxy 已鉴权接纳的逻辑 ingress:
 
 ```text
-ingress = parking + egress
+ingress = parking + connected
 parking = 鉴权成功,但生命周期激活/最终 backend dial 尚未完成
-egress  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
+connected  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
 ```
 
 ```json
@@ -668,16 +668,40 @@ egress  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
   "maxInflight": {
     "total": 128,
     "forward": 96,
-    "e2b:envd": 16,
-    "e2b:code-interpreter": 8,
+    "e2b:envd": 0,
+    "e2b:code-interpreter": 0,
     "exec": 8
   },
-  "inflight": {"parking": 0, "egress": 0},
+  "inflight": {
+    "parking": 0,
+    "connected": 0
+  },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
-    "forward": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:03:21.123456789Z"},
-    "exec": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:00:00Z"}
-  }
+    "forward": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:03:21.123456789Z"
+    },
+    "exec": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:00:00Z"
+    }
+  },
+  "platform": {
+    "rxPackets": 57,
+    "rxBytes": 5108,
+    "txPackets": 39,
+    "txBytes": 8042
+  },
+  "transit": {
+    "rxPackets": 2,
+    "rxBytes": 196,
+    "txPackets": 3,
+    "txBytes": 294
+  },
+  "egress": {}
 }
 ```
 
@@ -688,14 +712,20 @@ Sandbox 的近似上限,`N` 个 worker 的短暂理论上界为 `M+N-1`,不是�
 e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec`,bare 是
 `forward/exec`。顶层 `inflight` 是各 service 求和。每个 service 仅在两项为零时附
 `idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
-starting/paused 返回 inflight 但不返回顶层 idle。V1 不返回 idle bool/duration、last
-open/close、累计连接数、bytes/延迟/端口明细或 worker 信息。
+starting/paused 返回 inflight 但不返回顶层 idle。接口不返回 idle bool/duration、last
+open/close、累计连接数、速率/延迟/端口明细或 worker 信息。
 
 conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master cache,查询时不扇出 worker.master 未注册,
 route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
 stats 的 503 窗口不影响 Proxy master 的 route/admission authority 或 Create barrier。完整共享
 admission算法、误差证明、worker-local状态机、绝对快照 stream 和故障窗口见
 [node-proxy.md](node-proxy_zh.md) §8。
+
+响应为平铺结构: `state`、`maxInflight`、`inflight`、`idleSince`、`services`、`platform`、`transit` 和 `egress`. Conductor 拥有该原生 API,按照当前 Sandbox 到 switch/port 的绑定组织既有 Proxy 观测与网络计数. `platform` 映射 connector 的 Mgmt RX/TX 包数和字节数,`transit` 映射 Transit RX/TX;两者都采用沙箱视角. 已配置且当前有效的端口返回全部四项无符号整数,包括合法的 0. 没有 attached port 的沙箱返回空 `platform`/`transit` 对象,表示没有适用的当前观测. `egress: {}` 始终表示尚无可发布的 egress 统计,不是观测到零流量. 不发布 per-service 包计数、来源分组或 network API 别名.
+
+`connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 仅描述 Proxy 已接纳 ingress;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
+
+Conductor 每个 switch 最多批量读取 64 个当前端口,调用 connector Go `Stats(ports)`,不逐沙箱启动 CLI,不维护第二套生命周期权威. 它复用原有 allocation/detach fence;connector 复用 pin 目录共享锁、当前 pinned-map ID 和清零确认标记. 既有 Proxy stats socket 也支持有界批量. 已配置来源读取失败、清零未确认、控制锁占用、结果不完整或绑定变化时,整个读取返回 503,不会用 0 或旧样本伪装完整响应. 公开 API、可信本机 batch 与 conductor extension 共用相同领域读取. Stats 独立于 telemetry,不参与 Create/Resume readiness.
 
 原生生命周期计量通过 `/sandboxes/{id}/stats/usage` 发布, paused 对象也可读取. 它独立选择 current/saved/history, 完整保留原生无损记录, 不用 resource counter 替代. 参见[原生 usage 与可信 batch 读取](node-usage_zh.md).
 

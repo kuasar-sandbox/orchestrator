@@ -9,6 +9,7 @@ type StatsRequest = conductorextension.StatsRequest
 type SandboxStats = conductorextension.SandboxStats
 type ResourceStats = conductorextension.ResourceStats
 type TrafficStats = conductorextension.TrafficStats
+type TrafficCounters = conductorextension.TrafficCounters
 type TrafficInflight = conductorextension.TrafficInflight
 type ServiceTrafficStats = conductorextension.ServiceTrafficStats
 type UsageQuery = conductorextension.UsageQuery

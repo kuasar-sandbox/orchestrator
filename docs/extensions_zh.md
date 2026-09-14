@@ -528,12 +528,14 @@ Observing sink 仅在 core SHM 操作成功后更新扩展投影。发布有界�
 `TrafficSource.Get(context.Context, string) (TrafficView, error)` 没有 found boolean 或 Watch。
 `ErrTrafficUnavailable` 表示 route identity 或完整 worker contribution 不可用;
 `ErrTrafficConflict` 表示当前 route state 不能生成请求的观测。
-[TrafficView](../app/proxy/extension/traffic.go) 含 `SandboxID`、`RunID`、`Profile`、`State`、
+[TrafficView](../app/proxy/extension/traffic.go) 含 `SandboxID`、`Profile`、`State`、
 有效 `MaxInflight config.MaxInflight`、`Inflight TrafficInflight`、`IdleSince *time.Time` 和
-`Services map[string]ServiceTrafficView`。Inflight 含 `Parking`/`Egress uint64`,每 service
+`Services map[string]ServiceTrafficView`。Inflight 含 `Parking`/`Connected uint64`,每 service
 另含 `IdleSince *time.Time`。`config.MaxInflight` 含 `Total`、`Forward`、`E2BEnvd`、
 `E2BCodeInterpreter`、`Exec uint32`(JSON 为 `total`、`forward`、`e2b:envd`、
 `e2b:code-interpreter`、`exec`);零表示无限,`Unlimited() bool` 检查整个向量。
+
+traffic extension 投影不暴露 RunID;Proxy 在内部保留 route/run/worker fence. `Connected` 替代原来的逻辑 `Egress` 字段,仍仅在 backend 最终 Close 时结束. conductor `Host.Stats().ReadStats` 还发布平铺 `Platform`/`Transit` 计数和空 `Egress`,与公开 API 共用同一份原生读取.
 
 `TrafficSource.Get` 在进程内直接组合当前 applied route 身份、有效的 per-Sandbox maxInflight policy 和 MasterStats；它不查询 stats UDS，也不从 conductor Sandbox 行推导限额。`TrafficView.MaxInflight` 使用 canonical `config.MaxInflight` 结构；返回的 map 与时间指针是独立副本。V1 明确没有 traffic Watch。重连期间保留的 route 仍可查询，需要新鲜状态的调用方还必须检查 `Routes().SyncState()`。
 
@@ -593,7 +595,7 @@ type ForwardRequest struct {
 
 固定顺序为：无副作用 route lookup 和 target validation、共享 per-Sandbox admission 与 traffic parking、ActivateRoute/Wake 和 admission/route binding 重验、可选 Revalidate、backend dial、普通 HTTP/CONNECT 传输、traffic close/idle 记账。Revalidate 在 activation 之后、dial 之前运行，使私有 registration、policy generation 或 lease revision 能对恢复后的路由施加 fence。其错误细节只写日志，客户端收到固定 stale-policy 响应，不连接旧 backend。
 
-一个逻辑请求无论直接 ForwardAuthorized，还是 canonicalize 后调用 next，admission 都只发生一次；wrapper 不能嵌套这两条路径。拒绝先于 Wake、activation 或 dial，使用 core 的 429 max_inflight_reached。Admission lease 和 parking/egress 记账共享普通响应、CONNECT relay、取消及失败 cleanup 的单一生命周期。Generic helper 仍拒绝 native exec，因此不能绕过 KAT/CEL/首帧 gate，也不能把 exec admission 提前到 gate 之前。
+一个逻辑请求无论直接 ForwardAuthorized，还是 canonicalize 后调用 next，admission 都只发生一次；wrapper 不能嵌套这两条路径。拒绝先于 Wake、activation 或 dial，使用 core 的 429 max_inflight_reached。Admission lease 和 parking/connected 记账共享普通响应、CONNECT relay、取消及失败 cleanup 的单一生命周期。Generic helper 仍拒绝 native exec，因此不能绕过 KAT/CEL/首帧 gate，也不能把 exec admission 提前到 gate 之前。
 
 普通 HTTP 的 Rewrite 收到独立的 Guest 请求副本。回调后 core 完成最终 hop-header/transport 归一化，回调失败则不写任何 Guest 请求字节。CONNECT 没有 Guest HTTP 请求，绝不调用 Rewrite。Generic helper 拒绝 native exec target，标准 exec 继续走 next 与 KAT、逐命令 CEL 路径。Helper 共享 core 的 HTTP/CONNECT 传输，包括 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#51-http11-websocket-转发)；升级后等待 relay 结束才返回，wrapper 不维护另一套 WebSocket 传输或流量生命周期。
 

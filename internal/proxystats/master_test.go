@@ -41,7 +41,7 @@ func TestMasterAggregatesWorkersAndDuplicateAbsoluteFrames(t *testing.T) {
 		Type: TypeUpdate, Version: Version, Epoch: 1, Sequence: 2,
 		Counters: map[string]uint64{"requests_total": 4},
 		Traffic: []SandboxSnapshot{{SandboxID: "s1", Services: map[string]ServiceSnapshot{
-			string(proxy.ConnectServiceForward): {Egress: 2},
+			string(proxy.ConnectServiceForward): {Connected: 2},
 		}}},
 	}
 	if err := master.Receive("w0", 1, update0); err != nil {
@@ -55,7 +55,7 @@ func TestMasterAggregatesWorkersAndDuplicateAbsoluteFrames(t *testing.T) {
 	}
 	conflictingDuplicate := update1
 	conflictingDuplicate.Traffic = []SandboxSnapshot{{SandboxID: "s1", Services: map[string]ServiceSnapshot{
-		string(proxy.ConnectServiceForward): {Egress: 3},
+		string(proxy.ConnectServiceForward): {Connected: 3},
 	}}}
 	if err := master.Receive("w1", 1, conflictingDuplicate); err == nil {
 		t.Fatal("same sequence with different content was accepted")
@@ -64,14 +64,14 @@ func TestMasterAggregatesWorkersAndDuplicateAbsoluteFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Inflight.Parking != 1 || stats.Inflight.Egress != 2 || stats.IdleSince != nil {
+	if stats.Inflight.Parking != 1 || stats.Inflight.Connected != 2 || stats.IdleSince != nil {
 		t.Fatalf("aggregate stats = %+v", stats)
 	}
 	forward := stats.Services[string(proxy.ConnectServiceForward)]
-	if forward.Parking != 1 || forward.Egress != 2 || forward.IdleSince != nil {
+	if forward.Parking != 1 || forward.Connected != 2 || forward.IdleSince != nil {
 		t.Fatalf("forward aggregate = %+v", forward)
 	}
-	if exec := stats.Services[string(proxy.ConnectServiceExec)]; exec.Parking != 0 || exec.Egress != 0 || exec.IdleSince == nil {
+	if exec := stats.Services[string(proxy.ConnectServiceExec)]; exec.Parking != 0 || exec.Connected != 0 || exec.IdleSince == nil {
 		t.Fatalf("unused exec service = %+v", exec)
 	}
 	recorder := httptest.NewRecorder()
@@ -119,7 +119,7 @@ func TestMasterFaultWindowExitAndReplacementReadiness(t *testing.T) {
 	if err := master.Receive("w0", 1, Frame{
 		Type: TypeUpdate, Version: Version, Epoch: 1, Sequence: 2,
 		Traffic: []SandboxSnapshot{{SandboxID: "s1", Services: map[string]ServiceSnapshot{
-			string(proxy.ConnectServiceForward): {Egress: 1},
+			string(proxy.ConnectServiceForward): {Connected: 1},
 		}}},
 	}); err != nil {
 		t.Fatal(err)
@@ -162,7 +162,7 @@ func TestMasterFaultWindowExitAndReplacementReadiness(t *testing.T) {
 			t.Fatalf("service %s has invalid conservative idle time: %+v", service, state)
 		}
 	}
-	if stats.Inflight.Parking != 0 || stats.Inflight.Egress != 0 {
+	if stats.Inflight.Parking != 0 || stats.Inflight.Connected != 0 {
 		t.Fatalf("exited worker contribution survived replacement: %+v", stats.Inflight)
 	}
 }
