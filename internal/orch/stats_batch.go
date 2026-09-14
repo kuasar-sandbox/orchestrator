@@ -41,21 +41,11 @@ func (o *Orchestrator) ReadStats(ctx context.Context, request conductorextension
 	var network []trafficNetwork
 	var ingress []*api.TrafficStats
 	if sections["traffic"] {
-		sandboxes = make([]*types.Sandbox, len(request.SandboxIDs))
-		for i, id := range request.SandboxIDs {
-			sb, err := o.st.Get(ctx, id)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil, fmt.Errorf("%w: %v", api.ErrStatsUnavailable, ctx.Err())
-				}
-				return nil, err
-			}
-			if sb == nil {
-				return nil, api.ErrNotFound
-			}
-			sandboxes[i] = sb
-		}
 		var err error
+		sandboxes, err = o.lookupTrafficSandboxes(ctx, request.SandboxIDs)
+		if err != nil {
+			return nil, err
+		}
 		network, ingress, err = o.prepareTrafficReads(ctx, sandboxes)
 		if err != nil {
 			if ctx.Err() != nil {

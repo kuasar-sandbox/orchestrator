@@ -36,6 +36,28 @@ func (o *Orchestrator) acquireStatsSlot(ctx context.Context) (func(), error) {
 	}
 }
 
+// Batch preparation shares the same global budget as section reads. Release
+// the slot before connector/Proxy preparation acquires its own slot.
+func (o *Orchestrator) lookupTrafficSandboxes(ctx context.Context, ids []string) ([]*types.Sandbox, error) {
+	release, err := o.acquireStatsSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	sandboxes := make([]*types.Sandbox, len(ids))
+	for i, id := range ids {
+		sb, err := o.st.Get(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("%w: traffic object lookup: %v", api.ErrStatsUnavailable, err)
+		}
+		if sb == nil {
+			return nil, api.ErrNotFound
+		}
+		sandboxes[i] = sb
+	}
+	return sandboxes, nil
+}
+
 // prepareTrafficReads is shared by public single-object and trusted batch
 // reads. The node has one configured switch; its ports are read in one bounded
 // connector call. Full Proxy batch support is reused when the provider has it.
