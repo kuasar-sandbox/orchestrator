@@ -428,42 +428,111 @@ func TestExportDeleteTeardownFailurePreservesSourceForRetry(t *testing.T) {
 	}
 }
 
-func TestExportFinalizerWinsThenResumeUsesPortableRef(t *testing.T) {
+func TestExportKeepSourcePreservesLocalResumeSource(t *testing.T) {
 	fixture := newExportResumeFixture(t)
 	portableRef := "manifest://" + strings.Repeat("2", 64)
 	publisher := newBlockingExportPublisher(portableRef)
 	publisher.Release()
 	fixture.o.artifactPublisher = publisher.Publish
+	localSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}
 
 	result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, false, true)
 	if err != nil || !strings.HasPrefix(result, "kmt1.") {
 		t.Fatalf("retained KMT export = %q, %v", result, err)
 	}
+	// The source row keeps its original local ResumeSource — keep-source
+	// produces a result but does not change the source (#336).
 	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: portableRef}) {
-		t.Fatalf("finalized retained source = %+v, %v", stored, err)
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != localSource {
+		t.Fatalf("retained source = %+v, %v", stored, err)
 	}
-	if _, err := os.Stat(filepath.Dir(fixture.localRef)); !os.IsNotExist(err) {
-		t.Fatalf("finalized local snapshot still exists: %v", err)
+	if cached := fixture.o.lookup(fixture.sb.ID); cached == nil || cached.ResumeSource != localSource {
+		t.Fatalf("cached source = %+v, want local ref", cached)
+	}
+	// The local checkpoint is retained, unchanged.
+	if _, err := os.Stat(fixture.localRef); err != nil {
+		t.Fatalf("keep-source removed the local snapshot: %v", err)
 	}
 
+	// Resume uses the same original local ref — the runner receives it
+	// verbatim, proving the export did not alter the restore path.
 	restored := make(chan string, 1)
 	fixture.launcher.snapshotRoots = restored
 	connected, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{})
 	if err != nil || connected == nil || connected.State != types.StateStarting {
-		t.Fatalf("Connect after finalized export = %+v, %v", connected, err)
+		t.Fatalf("Connect after keep-source export = %+v, %v", connected, err)
 	}
 	select {
 	case ref := <-restored:
-		if ref != portableRef {
-			t.Fatalf("Resume restore ref = %q, want %q", ref, portableRef)
+		if ref != fixture.localRef {
+			t.Fatalf("Resume restore ref = %q, want local %q", ref, fixture.localRef)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("runner task did not receive the portable root snapshot")
+		t.Fatal("runner task did not receive the local root snapshot")
 	}
 	waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning
-	}, "running after finalized export")
+	}, "running after keep-source export")
+}
+
+// The retention created by keep-source ends at the next unkept export: the
+// drop deletes the durable row and removes the retained local checkpoint.
+func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
+	fixture := newExportResumeFixture(t)
+	if err := os.MkdirAll(fixture.sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	portableRef := "manifest://" + strings.Repeat("1", 64)
+	publisher := newBlockingExportPublisher(portableRef)
+	publisher.Release()
+	fixture.o.artifactPublisher = publisher.Publish
+	events, cancelEvents := fixture.o.Subscribe()
+	defer cancelEvents()
+
+	kept, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := types.ParseTemplateID(kept); err != nil {
+		t.Fatalf("kept export result = %q: %v", kept, err)
+	}
+	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused ||
+		stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+		t.Fatalf("kept source = %+v, %v", stored, err)
+	}
+	if _, err := os.Stat(fixture.localRef); err != nil {
+		t.Fatalf("kept export removed the local snapshot: %v", err)
+	}
+
+	result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := types.ParseTemplateID(result)
+	if err != nil || template.Ref != portableRef || template.Kind != types.KindSnp {
+		t.Fatalf("drop result = %#v, %v", template, err)
+	}
+	if stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID); err != nil || stored != nil {
+		t.Fatalf("dropped source = %+v, %v", stored, err)
+	}
+	if cached := fixture.o.lookup(fixture.sb.ID); cached != nil {
+		t.Fatalf("dropped source remained cached: %+v", cached)
+	}
+	if _, err := os.Stat(filepath.Dir(fixture.localRef)); !os.IsNotExist(err) {
+		t.Fatalf("drop retained the local checkpoint directory: %v", err)
+	}
+	if _, err := os.Stat(fixture.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drop retained the run directory: %v", err)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != "delete" || event.SID != fixture.sb.ID {
+			t.Fatalf("drop route event = %+v", event)
+		}
+	default:
+		t.Fatal("drop export did not publish source deletion")
+	}
 }
 
 func TestDetachedTemplateUploadDoesNotBlockResumeCommitButFencesKill(t *testing.T) {

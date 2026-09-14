@@ -1253,26 +1253,6 @@ func (s *Store) SetDeadlineIfState(ctx context.Context, id string, expected type
 	return sandboxUpdateChanged("set deadline", id, result)
 }
 
-// ReplacePausedResumeSource atomically promotes one exact paused source. The
-// old source is part of the CAS so a finalizer can never delete its local
-// artifact after another lifecycle owner changed the durable row.
-func (s *Store) ReplacePausedResumeSource(ctx context.Context, id string, expected, replacement types.ResumeSource) (bool, error) {
-	if !expected.Valid() || !replacement.Valid() {
-		return false, fmt.Errorf("store: replace resume source sandbox %s: invalid source", id)
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes
-		   SET resume_source_kind=?, resume_source_ref=?
-		 WHERE id=? AND state=? AND launch_mode=''
-		   AND resume_source_kind=? AND resume_source_ref=?`,
-		string(replacement.Kind), replacement.Ref, id, string(types.StatePaused),
-		string(expected.Kind), expected.Ref)
-	if err != nil {
-		return false, fmt.Errorf("store: replace resume source sandbox %s: %w", id, err)
-	}
-	return sandboxUpdateChanged("replace resume source", id, result)
-}
-
 func (s *Store) Delete(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id=?`, id)
 	return err
