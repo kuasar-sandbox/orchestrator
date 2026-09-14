@@ -66,10 +66,20 @@ func run(endpoint string) error {
 	if err != nil {
 		return err
 	}
-	if response.ProtoMajor != 2 || response.StatusCode != 200 || response.Trailer.Get("Grpc-Status") != "0" || !bytes.Equal(body, make([]byte, 5)) {
+	if response.ProtoMajor != 2 || response.StatusCode != 200 || response.Trailer.Get("Grpc-Status") != "0" || !successfulExport(body) {
 		return fmt.Errorf("OTLP response: %s %s trailers=%v body=%x", response.Proto, response.Status, response.Trailer, body)
 	}
 	return nil
+}
+
+func successfulExport(frame []byte) bool {
+	if len(frame) < 5 || frame[0] != 0 || int(binary.BigEndian.Uint32(frame[1:5])) != len(frame)-5 {
+		return false
+	}
+	// The receiver may omit partial_success or encode the empty submessage.
+	// Both acknowledge the complete request. Reject any populated partial
+	// success, malformed frame or additional response instead of hiding drops.
+	return len(frame) == 5 || bytes.Equal(frame[5:], []byte{0x0a, 0x00})
 }
 
 func main() {
