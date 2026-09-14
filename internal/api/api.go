@@ -428,6 +428,7 @@ type ResourceStats = conductorextension.ResourceStats
 type TrafficInflight = conductorextension.TrafficInflight
 type ServiceTrafficStats = conductorextension.ServiceTrafficStats
 type TrafficStats = conductorextension.TrafficStats
+type TrafficCounters = conductorextension.TrafficCounters
 
 type API struct {
 	core         Core

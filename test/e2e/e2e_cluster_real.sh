@@ -334,8 +334,16 @@ wait_cluster_traffic_stats() { # $1=sid, $2=parking|idle|paused
 import json, sys
 stats = json.load(open(sys.argv[1]))
 mode = sys.argv[2]
-if set(stats) - {"state", "maxInflight", "inflight", "idleSince", "services"}:
+if set(stats) - {"state", "maxInflight", "inflight", "idleSince", "services", "platform", "transit", "egress"}:
     raise SystemExit(1)
+if stats.get("egress") != {}:
+    raise SystemExit(1)
+for plane in ("platform", "transit"):
+    counters = stats.get(plane)
+    if not isinstance(counters, dict) or (counters and set(counters) != {"rxPackets", "rxBytes", "txPackets", "txBytes"}):
+        raise SystemExit(1)
+    if any(type(value) is not int or value < 0 for value in counters.values()):
+        raise SystemExit(1)
 max_inflight = stats.get("maxInflight")
 if not isinstance(max_inflight, dict) or set(max_inflight) != {"total", "forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
     raise SystemExit(1)
@@ -343,21 +351,21 @@ if any(type(value) is not int or value < 0 for value in max_inflight.values()):
     raise SystemExit(1)
 inflight = stats.get("inflight", {})
 services = stats.get("services", {})
-if set(inflight) != {"parking", "egress"}:
+if set(inflight) != {"parking", "connected"}:
     raise SystemExit(1)
 if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
     raise SystemExit(1)
 for item in services.values():
-    if set(item) - {"parking", "egress", "idleSince"} or not {"parking", "egress"} <= set(item):
+    if set(item) - {"parking", "connected", "idleSince"} or not {"parking", "connected"} <= set(item):
         raise SystemExit(1)
-    if (item["parking"] or item["egress"]) and "idleSince" in item:
+    if (item["parking"] or item["connected"]) and "idleSince" in item:
         raise SystemExit(1)
 if mode == "parking":
     ok = inflight["parking"] >= 1 and "idleSince" not in stats
 elif mode == "idle":
-    ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+    ok = stats.get("state") == "running" and inflight == {"parking": 0, "connected": 0} and "idleSince" in stats
 elif mode == "paused":
-    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "egress": 0} and "idleSince" not in stats
+    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "connected": 0} and "idleSince" not in stats
 else:
     ok = False
 raise SystemExit(0 if ok else 1)

@@ -335,7 +335,7 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 	if err := stats.Receive("w0", 1, proxystats.Frame{
 		Type: proxystats.TypeUpdate, Version: proxystats.Version, Epoch: 1, Sequence: 2,
 		Traffic: []proxystats.SandboxSnapshot{{SandboxID: "s1", Services: map[string]proxystats.ServiceSnapshot{
-			string(internalproxy.ConnectServiceForward): {Parking: 2, Egress: 3},
+			string(internalproxy.ConnectServiceForward): {Parking: 2, Connected: 3},
 		}}},
 	}); err != nil {
 		t.Fatal(err)
@@ -356,13 +356,13 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.SandboxID != "s1" || view.RunID != "run-1" || view.Profile != proxyextension.ProfileBare ||
+	if view.SandboxID != "s1" || view.Profile != proxyextension.ProfileBare ||
 		view.State != proxyextension.RouteStateRunning || view.MaxInflight != wantMaxInflight ||
-		view.Inflight.Parking != 2 || view.Inflight.Egress != 3 {
+		view.Inflight.Parking != 2 || view.Inflight.Connected != 3 {
 		t.Fatalf("traffic view = %+v", view)
 	}
 	forward := view.Services[string(internalproxy.ConnectServiceForward)]
-	if forward.Parking != 2 || forward.Egress != 3 {
+	if forward.Parking != 2 || forward.Connected != 3 {
 		t.Fatalf("forward traffic = %+v", forward)
 	}
 	delete(view.Services, string(internalproxy.ConnectServiceExec))
@@ -379,7 +379,7 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 
 	sink.InvalidateSync()
 	stale, err := host.Traffic().Get(context.Background(), "s1")
-	if err != nil || stale.RunID != "run-1" {
+	if err != nil || stale.SandboxID != "s1" || stale.Inflight.Connected != 3 {
 		t.Fatalf("retained stale route traffic = %+v err=%v", stale, err)
 	}
 }

@@ -33,6 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
 . "$SCRIPT_DIR/lib/telemetry.sh"
+. "$SCRIPT_DIR/lib/native_traffic.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -328,31 +329,39 @@ wait_traffic_stats() { # $1=sid, $2=parking|idle|paused
 import json, sys
 stats = json.load(open(sys.argv[1]))
 mode = sys.argv[2]
-if set(stats) - {"state", "maxInflight", "inflight", "idleSince", "services"}:
+if set(stats) - {"state", "maxInflight", "inflight", "idleSince", "services", "platform", "transit", "egress"}:
     raise SystemExit(1)
+if stats.get("egress") != {}:
+    raise SystemExit(1)
+for plane in ("platform", "transit"):
+    counters = stats.get(plane)
+    if not isinstance(counters, dict) or (counters and set(counters) != {"rxPackets", "rxBytes", "txPackets", "txBytes"}):
+        raise SystemExit(1)
+    if any(type(value) is not int or value < 0 for value in counters.values()):
+        raise SystemExit(1)
 max_inflight = stats.get("maxInflight")
 if not isinstance(max_inflight, dict) or set(max_inflight) != {"total", "forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
     raise SystemExit(1)
 if any(type(value) is not int or value < 0 for value in max_inflight.values()):
     raise SystemExit(1)
 inflight = stats.get("inflight", {})
-if set(inflight) != {"parking", "egress"}:
+if set(inflight) != {"parking", "connected"}:
     raise SystemExit(1)
 services = stats.get("services", {})
 if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
     raise SystemExit(1)
 for item in services.values():
-    if set(item) - {"parking", "egress", "idleSince"} or not {"parking", "egress"} <= set(item):
+    if set(item) - {"parking", "connected", "idleSince"} or not {"parking", "connected"} <= set(item):
         raise SystemExit(1)
-    busy = item["parking"] or item["egress"]
+    busy = item["parking"] or item["connected"]
     if busy and "idleSince" in item:
         raise SystemExit(1)
 if mode == "parking":
-    ok = inflight["parking"] >= 1 and inflight["egress"] >= 0 and "idleSince" not in stats
+    ok = inflight["parking"] >= 1 and inflight["connected"] >= 0 and "idleSince" not in stats
 elif mode == "idle":
-    ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+    ok = stats.get("state") == "running" and inflight == {"parking": 0, "connected": 0} and "idleSince" in stats
 elif mode == "paused":
-    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "egress": 0} and "idleSince" not in stats
+    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "connected": 0} and "idleSince" not in stats
 else:
     ok = False
 raise SystemExit(0 if ok else 1)
@@ -819,7 +828,7 @@ assert claims["sid"] == sys.argv[4]
 PY_IDENTITY
 echo "==> PASS: explicit local/stable identity survived real Proxy exec/envd; duplicate Create is 409"
 wait_traffic_stats "$SID" idle || { dump_logs; fail "Proxy traffic did not converge to idle"; }
-echo "==> PASS: Proxy master cache converged parking/egress to idle"
+echo "==> PASS: Proxy master cache converged parking/connected to idle"
 
 code=$(req GET "/sandboxes/$SID/stats/resource" "$AK")
 [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "static resource stats=$code (want 200)"; }
@@ -831,6 +840,8 @@ assert set(stats) == required, stats
 assert all(stats[key] > 0 for key in required), stats
 PY_RESOURCE
 echo "==> PASS: static resource stats observes VMM memory/CPU with controller, usage and telemetry disabled"
+native_traffic_probe 0
+echo "==> PASS: conductor native traffic reads work while telemetry is stopped"
 
 ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
@@ -887,7 +898,11 @@ sys.stdout.write("\nOUTPUT_END\n")
 PY
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
+IDLE_BEFORE_MANAGEMENT="$(traffic_idle_since "$SID")"
 run_telemetry_guest_probe
+native_traffic_probe 1
+[ "$(traffic_idle_since "$SID")" = "$IDLE_BEFORE_MANAGEMENT" ] || fail "management OTLP monitoring refreshed Proxy ingress idleSince"
+echo "==> PASS: real guest OTLP management packets are platform traffic and do not refresh ingress idle"
 ok=""
 for _ in $(seq 1 20); do
     code=$(dp "49983-$SID" /health "$ENVD_TOKEN")
@@ -921,7 +936,7 @@ wait_traffic_stats "$SID" idle || { dump_logs; fail "invalid credentials changed
 IDLE_AFTER_INVALID="$(traffic_idle_since "$SID")"
 [ "$IDLE_AFTER_INVALID" = "$IDLE_BEFORE_INVALID" ] \
     || fail "invalid credentials changed idleSince ($IDLE_BEFORE_INVALID -> $IDLE_AFTER_INVALID)"
-echo "==> PASS: invalid credentials caused no parking/egress and did not refresh idleSince"
+echo "==> PASS: invalid credentials caused no parking/connected and did not refresh idleSince"
 
 USER_MARK="proxy-netns-user-port-$RANDOM"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \

@@ -89,7 +89,7 @@ func (o *Orchestrator) statsBindingCurrent(ctx context.Context, expected *types.
 		return fmt.Errorf("%w: validate current binding: %v", api.ErrStatsUnavailable, err)
 	}
 	if current == nil || current.RunID != expected.RunID || current.RunDir != expected.RunDir || current.BaseDir != expected.BaseDir || current.State != expected.State ||
-		current.VswitchPort != expected.VswitchPort || current.FloatingIP != expected.FloatingIP || current.CreatedUnix != expected.CreatedUnix ||
+		current.VswitchPort != expected.VswitchPort || current.FloatingIP != expected.FloatingIP || current.InnerIP != expected.InnerIP || current.PortMAC != expected.PortMAC || current.CreatedUnix != expected.CreatedUnix ||
 		current.Profile != expected.Profile || current.StableIDValue != expected.StableIDValue || !sameClusterSandboxOwner(current.Cluster, expected.Cluster) ||
 		current.APISecret != expected.APISecret || current.ManifestKey != expected.ManifestKey || current.ServiceSecret != expected.ServiceSecret ||
 		current.EnvdAccessToken != expected.EnvdAccessToken || current.TrafficAccessToken != expected.TrafficAccessToken || current.ForwardAccessToken != expected.ForwardAccessToken {
@@ -110,21 +110,28 @@ func (o *Orchestrator) TrafficStats(ctx context.Context, id, apiKey string) (*ap
 }
 
 func (o *Orchestrator) readTrafficStats(ctx context.Context, sb *types.Sandbox) (*api.TrafficStats, error) {
-	if o.trafficStats == nil {
-		return nil, api.ErrStatsUnsupported
-	}
-	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
-		return nil, api.ErrStatsConflict
-	}
-	stats, err := o.trafficStats.SandboxTrafficStats(ctx, sb.ID, sb.RunID, sb.Profile, sb.State)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	network, ingress, err := o.prepareTrafficReads(ctx, []*types.Sandbox{sb})
 	if err != nil {
 		return nil, err
 	}
-	if stats == nil {
-		return nil, api.ErrStatsUnavailable
+	var stats *api.TrafficStats
+	if ingress != nil {
+		stats = ingress[0]
+	} else {
+		release, err := o.acquireStatsSlot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		stats, err = o.readIngressStats(ctx, sb)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := o.statsBindingCurrent(ctx, sb); err != nil {
 		return nil, err
 	}
-	return stats, nil
+	return combineTraffic(stats, network[0]), nil
 }

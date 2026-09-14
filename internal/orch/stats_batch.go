@@ -8,6 +8,7 @@ import (
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -36,6 +37,23 @@ func (o *Orchestrator) ReadStats(ctx context.Context, request conductorextension
 	}
 	ctx, cancel := context.WithTimeout(ctx, conductorextension.StatsTimeout)
 	defer cancel()
+	var sandboxes []*types.Sandbox
+	var network []trafficNetwork
+	var ingress []*api.TrafficStats
+	if sections["traffic"] {
+		var err error
+		sandboxes, err = o.lookupTrafficSandboxes(ctx, request.SandboxIDs)
+		if err != nil {
+			return nil, err
+		}
+		network, ingress, err = o.prepareTrafficReads(ctx, sandboxes)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("%w: %v", api.ErrStatsUnavailable, ctx.Err())
+			}
+			return nil, err
+		}
+	}
 	group, readCtx := errgroup.WithContext(ctx)
 	group.SetLimit(conductorextension.MaxStatsConcurrency)
 	result := make([]conductorextension.SandboxStats, len(request.SandboxIDs))
@@ -52,7 +70,13 @@ func (o *Orchestrator) ReadStats(ctx context.Context, request conductorextension
 			case <-readCtx.Done():
 				return readCtx.Err()
 			}
-			sb, err := o.st.Get(readCtx, id)
+			var sb *types.Sandbox
+			var err error
+			if sandboxes != nil {
+				sb = sandboxes[i]
+			} else {
+				sb, err = o.st.Get(readCtx, id)
+			}
 			if err != nil {
 				return err
 			}
@@ -64,7 +88,14 @@ func (o *Orchestrator) ReadStats(ctx context.Context, request conductorextension
 				row.Resource, err = o.readResourceStats(readCtx, sb)
 			}
 			if err == nil && sections["traffic"] {
-				row.Traffic, err = o.readTrafficStats(readCtx, sb)
+				if ingress != nil {
+					row.Traffic = ingress[i]
+				} else {
+					row.Traffic, err = o.readIngressStats(readCtx, sb)
+				}
+				if err == nil {
+					row.Traffic = combineTraffic(row.Traffic, network[i])
+				}
 			}
 			if err == nil && sections["usage"] {
 				row.Usage, err = o.readUsageStats(readCtx, sb, request.Usage)

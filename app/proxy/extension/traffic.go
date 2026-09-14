@@ -19,14 +19,14 @@ var (
 
 // TrafficInflight is the aggregate number of open proxy flows.
 type TrafficInflight struct {
-	Parking uint64
-	Egress  uint64
+	Parking   uint64
+	Connected uint64
 }
 
 // ServiceTrafficView is one service's traffic observation.
 type ServiceTrafficView struct {
 	Parking   uint64
-	Egress    uint64
+	Connected uint64
 	IdleSince *time.Time
 }
 
@@ -34,7 +34,6 @@ type ServiceTrafficView struct {
 // traffic aggregate. All maps and pointers are independent copies.
 type TrafficView struct {
 	SandboxID string
-	RunID     string
 	Profile   Profile
 	State     RouteState
 	// MaxInflight is the effective policy applied by this Proxy master. Zero
