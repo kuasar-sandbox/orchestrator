@@ -43,8 +43,8 @@ Heartbeat 返回 reservation echo,不是执行命令。
 | HostMemoryCurrent | host VMM cgroup `memory.current`,仅诊断 | sandbox 上报,node 记录 |
 | reservedMemory | 所有 live `NodeReservation` 的和 | node state |
 
-`Headroom` 不是 total Budget。CPU `allocatable` 仍表示调度权重/保证,与 memory
-headroom 不完全同构。
+`Headroom` 不是 total Budget. CPU `allocatable` 表示映射到 `cpu.weight` 的相对调度规格,
+不表示 fractional-core 硬 quota 或无条件性能保证. 其含义与 memory headroom 不同.
 
 sandbox 内部另有 `TargetBudget`、`CurrentBudget`、`ObservedBudget` 和
 `DemandMemory`;node 不需要也不保存这些状态。正常受控路径中 sandbox 先取得足够

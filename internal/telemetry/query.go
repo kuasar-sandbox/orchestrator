@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	extension "github.com/kuasar-sandbox/orchestrator/app/telemetry/extension"
+	"github.com/kuasar-sandbox/orchestrator/config"
 )
 
 // SandboxMetric matches E2B's public schema, including the deprecated timestamp.
@@ -58,16 +60,20 @@ func CalculateStep(start, end time.Time) time.Duration {
 	}
 }
 
-// QueryHandler serves only the private, registered query UDS. The conductor
-// owns public authentication and sandbox existence/ownership checks.
-func QueryHandler(reader extension.Reader) http.Handler {
+// QueryHandler serves only the lease-registered UDS. Conductor authorizes the
+// exact sandbox path. Every handler gets a Reader permanently bound to that ID.
+func QueryHandler(reader extension.Reader, factory extension.MetricsHandler) http.Handler {
 	mux := http.NewServeMux()
 	queries := make(chan struct{}, 8)
 	mux.HandleFunc("GET /sandboxes/{id}/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		if reader == nil {
-			queryError(w, 503, "metrics storage unavailable")
+		if reader == nil || factory == nil {
+			queryError(w, 503, "metrics query unavailable")
+			return
+		}
+		id := r.PathValue("id")
+		if err := validateSelection(extension.Selection{SandboxID: id}); err != nil {
+			queryError(w, 400, "invalid sandbox scope")
 			return
 		}
 		select {
@@ -78,63 +84,164 @@ func QueryHandler(reader extension.Reader) http.Handler {
 			queryError(w, 503, "metrics query capacity exhausted")
 			return
 		}
-		values, err := url.ParseQuery(r.URL.RawQuery)
-		if err != nil {
-			queryError(w, 400, "invalid query parameters")
-			return
-		}
-		start, err := queryBoundary(values, "start")
-		if err != nil {
-			queryError(w, 400, err.Error())
-			return
-		}
-		end, err := queryBoundary(values, "end")
-		if err != nil {
-			queryError(w, 400, err.Error())
-			return
-		}
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		id := r.PathValue("id")
-		if start == nil || end == nil {
-			first, last, found, err := reader.Bounds(ctx, id)
-			if err != nil {
-				queryError(w, 503, "metrics storage unavailable")
-				return
-			}
-			if !found {
-				_, _ = w.Write([]byte("[]\n"))
-				return
-			}
-			if start == nil {
-				start = &first
-			}
-			if end == nil {
-				end = &last
-			}
-		}
-		if err := ValidateRange(*start, *end); err != nil {
-			queryError(w, 400, err.Error())
+		handler := factory(extension.QueryScope{SandboxID: id, Reader: scopedReader{reader: reader, id: id}})
+		if handler == nil {
+			queryError(w, 503, "metrics handler unavailable")
 			return
 		}
-		query := extension.Query{SandboxID: id, Start: *start, End: *end, Step: CalculateStep(*start, *end)}
-		points, err := reader.Query(ctx, query)
-		if err != nil {
-			queryError(w, 503, "metrics storage unavailable")
-			return
-		}
-		result, err := aggregate(points, query)
-		if err != nil {
-			queryError(w, 503, "metrics storage returned invalid observations")
-			return
-		}
-		if err := ctx.Err(); err != nil {
-			queryError(w, 503, "metrics query cancelled")
-			return
-		}
-		_ = json.NewEncoder(w).Encode(result)
+		handler.ServeHTTP(w, r.WithContext(ctx))
 	})
 	return mux
+}
+
+type scopedReader struct {
+	reader extension.Reader
+	id     string
+}
+
+func (r scopedReader) selection(selection extension.Selection) (extension.Selection, error) {
+	if selection.SandboxID != "" && selection.SandboxID != r.id {
+		return selection, errors.New("query cannot replace the authorized SandboxID")
+	}
+	selection.SandboxID = r.id
+	selection.Metrics = append([]string(nil), selection.Metrics...)
+	selection.Attributes = maps.Clone(selection.Attributes)
+	return selection, validateSelection(selection)
+}
+func (r scopedReader) Bounds(ctx context.Context, selection extension.Selection) (time.Time, time.Time, bool, error) {
+	selection, err := r.selection(selection)
+	if err != nil {
+		return time.Time{}, time.Time{}, false, err
+	}
+	return r.reader.Bounds(ctx, selection)
+}
+func (r scopedReader) Query(ctx context.Context, query extension.Query) ([]extension.Series, error) {
+	selection, err := r.selection(query.Selection)
+	if err != nil {
+		return nil, err
+	}
+	query.Selection = selection
+	validated, err := newSeriesBuckets(query)
+	if err != nil {
+		return nil, err
+	}
+	query = validated.query
+	series, err := r.reader.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(series) > 100000 {
+		return nil, errors.New("metrics result exceeds series limit")
+	}
+	points := 0
+	for _, series := range series {
+		if !selectedSeries(selection, series.Metric, series.Attributes) {
+			return nil, errors.New("query backend returned a different sandbox or selection")
+		}
+		points += len(series.Points)
+		if points > maxQueryPoints {
+			return nil, errors.New("metrics result exceeds point limit")
+		}
+	}
+	return series, ctx.Err()
+}
+
+var e2bFields = [...]string{"cpuCount", "cpuUsedPct", "memTotal", "memUsed", "memCache", "diskTotal", "diskUsed"}
+
+// E2BHandler is an independent compatibility adapter. Its seven mappings and
+// default envd source do not constrain generic readers or custom HTTP handlers.
+func E2BHandler(cfg config.TelemetryE2B) extension.MetricsHandler {
+	metricNames := make([]string, len(e2bFields))
+	for i, field := range e2bFields {
+		metricNames[i] = cfg.Metrics[field]
+	}
+	return func(scope extension.QueryScope) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			values, err := url.ParseQuery(r.URL.RawQuery)
+			if err != nil {
+				queryError(w, 400, "invalid query parameters")
+				return
+			}
+			start, err := queryBoundary(values, "start")
+			if err != nil {
+				queryError(w, 400, err.Error())
+				return
+			}
+			end, err := queryBoundary(values, "end")
+			if err != nil {
+				queryError(w, 400, err.Error())
+				return
+			}
+			ctx := r.Context()
+			selection := extension.Selection{SandboxID: scope.SandboxID, Metrics: metricNames, Attributes: map[string]string{sourceAttribute: cfg.Source}}
+			if start == nil || end == nil {
+				first, last, found, err := scope.Reader.Bounds(ctx, selection)
+				if err != nil {
+					queryError(w, 503, "metrics backend unavailable")
+					return
+				}
+				if !found {
+					_, _ = w.Write([]byte("[]\n"))
+					return
+				}
+				if start == nil {
+					start = &first
+				}
+				if end == nil {
+					end = &last
+				}
+			}
+			if err := ValidateRange(*start, *end); err != nil {
+				queryError(w, 400, err.Error())
+				return
+			}
+			query := extension.Query{Selection: selection, Start: *start, End: *end, Step: CalculateStep(*start, *end), Aggregation: extension.Max}
+			series, err := scope.Reader.Query(ctx, query)
+			if err != nil {
+				queryError(w, 503, "metrics backend unavailable")
+				return
+			}
+			points, err := e2bPoints(series, metricNames)
+			if err != nil {
+				queryError(w, 503, "metrics backend returned invalid observations")
+				return
+			}
+			result, err := aggregate(points, query)
+			if err != nil {
+				queryError(w, 503, "metrics backend returned invalid observations")
+				return
+			}
+			if ctx.Err() != nil {
+				queryError(w, 503, "metrics query cancelled")
+				return
+			}
+			_ = json.NewEncoder(w).Encode(result)
+		})
+	}
+}
+
+func e2bPoints(series []extension.Series, metricNames []string) ([]e2bPoint, error) {
+	fields := make(map[string]e2bField, len(metricNames))
+	for i, name := range metricNames {
+		fields[name] = e2bField(i)
+	}
+	var points []e2bPoint
+	for _, series := range series {
+		field, ok := fields[series.Metric]
+		if !ok {
+			return nil, errors.New("unexpected E2B metric")
+		}
+		for _, point := range series.Points {
+			if len(points) >= maxQueryPoints {
+				return nil, errors.New("metrics result exceeds point limit")
+			}
+			points = append(points, e2bPoint{Timestamp: point.Timestamp, Field: field, Value: point.Value})
+		}
+	}
+	return points, nil
 }
 
 func queryBoundary(values url.Values, name string) (*time.Time, error) {
@@ -154,13 +261,14 @@ func queryBoundary(values url.Values, name string) (*time.Time, error) {
 }
 
 func queryError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": message})
 }
 
-func aggregate(points []extension.Point, query extension.Query) ([]SandboxMetric, error) {
+func aggregate(points []e2bPoint, query extension.Query) ([]SandboxMetric, error) {
 	type bucket struct {
-		values [extension.FieldCount]float64
+		values [e2bFieldCount]float64
 		seen   uint8
 	}
 	buckets := make(map[int64]*bucket)
@@ -169,7 +277,7 @@ func aggregate(points []extension.Point, query extension.Query) ([]SandboxMetric
 		return nil, errors.New("invalid query step")
 	}
 	for _, point := range points {
-		if point.Field >= extension.FieldCount || math.IsNaN(point.Value) || math.IsInf(point.Value, 0) || point.Value < 0 {
+		if point.Field >= e2bFieldCount || math.IsNaN(point.Value) || math.IsInf(point.Value, 0) || point.Value < 0 {
 			return nil, errors.New("invalid metric point")
 		}
 		// Readers may already have epoch-aligned MAX buckets. A first bucket can
@@ -200,22 +308,22 @@ func aggregate(points []extension.Point, query extension.Query) ([]SandboxMetric
 	out := make([]SandboxMetric, 0, len(stamps))
 	for _, stamp := range stamps {
 		b := buckets[stamp]
-		if b.seen != 1<<extension.FieldCount-1 {
+		if b.seen != 1<<e2bFieldCount-1 {
 			continue
 		}
 		for i, value := range b.values {
-			if extension.Field(i) != extension.CPUUsedPct && (value >= float64(math.MaxInt64) || math.Trunc(value) != value) {
+			if e2bField(i) != e2bCPUUsedPct && (value >= float64(math.MaxInt64) || math.Trunc(value) != value) {
 				return nil, errors.New("integer observation out of range")
 			}
 		}
-		if b.values[extension.CPUCount] > math.MaxInt32 {
+		if b.values[e2bCPUCount] > math.MaxInt32 {
 			return nil, errors.New("cpu count out of range")
 		}
 		timestamp := time.UnixMilli(stamp).UTC()
 		out = append(out, SandboxMetric{Timestamp: timestamp, TimestampUnix: timestamp.Unix(),
-			CPUCount: int32(b.values[extension.CPUCount]), CPUUsedPct: b.values[extension.CPUUsedPct],
-			MemTotal: int64(b.values[extension.MemTotal]), MemUsed: int64(b.values[extension.MemUsed]), MemCache: int64(b.values[extension.MemCache]),
-			DiskTotal: int64(b.values[extension.DiskTotal]), DiskUsed: int64(b.values[extension.DiskUsed])})
+			CPUCount: int32(b.values[e2bCPUCount]), CPUUsedPct: b.values[e2bCPUUsedPct],
+			MemTotal: int64(b.values[e2bMemTotal]), MemUsed: int64(b.values[e2bMemUsed]), MemCache: int64(b.values[e2bMemCache]),
+			DiskTotal: int64(b.values[e2bDiskTotal]), DiskUsed: int64(b.values[e2bDiskUsed])})
 	}
 	return out, nil
 }

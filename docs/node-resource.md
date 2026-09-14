@@ -37,7 +37,7 @@ The normal reservation loop neither samples nor writes sandbox cgroups, calls CH
 | HostMemoryCurrent | Host VMM cgroup `memory.current`; diagnostic only. | Reported by sandbox, recorded by node. |
 | reservedMemory | Sum of all live `NodeReservation` values. | Node state. |
 
-Headroom is not the total Budget. CPU `allocatable` still expresses scheduling weight/guarantee; it is not structurally identical to memory headroom.
+Headroom is not the total Budget. CPU `allocatable` expresses the relative scheduling specification mapped to `cpu.weight`, without a hard fractional-core quota or unconditional performance guarantee. Its meaning differs from memory headroom.
 
 Sandbox-local state also includes `TargetBudget`, `CurrentBudget`, `ObservedBudget` and `DemandMemory`; the node neither needs nor stores them. On the normal controlled path, the sandbox obtains enough NodeReservation before increasing Budget and releases reservation only after shrink converges. Emergency guest `deflate_on_oom` is an exception to the phased soft guarantee: it changes neither target nor reservation. Existing `memory.high` continues bounding host VMM charge, while the sandbox marks target/current unstable and prohibits shrink. Snapshot still computes BudgetAtSnapshot from the safe upper bound of both sides.
 

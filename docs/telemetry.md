@@ -16,7 +16,7 @@ Run each command in its own service. Conductor owns lifecycle, API authenticatio
 ownership and the Plugin registry. Proxy owns sandbox application data forwarding,
 MMDS and instantaneous traffic observations. Telemetry owns its RouteEntry view,
 envd scrape, sandbox-facing OTLP metrics ingress, trusted identity enrichment,
-Collector pipeline, primary storage, exporters, history queries and E2B conversion.
+Collector pipelines, optional local TSDB, exporters, query backends and HTTP adapters.
 It does not expand the resource controller or change checkpoint/lifecycle policy.
 
 ```text
@@ -78,7 +78,7 @@ body, status and relevant headers unchanged. It filters hop-by-hop headers and
 does not support protocol upgrades on this channel. It interprets no metric
 names, DTOs, ranges, steps or storage results. Missing/non-owned sandbox is 404;
 invalid authentication follows the existing API behavior. No live readable
-telemetry endpoint, a failed UDS request or unavailable primary reader gives 503.
+telemetry endpoint, a failed UDS request or unavailable query backend gives 503.
 Client cancellation reaches the HTTP UDS request and backend query. Queries never
 call Wake, Resume, import, reservation or guest control APIs; paused history is
 read without touching the sandbox.
@@ -134,7 +134,7 @@ options are not silently translated into a smaller routing language.
 | Processors | `filter`, `transform` | contrib 0.145.0 |
 | Exporters | `otlp`, `otlp_http`, `debug` | Collector 0.145.0 |
 | Exporters | `prometheusremotewrite`, `clickhouse` | contrib 0.145.0 |
-| Primary adapter exporter | `sandboxstorage` | This orchestrator source |
+| Optional local exporter | `sandboxlocal` | This orchestrator source |
 | Connector | `routing` | contrib 0.145.0 |
 | Collector extension | `health_check` | contrib 0.145.0 |
 | Config providers | `env`, `file`, `yaml` | confmap 1.51.0 |
@@ -293,132 +293,204 @@ and 4,096 metrics per scope. Excess is rejected, not silently truncated.
 The gRPC server's 10s deadline starts before reading the message body, so a
 stalled client cannot indefinitely retain a global request slot.
 
-## 5. Primary storage versus extra exporters
+## 5. Independent writes and queries
 
-`telemetry.storage` selects exactly one primary with both Collector write and
-`extension.Reader` history read. `collector.exporters` and `service.pipelines` declare all write destinations
-and fan-out edges. An exporter never implicitly becomes
-a primary reader. `storage.type: none` requires an exporter; telemetry still
-collects/enriches/forwards but registers no query API, so public metrics is 503.
+`collector` is the native write graph. `query.backend` independently selects
+`none`, `local`, `prometheus`, `clickhouse` or `custom`; `query.handler` selects
+`none`, `e2b` or `custom`. A usable Reader and handler are both needed to register
+the query UDS. With no handler, public `/metrics` returns 503. Conductor's three
+native stats APIs keep their original sources in every mode.
 
-### Local (explicit opt-in)
+| Deployment | Configuration |
+|---|---|
+| Remote write and read | Standard remote exporter plus matching `query.backend`/endpoint/schema/labels |
+| Write-only | Collector exporters, `query: {backend: none, handler: none}`; no query UDS |
+| Query-only | Select a backend and handler; omit `collector` entirely; no dummy receiver |
+| Local write and read | `local.enabled: true`, `sandboxlocal` exporter, `query.backend: local` |
+| Local plus remote fan-out | Enable local and reference `sandboxlocal` plus remote exporters; explicitly select one query backend |
+| Custom query contract | Statically bind `Runtime.MetricsHandler` with `query.handler: custom` |
 
-The core `sandboxstorage` Collector exporter targets embedded Prometheus TSDB;
-the `Local` backend provides both its writer and the reader of that same DB. No Prometheus web
-server, scrape manager, rule manager or Alertmanager runs. Configuration:
+The old unreleased `telemetry.storage`, combined `extension.Storage`,
+`Runtime.Storage` and `Runtime.StorageHeaders` contracts are replaced directly.
+Use `local`, `query`, `Runtime.QueryBackend` and `Runtime.QueryHeaders`; the local
+Collector exporter is now `sandboxlocal`. There is no parsing alias or second
+runtime path. The write exporter and read backend are configured and validated
+separately: an OTLP destination is not automatically a query backend. Remote
+errors never select a local database or become successful empty history.
 
-```yaml
-telemetry:
-  storage:
-    type: local
-    path: /var/lib/sandbox/telemetry
-    retention: 168h
-    max_size: 10GiB
-    max_series: 1000000
-```
+### Local TSDB
 
-The DB owns its WAL, replay, compaction and retention. Writes transactionally
-append a canonical batch, rollback on failure, and store millisecond timestamps
-(sub-millisecond precision is truncated). Exact duplicate samples are idempotent;
-conflicting values at the same timestamp fail rather than overwrite history.
-Out-of-order data is accepted within min(5m, retention); older data fails. Data
-older than wall-clock retention is omitted, and timestamps over one minute in
-the future are rejected to protect the head. Paused/deleted sandbox history
-continues aging even when no newer sample arrives. Background head expiration
-and block expiration reclaim idle data; queries enforce retention immediately.
-
-`max_size` is the Prometheus TSDB retention-size target, not a filesystem quota:
-head/WAL and temporary compaction data can exceed it.
-Provision disk headroom and monitor the filesystem. `max_series` bounds live head
-series, including labels; startup rejects a replayed head above the configured
-limit. Scrape/ingress/request limits bound per-operation growth. Storage health
-errors, corruption/WAL recovery warnings and failed startup surface as component
-failure rather than a silently usable partial reader. Preserve a failed DB for
-offline diagnosis/backup recovery; do not automatically delete it. Process restart
-replays WAL; this is not an extra power-loss durability guarantee.
-
-Canonical mapping preserves UTF-8 OTel metric names. Trusted identity has direct
-labels; other attributes use collision-free `resource.`, `scope.`, `point.` label
-namespaces plus scope name/version, unit and metric kind. Sums retain explicit
-temporality/monotonicity, not a silent delta-to-cumulative conversion. Histograms
-and exponential histograms become count/sum/cumulative-bucket scalar series;
-summaries become count/sum/quantile series. Expansion is bounded (160 histogram
-bounds/quantiles and 65,536 scalar samples per write). Exemplars and histogram
-min/max are not indexed by the scalar primary representation; extra OTLP
-exporters retain the Collector pdata representation. Float64 storage has the
-usual precision limit for integers above 2^53. E2B reads only trusted envd gauges.
-
-### Prometheus-compatible readable primary
+Local storage is created only with `local.enabled: true`. Merely selecting a
+remote query backend or starting Collector creates no local DB. The core
+`sandboxlocal` exporter writes the existing embedded Prometheus TSDB; there is no
+Prometheus server, scrape manager, rule manager or Alertmanager. For local reads,
+`query.backend: local` also requires explicit local enablement. See the complete
+[local deployment](../deploy/telemetry.example.yaml).
 
 ```yaml
-telemetry:
-  storage:
-    type: prometheus
-    retention: 168h
-    prometheus:
-      endpoint: https://metrics.example.com/prometheus
-      headers: {Authorization: "Bearer REPLACE_WITH_PROTECTED_MATERIAL"}
+query: {backend: local, handler: e2b}
+local:
+  enabled: true
+  path: /var/lib/sandbox/telemetry
+  retention: 168h
+  max_size: 10GiB
+  max_series: 1000000
 ```
 
-The adapter writes standard Snappy/protobuf remote-write v1 to
-`<endpoint>/api/v1/write` and negotiates `STREAMED_XOR_CHUNKS` from
-`<endpoint>/api/v1/read`, then applies the same field-wise MAX behavior. Each
-history-boundary lookup and data query uses one request, including empty or sparse
-long-retention histories. Frames are checksum-verified and limited to 32 MiB;
-only one frame is retained at a time, with a 10s HTTP deadline covering the body.
-Complete edge chunks are filtered to the exact inclusive sample range. A backend
-that only supports `SAMPLES` can fall back to a single Snappy response, with both
-compressed and decoded sizes capped at 32 MiB; use streaming for larger histories. The
-backend must enable both APIs and accept Prometheus 3 UTF-8 metric/label names;
-a query-only server or write-only exporter is not sufficient. Remote read
-preserves exact observations instead of PromQL lookback/step interpolation. See
-the [remote read API](https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/).
-Configured retention defines the read lookback/write age policy; provision
-backend retention, capacity and cardinality controls independently.
+The TSDB owns its existing WAL, replay, compaction and retention. Its WAL contract
+is independent of native usage's no-sync contract. Each Collector delivery is a
+transaction; failures roll back. Millisecond timestamps truncate sub-millisecond
+precision. Exact duplicate samples are idempotent; conflicting values at the
+same timestamp fail. Out-of-order samples are accepted within min(5m, retention).
+Older samples fail. Wall-clock retention excludes expired observations and
+reclaims idle head/block data even after all sandboxes pause. Writes more than
+one minute in the future fail. Cached observations are never given a new time.
 
-### ClickHouse readable primary
+`max_size` is a retention target, not a filesystem quota; head/WAL and temporary
+compaction data may exceed it. `max_series` bounds live head series and checks
+replay. Background errors and corruption/WAL recovery warnings stop the component
+and revoke its query lease. Startup does not delete a damaged DB. Restart replays
+WAL without adding a new power-loss durability guarantee.
 
-```yaml
-telemetry:
-  storage:
-    type: clickhouse
-    retention: 168h
-    clickhouse:
-      endpoint: https://clickhouse.example.com:8443
-      database: default
-      table: sandbox_metrics
-      headers: {X-ClickHouse-User: telemetry, X-ClickHouse-Key: REPLACE_WITH_PROTECTED_MATERIAL}
-```
+The scalar representation preserves OTel metric names. Accepted identity labels
+are `sandbox.id`, `sandbox.stable_id` and `sandbox.telemetry.source`. Other
+attributes use `resource.`, `scope.` and `point.` prefixes; scope name/version,
+unit and kind use `otel.*`. Sums retain temporality/monotonicity. Histogram and
+exponential histogram count/sum/cumulative buckets use the original metric name
+with `otel.part`/`otel.bound`, and summaries use count/sum/quantile parts. Optional
+histogram sums remain absent when not recorded. Expansion is bounded at 160
+bounds/quantiles and 65,536 scalar samples per write. Exemplars and histogram
+min/max are not part of this scalar query representation. Other Collector
+exporters retain their supported pdata representation. Float64 cannot preserve
+all integers above 2^53 or replace the lossless native usage ledger.
 
-The database must exist; telemetry creates its dedicated MergeTree table and
-sets its TTL from retention. Give the service scoped CREATE/ALTER/INSERT/SELECT
-permissions for that table, not unrelated tables. Changing retention updates its
-TTL. JSONEachRow writes keep canonical labels and DateTime64(3, UTC) timestamps.
-Small concurrent writes use bounded server-side async insert batching and wait
-for flush completion, propagating errors/backpressure. Parameterized SQL filters
-exact SandboxID and trusted envd source; integer epoch time buckets group each
-metric independently with MAX. Duplicate/out-of-order rows preserve these MAX
-results. Reads impose time, row, byte, thread and memory limits and cancel readonly
-queries on HTTP client disconnect. HTTP-200 error bodies are not accepted as data.
-See [ClickHouse HTTP](https://clickhouse.com/docs/interfaces/http) and
-[async inserts](https://clickhouse.com/docs/optimize/asynchronous-inserts).
+### Prometheus remote read and standard remote write
 
-Both external clients bound pools and responses, propagate request cancellation,
-reject redirects, and allow only operator-configured HTTP(S) destinations.
-Credentials may instead come from Runtime providers. External storage owns its
-disk-size/cardinality enforcement; local-only `max_size`/`max_series` do not
-configure an external server. No external adapter is intentionally deferred.
+The [Prometheus deployment](../deploy/telemetry-prometheus.example.yaml) selects
+`prometheusremotewrite` independently of the `prometheus` query backend. The
+exporter uses its native queue, retry, batching and resource conversion options.
+The Reader only calls `<query.prometheus.endpoint>/api/v1/read`; it does not
+implement Write. A [query-only deployment](../deploy/telemetry-query-only.example.yaml)
+can use an existing remote database without starting Collector.
 
-### Native exporters and custom primary
+The linked exporter replaces punctuation in names/labels with underscores.
+`resource_to_telemetry_conversion.enabled: true` carries accepted identity onto
+each metric. Default query label mapping translates logical `sandbox.id`,
+`sandbox.stable_id` and `sandbox.telemetry.source` to physical `sandbox_id`,
+`sandbox_stable_id` and `sandbox_telemetry_source`. `query.prometheus.labels` can
+supply another explicit mapping, including identity mappings for a backend that
+stores original UTF-8 names. Duplicate/overlapping mappings fail validation.
+Result attributes use the configured logical names; other remote labels remain
+as stored, including point labels. Physical identity aliases cannot replace the
+mandatory exact SandboxID match.
 
-Add an exporter under `collector.exporters` and reference its complete ID from
-`collector.service.pipelines`. The [Collector fan-out example](../deploy/telemetry-fanout.example.yaml)
-uses native batch, filter, transform, routing, two OTLP HTTP sinks, queue and retry.
-Native exporter options control queue size, consumers, retry and timeout; they
-are not overwritten by a generated graph. Queues are not durable history unless
-a configured component explicitly provides that behavior. Export failure does
-not pause a sandbox. Static integration follows the
-[extension contract](extensions.md#telemetry-bootstrap-and-extension).
+Metric names in generic queries are the physical backend names. The example
+sets `add_metric_suffixes: false` and maps the seven E2B fields to names such as
+`sandbox_memory_used`. With suffixes enabled, standard unit/type conversion may
+produce names such as `task_payload_bytes` or cumulative Sum names ending in
+`_total`; update the E2B mapping if those metrics supply the compatibility API.
+Query code does not guess a writer's namespace, normalization or unit suffixes.
+Configure server retention, remote-write reception and out-of-order policy on
+the server separately. Query credentials need remote-read access independently
+of exporter credentials.
+
+The Reader negotiates `STREAMED_XOR_CHUNKS`, verifies each frame's CRC32C, bounds
+frames at 32 MiB and retains one frame at a time. A server offering `SAMPLES`
+uses a single Snappy response with both compressed and decoded sizes capped at
+32 MiB. One request obtains Bounds and one obtains Query, including empty and
+sparse long histories. The 10s HTTP deadline covers the body. Complete edge
+chunks are filtered to the exact inclusive raw-sample range before aggregation.
+PromQL lookback, interpolation and last-value extension never enter this API.
+See the [remote read API](https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/).
+`query.lookback` bounds the remote read window, defaults to 168h and must be at
+least one minute; it does not change exporter writes or server retention.
+
+Native histogram chunks and histogram samples are decoded through the linked
+Prometheus model. They retain the physical metric name and expose `otel.part`
+values `count`, `sum` and `native_bucket`; `otel.bound` records each native
+bucket's actual open/closed interval. Native bucket counts are absolute, not
+cumulative. These derived attributes can be selected at the Reader boundary.
+Classic histogram `_bucket`/`_sum`/`_count` series and summary quantile labels
+retain the standard exporter's physical representation. Stale markers do not
+become observations or extend a previous value. Both unit-suffix settings and
+all five metric kinds are verified against the real server.
+
+### ClickHouse standard schema and read-only queries
+
+The [ClickHouse deployment](../deploy/telemetry-clickhouse.example.yaml) uses the
+linked standard `clickhouse` exporter and its five native metrics tables:
+`otel_metrics_gauge`, `otel_metrics_sum`, `otel_metrics_summary`,
+`otel_metrics_histogram` and `otel_metrics_exponential_histogram`. The exporter
+controls database creation, `create_schema`, TTL, queue/retry and write grants.
+The Reader uses only SELECT through its separately configured HTTP(S) endpoint,
+credentials, database and `query.clickhouse.tables`. It never creates a table,
+changes TTL or requires Write. Old `sandbox_metrics` canonical tables are not this
+schema. A missing/mismatched table or backend error is an error, not empty data.
+
+The Reader matches `ResourceAttributes['sandbox.id']` before reading rows. It
+uses `MetricName`, `TimeUnix`, `Value`, resource/scope/point maps and metric-kind
+columns from the standard exporter schema. `Flags.NoRecordedValue` rows are
+excluded. Gauge/Sum values keep the original metric name/unit, and attributes
+use the local scalar namespace. Summary parts include count, sum and quantiles;
+explicit Histogram parts include count and cumulative buckets. The standard
+schema does not retain Histogram `HasSum`, so its ambiguous sum column is not
+published as an observed zero. It also omits exponential `ZeroThreshold`:
+exponential results publish count/zero_count and stored positive/negative bucket
+counts, with `otel.scale` and the original bucket index in `otel.bound`, rather
+than inventing numeric bounds. These schema limits do not remove data from the
+Collector or other exporters; they define this backend's scalar read mapping.
+
+SQL parameters carry SandboxID, metric names, equality attributes, time and
+step. Client input never supplies SQL. Time is projected to milliseconds before
+inclusive filtering, matching local/Prometheus precision. Raw queries preserve
+observed times. MAX filters raw rows first, then groups independently by complete
+attributes and epoch-aligned bucket. Duplicate identical observations deduplicate;
+conflicting raw values at one millisecond fail instead of being arbitrarily
+selected. Out-of-order/duplicate inserts do not alter MAX. No missing Gauge is
+extended into later buckets.
+
+Read requests enforce nine seconds of server execution, two threads, 256 MiB
+server memory, 700,000 rows and 32 MiB response limits, cancel readonly queries
+when HTTP clients disconnect, and reject HTTP-200 error bodies. See
+[ClickHouse HTTP](https://clickhouse.com/docs/interfaces/http). Both remote clients
+bound pools, propagate cancellation, reject redirects and use only protected
+operator-configured destinations. `Runtime.QueryHeaders` replaces read credentials;
+exporter credentials use native Collector config providers. Neither read errors
+nor authentication errors fall back to a local DB. External size/cardinality
+controls remain the external server's responsibility.
+
+### Fan-out and static extensions
+
+Add factories once by type; declare each instance and edge in native Collector
+configuration. The [fan-out example](../deploy/telemetry-fanout.example.yaml)
+uses batch/filter/transform/routing and two OTLP HTTP sinks with queue/retry.
+Adding `local.enabled` and a `sandboxlocal` destination creates optional local
+fan-out; `query.backend` still explicitly selects the Reader. Queue durability
+comes only from the configured component's own contract. Export failures do not
+pause or wake sandboxes. See [static extensions](extensions.md#telemetry-bootstrap-and-extension).
+
+`extension.Reader` accepts `Selection{SandboxID, Metrics, Attributes}` and
+`Query{Selection, Start, End, Step, Aggregation}`, returning `[]Series` with metric
+name, complete attributes and timestamp/value points. Metrics are exact names,
+attributes require an existing key with an equal value (empty does not match
+missing), and an empty metric list selects all names
+within that exact sandbox. There is no seven-field enum, source allowlist or
+public SQL/PromQL input. Omitted aggregation is normalized to `Raw` before
+dispatch to any backend. `Raw` requires zero Step;
+`Max` requires a positive whole-millisecond Step. Queries accept 1970–2299,
+up to 64 metric names, 110 equality attributes, 100,000 series and 700,000 points.
+Absent points stay absent; negative Gauges are legal. Bounds applies the same
+selection to retained observations.
+
+`Runtime.QueryBackend` constructs a `Reader` plus Shutdown without Write.
+`Runtime.MetricsHandler` supplies a standard `http.Handler` per `QueryScope`.
+The scope Reader is permanently bound to conductor's exact SandboxID and rejects
+attempts to replace it, including attribute selectors or a different context.
+Deployments and static extensions remain trusted. A custom JSON contract is not
+E2B compatibility; use the built-in E2B handler for E2B SDKs. The buildable
+[custom handler](../examples/custom-telemetry/query.go) publishes arbitrary raw
+series, and its [query-only config](../examples/custom-telemetry/query.yaml)
+starts neither Collector nor local storage.
 
 ## 6. E2B history query
 
@@ -431,7 +503,10 @@ StableID is only external observability correlation. RunID remains runner/run-pl
 systemd/pidfile, MMDSv2 and logging/debug identity; it is never a telemetry label,
 resource attribute, TSDB identity, query key or pause/resume series discriminator.
 
-The telemetry handler parses nonnegative integral Unix-second boundaries
+With `query.handler: e2b`, the independent E2B adapter uses the seven
+`query.e2b.metrics` mappings and `query.e2b.source` (default `envd`). Deployments
+can explicitly select another source with the same observation semantics. Generic
+Readers do not impose either mapping or source. This handler parses nonnegative integral Unix-second boundaries
 (through 2299-12-31 UTC), resolves omitted start/end from first/last retained
 history, validates start <= end, calculates step, calls Reader, then takes MAX
 independently for each of the seven fields in epoch-aligned buckets:
@@ -489,7 +564,7 @@ See [deploy YAML](../deploy/telemetry.example.yaml),
 
 Shutdown first stops route subscription/revokes the query lease, drains query
 and OTLP ingress, shuts down Collector receivers/processors/exporters, then the
-extension and finally primary storage. Startup failures unwind the same owned
+extension and finally the query backend and optional local TSDB. Startup failures unwind the same owned
 resources. Retained extension work is canceled even when startup fails. Keep the
 storage path persistent and do not make conductor/Proxy systemd dependencies
 require telemetry; telemetry failure must not change sandbox lifecycle.
@@ -501,17 +576,44 @@ GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/confi
 GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
-TELEMETRY_CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 GOWORK=off go test ./internal/telemetry -run TestClickHouseIntegration -count=1
-TELEMETRY_PROMETHEUS_TEST_URL=http://127.0.0.1:9090 GOWORK=off go test ./internal/telemetry -run TestPrometheusIntegration -count=1
+bash test/e2e/e2e_telemetry_backends.sh # source: Go + Docker; installed package: BIN + Docker
 make test vet build
 make test-e2e # assembled project BIN and real KVM host required
 ```
 
-Use disposable endpoints for optional live-engine tests. The ClickHouse test
-creates/drops only a unique test table. The Prometheus test writes a uniquely
-named sandbox series (removed by backend retention), requires remote write and
-an out-of-order window of at least 5m, and verifies streaming, UTF-8 labels,
-duplicate/out-of-order samples, field MAX and exact time bounds. Density
+The component-owned backend case creates disposable Prometheus 3.5.0 and
+ClickHouse 25.8 containers from pinned manifest digests, publishes loopback-only
+ports, records actual versions and image identities, and owns a private Docker
+network. Containers, volumes and that network are removed on exit, including
+partial startup failure; the shared default bridge is not required or modified.
+Both engines and every named case are required; missing
+prerequisites, skips and failures are errors. Uncached images use platform's
+existing public Docker Hub mirror with a bounded pull and the same pinned
+manifest digest; no tag or backend version is substituted. Source CI locates the exact sibling
+checkout from the assembled `BIN` directory; missing sources remain an error.
+Set `TELEMETRY_SOURCE_ROOT` only for another source layout. The same case runs
+from `test/e2e/run_all.sh` in source and exact-assets validation. Exact-assets uses
+the shipped `BIN/node-ctl`, without Go or rebuilding component sources.
+`TELEMETRY_BACKEND_OUT_DIR` optionally selects retained configurations, JSON test
+events, executable hashes and engine logs; CI defaults to its uploaded metadata
+directory. Fixture tables and Prometheus samples exist only in disposable
+containers, whose volumes are removed on exit.
+
+Both layouts run the installed node-ctl with a trusted infrastructure OTLP
+fixture, native batch/queue, the standard remote exporter and the matching Reader
+through the private E2B query UDS. Assertions cover exact SID/source isolation,
+StableID as a label only, independent MAX, inclusive boundaries, incomplete
+buckets, no Gauge extension, no local DB and clean shutdown. This backend case
+does not replace the real guest/conductor authentication and namespace cases.
+
+Coverage includes actual native deployment startup, name/unit/resource-label
+conversion, all metric kinds, duplicate/out-of-order samples, raw/MAX edges,
+gaps, exact SID, local/remote fan-out and accepted batches after route deletion.
+Source validation additionally builds and executes node-ctl and custom-telemetry from the exact sources,
+passes sealed bootstrap, queries a non-E2B metric from real Prometheus through
+the actual Plugin lease/query UDS, and verifies query-only cleanup with no
+Collector graph or local DB. Ordinary unit invocations may skip these external
+fixtures; those skips are never backend acceptance. Density
 benchmarks measure real 5s periods for 1k/10k/50k
 synthetic targets, scrape counts, peak goroutines/FDs (including fixture server),
 allocations, TSDB batch writes and local query cost. Receiver and TSDB benchmarks

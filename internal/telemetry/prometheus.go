@@ -8,108 +8,86 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"maps"
 	"math"
 	"mime"
 	"net/url"
-	"sort"
+	"strconv"
 	"time"
 
 	"github.com/golang/snappy"
 	"github.com/kuasar-sandbox/orchestrator/app/telemetry/extension"
 	"github.com/kuasar-sandbox/orchestrator/config"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
-// Prometheus is a readable primary using the standard Snappy/protobuf remote
-// read/write HTTP protocols. Raw sample reads preserve exact sparse history;
+// Prometheus reads the standard Snappy/protobuf remote-read HTTP protocol. Raw sample reads preserve exact sparse history;
 // PromQL lookback, interpolation and range-vector boundary artifacts do not
-// enter E2B compatibility. Backends must accept Prometheus 3 UTF-8 label names.
+// enter E2B compatibility. Label mapping is independent of the chosen Collector exporter.
 type Prometheus struct {
 	*remoteClient
-	endpoint  string
-	retention time.Duration
+	endpoint   string
+	retention  time.Duration
+	labelNames map[string]string
 }
 
-func NewPrometheus(cfg config.TelemetryStorage) (*Prometheus, error) {
-	retention, err := time.ParseDuration(cfg.Retention)
+func NewPrometheus(cfg config.TelemetryQuery) (*Prometheus, error) {
+	retention, err := time.ParseDuration(cfg.Lookback)
 	if err != nil {
 		return nil, err
 	}
-	return &Prometheus{remoteClient: newRemoteClient(cfg.Prometheus.Headers), endpoint: cfg.Prometheus.Endpoint, retention: retention}, nil
+	return &Prometheus{remoteClient: newRemoteClient(cfg.Prometheus.Headers), endpoint: cfg.Prometheus.Endpoint, retention: retention, labelNames: maps.Clone(cfg.Prometheus.Labels)}, nil
 }
 
-func (p *Prometheus) Write(ctx context.Context, samples []extension.Sample) error {
-	if len(samples) > maxWriteSamples {
-		return ErrInvalidMetrics
-	}
-	// Group by the complete canonical label set, without an unbounded cross-
-	// request cache. Prometheus requires sorted labels and per-series samples.
-	request := prompb.WriteRequest{}
-	series := make(map[string]int)
-	now := time.Now()
-	for _, sample := range samples {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if sample.Timestamp.Before(now.Add(-p.retention)) {
-			continue
-		}
-		if sample.Timestamp.After(now.Add(time.Minute)) || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
-			return ErrInvalidMetrics
-		}
-		builder := labels.NewScratchBuilder(len(sample.Labels) + 1)
-		builder.Add(labels.MetricName, sample.Metric)
-		for key, value := range sample.Labels {
-			builder.Add(key, value)
-		}
-		builder.Sort()
-		canonical := builder.Labels()
-		key := canonical.String()
-		index, exists := series[key]
-		if !exists {
-			index = len(request.Timeseries)
-			series[key] = index
-			entry := prompb.TimeSeries{}
-			canonical.Range(func(label labels.Label) {
-				entry.Labels = append(entry.Labels, prompb.Label{Name: label.Name, Value: label.Value})
-			})
-			request.Timeseries = append(request.Timeseries, entry)
-		}
-		request.Timeseries[index].Samples = append(request.Timeseries[index].Samples, prompb.Sample{Timestamp: sample.Timestamp.UnixMilli(), Value: sample.Value})
-	}
-	if len(request.Timeseries) == 0 {
-		return nil
-	}
-	for i := range request.Timeseries {
-		points := request.Timeseries[i].Samples
-		sort.SliceStable(points, func(a, b int) bool { return points[a].Timestamp < points[b].Timestamp })
-	}
-	if request.Size() > maxRemoteBytes {
-		return ErrInvalidMetrics
-	}
-	raw, err := request.Marshal()
-	if err != nil {
+func (p *Prometheus) read(ctx context.Context, selection extension.Selection, start, end int64, visitor seriesVisitor) error {
+	if err := validateSelection(selection); err != nil {
 		return err
 	}
-	endpoint, err := url.JoinPath(p.endpoint, "api/v1/write")
-	if err != nil {
-		return err
+	// Native histograms become scalar parts at the read boundary. These two
+	// derived attributes are filtered after decoding, not sent as physical labels.
+	physicalSelection := selection
+	physicalSelection.Attributes = maps.Clone(selection.Attributes)
+	delete(physicalSelection.Attributes, "otel.part")
+	delete(physicalSelection.Attributes, "otel.bound")
+	visit := func(name string, raw map[string]string) (func(int64, float64) error, error) {
+		attributes := maps.Clone(raw)
+		for logical, physical := range p.labelNames {
+			if physical == logical {
+				continue
+			}
+			if value, ok := raw[physical]; ok {
+				if _, collision := raw[logical]; collision {
+					return nil, errors.New("ambiguous Prometheus label mapping")
+				}
+				delete(attributes, physical)
+				attributes[logical] = value
+			}
+		}
+		matched, err := matchPrometheusSeries(physicalSelection, name, attributes)
+		if err != nil {
+			return nil, err
+		}
+		if !matched || !selectedSeries(selection, name, attributes) {
+			return func(int64, float64) error { return nil }, nil
+		}
+		return visitor(name, attributes)
 	}
-	_, err = p.request(ctx, endpoint, snappy.Encode(nil, raw), map[string]string{"Content-Type": "application/x-protobuf", "Content-Encoding": "snappy", "X-Prometheus-Remote-Write-Version": "0.1.0"})
-	return err
-}
-
-func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visit func(extension.Field, int64, float64) error) error {
 	request := prompb.ReadRequest{AcceptedResponseTypes: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS, prompb.ReadRequest_SAMPLES}}
 	query := &prompb.Query{StartTimestampMs: start, EndTimestampMs: end}
-	for _, matcher := range resourceMatchers(id) {
+	for _, matcher := range selectionMatchers(physicalSelection) {
 		kind := prompb.LabelMatcher_EQ
 		if matcher.Type == labels.MatchRegexp {
 			kind = prompb.LabelMatcher_RE
 		}
-		query.Matchers = append(query.Matchers, &prompb.LabelMatcher{Type: kind, Name: matcher.Name, Value: matcher.Value})
+		name := matcher.Name
+		if mapped := p.labelNames[name]; mapped != "" {
+			name = mapped
+		}
+		query.Matchers = append(query.Matchers, &prompb.LabelMatcher{Type: kind, Name: name, Value: matcher.Value})
 	}
 	request.Queries = []*prompb.Query{query}
 	raw, err := request.Marshal()
@@ -130,7 +108,7 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 		return fmt.Errorf("invalid Prometheus response content type: %w", err)
 	}
 	if media == "application/x-streamed-protobuf" && params["proto"] == "prometheus.ChunkedReadResponse" && response.Header.Get("Content-Encoding") == "" {
-		return readPrometheusChunks(ctx, response.Body, id, start, end, visit)
+		return readPrometheusChunks(ctx, response.Body, start, end, visit)
 	}
 	if media != "application/x-protobuf" || response.Header.Get("Content-Encoding") != "snappy" {
 		return errors.New("unsupported Prometheus response format")
@@ -161,7 +139,7 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 		if series == nil {
 			return ErrInvalidMetrics
 		}
-		field, err := remoteResourceField(series.Labels, id)
+		appendPoint, err := visitPrometheusSeries(series.Labels, visit)
 		if err != nil {
 			return err
 		}
@@ -172,8 +150,18 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 			if sample.Timestamp < start || sample.Timestamp > end {
 				continue
 			}
-			if err := visit(field, sample.Timestamp, sample.Value); err != nil {
+			if err := appendPoint(sample.Timestamp, sample.Value); err != nil {
 				return err
+			}
+		}
+		for _, sample := range series.Histograms {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if sample.Timestamp >= start && sample.Timestamp <= end {
+				if err := visitPrometheusHistogram(series.Labels, sample.Timestamp, sample.ToFloatHistogram(), visit); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -184,7 +172,7 @@ func (p *Prometheus) read(ctx context.Context, id string, start, end int64, visi
 // ChunkedReadResponse protobuf. Decode one bounded frame at a time; importing
 // storage/remote just for its framing helper would also link the scrape manager.
 // https://github.com/prometheus/prometheus/blob/main/prompb/remote.proto
-func readPrometheusChunks(ctx context.Context, body io.Reader, id string, start, end int64, visit func(extension.Field, int64, float64) error) error {
+func readPrometheusChunks(ctx context.Context, body io.Reader, start, end int64, visit seriesVisitor) error {
 	reader := bufio.NewReader(body)
 	checksumTable := crc32.MakeTable(crc32.Castagnoli)
 	var buffer []byte
@@ -227,15 +215,26 @@ func readPrometheusChunks(ctx context.Context, body io.Reader, id string, start,
 			if series == nil {
 				return ErrInvalidMetrics
 			}
-			field, err := remoteResourceField(series.Labels, id)
+			appendPoint, err := visitPrometheusSeries(series.Labels, visit)
 			if err != nil {
 				return err
 			}
 			for _, encoded := range series.Chunks {
-				if encoded.Type != prompb.Chunk_XOR || len(encoded.Data) < 2 {
-					return errors.New("invalid Prometheus resource chunk encoding")
+				var encoding chunkenc.Encoding
+				switch encoded.Type {
+				case prompb.Chunk_XOR:
+					encoding = chunkenc.EncXOR
+				case prompb.Chunk_HISTOGRAM:
+					encoding = chunkenc.EncHistogram
+				case prompb.Chunk_FLOAT_HISTOGRAM:
+					encoding = chunkenc.EncFloatHistogram
+				default:
+					return errors.New("invalid Prometheus chunk encoding")
 				}
-				chunk, err := chunkenc.FromData(chunkenc.EncXOR, encoded.Data)
+				if len(encoded.Data) < 2 {
+					return errors.New("invalid Prometheus chunk data")
+				}
+				chunk, err := chunkenc.FromData(encoding, encoded.Data)
 				if err != nil {
 					return err
 				}
@@ -244,13 +243,22 @@ func readPrometheusChunks(ctx context.Context, body io.Reader, id string, start,
 					if err := ctx.Err(); err != nil {
 						return err
 					}
+					if kind == chunkenc.ValHistogram || kind == chunkenc.ValFloatHistogram {
+						stamp, histogram := iterator.AtFloatHistogram(nil)
+						if stamp >= start && stamp <= end {
+							if err := visitPrometheusHistogram(series.Labels, stamp, histogram, visit); err != nil {
+								return err
+							}
+						}
+						continue
+					}
 					if kind != chunkenc.ValFloat {
 						return ErrInvalidMetrics
 					}
 					stamp, value := iterator.At()
 					// Edge chunks can include observations outside requested bounds.
 					if stamp >= start && stamp <= end {
-						if err := visit(field, stamp, value); err != nil {
+						if err := appendPoint(stamp, value); err != nil {
 							return err
 						}
 					}
@@ -263,60 +271,130 @@ func readPrometheusChunks(ctx context.Context, body io.Reader, id string, start,
 	}
 }
 
-func remoteResourceField(seriesLabels []prompb.Label, id string) (extension.Field, error) {
+// Preserve native bucket intervals rather than inventing inclusive cumulative
+// bounds for negative/zero buckets. Count/sum and absolute bucket counts are
+// scalar observations at the original time; this does not compute rates.
+func visitPrometheusHistogram(seriesLabels []prompb.Label, stamp int64, h *histogram.FloatHistogram, visit seriesVisitor) error {
+	if h == nil {
+		return ErrInvalidMetrics
+	}
+	if value.IsStaleNaN(h.Sum) {
+		return nil
+	}
+	if err := h.Validate(); err != nil {
+		return fmt.Errorf("invalid Prometheus histogram: %w", err)
+	}
+	name, attributes, err := prometheusSeriesLabels(seriesLabels)
+	if err != nil {
+		return err
+	}
+	if _, exists := attributes["otel.part"]; exists {
+		return errors.New("Prometheus histogram label conflicts with scalar part")
+	}
+	if _, exists := attributes["otel.bound"]; exists {
+		return errors.New("Prometheus histogram label conflicts with scalar bound")
+	}
+	appendPart := func(part, bound string, number float64) error {
+		attrs := maps.Clone(attributes)
+		attrs["otel.part"] = part
+		if bound != "" {
+			attrs["otel.bound"] = bound
+		}
+		appendPoint, err := visit(name, attrs)
+		if err != nil {
+			return err
+		}
+		return appendPoint(stamp, number)
+	}
+	if err := appendPart("count", "", h.Count); err != nil {
+		return err
+	}
+	if err := appendPart("sum", "", h.Sum); err != nil {
+		return err
+	}
+	iterator := h.AllBucketIterator()
+	for count := 0; iterator.Next(); count++ {
+		if count >= maxQueryPoints {
+			return errors.New("Prometheus histogram exceeds bucket limit")
+		}
+		bucket := iterator.At()
+		left, right := "(", ")"
+		if bucket.LowerInclusive {
+			left = "["
+		}
+		if bucket.UpperInclusive {
+			right = "]"
+		}
+		bound := left + strconv.FormatFloat(bucket.Lower, 'g', -1, 64) + "," + strconv.FormatFloat(bucket.Upper, 'g', -1, 64) + right
+		if err := appendPart("native_bucket", bound, bucket.Count); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func visitPrometheusSeries(seriesLabels []prompb.Label, visit seriesVisitor) (func(int64, float64) error, error) {
+	name, attrs, err := prometheusSeriesLabels(seriesLabels)
+	if err != nil {
+		return nil, err
+	}
+	return visit(name, attrs)
+}
+
+func prometheusSeriesLabels(seriesLabels []prompb.Label) (string, map[string]string, error) {
 	attrs := make(map[string]string, len(seriesLabels))
 	for _, label := range seriesLabels {
 		if _, exists := attrs[label.Name]; exists {
-			return 0, ErrInvalidMetrics
+			return "", nil, ErrInvalidMetrics
 		}
 		attrs[label.Name] = label.Value
 	}
-	field, ok := metricField(attrs[labels.MetricName])
-	if !ok || attrs[SandboxIDAttribute] != id || attrs[sourceAttribute] != "envd" || attrs["otel.kind"] != "Gauge" {
-		return 0, errors.New("Prometheus returned a series outside the requested sandbox resource scope")
+	name := attrs[labels.MetricName]
+	delete(attrs, labels.MetricName)
+	if name == "" || len(name) > 128 || len(attrs) > 110 {
+		return "", nil, ErrInvalidMetrics
 	}
-	return field, nil
+	return name, attrs, nil
 }
 
-func (p *Prometheus) Bounds(ctx context.Context, id string) (start, end time.Time, found bool, err error) {
-	if id == "" {
-		return
-	}
+func (p *Prometheus) Bounds(ctx context.Context, selection extension.Selection) (start, end time.Time, found bool, err error) {
 	now := time.Now()
-	// One streaming request, including for empty or sparse long-retention
-	// histories. Neither request count nor response memory grows with retention.
-	err = p.read(ctx, id, now.Add(-p.retention).UnixMilli(), now.Add(time.Minute).UnixMilli(), func(_ extension.Field, stamp int64, value float64) error {
-		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return nil // Prometheus stale markers are not observations.
-		}
-		observed := time.UnixMilli(stamp).UTC()
-		if !found || observed.Before(start) {
-			start = observed
-		}
-		if !found || observed.After(end) {
-			end = observed
-		}
-		found = true
-		return nil
+	// One streaming raw-sample request also preserves sparse long histories.
+	err = p.read(ctx, selection, now.Add(-p.retention).UnixMilli(), now.Add(time.Minute).UnixMilli(), func(_ string, _ map[string]string) (func(int64, float64) error, error) {
+		return func(stamp int64, value float64) error {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return nil
+			}
+			observed := time.UnixMilli(stamp).UTC()
+			if !found || observed.Before(start) {
+				start = observed
+			}
+			if !found || observed.After(end) {
+				end = observed
+			}
+			found = true
+			return nil
+		}, nil
 	})
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	return
 }
 
-func (p *Prometheus) Query(ctx context.Context, query extension.Query) ([]extension.Point, error) {
-	if err := ValidateRange(query.Start, query.End); err != nil {
-		return nil, err
-	}
-	buckets, err := newPointBuckets(query.Step)
+func (p *Prometheus) Query(ctx context.Context, query extension.Query) ([]extension.Series, error) {
+	buckets, err := newSeriesBuckets(query)
 	if err != nil {
 		return nil, err
 	}
 	start, end := max(query.Start.UnixMilli(), time.Now().Add(-p.retention).UnixMilli()), min(query.End.UnixMilli(), time.Now().Add(time.Minute).UnixMilli())
 	if start <= end {
-		if err := p.read(ctx, query.SandboxID, start, end, buckets.add); err != nil {
+		if err := p.read(ctx, query.Selection, start, end, buckets.visit); err != nil {
 			return nil, err
 		}
 	}
-	return buckets.points(), nil
+	result := buckets.result()
+	return result, ctx.Err()
 }
 
-var _ extension.Storage = (*Prometheus)(nil)
+var _ extension.QueryBackend = (*Prometheus)(nil)

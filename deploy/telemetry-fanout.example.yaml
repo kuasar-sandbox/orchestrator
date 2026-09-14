@@ -1,8 +1,7 @@
 # Independent write-only Collector; no local DB and no query API registration.
 config_socket: /run/sandbox/node-ctl.socket
 # proxy_netns: sandbox-proxy
-telemetry:
-  storage: {type: none}
+query: {backend: none, handler: none}
 collector:
   receivers:
     envd: {collection_interval: 5s, timeout: 1s, concurrency: 64}

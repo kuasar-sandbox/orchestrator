@@ -91,9 +91,9 @@ func TestAppRejectsInvalidBootstrapAndHooksBeforeCore(t *testing.T) {
 				case "final-netns":
 					cfg.ProxyNetNS = "../invalid"
 				case "provider":
-					cfg.Telemetry.Storage.Type = "prometheus"
-					cfg.Telemetry.Storage.Prometheus.Endpoint = "http://example.com"
-					runtime.StorageHeaders = func(context.Context) (map[string]string, error) { return nil, errors.New("provider failed") }
+					cfg.Query.Backend = "prometheus"
+					cfg.Query.Prometheus.Endpoint = "http://example.com"
+					runtime.QueryHeaders = func(context.Context) (map[string]string, error) { return nil, errors.New("provider failed") }
 				}
 				return nil
 			}})

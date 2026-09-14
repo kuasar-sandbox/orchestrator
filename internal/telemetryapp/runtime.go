@@ -16,8 +16,9 @@ import (
 type Bindings struct {
 	Logger         *slog.Logger
 	Extension      extension.Extension
-	Storage        func(context.Context, config.TelemetryStorage) (extension.Storage, error)
-	StorageHeaders func(context.Context) (map[string]string, error)
+	QueryBackend   func(context.Context, config.TelemetryQuery) (extension.QueryBackend, error)
+	MetricsHandler extension.MetricsHandler
+	QueryHeaders   func(context.Context) (map[string]string, error)
 	Collector      customotel.Components
 }
 
@@ -33,22 +34,25 @@ func ResolveRuntime(ctx context.Context, cfg *config.Telemetry, bindings Binding
 	if bindings.Logger == nil {
 		bindings.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	if (cfg.Telemetry.Storage.Type == "custom") != (bindings.Storage != nil) {
-		return nil, errors.New("telemetry custom primary storage requires exactly one Storage provider and storage.type=custom")
+	if (cfg.Query.Backend == "custom") != (bindings.QueryBackend != nil) {
+		return nil, errors.New("telemetry query.backend=custom requires exactly one QueryBackend provider")
+	}
+	if (cfg.Query.Handler == "custom") != (bindings.MetricsHandler != nil) {
+		return nil, errors.New("query.handler=custom requires exactly one MetricsHandler")
 	}
 	bindings.Collector = bindings.Collector.Clone()
-	if bindings.StorageHeaders != nil {
-		headers, err := bindings.StorageHeaders(ctx)
+	if bindings.QueryHeaders != nil {
+		headers, err := bindings.QueryHeaders(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("telemetry primary storage credentials: %w", err)
+			return nil, fmt.Errorf("telemetry query credentials: %w", err)
 		}
-		switch cfg.Telemetry.Storage.Type {
+		switch cfg.Query.Backend {
 		case "prometheus":
-			cfg.Telemetry.Storage.Prometheus.Headers = maps.Clone(headers)
+			cfg.Query.Prometheus.Headers = maps.Clone(headers)
 		case "clickhouse":
-			cfg.Telemetry.Storage.ClickHouse.Headers = maps.Clone(headers)
+			cfg.Query.ClickHouse.Headers = maps.Clone(headers)
 		default:
-			return nil, errors.New("StorageHeaders requires a built-in external primary storage")
+			return nil, errors.New("QueryHeaders requires a built-in remote query backend")
 		}
 	}
 	if err := config.ValidateTelemetryFinal(cfg); err != nil {

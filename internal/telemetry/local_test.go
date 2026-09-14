@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,10 +20,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
-func localConfig(t testing.TB) config.TelemetryStorage {
-	return config.TelemetryStorage{Type: "local", Path: t.TempDir(), Retention: "168h", MaxSize: "64MiB", MaxSeries: 10000}
+func localConfig(t testing.TB) config.TelemetryLocal {
+	return config.TelemetryLocal{Enabled: true, Path: t.TempDir(), Retention: "168h", MaxSize: "64MiB", MaxSeries: 10000}
 }
-func openLocal(t testing.TB, cfg config.TelemetryStorage) *Local {
+func openLocal(t testing.TB, cfg config.TelemetryLocal) *Local {
 	t.Helper()
 	backend, err := OpenLocal(cfg, testLogger())
 	if err != nil {
@@ -73,7 +74,7 @@ func TestLocalCollectorExporterRestartPrecisionAndSandboxLookup(t *testing.T) {
 	for n := 0; n < scope.Metrics().Len(); n++ {
 		scope.Metrics().At(n).Gauge().DataPoints().At(0).SetTimestamp(pcommon.NewTimestampFromTime(stamp))
 	}
-	factory := primaryFactory(backend)
+	factory := localFactory(backend)
 	writer, err := factory.CreateMetrics(ctx, exporter.Settings{ID: component.NewID(factory.Type())}, factory.CreateDefaultConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -91,14 +92,14 @@ func TestLocalCollectorExporterRestartPrecisionAndSandboxLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend = openLocal(t, cfg)
-	first, last, found, err := backend.Bounds(ctx, "sandbox")
+	first, last, found, err := backend.Bounds(ctx, envdSelection("sandbox"))
 	if err != nil || !found || first.UnixMilli() != stamp.UnixMilli() || last.UnixNano()%int64(time.Millisecond) != 0 {
 		t.Fatalf("bounds/precision %s %s %v %v", first, last, found, err)
 	}
-	if _, _, found, err := backend.Bounds(ctx, "stable-sandbox"); err != nil || found {
+	if _, _, found, err := backend.Bounds(ctx, envdSelection("stable-sandbox")); err != nil || found {
 		t.Fatal("StableID fallback", found, err)
 	}
-	points, err := backend.Query(ctx, extension.Query{SandboxID: "sandbox", Start: stamp.Add(-time.Second), End: stamp.Add(time.Second), Step: 5 * time.Second})
+	points, err := backend.Query(ctx, extension.Query{Selection: envdSelection("sandbox"), Aggregation: extension.Max, Start: stamp.Add(-time.Second), End: stamp.Add(time.Second), Step: 5 * time.Second})
 	if err != nil || len(points) != 7 {
 		t.Fatalf("restart read = %v %v", points, err)
 	}
@@ -135,13 +136,15 @@ func TestLocalDuplicateAndOutOfOrderSamples(t *testing.T) {
 		t.Fatal("unbounded out-of-order accepted")
 	}
 	// Failed transactions cannot leak changed data into the reader.
-	points, err := backend.Query(ctx, extension.Query{SandboxID: "sandbox", Start: stamp.Add(-2 * time.Second), End: stamp, Step: time.Second})
-	if err != nil || len(points) != 14 {
+	points, err := backend.Query(ctx, extension.Query{Selection: envdSelection("sandbox"), Aggregation: extension.Max, Start: stamp.Add(-2 * time.Second), End: stamp, Step: time.Second})
+	if err != nil || seriesPointCount(points) != 14 {
 		t.Fatalf("samples after rollback = %v %v", points, err)
 	}
-	for _, point := range points {
-		if point.Field == extension.CPUCount && point.Value != 4 {
-			t.Fatal("failed append changed history", point)
+	for _, series := range points {
+		for _, point := range series.Points {
+			if series.Metric == resourceMetrics[e2bCPUCount].name && point.Value != 4 {
+				t.Fatal("failed append changed history", point)
+			}
 		}
 	}
 }
@@ -166,7 +169,7 @@ func TestLocalRetentionCardinalityAndSourceIsolation(t *testing.T) {
 	if err := backend.Write(ctx, resourceSamples(t, "expired", now.Add(-2*time.Minute))); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, found, err := backend.Bounds(ctx, "expired"); err != nil || found {
+	if _, _, found, err := backend.Bounds(ctx, envdSelection("expired")); err != nil || found {
 		t.Fatal("expired write retained", err)
 	}
 	if err := backend.Write(ctx, resourceSamples(t, "sid", now.Add(-time.Second))); err != nil {
@@ -180,7 +183,7 @@ func TestLocalRetentionCardinalityAndSourceIsolation(t *testing.T) {
 	}
 	// The retention clock is atomic because TSDB block maintenance runs in the background.
 	clock.Store(now.Add(2 * time.Minute).UnixNano())
-	if _, _, found, err := backend.Bounds(ctx, "sid"); err != nil || found {
+	if _, _, found, err := backend.Bounds(ctx, envdSelection("sid")); err != nil || found {
 		t.Fatal("expired head readable", err)
 	}
 	if err := backend.expireHead(); err != nil {
@@ -204,7 +207,7 @@ func TestLocalGuestResourceNameCannotPolluteE2BHistory(t *testing.T) {
 	if err := backend.Write(context.Background(), samples); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, found, err := backend.Bounds(context.Background(), "sid"); found || err != nil {
+	if _, _, found, err := backend.Bounds(context.Background(), envdSelection("sid")); found || err != nil {
 		t.Fatal("guest OTLP metric masqueraded as envd", found, err)
 	}
 }
@@ -232,7 +235,7 @@ func TestLocalOpenAndBackgroundErrorsPropagate(t *testing.T) {
 	if err := backend.Write(context.Background(), nil); !errors.Is(err, want) {
 		t.Fatal("unhealthy write", err)
 	}
-	if _, _, _, err := backend.Bounds(context.Background(), "sid"); !errors.Is(err, want) {
+	if _, _, _, err := backend.Bounds(context.Background(), envdSelection("sid")); !errors.Is(err, want) {
 		t.Fatal("unhealthy reader", err)
 	}
 }
@@ -295,7 +298,7 @@ func TestLocalSizeRetentionDropsCompactedHistory(t *testing.T) {
 	if err := backend.db.Compact(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	start, _, found, err := backend.Bounds(context.Background(), "sid")
+	start, _, found, err := backend.Bounds(context.Background(), envdSelection("sid"))
 	if err != nil || !found || !start.After(now) {
 		t.Fatal("size retention did not remove old compacted samples", start, found, err)
 	}
@@ -336,7 +339,15 @@ func BenchmarkLocalHistoryQuery(b *testing.B) {
 	if err := backend.Write(context.Background(), samples); err != nil {
 		b.Fatal(err)
 	}
-	query := extension.Query{SandboxID: "sandbox", Start: now, End: now.Add(time.Hour), Step: 30 * time.Second}
+	query := extension.Query{Selection: envdSelection("sandbox"), Aggregation: extension.Max, Start: now, End: now.Add(time.Hour), Step: 30 * time.Second}
+	if _, err := backend.Query(context.Background(), query); err != nil {
+		b.Fatal(err)
+	}
+	filesBefore, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		b.Fatal(err)
+	}
+	goroutinesBefore := runtime.NumGoroutine()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -344,4 +355,11 @@ func BenchmarkLocalHistoryQuery(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+	b.StopTimer()
+	filesAfter, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(len(filesAfter)-len(filesBefore)), "FD-delta")
+	b.ReportMetric(float64(runtime.NumGoroutine()-goroutinesBefore), "goroutine-delta")
 }

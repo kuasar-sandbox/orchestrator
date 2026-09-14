@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/app/telemetry/extension"
 	customotel "github.com/kuasar-sandbox/orchestrator/app/telemetry/otel"
 	"github.com/kuasar-sandbox/orchestrator/config"
 )
@@ -28,21 +27,26 @@ func TestCollectorDeploymentExamplesStart(t *testing.T) {
 			}
 			// Test-owned paths/ports replace deployment host resources. The graph,
 			// native options and provider references are read from the real file.
-			cfg.Telemetry.Storage.Path = filepath.Join(t.TempDir(), "db")
+			cfg.Local.Path = filepath.Join(t.TempDir(), "db")
 			otlp := cfg.Collector["receivers"].(map[string]any)["sandboxotlp"].(map[string]any)
 			otlp["http_listen"], otlp["grpc_listen"] = "127.0.0.1:0", "127.0.0.1:0"
 			if err := config.ValidateTelemetryFinal(cfg); err != nil {
 				t.Fatal(err)
 			}
-			var backend extension.Storage
-			if cfg.Telemetry.Storage.Type == "local" {
-				backend, err = OpenLocal(cfg.Telemetry.Storage, testLogger())
+			var backend *Local
+			if cfg.Local.Enabled {
+				backend, err = OpenLocal(cfg.Local, testLogger())
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer backend.Shutdown(context.Background())
 			}
-			collector, err := NewCollector(t.Context(), *cfg, NewView(1), backend, customotel.Components{}, testLogger(), make(chan error, 1))
+			collector, err := NewCollector(t.Context(), *cfg, NewView(1), func() sampleWriter {
+				if backend != nil {
+					return backend
+				}
+				return nil
+			}(), customotel.Components{}, testLogger(), make(chan error, 1))
 			if err != nil {
 				t.Fatal(err)
 			}

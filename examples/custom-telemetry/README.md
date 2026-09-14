@@ -41,13 +41,24 @@ and user `application.run_id` is retained. Native static factories may add
 receivers, processors, exporters, connectors, Collector extensions, config
 providers and converters; instances and pipeline edges stay declarative.
 
-Custom primary storage binds `Runtime.Storage` with `storage.type: custom` and
-implements `extension.Storage` (canonical Collector writes, exact-SandboxID
-Bounds/Query, Shutdown). It is not an extra exporter. `Runtime.StorageHeaders`
-provides material for built-in Prometheus/ClickHouse primary backends. Extra
-Collector exporters bind through the separate `otel.Components.Exporters` list
-and do not make history queryable. The ordinary `extension` package has no OTel
-types and no dynamic registry/DI container.
+[query.yaml](query.yaml) is a separate query-only configuration: it selects the
+Prometheus Reader and the real HTTP handler in [query.go](query.go), without
+Collector or local storage. Set the query endpoint and protected read credentials.
+`/sandboxes/{SandboxID}/metrics?metric=task_temperature` returns raw generic
+`Series` JSON with `X-Metrics-Contract: kuasar-example-series-v1`. Repeated `metric`
+parameters select up to 64 exact backend names. This response is its own contract;
+E2B SDKs must use `query.handler: e2b`. Conductor keeps opaque forwarding for both.
+The handler's Reader is bound to the authorized exact SandboxID and cannot query
+another sandbox through client parameters or a replacement context.
+
+A custom Reader binds `Runtime.QueryBackend` with `query.backend: custom` and
+implements `extension.QueryBackend`: Selection-based Bounds, generic Series Query
+and Shutdown. No Write method or Collector graph is required. `Runtime.QueryHeaders`
+provides read credentials for built-in Prometheus/ClickHouse backends; native
+Collector config providers independently supply exporter credentials. A provider
+error does not fall back to YAML or local DB. `local.enabled` explicitly creates
+the optional TSDB, and `sandboxlocal` exports to it through Collector. The
+`extension` package has no OTel types, dynamic registry or DI container.
 
 See the complete [telemetry specification](../../docs/telemetry.md) and
 [extension contract](../../docs/extensions.md#telemetry-bootstrap-and-extension).

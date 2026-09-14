@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"reflect"
 
-	"github.com/kuasar-sandbox/orchestrator/app/telemetry/extension"
 	customotel "github.com/kuasar-sandbox/orchestrator/app/telemetry/otel"
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector"
@@ -60,7 +59,7 @@ func factoryMap[T component.Factory](factories []T) (map[component.Type]T, error
 	return otelcol.MakeFactoryMap(factories...)
 }
 
-func collectorFactories(cfg config.Telemetry, view *View, backend extension.Storage, custom customotel.Components, logger *slog.Logger, fatal chan error) (otelcol.Factories, error) {
+func collectorFactories(cfg config.Telemetry, view *View, backend sampleWriter, custom customotel.Components, logger *slog.Logger, fatal chan error) (otelcol.Factories, error) {
 	report := func(err error) {
 		select {
 		case fatal <- err:
@@ -83,7 +82,7 @@ func collectorFactories(cfg config.Telemetry, view *View, backend extension.Stor
 	}
 	exporters := []exporter.Factory{otlpexporter.NewFactory(), otlphttpexporter.NewFactory(), debugexporter.NewFactory(), prometheusremotewriteexporter.NewFactory(), clickhouseexporter.NewFactory()}
 	if backend != nil {
-		exporters = append(exporters, primaryFactory(backend))
+		exporters = append(exporters, localFactory(backend))
 	}
 	factories.Exporters, err = factoryMap(append(exporters, custom.Exporters...))
 	if err != nil {
@@ -99,7 +98,7 @@ func collectorFactories(cfg config.Telemetry, view *View, backend extension.Stor
 
 // NewCollector resolves providers and uses the Collector's own component
 // unmarshalling, validation and service assembly for all signals and pipelines.
-func NewCollector(ctx context.Context, cfg config.Telemetry, view *View, backend extension.Storage, custom customotel.Components, logger *slog.Logger, fatal chan error) (_ *Collector, resultErr error) {
+func NewCollector(ctx context.Context, cfg config.Telemetry, view *View, backend sampleWriter, custom customotel.Components, logger *slog.Logger, fatal chan error) (_ *Collector, resultErr error) {
 	factories, err := collectorFactories(cfg, view, backend, custom, logger, fatal)
 	if err != nil {
 		return nil, err

@@ -40,23 +40,30 @@ func renderTelemetryConfig(template bool, path string) ([]byte, error) {
 	return output, nil
 }
 
-const telemetryConfigSkeleton = `# node-ctl telemetry serve --config <this>
-# Independent component: never participates in create/resume readiness barriers.
+const telemetryConfigSkeleton = `# node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
+# Separate from conductor.yaml/proxy.yaml; never a create/resume barrier.
 config_socket: /run/sandbox/node-ctl.socket
 api_socket: /run/sandbox/telemetry.sock
-# Bind OTLP directly in the sandbox-facing network namespace, as for Proxy/MMDS.
+# Use the namespace carrying the existing connector management path.
 # proxy_netns: sandbox-proxy
-# Applies only to the sandbox OTLP listeners, not remote exporter/query clients.
+# For loopback listeners in the existing connector management namespace, add
+# these to the actual vswitch start command, retaining its MMDS mapping:
+#   --mgmt-extract=sandbox-proxy:sw0m0:169.254.169.254/32
+#   --mgmt-service=169.254.169.254:4317:127.0.0.1:4317
+#   --mgmt-service=169.254.169.254:4318:127.0.0.1:4318
+# Enable route_localnet on that management device and bind the OTLP addresses
+# below to 127.0.0.1. Empty proxy_netns uses the current process namespace.
+# This never changes the network used by remote exporters/query clients or UDS.
 route_capacity: 65536
 paths:
   # telemetry_executable: /opt/kuasar/bin/custom-telemetry
-telemetry:
-  storage:
-    type: local
-    path: /var/lib/sandbox/telemetry
-    retention: 168h
-    max_size: 10GiB
-    max_series: 1000000
+query: {backend: local, handler: e2b}
+local:
+  enabled: true
+  path: /var/lib/sandbox/telemetry
+  retention: 168h
+  max_size: 10GiB
+  max_series: 1000000
 collector:
   receivers:
     envd:
@@ -79,7 +86,7 @@ collector:
       send_batch_size: 8192
       send_batch_max_size: 8192
   exporters:
-    sandboxstorage: {}
+    sandboxlocal: {}
     # otlp_http/observability:
     #   endpoint: https://collector.example.com
   service:
@@ -90,5 +97,6 @@ collector:
       metrics:
         receivers: [envd, sandboxstats, sandboxotlp]
         processors: [batch]
-        exporters: [sandboxstorage]
+        exporters: [sandboxlocal]
+# See docs/telemetry.md for Collector pipelines and query backends.
 `

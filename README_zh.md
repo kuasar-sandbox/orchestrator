@@ -15,7 +15,7 @@
 
 - **Conductor**:权威控制 API、Sandbox/Build 生命周期、本地路由、凭据管理与可选节点资源准入。
 - **Proxy**:唯一沙箱数据入口,负责 Envd、floating-IP 服务、native exec、MMDS 与 traffic observation。
-- **Telemetry**：独立 envd/OTLP 指标采集、可信沙箱身份、Collector pipeline、embedded TSDB 或 readable external storage、exporter 与 E2B 历史查询。
+- **Telemetry**：独立 envd/native stats/OTLP 采集、可信沙箱身份、原生 Collector pipeline、可选本地 TSDB、独立远端写入与查询、E2B/自定义 HTTP handler。
 - **Node link**:可选客户端,把节点接入集群控制面。
 - **Launch helpers**:systemd 管理的 Sandbox/Build runner。
 - **Administration**:资源状态/drain、模板构建状态、配置检查、manifest-key 管理与 Sandbox export/import。
@@ -226,8 +226,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 - [Node](docs/node_zh.md):节点架构、命令、配置、E2B API、生命周期、凭据与可靠性。
 - [Node Build](docs/node-build_zh.md):完整 Build API、配置、执行、发布与恢复。
-- [Runtime extensions](docs/extensions_zh.md):完整 Conductor/Proxy/Telemetry SDK 生命周期、source、Hook、wrapper 与 storage/Collector 绑定。
-- [Telemetry](docs/telemetry_zh.md)：直接 FloatingIP OTLP ingress、envd 采集、local/Prometheus/ClickHouse 主存储、exporter、E2B 历史与身份不变量。
+- [Runtime extensions](docs/extensions_zh.md):完整 Conductor/Proxy/Telemetry SDK 生命周期、source、Hook、wrapper 与 query/Collector 绑定。
+- [Telemetry](docs/telemetry_zh.md)：FloatingIP OTLP ingress、envd/native stats 采集、原生 Collector 多 pipeline、独立 local/Prometheus/ClickHouse 查询与写入、E2B 和自定义 HTTP 查询。
 - [Journal 身份](docs/node-journald_zh.md):独立 Sandbox/Build 输出身份、StableID、查询与验证。
 - [Node Proxy](docs/node-proxy_zh.md):独立数据面、路由、鉴权、MMDS 与 native exec。
 - [Node resource](docs/node-resource_zh.md):节点准入、reservation、水位、inventory 恢复与统计。

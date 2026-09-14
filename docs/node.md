@@ -51,8 +51,9 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 Alongside the application data path below, `node-ctl telemetry serve` subscribes
 to the same full Plugin Plane RouteEntry stream. It scrapes envd over UDS and
 directly accepts FloatingIP-identified guest OTLP in the management namespace.
-Its Collector pipeline writes the selected primary (embedded TSDB by default)
-and extra exporters. Conductor forwards authenticated metrics queries over the
+Its Collector pipelines use standard exporter configuration; the local TSDB opens
+only when explicitly enabled. Query backends and HTTP handlers are selected independently,
+and query-only requires no Collector graph. Conductor forwards authenticated metrics queries over the
 independent registered API UDS; no telemetry work enters lifecycle barriers.
 The complete topology, failure and identity contracts are in [Telemetry](telemetry.md).
 
@@ -195,7 +196,8 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 This is an independent component with its own strict config schema and
 `paths.telemetry_executable` static bootstrap option. It registers fixed Plugin
 ID `telemetry`, subscribes with `Kind: route`, and registers a separate HTTP
-query UDS only when primary storage is readable. It does not join Create/Resume
+query UDS only when a Reader and HTTP handler are selected. Writes and reads
+are independent; query-only requires neither Collector nor local TSDB. It does not join Create/Resume
 readiness or call Wake. Native Collector configuration selects envd, sandboxstats
 and sandboxotlp receivers, standard processors/exporters/connectors/extensions
 and multiple pipelines. Sandboxstats uses only the current telemetry lease on

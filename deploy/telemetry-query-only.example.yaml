@@ -1,0 +1,24 @@
+# Query-only: omit Collector entirely. No receiver, exporter or local DB starts.
+# The selected remote backend must provide the independent remote-read API.
+config_socket: /run/sandbox/node-ctl.socket
+# proxy_netns: sandbox-proxy
+query:
+  backend: prometheus
+  handler: e2b
+  lookback: 168h
+  prometheus:
+    endpoint: https://prometheus.example.com
+    labels:
+      sandbox.id: sandbox_id
+      sandbox.stable_id: sandbox_stable_id
+      sandbox.telemetry.source: sandbox_telemetry_source
+  e2b:
+    source: envd
+    metrics:
+      cpuCount: sandbox_cpu_count
+      cpuUsedPct: sandbox_cpu_used
+      memTotal: sandbox_memory_total
+      memUsed: sandbox_memory_used
+      memCache: sandbox_memory_cache
+      diskTotal: sandbox_disk_total
+      diskUsed: sandbox_disk_used
