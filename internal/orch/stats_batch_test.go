@@ -141,3 +141,15 @@ func TestNativeStatsBatchGlobalConcurrencyAndCancellation(t *testing.T) {
 		t.Fatal("cancellation leaked read slots", len(rows), err)
 	}
 }
+
+func TestNativeStatsBatchMissingSandbox(t *testing.T) {
+	o := testOrch(t)
+	for _, section := range []string{"resource", "traffic", "usage"} {
+		t.Run(section, func(t *testing.T) {
+			rows, err := o.ReadStats(context.Background(), conductorextension.StatsRequest{SandboxIDs: []string{"missing-sandbox"}, Sections: []string{section}})
+			if rows != nil || !errors.Is(err, api.ErrNotFound) {
+				t.Fatalf("missing sandbox: rows=%+v err=%v", rows, err)
+			}
+		})
+	}
+}

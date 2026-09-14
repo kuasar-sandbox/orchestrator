@@ -56,6 +56,9 @@ func (o *Orchestrator) ReadStats(ctx context.Context, request conductorextension
 			if err != nil {
 				return err
 			}
+			if sb == nil {
+				return api.ErrNotFound
+			}
 			row := conductorextension.SandboxStats{SandboxID: sb.ID, StableID: sb.StableID()}
 			if sections["resource"] {
 				row.Resource, err = o.readResourceStats(readCtx, sb)
