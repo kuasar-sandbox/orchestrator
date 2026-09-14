@@ -196,7 +196,10 @@ This is an independent component with its own strict config schema and
 `paths.telemetry_executable` static bootstrap option. It registers fixed Plugin
 ID `telemetry`, subscribes with `Kind: route`, and registers a separate HTTP
 query UDS only when primary storage is readable. It does not join Create/Resume
-readiness or call Wake. Local TSDB, Prometheus and ClickHouse readers, direct
+readiness or call Wake. Native Collector configuration selects envd, sandboxstats
+and sandboxotlp receivers, standard processors/exporters/connectors/extensions
+and multiple pipelines. Sandboxstats uses only the current telemetry lease on
+conductor config_socket; native stats remain independent of telemetry. Local TSDB, Prometheus and ClickHouse readers, direct
 sandbox OTLP networking, E2B steps/MAX behavior and bounds are specified in
 [Telemetry](telemetry.md). Use `deploy/node-telemetry.service` alongside, not as
 a required dependency of, conductor/Proxy.

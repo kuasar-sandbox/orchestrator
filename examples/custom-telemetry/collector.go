@@ -7,7 +7,6 @@ import (
 	"context"
 
 	"github.com/kuasar-sandbox/orchestrator/app/telemetry"
-	customotel "github.com/kuasar-sandbox/orchestrator/app/telemetry/otel"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -21,13 +20,13 @@ func bindCollector(runtime *telemetry.Runtime) {
 				for i := 0; i < data.ResourceMetrics().Len(); i++ {
 					data.ResourceMetrics().At(i).Resource().Attributes().PutStr("deployment.environment.name", "example")
 				}
-				// Preserve the ingress context: core's final identity guard checks
-				// the original trusted peer/target again before any exporter.
+				// Accepted identity is already stored on each pdata resource;
+				// ordinary batch, queue and retry can detach the request context.
 				return next.ConsumeMetrics(ctx, data)
 			}, consumer.WithCapabilities(consumer.Capabilities{MutatesData: true}))
 			return &deploymentProcessor{Metrics: metrics}, err
 		}, component.StabilityLevelStable))
-	runtime.Collector.Processors = []customotel.Processor{{Factory: factory}}
+	runtime.Collector.Processors = []processor.Factory{factory}
 }
 
 type deploymentProcessor struct{ consumer.Metrics }

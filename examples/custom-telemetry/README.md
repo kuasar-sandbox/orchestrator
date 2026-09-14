@@ -16,26 +16,30 @@ is rejected. Node-ctl validates the file, creates sealed bootstrap, and replaces
 itself in place; there is no fallback after a custom startup failure.
 
 The same `proxy_netns` configuration reaches `Configure` as `Config.ProxyNetNS`.
-It selects the namespace for both sandbox OTLP listeners; it does not move this
-executable or its remote clients. Rename the early Preview `sandbox_netns` key:
-strict bootstrap/config decoding rejects that old name. See the
-[management network deployment](../../docs/telemetry.md#4-direct-sandbox-facing-otlp).
+It selects both sandbox OTLP listeners' namespace without moving the executable
+or remote clients. The early Preview `sandbox_netns` key is rejected by strict
+bootstrap/config decoding. See the [management deployment](../../docs/telemetry.md#4-direct-sandbox-facing-otlp).
 
 `Configure` runs once before stores/listeners. Config contains declarations;
-Runtime contains nonserializable process-local bindings. The example retains
-the selected primary storage, logs extension start/stop, and optionally provides
-extra-exporter Authorization headers from `TELEMETRY_EXPORTER_AUTHORIZATION`.
-When supplied, that provider replaces the YAML header map; failure never falls
-back to YAML credentials. Do not log/upload secrets or diagnostic environments.
-Production builds can replace it with a secret-file or credential service.
+Runtime contains process-local bindings. The example logs lifecycle start/stop and
+registers the `privatedeployment` processor factory. Native config providers supply
+exporter credentials through component options, for example `${env:OTLP_TOKEN}`;
+provider failure fails startup instead of selecting alternative credentials.
+[telemetry.yaml](telemetry.yaml) is a complete write-only example using all three
+native receivers, the custom processor, batch and an OTLP HTTP exporter. Set
+`OTLP_ENDPOINT` to the destination. With no selected reader, `/metrics` remains
+unavailable; native conductor stats continue to work.
 
-`collector.go` separately demonstrates the narrow `app/telemetry/otel` API: a
-real Collector processor adds a deployment attribute and preserves the ingress
-context. Core surrounds custom processors with identity enrichment and a final
-guard. Do not detach the context, merge different sandbox identities into one
-resource, replace trusted attributes, or insert receivers ahead of the guard.
-Core rejects missing/stale identity and overwrites sandbox ID/StableID before
-primary storage and every exporter; RunID is excluded.
+Add `privatedeployment: {}` to `collector.processors` and include
+`privatedeployment` in the desired pipeline's `processors` list. Merely registering
+a factory does not insert it into every pipeline. `collector.go` demonstrates a
+normal mutating Collector processor. Source identity is already accepted into
+each pdata resource, so standard batch, queue and retry can lose the original
+request context and combine multiple resources. Do not merge different sandbox
+identities into a single resource. Pause/delete does not discard accepted history,
+and user `application.run_id` is retained. Native static factories may add
+receivers, processors, exporters, connectors, Collector extensions, config
+providers and converters; instances and pipeline edges stay declarative.
 
 Custom primary storage binds `Runtime.Storage` with `storage.type: custom` and
 implements `extension.Storage` (canonical Collector writes, exact-SandboxID

@@ -1,0 +1,50 @@
+# Independent write-only Collector; no local DB and no query API registration.
+config_socket: /run/sandbox/node-ctl.socket
+# proxy_netns: sandbox-proxy
+telemetry:
+  storage: {type: none}
+collector:
+  receivers:
+    envd: {collection_interval: 5s, timeout: 1s, concurrency: 64}
+    sandboxstats: {resource_interval: 5s, traffic_interval: 10s, usage_interval: 1m}
+    sandboxotlp: {grpc_listen: ':4317', http_listen: ':4318'}
+  processors:
+    filter/selection:
+      metrics:
+        metric: ['name == "sandbox.traffic.service.idle_since"']
+    transform/deployment:
+      metric_statements:
+        - context: resource
+          statements: ['set(attributes["deployment.environment.name"], "production")']
+    batch:
+      timeout: 1s
+      send_batch_size: 8192
+      send_batch_max_size: 8192
+  connectors:
+    routing/source:
+      default_pipelines: [metrics/native]
+      table:
+        - context: resource
+          condition: 'attributes["sandbox.telemetry.source"] == "envd"'
+          pipelines: [metrics/envd]
+  exporters:
+    otlp_http/envd:
+      endpoint: ${env:OTLP_ENVD_ENDPOINT:-https://envd-collector.example.com}
+      timeout: 10s
+      sending_queue: {enabled: true, queue_size: 256, num_consumers: 2}
+      retry_on_failure: {enabled: true, max_elapsed_time: 30s}
+    otlp_http/native:
+      endpoint: ${env:OTLP_NATIVE_ENDPOINT:-https://native-collector.example.com}
+      timeout: 10s
+      sending_queue: {enabled: true, queue_size: 256, num_consumers: 2}
+      retry_on_failure: {enabled: true, max_elapsed_time: 30s}
+  service:
+    extensions: []
+    telemetry: {metrics: {level: none}}
+    pipelines:
+      metrics/input:
+        receivers: [envd, sandboxstats, sandboxotlp]
+        processors: [filter/selection, transform/deployment, batch]
+        exporters: [routing/source]
+      metrics/envd: {receivers: [routing/source], exporters: [otlp_http/envd]}
+      metrics/native: {receivers: [routing/source], exporters: [otlp_http/native]}

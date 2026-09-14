@@ -47,6 +47,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
 . "$SCRIPT_DIR/lib/execute_state.sh"
 . "$SCRIPT_DIR/lib/native_usage.sh"
+. "$SCRIPT_DIR/lib/telemetry_stats.sh"
 NATIVE_USAGE_SAMPLE=1s
 NATIVE_USAGE_FLUSH=2s
 BIN="${BIN:-$REPO_ROOT/bin}"
@@ -2069,6 +2070,7 @@ wait_proxy_traffic_stats "$SID" paused || fail "paused traffic stats were not st
 wait_resource_status "$SID" 409 || fail "paused resource stats did not converge to 409"
 wait_paused_cleanup "$SID" || fail "paused runtime ownership did not durably clear"
 assert_native_usage "$SID" paused
+assert_paused_usage_export "$SID" "$WORK/usage-$SID-paused.json"
 # Keep the sandbox durably paused for longer than several service counter ticks.
 # On restore the counter must resume from the frozen snapshot rather than track
 # this host wall-clock interval.

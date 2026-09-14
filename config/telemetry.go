@@ -4,21 +4,21 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/util"
+	"go.opentelemetry.io/collector/confmap"
 	"golang.org/x/net/http/httpguts"
 )
 
 // Telemetry is the independent node-ctl telemetry declarative configuration.
 // It does not configure the conductor, data proxy, or sandbox lifecycle.
 type Telemetry struct {
+	Collector     map[string]any    `yaml:"collector,omitempty" json:"collector,omitempty"`
 	ConfigSocket  string            `yaml:"config_socket" json:"config_socket"`
 	APISocket     string            `yaml:"api_socket" json:"api_socket"`
 	ProxyNetNS    string            `yaml:"proxy_netns,omitempty" json:"proxy_netns,omitempty"`
@@ -32,29 +32,11 @@ type TelemetryPaths struct {
 }
 
 type TelemetryPipeline struct {
-	Scrape    TelemetryScrape     `yaml:"scrape" json:"scrape"`
-	OTLP      TelemetryOTLP       `yaml:"otlp" json:"otlp"`
-	Storage   TelemetryStorage    `yaml:"storage" json:"storage"`
-	Exporters []TelemetryExporter `yaml:"exporters,omitempty" json:"exporters,omitempty"`
+	Storage TelemetryStorage `yaml:"storage" json:"storage"`
 }
 
-type TelemetryScrape struct {
-	Interval    string `yaml:"interval" json:"interval"`
-	Timeout     string `yaml:"timeout" json:"timeout"`
-	Concurrency int    `yaml:"concurrency" json:"concurrency"`
-}
-
-type TelemetryOTLP struct {
-	Enabled         *bool  `yaml:"enabled" json:"enabled"`
-	GRPCListen      string `yaml:"grpc_listen" json:"grpc_listen"`
-	HTTPListen      string `yaml:"http_listen" json:"http_listen"`
-	MaxConnections  int    `yaml:"max_connections" json:"max_connections"`
-	MaxRequests     int    `yaml:"max_requests" json:"max_requests"`
-	MaxRequestBytes int    `yaml:"max_request_bytes" json:"max_request_bytes"`
-}
-
-// TelemetryStorage selects the primary write AND read backend. Exporters below
-// are only fan-out destinations; configuring one never enables metrics queries.
+// TelemetryStorage selects the primary read/write adapter. Collector exporters
+// are configured independently in Collector; their presence does not enable queries.
 type TelemetryStorage struct {
 	Type       string              `yaml:"type" json:"type"`
 	Path       string              `yaml:"path,omitempty" json:"path,omitempty"`
@@ -75,13 +57,6 @@ type TelemetryClickHouse struct {
 	Headers  map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	Database string            `yaml:"database,omitempty" json:"database,omitempty"`
 	Table    string            `yaml:"table,omitempty" json:"table,omitempty"`
-}
-
-type TelemetryExporter struct {
-	Name     string            `yaml:"name" json:"name"`
-	Type     string            `yaml:"type" json:"type"`
-	Endpoint string            `yaml:"endpoint" json:"endpoint"`
-	Headers  map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 }
 
 func LoadTelemetry(path string) (*Telemetry, error) {
@@ -122,39 +97,9 @@ func (c *Telemetry) applyDefaults() {
 	if c.RouteCapacity == 0 {
 		c.RouteCapacity = 65536
 	}
-	s := &c.Telemetry.Scrape
-	if s.Interval == "" {
-		s.Interval = "5s"
-	}
-	if s.Timeout == "" {
-		s.Timeout = "1s"
-	}
-	if s.Concurrency == 0 {
-		s.Concurrency = 64
-	}
-	o := &c.Telemetry.OTLP
-	if o.Enabled == nil {
-		enabled := true
-		o.Enabled = &enabled
-	}
-	if o.GRPCListen == "" {
-		o.GRPCListen = ":4317"
-	}
-	if o.HTTPListen == "" {
-		o.HTTPListen = ":4318"
-	}
-	if o.MaxConnections == 0 {
-		o.MaxConnections = 256
-	}
-	if o.MaxRequests == 0 {
-		o.MaxRequests = 32
-	}
-	if o.MaxRequestBytes == 0 {
-		o.MaxRequestBytes = 4 << 20
-	}
 	b := &c.Telemetry.Storage
 	if b.Type == "" {
-		b.Type = "local"
+		b.Type = "none"
 	}
 	if b.Path == "" && b.Type == "local" {
 		b.Path = "/var/lib/sandbox/telemetry"
@@ -202,39 +147,6 @@ func validateTelemetry(c *Telemetry, final bool) error {
 	if c.RouteCapacity < 1 || c.RouteCapacity > 1000000 {
 		return fmt.Errorf("telemetry route_capacity must be in [1, 1000000]")
 	}
-	s := c.Telemetry.Scrape
-	interval, err := time.ParseDuration(s.Interval)
-	if err != nil || interval < time.Second || interval > time.Hour {
-		return fmt.Errorf("telemetry scrape.interval must be in [1s, 1h]")
-	}
-	timeout, err := time.ParseDuration(s.Timeout)
-	if err != nil || timeout <= 0 || timeout > interval {
-		return fmt.Errorf("telemetry scrape.timeout must be positive and <= interval")
-	}
-	if s.Concurrency < 1 || s.Concurrency > 1024 {
-		return fmt.Errorf("telemetry scrape.concurrency must be in [1, 1024]")
-	}
-	o := c.Telemetry.OTLP
-	if o.Enabled == nil {
-		return fmt.Errorf("telemetry otlp.enabled must be resolved")
-	}
-	if o.MaxConnections < 1 || o.MaxConnections > 65536 || o.MaxRequests < 1 || o.MaxRequests > 4096 || o.MaxRequestBytes < 1024 || o.MaxRequestBytes > 64<<20 {
-		return fmt.Errorf("telemetry OTLP limits are out of range")
-	}
-	if *o.Enabled {
-		for _, address := range []string{o.GRPCListen, o.HTTPListen} {
-			_, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return fmt.Errorf("telemetry OTLP listen address: %w", err)
-			}
-			if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
-				return fmt.Errorf("telemetry OTLP listen port must be in [0, 65535]")
-			}
-		}
-		if o.GRPCListen == o.HTTPListen {
-			return fmt.Errorf("telemetry OTLP listeners must be distinct")
-		}
-	}
 	b := c.Telemetry.Storage
 	switch b.Type {
 	case "local", "none", "custom", "prometheus", "clickhouse":
@@ -252,8 +164,8 @@ func validateTelemetry(c *Telemetry, final bool) error {
 	if err != nil || size < 64<<20 || size > math.MaxInt64 {
 		return fmt.Errorf("telemetry storage.max_size must be in [64MiB, MaxInt64]")
 	}
-	if b.MaxSeries < 7 || b.MaxSeries > 10000000 {
-		return fmt.Errorf("telemetry storage.max_series must be in [7, 10000000]")
+	if b.MaxSeries < 1 || b.MaxSeries > 10000000 {
+		return fmt.Errorf("telemetry storage.max_series must be in [1, 10000000]")
 	}
 	switch b.Type {
 	case "prometheus":
@@ -273,22 +185,6 @@ func validateTelemetry(c *Telemetry, final bool) error {
 					return fmt.Errorf("telemetry ClickHouse identifier is invalid")
 				}
 			}
-		}
-	}
-	seen := map[string]bool{}
-	if len(c.Telemetry.Exporters) > 16 {
-		return fmt.Errorf("telemetry supports at most 16 extra exporters")
-	}
-	for _, exporter := range c.Telemetry.Exporters {
-		if exporter.Name == "" || len(exporter.Name) > 64 || strings.ContainsAny(exporter.Name, "/\x00\r\n") || seen[exporter.Name] {
-			return fmt.Errorf("telemetry exporters require unique names (max 64 bytes)")
-		}
-		seen[exporter.Name] = true
-		if exporter.Type != "otlphttp" {
-			return fmt.Errorf("telemetry exporter %q: unsupported type %q", exporter.Name, exporter.Type)
-		}
-		if err := validateTelemetryRemote(exporter.Endpoint, exporter.Headers, final); err != nil {
-			return fmt.Errorf("telemetry exporter %q: %w", exporter.Name, err)
 		}
 	}
 	return nil
@@ -319,12 +215,10 @@ func (c *Telemetry) Clone() *Telemetry {
 		return nil
 	}
 	out := *c
-	out.Telemetry.OTLP.Enabled = clonePtr(c.Telemetry.OTLP.Enabled)
+	if c.Collector != nil {
+		out.Collector = confmap.NewFromStringMap(c.Collector).ToStringMap()
+	}
 	out.Telemetry.Storage.Prometheus.Headers = cloneMap(c.Telemetry.Storage.Prometheus.Headers)
 	out.Telemetry.Storage.ClickHouse.Headers = cloneMap(c.Telemetry.Storage.ClickHouse.Headers)
-	out.Telemetry.Exporters = cloneSlice(c.Telemetry.Exporters)
-	for i := range out.Telemetry.Exporters {
-		out.Telemetry.Exporters[i].Headers = cloneMap(c.Telemetry.Exporters[i].Headers)
-	}
 	return &out
 }

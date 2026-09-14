@@ -41,10 +41,14 @@ func testConfig(t *testing.T) *config.Telemetry {
 	}
 	cfg.ConfigSocket = filepath.Join(directory, "plugin.sock")
 	cfg.APISocket = filepath.Join(directory, "query.sock")
+	cfg.Telemetry.Storage.Type = "local"
 	cfg.Telemetry.Storage.Path = filepath.Join(directory, "db")
 	cfg.Telemetry.Storage.MaxSize = "64MiB"
-	cfg.Telemetry.Scrape.Interval = "1s"
-	*cfg.Telemetry.OTLP.Enabled = false
+	cfg.Collector = map[string]any{
+		"receivers": map[string]any{"envd": map[string]any{"collection_interval": "1s"}},
+		"exporters": map[string]any{"sandboxstorage": map[string]any{}},
+		"service":   map[string]any{"telemetry": map[string]any{"metrics": map[string]any{"level": "none"}}, "pipelines": map[string]any{"metrics": map[string]any{"receivers": []any{"envd"}, "exporters": []any{"sandboxstorage"}}}},
+	}
 	return cfg
 }
 func logger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -227,9 +231,8 @@ func TestStartupFailuresCleanUpStorageExtensionAndSockets(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ln.Close()
-				*cfg.Telemetry.OTLP.Enabled = true
-				cfg.Telemetry.OTLP.HTTPListen = "127.0.0.1:0"
-				cfg.Telemetry.OTLP.GRPCListen = ln.Addr().String()
+				cfg.Collector["receivers"].(map[string]any)["sandboxotlp"] = map[string]any{"http_listen": "127.0.0.1:0", "grpc_listen": ln.Addr().String()}
+				cfg.Collector["service"].(map[string]any)["pipelines"].(map[string]any)["metrics"].(map[string]any)["receivers"] = []any{"envd", "sandboxotlp"}
 			}
 			resolved, err := ResolveRuntime(context.Background(), cfg, Bindings{Logger: logger(), Extension: ext})
 			if err != nil {
@@ -283,8 +286,9 @@ func TestQuerySocketExclusiveOwnershipAndRestart(t *testing.T) {
 
 func TestRuntimeProvidersAreAuthoritative(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Telemetry.Exporters = []config.TelemetryExporter{{Name: "extra", Type: "otlphttp", Endpoint: "https://example.com", Headers: map[string]string{"Authorization": "fallback"}}}
-	if _, err := ResolveRuntime(context.Background(), cfg, Bindings{ExporterHeaders: func(context.Context, string) (map[string]string, error) { return nil, errors.New("credential failure") }}); err == nil {
+	cfg.Telemetry.Storage.Type = "prometheus"
+	cfg.Telemetry.Storage.Prometheus = config.TelemetryRemote{Endpoint: "https://example.com", Headers: map[string]string{"Authorization": "fallback"}}
+	if _, err := ResolveRuntime(context.Background(), cfg, Bindings{StorageHeaders: func(context.Context) (map[string]string, error) { return nil, errors.New("credential failure") }}); err == nil {
 		t.Fatal("credentials fell back")
 	}
 	cfg.Telemetry.Storage.Type = "custom"
@@ -292,8 +296,8 @@ func TestRuntimeProvidersAreAuthoritative(t *testing.T) {
 		t.Fatal("custom storage fell back")
 	}
 	cfg.Telemetry.Storage.Type = "none"
-	cfg.Telemetry.Exporters = nil
-	if _, err := ResolveRuntime(context.Background(), cfg, Bindings{}); err == nil {
+	cfg.Collector = nil
+	if err := Run(context.Background(), cfg, &Runtime{Bindings: Bindings{Logger: logger()}}); err == nil {
 		t.Fatal("no output accepted")
 	}
 }
@@ -334,7 +338,8 @@ func TestForwardOnlyRegistersWithoutReadableEndpoint(t *testing.T) {
 	cfg.Telemetry.Storage.Type = "none"
 	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
 	defer sink.Close()
-	cfg.Telemetry.Exporters = []config.TelemetryExporter{{Name: "extra", Type: "otlphttp", Endpoint: sink.URL}}
+	cfg.Collector["exporters"] = map[string]any{"otlp_http/extra": map[string]any{"endpoint": sink.URL}}
+	cfg.Collector["service"].(map[string]any)["pipelines"].(map[string]any)["metrics"].(map[string]any)["exporters"] = []any{"otlp_http/extra"}
 	src := &source{route: routesync.RouteEntry{SandboxID: "sid", StableID: "stable-sid", State: routesync.StatePaused}, events: make(chan routesync.Event), syncs: make(chan struct{}, 1)}
 	registry := servePlugins(t, cfg, src)
 	ext := &lifecycleExtension{}

@@ -20,26 +20,26 @@ Collector pipeline, primary storage, exporters, history queries and E2B conversi
 It does not expand the resource controller or change checkpoint/lifecycle policy.
 
 ```text
-Conductor Plugin Plane ── full RouteEntry stream ──► Telemetry view
-                                                       │
-envd /metrics over per-sandbox UDS ─► envd receiver ─────┤
-guest ─► connector mgmt-extract ─► OTLP HTTP/gRPC ───────┤
-                                                       ▼
-                             Collector: trusted identity enrichment
-                                      → custom processors (optional)
-                                      → final identity guard
-                                      ├─ primary storage exporter → DB
-                                      └─ extra exporters → external collectors
+Conductor Plugin Plane -> full RouteEntry -> Telemetry view
+Conductor config_socket -> native stats -> sandboxstats receiver
+Envd UDS -> envd receiver
+Guest -> connector management -> sandboxotlp receiver
+                |
+      source acceptance + trusted pdata identity
+                |
+Collector native processors / connectors / pipelines
+                |
+       configured exporters -> selected destinations
 
 GET /sandboxes/{SandboxID}/metrics
-  → Conductor API auth + ownership → live registered query UDS
-  → Telemetry E2B handler → primary Reader → same DB
+  -> Conductor auth + ownership -> registered HTTP query UDS
+  -> Telemetry handler -> selected Reader
 ```
 
-Every primary write passes through a real OpenTelemetry Collector service graph
-and exporter. Receivers have no storage handle. The built-in distribution links
-only required Collector components, including OTLP/HTTP extra exporting; it does
-not embed a complete contrib distribution or Prometheus server.
+All collection writes pass through a native OpenTelemetry Collector service
+and configured exporters. Receivers have no storage handle. Native Collector
+configuration selects all pipeline edges and linked signals; the distribution
+does not embed the whole contrib repository or a Prometheus server.
 
 ## 2. Plugin lease and query channel
 
@@ -110,11 +110,100 @@ normalization. There are no `kuasar.sandbox.*` built-in metric names.
 Pause removes the scrape target; resume creates a fresh local generation; delete
 removes it. Endpoint/token changes cancel the old request, and stale responses
 are discarded even if a transport ignores cancellation. Disconnect invalidates
-the entire view until a new full sync and Bookmark. A heap scheduler, bounded
-worker/queue count and global idle pool avoid per-target timer goroutines.
+the entire view until a new full sync and Bookmark. Each `envd/name` instance has its own heap scheduler, bounded
+worker/queue count and idle pool; these avoid per-target timer goroutines.
 Pool keys include UDS, local generation and SandboxID, so one sandbox's UDS
 connection cannot be reused for another. There are at most `concurrency` active
 scrapes and `concurrency` idle scrape connections.
+
+### Native Collector configuration
+
+`collector` is an unmodified Collector configuration map, resolved with native
+confmap providers and component validation. It supports `receivers`, `processors`,
+`exporters`, `connectors`, `extensions`, `service.extensions`, `service.pipelines`
+and `service.telemetry`. The resolved graph is the graph that runs. A factory
+registers its type once; configuration defines instances such as `envd/fast` and
+`envd/slow`, each with its own cadence and lifecycle. Unused or invalid component
+options are not silently translated into a smaller routing language.
+
+| Category | Included component types | Version |
+|---|---|---|
+| Receivers | `envd`, `sandboxstats`, `sandboxotlp` | This orchestrator source |
+| Infrastructure receiver | `otlp` | Collector 0.145.0 |
+| Processors | `batch`, `memory_limiter` | Collector 0.145.0 |
+| Processors | `filter`, `transform` | contrib 0.145.0 |
+| Exporters | `otlp`, `otlp_http`, `debug` | Collector 0.145.0 |
+| Exporters | `prometheusremotewrite`, `clickhouse` | contrib 0.145.0 |
+| Primary adapter exporter | `sandboxstorage` | This orchestrator source |
+| Connector | `routing` | contrib 0.145.0 |
+| Collector extension | `health_check` | contrib 0.145.0 |
+| Config providers | `env`, `file`, `yaml` | confmap 1.51.0 |
+
+Static builds can add every factory category, providers and converters through
+`app/telemetry/otel.Components`. Native `${env:NAME}` and `${file:/path}` resolution
+is supported inside Collector configuration. The selected Collector components
+validate their own options. Standard infrastructure `otlp` and linked exporters
+can carry logs/traces pipelines without SandboxID; only the sandbox business
+receivers are metrics-specific. No logs/traces business query API is introduced.
+`proxy_netns` applies only to each configured `sandboxotlp` instance.
+
+The old `telemetry.scrape`, `telemetry.otlp` and list-style `telemetry.exporters`
+are rejected. Move those settings into native receiver/exporter instances and
+explicitly connect them in `service.pipelines`. Envd options are now
+`collection_interval`, `timeout`, `concurrency`; sandboxotlp retains
+`http_listen`, `grpc_listen`, `max_connections`, `max_requests`,
+`max_request_bytes`, without an `enabled` switch. Include or omit the receiver
+from a pipeline to select it. See the complete [local deployment](../deploy/telemetry.example.yaml)
+and [two-sink configuration](../deploy/telemetry-fanout.example.yaml).
+
+### Native sandboxstats receiver
+
+`sandboxstats` discovers exact SandboxIDs from the same RouteEntry view and calls
+conductor's existing `config_socket` batch adaptation. The current telemetry
+lease and actual peer PID authorize that read; connecting to a UDS does not grant
+ordinary tenant API permissions. It needs no tenant API-key collection and has
+no sandbox ctl client, usage-file access or second port binding map. Conductor
+organizes native sources and retains ownership/binding checks and failure rules.
+
+Configure `resource_interval` (default 5s), `traffic_interval` (10s),
+`usage_interval` (1m), `timeout` (5s maximum), and `concurrency` (default 4, 1..8).
+An interval of zero disables that section; enabled intervals are 1s..1h and at
+least one must be enabled. Each instance issues at most 64 SandboxIDs per request,
+with conductor's 4 MiB response limit. Rounds do not overlap for a section, and
+completion starts the next interval. A due round waits for the route bookmark
+while discovery is unsynchronized, including startup and reconnection, rather
+than consuming an interval as an empty round. Cancellation bounds this wait,
+pending requests and delivery. An unavailable configured source logs an error
+and drops that read; it never exports zeros or a stale complete response. Resource selects current
+starting/running objects; traffic and saved usage also include paused objects.
+Once conductor accepts the object data, later route changes do not revoke it.
+
+All projections below are Gauges with trusted `sandbox.telemetry.source=sandboxstats`.
+Their values describe current counters or native cumulative endpoints, not
+never-reset counters. Native HTTP/usage JSON remains lossless; float64 projection
+can round uint64 values above 2^53 and 128-bit integrals. Telemetry scalar history
+cannot reconstruct the native usage ledger.
+
+| Native section | Metric prefix and suffixes | Observation semantics |
+|---|---|---|
+| resource | `sandbox.resource.cpu.capacity`, `cpu.allocatable`; `memory.capacity`, `memory.headroom`, `memory.reserved`, `memory.used`; `cpu.seconds` | Core counts, bytes, seconds. Configuration/reservation are current reads; host Used/CPU retain native `timestampUnix`. Missing values are omitted independently; valid zero is retained. Headroom is the balloon controller's effective allocatable memory, not node reservation; CPU allocatable is relative weight, not quota |
+| traffic | `sandbox.traffic.state`, `max_inflight`, `idle_since`, `inflight.parking`, `inflight.connected`; `service.parking`, `service.connected`, `service.max_inflight`, `service.idle_since` | Current Proxy ingress read, with state/service attributes. Zero admission limit means unlimited. Optional idle timestamps remain optional and refer only to admitted ingress, never whole-sandbox idle |
+| traffic | `sandbox.traffic.platform` / `sandbox.traffic.transit` + `.rx.packets`, `.rx.bytes`, `.tx.packets`, `.tx.bytes` | Current connector counter read, sandbox direction; never summed across observation points. Missing planes publish no counters; `egress:{}` produces no fake egress series |
+| usage | `sandbox.usage.cpu.seconds`, `memory.integral`, `memory.span`, `memory.covered` | Saved native endpoint only. CPU uses native known nanoseconds / 1e9; integrals use byte-nanoseconds / 1e9, span/coverage nanoseconds / 1e9. `usage.name`, `usage.status`, and CPU `usage.complete` preserve the existing category/validity. Source identities and run_epoch remain native metadata, never labels |
+| usage | `sandbox.usage.saved.available`, `enabled`, `saving`, `unknown_tail`, `save_error`, `read_error` | Separate Boolean Gauges of current read status. They do not redate saved quantities or convert an uncertain tail into reliable zero consumption |
+
+Usage collection requests `view=saved`. Each cumulative quantity retains its
+Record `saved_utc_ns`; repeated reads publish the same endpoint, never add totals
+or reintegrate memory. Unobserved quantities are omitted. Pausing or replacing a
+source invalidates its current position without erasing already saved totals;
+known contributions and coverage remain published with the original record time.
+`usage.source_known`, `usage.position_known`, and `usage.value_known` distinguish
+that saved contribution from a current source observation. Live data
+can be ahead of saved; crash/failed save can lose that unsaved tail. The receiver
+does not force a sample, save, fsync or export acknowledgement and does not change
+native usage policy. Current/live/history, precise integers, raw counters,
+128-bit integrals, coverage and detailed errors remain available through
+[`stats/usage`](node-usage.md). Enabling telemetry does not enable usage.
 
 ## 4. Direct sandbox-facing OTLP
 
@@ -130,7 +219,7 @@ fallback to the host namespace. Only listener creation runs inside the selected
 namespace; the calling thread returns to its original namespace. This setting
 does not move the process or change conductor/query/envd UDS, remote exporters
 or query clients. Those retain their normal process network environment.
-The supported signal is metrics: OTLP/gRPC MetricsService on 4317 and OTLP/HTTP
+The `sandboxotlp` receiver supports metrics: OTLP/gRPC MetricsService on 4317 and OTLP/HTTP
 `POST /v1/metrics` on 4318 (protobuf or JSON, optionally gzip). No OTLP token
 identity scheme is added; application traces/logs are not accepted by this metrics
 component. Do not route these listeners through the application Proxy or another
@@ -146,8 +235,8 @@ MMDS mapping and add these service mappings to the deployment's vswitch command:
 --mgmt-service=169.254.169.254:4318:127.0.0.1:4318
 ```
 
-Set `proxy_netns: sandbox-proxy`, `grpc_listen: 127.0.0.1:4317` and
-`http_listen: 127.0.0.1:4318`. Guest exporters use
+Set outer `proxy_netns: sandbox-proxy` and the `sandboxotlp` receiver
+`grpc_listen: 127.0.0.1:4317`, `http_listen: 127.0.0.1:4318`. Guest exporters use
 `http://169.254.169.254:4318` (or the gRPC port). Connector's existing slot-derived
 SNAT converts the shared guest inner IP to its assigned FloatingIP; service DNAT
 selects telemetry's listener and the management return path restores the guest
@@ -174,13 +263,27 @@ an anonymous keep-alive connection never becomes trusted. Identity is pinned to 
 connection; remap, pause or stream invalidation closes that connection instead
 of turning it into the successor sandbox's connection.
 
-Core overwrites `sandbox.id` and `sandbox.stable_id` from the current route at
-resource level and removes conflicting point/scope identity. The trusted
-`sandbox.telemetry.source=envd|otlp` also cannot be guest-forged: guest OTLP gauges
-named like built-in resource metrics cannot poison E2B envd history. Custom
-processors are bracketed by enrichment and a final revalidation/overwrite guard.
-Losing the private ingress context fails closed. RunID-like attributes are removed
-at resource, scope and datapoint levels, including custom processor output.
+At source acceptance, envd validates the current target and sandbox OTLP validates
+the pinned connection. Core overwrites `sandbox.id`, `sandbox.stable_id` and
+`sandbox.telemetry.source` on each pdata resource and removes conflicting
+point/scope identity. Spellings that normalize to the same standard exporter
+labels (for example `sandbox_id` or `sandbox-telemetry-source`) are reserved too
+and removed before stamping, so Guest attributes cannot merge into trusted
+SID, StableID or source values during export. EnvD uses source `envd`, guest OTLP uses `otlp`; sources are
+not globally restricted to those two names. Guest metrics cannot forge envd
+source even when they copy its metric names. The exact obsolete platform keys
+`sandbox.run_id`, `run_id`, `runId` and `RunID` are removed at ingress; user
+attributes such as `application.run_id` are retained.
+
+Accepted resources carry their own identity through standard batch, queue and
+retry. A batch may contain multiple SandboxIDs. Subsequent pause/deletion or
+loss of the original request context does not revoke accepted history. No view
+lock is held while calling downstream processors or exporters. An unfinished
+envd fetch or unaccepted OTLP request still fails when its target is invalidated.
+Ordinary infrastructure receivers use their own configuration and need no
+SandboxID. Trusted deployment processors and static extensions remain in the
+existing trust domain and can transform pdata; there is no final sandbox-only
+guard across asynchronous pipeline boundaries.
 
 Limits apply before transport decoding where possible: 256 connections per
 listener, 32 concurrent requests globally, 4 MiB per encoded/decompressed HTTP
@@ -193,12 +296,12 @@ stalled client cannot indefinitely retain a global request slot.
 ## 5. Primary storage versus extra exporters
 
 `telemetry.storage` selects exactly one primary with both Collector write and
-`extension.Reader` history read. `telemetry.exporters` and custom Collector
-exporters are additional write-only fan-out. An exporter never implicitly becomes
+`extension.Reader` history read. `collector.exporters` and `service.pipelines` declare all write destinations
+and fan-out edges. An exporter never implicitly becomes
 a primary reader. `storage.type: none` requires an exporter; telemetry still
 collects/enriches/forwards but registers no query API, so public metrics is 503.
 
-### Local (default)
+### Local (explicit opt-in)
 
 The core `sandboxstorage` Collector exporter targets embedded Prometheus TSDB;
 the `Local` backend provides both its writer and the reader of that same DB. No Prometheus web
@@ -306,22 +409,16 @@ Credentials may instead come from Runtime providers. External storage owns its
 disk-size/cardinality enforcement; local-only `max_size`/`max_series` do not
 configure an external server. No external adapter is intentionally deferred.
 
-### Extra exporters and custom primary
+### Native exporters and custom primary
 
-```yaml
-telemetry:
-  exporters:
-    - name: observability
-      type: otlphttp
-      endpoint: https://collector.example.com
-```
-
-Built-in OTLP/HTTP exporters have bounded 16 MiB in-memory queues, two consumers,
-10s request timeout and at most 30s retry elapsed time. These queues are not
-durable history and do not make a failed primary query succeed. Transient
-scrape/export failure drops or retries according to that component; telemetry
-never pauses a sandbox to obtain delivery. Custom primary and Collector
-integration use the [extension contract](extensions.md#telemetry-bootstrap-and-extension).
+Add an exporter under `collector.exporters` and reference its complete ID from
+`collector.service.pipelines`. The [Collector fan-out example](../deploy/telemetry-fanout.example.yaml)
+uses native batch, filter, transform, routing, two OTLP HTTP sinks, queue and retry.
+Native exporter options control queue size, consumers, retry and timeout; they
+are not overwritten by a generated graph. Queues are not durable history unless
+a configured component explicitly provides that behavior. Export failure does
+not pause a sandbox. Static integration follows the
+[extension contract](extensions.md#telemetry-bootstrap-and-extension).
 
 ## 6. E2B history query
 
@@ -420,6 +517,13 @@ synthetic targets, scrape counts, peak goroutines/FDs (including fixture server)
 allocations, TSDB batch writes and local query cost. Receiver and TSDB benchmarks
 are separate diagnostics, not a claim of end-to-end production capacity. Timing
 numbers are not ordinary CI gates; repeat on representative hosts/workloads.
+
+The real guest fixtures additionally export conductor resource/traffic observations
+through sandboxstats, native batch and an HTTP sink on the host network. A paused
+sandbox exports its actual saved usage through the same lease-authorized reader;
+assertions compare CPU/memory cumulative values and the original saved timestamp
+with the public native API and confirm the sandbox stays paused.
+
 The existing real Proxy E2E fixture also exercises envd → Collector → local DB,
 guest OTLP through connector mgmt-extract, auth, paused queries, unavailable
 telemetry, lease revocation and TSDB restart, without a second VM lifecycle.
