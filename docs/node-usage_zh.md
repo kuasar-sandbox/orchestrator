@@ -1,4 +1,4 @@
-[English](node-usage.md)
+[English](node-usage.md) | [简体中文](node-usage_zh.md)
 
 # 原生沙箱 usage 与本机 stats 读取
 

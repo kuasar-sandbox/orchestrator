@@ -1,4 +1,4 @@
-[简体中文](node-usage_zh.md)
+[English](node-usage.md) | [简体中文](node-usage_zh.md)
 
 # Native sandbox usage and local stats reads
 
