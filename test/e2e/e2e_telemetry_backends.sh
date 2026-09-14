@@ -43,7 +43,7 @@ elif [ -z "${BIN:-}" ]; then
     echo 'FAIL: BIN is required for validation without component sources' >&2
     exit 1
 fi
-for tool in docker curl python3; do
+for tool in docker curl python3 timeout; do
     command -v "$tool" >/dev/null || { echo "FAIL: $tool is required" >&2; exit 1; }
 done
 docker info >/dev/null
@@ -81,9 +81,21 @@ trap 'exit 143' TERM
 # recorded. Tests use only loopback-published, disposable service endpoints.
 prometheus_image='prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996'
 clickhouse_image='clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77'
-for image in "$prometheus_image" "$clickhouse_image"; do
-    docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
-done
+prepare_image() {
+    local image="$1"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        # Reuse the public Docker Hub transport already used by platform's
+        # source and exact-assets suites. Docker verifies the unchanged pinned
+        # manifest digest; this does not select another tag or backend version.
+        image="m.daocloud.io/docker.io/$image"
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            timeout 3m docker pull "$image" >&2 || return 1
+        fi
+    fi
+    printf '%s\n' "$image"
+}
+prometheus_image="$(prepare_image "$prometheus_image")"
+clickhouse_image="$(prepare_image "$clickhouse_image")"
 docker image inspect "$prometheus_image" "$clickhouse_image" >"$TELEMETRY_BACKEND_OUT_DIR/images.json"
 cat >"$TELEMETRY_BACKEND_OUT_DIR/prometheus.yml" <<'YAML'
 global:

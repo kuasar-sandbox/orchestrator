@@ -585,7 +585,9 @@ The component-owned backend case creates disposable Prometheus 3.5.0 and
 ClickHouse 25.8 containers from pinned manifest digests, publishes loopback-only
 ports, records actual versions and image identities, and removes its containers
 and volumes on exit. Both engines and every named case are required; missing
-prerequisites, skips and failures are errors. Source CI locates the exact sibling
+prerequisites, skips and failures are errors. Uncached images use platform's
+existing public Docker Hub mirror with a bounded pull and the same pinned
+manifest digest; no tag or backend version is substituted. Source CI locates the exact sibling
 checkout from the assembled `BIN` directory; missing sources remain an error.
 Set `TELEMETRY_SOURCE_ROOT` only for another source layout. The same case runs
 from `test/e2e/run_all.sh` in source and exact-assets validation. Exact-assets uses
