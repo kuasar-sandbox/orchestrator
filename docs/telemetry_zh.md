@@ -494,8 +494,9 @@ make test-e2e # 要求组装的项目 BIN 与真实 KVM host
 ```
 
 组件自有 backend case 从固定 manifest digest 创建临时 Prometheus 3.5.0 和
-ClickHouse 25.8 容器, 只向 loopback 发布端口, 记录实际版本与镜像身份, 并在退出时
-删除自己创建的容器和 volume. 两个引擎与所有具名 case 均必须执行; 缺少前提条件、
+ClickHouse 25.8 容器, 只向 loopback 发布端口, 记录实际版本与镜像身份, 并独占一个
+私有 Docker network. 退出时删除自己创建的容器、volume 和 network, 包括部分启动
+失败的情况; 不依赖或修改共享的默认网桥. 两个引擎与所有具名 case 均必须执行; 缺少前提条件、
 skip 和失败均报错. 未缓存的镜像使用 platform 现有的公共 Docker Hub mirror,
 在有界时间内拉取相同的固定 manifest digest, 不替换 tag 或 backend 版本.
 Source CI 从组装的 `BIN` 目录定位精确 sibling checkout;

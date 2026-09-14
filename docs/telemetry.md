@@ -583,8 +583,10 @@ make test-e2e # assembled project BIN and real KVM host required
 
 The component-owned backend case creates disposable Prometheus 3.5.0 and
 ClickHouse 25.8 containers from pinned manifest digests, publishes loopback-only
-ports, records actual versions and image identities, and removes its containers
-and volumes on exit. Both engines and every named case are required; missing
+ports, records actual versions and image identities, and owns a private Docker
+network. Containers, volumes and that network are removed on exit, including
+partial startup failure; the shared default bridge is not required or modified.
+Both engines and every named case are required; missing
 prerequisites, skips and failures are errors. Uncached images use platform's
 existing public Docker Hub mirror with a bounded pull and the same pinned
 manifest digest; no tag or backend version is substituted. Source CI locates the exact sibling

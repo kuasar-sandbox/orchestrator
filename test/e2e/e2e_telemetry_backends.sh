@@ -58,6 +58,7 @@ mkdir -p "$TELEMETRY_BACKEND_OUT_DIR"
 TELEMETRY_BACKEND_OUT_DIR="$(cd "$TELEMETRY_BACKEND_OUT_DIR" && pwd)"
 prometheus_id=""
 clickhouse_id=""
+backend_network=""
 telemetry_bin=""
 cleanup() {
     local status=$?
@@ -69,6 +70,10 @@ cleanup() {
         docker inspect "$id" >"$TELEMETRY_BACKEND_OUT_DIR/$name-container.json" || true
         docker rm -fv "$id" >/dev/null || status=1
     done
+    if [ -n "$backend_network" ]; then
+        docker network inspect "$backend_network" >"$TELEMETRY_BACKEND_OUT_DIR/network.json" || status=1
+        docker network rm "$backend_network" >/dev/null || status=1
+    fi
     if [ -n "$telemetry_bin" ]; then rm -rf -- "$telemetry_bin"; fi
     echo "Telemetry backend evidence: $TELEMETRY_BACKEND_OUT_DIR"
     exit "$status"
@@ -97,6 +102,11 @@ prepare_image() {
 prometheus_image="$(prepare_image "$prometheus_image")"
 clickhouse_image="$(prepare_image "$clickhouse_image")"
 docker image inspect "$prometheus_image" "$clickhouse_image" >"$TELEMETRY_BACKEND_OUT_DIR/images.json"
+# Own the network just like the containers and data. Privileged guest suites
+# may leave the daemon's default bridge absent; never repair shared docker0 or
+# make a backend fixture depend on that unrelated interface's lifecycle.
+backend_network="$(docker network create --driver bridge --label kuasar.test=telemetry-backends \
+    "telemetry-backends-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')")"
 cat >"$TELEMETRY_BACKEND_OUT_DIR/prometheus.yml" <<'YAML'
 global:
   scrape_interval: 60s
@@ -105,14 +115,17 @@ storage:
   tsdb:
     out_of_order_time_window: 5m
 YAML
-prometheus_id="$(docker create --label kuasar.test=telemetry-backends -p 127.0.0.1::9090 \
+prometheus_id="$(docker create --network "$backend_network" --label kuasar.test=telemetry-backends -p 127.0.0.1::9090 \
     "$prometheus_image" --config.file=/etc/prometheus/prometheus.yml \
     --web.enable-remote-write-receiver --storage.tsdb.retention.time=1h \
     --enable-feature=native-histograms)"
 docker cp "$TELEMETRY_BACKEND_OUT_DIR/prometheus.yml" "$prometheus_id:/etc/prometheus/prometheus.yml"
 docker start "$prometheus_id" >/dev/null
-clickhouse_id="$(docker run -d --label kuasar.test=telemetry-backends -p 127.0.0.1::8123 \
+# Record ownership before start so a failed start cannot leave an untracked
+# ClickHouse container behind.
+clickhouse_id="$(docker create --network "$backend_network" --label kuasar.test=telemetry-backends -p 127.0.0.1::8123 \
     --ulimit nofile=262144:262144 -e CLICKHOUSE_SKIP_USER_SETUP=1 "$clickhouse_image")"
+docker start "$clickhouse_id" >/dev/null
 export TELEMETRY_PROMETHEUS_TEST_URL="http://$(docker port "$prometheus_id" 9090/tcp)"
 export TELEMETRY_CLICKHOUSE_TEST_URL="http://$(docker port "$clickhouse_id" 8123/tcp)"
 for endpoint in "$TELEMETRY_PROMETHEUS_TEST_URL/-/ready" "$TELEMETRY_CLICKHOUSE_TEST_URL/ping"; do
