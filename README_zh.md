@@ -88,7 +88,7 @@
 | `deploy/` | 各角色 example YAML 与 node/Proxy/Telemetry/Registry/Router/Placer systemd unit |
 | `examples/custom-conductor` | 可编译 xconductor,由 node-ctl conductor serve 进入 |
 | `examples/custom-proxy` | 可编译 xproxy,由 node-ctl proxy serve 进入,master reexec worker |
-| `examples/custom-telemetry` | 可编译静态 telemetry App，演示普通扩展与窄 advanced Collector integration |
+| `examples/custom-telemetry` | 可编译静态 telemetry App, 演示原生 Collector factory、pipeline 与 query 扩展 |
 
 ## 构建与测试
 

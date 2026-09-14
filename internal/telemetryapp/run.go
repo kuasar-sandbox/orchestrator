@@ -93,8 +93,7 @@ func Run(ctx context.Context, cfg *config.Telemetry, runtime *Runtime) (resultEr
 			return fmt.Errorf("telemetry extension start: %w", err)
 		}
 	}
-	interval, _ := time.ParseDuration(cfg.Telemetry.Scrape.Interval)
-	view := telemetry.NewView(cfg.RouteCapacity, interval)
+	view := telemetry.NewView(cfg.RouteCapacity)
 	defer view.InvalidateSync()
 	fatal := make(chan error, 1)
 	collector, err := telemetry.NewCollector(ctx, *cfg, view, backend, runtime.Collector, runtime.Logger, fatal)
@@ -147,7 +146,7 @@ func Run(ctx context.Context, cfg *config.Telemetry, runtime *Runtime) (resultEr
 	// First revoke the query lease, then drain query/ingress, then Collector,
 	// extension, and finally TSDB. Storage remains alive for every consumer.
 	defer func() { stopSubscription(); <-subDone }()
-	runtime.Logger.Info("telemetry started", "storage", cfg.Telemetry.Storage.Type, "query", reader != nil, "otlp", *cfg.Telemetry.OTLP.Enabled)
+	runtime.Logger.Info("telemetry started", "storage", cfg.Telemetry.Storage.Type, "query", reader != nil)
 	select {
 	case <-ctx.Done():
 		return nil

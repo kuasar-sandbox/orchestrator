@@ -27,11 +27,10 @@ type Config = config.Telemetry
 // Runtime bindings never enter the sealed declarative bootstrap. Providers are
 // authoritative: errors do not fall back to YAML, local storage, or credentials.
 type Runtime struct {
-	Logger          *slog.Logger
-	Extension       extension.Extension
-	Storage         func(context.Context, config.TelemetryStorage) (extension.Storage, error)
-	ExporterHeaders func(context.Context, string) (map[string]string, error)
-	StorageHeaders  func(context.Context) (map[string]string, error)
+	Logger         *slog.Logger
+	Extension      extension.Extension
+	Storage        func(context.Context, config.TelemetryStorage) (extension.Storage, error)
+	StorageHeaders func(context.Context) (map[string]string, error)
 	// Collector is optional advanced integration, isolated in app/telemetry/otel.
 	Collector customotel.Components
 }
@@ -110,7 +109,7 @@ func (a *App) RunContext(ctx context.Context) error {
 	}
 	frozen := cfg.Clone()
 	resolved, err := telemetryapp.ResolveRuntime(ctx, frozen, telemetryapp.Bindings{Logger: bindings.Logger, Extension: bindings.Extension,
-		Storage: bindings.Storage, ExporterHeaders: bindings.ExporterHeaders, StorageHeaders: bindings.StorageHeaders, Collector: bindings.Collector.Clone()})
+		Storage: bindings.Storage, StorageHeaders: bindings.StorageHeaders, Collector: bindings.Collector.Clone()})
 	if err != nil {
 		return err
 	}

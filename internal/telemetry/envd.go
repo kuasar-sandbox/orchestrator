@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -25,23 +24,44 @@ import (
 )
 
 type envdReceiver struct {
-	view   *View
-	cfg    config.TelemetryScrape
-	next   consumer.Metrics
-	log    *slog.Logger
-	cancel context.CancelFunc
-	done   chan struct{}
+	view     *View
+	cfg      envdReceiverConfig
+	next     consumer.Metrics
+	log      *slog.Logger
+	cancel   context.CancelFunc
+	done     chan struct{}
+	schedule *scrapeSchedule
 }
 
-func envdFactory(view *View, cfg config.TelemetryScrape, logger *slog.Logger) receiver.Factory {
-	return receiver.NewFactory(component.MustNewType("envd"), func() component.Config { return &emptyConfig{} },
-		receiver.WithMetrics(func(_ context.Context, _ receiver.Settings, _ component.Config, next consumer.Metrics) (receiver.Metrics, error) {
-			return &envdReceiver{view: view, cfg: cfg, next: next, log: logger}, nil
-		}, component.StabilityLevelStable))
+type envdReceiverConfig struct {
+	CollectionInterval time.Duration `mapstructure:"collection_interval"`
+	Timeout            time.Duration `mapstructure:"timeout"`
+	Concurrency        int           `mapstructure:"concurrency"`
+}
+
+func (c *envdReceiverConfig) Validate() error {
+	if c.CollectionInterval < time.Second || c.CollectionInterval > time.Hour || c.Timeout <= 0 || c.Timeout > c.CollectionInterval || c.Concurrency < 1 || c.Concurrency > 1024 {
+		return errors.New("envd requires collection_interval in [1s, 1h], positive timeout <= interval and concurrency in [1, 1024]")
+	}
+	return nil
+}
+
+func envdFactory(view *View, logger *slog.Logger) receiver.Factory {
+	return receiver.NewFactory(component.MustNewType("envd"), func() component.Config {
+		return &envdReceiverConfig{CollectionInterval: 5 * time.Second, Timeout: time.Second, Concurrency: 64}
+	}, receiver.WithMetrics(func(_ context.Context, _ receiver.Settings, raw component.Config, next consumer.Metrics) (receiver.Metrics, error) {
+		cfg := raw.(*envdReceiverConfig)
+		return &envdReceiver{view: view, cfg: *cfg, next: next, log: logger}, nil
+	}, component.StabilityLevelStable))
 }
 
 func (r *envdReceiver) Start(ctx context.Context, _ component.Host) error {
+	interval := r.cfg.CollectionInterval
+	if interval <= 0 {
+		return errors.New("invalid envd collection interval")
+	}
 	ctx, r.cancel = context.WithCancel(ctx)
+	r.schedule = newScrapeSchedule(r.view, interval)
 	r.done = make(chan struct{})
 	go func() { defer close(r.done); r.run(ctx) }()
 	return nil
@@ -61,7 +81,8 @@ func (r *envdReceiver) Shutdown(ctx context.Context) error {
 }
 
 func (r *envdReceiver) run(ctx context.Context) {
-	interval, _ := time.ParseDuration(r.cfg.Interval)
+	defer r.schedule.detach()
+	interval := r.cfg.CollectionInterval
 	transport := &http.Transport{
 		MaxIdleConns: r.cfg.Concurrency, MaxIdleConnsPerHost: 1, MaxConnsPerHost: 1,
 		IdleConnTimeout: 2 * interval, DisableCompression: true,
@@ -92,7 +113,7 @@ func (r *envdReceiver) run(ctx context.Context) {
 					return
 				case entry := <-jobs:
 					err := r.scrape(ctx, client, entry)
-					r.view.finished(entry)
+					r.schedule.finished(entry)
 					if err != nil && ctx.Err() == nil && entry.ctx.Err() == nil && r.log != nil {
 						r.log.Debug("envd metric scrape failed", "sandbox_id", entry.route.SandboxID, "err", err)
 					}
@@ -105,10 +126,10 @@ func (r *envdReceiver) run(ctx context.Context) {
 	defer timer.Stop()
 	for {
 		now := time.Now()
-		for _, entry := range r.view.takeDue(now, cap(jobs)-len(jobs)) {
+		for _, entry := range r.schedule.takeDue(now, cap(jobs)-len(jobs)) {
 			jobs <- entry
 		}
-		delay := r.view.nextDelay(now)
+		delay := r.schedule.nextDelay(now)
 		if len(jobs) == cap(jobs) {
 			delay = time.Hour
 		} // A completion wakes us as soon as capacity is free.
@@ -116,14 +137,15 @@ func (r *envdReceiver) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-r.view.changed:
+		case <-r.schedule.changed:
 		case <-timer.C:
 		}
 	}
 }
 
 func (r *envdReceiver) scrape(ctx context.Context, client *http.Client, entry *target) error {
-	timeout, _ := time.ParseDuration(r.cfg.Timeout)
+	timeout := r.cfg.Timeout
+	pipelineCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	stop := context.AfterFunc(entry.ctx, cancel)
@@ -154,7 +176,15 @@ func (r *envdReceiver) scrape(ctx context.Context, client *http.Client, entry *t
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return r.next.ConsumeMetrics(withIdentity(ctx, entry, "envd"), metrics)
+	if err := r.view.acceptMetrics(ctx, entry, "envd", metrics); err != nil {
+		return err
+	}
+	// Entry invalidation can cancel an unfinished fetch, but not an accepted
+	// sample's subsequent batch/queue delivery. The component context still
+	// cancels shutdown, and the delivery retains a bounded timeout.
+	pipelineCtx, stopPipeline := context.WithTimeout(pipelineCtx, timeout)
+	defer stopPipeline()
+	return r.next.ConsumeMetrics(pipelineCtx, metrics)
 }
 
 func decodeEnvd(reader io.Reader) (pmetric.Metrics, error) {

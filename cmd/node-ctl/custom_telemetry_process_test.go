@@ -30,7 +30,7 @@ func customTelemetryProcess() {
 		os.Exit(98)
 	case "xtelemetry":
 		app := telemetry.New(telemetry.Hooks{Configure: func(_ context.Context, cfg *telemetry.Config, _ *telemetry.Runtime) error {
-			fmt.Printf("%d\n%s\n%s\n", os.Getpid(), cfg.Telemetry.Scrape.Interval, cfg.ProxyNetNS)
+			fmt.Printf("%d\n%s\n%s\n", os.Getpid(), cfg.Collector["receivers"].(map[string]any)["envd"].(map[string]any)["collection_interval"], cfg.ProxyNetNS)
 			return errors.New("stop before telemetry core")
 		}})
 		err := app.RunContext(context.Background())
@@ -51,7 +51,7 @@ func TestNodeCtlExecsCustomTelemetryInPlace(t *testing.T) {
 	executable := filepath.Join(directory, "xtelemetry")
 	copyExecutable(t, source, executable)
 	configPath := filepath.Join(directory, "telemetry.yaml")
-	body := "proxy_netns: sandbox-proxy\npaths:\n  telemetry_executable: " + executable + "\ntelemetry:\n  scrape:\n    interval: 7s\n"
+	body := "proxy_netns: sandbox-proxy\npaths:\n  telemetry_executable: " + executable + "\ncollector:\n  receivers:\n    envd:\n      collection_interval: 7s\n"
 	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}

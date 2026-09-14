@@ -53,14 +53,29 @@ api_socket: $WORK/telemetry.sock
 proxy_netns: $PROXY_NETNS
 route_capacity: 1024
 telemetry:
-  otlp:
-    grpc_listen: $PROXY_NS_IP:4317
-    http_listen: $PROXY_NS_IP:4318
   storage:
     type: local
     path: $WORK/telemetry-db
     retention: 1h
     max_size: 64MiB
+collector:
+  receivers:
+    envd: {collection_interval: 1s}
+    sandboxstats: {resource_interval: 5s, traffic_interval: 10s, usage_interval: 1m}
+    sandboxotlp:
+      grpc_listen: $PROXY_NS_IP:4317
+      http_listen: $PROXY_NS_IP:4318
+  processors:
+    batch: {timeout: 200ms}
+  exporters:
+    sandboxstorage: {}
+  service:
+    telemetry: {metrics: {level: none}}
+    pipelines:
+      metrics:
+        receivers: [envd, sandboxstats, sandboxotlp]
+        processors: [batch]
+        exporters: [sandboxstorage]
 EOF
     local code command
     code=$(req GET "/sandboxes/$SID/metrics" "$AK")

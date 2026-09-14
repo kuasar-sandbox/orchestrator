@@ -3,15 +3,10 @@ package telemetry
 import (
 	"context"
 	"errors"
-	"strings"
-	"unicode"
 	"unicode/utf8"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/collector/processor"
 )
 
 var ErrInvalidMetrics = errors.New("telemetry: invalid or oversized metrics")
@@ -31,60 +26,26 @@ func withIdentity(ctx context.Context, entry *target, source string) context.Con
 
 type emptyConfig struct{}
 
-type identityProcessor struct {
-	view  *View
-	next  consumer.Metrics
-	final bool
-}
-
-func identityFactory(view *View, final bool) processor.Factory {
-	name := "sandboxidentity"
-	if final {
-		name = "sandboxidentityguard"
-	}
-	return processor.NewFactory(component.MustNewType(name), func() component.Config { return &emptyConfig{} },
-		processor.WithMetrics(func(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Metrics) (processor.Metrics, error) {
-			return &identityProcessor{view: view, next: next, final: final}, nil
-		}, component.StabilityLevelStable))
-}
-
-func (*identityProcessor) Start(context.Context, component.Host) error { return nil }
-func (*identityProcessor) Shutdown(context.Context) error              { return nil }
-func (*identityProcessor) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: true}
-}
-
-func (p *identityProcessor) ConsumeMetrics(ctx context.Context, metrics pmetric.Metrics) error {
-	identity, _ := ctx.Value(identityContextKey{}).(ingressIdentity)
-	entry := identity.entry
+// acceptMetrics linearizes bounded identity validation and pdata enrichment
+// with route invalidation. It never calls a downstream component under the view
+// lock. Once accepted, identity belongs to each pdata resource, independent of
+// the request context and any later route pause, replacement or deletion.
+func (v *View) acceptMetrics(ctx context.Context, entry *target, source string, metrics pmetric.Metrics) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	err := p.view.withCurrent(entry, func() error {
-		if err := enrich(metrics, entry, identity.source); err != nil {
-			return err
-		}
-		if p.final {
-			return p.next.ConsumeMetrics(ctx, metrics)
-		}
-		return nil
-	})
-	if err != nil || p.final {
-		return err
-	}
-	return p.next.ConsumeMetrics(ctx, metrics)
+	return v.withCurrent(entry, func() error { return enrich(metrics, entry, source) })
 }
 
-// Run identity is excluded even if a guest supplies similarly spelled labels.
-// The original RouteEntry run field is deliberately never read by telemetry.
+// These exact reserved spellings are obsolete platform run identity. Application
+// attributes such as application.run_id are unrelated and must be retained.
 func forbiddenAttribute(key string) bool {
-	normalized := strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return unicode.ToLower(r)
-		}
-		return -1
-	}, key)
-	return strings.HasSuffix(normalized, "runid")
+	switch key {
+	case "sandbox.run_id", "run_id", "runId", "RunID":
+		return true
+	default:
+		return false
+	}
 }
 
 func boundedAttributes(attrs pcommon.Map, removeIdentity bool) error {
@@ -109,7 +70,7 @@ func boundedAttributes(attrs pcommon.Map, removeIdentity bool) error {
 }
 
 func enrich(metrics pmetric.Metrics, entry *target, source string) error {
-	if source != "envd" && source != "otlp" {
+	if entry == nil || entry.route.SandboxID == "" || source == "" || len(source) > 128 || !utf8.ValidString(source) {
 		return ErrIdentity
 	}
 	if metrics.DataPointCount() > 16384 || metrics.ResourceMetrics().Len() > 128 {

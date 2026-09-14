@@ -1,0 +1,28 @@
+# Install the executable as documented in README.md, then run through node-ctl.
+config_socket: /run/sandbox/node-ctl.socket
+api_socket: /run/sandbox/telemetry.sock
+paths:
+  telemetry_executable: /opt/kuasar/bin/custom-telemetry
+telemetry:
+  storage: {type: none}
+collector:
+  receivers:
+    envd: {collection_interval: 5s}
+    sandboxstats: {resource_interval: 5s, traffic_interval: 10s, usage_interval: 1m}
+    sandboxotlp: {http_listen: ":4318", grpc_listen: ":4317"}
+  processors:
+    privatedeployment: {}
+    batch: {timeout: 1s, send_batch_max_size: 8192}
+  exporters:
+    otlp_http:
+      endpoint: ${env:OTLP_ENDPOINT:-https://collector.example.com}
+      sending_queue: {enabled: true, queue_size: 256}
+      retry_on_failure: {enabled: true, max_elapsed_time: 30s}
+  service:
+    telemetry:
+      metrics: {level: none}
+    pipelines:
+      metrics:
+        receivers: [envd, sandboxstats, sandboxotlp]
+        processors: [privatedeployment, batch]
+        exporters: [otlp_http]

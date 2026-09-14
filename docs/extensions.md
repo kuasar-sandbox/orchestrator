@@ -131,7 +131,7 @@ The only operator entry is `node-ctl telemetry serve --config telemetry.yaml`.
 same bounded strict YAML decode and once-only defaults. Omitted external
 endpoints may be supplied by Configure; malformed explicit values already fail
 decoding. `ValidateTelemetryFinal` validates complete declarations without
-reapplying defaults. `Clone` deep-copies pointers, maps and exporter declarations.
+reapplying defaults. `Clone` deep-copies maps, slices and native Collector declarations.
 `node-ctl config telemetry` only diagnoses declarations/executable metadata;
 it never runs an extension or material provider.
 
@@ -148,7 +148,7 @@ the immutable dispatch path; no hook can redirect it to a different executable.
 app := telemetry.New(telemetry.Hooks{
     Configure: func(ctx context.Context, cfg *telemetry.Config, rt *telemetry.Runtime) error {
         rt.Extension = myExtension
-        // Optionally bind rt.Storage, rt.StorageHeaders, rt.ExporterHeaders.
+        // Optionally bind rt.Storage, rt.StorageHeaders, rt.Collector.
         return nil
     },
 })
@@ -160,7 +160,7 @@ hook and runs before store/listener/receiver side effects. Core freezes config,
 resolves authoritative material providers, performs final validation, then opens
 primary storage and starts the extension, Collector, query listener and Plugin
 subscriber. `Runtime` rejects JSON serialization/deserialization and contains
-process-local Logger, Extension, Storage, StorageHeaders, ExporterHeaders and
+process-local Logger, Extension, Storage, StorageHeaders and
 optional advanced Collector bindings. Never serialize it in a private protocol
 or retain/mutate Configure's declarations after the hook returns.
 
@@ -179,31 +179,34 @@ or retain/mutate Configure's declarations after the hook returns.
 bind it exactly with `storage.type: custom`. Errors/nil result do not fall back
 to local. If construction returns an owned backend plus an error, core still
 shuts it down. `Runtime.StorageHeaders(ctx)` replaces the entire credential map
-for a built-in Prometheus/ClickHouse primary. `Runtime.ExporterHeaders(ctx, name)`
-does the same for each configured OTLP/HTTP extra exporter. Empty maps are
-authoritative; provider errors never use stale YAML credentials. Returned maps
-are copied. Custom storage owns any other private material it requires.
+for a built-in Prometheus/ClickHouse primary. Empty maps are authoritative;
+provider errors never use stale YAML credentials. Returned maps are copied.
+Native exporter credentials use native confmap providers, such as `${env:NAME}`
+or `${file:/path}` in component configuration. The former ExporterHeaders binding
+and per-component Configure wrappers are removed; a static configuration provider
+can supply private material using the same Collector resolver contract.
 
-Ordinary extension contracts import no OTel types. Advanced integration alone
-uses `app/telemetry/otel`: `Components.Processors` and `Components.Exporters`
-accept actual Collector factories and optional Configure callbacks over fresh
-default component configs. Core validates configurations and rejects duplicate
-or reserved types. This is an explicit ordered startup list, not runtime
-discovery or DI. It deliberately exposes neither replacement core receivers nor
-custom routing/identity authority. A private component must use the Collector
-versions selected by this build; no cross-version binary plugin ABI is promised.
+Ordinary extension contracts import no OTel types. Advanced integration uses
+`app/telemetry/otel.Components`, with `Receivers`, `Processors`, `Exporters`,
+`Connectors`, `Extensions`, `Providers` and `Converters` factory lists. A factory
+registers each type once; native configuration creates `type/name` instances and
+connects pipelines. Native confmap unmarshalling and validation reject unsupported
+options, unknown components and inconsistent pipeline references. `service.telemetry`
+and `service.extensions` retain native semantics. All linked generic signals are
+available; no metrics-only wrapper blocks ordinary logs/traces pipelines.
+Static factories use the selected Collector version, without a binary plugin ABI.
 
-Custom processors preserve the private ingress context, cannot merge different
-sandbox identities into one resource, and sit between initial enrichment and
-the final current-route identity guard. Context loss/staleness fails closed;
-guest or custom `sandbox.id`/`sandbox.stable_id` is overwritten before storage
-and exporters, and RunID attributes are excluded. Asynchronous processors that
-discard context or combine identities are unsupported. Use bounded queues in
-exporters after the final guard instead. An extra exporter is write-only and
-does not enable E2B queries. A custom primary must implement both read and write,
-preserve exact SandboxID, respect cancellation/bounds and return missing
-observations rather than fabricating zeros. This is a trusted in-process API,
-not a sandbox against deliberately malicious statically linked code.
+Core establishes sandbox identity at source acceptance in pdata resource attributes.
+Standard batch may combine resources from several sandboxes; their identities
+remain attached independently. Queues/retries after pause/delete retain accepted
+samples, without private request context or exporter-time route lookup. Envd
+rejects late unaccepted fetches; OTLP still uses pinned actual FloatingIP peers;
+conductor stats trust authorized object reads including paused saved usage.
+Ordinary infrastructure receivers need no sandbox identity. Application attributes
+such as `application.run_id` survive. Trusted deployment configuration and static
+extensions belong to the original trust domain, and must preserve intended data
+ownership when deliberately transforming resource attributes. They do not receive
+an additional discovery, lifecycle or network-binding authority.
 
 Shutdown first revokes the Plugin lease and drains query/ingress, then shuts
 down Collector, Extension and primary storage, in that order; each cleanup has

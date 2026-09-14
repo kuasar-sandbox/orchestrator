@@ -11,7 +11,7 @@ import (
 )
 
 func TestIdentityOverwritesGuestAndExcludesRunAttributes(t *testing.T) {
-	view := NewView(1, 1)
+	view := NewView(1)
 	entry := upsert(t, view, testRoute("sandbox"))
 	view.Bookmark()
 	metrics, err := decodeEnvd(bytes.NewReader(envdJSON()))
@@ -26,12 +26,13 @@ func TestIdentityOverwritesGuestAndExcludesRunAttributes(t *testing.T) {
 		attrs.PutStr("sandbox.run_id", "forged")
 		attrs.PutStr("RunID", "forged")
 		attrs.PutStr("app.label", "kept")
+		attrs.PutStr("application.run_id", "user-owned")
 	}
 	var consumed bool
-	guard := &identityProcessor{view: view, final: true, next: metricsConsumer(t, func(_ context.Context, got pmetric.Metrics) error {
+	check := func(got pmetric.Metrics) error {
 		consumed = true
 		attrs := got.ResourceMetrics().At(0).Resource().Attributes()
-		for key, want := range map[string]string{SandboxIDAttribute: "sandbox", StableIDAttribute: "stable-sandbox", sourceAttribute: "otlp", "app.label": "kept"} {
+		for key, want := range map[string]string{SandboxIDAttribute: "sandbox", StableIDAttribute: "stable-sandbox", sourceAttribute: "otlp", "app.label": "kept", "application.run_id": "user-owned"} {
 			value, ok := attrs.Get(key)
 			if !ok || value.Str() != want {
 				t.Errorf("%s = %v", key, value)
@@ -49,24 +50,27 @@ func TestIdentityOverwritesGuestAndExcludesRunAttributes(t *testing.T) {
 			t.Error("point identity can override resource")
 		}
 		return nil
-	})}
-	if err := guard.ConsumeMetrics(withIdentity(context.Background(), entry, "otlp"), metrics); err != nil {
+	}
+	if err := view.acceptMetrics(context.Background(), entry, "otlp", metrics); err != nil {
+		t.Fatal(err)
+	}
+	if err := check(metrics); err != nil {
 		t.Fatal(err)
 	}
 	if !consumed {
 		t.Fatal("no delivery")
 	}
-	if err := guard.ConsumeMetrics(context.Background(), metrics); !errors.Is(err, ErrIdentity) {
+	if err := view.acceptMetrics(context.Background(), nil, "otlp", metrics); !errors.Is(err, ErrIdentity) {
 		t.Fatal("untrusted context accepted", err)
 	}
 	view.InvalidateSync()
-	if err := guard.ConsumeMetrics(withIdentity(context.Background(), entry, "otlp"), metrics); !errors.Is(err, ErrIdentity) {
+	if err := view.acceptMetrics(context.Background(), entry, "otlp", metrics); !errors.Is(err, ErrIdentity) {
 		t.Fatal("stale identity accepted", err)
 	}
 }
 
 func TestIdentityBoundsAttributes(t *testing.T) {
-	view := NewView(1, 1)
+	view := NewView(1)
 	entry := upsert(t, view, testRoute("sandbox"))
 	metrics, err := decodeEnvd(bytes.NewReader(envdJSON()))
 	if err != nil {

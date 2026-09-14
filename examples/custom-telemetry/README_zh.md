@@ -19,17 +19,22 @@ root 或服务 UID 属主。在独立 `telemetry.yaml` 的 `paths.telemetry_exec
 早期 Preview 的 `sandbox_netns` key 必须改名, strict bootstrap/config decode 拒绝旧名称.
 部署方法见 [management 网络](../../docs/telemetry_zh.md#4-直接面向沙箱的-otlp).
 
-`Configure` 在 store/listener 启动前执行一次。Config 存放声明，Runtime 存放不可序列化
-的进程内绑定。本例保留选定的 primary storage，记录扩展启动/停止，并可从
-`TELEMETRY_EXPORTER_AUTHORIZATION` 提供 extra exporter 的 Authorization header。
-一旦绑定，该 provider 替换 YAML header map；失败不会回退到 YAML 凭据。不要记录或
-上传 secret、诊断环境。生产构建可以改用受保护文件或凭据服务。
+`Configure` 在 store/listener 前执行一次. Config 保存声明, Runtime 保存进程内
+binding. 示例记录 lifecycle start/stop 并注册 `privatedeployment` processor factory.
+Exporter 凭据通过组件选项中的原生 config provider 提供, 如 `${env:OTLP_TOKEN}`;
+provider 失败会终止启动, 不会改选其他凭据.
+[telemetry.yaml](telemetry.yaml) 是完整 write-only 示例, 包含三个原生 receiver、
+定制 processor、batch 和 OTLP HTTP exporter. 将 `OTLP_ENDPOINT` 设置为目标地址.
+没有选定 reader 时 `/metrics` 不可用; conductor 的原生 stats 继续工作.
 
-`collector.go` 单独演示窄 `app/telemetry/otel` API：真正的 Collector processor 添加
-部署属性并保留 ingress context。core 在定制 processor 前后分别放置 identity enrichment
-与最终 guard。不要丢弃 context、把不同 sandbox 合成一个 resource、替换可信属性，
-或在 guard 之前插入其他 receiver。进入 primary storage 和各 exporter 前，core 拒绝
-缺失/过期身份并覆盖 SandboxID/StableID；RunID 不进入指标身份。
+在 `collector.processors` 添加 `privatedeployment: {}`, 并将 `privatedeployment` 加入
+需要它的 pipeline `processors` 列表. 注册 factory 本身不会将它插入所有 pipeline.
+`collector.go` 展示普通 mutating Collector processor. 来源身份已经接纳到每个 pdata
+resource, 标准 batch、queue、retry 可以丢失原请求 context, 也可以组合多个 resource.
+不同沙箱身份不能合并进同一 resource. Pause/delete 不丢弃已接纳历史, 用户
+`application.run_id` 会保留. 静态 factory 可增加 receiver、processor、exporter、
+connector、Collector extension、config provider、converter; 实例与 pipeline 边仍由
+声明配置决定.
 
 定制主存储使用 `storage.type: custom` 并绑定 `Runtime.Storage`，实现
 `extension.Storage`：canonical Collector 写入、精确 SandboxID 的 Bounds/Query、

@@ -15,16 +15,8 @@ func main() {
 	app := telemetry.New(telemetry.Hooks{Configure: func(_ context.Context, _ *telemetry.Config, runtime *telemetry.Runtime) error {
 		runtime.Logger = slog.Default()
 		runtime.Extension = &lifecycle{logger: runtime.Logger}
-		// Optional private startup material, never copied back into bootstrap or
-		// logged. Production may replace this with a bounded secret-file/provider.
-		if authorization, present := os.LookupEnv("TELEMETRY_EXPORTER_AUTHORIZATION"); present {
-			runtime.ExporterHeaders = func(ctx context.Context, _ string) (map[string]string, error) {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				return map[string]string{"Authorization": authorization}, nil
-			}
-		}
+		// Native Collector config providers supply exporter credentials; keep
+		// them in the corresponding component config, e.g. ${env:OTLP_TOKEN}.
 		bindCollector(runtime)
 		return nil
 	}})

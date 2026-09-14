@@ -55,15 +55,15 @@ func TestConfigureOnceFreezesConfigAndRuntime(t *testing.T) {
 		calls++
 		retainedConfig = cfg
 		retainedRuntime = runtime
-		cfg.Telemetry.Exporters = []config.TelemetryExporter{{Name: "extra", Type: "otlphttp", Endpoint: "https://collector.example.com", Headers: map[string]string{"Authorization": "private"}}}
+		cfg.Collector = map[string]any{"exporters": map[string]any{"otlp_http/extra": map[string]any{"endpoint": "https://collector.example.com", "headers": map[string]any{"Authorization": "private"}}}}
 		runtime.Logger = logger
 		return nil
 	}})
 	app.receive = func() (*componentexec.Bootstrap, error) { return boot, nil }
 	app.run = func(_ context.Context, cfg *config.Telemetry, runtime *telemetryapp.Runtime) error {
-		retainedConfig.Telemetry.Exporters[0].Headers["Authorization"] = "mutated"
+		retainedConfig.Collector["exporters"].(map[string]any)["otlp_http/extra"].(map[string]any)["headers"].(map[string]any)["Authorization"] = "mutated"
 		retainedRuntime.Logger = nil
-		if cfg.Telemetry.Exporters[0].Headers["Authorization"] != "private" || runtime.Logger != logger {
+		if cfg.Collector["exporters"].(map[string]any)["otlp_http/extra"].(map[string]any)["headers"].(map[string]any)["Authorization"] != "private" || runtime.Logger != logger {
 			t.Fatal("config/runtime not frozen")
 		}
 		return nil
@@ -87,12 +87,13 @@ func TestAppRejectsInvalidBootstrapAndHooksBeforeCore(t *testing.T) {
 				case "path-mutation":
 					cfg.Paths.TelemetryExecutable = "/another"
 				case "final-validation":
-					cfg.Telemetry.Scrape.Concurrency = 0
+					cfg.RouteCapacity = 0
 				case "final-netns":
 					cfg.ProxyNetNS = "../invalid"
 				case "provider":
-					cfg.Telemetry.Exporters = []config.TelemetryExporter{{Name: "extra", Type: "otlphttp", Endpoint: "http://example.com"}}
-					runtime.ExporterHeaders = func(context.Context, string) (map[string]string, error) { return nil, errors.New("provider failed") }
+					cfg.Telemetry.Storage.Type = "prometheus"
+					cfg.Telemetry.Storage.Prometheus.Endpoint = "http://example.com"
+					runtime.StorageHeaders = func(context.Context) (map[string]string, error) { return nil, errors.New("provider failed") }
 				}
 				return nil
 			}})
