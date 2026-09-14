@@ -21,6 +21,9 @@ type Extension interface {
 type Host interface {
 	Sandboxes() SandboxSource
 	Builds() BuildSource
+	// Stats reads return unavailable until core reconciliation and provider
+	// wiring complete; they never block Extension.Start waiting for startup.
+	Stats() StatsReader
 }
 
 // APIWrapper is an optional capability implemented by the same Extension

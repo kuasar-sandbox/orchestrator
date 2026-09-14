@@ -127,6 +127,27 @@ func TestConductorConfigTemplateDocumentsSandboxDeadRetention(t *testing.T) {
 	}
 }
 
+func TestConductorConfigTemplateNativeUsagePolicy(t *testing.T) {
+	// Decode without defaults first: the authoring template must explicitly
+	// expose policy, rather than merely inheriting an invisible disabled value.
+	var document struct {
+		Sandbox struct {
+			Usage *config.UsageConfig `yaml:"usage"`
+		} `yaml:"sandbox"`
+	}
+	if err := yaml.Unmarshal([]byte(conductorConfigSkeleton), &document); err != nil {
+		t.Fatal(err)
+	}
+	want := config.UsageConfig{Enabled: false, SampleInterval: "1s", FlushInterval: "5m"}
+	if document.Sandbox.Usage == nil || *document.Sandbox.Usage != want {
+		t.Fatalf("template usage policy: %+v", document.Sandbox.Usage)
+	}
+	parsed, err := config.DecodeConductor(strings.NewReader(conductorConfigSkeleton))
+	if err != nil || parsed.Sandbox.Usage != want {
+		t.Fatalf("native config parser: config=%+v error=%v", parsed, err)
+	}
+}
+
 func TestConductorConfigTemplateDocumentsBundleCheckpointAndRemotePublication(t *testing.T) {
 	start := strings.Index(conductorConfigSkeleton, "checkpoint:")
 	end := strings.Index(conductorConfigSkeleton[start:], "\n# mmds:")

@@ -82,6 +82,10 @@ paths:
 sandbox:
   timeout_sec: 300                                # default TTL
   dead_ttl: 24h                                   # owner-free dead-row diagnostic retention
+  usage:
+    enabled: false                               # native lifecycle accounting, independent of telemetry
+    sample_interval: 1s
+    flush_interval: 5m                            # append interval, not filesystem sync
   resources:
     capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B cpuCount,memoryMB
     allocatable:

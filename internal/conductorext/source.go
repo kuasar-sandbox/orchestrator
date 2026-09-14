@@ -39,6 +39,7 @@ type buildSource struct {
 type Host struct {
 	sandboxes *sandboxSource
 	builds    *buildSource
+	stats     conductorextension.StatsReader
 }
 
 // Observer is attached to the core before Extension.Start. Its methods project
@@ -50,8 +51,10 @@ type Observer struct {
 
 // New constructs object sources and their core observer. It starts no
 // goroutines; Watch executes in the Extension-owned calling goroutine.
-func New(storage *store.Store) (*Host, *Observer) {
-	return newWithCapacity(storage, defaultQueueCapacity)
+func New(storage *store.Store, stats conductorextension.StatsReader) (*Host, *Observer) {
+	host, observer := newWithCapacity(storage, defaultQueueCapacity)
+	host.stats = stats
+	return host, observer
 }
 
 func newWithCapacity(storage *store.Store, capacity int) (*Host, *Observer) {
@@ -65,6 +68,7 @@ func newWithCapacity(storage *store.Store, capacity int) (*Host, *Observer) {
 
 func (h *Host) Sandboxes() conductorextension.SandboxSource { return h.sandboxes }
 func (h *Host) Builds() conductorextension.BuildSource      { return h.builds }
+func (h *Host) Stats() conductorextension.StatsReader       { return h.stats }
 
 func (s *sandboxSource) Get(ctx context.Context, id string) (conductorextension.SandboxView, bool, error) {
 	sandbox, err := s.store.Get(ctx, id)

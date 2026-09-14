@@ -38,7 +38,7 @@ func (f buildHookFunc) PrepareBuild(ctx context.Context, operation *conductorext
 func TestPauseHookRunsOutsideLifecycleLockCanReadHostAndRejectsBeforeSnapshot(t *testing.T) {
 	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
 	o, sandbox, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, "")
-	host, _ := conductorext.New(o.st)
+	host, _ := conductorext.New(o.st, o)
 	o.SetExtensionHooks(sandboxHookFunc(func(ctx context.Context, operation *conductorextension.SandboxOperation) error {
 		if operation.Kind != conductorextension.SandboxOperationPause || operation.Current == nil {
 			t.Fatalf("pause operation = %+v", operation)

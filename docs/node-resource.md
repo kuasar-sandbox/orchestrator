@@ -329,6 +329,8 @@ Observe reservation/recovery state with resource status/list and cluster heartbe
 
 Do not combine these into one undifferentiated memory-usage value: reservation, host VMM charge and guest demand are separate measures.
 
+Lifecycle cumulative usage is read through [native stats/usage](node-usage.md), with node policy applied to all three launch paths. Current VMM counters, lifecycle totals and historical E2B gauges retain separate meanings.
+
 ## 10. See also
 
 - [node](node.md).
