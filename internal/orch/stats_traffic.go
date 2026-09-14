@@ -117,7 +117,7 @@ func (o *Orchestrator) readNetworkTraffic(ctx context.Context, sandboxes []*type
 			continue // No attached port: empty observations, not observed zero.
 		}
 		port, err := strconv.ParseUint(sb.VswitchPort, 10, 32)
-		if err != nil || port == 0 || port > 4096 || sb.FloatingIP == "" {
+		if err != nil || port == 0 || port > 4096 || sb.FloatingIP == "" || sb.InnerIP == "" || sb.PortMAC == "" {
 			return nil, api.ErrStatsUnavailable
 		}
 		if _, found := indices[int(port)]; found {
@@ -164,11 +164,9 @@ func (o *Orchestrator) readNetworkTraffic(ctx context.Context, sandboxes []*type
 		if !found || row.FloatingIP != sandboxes[i].FloatingIP {
 			return nil, api.ErrStatsUnavailable
 		}
-		if cidr := sandboxes[i].InnerIP; cidr != "" {
-			ip, _, err := net.ParseCIDR(cidr)
-			if err != nil || !ip.Equal(net.ParseIP(row.InnerIP)) {
-				return nil, api.ErrStatsUnavailable
-			}
+		ip, _, err := net.ParseCIDR(sandboxes[i].InnerIP)
+		if err != nil || !ip.Equal(net.ParseIP(row.InnerIP)) {
+			return nil, api.ErrStatsUnavailable
 		}
 		delete(indices, int(row.Port))
 		result[i] = trafficNetwork{

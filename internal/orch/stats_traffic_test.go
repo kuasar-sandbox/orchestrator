@@ -48,6 +48,7 @@ func trafficBindings(t *testing.T, o *Orchestrator, count int) []string {
 		}
 		sb.RunID, sb.VswitchPort, sb.FloatingIP = "internal-fence", strconv.Itoa(i+1), fmt.Sprintf("198.18.0.%d", i+1)
 		sb.InnerIP = "169.254.1.1/31"
+		sb.PortMAC = fmt.Sprintf("02:00:00:00:01:%02x", i+1)
 		if err := o.st.Put(context.Background(), sb); err != nil {
 			t.Fatal(err)
 		}
@@ -226,11 +227,16 @@ func TestTrafficNoPortAndSingleSourceFailure(t *testing.T) {
 	}
 }
 
-func TestTrafficRejectsPartialBindingWithoutPort(t *testing.T) {
-	for _, field := range []string{"floating-ip", "inner-ip", "port-mac"} {
+func TestTrafficRejectsPartialNetworkBinding(t *testing.T) {
+	for _, field := range []string{"floating-ip", "inner-ip", "port-mac", "attached-missing-floating-ip", "attached-missing-inner-ip", "attached-missing-port-mac"} {
 		t.Run(field, func(t *testing.T) {
 			o := testOrch(t)
-			ids := batchSandboxes(t, o, 2)
+			var ids []string
+			if strings.HasPrefix(field, "attached-") {
+				ids = trafficBindings(t, o, 2)
+			} else {
+				ids = batchSandboxes(t, o, 2)
+			}
 			sb, err := o.st.Get(context.Background(), ids[0])
 			if err != nil {
 				t.Fatal(err)
@@ -242,6 +248,12 @@ func TestTrafficRejectsPartialBindingWithoutPort(t *testing.T) {
 				sb.InnerIP = "169.254.1.1/31"
 			case "port-mac":
 				sb.PortMAC = "02:00:00:00:00:01"
+			case "attached-missing-floating-ip":
+				sb.FloatingIP = ""
+			case "attached-missing-inner-ip":
+				sb.InnerIP = ""
+			case "attached-missing-port-mac":
+				sb.PortMAC = ""
 			}
 			if err := o.st.Put(context.Background(), sb); err != nil {
 				t.Fatal(err)
