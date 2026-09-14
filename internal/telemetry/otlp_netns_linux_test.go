@@ -134,11 +134,15 @@ func TestOTLPProxyNetNSCollectorIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ProxyNetNS = ns.String()
-	cfg.Telemetry.OTLP.HTTPListen = hostHTTP.Listener.Addr().String()
-	cfg.Telemetry.OTLP.GRPCListen = hostGRPC.Addr().String()
 	cfg.Telemetry.Storage.Type = "none"
-	cfg.Telemetry.Exporters = []config.TelemetryExporter{{Name: "host", Type: "otlphttp", Endpoint: sink.URL}}
-	view := NewView(4, time.Second)
+	cfg.Collector = map[string]any{
+		"receivers": map[string]any{"sandboxotlp": map[string]any{"http_listen": hostHTTP.Listener.Addr().String(), "grpc_listen": hostGRPC.Addr().String()}},
+		"exporters": map[string]any{"otlp_http/host": map[string]any{"endpoint": sink.URL}},
+		"service": map[string]any{"telemetry": map[string]any{"metrics": map[string]any{"level": "none"}}, "pipelines": map[string]any{"metrics": map[string]any{
+			"receivers": []any{"sandboxotlp"}, "exporters": []any{"otlp_http/host"},
+		}}},
+	}
+	view := NewView(4)
 	defer view.InvalidateSync()
 	route := testRoute("sid")
 	route.FloatingIP = "192.0.2.2"
@@ -256,14 +260,9 @@ func TestOTLPProxyNetNSStartFailureCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer blocker.Close()
-			cfg, err := config.DecodeTelemetry(strings.NewReader("{}"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg.ProxyNetNS = spec
-			cfg.Telemetry.OTLP.HTTPListen = "127.0.0.1:0"
-			cfg.Telemetry.OTLP.GRPCListen = blocker.Addr().String()
-			r := &otlpReceiver{cfg: *cfg, view: NewView(1, time.Second)}
+			cfg := defaultOTLPConfig()
+			cfg.HTTPListen, cfg.GRPCListen = "127.0.0.1:0", blocker.Addr().String()
+			r := &otlpReceiver{cfg: cfg, proxyNetNS: spec, view: NewView(1)}
 			if err := r.Start(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "OTLP gRPC listen") {
 				t.Fatal("occupied gRPC port accepted", err)
 			}
@@ -284,7 +283,7 @@ func TestOTLPProxyNetNSStartFailureCleanup(t *testing.T) {
 
 func TestOTLPProxyNetNSInvalidFailsClosed(t *testing.T) {
 	for _, spec := range []string{"kuasar-test-no-such-netns", filepath.Join(t.TempDir(), "missing")} {
-		r := &otlpReceiver{cfg: config.Telemetry{ProxyNetNS: spec}}
+		r := &otlpReceiver{cfg: defaultOTLPConfig(), proxyNetNS: spec}
 		if err := r.Start(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "proxy_netns") {
 			t.Fatal("invalid netns accepted", err)
 		}
@@ -296,7 +295,7 @@ func TestOTLPProxyNetNSInvalidFailsClosed(t *testing.T) {
 	if err := os.WriteFile(file, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	r := &otlpReceiver{cfg: config.Telemetry{ProxyNetNS: file}}
+	r := &otlpReceiver{cfg: defaultOTLPConfig(), proxyNetNS: file}
 	if err := r.Start(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "setns") {
 		t.Fatal("non-namespace file accepted", err)
 	}
@@ -305,7 +304,7 @@ func TestOTLPProxyNetNSInvalidFailsClosed(t *testing.T) {
 func TestOTLPProxyNetNSNoSetnsPermission(t *testing.T) {
 	const marker = "KUASAR_OTLP_NO_SETNS_TEST"
 	if os.Getenv(marker) == "1" {
-		r := &otlpReceiver{cfg: config.Telemetry{ProxyNetNS: "/proc/self/ns/net"}}
+		r := &otlpReceiver{cfg: defaultOTLPConfig(), proxyNetNS: "/proc/self/ns/net"}
 		if err := r.Start(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "setns") {
 			t.Fatal("setns failure silently accepted", err)
 		}

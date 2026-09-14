@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"google.golang.org/grpc"
@@ -24,20 +23,16 @@ import (
 
 func startOTLP(t *testing.T, view *View) (*otlpReceiver, <-chan pmetric.Metrics) {
 	t.Helper()
-	cfg, err := config.DecodeTelemetry(bytes.NewReader([]byte("{}")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Independent ephemeral ports are safe for this internal receiver harness.
-	cfg.Telemetry.OTLP.HTTPListen, cfg.Telemetry.OTLP.GRPCListen = "127.0.0.1:0", "127.0.0.1:0"
+	cfg := defaultOTLPConfig()
+	cfg.HTTPListen, cfg.GRPCListen = "127.0.0.1:0", "127.0.0.1:0"
 	observed := make(chan pmetric.Metrics, 32)
-	guard := &identityProcessor{view: view, final: true, next: metricsConsumer(t, func(_ context.Context, metrics pmetric.Metrics) error {
+	guard := metricsConsumer(t, func(_ context.Context, metrics pmetric.Metrics) error {
 		copy := pmetric.NewMetrics()
 		metrics.CopyTo(copy)
 		observed <- copy
 		return nil
-	})}
-	r := &otlpReceiver{cfg: *cfg, view: view, next: guard, requests: make(chan struct{}, cfg.Telemetry.OTLP.MaxRequests), fatal: func(err error) { t.Error(err) }}
+	})
+	r := &otlpReceiver{cfg: cfg, view: view, next: guard, requests: make(chan struct{}, cfg.MaxRequests), fatal: func(err error) { t.Error(err) }}
 	if err := r.Start(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +79,7 @@ func assertOTLPIdentity(t *testing.T, observed <-chan pmetric.Metrics) {
 }
 
 func TestOTLPHTTPAndGRPCTransportIdentity(t *testing.T) {
-	view := NewView(10, time.Second)
+	view := NewView(10)
 	upsert(t, view, testRoute("sid"))
 	view.Bookmark()
 	r, observed := startOTLP(t, view)
@@ -145,7 +140,7 @@ func TestOTLPHTTPAndGRPCTransportIdentity(t *testing.T) {
 }
 
 func TestOTLPUnknownPeerFailsClosed(t *testing.T) {
-	view := NewView(10, time.Second)
+	view := NewView(10)
 	route := testRoute("sid")
 	route.FloatingIP = "127.0.0.2"
 	upsert(t, view, route)
@@ -204,7 +199,7 @@ func TestOTLPUnknownPeerFailsClosed(t *testing.T) {
 }
 
 func TestOTLPPersistentConnectionRevokedOnRemap(t *testing.T) {
-	view := NewView(10, time.Second)
+	view := NewView(10)
 	upsert(t, view, testRoute("sid"))
 	view.Bookmark()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -237,7 +232,7 @@ func TestOTLPPersistentConnectionRevokedOnRemap(t *testing.T) {
 }
 
 func TestOTLPHTTPBodyLimitsBeforeCollector(t *testing.T) {
-	view := NewView(1, time.Second)
+	view := NewView(1)
 	entry := upsert(t, view, testRoute("sid"))
 	view.Bookmark()
 	defer view.InvalidateSync()
@@ -245,7 +240,7 @@ func TestOTLPHTTPBodyLimitsBeforeCollector(t *testing.T) {
 		t.Error("invalid/oversized request reached Collector")
 		return nil
 	})}
-	r.cfg.Telemetry.OTLP.MaxRequestBytes = 1024
+	r.cfg.MaxRequestBytes = 1024
 	var compressed bytes.Buffer
 	gz := gzip.NewWriter(&compressed)
 	_, _ = gz.Write(bytes.Repeat([]byte("x"), 1025))
@@ -287,7 +282,7 @@ func (r unreadBody) Read([]byte) (int, error) {
 }
 
 func TestOTLPRequestCapacitySharedAcrossTransports(t *testing.T) {
-	view := NewView(1, time.Second)
+	view := NewView(1)
 	entry := upsert(t, view, testRoute("sid"))
 	view.Bookmark()
 	defer view.InvalidateSync()
@@ -324,7 +319,7 @@ func TestOTLPRequestCapacitySharedAcrossTransports(t *testing.T) {
 }
 
 func TestOTLPGRPCSlowBodyHasServerDeadline(t *testing.T) {
-	view := NewView(1, time.Second)
+	view := NewView(1)
 	entry := upsert(t, view, testRoute("sid"))
 	view.Bookmark()
 	defer view.InvalidateSync()

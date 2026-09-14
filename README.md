@@ -86,7 +86,7 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 | `deploy/` | Per-role example YAML and node/Proxy/Telemetry/Registry/Router/Placer systemd units |
 | `examples/custom-conductor` | Buildable xconductor entered through node-ctl conductor serve |
 | `examples/custom-proxy` | Buildable xproxy entered through node-ctl proxy serve; master reexecutes workers |
-| `examples/custom-telemetry` | Buildable static telemetry App with ordinary extension and narrow advanced Collector integration |
+| `examples/custom-telemetry` | Buildable static telemetry App with native Collector factories, pipelines and query extension |
 
 ## Build and test
 

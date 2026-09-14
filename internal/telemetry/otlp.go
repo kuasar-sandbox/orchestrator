@@ -9,14 +9,15 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/receiver"
 	"golang.org/x/net/netutil"
@@ -28,17 +29,57 @@ import (
 	"google.golang.org/grpc/tap"
 )
 
-func otlpFactory(view *View, cfg config.Telemetry, fatal func(error)) receiver.Factory {
-	return receiver.NewFactory(component.MustNewType("sandboxotlp"), func() component.Config { return &emptyConfig{} },
-		receiver.WithMetrics(func(_ context.Context, _ receiver.Settings, _ component.Config, next consumer.Metrics) (receiver.Metrics, error) {
-			return &otlpReceiver{view: view, cfg: cfg, next: next, fatal: fatal, requests: make(chan struct{}, cfg.Telemetry.OTLP.MaxRequests)}, nil
-		}, component.StabilityLevelStable))
+type otlpReceiverConfig struct {
+	HTTPListen      string `mapstructure:"http_listen"`
+	GRPCListen      string `mapstructure:"grpc_listen"`
+	MaxConnections  int    `mapstructure:"max_connections"`
+	MaxRequests     int    `mapstructure:"max_requests"`
+	MaxRequestBytes int    `mapstructure:"max_request_bytes"`
+}
+
+func defaultOTLPConfig() otlpReceiverConfig {
+	return otlpReceiverConfig{HTTPListen: ":4318", GRPCListen: ":4317", MaxConnections: 256, MaxRequests: 32, MaxRequestBytes: 4 << 20}
+}
+
+func (c *otlpReceiverConfig) Validate() error {
+	if c.MaxConnections < 1 || c.MaxConnections > 65536 || c.MaxRequests < 1 || c.MaxRequests > 4096 || c.MaxRequestBytes < 1024 || c.MaxRequestBytes > 64<<20 {
+		return errors.New("sandboxotlp limits out of range")
+	}
+	for _, address := range []string{c.HTTPListen, c.GRPCListen} {
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return fmt.Errorf("sandboxotlp listen: %w", err)
+		}
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 0 || number > 65535 {
+			return errors.New("sandboxotlp port must be in [0, 65535]")
+		}
+	}
+	if c.HTTPListen == c.GRPCListen {
+		_, port, _ := net.SplitHostPort(c.HTTPListen)
+		if port != "0" {
+			return errors.New("sandboxotlp listeners conflict")
+		}
+	}
+	return nil
+}
+
+func otlpFactory(view *View, proxyNetNS string, fatal func(error)) receiver.Factory {
+	return receiver.NewFactory(component.MustNewType("sandboxotlp"), func() component.Config {
+		cfg := defaultOTLPConfig()
+		return &cfg
+	}, receiver.WithMetrics(func(_ context.Context, _ receiver.Settings, raw component.Config, next consumer.Metrics) (receiver.Metrics, error) {
+		parsed := raw.(*otlpReceiverConfig)
+		return &otlpReceiver{view: view, cfg: *parsed, proxyNetNS: proxyNetNS, next: next, fatal: fatal, requests: make(chan struct{}, parsed.MaxRequests)}, nil
+	}, component.StabilityLevelStable))
 }
 
 type otlpReceiver struct {
 	pmetricotlp.UnimplementedGRPCServer
 	view                       *View
-	cfg                        config.Telemetry
+	lifecycle                  context.Context
+	cfg                        otlpReceiverConfig
+	proxyNetNS                 string
 	next                       consumer.Metrics
 	fatal                      func(error)
 	requests                   chan struct{}
@@ -105,7 +146,8 @@ func (l *identityListener) Accept() (net.Conn, error) {
 }
 
 func (r *otlpReceiver) Start(ctx context.Context, _ component.Host) (err error) {
-	ns, err := appnet.OpenProxyNetNS(r.cfg.ProxyNetNS)
+	r.lifecycle = ctx
+	ns, err := appnet.OpenProxyNetNS(r.proxyNetNS)
 	if err != nil {
 		return err
 	}
@@ -115,13 +157,13 @@ func (r *otlpReceiver) Start(ctx context.Context, _ component.Host) (err error) 
 		if err != nil {
 			return nil, err
 		}
-		return &identityListener{Listener: netutil.LimitListener(ln, r.cfg.Telemetry.OTLP.MaxConnections), view: r.view}, nil
+		return &identityListener{Listener: netutil.LimitListener(ln, r.cfg.MaxConnections), view: r.view}, nil
 	}
-	r.httpListener, err = listen(r.cfg.Telemetry.OTLP.HTTPListen)
+	r.httpListener, err = listen(r.cfg.HTTPListen)
 	if err != nil {
 		return fmt.Errorf("OTLP HTTP listen: %w", err)
 	}
-	r.grpcListener, err = listen(r.cfg.Telemetry.OTLP.GRPCListen)
+	r.grpcListener, err = listen(r.cfg.GRPCListen)
 	if err != nil {
 		_ = r.httpListener.Close()
 		return fmt.Errorf("OTLP gRPC listen: %w", err)
@@ -132,7 +174,7 @@ func (r *otlpReceiver) Start(ctx context.Context, _ component.Host) (err error) 
 			addr, _ := conn.RemoteAddr().(identityAddr)
 			return withIdentity(ctx, addr.entry, "otlp")
 		}}
-	r.grpcServer = grpc.NewServer(grpc.MaxRecvMsgSize(r.cfg.Telemetry.OTLP.MaxRequestBytes), grpc.MaxConcurrentStreams(uint32(r.cfg.Telemetry.OTLP.MaxRequests)), grpc.ConnectionTimeout(5*time.Second),
+	r.grpcServer = grpc.NewServer(grpc.MaxRecvMsgSize(r.cfg.MaxRequestBytes), grpc.MaxConcurrentStreams(uint32(r.cfg.MaxRequests)), grpc.ConnectionTimeout(5*time.Second),
 		grpc.InTapHandle(r.grpcTap), grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 30 * time.Second}))
 	pmetricotlp.RegisterGRPCServer(r.grpcServer, r)
 	r.wg.Add(2)
@@ -196,7 +238,7 @@ func (r *otlpReceiver) Export(ctx context.Context, request pmetricotlp.ExportReq
 	defer cancel()
 	stop := context.AfterFunc(addr.entry.ctx, cancel)
 	defer stop()
-	if err := r.next.ConsumeMetrics(ctx, request.Metrics()); err != nil {
+	if err := r.acceptAndDeliver(ctx, addr.entry, request.Metrics()); err != nil {
 		code := codes.Unavailable
 		if errors.Is(err, ErrIdentity) {
 			code = codes.Unauthenticated
@@ -241,6 +283,19 @@ func (r *otlpReceiver) grpcTap(ctx context.Context, info *tap.Info) (context.Con
 	return ctx, nil
 }
 
+func (r *otlpReceiver) acceptAndDeliver(ctx context.Context, entry *target, metrics pmetric.Metrics) error {
+	if err := r.view.acceptMetrics(ctx, entry, "otlp", metrics); err != nil {
+		return err
+	}
+	parent := r.lifecycle
+	if parent == nil {
+		parent = context.Background()
+	} // Direct handler test harness.
+	pipelineCtx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	return r.next.ConsumeMetrics(pipelineCtx, metrics)
+}
+
 func (r *otlpReceiver) httpHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/metrics", func(w http.ResponseWriter, req *http.Request) {
@@ -265,7 +320,7 @@ func (r *otlpReceiver) httpHandler() http.Handler {
 			http.Error(w, "unsupported OTLP content type", 415)
 			return
 		}
-		var body io.Reader = http.MaxBytesReader(w, req.Body, int64(r.cfg.Telemetry.OTLP.MaxRequestBytes))
+		var body io.Reader = http.MaxBytesReader(w, req.Body, int64(r.cfg.MaxRequestBytes))
 		switch req.Header.Get("Content-Encoding") {
 		case "", "identity":
 		case "gzip":
@@ -280,8 +335,8 @@ func (r *otlpReceiver) httpHandler() http.Handler {
 			http.Error(w, "unsupported OTLP encoding", 415)
 			return
 		}
-		raw, err := io.ReadAll(io.LimitReader(body, int64(r.cfg.Telemetry.OTLP.MaxRequestBytes)+1))
-		if err != nil || len(raw) > r.cfg.Telemetry.OTLP.MaxRequestBytes {
+		raw, err := io.ReadAll(io.LimitReader(body, int64(r.cfg.MaxRequestBytes)+1))
+		if err != nil || len(raw) > r.cfg.MaxRequestBytes {
 			http.Error(w, "OTLP body too large or unreadable", 413)
 			return
 		}
@@ -295,7 +350,7 @@ func (r *otlpReceiver) httpHandler() http.Handler {
 			http.Error(w, "invalid OTLP metrics", 400)
 			return
 		}
-		if err = r.next.ConsumeMetrics(ctx, request.Metrics()); err != nil {
+		if err = r.acceptAndDeliver(ctx, identity.entry, request.Metrics()); err != nil {
 			code := http.StatusServiceUnavailable
 			if errors.Is(err, ErrIdentity) {
 				code = http.StatusUnauthorized

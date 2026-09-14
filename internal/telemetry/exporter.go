@@ -54,11 +54,9 @@ func canonicalSamples(metrics pmetric.Metrics) ([]extension.Sample, error) {
 		rm := resources.At(i)
 		base := make(map[string]string)
 		for _, key := range []string{SandboxIDAttribute, StableIDAttribute, sourceAttribute} {
-			value, ok := rm.Resource().Attributes().Get(key)
-			if !ok || value.Type() != pcommon.ValueTypeStr || value.Str() == "" {
-				return nil, ErrIdentity
+			if value, ok := rm.Resource().Attributes().Get(key); ok {
+				base[key] = value.AsString()
 			}
-			base[key] = value.Str()
 		}
 		rm.Resource().Attributes().Range(func(key string, value pcommon.Value) bool {
 			if key != SandboxIDAttribute && key != StableIDAttribute && key != sourceAttribute {

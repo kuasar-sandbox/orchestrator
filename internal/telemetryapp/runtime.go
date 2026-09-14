@@ -14,12 +14,11 @@ import (
 )
 
 type Bindings struct {
-	Logger          *slog.Logger
-	Extension       extension.Extension
-	Storage         func(context.Context, config.TelemetryStorage) (extension.Storage, error)
-	ExporterHeaders func(context.Context, string) (map[string]string, error)
-	StorageHeaders  func(context.Context) (map[string]string, error)
-	Collector       customotel.Components
+	Logger         *slog.Logger
+	Extension      extension.Extension
+	Storage        func(context.Context, config.TelemetryStorage) (extension.Storage, error)
+	StorageHeaders func(context.Context) (map[string]string, error)
+	Collector      customotel.Components
 }
 
 type Runtime struct{ Bindings }
@@ -51,19 +50,6 @@ func ResolveRuntime(ctx context.Context, cfg *config.Telemetry, bindings Binding
 		default:
 			return nil, errors.New("StorageHeaders requires a built-in external primary storage")
 		}
-	}
-	if bindings.ExporterHeaders != nil {
-		for i := range cfg.Telemetry.Exporters {
-			headers, err := bindings.ExporterHeaders(ctx, cfg.Telemetry.Exporters[i].Name)
-			if err != nil {
-				return nil, fmt.Errorf("telemetry exporter credentials: %w", err)
-			}
-			// Provider is authoritative, including an intentionally empty map.
-			cfg.Telemetry.Exporters[i].Headers = maps.Clone(headers)
-		}
-	}
-	if cfg.Telemetry.Storage.Type == "none" && len(cfg.Telemetry.Exporters) == 0 && len(bindings.Collector.Exporters) == 0 {
-		return nil, errors.New("telemetry requires a primary storage or an exporter")
 	}
 	if err := config.ValidateTelemetryFinal(cfg); err != nil {
 		return nil, err

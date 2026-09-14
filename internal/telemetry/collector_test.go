@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -44,15 +43,14 @@ type testExporter struct{ consumer.Metrics }
 func (*testExporter) Start(context.Context, component.Host) error { return nil }
 func (*testExporter) Shutdown(context.Context) error              { return nil }
 
-func TestCollectorCustomComponentsCannotReplaceTrustedIdentity(t *testing.T) {
+func TestCollectorAcceptsBeforeDetachedContextAndRouteDeletion(t *testing.T) {
 	for _, dropContext := range []bool{false, true} {
-		t.Run(map[bool]string{false: "overwrite", true: "context-loss"}[dropContext], func(t *testing.T) {
+		t.Run(map[bool]string{false: "preserve", true: "context-loss"}[dropContext], func(t *testing.T) {
 			cfg, err := config.DecodeTelemetry(bytes.NewReader([]byte("{}")))
 			if err != nil {
 				t.Fatal(err)
 			}
-			*cfg.Telemetry.OTLP.Enabled = false
-			view := NewView(1, time.Second)
+			view := NewView(1)
 			defer view.InvalidateSync()
 			route := testRoute("sid")
 			route.EnvdUDS = unixHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(envdBody()) }))
@@ -65,9 +63,8 @@ func TestCollectorCustomComponentsCannotReplaceTrustedIdentity(t *testing.T) {
 				processor.WithMetrics(func(_ context.Context, _ processor.Settings, _ component.Config, next consumer.Metrics) (processor.Metrics, error) {
 					c, err := consumer.NewMetrics(func(ctx context.Context, m pmetric.Metrics) error {
 						attrs := m.ResourceMetrics().At(0).Resource().Attributes()
-						attrs.PutStr(SandboxIDAttribute, "victim")
-						attrs.PutStr(StableIDAttribute, "victim-stable")
-						attrs.PutStr("sandbox.run_id", "injected")
+						attrs.PutStr("application.run_id", "application-owned")
+						view.ApplyDelete("sid")
 						if dropContext {
 							ctx = context.Background()
 						}
@@ -86,8 +83,16 @@ func TestCollectorCustomComponentsCannotReplaceTrustedIdentity(t *testing.T) {
 						return nil
 					})}, nil
 				}, component.StabilityLevelStable))
+			cfg.Collector = map[string]any{
+				"receivers":  map[string]any{"envd": map[string]any{"collection_interval": "1s"}},
+				"processors": map[string]any{"privateprocessor": map[string]any{}},
+				"exporters":  map[string]any{"sandboxstorage": map[string]any{}, "privateexporter": map[string]any{}},
+				"service": map[string]any{"telemetry": map[string]any{"metrics": map[string]any{"level": "none"}}, "pipelines": map[string]any{"metrics": map[string]any{
+					"receivers": []any{"envd"}, "processors": []any{"privateprocessor"}, "exporters": []any{"sandboxstorage", "privateexporter"},
+				}}},
+			}
 			collector, err := NewCollector(context.Background(), *cfg, view, backend, customotel.Components{
-				Processors: []customotel.Processor{{Factory: factory}}, Exporters: []customotel.Exporter{{Factory: fanout}},
+				Processors: []processor.Factory{factory}, Exporters: []exporter.Factory{fanout},
 			}, testLogger(), make(chan error, 1))
 			if err != nil {
 				t.Fatal(err)
@@ -107,17 +112,11 @@ func TestCollectorCustomComponentsCannotReplaceTrustedIdentity(t *testing.T) {
 			}
 			select {
 			case err := <-processed:
-				if dropContext && !errors.Is(err, ErrIdentity) || !dropContext && err != nil {
-					t.Fatal("final guard", err)
+				if err != nil {
+					t.Fatal("accepted sample delivery", err)
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("custom pipeline did not run")
-			}
-			if dropContext {
-				if len(backend.writes) != 0 || len(exported) != 0 {
-					t.Fatal("lost identity reached storage/exporter")
-				}
-				return
 			}
 			samples := <-backend.writes
 			if len(samples) != 7 {
@@ -138,19 +137,5 @@ func TestCollectorCustomComponentsCannotReplaceTrustedIdentity(t *testing.T) {
 				t.Fatal("forged exported identity")
 			}
 		})
-	}
-}
-
-func TestCollectorRejectsReservedComponentTypes(t *testing.T) {
-	cfg, err := config.DecodeTelemetry(bytes.NewReader([]byte("{}")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"sandboxidentity", "sandboxidentityguard"} {
-		factory := processor.NewFactory(component.MustNewType(name), func() component.Config { return &emptyConfig{} })
-		if _, err := NewCollector(context.Background(), *cfg, NewView(1, time.Second), nil,
-			customotel.Components{Processors: []customotel.Processor{{Factory: factory}}}, testLogger(), make(chan error, 1)); err == nil {
-			t.Fatal("reserved type accepted", name)
-		}
 	}
 }

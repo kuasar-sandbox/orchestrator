@@ -262,7 +262,7 @@ Core 固定最低 TLS 1.2 与 `h2`/`http/1.1` ALPN。
 `config.LoadTelemetry`/`DecodeTelemetry` 返回 `*config.Telemetry`，沿用有界 strict YAML
 decode 和一次默认化。省略的 external endpoint 可由 Configure 提供；显式非法值在
 decode 阶段就失败。`ValidateTelemetryFinal` 校验完整声明，不重新套用默认值。`Clone`
-深拷贝 pointer/map/exporter 声明。`node-ctl config telemetry` 只诊断声明和 executable
+深拷贝 map、slice 和原生 Collector 声明。`node-ctl config telemetry` 只诊断声明和 executable
 metadata，不运行 extension 或 material provider。
 
 `paths.telemetry_executable` 为空使用内置组件；否则 node-ctl 校验并打开受保护静态
@@ -276,7 +276,7 @@ dispatch path；Hook 不能把它重定向到另一个 executable。
 app := telemetry.New(telemetry.Hooks{
     Configure: func(ctx context.Context, cfg *telemetry.Config, rt *telemetry.Runtime) error {
         rt.Extension = myExtension
-        // 可选绑定 rt.Storage、rt.StorageHeaders、rt.ExporterHeaders。
+        // 可选绑定 rt.Storage、rt.StorageHeaders、rt.Collector。
         return nil
     },
 })
@@ -286,8 +286,7 @@ err := app.Run() // RunContext(ctx) 使用显式父生命周期。
 New 无副作用，App 只能运行一次。Configure 是唯一 startup hook，早于 store/listener/
 receiver 副作用。Core 冻结 config，解析 authoritative material provider、最终校验，
 然后打开 primary storage，启动 extension、Collector、query listener、Plugin subscriber。
-`Runtime` 拒绝 JSON 序列化/反序列化，包含进程内 Logger、Extension、Storage、StorageHeaders、
-ExporterHeaders 及可选 advanced Collector binding。私有协议也不要序列化 Runtime，
+`Runtime` 拒绝 JSON 序列化/反序列化，包含进程内 Logger、Extension、Storage、StorageHeaders 及可选 advanced Collector binding。私有协议也不要序列化 Runtime，
 Hook 返回后不要保留并修改 Configure 的声明。
 
 `app/telemetry/extension` 是普通 provider-neutral 叶包：
@@ -304,25 +303,27 @@ Hook 返回后不要保留并修改 Configure 的声明。
 `Runtime.Storage` 是接收 context 和独立 storage 声明副本的 factory，只与
 `storage.type: custom` 配对。错误或 nil 结果不回退 local。如果构造返回已拥有的 backend
 同时返回 error，core 仍关闭该 backend。`Runtime.StorageHeaders(ctx)` 为内建
-Prometheus/ClickHouse primary 替换整个 credential map；`Runtime.ExporterHeaders(ctx, name)`
-为每个配置的 OTLP/HTTP extra exporter 做相同替换。空 map 也 authoritative，provider
-错误不使用旧 YAML 凭据，返回 map 会被复制。Custom storage 自己管理其他私有材料。
+Prometheus/ClickHouse primary 替换整个 credential map. 空 map 同样 authoritative,
+provider 失败不使用旧 YAML 凭据, 返回 map 会被复制. 原生 exporter 凭据使用 confmap
+provider, 如组件配置内的 `${env:NAME}` 或 `${file:/path}`. 旧 ExporterHeaders binding
+和逐组件 Configure wrapper 已移除; 静态 config provider 可按相同 Collector resolver
+契约提供私有材料.
 
-普通 extension 契约不导入 OTel 类型。只有 advanced integration 使用
-`app/telemetry/otel`：`Components.Processors`/`Components.Exporters` 接收实际 Collector
-factory，以及可选的 fresh default component config Configure callback。Core 校验配置，
-拒绝重复/reserved type。它是明确有序的启动列表，不是 runtime discovery 或 DI；不暴露
-core receiver 替换或新 routing/identity authority。私有 component 使用本次构建选定的
-Collector 版本，不承诺跨版本 binary plugin ABI。
+普通 extension 契约不导入 OTel 类型. Advanced integration 使用
+`app/telemetry/otel.Components` 的 `Receivers`、`Processors`、`Exporters`、`Connectors`、
+`Extensions`、`Providers`、`Converters` factory 列表. 每个 type 只注册一次, 原生配置
+创建 `type/name` 实例并连接 pipeline. 原生 confmap unmarshal/validation 拒绝不支持的
+选项、未知组件及不一致 pipeline 引用. `service.telemetry`、`service.extensions` 保留
+原生语义. 已链接的通用 signal 均可用, 不用 metrics-only wrapper 阻断普通 logs/traces.
+静态 factory 使用本次选定 Collector 版本, 不承诺 binary plugin ABI.
 
-定制 processor 保留私有 ingress context，不能把不同 sandbox identity 合并到同一个
-resource；它们位于初始 enrichment 与最终 current-route identity guard 之间。Context
-丢失/过期 fail closed；进入 storage/exporter 前，guest 或 custom 提供的
-`sandbox.id`/`sandbox.stable_id` 被覆盖，RunID 属性被移除。不支持丢弃 context 或混合
-不同身份的 asynchronous processor；有界 queue 应放在 final guard 后的 exporter。
-Extra exporter 只写，不开启 E2B query。Custom primary 必须同时实现 read/write，
-坚持精确 SandboxID、遵守 cancellation/bounds、返回缺失观测而非编造零值。这是受信
-进程内 API，不是对恶意静态链接代码的安全沙箱。
+Core 在来源接纳时将沙箱身份写入 pdata resource attributes. 标准 batch 可包含多个
+沙箱的 resource, 各自身份独立保留. Pause/delete 后的 queue/retry 保留已接纳样本,
+不依赖私有请求 context 或 exporter 阶段的 route lookup. Envd 拒绝迟到未接纳 fetch;
+OTLP 仍使用已固定的实际 FloatingIP peer; conductor stats 信任已授权对象读取, 包括
+paused saved usage. 普通基础设施 receiver 不要求 SandboxID. `application.run_id` 等
+应用属性保留. 可信部署配置与静态扩展属于原信任域; 显式转换 resource attributes 时
+须维护期望的数据归属. 它们不会得到额外 discovery、生命周期或网络绑定权威.
 
 关闭时先撤销 Plugin lease、drain query/ingress，再依次关闭 Collector、Extension、
 primary storage；每步 cleanup 都有有界 context。Extension 在 Shutdown 后不能继续使用

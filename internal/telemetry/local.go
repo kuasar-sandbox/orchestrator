@@ -180,7 +180,7 @@ func (l *Local) Write(ctx context.Context, samples []extension.Sample) error {
 		if stamp > now.Add(time.Minute).UnixMilli() || stamp < 0 || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
 			return ErrInvalidMetrics
 		}
-		if sample.Metric == "" || len(sample.Metric) > 128 || len(sample.Labels) > 110 || sample.Labels[SandboxIDAttribute] == "" || sample.Labels[StableIDAttribute] == "" {
+		if sample.Metric == "" || len(sample.Metric) > 128 || len(sample.Labels) > 110 {
 			return ErrInvalidMetrics
 		}
 		builder := labels.NewScratchBuilder(len(sample.Labels) + 1)

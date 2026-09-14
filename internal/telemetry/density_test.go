@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
@@ -24,7 +23,7 @@ func BenchmarkEnvdDensity(b *testing.B) {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
 			body := envdJSON()
 			path := unixHTTP(b, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
-			view := NewView(count, 5*time.Second)
+			view := NewView(count)
 			defer view.InvalidateSync()
 			for n := range count {
 				route := testRoute(fmt.Sprint(n))
@@ -33,8 +32,8 @@ func BenchmarkEnvdDensity(b *testing.B) {
 			}
 			view.Bookmark()
 			var received atomic.Int64
-			guard := &identityProcessor{view: view, final: true, next: metricsConsumer(b, func(context.Context, pmetric.Metrics) error { received.Add(1); return nil })}
-			r := &envdReceiver{view: view, cfg: config.TelemetryScrape{Interval: "5s", Timeout: "1s", Concurrency: 64}, next: guard, log: testLogger()}
+			guard := metricsConsumer(b, func(context.Context, pmetric.Metrics) error { received.Add(1); return nil })
+			r := &envdReceiver{view: view, cfg: envdReceiverConfig{CollectionInterval: 5 * time.Second, Timeout: time.Second, Concurrency: 64}, next: guard, log: testLogger()}
 			fds := func() int {
 				entries, err := os.ReadDir("/proc/self/fd")
 				if err != nil {

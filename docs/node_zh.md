@@ -296,7 +296,9 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 独立组件拥有自身 strict config schema 和 `paths.telemetry_executable` static bootstrap
 入口。以固定 Plugin ID `telemetry` 注册，订阅 `Kind: route`；只有 primary storage
 可读时才注册独立 HTTP query UDS。它不加入 Create/Resume readiness，也不调用 Wake。
-Local TSDB、Prometheus、ClickHouse reader、直接 sandbox OTLP 网络、E2B step/MAX 与
+原生 Collector 配置选择 envd、sandboxstats、sandboxotlp receiver, 标准 processor、
+exporter、connector、extension 及多 pipeline. Sandboxstats 只经 conductor config_socket
+上的当前 telemetry lease 读取, 原生 stats 不依赖 telemetry. Local TSDB、Prometheus、ClickHouse reader、直接 sandbox OTLP 网络、E2B step/MAX 与
 boundary 契约见 [Telemetry](telemetry_zh.md)。`deploy/node-telemetry.service` 与
 conductor/Proxy 并列部署，不作为它们的 required dependency。
 

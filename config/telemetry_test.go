@@ -13,7 +13,7 @@ func TestTelemetryDefaultsAndStrictDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Telemetry.Scrape.Interval != "5s" || cfg.Telemetry.Scrape.Timeout != "1s" || cfg.Telemetry.Storage.Type != "local" || !*cfg.Telemetry.OTLP.Enabled {
+	if cfg.Telemetry.Storage.Type != "none" || cfg.Collector != nil {
 		t.Fatalf("defaults %+v", cfg)
 	}
 	for _, raw := range []string{"unknown: true", "telemetry:\n  scrape:\n    bogus: 1", "telemetry:\n  storage:\n    type: local\n    type: none", "{}\n---\n{}", "api_socket: relative", "paths:\n  telemetry_executable: relative", "proxy_netns: ../escape", "telemetry:\n  storage:\n    type: sqlite", "telemetry:\n  scrape:\n    timeout: 6s", "telemetry:\n  otlp:\n    grpc_listen: localhost:invalid"} {
@@ -58,21 +58,27 @@ func TestTelemetryProxyNetNSContract(t *testing.T) {
 }
 
 func TestTelemetryFinalValidationAndClone(t *testing.T) {
-	cfg, err := DecodeTelemetry(strings.NewReader("telemetry:\n  exporters:\n    - name: extra\n      type: otlphttp\n      endpoint: https://collector.example.com\n      headers:\n        Authorization: secret\n"))
+	cfg, err := DecodeTelemetry(strings.NewReader(`collector:
+  exporters:
+    otlp_http/extra:
+      endpoint: https://collector.example.com
+      headers: {Authorization: secret}
+`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	clone := cfg.Clone()
-	clone.Telemetry.Exporters[0].Headers["Authorization"] = "other"
-	*clone.Telemetry.OTLP.Enabled = false
-	if cfg.Telemetry.Exporters[0].Headers["Authorization"] != "secret" || !*cfg.Telemetry.OTLP.Enabled {
-		t.Fatal("clone aliases config")
+	header := func(c *Telemetry) map[string]any {
+		return c.Collector["exporters"].(map[string]any)["otlp_http/extra"].(map[string]any)["headers"].(map[string]any)
 	}
+	header(clone)["Authorization"] = "other"
+	if header(cfg)["Authorization"] != "secret" {
+		t.Fatal("clone aliases Collector config")
+	}
+
 	for _, modify := range []func(*Telemetry){
-		func(c *Telemetry) { c.Telemetry.Scrape.Concurrency = 0 }, func(c *Telemetry) { c.Telemetry.OTLP.Enabled = nil },
 		func(c *Telemetry) { c.Telemetry.Storage.Retention = "0s" }, func(c *Telemetry) { c.Telemetry.Storage.MaxSize = "1MiB" },
-		func(c *Telemetry) { c.Telemetry.Storage.MaxSeries = 1 }, func(c *Telemetry) { c.APISocket = c.ConfigSocket },
-		func(c *Telemetry) { c.Telemetry.OTLP.GRPCListen = c.Telemetry.OTLP.HTTPListen }, func(c *Telemetry) { c.Telemetry.Exporters[0].Headers["Authorization"] = "bad\r\nX: value" },
+		func(c *Telemetry) { c.Telemetry.Storage.MaxSeries = 0 }, func(c *Telemetry) { c.APISocket = c.ConfigSocket },
 	} {
 		candidate := cfg.Clone()
 		modify(candidate)

@@ -51,26 +51,44 @@ route_capacity: 65536
 paths:
   # telemetry_executable: /opt/kuasar/bin/custom-telemetry
 telemetry:
-  scrape:
-    interval: 5s
-    timeout: 1s
-    concurrency: 64
-  otlp:
-    enabled: true
-    grpc_listen: ":4317"
-    http_listen: ":4318"
-    max_connections: 256
-    max_requests: 32
-    max_request_bytes: 4194304
   storage:
     type: local
     path: /var/lib/sandbox/telemetry
     retention: 168h
     max_size: 10GiB
     max_series: 1000000
-  # Extra exporters are write-only fan-out, not metrics query backends.
-  # exporters:
-  #   - name: observability
-  #     type: otlphttp
-  #     endpoint: https://collector.example.com
+collector:
+  receivers:
+    envd:
+      collection_interval: 5s
+      timeout: 1s
+      concurrency: 64
+    sandboxstats:
+      resource_interval: 5s
+      traffic_interval: 10s
+      usage_interval: 1m
+    sandboxotlp:
+      grpc_listen: ":4317"
+      http_listen: ":4318"
+      max_connections: 256
+      max_requests: 32
+      max_request_bytes: 4194304
+  processors:
+    batch:
+      timeout: 1s
+      send_batch_size: 8192
+      send_batch_max_size: 8192
+  exporters:
+    sandboxstorage: {}
+    # otlp_http/observability:
+    #   endpoint: https://collector.example.com
+  service:
+    extensions: []
+    telemetry:
+      metrics: {level: none}
+    pipelines:
+      metrics:
+        receivers: [envd, sandboxstats, sandboxotlp]
+        processors: [batch]
+        exporters: [sandboxstorage]
 `

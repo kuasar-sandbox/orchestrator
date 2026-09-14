@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -106,13 +105,13 @@ func TestEnvdMappingAndMalformedFields(t *testing.T) {
 func TestEnvdTimeoutAndStaleResponse(t *testing.T) {
 	for _, stale := range []bool{false, true} {
 		t.Run(fmt.Sprint("stale=", stale), func(t *testing.T) {
-			view := NewView(1, time.Second)
+			view := NewView(1)
 			route := testRoute("sid")
 			entry := upsert(t, view, route)
 			view.Bookmark()
 			var writes atomic.Int32
-			next := &identityProcessor{view: view, final: true, next: metricsConsumer(t, func(context.Context, pmetric.Metrics) error { writes.Add(1); return nil })}
-			r := &envdReceiver{view: view, cfg: config.TelemetryScrape{Timeout: "20ms"}, next: next}
+			next := metricsConsumer(t, func(context.Context, pmetric.Metrics) error { writes.Add(1); return nil })
+			r := &envdReceiver{view: view, cfg: envdReceiverConfig{Timeout: 20 * time.Millisecond}, next: next}
 			started, release := make(chan struct{}), make(chan struct{})
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if req.URL.Path != "/metrics" || req.Header.Get("X-Access-Token") != route.EnvdAccessToken {
@@ -150,7 +149,7 @@ func TestEnvdTimeoutAndStaleResponse(t *testing.T) {
 }
 
 func TestEnvdUDSConnectionIsolationAndBoundedWorkers(t *testing.T) {
-	view := NewView(10, 20*time.Millisecond)
+	view := NewView(10)
 	var bad, active, maximum atomic.Int32
 	for i := range 2 {
 		id, token := fmt.Sprint(i), fmt.Sprint("token-", i)
@@ -174,16 +173,17 @@ func TestEnvdUDSConnectionIsolationAndBoundedWorkers(t *testing.T) {
 	}
 	view.Bookmark()
 	observed := make(chan string, 32)
-	next := &identityProcessor{view: view, final: true, next: metricsConsumer(t, func(ctx context.Context, metrics pmetric.Metrics) error {
-		id := ctx.Value(identityContextKey{}).(ingressIdentity).entry.route.SandboxID
+	next := metricsConsumer(t, func(ctx context.Context, metrics pmetric.Metrics) error {
+		value, _ := metrics.ResourceMetrics().At(0).Resource().Attributes().Get(SandboxIDAttribute)
+		id := value.Str()
 		count := metrics.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0).DoubleValue()
 		if (id == "0" && count != 1) || (id == "1" && count != 2) {
 			bad.Add(1)
 		}
 		observed <- id
 		return nil
-	})}
-	r := &envdReceiver{view: view, cfg: config.TelemetryScrape{Interval: "20ms", Timeout: "1s", Concurrency: 1}, next: next, log: testLogger()}
+	})
+	r := &envdReceiver{view: view, cfg: envdReceiverConfig{CollectionInterval: 20 * time.Millisecond, Timeout: time.Second, Concurrency: 1}, next: next, log: testLogger()}
 	if err := r.Start(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}

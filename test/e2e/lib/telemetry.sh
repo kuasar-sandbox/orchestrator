@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Uses the existing real Proxy/envd fixture; no second lifecycle or network setup.
+. "$SCRIPT_DIR/lib/telemetry_stats.sh"
 
 start_telemetry() {
     "$BIN/node-ctl" telemetry serve --config "$WORK/telemetry.yaml" >>"$WORK/telemetry.log" 2>&1 &
@@ -47,22 +48,39 @@ run_telemetry_guest_probe() {
     fi
     # Sandbox creation already succeeded before telemetry was started: telemetry
     # registration must not be part of create/resume admission.
+    start_stats_sink
     cat >"$WORK/telemetry.yaml" <<EOF
 config_socket: $WORK/node-ctl.socket
 api_socket: $WORK/telemetry.sock
 proxy_netns: $PROXY_NETNS
 route_capacity: 1024
 telemetry:
-  otlp:
-    grpc_listen: $PROXY_NS_IP:4317
-    http_listen: $PROXY_NS_IP:4318
   storage:
     type: local
     path: $WORK/telemetry-db
     retention: 1h
     max_size: 64MiB
+collector:
+  receivers:
+    envd: {collection_interval: 1s}
+    sandboxstats: {resource_interval: 1s, traffic_interval: 1s, usage_interval: 1s}
+    sandboxotlp:
+      grpc_listen: $PROXY_NS_IP:4317
+      http_listen: $PROXY_NS_IP:4318
+  processors:
+    batch: {timeout: 200ms}
+  exporters:
+    sandboxstorage: {}
+    otlp_http/probe: {endpoint: 'http://127.0.0.1:$STATS_SINK_PORT', encoding: json, compression: none}
+  service:
+    telemetry: {metrics: {level: none}}
+    pipelines:
+      metrics:
+        receivers: [envd, sandboxstats, sandboxotlp]
+        processors: [batch]
+        exporters: [sandboxstorage, otlp_http/probe]
 EOF
-    local code command
+    local code command section
     code=$(req GET "/sandboxes/$SID/metrics" "$AK")
     [ "$code" = 503 ] || fail "metrics without telemetry=$code (want 503)"
     start_telemetry
@@ -101,6 +119,13 @@ EOF
         >"$WORK/telemetry-guest-grpc.out" 2>&1
     grep -q 'OTLP_GRPC_PEER_IDENTITY_OK' "$WORK/telemetry-guest-grpc.out" \
         || { cat "$WORK/telemetry-guest-grpc.out"; dump_logs; fail "guest OTLP/gRPC through management service"; }
+    for section in resource traffic; do
+        code=$(req GET "/sandboxes/$SID/stats/$section" "$AK")
+        [ "$code" = 200 ] || fail "native $section reference=$code"
+        cp "$WORK/resp.body" "$WORK/telemetry-native-$section.json"
+        wait_native_export "$SID" "$section" "$WORK/telemetry-native-$section.json"
+    done
+    echo "==> PASS: real native resource/traffic -> conductor lease -> sandboxstats -> batch -> HTTP exporter; exact SID and host timestamps"
     echo "==> PASS: envd -> Collector -> local TSDB -> E2B; real guest FloatingIP OTLP HTTP/gRPC; listener namespace ownership"
 }
 

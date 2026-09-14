@@ -1,12 +1,9 @@
 package telemetry
 
 import (
-	"container/heap"
 	"context"
 	"errors"
-	"hash/fnv"
 	"sync"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routeidentity"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -23,10 +20,9 @@ type View struct {
 	byIP       map[uint32]string
 	synced     bool
 	capacity   int
-	interval   time.Duration
 	generation uint64
-	due        targetHeap
 	changed    chan struct{}
+	schedules  map[*scrapeSchedule]struct{}
 }
 
 type target struct {
@@ -34,13 +30,10 @@ type target struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	generation uint64
-	next       time.Time
-	index      int
-	busy       bool
 }
 
-func NewView(capacity int, interval time.Duration) *View {
-	return &View{byID: make(map[string]*target), byIP: make(map[uint32]string), capacity: capacity, interval: interval, changed: make(chan struct{}, 1)}
+func NewView(capacity int) *View {
+	return &View{byID: make(map[string]*target), byIP: make(map[uint32]string), capacity: capacity, changed: make(chan struct{}), schedules: make(map[*scrapeSchedule]struct{})}
 }
 
 func (v *View) BeginSync() { v.InvalidateSync() }
@@ -54,7 +47,9 @@ func (v *View) InvalidateSync() {
 	}
 	clear(v.byID)
 	clear(v.byIP)
-	v.due = nil
+	for schedule := range v.schedules {
+		schedule.clear()
+	}
 	v.notify()
 }
 
@@ -62,9 +57,18 @@ func (v *View) SetPolicy(routesync.Policy) {}
 
 func (v *View) Bookmark() {
 	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.synced {
+		return
+	}
 	v.synced = true
+	for schedule := range v.schedules {
+		schedule.clear()
+		for _, entry := range v.byID {
+			schedule.update(entry.route.SandboxID, entry)
+		}
+	}
 	v.notify()
-	v.mu.Unlock()
 }
 
 func telemetryRoute(r routesync.RouteEntry) routesync.RouteEntry {
@@ -89,25 +93,23 @@ func (v *View) ApplyUpsert(route routesync.RouteEntry) error {
 	v.removeLocked(route.SandboxID)
 	v.generation++
 	ctx, cancel := context.WithCancel(context.Background())
-	entry := &target{route: route, ctx: ctx, cancel: cancel, generation: v.generation, index: -1}
+	entry := &target{route: route, ctx: ctx, cancel: cancel, generation: v.generation}
 	v.byID[route.SandboxID] = entry
 	if ip, ok := routeidentity.IPv4(route.FloatingIP); ok && routeidentity.Active(route.State) {
 		// Same last-upsert ownership rule as the MMDS reverse index. A delayed
 		// delete of the previous owner cannot remove this successor mapping.
 		if previous := v.byID[v.byIP[ip]]; previous != nil && previous != entry {
 			previous.cancel()
-			if previous.index >= 0 {
-				heap.Remove(&v.due, previous.index)
+			for schedule := range v.schedules {
+				schedule.update(previous.route.SandboxID, nil)
 			}
 		}
 		v.byIP[ip] = route.SandboxID
 	}
-	if scrapeEligible(route) {
-		hash := fnv.New64a()
-		_, _ = hash.Write([]byte(route.SandboxID))
-		// Spread a full-sync across the interval rather than producing a burst.
-		entry.next = time.Now().Add(time.Duration(hash.Sum64() % uint64(v.interval)))
-		heap.Push(&v.due, entry)
+	if v.synced {
+		for schedule := range v.schedules {
+			schedule.update(route.SandboxID, entry)
+		}
 	}
 	v.notify()
 	return nil
@@ -121,6 +123,7 @@ func (v *View) ApplyDelete(id string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.removeLocked(id)
+	v.notify()
 }
 
 func (v *View) removeLocked(id string) {
@@ -129,13 +132,13 @@ func (v *View) removeLocked(id string) {
 		return
 	}
 	entry.cancel()
-	if entry.index >= 0 {
-		heap.Remove(&v.due, entry.index)
-	}
 	if ip, ok := routeidentity.IPv4(entry.route.FloatingIP); ok && v.byIP[ip] == id {
 		delete(v.byIP, ip)
 	}
 	delete(v.byID, id)
+	for schedule := range v.schedules {
+		schedule.update(id, nil)
+	}
 }
 
 // ByFloatingIP follows MMDS: parse an IPv4 (including IPv4-mapped IPv6), look
@@ -172,69 +175,32 @@ func (v *View) withCurrent(entry *target, operation func() error) error {
 	if ip, ok := routeidentity.IPv4(entry.route.FloatingIP); ok && v.byIP[ip] != entry.route.SandboxID {
 		return ErrIdentity
 	}
-	// Linearize the final Collector delivery with route invalidation. A scrape
-	// response returned after cancellation can never reach storage/exporters.
+	// Linearize source acceptance with route invalidation. The callback only
+	// validates/enriches bounded pdata; it must not call a downstream consumer.
 	return operation()
 }
 
-func (v *View) takeDue(now time.Time, limit int) []*target {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if !v.synced {
-		return nil
-	}
-	var jobs []*target
-	for len(jobs) < limit && len(v.due) != 0 && !v.due[0].next.After(now) {
-		entry := heap.Pop(&v.due).(*target)
-		if !entry.busy {
-			entry.busy = true
-			jobs = append(jobs, entry)
-		}
-		entry.next = now.Add(v.interval)
-		heap.Push(&v.due, entry)
-	}
-	return jobs
-}
-
-func (v *View) finished(entry *target) {
-	v.mu.Lock()
-	entry.busy = false
-	v.mu.Unlock()
-	v.notify()
-}
-
+// notify broadcasts existing RouteEntry changes to every receiver instance.
+// Callers hold mu; this carries no metric samples or alternate target protocol.
 func (v *View) notify() {
-	select {
-	case v.changed <- struct{}{}:
-	default:
-	}
+	close(v.changed)
+	v.changed = make(chan struct{})
 }
-func (v *View) nextDelay(now time.Time) time.Duration {
+
+// snapshot contains exact discovered objects, including paused objects whose
+// saved native usage can be read. Source-specific eligibility belongs to the
+// receiver; conductor remains authoritative for native stats.
+func (v *View) snapshot() ([]*target, <-chan struct{}) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	if !v.synced || len(v.due) == 0 {
-		return time.Hour
+	if !v.synced {
+		return nil, v.changed
 	}
-	return max(time.Millisecond, v.due[0].next.Sub(now))
-}
-
-type targetHeap []*target
-
-func (h targetHeap) Len() int           { return len(h) }
-func (h targetHeap) Less(i, j int) bool { return h[i].next.Before(h[j].next) }
-func (h targetHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
-func (h *targetHeap) Push(value any) {
-	entry := value.(*target)
-	entry.index = len(*h)
-	*h = append(*h, entry)
-}
-func (h *targetHeap) Pop() any {
-	old := *h
-	entry := old[len(old)-1]
-	old[len(old)-1] = nil
-	*h = old[:len(old)-1]
-	entry.index = -1
-	return entry
+	out := make([]*target, 0, len(v.byID))
+	for _, entry := range v.byID {
+		out = append(out, entry)
+	}
+	return out, v.changed
 }
 
 var _ routesync.Sink = (*View)(nil)

@@ -19,25 +19,25 @@ Collector pipeline、primary storage、exporter、历史查询及 E2B 转换。�
 controller，不改变 checkpoint 或生命周期策略。
 
 ```text
-Conductor Plugin Plane ── 完整 RouteEntry stream ──► Telemetry view
-                                                       │
-envd /metrics 经各 sandbox UDS ─► envd receiver ─────────┤
-guest ─► connector mgmt-extract ─► OTLP HTTP/gRPC ───────┤
-                                                       ▼
-                             Collector: trusted identity enrichment
-                                      → custom processors（可选）
-                                      → final identity guard
-                                      ├─ primary storage exporter → DB
-                                      └─ extra exporters → 外部 Collector
+Conductor Plugin Plane -> full RouteEntry -> Telemetry view
+Conductor config_socket -> native stats -> sandboxstats receiver
+Envd UDS -> envd receiver
+Guest -> connector management -> sandboxotlp receiver
+                |
+      source acceptance + trusted pdata identity
+                |
+Collector native processors / connectors / pipelines
+                |
+       configured exporters -> selected destinations
 
 GET /sandboxes/{SandboxID}/metrics
-  → Conductor API 鉴权 + ownership → live registration 的 query UDS
-  → Telemetry E2B handler → primary Reader → 同一个 DB
+  -> Conductor auth + ownership -> registered HTTP query UDS
+  -> Telemetry handler -> selected Reader
 ```
 
-所有主存储写入都经过真正的 OpenTelemetry Collector service graph 和 exporter。
-receiver 不持有 storage handle。内建分发只链接实际需要的 Collector component，
-包括 OTLP/HTTP extra exporter；不嵌入整个 contrib distribution 或 Prometheus server。
+所有采集写入都经过原生 OpenTelemetry Collector service 和配置的 exporter.
+Receiver 不持有 storage handle. 原生 Collector 配置选择全部 pipeline 边和已链接
+signal; 发行包不嵌入整个 contrib 仓库或 Prometheus server.
 
 ## 2. Plugin lease 与查询通道
 
@@ -96,10 +96,85 @@ quota 再归一化。内建指标不使用 `kuasar.sandbox.*` 命名。
 
 Pause 移除 scrape target；resume 创建新本地 generation；delete 移除 target。
 Endpoint/token 变化取消旧请求；即使 transport 忽略取消，也丢弃 stale response。
-断线使整个 view 失效，直到新一轮 full sync + Bookmark。heap scheduler、固定上限的
-worker/queue 和全局 idle pool 避免为每个 target 创建 timer goroutine。连接池 key 包含
+断线使整个 view 失效，直到新一轮 full sync + Bookmark。每个 `envd/name` 实例独立维护 heap scheduler、有界
+worker/queue 和 idle pool, 避免为每个 target 创建 timer goroutine。连接池 key 包含
 UDS、本地 generation 与 SandboxID，不能把一个 sandbox 的 UDS connection 复用于另一个。
 活跃 scrape 最多 `concurrency` 个，空闲 scrape connection 最多 `concurrency` 个。
+
+### 原生 Collector 配置
+
+`collector` 是原样交给 Collector 的配置 map, 由原生 confmap provider 和组件校验解析.
+支持 `receivers`、`processors`、`exporters`、`connectors`、`extensions`、
+`service.extensions`、`service.pipelines`、`service.telemetry`. 实际运行的就是解析后
+的 graph. Factory 每种 type 只注册一次; 配置通过 `envd/fast`、`envd/slow` 等实例名
+分别定义周期和生命周期. 无效或未使用选项不会被悄悄转换成能力更少的路由语言.
+
+| 类别 | 发行包内组件 type | 版本 |
+|---|---|---|
+| Receiver | `envd`、`sandboxstats`、`sandboxotlp` | 当前 orchestrator 源码 |
+| 基础设施 receiver | `otlp` | Collector 0.145.0 |
+| Processor | `batch`、`memory_limiter` | Collector 0.145.0 |
+| Processor | `filter`、`transform` | contrib 0.145.0 |
+| Exporter | `otlp`、`otlp_http`、`debug` | Collector 0.145.0 |
+| Exporter | `prometheusremotewrite`、`clickhouse` | contrib 0.145.0 |
+| 主存储适配 exporter | `sandboxstorage` | 当前 orchestrator 源码 |
+| Connector | `routing` | contrib 0.145.0 |
+| Collector extension | `health_check` | contrib 0.145.0 |
+| Config provider | `env`、`file`、`yaml` | confmap 1.51.0 |
+
+静态构建可通过 `app/telemetry/otel.Components` 增加全部 factory 类别、provider 和
+converter. Collector 子配置支持原生 `${env:NAME}`、`${file:/path}` 解析, 组件自行
+校验选项. 标准基础设施 `otlp` 与已链接 exporter 可运行不含 SandboxID 的 logs/traces
+pipeline; 只有沙箱业务 receiver 专门处理 metrics. 不增加 logs/traces 业务查询 API.
+`proxy_netns` 只约束配置的各个 `sandboxotlp` 实例.
+
+旧 `telemetry.scrape`、`telemetry.otlp` 和列表式 `telemetry.exporters` 被严格拒绝.
+应迁移到原生 receiver/exporter 实例, 并在 `service.pipelines` 显式连接. Envd 选项
+改为 `collection_interval`、`timeout`、`concurrency`; sandboxotlp 保留 `http_listen`、
+`grpc_listen`、`max_connections`、`max_requests`、`max_request_bytes`, 不再有 `enabled`.
+是否将 receiver 接入 pipeline 决定是否运行. 参见完整[本地部署](../deploy/telemetry.example.yaml)
+和[双 sink 配置](../deploy/telemetry-fanout.example.yaml).
+
+### 原生 sandboxstats receiver
+
+`sandboxstats` 从同一 RouteEntry view 发现精确 SandboxID, 调用 conductor 现有
+`config_socket` 的批量适配. 当前 telemetry lease 和真实 peer PID 授权该读取;
+连接 UDS 不等于取得普通租户 API 权限. 它不收集租户 API key, 不持有 sandbox ctl
+client、不读取 usage 文件、不维护第二套 port 绑定. Conductor 组织原生来源, 保留
+ownership/binding 校验及失败规则.
+
+配置项包括 `resource_interval` (默认 5s)、`traffic_interval` (10s)、`usage_interval`
+(1m)、`timeout` (上限 5s)、`concurrency` (默认 4, 范围 1..8). 周期零表示关闭对应
+section; 启用周期为 1s..1h, 至少启用一项. 每实例每次请求最多 64 个 SandboxID,
+响应遵守 conductor 的 4 MiB 上限. 同一 section 的轮次不重叠, 完成后开始下一周期.
+启动或重连期间 discovery 尚未同步时, 到期轮次等待路由 bookmark, 不把未同步
+视为完成空轮次而消耗整个周期. 取消约束该等待、请求等待及投递.
+配置来源不可用会记录错误并丢弃本次读取, 不导出零值或
+旧的完整响应. Resource 选择当前 starting/running 对象; traffic 和 saved usage
+也读取 paused 对象. Conductor 接纳的数据不因后续路由变化而撤销.
+
+以下投影均为 Gauge, 可信来源为 `sandbox.telemetry.source=sandboxstats`. 数值表示
+当前 counter 或原生累计端点, 不承诺永不重置. 原生 HTTP/usage JSON 保持无损;
+float64 投影会舍入大于 2^53 的 uint64 以及 128-bit 积分. 遥测 scalar 历史不能反推
+无损 native usage 账本.
+
+| 原生 section | Metric 前缀及后缀 | 观测语义 |
+|---|---|---|
+| resource | `sandbox.resource.cpu.capacity`、`cpu.allocatable`; `memory.capacity`、`memory.headroom`、`memory.reserved`、`memory.used`; `cpu.seconds` | 单位为核、字节、秒. 配置/reservation 是当前读取; 宿主 Used/CPU 保留原生 `timestampUnix`. 各字段分别省略缺测并保留合法零. Headroom 是气球控制生效的 allocatable memory, 不是节点 reservation; CPU allocatable 表示相对 weight, 不是 quota |
+| traffic | `sandbox.traffic.state`、`max_inflight`、`idle_since`、`inflight.parking`、`inflight.connected`; `service.parking`、`service.connected`、`service.max_inflight`、`service.idle_since` | 当前 Proxy ingress 读取, 带 state/service 属性. Admission limit 为零表示不限. 可选 idle 时间戳保持可选, 只描述已接纳 ingress, 不代表全沙箱空闲 |
+| traffic | `sandbox.traffic.platform` / `sandbox.traffic.transit` 加 `.rx.packets`、`.rx.bytes`、`.tx.packets`、`.tx.bytes` | 当前 connector counter 读取, 方向为沙箱视角, 不跨观测点相加. 缺失平面不发布 counter; `egress:{}` 不产生伪造 egress series |
+| usage | `sandbox.usage.cpu.seconds`、`memory.integral`、`memory.span`、`memory.covered` | 只投影 saved 原生端点. CPU 为 native known ns / 1e9; 积分为 byte-ns / 1e9, span/coverage 为 ns / 1e9. `usage.name`、`usage.status` 和 CPU 的 `usage.complete` 保留既有类别/有效性. Source identity 和 run_epoch 仍是 native metadata, 不作为 label |
+| usage | `sandbox.usage.saved.available`、`enabled`、`saving`、`unknown_tail`、`save_error`、`read_error` | 当前读取状态的独立 Boolean Gauge. 不重标 saved 数量时间, 不把不确定尾部变成可靠零消耗 |
+
+Usage 采集请求 `view=saved`. 累计数量保留 Record 的 `saved_utc_ns`; 重复读取只发布
+相同端点, 不相加、不重新对 memory 积分. 未观测的数量被省略. Pause 或替换来源
+会使当前位置失效, 但不会抹去已保存累计量; 已知贡献及 coverage 保留原始 record 时间
+继续发布. `usage.source_known`、`usage.position_known`、`usage.value_known` 用于
+区分保存的贡献和当前来源观测.
+Live 可以领先 saved; crash 或保存失败可能丢失未保存尾部. Receiver 不强制 sample、
+save、fsync 或 export ACK, 不改变原生 usage 策略. Current/live/history、精确整数、
+raw counter、128-bit 积分、coverage 和详细错误仍由 [`stats/usage`](node-usage_zh.md)
+提供. 启用 telemetry 不会启用 usage.
 
 ## 4. 直接面向沙箱的 OTLP
 
@@ -112,7 +187,7 @@ listener; 空值表示当前进程 namespace.
 不回退宿主 namespace. 仅创建 listener 时进入指定 namespace, 随后调用线程恢复原 namespace.
 配置不移动整个进程, 不改变 conductor/query/envd UDS, 远端 exporter 或 query client;
 这些通道继续使用正常的进程网络环境.
-支持的 signal 是 metrics: 4317 上的 OTLP/gRPC
+`sandboxotlp` receiver 支持 metrics: 4317 上的 OTLP/gRPC
 MetricsService，以及 4318 上的 OTLP/HTTP `POST /v1/metrics`（protobuf/JSON，可选 gzip）。
 不增加 OTLP token 身份协议；本 metrics 组件不接收应用 traces/logs。不要把 listener
 放到应用 Proxy 或另一层 L7 reverse proxy 后面。
@@ -126,8 +201,8 @@ namespace、监听 loopback 时，保留现有 MMDS mapping，并在部署的 vs
 --mgmt-service=169.254.169.254:4318:127.0.0.1:4318
 ```
 
-配置 `proxy_netns: sandbox-proxy`、`grpc_listen: 127.0.0.1:4317`、
-`http_listen: 127.0.0.1:4318`。Guest exporter 使用 `http://169.254.169.254:4318`
+外层配置 `proxy_netns: sandbox-proxy`, 在 `sandboxotlp` receiver 中配置
+`grpc_listen: 127.0.0.1:4317`、`http_listen: 127.0.0.1:4318`.Guest exporter 使用 `http://169.254.169.254:4318`
 或对应 gRPC 端口。Connector 已有的 slot-derived SNAT 把共享 guest inner IP 转为分配
 给该 sandbox 的 FloatingIP；service DNAT 选择 telemetry listener，management 回程
 恢复 guest tuple。这是数据包直接送达 telemetry，不是转发身份 header。已有 loopback
@@ -148,12 +223,22 @@ Route view 同时索引 SandboxID 与 FloatingIP，复用 MMDS 的 IPv4 解析�
 身份固定在 accepted connection；
 remap、pause 或 stream invalidation 会关闭连接，不会把旧连接变成 successor 的连接。
 
-Core 在 resource 层用当前 RouteEntry 覆盖 `sandbox.id`、`sandbox.stable_id`，移除
-point/scope 中冲突身份。可信 `sandbox.telemetry.source=envd|otlp` 也不能伪造；即使
-guest OTLP gauge 复制内建 resource metric 名，也不能污染 E2B envd 历史。定制 processor
-位于 enrichment 与最终 revalidation/overwrite guard 之间；丢失私有 ingress context
-会 fail closed。Resource、scope、datapoint 的 RunID-like 属性均被移除，包括定制
-processor 新添加的此类属性。
+来源接纳时, envd 校验当前 target, sandbox OTLP 校验已固定身份的连接.
+Core 在每个 pdata resource 上覆盖 `sandbox.id`、`sandbox.stable_id` 和
+`sandbox.telemetry.source`, 移除 point/scope 中冲突身份. 规范化为相同标准 exporter
+label 的拼写(如 `sandbox_id` 或 `sandbox-telemetry-source`)也属于保留身份属性,
+在写入可信身份前移除, 避免 Guest 属性在导出时混入可信 SID、StableID 或 source
+值. Envd 使用 `envd` 来源,
+guest OTLP 使用 `otlp`; 全局不将来源限制为这两个名称. Guest 即使复制 envd 指标名,
+也不能伪造 envd 来源. 入站移除旧平台精确 key `sandbox.run_id`、`run_id`、`runId`、
+`RunID`; 保留 `application.run_id` 等用户属性.
+
+已接纳 resource 自身携带身份, 可以通过标准 batch、queue 和 retry. 一个 batch 可以
+包含多个 SandboxID. 后续 pause/delete 或原请求 context 丢失不撤销已接纳历史.
+调用下游 processor/exporter 时不持有 view 锁. 尚未结束的 envd fetch 或尚未接纳的
+OTLP 请求在 target 失效时仍然失败. 普通基础设施 receiver 使用自身配置, 不要求
+SandboxID. 可信部署 processor 和静态扩展仍属于原信任域, 可以转换 pdata; 异步
+pipeline 边界不存在最终 sandbox-only guard.
 
 尽可能在 transport decode 前施加上限：默认每 listener 256 条连接，全局 32 个并发
 请求，HTTP 压缩体/解压体与 gRPC message 各 4 MiB。Resource/point attributes 最多
@@ -165,11 +250,11 @@ gRPC server 的 10s deadline 在读取 message body 前就开始，停滞客户�
 ## 5. Primary storage 与 extra exporters
 
 `telemetry.storage` 选择唯一主存储，必须同时实现 Collector write 和
-`extension.Reader` history read。`telemetry.exporters` 和 custom Collector exporters
-是额外的 write-only fan-out，不隐式成为 primary reader。`storage.type: none` 必须有
+`extension.Reader` history read. `collector.exporters` 与 `service.pipelines` 声明
+全部写入目的地及 fan-out 边, 不隐式成为 primary reader.`storage.type: none` 必须有
 exporter；telemetry 继续 collect/enrich/forward，但不注册 query API，公开 metrics 为 503。
 
-### Local（默认）
+### Local (显式启用)
 
 Core `sandboxstorage` Collector exporter 指向 embedded Prometheus TSDB；`Local`
 backend 同时提供写入与同一 DB 的直接 reader。不启动 Prometheus web server、scrape manager、rule
@@ -262,21 +347,14 @@ thread、memory 上限，HTTP client disconnect 会取消 readonly query。不�
 disk-size/cardinality enforcement；local 的 `max_size`/`max_series` 不配置外部 server。
 没有刻意延期的 external adapter。
 
-### Extra exporter 与 custom primary
+### 原生 exporter 与 custom primary
 
-```yaml
-telemetry:
-  exporters:
-    - name: observability
-      type: otlphttp
-      endpoint: https://collector.example.com
-```
-
-内建 OTLP/HTTP exporter 使用 16 MiB 有界内存 queue、两个 consumer、10s request timeout、
-最多 30s retry elapsed time。Queue 不是持久历史，也不能让故障 primary query 成功。
-临时 scrape/export 错误按组件行为丢弃或重试；telemetry 不会为保证投递而暂停 sandbox。
-Custom primary 与 Collector integration 使用
-[扩展契约](extensions_zh.md#telemetry-bootstrap-与扩展)。
+在 `collector.exporters` 声明 exporter, 再由 `collector.service.pipelines` 引用完整 ID.
+[Collector fan-out 示例](../deploy/telemetry-fanout.example.yaml) 使用原生 batch、filter、
+transform、routing、两个 OTLP HTTP sink、queue 和 retry. Queue 大小、consumer、retry
+及 timeout 由原生 exporter 选项控制, 不会被生成的 graph 覆盖. 除非组件明确提供,
+queue 不代表持久历史. Export 失败不会暂停 sandbox. 静态集成遵循
+[扩展契约](extensions_zh.md#telemetry-bootstrap-与扩展).
 
 ## 6. E2B 历史查询
 
@@ -364,6 +442,12 @@ field MAX 和精确时间边界。
 Density benchmark 对 1k/10k/50k synthetic targets 测真实 5s 周期，报告 scrape count、
 goroutine/FD 峰值（含 fixture server）、allocation、TSDB batch write 与 local query
 成本。Receiver 与 TSDB 分开测量，不声称是端到端生产容量。时间数字不作为普通 CI gate，
-应在代表性 host/workload 重复测量。已有真实 Proxy E2E fixture 同时覆盖 envd → Collector
+应在代表性 host/workload 重复测量。
+
+真实 guest fixture 还将 conductor 的 resource/traffic 观测经 sandboxstats、原生 batch
+导出至宿主网络 HTTP sink. 已暂停沙箱通过同一 lease 授权读取面导出实际 saved usage;
+断言与公开原生 API 比较 CPU/内存累计值及原始 saved 时间, 并确认沙箱保持 paused.
+
+已有真实 Proxy E2E fixture 同时覆盖 envd → Collector
 → local DB、guest 经 connector mgmt-extract 的 OTLP、auth、paused query、telemetry
 不可用、lease 撤销和 TSDB restart，不另建第二套 VM 生命周期。
