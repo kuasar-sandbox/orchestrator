@@ -31,6 +31,7 @@ func TestPublicConductorAPICompilesWithoutInternalTypes(t *testing.T) {
 	seen := map[reflect.Type]bool{}
 	for _, value := range []any{
 		conductor.Config{}, conductor.Hooks{}, conductor.Runtime{}, conductor.TLSMaterial{},
+		conductor.ResourceStats{},
 		conductor.ObjectStoreCredentials{}, (*conductor.App)(nil),
 		(*conductor.TLSMaterialProvider)(nil), (*conductor.EncryptionKeyProvider)(nil),
 		(*conductor.ObjectStoreCredentialsProvider)(nil),

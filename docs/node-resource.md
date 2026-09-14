@@ -281,13 +281,15 @@ Temporary shortages can enter the FIFO queue. Requests beyond node limits, or di
 
 ResourceProbe.Allocated and cluster projected memory load use reservedMemory, not host charge. E2B memoryMB still means Capacity/SKU.
 
-Per-sandbox resource statistics:
+Per-sandbox resource statistics use the current sandbox-ctl owner independently of the controller's heartbeat/reservation path:
 
-- `memTotal`: Capacity.
-- `memAllocatable`: existing API name for NodeReservation.
-- `memUsed`: HostMemoryCurrent/VMM cgroup charge.
+- `cpuCapacity`: effective capacity in cores; `cpuAllocatable`: the relative scheduling specification mapped to `cpu.weight`, without a hard fractional-core quota or performance guarantee.
+- `memoryCapacity`: effective Capacity in bytes; `memoryHeadroom`: final `resources.allocatable.memory`, the balloon headroom, not Budget, guest free memory or NodeReservation.
+- `memoryReserved`: current NodeReservation when the dynamic controller has an observation; omitted otherwise.
+- `memoryUsed`: host VMM `memory.current`; `cpuSeconds`: the same cgroup's `cpu.stat.usage_usec / 1e6`. No ctl/guest CPU addition, inactive-file/balloon subtraction or guest-capacity clipping occurs.
+- `timestampUnix`: actual observation time; missing host fields are independently omitted and valid zeros remain visible. A source rebuild may reset CPU seconds; native usage owns lifecycle accumulation.
 
-MemUsed is not DemandMemory and does not participate in RequestBudget, admission or recovery charge.
+These reads work in static/dynamic mode with usage or telemetry disabled. They do not alter RequestBudget, admission, recovery charge, heartbeat sampling or the existing build-phase reservation release fence. The native API removes `cpuCount`/`memTotal`/`memAllocatable`/`memUsed`; reservation and headroom now have separate explicit names. [Node §4.1.1](node.md#411-instantaneous-resource-and-traffic-stats) defines response validity, errors and numeric precision. E2B compatibility metrics keep their own field names and meanings.
 
 ## 8. Reliability
 

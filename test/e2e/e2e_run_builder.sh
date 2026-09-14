@@ -573,21 +573,21 @@ wait_running() { # sid
     echo "sandbox $sid state=$state, want running" >&2
     return 1
 }
-wait_resource_capacity() { # $1=sid, $2=expected memTotal bytes
+wait_resource_capacity() { # $1=sid, $2=expected memoryCapacity bytes
     local sid="$1" expected="$2" code=""
     for _ in $(seq 1 240); do
         code=$(req GET "/sandboxes/$sid/stats/resource" "$AK" || true)
         if [ "$code" = "200" ] && python3 - "$WORK/resp.body" "$expected" <<'PY'
 import json, sys
 stats = json.load(open(sys.argv[1]))
-assert stats.get("memTotal") == int(sys.argv[2]), stats
+assert stats.get("memoryCapacity") == int(sys.argv[2]), stats
 PY
         then
             return 0
         fi
         sleep 0.25
     done
-    echo "resource stats sid=$sid status=$code expected memTotal=$expected body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    echo "resource stats sid=$sid status=$code expected memoryCapacity=$expected body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
     return 1
 }
 persist_ref() {
