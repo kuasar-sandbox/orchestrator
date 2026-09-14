@@ -1259,7 +1259,7 @@ Production uses operator-provided wildcard DNS/TLS for *.<domain> and api.<domai
 | Mkfs.erofs (deps) | Guest-runtime make sandbox-runtime and guest flatten backend. | Deterministic runtime packaging; guest exports EROFS images (§11/[Build §5](node-build.md#5-target-aware-execution-and-publication)). |
 | Guest envd | UDS mapped by sandbox-ctl --connect. Build uses a minimal Connect+JSON process.Start client for steps/startCmd/readyCmd ([Build §5](node-build.md#5-target-aware-execution-and-publication)). | Unmodified upstream; protocol pins in §4.2/§4.3. |
 | Systemd | D-Bus StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload. | Process management and unit installation (§5). |
-| Node-ctl proxy serve | Bidirectional framed-JSON h2c routesync UDS plus separate data listener. | Independently operated on the same node. Master registers once; workers inherit data-listener FDs and shared routes. Frozen EffectiveConfig includes paths.run_root; workers never reread proxy.yaml (node-proxy.md §2.1/§3/§4). |
+| Node-ctl proxy serve | Bidirectional framed-JSON h2c routesync UDS plus separate data listener. | Independently operated on the same node. Master registers once; workers inherit data-listener FDs and shared routes. Frozen EffectiveConfig includes paths.run_root; workers never reread proxy.yaml (node-proxy.md §2/§3/§4). |
 
 Public Config/App/extension contracts live in config and app/conductor, app/proxy and app/telemetry; advanced Collector bindings are isolated in app/telemetry/otel. CGO_ENABLED=0 remains supported; internal core retains internal/* dependency boundaries.
 

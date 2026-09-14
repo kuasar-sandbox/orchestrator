@@ -2005,7 +2005,7 @@ plugin 平面,机群路由经 registry 聚合。
 | `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、[Build §5](node-build_zh.md#5-按目标执行与发布)) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,[Build §5](node-build_zh.md#5-按目标执行与发布)) | 原版不改;协议 pin 见 §4.2/§4.3 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
-| `node-ctl proxy` | UDS routesync(双向 h2c 帧化 JSON)+ 独立 Data listener | 同节点,运维带外起;Proxy master 注册一次,worker 共享继承 Data listener fd + shm 路由视图;master 冻结的 EffectiveConfig 含 `paths.run_root`,worker 不重读 `proxy.yaml`(node-proxy.md §2.1/§3/§4) |
+| `node-ctl proxy` | UDS routesync(双向 h2c 帧化 JSON)+ 独立 Data listener | 同节点,运维带外起;Proxy master 注册一次,worker 共享继承 Data listener fd + shm 路由视图;master 冻结的 EffectiveConfig 含 `paths.run_root`,worker 不重读 `proxy.yaml`(node-proxy.md §2/§3/§4) |
 
 公共 Config/App/extension 契约位于 `config`、`app/conductor`、`app/proxy`、`app/telemetry`；
 advanced Collector binding 隔离在 `app/telemetry/otel`；
