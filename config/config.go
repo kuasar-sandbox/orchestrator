@@ -382,6 +382,7 @@ type SandboxConfig struct {
 	DeadTTL    string          `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
 	Capacity   int             `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator, §4.2); 0 = unbounded
 	Resources  ResourcesConfig `yaml:"resources" json:"resources"`     // capacity + resource control
+	Usage      UsageConfig     `yaml:"usage" json:"usage"`             // node-local native accounting policy
 	Network    NetworkConfig   `yaml:"network" json:"network"`         // vswitch + inner IP
 	Boot       BootConfig      `yaml:"boot" json:"boot"`               // boot artifacts (kernel / guest runtime / overlay)
 }
@@ -864,6 +865,9 @@ func DecodeConductor(r io.Reader) (*Conductor, error) {
 	if err := rejectBuilderAdmissionNulls(b); err != nil {
 		return nil, err
 	}
+	if err := validateSandboxUsageYAML(b); err != nil {
+		return nil, err
+	}
 	var c Conductor
 	if err := decodeKnownYAML(b, &c); err != nil {
 		return nil, err
@@ -955,6 +959,8 @@ func (c *Conductor) applyDefaults() {
 	def(&c.Proxy.ParkTimeout, "30s")
 	def(&c.ManifestConfig, "/opt/sandbox/manifest.yaml")
 	def(&c.Paths.RunRoot, "/run/sandbox")
+	def(&c.Sandbox.Usage.SampleInterval, "1s")
+	def(&c.Sandbox.Usage.FlushInterval, "5m")
 	def(&c.Paths.BaseRoot, "/var/lib/sandbox")
 	def(&c.Paths.ConfigSocket, "/run/sandbox/node-ctl.socket")
 	if c.Paths.DBPath == "" {
@@ -1087,6 +1093,9 @@ func validateAdvertisedEndpoint(name, endpoint string) error {
 }
 
 func (c *Conductor) validateDeclarative() error {
+	if _, _, err := c.Sandbox.Usage.Runtime().Intervals(); err != nil {
+		return fmt.Errorf("config: sandbox.%w", err)
+	}
 	if c.Paths.ConductorExecutable != "" && !filepath.IsAbs(c.Paths.ConductorExecutable) {
 		return fmt.Errorf("config: paths.conductor_executable must be absolute")
 	}

@@ -241,6 +241,7 @@ type Extension interface {
 type Host interface {
     Sandboxes() SandboxSource
     Builds() BuildSource
+    Stats() StatsReader
 }
 ```
 
@@ -322,6 +323,8 @@ or independently clean it.
 For route consumers, both the live delete and omission from a reconnecting full
 snapshot withdraw an older projection. Durable local cleanup continues from the
 retained row independently of either route convergence path.
+
+`Host.Stats()` exposes the same bounded native section reader used by the public stats APIs and telemetry plugin. `StatsRequest` selects exact SandboxIDs, resource/traffic/usage sections and optional native usage view/cursor/limit; `SandboxStats` contains each unchanged native body and a correlation-only StableID. This trusted in-process entry performs no API-key collection, guest wake or sampling. It enforces the same 64-object, eight-concurrent-read, five-second and 4 MiB limits. Do not perform slow reads inside a Watch callback; retain the Host and use a separate cancellable task. See [Native usage and local stats](node-usage.md) and [the public types](../app/conductor/extension/stats.go).
 
 ## Conductor lifecycle hooks
 

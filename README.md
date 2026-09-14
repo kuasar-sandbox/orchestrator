@@ -241,6 +241,7 @@ Detailed design and reference documents provide complete English and Chinese edi
 - [`docs/node-journald.md`](docs/node-journald.md) ([Chinese edition](docs/node-journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;
+- [Native usage](docs/node-usage.md) — lossless usage API, node policy, online/offline ownership and trusted local stats reads.
 - [`docs/cluster.md`](docs/cluster.md) — Registry membership, replicated state, node links, reservation state, and cluster E2E;
 - [`docs/cluster-router.md`](docs/cluster-router.md) — unified cluster control- and data-plane ingress, routing, and stable/node-local identity translation;
 - [`docs/cluster-placer.md`](docs/cluster-placer.md) — providers/importers, WATCH_LIST, source leases, selector patches, and placement recommendations.

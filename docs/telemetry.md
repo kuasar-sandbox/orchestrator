@@ -374,6 +374,8 @@ The nine required fields match the
 The platform's instantaneous `/stats/resource` and `/stats/traffic` remain
 separate read-only interfaces, not substitutes for this guest-metric history.
 
+Native resource, traffic and usage reads are owned by conductor and remain available when telemetry stops. The trusted telemetry lease can consume selected sections through the existing config socket; it does not access sandbox ctl sockets or usage files. Paused saved usage does not require an active guest. See [Native usage and local reads](node-usage.md).
+
 ## 7. Configuration, shutdown and verification
 
 Use `node-ctl config telemetry --template`, or

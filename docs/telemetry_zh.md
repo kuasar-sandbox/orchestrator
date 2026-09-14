@@ -324,6 +324,8 @@ Reader 失败返回脱敏 503。不插值、不填零、
 平台已有 `/stats/resource` 与 `/stats/traffic` 保持独立只读即时接口，不替代 guest
 metric history。
 
+原生 resource、traffic 和 usage 读取由 conductor 负责, telemetry 停止时仍可使用. 可信 telemetry lease 经现有 config socket 消费选定 section, 不访问沙箱 ctl socket 或 usage 文件. Paused saved usage 不要求 active guest. 参见[原生 usage 与本机读取](node-usage_zh.md).
+
 ## 7. 配置、关闭与验证
 
 通过 `node-ctl config telemetry --template` 或

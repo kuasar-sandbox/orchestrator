@@ -21,6 +21,7 @@ type Extension interface {
 type Host interface {
 	Sandboxes() SandboxSource
 	Builds() BuildSource
+	Stats() StatsReader
 }
 
 // APIWrapper is an optional capability implemented by the same Extension

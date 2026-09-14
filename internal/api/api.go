@@ -16,7 +16,6 @@ import (
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
-	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
@@ -377,6 +376,7 @@ type Core interface {
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
 	TrafficStats(ctx context.Context, id, apiKey string) (*TrafficStats, error)
+	UsageStats(ctx context.Context, id, apiKey string, query conductorextension.UsageQuery) (json.RawMessage, error)
 
 	// Template builds (e2b v2/v3 build system, what the SDK uses): POST /v3/templates
 	// (register name/cpu/memory) → POST /v2/templates/{tid}/builds/{bid} (start, carries
@@ -425,24 +425,9 @@ type Resources struct {
 // an observed zero from an unavailable sample.
 type ResourceStats = conductorextension.ResourceStats
 
-type TrafficInflight struct {
-	Parking uint64 `json:"parking"`
-	Egress  uint64 `json:"egress"`
-}
-
-type ServiceTrafficStats struct {
-	Parking   uint64     `json:"parking"`
-	Egress    uint64     `json:"egress"`
-	IdleSince *time.Time `json:"idleSince,omitempty"`
-}
-
-type TrafficStats struct {
-	State       string                         `json:"state"`
-	MaxInflight config.MaxInflight             `json:"maxInflight"`
-	Inflight    TrafficInflight                `json:"inflight"`
-	IdleSince   *time.Time                     `json:"idleSince,omitempty"`
-	Services    map[string]ServiceTrafficStats `json:"services"`
-}
+type TrafficInflight = conductorextension.TrafficInflight
+type ServiceTrafficStats = conductorextension.ServiceTrafficStats
+type TrafficStats = conductorextension.TrafficStats
 
 type API struct {
 	core         Core
@@ -471,6 +456,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /sandboxes/{id}/stats/resource", a.auth(a.resourceStats))
 	mux.HandleFunc("GET /sandboxes/{id}/metrics", a.auth(a.sandboxMetrics))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/traffic", a.auth(a.trafficStats))
+	mux.HandleFunc("GET /sandboxes/{id}/stats/usage", a.auth(a.usageStats))
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
@@ -1410,18 +1396,28 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 }
 
 func (a *API) failStats(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, ErrNotFound):
-		writeErr(w, http.StatusNotFound, "not found")
-	case errors.Is(err, ErrStatsUnsupported):
-		writeErr(w, http.StatusNotImplemented, "stats unsupported")
-	case errors.Is(err, ErrStatsConflict):
-		writeErr(w, http.StatusConflict, "stats unavailable for sandbox state")
-	case errors.Is(err, ErrStatsUnavailable):
-		writeErr(w, http.StatusServiceUnavailable, "stats temporarily unavailable")
-	default:
+	status, message := StatsErrorStatus(err)
+	if status == http.StatusInternalServerError {
 		a.log.Warn("sandbox stats error", "err", err)
-		writeErr(w, http.StatusInternalServerError, "internal error")
+	}
+	writeErr(w, status, message)
+}
+
+// StatsErrorStatus is shared by the public API and the trusted local adapter.
+func StatsErrorStatus(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrBadRequest):
+		return http.StatusBadRequest, "invalid stats query"
+	case errors.Is(err, ErrNotFound):
+		return http.StatusNotFound, "not found"
+	case errors.Is(err, ErrStatsUnsupported):
+		return http.StatusNotImplemented, "stats unsupported"
+	case errors.Is(err, ErrStatsConflict):
+		return http.StatusConflict, "stats unavailable for sandbox state"
+	case errors.Is(err, ErrStatsUnavailable):
+		return http.StatusServiceUnavailable, "stats temporarily unavailable"
+	default:
+		return http.StatusInternalServerError, "internal error"
 	}
 }
 

@@ -120,9 +120,10 @@ type Orchestrator struct {
 	// before the database CAS without weakening the production store contract.
 	commitBuildTrigger func(context.Context, *types.Build) (bool, error)
 
-	probe         ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
-	resourceStats SandboxResourceProvider
-	trafficStats  SandboxTrafficProvider
+	probe            ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
+	resourceStats    SandboxResourceProvider
+	trafficStats     SandboxTrafficProvider
+	nativeStatsSlots chan struct{}
 	// Set once from nodectl.Resolved.SocketIdentity before any API or node-link
 	// listener starts. The raw resource_listen socket is never a sandbox policy
 	// source.
@@ -212,6 +213,7 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		removeBuildRunDir:    os.RemoveAll,
 		removeBuildBaseDir:   os.RemoveAll,
 		files:                files,
+		nativeStatsSlots:     make(chan struct{}, conductorextension.MaxStatsConcurrency),
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -2061,6 +2063,7 @@ func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, s
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFD:          sandboxTapFD(o.vs.TapFD(sb.VswitchPort)), EnvVars: sb.Env,
 		Resources:   resources,
+		Usage:       o.cfg.Sandbox.Usage.Runtime(),
 		Network:     network,
 		MMDSEnabled: o.cfg.MMDS.Enabled,
 		Spec:        spec,

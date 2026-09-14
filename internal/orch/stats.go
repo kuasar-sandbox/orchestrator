@@ -86,7 +86,7 @@ func (o *Orchestrator) statsBindingCurrent(ctx context.Context, expected *types.
 	if err != nil {
 		return fmt.Errorf("%w: validate current binding: %v", api.ErrStatsUnavailable, err)
 	}
-	if current == nil || current.RunID != expected.RunID || current.RunDir != expected.RunDir || current.State != expected.State ||
+	if current == nil || current.RunID != expected.RunID || current.RunDir != expected.RunDir || current.BaseDir != expected.BaseDir || current.State != expected.State ||
 		current.VswitchPort != expected.VswitchPort || current.FloatingIP != expected.FloatingIP || current.CreatedUnix != expected.CreatedUnix {
 		return api.ErrStatsUnavailable
 	}
@@ -101,11 +101,25 @@ func (o *Orchestrator) TrafficStats(ctx context.Context, id, apiKey string) (*ap
 	if !ownsSandbox(sb, apiKey) {
 		return nil, api.ErrNotFound
 	}
+	return o.readTrafficStats(ctx, sb)
+}
+
+func (o *Orchestrator) readTrafficStats(ctx context.Context, sb *types.Sandbox) (*api.TrafficStats, error) {
 	if o.trafficStats == nil {
 		return nil, api.ErrStatsUnsupported
 	}
 	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
 		return nil, api.ErrStatsConflict
 	}
-	return o.trafficStats.SandboxTrafficStats(ctx, sb.ID, sb.RunID, sb.Profile, sb.State)
+	stats, err := o.trafficStats.SandboxTrafficStats(ctx, sb.ID, sb.RunID, sb.Profile, sb.State)
+	if err != nil {
+		return nil, err
+	}
+	if stats == nil {
+		return nil, api.ErrStatsUnavailable
+	}
+	if err := o.statsBindingCurrent(ctx, sb); err != nil {
+		return nil, err
+	}
+	return stats, nil
 }

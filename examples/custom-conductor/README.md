@@ -1,3 +1,5 @@
+[简体中文](README_zh.md)
+
 # Custom conductor
 
 Build the example with:
@@ -48,3 +50,28 @@ the Config, then bind encryption material through Runtime before startup.
 direct pointer assignment is equivalent. `InheritMemory()` restores the
 omitted `256MiB` default and its capacity-clamp behavior. Config snapshots and
 `Clone` preserve this distinction.
+
+Native accounting stays in `cfg.Sandbox.Usage`; for example, declare
+`enabled: true`, `sample_interval: 1s`, `flush_interval: 5m` under
+`sandbox.usage` in the conductor YAML. The public config carries that policy
+through bootstrap and all three native launch paths. The final Configure-hook
+validation rejects invalid intervals even when usage is disabled.
+
+Trusted private tasks can read `e.host.Stats()` after Start. Use the exact
+`SandboxView.ID`, with a cancellable context, outside the Watch callback:
+
+```go
+rows, err := e.host.Stats().ReadStats(ctx, conductor.StatsRequest{
+    SandboxIDs: []string{sandboxID},
+    Sections: []string{"usage"},
+    Usage: conductor.UsageQuery{View: "saved"},
+})
+// On success, rows[0].Usage is lossless native JSON, including for a paused VM.
+```
+
+This calls the same conductor domain reader as the public stats API and the
+trusted telemetry plugin. The fixed request/concurrency/time/size limits and
+whole-batch errors also apply in process. StableID cannot replace SandboxID.
+Keep the raw JSON or decode the native integer types; do not round through a
+generic float64 map or expose this trusted reader through an unauthenticated
+wrapper. See [native usage](../../docs/node-usage.md).

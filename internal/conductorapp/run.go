@@ -171,6 +171,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
 		API:                          apiHandler, AdminPidfile: cfg.Paths.AdminPidfile,
 		RouteSource: core, Plugins: plugins, PluginPidfile: cfg.Paths.PluginPidfile,
+		Stats: core,
 	}, logger)
 	configReady := make(chan struct{})
 	configDone := make(chan error, 1)
@@ -226,7 +227,7 @@ func startExtension(ctx context.Context, runtime *Runtime, storage *store.Store,
 	if runtime.Extension == nil {
 		return nil, nil
 	}
-	host, observer := conductorext.New(storage)
+	host, observer := conductorext.New(storage, core)
 	core.SetExtensionObserver(observer)
 	if err := runtime.Extension.Start(ctx, host); err != nil {
 		return nil, fmt.Errorf("conductor extension start: %w", err)

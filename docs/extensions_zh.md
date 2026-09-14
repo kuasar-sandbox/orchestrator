@@ -365,6 +365,7 @@ type Extension interface {
 type Host interface {
     Sandboxes() SandboxSource
     Builds() BuildSource
+    Stats() StatsReader
 }
 ```
 
@@ -396,6 +397,8 @@ Core 先订阅，再查询 SQLite 快照，避免修改永久落入 snapshot/liv
 显式删除一旦成功持久进入 deleting，就从 node cache 移除 Sandbox 并发布 route delete。该事件仅撤销投影，不证明 unit、网络、目录或数据库行已经 finalize。Conductor 对象源只有在 exact 本地 cleanup 与 hard delete 完成后才发出终态 Sandbox removal。因此启动时快照可能包含等待 cleanup 的 deleting 视图，其网络 tuple 可能仍待清理，也可能已经清除。扩展只能将其视作诊断状态，不得尝试恢复、路由或独立清理它。
 
 对路由消费者而言，live delete 和重新连接后的完整快照中缺席，都会撤销旧投影。持久本地清理独立于这两条路由收敛路径，从保留的行继续执行。
+
+`Host.Stats()` 提供与公开 stats API 和 telemetry plugin 共用的有界原生 section Reader. `StatsRequest` 选择精确 SandboxID、resource/traffic/usage section 及可选原生 usage view/cursor/limit; `SandboxStats` 包含各 section 原样 body 和仅作关联的 StableID. 此可信进程内入口不收集 API key、不唤醒 guest、不采样. 它执行同样的 64 对象、八个并发读取、五秒和 4 MiB 上限. 不要在 Watch callback 内执行慢读取; 应保留 Host, 在独立可取消任务中读取. 参见[原生 usage 与本机 stats](node-usage_zh.md)及[公共类型](../app/conductor/extension/stats.go).
 
 ## Conductor 生命周期 Hook
 
