@@ -319,33 +319,6 @@ func TestPausedOwnershipCleanupUsesIndependentExactCAS(t *testing.T) {
 	}
 }
 
-func TestReplacePausedResumeSourceFencesExactOriginal(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-	sb := sandboxInsertFixture("promote-source-cas", 0)
-	sb.State = types.StatePaused
-	sb.LaunchMode = ""
-	sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC = "", "", "", "", ""
-	if err := st.InsertSandbox(ctx, sb); err != nil {
-		t.Fatal(err)
-	}
-	replacement := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
-	stale := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "stale.snapshot"}
-	if changed, err := st.ReplacePausedResumeSource(ctx, sb.ID, stale, replacement); err != nil || changed {
-		t.Fatalf("stale source replacement = %t, %v; want CAS miss", changed, err)
-	}
-	if changed, err := st.ReplacePausedResumeSource(ctx, sb.ID, sb.ResumeSource, replacement); err != nil || !changed {
-		t.Fatalf("exact source replacement = %t, %v", changed, err)
-	}
-	got, err := st.Get(ctx, sb.ID)
-	if err != nil || got == nil || got.State != types.StatePaused || got.ResumeSource != replacement || got.LaunchMode != "" {
-		t.Fatalf("promoted paused source = %+v, %v", got, err)
-	}
-	if changed, err := st.ReplacePausedResumeSource(ctx, sb.ID, sb.ResumeSource, replacement); err != nil || changed {
-		t.Fatalf("duplicate stale replacement = %t, %v; want CAS miss", changed, err)
-	}
-}
-
 func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

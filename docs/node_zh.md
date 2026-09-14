@@ -392,7 +392,8 @@ node-ctl import-sandbox <token> [--socket S]
 ```
 
 - `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token.成功进入 source
-  finalizer 后默认删除源沙箱;`--keep-source` 保留 paused source.
+  finalizer 后默认删除源沙箱;`--keep-source` 保留 paused source,且 ResumeSource 与
+  local checkpoint 均保持原样——源沙箱仍从导出前的恢复位置恢复(#336).
 - `export-sandbox <sid> --to-template`:发布 paused Sandbox E 或 Snapshot S 并打印对应的
   持久 `sbx` / `snp` templateID(扇出用).
   `--keep-source` 使用相同的 source retention 语义;未指定时同样删除源沙箱.
@@ -1688,9 +1689,10 @@ MMDS secret value、cluster Group/RouteKey 或 generation。
 Export 第一阶段 publish 不持有长 lifecycle lock;第二阶段在 per-SID lock 内以 exact original
 `ResumeSource` 赢得 finalizer。Resume 先成功 `BeginResume` 时,KMT export 被取消并返回 409;
 template publish 可 detached 完成并返回 TemplateID,但不清理 source。finalizer 先获胜时,
-`keepSource=true` 把 row 的 source 切为 portable 并删除明确的 local artifact directory;
-`keepSource=false` 先 exact teardown ownership,再删除 row/cache/route/local artifact。任何 teardown
-或 Store 失败都保留可重试的 durable ownership。located/remote artifact 永不被本机 cleanup 删除。
+`keepSource=true` 只返回导出结果,source 完全不变——ResumeSource、row、cache、route 与
+local checkpoint 都保持原样(#336);`keepSource=false` 先 exact teardown ownership,再删除
+row/cache/route/local artifact。任何 teardown 或 Store 失败都保留可重试的 durable ownership。
+located/remote artifact 永不被本机 cleanup 删除。
 
 standalone import 省略 target 时复用 source NodeSandboxID;显式 target 只替换 node-local ID,保留
 StableID 和 service credentials。insert 是原子的 insert-only,冲突返回 409。Connect 可携
