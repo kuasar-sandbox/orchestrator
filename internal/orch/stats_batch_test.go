@@ -121,6 +121,14 @@ func TestNativeStatsBatchGlobalConcurrencyAndCancellation(t *testing.T) {
 			t.Fatal("batch did not fill its bounded concurrency")
 		}
 	}
+	// A saturated read budget also holds object prefetch. Looking up a missing
+	// ID immediately here would bypass the eight active native source reads.
+	limited, stopLimited := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	rows, err := o.ReadStats(limited, conductorextension.StatsRequest{SandboxIDs: []string{"not-present"}, Sections: []string{"traffic"}})
+	stopLimited()
+	if rows != nil || !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatal("traffic object lookup bypassed global read budget", rows, err)
+	}
 	cancel()
 	for range 2 {
 		select {
@@ -136,7 +144,7 @@ func TestNativeStatsBatchGlobalConcurrencyAndCancellation(t *testing.T) {
 		t.Fatal("global concurrency or cleanup", maximum.Load(), active.Load())
 	}
 	blocking.Store(false)
-	rows, err := o.ReadStats(context.Background(), conductorextension.StatsRequest{SandboxIDs: ids, Sections: []string{"traffic"}})
+	rows, err = o.ReadStats(context.Background(), conductorextension.StatsRequest{SandboxIDs: ids, Sections: []string{"traffic"}})
 	if err != nil || len(rows) != len(ids) {
 		t.Fatal("cancellation leaked read slots", len(rows), err)
 	}

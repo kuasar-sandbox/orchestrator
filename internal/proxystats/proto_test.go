@@ -14,7 +14,7 @@ func TestFrameRoundTripAndStrictBounds(t *testing.T) {
 	frame := Frame{
 		Type: TypeUpdate, Version: Version, Epoch: 7, Sequence: 2,
 		Counters: map[string]uint64{"requests_total": 4},
-		Traffic:  []SandboxSnapshot{{SandboxID: "s1", Services: map[string]ServiceSnapshot{"forward": {Egress: 1}}}},
+		Traffic:  []SandboxSnapshot{{SandboxID: "s1", Services: map[string]ServiceSnapshot{"forward": {Connected: 1}}}},
 	}
 	var wire bytes.Buffer
 	if err := WriteFrame(&wire, frame); err != nil {
@@ -77,14 +77,14 @@ func TestFrameRejectsMalformedProtocolState(t *testing.T) {
 		{
 			name: "duplicate sandbox",
 			frame: Frame{Type: TypeUpdate, Version: Version, Epoch: 1, Sequence: 2, Traffic: []SandboxSnapshot{
-				{SandboxID: "s1", Services: map[string]ServiceSnapshot{"forward": {Egress: 1}}},
-				{SandboxID: "s1", Services: map[string]ServiceSnapshot{"exec": {Egress: 1}}},
+				{SandboxID: "s1", Services: map[string]ServiceSnapshot{"forward": {Connected: 1}}},
+				{SandboxID: "s1", Services: map[string]ServiceSnapshot{"exec": {Connected: 1}}},
 			}},
 		},
 		{
 			name: "busy idle timestamp",
 			frame: Frame{Type: TypeUpdate, Version: Version, Epoch: 1, Sequence: 2, Traffic: []SandboxSnapshot{{
-				SandboxID: "s1", Services: map[string]ServiceSnapshot{"forward": {Egress: 1, IdleSince: &now, IdleSinceBootNS: 1}},
+				SandboxID: "s1", Services: map[string]ServiceSnapshot{"forward": {Connected: 1, IdleSince: &now, IdleSinceBootNS: 1}},
 			}}},
 		},
 		{
@@ -110,5 +110,17 @@ func TestFrameRejectsMalformedProtocolState(t *testing.T) {
 	wire.Write(payload)
 	if _, err := ReadFrame(&wire); err == nil {
 		t.Fatal("unknown frame field was accepted")
+	}
+}
+
+func TestFrameRejectsOldEgressField(t *testing.T) {
+	payload := []byte(`{"type":"update","version":1,"epoch":1,"seq":2,"traffic":[{"sandboxID":"s1","services":{"forward":{"parking":0,"egress":1}}}]}`)
+	var wire bytes.Buffer
+	if err := binary.Write(&wire, binary.LittleEndian, uint32(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	wire.Write(payload)
+	if _, err := ReadFrame(&wire); err == nil {
+		t.Fatal("old service egress field silently decoded as connected zero")
 	}
 }

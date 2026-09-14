@@ -16,6 +16,16 @@ type ExternalTrafficProvider struct {
 }
 
 func (p *ExternalTrafficProvider) SandboxTrafficStats(ctx context.Context, sandboxID, runID string, profile types.Profile, state types.State) (*api.TrafficStats, error) {
+	results, err := p.SandboxTrafficStatsBatch(ctx, []proxystats.TrafficQuery{{
+		SandboxID: sandboxID, RunID: runID, Profile: profile, State: state,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return results[0].Stats, nil
+}
+
+func (p *ExternalTrafficProvider) SandboxTrafficStatsBatch(ctx context.Context, queries []proxystats.TrafficQuery) ([]proxystats.BatchResult, error) {
 	if p == nil || p.Plugins == nil {
 		return nil, api.ErrStatsUnavailable
 	}
@@ -23,14 +33,5 @@ func (p *ExternalTrafficProvider) SandboxTrafficStats(ctx context.Context, sandb
 	if !found {
 		return nil, api.ErrStatsUnavailable
 	}
-	results, err := proxystats.QuerySocket(ctx, socket, []proxystats.TrafficQuery{{
-		SandboxID: sandboxID, RunID: runID, Profile: profile, State: state,
-	}})
-	if err != nil {
-		return nil, err
-	}
-	if len(results) != 1 || results[0].SandboxID != sandboxID || results[0].Stats == nil {
-		return nil, api.ErrStatsUnavailable
-	}
-	return results[0].Stats, nil
+	return proxystats.QuerySocket(ctx, socket, queries)
 }

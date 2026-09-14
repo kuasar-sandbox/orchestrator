@@ -375,14 +375,14 @@ func newTrafficHarness(t *testing.T) (*proxystats.WorkerStats, *proxystats.Maste
 func waitInflight(t *testing.T, master *proxystats.MasterStats, parking, egress uint64) *api.TrafficStats {
 	t.Helper()
 	return waitTraffic(t, master, func(stats *api.TrafficStats) bool {
-		return stats.Inflight.Parking == parking && stats.Inflight.Egress == egress
+		return stats.Inflight.Parking == parking && stats.Inflight.Connected == egress
 	})
 }
 
 func waitInflightFor(t *testing.T, master *proxystats.MasterStats, sandboxID string, parking, egress uint64) *api.TrafficStats {
 	t.Helper()
 	return waitTrafficFor(t, master, sandboxID, types.ProfileE2B, types.StateRunning, func(stats *api.TrafficStats) bool {
-		return stats.Inflight.Parking == parking && stats.Inflight.Egress == egress
+		return stats.Inflight.Parking == parking && stats.Inflight.Connected == egress
 	})
 }
 
@@ -417,7 +417,7 @@ func TestAuthorizedRequestParksDuringActivationAndEndsOnDialFailure(t *testing.T
 		t.Fatal("request did not enter activation")
 	}
 	stats := waitTraffic(t, master, func(stats *api.TrafficStats) bool { return stats.Inflight.Parking == 1 })
-	if service := stats.Services[string(proxy.ConnectServiceForward)]; service.Parking != 1 || service.Egress != 0 {
+	if service := stats.Services[string(proxy.ConnectServiceForward)]; service.Parking != 1 || service.Connected != 0 {
 		t.Fatalf("parking service stats = %+v", service)
 	}
 	close(release)
@@ -430,7 +430,7 @@ func TestAuthorizedRequestParksDuringActivationAndEndsOnDialFailure(t *testing.T
 		t.Fatalf("status = %d, want 502", resp.Code)
 	}
 	waitTraffic(t, master, func(stats *api.TrafficStats) bool {
-		return stats.Inflight.Parking == 0 && stats.Inflight.Egress == 0 && stats.IdleSince != nil
+		return stats.Inflight.Parking == 0 && stats.Inflight.Connected == 0 && stats.IdleSince != nil
 	})
 }
 

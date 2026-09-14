@@ -50,18 +50,18 @@ func TestTrafficFlowParkingEgressHalfCloseAndIdempotentClose(t *testing.T) {
 	worker := NewWorkerStats()
 	flow := worker.BeginParking("s1", proxy.ConnectServiceForward)
 	state := snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]
-	if state.Parking != 1 || state.Egress != 0 || state.IdleSince != nil {
+	if state.Parking != 1 || state.Connected != 0 || state.IdleSince != nil {
 		t.Fatalf("parking state = %+v", state)
 	}
 
 	base := &testConn{}
 	tracked := flow.AttachBackend(base)
 	state = snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]
-	if state.Parking != 0 || state.Egress != 1 || state.IdleSince != nil {
+	if state.Parking != 0 || state.Connected != 1 || state.IdleSince != nil {
 		t.Fatalf("attached state = %+v", state)
 	}
 	flow.Close() // Once attached, the backend Close is authoritative.
-	if state = snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]; state.Egress != 1 {
+	if state = snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]; state.Connected != 1 {
 		t.Fatalf("flow.Close ended attached egress: %+v", state)
 	}
 	if err := tracked.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
@@ -70,7 +70,7 @@ func TestTrafficFlowParkingEgressHalfCloseAndIdempotentClose(t *testing.T) {
 	if base.closeWrites.Load() != 1 {
 		t.Fatalf("underlying CloseWrite calls = %d", base.closeWrites.Load())
 	}
-	if state = snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]; state.Egress != 1 {
+	if state = snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]; state.Connected != 1 {
 		t.Fatalf("CloseWrite ended egress: %+v", state)
 	}
 	if err := tracked.Close(); err != nil {
@@ -80,7 +80,7 @@ func TestTrafficFlowParkingEgressHalfCloseAndIdempotentClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	state = snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]
-	if state.Parking != 0 || state.Egress != 0 || state.IdleSince == nil || state.IdleSinceBootNS == 0 {
+	if state.Parking != 0 || state.Connected != 0 || state.IdleSince == nil || state.IdleSinceBootNS == 0 {
 		t.Fatalf("closed state = %+v", state)
 	}
 	if base.closes.Load() != 1 {
@@ -148,7 +148,7 @@ func TestTrafficFlowActivationOrDialFailureEndsParking(t *testing.T) {
 	flow.Close()
 	flow.Close()
 	state := snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceE2BEnvd)]
-	if state.Parking != 0 || state.Egress != 0 || state.IdleSince == nil {
+	if state.Parking != 0 || state.Connected != 0 || state.IdleSince == nil {
 		t.Fatalf("failed flow state = %+v", state)
 	}
 }
@@ -174,10 +174,10 @@ func TestParkingToEgressIsAtomicUnderConcurrency(t *testing.T) {
 	close(start)
 	for {
 		state := snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]
-		if state.Parking+state.Egress != flows {
-			t.Fatalf("atomic transition exposed total=%d (parking=%d egress=%d), want %d", state.Parking+state.Egress, state.Parking, state.Egress, flows)
+		if state.Parking+state.Connected != flows {
+			t.Fatalf("atomic transition exposed total=%d (parking=%d egress=%d), want %d", state.Parking+state.Connected, state.Parking, state.Connected, flows)
 		}
-		if state.Egress == flows {
+		if state.Connected == flows {
 			break
 		}
 	}
@@ -188,7 +188,7 @@ func TestParkingToEgressIsAtomicUnderConcurrency(t *testing.T) {
 		}
 	}
 	state := snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]
-	if state.Parking != 0 || state.Egress != 0 || state.IdleSince == nil {
+	if state.Parking != 0 || state.Connected != 0 || state.IdleSince == nil {
 		t.Fatalf("final concurrent state = %+v", state)
 	}
 }
@@ -277,7 +277,7 @@ func TestSenderMergesTrafficToLatestAbsoluteStateAcrossBackpressure(t *testing.T
 		case frame := <-updates:
 			for _, snapshot := range frame.Traffic {
 				state := snapshot.Services[string(proxy.ConnectServiceForward)]
-				if snapshot.SandboxID == "s1" && state.Parking == 0 && state.Egress == 0 && state.IdleSince != nil {
+				if snapshot.SandboxID == "s1" && state.Parking == 0 && state.Connected == 0 && state.IdleSince != nil {
 					cancel()
 					<-done
 					return
@@ -329,7 +329,7 @@ func TestGCRouteLookupDoesNotBlockTrafficAndRechecksEntry(t *testing.T) {
 		t.Fatal("GC did not finish")
 	}
 	state := snapshotWorker(t, worker, "s1").Services[string(proxy.ConnectServiceForward)]
-	if state.Parking != 1 || state.Egress != 0 {
+	if state.Parking != 1 || state.Connected != 0 {
 		t.Fatalf("GC removed or corrupted a concurrently reactivated entry: %+v", state)
 	}
 	active.Close()
@@ -366,7 +366,7 @@ func TestOldBatchAckPreservesRecreatedEntryDirtyState(t *testing.T) {
 		t.Fatalf("recreated entry update was cleared by old ack: %+v, present=%v", newBatch, ok)
 	}
 	state := newBatch.frame.Traffic[0].Services[string(proxy.ConnectServiceForward)]
-	if state.Parking != 2 || state.Egress != 0 {
+	if state.Parking != 2 || state.Connected != 0 {
 		t.Fatalf("recreated entry snapshot = %+v, want parking=2 egress=0", state)
 	}
 	first.Close()

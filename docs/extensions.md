@@ -526,7 +526,9 @@ RouteBarrier ACK, or affect Wake/activation.
 
 ### Master traffic source
 
-`TrafficSource.Get(context.Context, string) (TrafficView, error)` has no found boolean or Watch. `ErrTrafficUnavailable` means route identity or complete worker contributions are unavailable; `ErrTrafficConflict` means the current route state cannot produce the requested observation. [TrafficView](../app/proxy/extension/traffic.go) carries `SandboxID`, `RunID`, `Profile`, `State`, effective `MaxInflight config.MaxInflight`, `Inflight TrafficInflight`, `IdleSince *time.Time` and `Services map[string]ServiceTrafficView`. Inflight has `Parking`/`Egress uint64`; each service adds `IdleSince *time.Time`. `config.MaxInflight` has `Total`, `Forward`, `E2BEnvd`, `E2BCodeInterpreter`, `Exec uint32` (JSON `total`, `forward`, `e2b:envd`, `e2b:code-interpreter`, `exec`); zero is unlimited and `Unlimited() bool` checks the whole vector.
+`TrafficSource.Get(context.Context, string) (TrafficView, error)` has no found boolean or Watch. `ErrTrafficUnavailable` means route identity or complete worker contributions are unavailable; `ErrTrafficConflict` means the current route state cannot produce the requested observation. [TrafficView](../app/proxy/extension/traffic.go) carries `SandboxID`, `Profile`, `State`, effective `MaxInflight config.MaxInflight`, `Inflight TrafficInflight`, `IdleSince *time.Time` and `Services map[string]ServiceTrafficView`. Inflight has `Parking`/`Connected uint64`; each service adds `IdleSince *time.Time`. `config.MaxInflight` has `Total`, `Forward`, `E2BEnvd`, `E2BCodeInterpreter`, `Exec uint32` (JSON `total`, `forward`, `e2b:envd`, `e2b:code-interpreter`, `exec`); zero is unlimited and `Unlimited() bool` checks the whole vector.
+
+The traffic extension projection exposes no RunID. The Proxy retains its route/run/worker fences internally. `Connected` replaces the old logical `Egress` field; it still ends only on final backend Close. Conductor `Host.Stats().ReadStats` additionally exposes flat `Platform`/`Transit` counters and empty `Egress`, using the same native read as its public API.
 
 `TrafficSource.Get` combines the current applied route identity and its effective
 per-Sandbox `maxInflight` policy with `MasterStats` directly in process; it does
@@ -622,7 +624,7 @@ Admission happens exactly once whether the wrapper calls `ForwardAuthorized`
 directly or canonicalizes a request and calls `next`; wrappers must not nest the
 two paths for one logical request. Rejection occurs before Wake, activation, or
 dial and uses the core `429 max_inflight_reached` response. The admission lease
-and parking/egress accounting share one lifecycle, including ordinary response,
+and parking/connected accounting share one lifecycle, including ordinary response,
 CONNECT relay, cancellation, and failure cleanup. The generic helper still
 rejects native exec, so it cannot bypass the KAT/CEL/first-frame gate or move exec
 admission ahead of that gate.

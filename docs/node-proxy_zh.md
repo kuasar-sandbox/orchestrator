@@ -362,7 +362,7 @@ Connection token 支持大小写混合、逗号分隔和多个 Header value。�
 不再写 HTTP 错误。两侧 reader 已预读的字节均保留；正常 EOF 对另一侧执行半关闭并排空
 尾部数据，请求取消则关闭两侧并等待 relay 结束。
 
-一条升级连接持续持有原 tracked backend、admission lease 和 egress 计数，直到 relay
+一条升级连接持续持有原 tracked backend、admission lease 和 connected 计数，直到 relay
 结束。Frame 不产生新的 ingress 或请求结果计数。Cluster-router 在现有到节点的 CONNECT
 隧道上使用同一个 HTTP exchange，保留 buffered reader 和 identity rewrite；不增加第二套
 WebSocket 实现，也不重放内部请求。本功能不增加配置、扩展 API、Frame 处理或 HTTP/2
@@ -553,7 +553,7 @@ release 的 flow 的 acquire→release 完整区间。删除这种正计数区�
 actual admitted inflight <= M + N - 1
 ```
 
-parking→egress 不改 shared count。activation、dial、HTTP forward、context cancel、ordinary
+parking→connected 不改 shared count。activation、dial、HTTP forward、context cancel、ordinary
 response 及完整 CONNECT/exec relay 的最终 Close 都由同一个 flow/lease exactly once 释放;
 half-close 不释放。
 
@@ -613,18 +613,18 @@ CONNECT 200 后差异见 §5。
 逻辑 ingress,不是客户端物理 TCP 数:
 
 ```text
-ingress = parking + egress
+ingress = parking + connected
 
 parking: 有效鉴权策略和 ExecRequest admission 通过后,ActivateRoute/ActivateExec 与最终 backend dial 尚未完成
-egress:  最终 node proxy → sandbox backend 已建立且尚未最终 Close
+connected:  最终 node proxy → sandbox backend 已建立且尚未最终 Close
 ```
 
 service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
 bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
-成功时在同一 worker-local entry lock 中原子执行 `parking--/egress++`;activation 或 dial
-失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 egress;只有 tracked backend
-的最终 `Close` 以 `sync.Once` 结束 egress。token 或 ExecRequest admission 失败不进入
-parking/egress,也不刷新 sandbox activity/`idleSince`。
+成功时在同一 worker-local entry lock 中原子执行 `parking--/connected++`;activation 或 dial
+失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 connected;只有 tracked backend
+的最终 `Close` 以 `sync.Once` 结束 connected。token 或 ExecRequest admission 失败不进入
+parking/connected,也不刷新 sandbox activity/`idleSince`。
 
 bare Sandbox 空闲响应示例（不适用的 e2b 上限为零）：
 
@@ -640,21 +640,34 @@ bare Sandbox 空闲响应示例（不适用的 e2b 上限为零）：
   },
   "inflight": {
     "parking": 0,
-    "egress": 0
+    "connected": 0
   },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
     "forward": {
       "parking": 0,
-      "egress": 0,
+      "connected": 0,
       "idleSince": "2026-08-12T14:03:21.123456789Z"
     },
     "exec": {
       "parking": 0,
-      "egress": 0,
+      "connected": 0,
       "idleSince": "2026-08-12T14:00:00Z"
     }
-  }
+  },
+  "platform": {
+    "rxPackets": 57,
+    "rxBytes": 5108,
+    "txPackets": 39,
+    "txBytes": 8042
+  },
+  "transit": {
+    "rxPackets": 2,
+    "rxBytes": 196,
+    "txPackets": 3,
+    "txBytes": 294
+  },
+  "egress": {}
 }
 ```
 
@@ -664,10 +677,18 @@ Sandbox row 推导;全零对象明确表示 unlimited。worker stats unavailable
 
 顶层 `idleSince` 仅在 state=running 且所有 inflight 为零时返回;starting/paused 即使零连接
 也不返回顶层时间。service 的 `idleSince` 也只在该 service 两项为零时出现。接口不返回
-`idle`、`idleForSeconds`、last-open/close、累计连接数、bytes、延迟、端口明细或 worker
+`idle`、`idleForSeconds`、last-open/close、累计连接数、速率、延迟、端口明细或 worker
 身份;`Cache-Control: no-store`.Proxy route 未完成同步,
 RunID/profile/state 不匹配或 worker 集不可信时返回 503。state 参与 conductor→master
 查询身份,避免 Pause 已提交但异步 route view 仍为 running 时返回旧的顶层 `idleSince`。
+
+响应为平铺结构: `state`、`maxInflight`、`inflight`、`idleSince`、`services`、`platform`、`transit` 和 `egress`. Conductor 拥有该原生 API,按照当前 Sandbox 到 switch/port 的绑定组织既有 Proxy 观测与网络计数. `platform` 映射 connector 的 Mgmt RX/TX 包数和字节数,`transit` 映射 Transit RX/TX;两者都采用沙箱视角. 已配置且当前有效的端口返回全部四项无符号整数,包括合法的 0. 没有 attached port 的沙箱仅在 FloatingIP、inner IP 和 port MAC 也都为空时返回空 `platform`/`transit` 对象,表示没有适用的当前观测. 已附着端口要求上述三个身份字段完整;不完整绑定在读取任一来源前返回 503. `egress: {}` 始终表示尚无可发布的 egress 统计,不是观测到零流量. 不发布 per-service 包计数、来源分组或 network API 别名.
+
+`connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 仅描述 Proxy 已接纳 ingress;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
+
+Conductor 每个 switch 最多批量读取 64 个当前端口,调用 connector Go `Stats(ports)`,不逐沙箱启动 CLI,不维护第二套生命周期权威. 它复用原有 allocation/detach fence;connector 复用 pin 目录共享锁、当前 pinned-map ID 和清零确认标记. 既有 Proxy stats socket 也支持有界批量. 已配置来源读取失败、清零未确认、控制锁占用、结果不完整或绑定变化时,整个读取返回 503,不会用 0 或旧样本伪装完整响应. 公开 API、可信本机 batch 与 conductor extension 共用相同领域读取. Stats 独立于 telemetry,不参与 Create/Resume readiness.
+
+流量采集需要相互匹配的 connector control binary、TC program 和当前 counter-map ABI. 开启采集前需重建旧 PERCPU_ARRAY/64-byte counter map;当前为带锁的 ARRAY/80-byte value. 清零失败仅影响 stats 可用性. switch 生命周期与部署见 [connector 操作说明](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch-operations_zh.md).
 
 每个 worker 使用一条 Unix socketpair 上报:
 

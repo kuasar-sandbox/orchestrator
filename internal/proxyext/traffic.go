@@ -45,18 +45,18 @@ func (s *trafficSource) Get(ctx context.Context, sandboxID string) (proxyextensi
 		return proxyextension.TrafficView{}, err
 	}
 	view := proxyextension.TrafficView{
-		SandboxID: sandboxID, RunID: route.RunID, Profile: route.Profile,
+		SandboxID: sandboxID, Profile: route.Profile,
 		State:       proxyextension.RouteState(stats.State),
 		MaxInflight: maxInflight,
 		Inflight: proxyextension.TrafficInflight{
-			Parking: stats.Inflight.Parking, Egress: stats.Inflight.Egress,
+			Parking: stats.Inflight.Parking, Connected: stats.Inflight.Connected,
 		},
 		IdleSince: cloneTime(stats.IdleSince),
 		Services:  make(map[string]proxyextension.ServiceTrafficView, len(stats.Services)),
 	}
 	for service, item := range stats.Services {
 		view.Services[service] = proxyextension.ServiceTrafficView{
-			Parking: item.Parking, Egress: item.Egress, IdleSince: cloneTime(item.IdleSince),
+			Parking: item.Parking, Connected: item.Connected, IdleSince: cloneTime(item.IdleSince),
 		}
 	}
 	return view, nil

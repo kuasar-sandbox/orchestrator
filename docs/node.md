@@ -372,7 +372,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
 | Metrics history | GET /sandboxes/{SandboxID}/metrics?start=...&end=... | Exact SandboxID ownership, opaque live telemetry UDS forwarding; 503 when unavailable, no Wake/Resume; [E2B contract](telemetry.md#6-e2b-history-query) |
-| Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/egress and conservative idleSince; no Wake/Resume |
+| Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/connected and conservative idleSince; no Wake/Resume |
 | List | GET /v2/sandboxes | Tenant-scoped state/limit/nextToken query. Omitted state lists running/paused; explicit states support diagnosis. x-next-token pagination; items include cpuCount/memoryMB/diskSizeMB and ISO-8601 startedAt/endAt. CPU/memory retain capacity/SKU meaning, not headroom |
 | Kill | DELETE /sandboxes/{id} → 204 | Non-owner returns 404. Atomically transfer complete ownership into deleting, exclude from cache/full snapshots and publish route Delete before response. Finalizer cancels launch, fences runner, detaches under allocation fence, exactly clears durable network ownership, removes RunDir/BaseDir and hard-deletes row. Route Delete only withdraws projection; pending repeats are idempotent |
 | Resume | POST /sandboxes/{id}/connect | Body timeout in seconds and optional bool/null memory. Kuasar maps nil to auto, true to memory, false to cold. Paused atomically becomes starting with durable launch_mode before response. Missing targets may synchronously import paused state from X-Kuasar-Migration-Token, then use the same admission. Response does not wait for launch |
@@ -445,9 +445,9 @@ This works with static or dynamic resource control, with usage disabled and with
 Traffic stats report authenticated logical ingress accepted by final node Proxy:
 
 ```text
-ingress = parking + egress
+ingress = parking + connected
 parking = Authenticated, but activation/final backend dial has not completed
-egress  = Final node proxy→Sandbox backend is established and not finally closed
+connected  = Final node proxy→Sandbox backend is established and not finally closed
 ```
 
 ```json
@@ -456,24 +456,54 @@ egress  = Final node proxy→Sandbox backend is established and not finally clos
   "maxInflight": {
     "total": 128,
     "forward": 96,
-    "e2b:envd": 16,
-    "e2b:code-interpreter": 8,
+    "e2b:envd": 0,
+    "e2b:code-interpreter": 0,
     "exec": 8
   },
-  "inflight": {"parking": 0, "egress": 0},
+  "inflight": {
+    "parking": 0,
+    "connected": 0
+  },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
-    "forward": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:03:21.123456789Z"},
-    "exec": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:00:00Z"}
-  }
+    "forward": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:03:21.123456789Z"
+    },
+    "exec": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:00:00Z"
+    }
+  },
+  "platform": {
+    "rxPackets": 57,
+    "rxBytes": 5108,
+    "txPackets": 39,
+    "txBytes": 8042
+  },
+  "transit": {
+    "rxPackets": 2,
+    "rxBytes": 196,
+    "txPackets": 3,
+    "txBytes": 294
+  },
+  "egress": {}
 }
 ```
 
 maxInflight comes from master’s currently applied route and destination-node effective policy, not conductor's row. An all-zero object means unlimited. Configured M is an approximate whole-node per-Sandbox ceiling; with N workers the transient theoretical bound is M+N-1, not M per worker.
 
-e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/exec. Top-level inflight sums services. Each service includes idleSince only when both counters are zero. Top-level idleSince appears only for running with all-zero counts and is the maximum of all applicable service idle times. Starting/paused returns inflight but no top-level idle. V1 omits idle boolean/duration, last open/close, cumulative connections, bytes/latency/port details and worker information.
+e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/exec. Top-level inflight sums services. Each service includes idleSince only when both counters are zero. Top-level idleSince appears only for running with all-zero counts and is the maximum of all applicable service idle times. Starting/paused returns inflight but no top-level idle. The API omits idle boolean/duration, last open/close, cumulative connection counts, rates, latency, port details and worker information.
 
 Conductor queries the current trusted Proxy registration's stats_socket master cache, without worker fan-out. Unregistered master, unsynchronized route, mismatched RunID/profile/state, failed worker stream or unready replacement returns 503. This stats window does not alter master route/admission authority or Create barrier. The complete shared-admission algorithm, error proof, worker state machine, absolute snapshots and failure windows are in [node-proxy.md](node-proxy.md) §8.
+
+The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services`, `platform`, `transit`, and `egress`. Conductor owns this native API and composes the existing Proxy observation with the current Sandbox-to-switch/port binding. `platform` maps connector Mgmt RX/TX packets/bytes; `transit` maps Transit RX/TX. Both use the sandbox viewpoint. Each configured current port supplies all four unsigned integer counters, including valid zero. A sandbox without an attached port has empty `platform`/`transit` objects, meaning no applicable current observation. `egress: {}` always means no publishable egress statistics; it does not mean observed zero traffic. There are no per-service packet counters, source groups or network API alias.
+
+`connected` replaces the former native `inflight.egress` and `services[*].egress`, preserving the established-backend-until-final-Close meaning. Top-level `idleSince` describes only admitted Proxy ingress; management monitoring packets do not refresh it and it makes no claim about sandbox computation or network idleness. Packets are packet counts, not application request counts; bytes are observed frame bytes, not throughput. Management uses the existing port/management ingress frame length; transit uses the frame before encapsulation or after removal of outer GENEVE headers, retaining Ethernet. Different observation points are not added into a traffic total. The cumulative counters belong to the current attachment and can reset on reuse; the API creates no network history.
+
+Conductor batches at most 64 current ports per switch through connector's Go `Stats(ports)` API, with no per-sandbox CLI processes or second lifecycle authority. It reuses its allocation/detach fence; connector reuses the pin-directory shared lock, current pinned-map ID and reset-confirmation flag. The existing Proxy stats socket also accepts a bounded batch. Configured-source read errors, unconfirmed reset, control contention, incomplete results or changed bindings return 503 for the whole read, never zero or an older complete-looking response. The same domain reads serve the public API, trusted local batch and conductor extension. Stats remains available independently of telemetry and does not participate in Create/Resume readiness.
 
 Native lifecycle accounting is available at `/sandboxes/{id}/stats/usage`, including paused objects. It has its own current/saved/history selection and preserves the native lossless record rather than replacing it with resource counters. See [Native usage and trusted batch reads](node-usage.md).
 

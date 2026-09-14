@@ -49,7 +49,7 @@ type SandboxSnapshot struct {
 
 type ServiceSnapshot struct {
 	Parking         uint64     `json:"parking"`
-	Egress          uint64     `json:"egress"`
+	Connected       uint64     `json:"connected"`
 	IdleSince       *time.Time `json:"idleSince,omitempty"`
 	IdleSinceBootNS int64      `json:"idleSinceBootNS,omitempty"`
 }
@@ -196,7 +196,7 @@ func validateSandboxSnapshot(snapshot SandboxSnapshot) error {
 		if !validService(service) {
 			return fmt.Errorf("proxystats: invalid service %q", service)
 		}
-		if (state.Parking != 0 || state.Egress != 0) && (state.IdleSince != nil || state.IdleSinceBootNS != 0) {
+		if (state.Parking != 0 || state.Connected != 0) && (state.IdleSince != nil || state.IdleSinceBootNS != 0) {
 			return fmt.Errorf("proxystats: busy service %q carries idle time", service)
 		}
 		if (state.IdleSince == nil) != (state.IdleSinceBootNS == 0) {

@@ -64,3 +64,5 @@ rows, err := e.host.Stats().ReadStats(ctx, conductor.StatsRequest{
 固定请求数、并发、时间、大小上限和整批错误也适用于进程内调用. StableID 不能替代
 SandboxID. 保留原始 JSON 或解码为原生整数类型; 不经过通用 float64 map 舍入,
 也不要通过未认证 wrapper 暴露此可信 Reader. 参见[原生 usage](../../docs/node-usage_zh.md).
+
+同一 `StatsRequest` 接受 `Sections: []string{"traffic"}`. 每项结果包含 `Traffic.Inflight.Connected`、逻辑 service 的 connected 计数、平铺的 `Traffic.Platform`/`Traffic.Transit` 计数和空 `Traffic.Egress`. 未绑定端口时对应平面为空;配置来源读取失败则整批失败. 可一次提交最多 64 个精确 SandboxID: conductor 执行一次原生交换机读取,使用内置 Proxy provider 时还执行一次 stats UDS 批量请求. Resource、traffic、usage 均为领域读取,不依赖 telemetry 的生命周期.

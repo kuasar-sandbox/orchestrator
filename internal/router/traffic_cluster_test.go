@@ -167,7 +167,7 @@ func waitClusterTraffic(t *testing.T, master *proxystats.MasterStats, sandboxID 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		stats, err := master.SandboxTrafficStats(context.Background(), sandboxID, "run-1", types.ProfileBare, types.StateRunning)
-		if err == nil && stats.Inflight.Parking == parking && stats.Inflight.Egress == egress {
+		if err == nil && stats.Inflight.Parking == parking && stats.Inflight.Connected == egress {
 			return
 		}
 		time.Sleep(time.Millisecond)
