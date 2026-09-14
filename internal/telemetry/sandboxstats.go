@@ -112,7 +112,18 @@ func (r *sandboxStatsReceiver) Shutdown(ctx context.Context) error {
 }
 
 func (r *sandboxStatsReceiver) collect(ctx context.Context, section string) {
-	entries, _ := r.view.snapshot()
+	entries, changed := r.view.snapshot()
+	// Collector startup precedes route subscription. An unsynchronized view
+	// is not a completed empty round: wait for its bookmark before starting
+	// the next interval. The same notification also covers reconnection.
+	for entries == nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-changed:
+			entries, changed = r.view.snapshot()
+		}
+	}
 	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		// Resource is a live-runtime read. Traffic and saved usage can apply to

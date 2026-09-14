@@ -170,9 +170,11 @@ Configure `resource_interval` (default 5s), `traffic_interval` (10s),
 An interval of zero disables that section; enabled intervals are 1s..1h and at
 least one must be enabled. Each instance issues at most 64 SandboxIDs per request,
 with conductor's 4 MiB response limit. Rounds do not overlap for a section, and
-completion starts the next interval. Cancellation bounds pending requests and
-delivery. An unavailable configured source logs an error and drops that read;
-it never exports zeros or a stale complete response. Resource selects current
+completion starts the next interval. A due round waits for the route bookmark
+while discovery is unsynchronized, including startup and reconnection, rather
+than consuming an interval as an empty round. Cancellation bounds this wait,
+pending requests and delivery. An unavailable configured source logs an error
+and drops that read; it never exports zeros or a stale complete response. Resource selects current
 starting/running objects; traffic and saved usage also include paused objects.
 Once conductor accepts the object data, later route changes do not revoke it.
 
@@ -515,6 +517,13 @@ synthetic targets, scrape counts, peak goroutines/FDs (including fixture server)
 allocations, TSDB batch writes and local query cost. Receiver and TSDB benchmarks
 are separate diagnostics, not a claim of end-to-end production capacity. Timing
 numbers are not ordinary CI gates; repeat on representative hosts/workloads.
+
+The real guest fixtures additionally export conductor resource/traffic observations
+through sandboxstats, native batch and an HTTP sink on the host network. A paused
+sandbox exports its actual saved usage through the same lease-authorized reader;
+assertions compare CPU/memory cumulative values and the original saved timestamp
+with the public native API and confirm the sandbox stays paused.
+
 The existing real Proxy E2E fixture also exercises envd → Collector → local DB,
 guest OTLP through connector mgmt-extract, auth, paused queries, unavailable
 telemetry, lease revocation and TSDB restart, without a second VM lifecycle.

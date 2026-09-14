@@ -147,7 +147,9 @@ ownership/binding 校验及失败规则.
 (1m)、`timeout` (上限 5s)、`concurrency` (默认 4, 范围 1..8). 周期零表示关闭对应
 section; 启用周期为 1s..1h, 至少启用一项. 每实例每次请求最多 64 个 SandboxID,
 响应遵守 conductor 的 4 MiB 上限. 同一 section 的轮次不重叠, 完成后开始下一周期.
-取消约束请求等待及投递. 配置来源不可用会记录错误并丢弃本次读取, 不导出零值或
+启动或重连期间 discovery 尚未同步时, 到期轮次等待路由 bookmark, 不把未同步
+视为完成空轮次而消耗整个周期. 取消约束该等待、请求等待及投递.
+配置来源不可用会记录错误并丢弃本次读取, 不导出零值或
 旧的完整响应. Resource 选择当前 starting/running 对象; traffic 和 saved usage
 也读取 paused 对象. Conductor 接纳的数据不因后续路由变化而撤销.
 
@@ -440,6 +442,12 @@ field MAX 和精确时间边界。
 Density benchmark 对 1k/10k/50k synthetic targets 测真实 5s 周期，报告 scrape count、
 goroutine/FD 峰值（含 fixture server）、allocation、TSDB batch write 与 local query
 成本。Receiver 与 TSDB 分开测量，不声称是端到端生产容量。时间数字不作为普通 CI gate，
-应在代表性 host/workload 重复测量。已有真实 Proxy E2E fixture 同时覆盖 envd → Collector
+应在代表性 host/workload 重复测量。
+
+真实 guest fixture 还将 conductor 的 resource/traffic 观测经 sandboxstats、原生 batch
+导出至宿主网络 HTTP sink. 已暂停沙箱通过同一 lease 授权读取面导出实际 saved usage;
+断言与公开原生 API 比较 CPU/内存累计值及原始 saved 时间, 并确认沙箱保持 paused.
+
+已有真实 Proxy E2E fixture 同时覆盖 envd → Collector
 → local DB、guest 经 connector mgmt-extract 的 OTLP、auth、paused query、telemetry
 不可用、lease 撤销和 TSDB restart，不另建第二套 VM 生命周期。

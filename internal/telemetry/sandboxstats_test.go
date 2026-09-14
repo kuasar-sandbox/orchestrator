@@ -45,6 +45,123 @@ func (f statsTestReader) ReadStats(ctx context.Context, q conductorextension.Sta
 	return f(ctx, q)
 }
 
+type delayedStatsSource struct {
+	statsTestSource
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s delayedStatsSource) Range(ctx context.Context, emit func(routesync.RouteEntry) error) error {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return s.statsTestSource.Range(ctx, emit)
+	}
+}
+
+func TestSandboxStatsReceiverWaitsForRouteSync(t *testing.T) {
+	dir, err := os.MkdirTemp("", "stats-initial-sync-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "conductor.sock")
+	view := NewView(2)
+	defer view.InvalidateSync()
+	source := delayedStatsSource{statsTestSource: statsTestSource{routes: []routesync.RouteEntry{{SandboxID: "sid", StableID: "stable", State: routesync.StateRunning}}}, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	backend := statsTestReader(func(ctx context.Context, q conductorextension.StatsRequest) ([]conductorextension.SandboxStats, error) {
+		record := savedStatsRecord("sid")
+		raw, err := json.Marshal(usage.View{Saved: &record})
+		if err != nil {
+			return nil, err
+		}
+		capacity := 1.0
+		return []conductorextension.SandboxStats{{SandboxID: "sid", StableID: "stable", Resource: &conductorextension.ResourceStats{CPUCapacity: &capacity}, Traffic: &conductorextension.TrafficStats{State: "running"}, Usage: raw}}, ctx.Err()
+	})
+	server := configsock.New(socket, configsock.Deps{Plugins: configsock.NewRegistry(), RouteSource: source, Stats: backend, API: http.NotFoundHandler()}, testLogger())
+	ctx, cancel := context.WithCancel(t.Context())
+	done, ready := make(chan error, 1), make(chan struct{})
+	go func() { done <- server.ServeReady(ctx, ready) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		t.Fatal("conductor socket unavailable")
+	}
+	delivered := make(chan string, 8)
+	r := &sandboxStatsReceiver{view: view, socket: socket, cfg: sandboxStatsConfig{Resource: time.Hour, Traffic: time.Hour, Usage: time.Hour, Timeout: time.Second, Concurrency: 3}, log: testLogger()}
+	r.next = metricsConsumer(t, func(_ context.Context, m pmetric.Metrics) error {
+		delivered <- m.ResourceMetrics().At(0).ScopeMetrics().At(0).Scope().Name()
+		return nil
+	})
+	// Match process startup: the Collector starts before the route subscriber.
+	if err := r.Start(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	subscriber := routesync.NewSubscriber(func(ctx context.Context) (net.Conn, error) { return (&net.Dialer{}).DialContext(ctx, "unix", socket) }, routesync.TelemetryPluginID,
+		routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}, Telemetry: &routesync.Telemetry{}}, view, nil, testLogger())
+	subCtx, stopSub := context.WithCancel(ctx)
+	subDone := make(chan struct{})
+	go func() { defer close(subDone); subscriber.Run(subCtx) }()
+	t.Cleanup(func() { stopSub(); <-subDone })
+	t.Cleanup(func() {
+		stopCtx, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		if err := r.Shutdown(stopCtx); err != nil {
+			t.Error(err)
+		}
+	})
+	select {
+	case <-source.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("route subscription did not start")
+	}
+	select {
+	case got := <-delivered:
+		t.Fatal("delivered before initial route bookmark", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(source.release)
+	seen := map[string]bool{}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for len(seen) < 3 {
+		select {
+		case section := <-delivered:
+			seen[section] = true
+		case <-deadline.C:
+			t.Fatal("first sample delayed for full configured hour after route sync", seen)
+		}
+	}
+	for _, section := range []string{"resource", "traffic", "usage"} {
+		if !seen["sandbox.stats."+section] {
+			t.Fatal("missing first section", section)
+		}
+	}
+}
+
+func TestSandboxStatsReceiverShutdownBeforeRouteSync(t *testing.T) {
+	r := &sandboxStatsReceiver{view: NewView(1), cfg: sandboxStatsConfig{Usage: time.Hour, Concurrency: 1}}
+	if err := r.Start(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := r.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSandboxStatsReceiverUsesConductorLeaseAndBoundedBatches(t *testing.T) {
 	// This is the actual config_socket HTTP/Plugin Plane and SO_PEERCRED
 	// authorization, with a controllable domain reader for cancellation/errors.
