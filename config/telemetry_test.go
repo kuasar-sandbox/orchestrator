@@ -1,8 +1,11 @@
 package config
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestTelemetryDefaultsAndStrictDecode(t *testing.T) {
@@ -13,9 +16,43 @@ func TestTelemetryDefaultsAndStrictDecode(t *testing.T) {
 	if cfg.Telemetry.Scrape.Interval != "5s" || cfg.Telemetry.Scrape.Timeout != "1s" || cfg.Telemetry.Storage.Type != "local" || !*cfg.Telemetry.OTLP.Enabled {
 		t.Fatalf("defaults %+v", cfg)
 	}
-	for _, raw := range []string{"unknown: true", "telemetry:\n  scrape:\n    bogus: 1", "telemetry:\n  storage:\n    type: local\n    type: none", "{}\n---\n{}", "api_socket: relative", "paths:\n  telemetry_executable: relative", "sandbox_netns: ../escape", "telemetry:\n  storage:\n    type: sqlite", "telemetry:\n  scrape:\n    timeout: 6s", "telemetry:\n  otlp:\n    grpc_listen: localhost:invalid"} {
+	for _, raw := range []string{"unknown: true", "telemetry:\n  scrape:\n    bogus: 1", "telemetry:\n  storage:\n    type: local\n    type: none", "{}\n---\n{}", "api_socket: relative", "paths:\n  telemetry_executable: relative", "proxy_netns: ../escape", "telemetry:\n  storage:\n    type: sqlite", "telemetry:\n  scrape:\n    timeout: 6s", "telemetry:\n  otlp:\n    grpc_listen: localhost:invalid"} {
 		if _, err := DecodeTelemetry(strings.NewReader(raw)); err == nil {
 			t.Fatalf("invalid config accepted: %s", raw)
+		}
+	}
+}
+
+func TestTelemetryProxyNetNSContract(t *testing.T) {
+	for _, raw := range []string{`proxy_netns: sandbox-proxy`, `{"proxy_netns":"sandbox-proxy"}`} {
+		cfg, err := DecodeTelemetry(strings.NewReader(raw))
+		if err != nil || cfg.ProxyNetNS != "sandbox-proxy" {
+			t.Fatalf("canonical netns: %v, %+v", err, cfg)
+		}
+		clone := cfg.Clone()
+		if clone.ProxyNetNS != cfg.ProxyNetNS {
+			t.Fatal("Clone lost proxy_netns")
+		}
+		for _, marshal := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
+			encoded, err := marshal(clone)
+			if err != nil || !strings.Contains(string(encoded), "proxy_netns") || strings.Contains(string(encoded), "sandbox_netns") {
+				t.Fatalf("canonical output: %s, %v", encoded, err)
+			}
+			if _, err := DecodeTelemetry(strings.NewReader(string(encoded))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		clone.ProxyNetNS = "../invalid"
+		if err := ValidateTelemetryFinal(clone); err == nil || !strings.Contains(err.Error(), "proxy_netns") {
+			t.Fatalf("invalid final namespace: %v", err)
+		}
+	}
+	for _, raw := range []string{
+		"sandbox_netns: sandbox-proxy", "sandbox_netns: ''", `{"sandbox_netns":"sandbox-proxy"}`,
+		"proxy_netns: sandbox-proxy\nsandbox_netns: sandbox-proxy", "proxy_netns: ../invalid",
+	} {
+		if _, err := DecodeTelemetry(strings.NewReader(raw)); err == nil {
+			t.Fatalf("invalid or legacy configuration accepted: %s", raw)
 		}
 	}
 }

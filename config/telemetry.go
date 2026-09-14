@@ -21,7 +21,7 @@ import (
 type Telemetry struct {
 	ConfigSocket  string            `yaml:"config_socket" json:"config_socket"`
 	APISocket     string            `yaml:"api_socket" json:"api_socket"`
-	SandboxNetNS  string            `yaml:"sandbox_netns,omitempty" json:"sandbox_netns,omitempty"`
+	ProxyNetNS    string            `yaml:"proxy_netns,omitempty" json:"proxy_netns,omitempty"`
 	RouteCapacity int               `yaml:"route_capacity" json:"route_capacity"`
 	Paths         TelemetryPaths    `yaml:"paths" json:"paths"`
 	Telemetry     TelemetryPipeline `yaml:"telemetry" json:"telemetry"`
@@ -196,8 +196,8 @@ func validateTelemetry(c *Telemetry, final bool) error {
 	if path := c.Paths.TelemetryExecutable; path != "" && !filepath.IsAbs(path) {
 		return fmt.Errorf("paths.telemetry_executable must be absolute")
 	}
-	if strings.ContainsAny(c.SandboxNetNS, "\x00\r\n") || (c.SandboxNetNS != "" && !filepath.IsAbs(c.SandboxNetNS) && (strings.Contains(c.SandboxNetNS, "/") || c.SandboxNetNS == "." || c.SandboxNetNS == "..")) {
-		return fmt.Errorf("telemetry sandbox_netns must be a namespace name or absolute path")
+	if strings.ContainsAny(c.ProxyNetNS, "\x00\r\n") || (c.ProxyNetNS != "" && !filepath.IsAbs(c.ProxyNetNS) && (strings.Contains(c.ProxyNetNS, "/") || c.ProxyNetNS == "." || c.ProxyNetNS == "..")) {
+		return fmt.Errorf("telemetry proxy_netns must be a namespace name or absolute path")
 	}
 	if c.RouteCapacity < 1 || c.RouteCapacity > 1000000 {
 		return fmt.Errorf("telemetry route_capacity must be in [1, 1000000]")

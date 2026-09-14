@@ -103,8 +103,16 @@ UDS、本地 generation 与 SandboxID，不能把一个 sandbox 的 UDS connecti
 
 ## 4. 直接面向沙箱的 OTLP
 
-Telemetry 使用与 Proxy/MMDS 相同的 netns primitive，自己在 `sandbox_netns` 内绑定两种
-listener；空值表示当前进程 namespace。支持的 signal 是 metrics：4317 上的 OTLP/gRPC
+Telemetry 使用与 Proxy/MMDS 相同的 netns primitive, 自己在 `proxy_netns` 内绑定两种
+listener; 空值表示当前进程 namespace.
+`proxy_netns` 是唯一目标 YAML/JSON key, Go 字段为 `ProxyNetNS`.
+早期 Preview 中使用 `sandbox_netns` 的配置必须迁移 key; strict decode 拒绝旧字段,
+也拒绝同时提供两个字段. Telemetry 未进入现有 Stable 配置合同.
+未知 namespace 名称/路径, setns 或 bind 失败均终止启动, 关闭已创建 listener 及应用资源,
+不回退宿主 namespace. 仅创建 listener 时进入指定 namespace, 随后调用线程恢复原 namespace.
+配置不移动整个进程, 不改变 conductor/query/envd UDS, 远端 exporter 或 query client;
+这些通道继续使用正常的进程网络环境.
+支持的 signal 是 metrics: 4317 上的 OTLP/gRPC
 MetricsService，以及 4318 上的 OTLP/HTTP `POST /v1/metrics`（protobuf/JSON，可选 gzip）。
 不增加 OTLP token 身份协议；本 metrics 组件不接收应用 traces/logs。不要把 listener
 放到应用 Proxy 或另一层 L7 reverse proxy 后面。
@@ -118,7 +126,7 @@ namespace、监听 loopback 时，保留现有 MMDS mapping，并在部署的 vs
 --mgmt-service=169.254.169.254:4318:127.0.0.1:4318
 ```
 
-配置 `sandbox_netns: sandbox-proxy`、`grpc_listen: 127.0.0.1:4317`、
+配置 `proxy_netns: sandbox-proxy`、`grpc_listen: 127.0.0.1:4317`、
 `http_listen: 127.0.0.1:4318`。Guest exporter 使用 `http://169.254.169.254:4318`
 或对应 gRPC 端口。Connector 已有的 slot-derived SNAT 把共享 guest inner IP 转为分配
 给该 sandbox 的 FloatingIP；service DNAT 选择 telemetry listener，management 回程
@@ -127,6 +135,10 @@ management 部署要求 management interface 的 `route_localnet=1`；也可在�
 namespace interface 地址监听，把 mapping target 换成该地址，并沿用 FloatingIP return
 route。参见 [connector management network](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md)。
 使用节点实际的 management namespace/device 名，不另建第二套交换机。
+[部署模板](../deploy/telemetry.example.yaml) 包含对应 management-service 映射.
+组件真实 guest E2E 通过这条已有路径验证两个协议. 特权 Collector 回归同时占用宿主相同端口,
+在隔离 namespace 内发送 HTTP/gRPC, 核验来源身份及向宿主独有目的地导出.
+无权限环境的 skip 不构成网络语义的通过证据.
 
 Route view 同时索引 SandboxID 与 FloatingIP，复用 MMDS 的 IPv4 解析、active-state 与
 反向查找一致性规则。HTTP/gRPC 身份都来自 accepted transport peer；`Forwarded`、

@@ -15,6 +15,12 @@ path in `paths.telemetry_executable` of the independent `telemetry.yaml`, then r
 is rejected. Node-ctl validates the file, creates sealed bootstrap, and replaces
 itself in place; there is no fallback after a custom startup failure.
 
+The same `proxy_netns` configuration reaches `Configure` as `Config.ProxyNetNS`.
+It selects the namespace for both sandbox OTLP listeners; it does not move this
+executable or its remote clients. Rename the early Preview `sandbox_netns` key:
+strict bootstrap/config decoding rejects that old name. See the
+[management network deployment](../../docs/telemetry.md#4-direct-sandbox-facing-otlp).
+
 `Configure` runs once before stores/listeners. Config contains declarations;
 Runtime contains nonserializable process-local bindings. The example retains
 the selected primary storage, logs extension start/stop, and optionally provides

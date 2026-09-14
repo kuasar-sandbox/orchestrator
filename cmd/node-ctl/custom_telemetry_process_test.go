@@ -30,7 +30,7 @@ func customTelemetryProcess() {
 		os.Exit(98)
 	case "xtelemetry":
 		app := telemetry.New(telemetry.Hooks{Configure: func(_ context.Context, cfg *telemetry.Config, _ *telemetry.Runtime) error {
-			fmt.Printf("%d\n%s\n", os.Getpid(), cfg.Telemetry.Scrape.Interval)
+			fmt.Printf("%d\n%s\n%s\n", os.Getpid(), cfg.Telemetry.Scrape.Interval, cfg.ProxyNetNS)
 			return errors.New("stop before telemetry core")
 		}})
 		err := app.RunContext(context.Background())
@@ -51,7 +51,7 @@ func TestNodeCtlExecsCustomTelemetryInPlace(t *testing.T) {
 	executable := filepath.Join(directory, "xtelemetry")
 	copyExecutable(t, source, executable)
 	configPath := filepath.Join(directory, "telemetry.yaml")
-	body := "paths:\n  telemetry_executable: " + executable + "\ntelemetry:\n  scrape:\n    interval: 7s\n"
+	body := "proxy_netns: sandbox-proxy\npaths:\n  telemetry_executable: " + executable + "\ntelemetry:\n  scrape:\n    interval: 7s\n"
 	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestNodeCtlExecsCustomTelemetryInPlace(t *testing.T) {
 		t.Fatalf("external telemetry: %v\n%s", err, output.String())
 	}
 	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
-	if len(lines) != 2 || lines[0] != strconv.Itoa(wantPID) || lines[1] != "7s" {
+	if len(lines) != 3 || lines[0] != strconv.Itoa(wantPID) || lines[1] != "7s" || lines[2] != "sandbox-proxy" {
 		t.Fatalf("sealed config/PID not preserved: %q (PID %d)", output.String(), wantPID)
 	}
 }
