@@ -39,53 +39,65 @@ func Run(ctx context.Context, cfg *config.Telemetry, runtime *Runtime) (resultEr
 		defer stop()
 		resultErr = errors.Join(resultErr, operation(shutdownCtx))
 	}
-	var backend extension.Storage
+	var local *telemetry.Local
+	var localErrors <-chan error
 	var err error
-	switch cfg.Telemetry.Storage.Type {
+	if cfg.Local.Enabled {
+		local, err = telemetry.OpenLocal(cfg.Local, runtime.Logger)
+		if err != nil {
+			return err
+		}
+		defer func() { shutdown(local.Shutdown) }()
+		localErrors = local.Errors()
+	}
+	var backend extension.QueryBackend
+	switch cfg.Query.Backend {
 	case "local":
-		var local *telemetry.Local
-		local, err = telemetry.OpenLocal(cfg.Telemetry.Storage, runtime.Logger)
-		if local != nil {
-			backend = local
+		if local == nil {
+			return errors.New("telemetry local query backend is not enabled")
 		}
+		backend = local
 	case "custom":
-		if runtime.Storage == nil {
-			return errors.New("telemetry: custom storage provider missing")
+		if runtime.QueryBackend == nil {
+			return errors.New("telemetry: custom query provider missing")
 		}
-		backend, err = runtime.Storage(ctx, cfg.Clone().Telemetry.Storage)
+		backend, err = runtime.QueryBackend(ctx, cfg.Clone().Query)
 		if backend == nil || reflect.ValueOf(backend).Kind() == reflect.Pointer && reflect.ValueOf(backend).IsNil() {
 			backend = nil
-			err = errors.Join(err, errors.New("telemetry: custom storage returned nil"))
+			err = errors.Join(err, errors.New("telemetry: custom query backend returned nil"))
 		}
 	case "prometheus":
 		var remote *telemetry.Prometheus
-		remote, err = telemetry.NewPrometheus(cfg.Telemetry.Storage)
+		remote, err = telemetry.NewPrometheus(cfg.Query)
 		if remote != nil {
 			backend = remote
 		}
 	case "clickhouse":
 		var remote *telemetry.ClickHouse
-		remote, err = telemetry.OpenClickHouse(ctx, cfg.Telemetry.Storage)
+		remote, err = telemetry.NewClickHouse(cfg.Query)
 		if remote != nil {
 			backend = remote
 		}
 	case "none":
 	default:
-		return errors.New("telemetry: unknown primary storage")
+		return errors.New("telemetry: unknown query backend")
 	}
-	if backend != nil {
+	if backend != nil && cfg.Query.Backend != "local" {
 		defer func() { shutdown(backend.Shutdown) }()
 	}
 	if err != nil {
 		return err
 	}
 	var reader extension.Reader
-	var storageErrors <-chan error
+	var queryErrors <-chan error
 	if backend != nil {
 		reader = backend
-		if health, ok := backend.(extension.HealthReporter); ok {
-			storageErrors = health.Errors()
+		if health, ok := backend.(extension.HealthReporter); ok && cfg.Query.Backend != "local" {
+			queryErrors = health.Errors()
 		}
+	}
+	if cfg.Collector == nil && reader == nil {
+		return errors.New("telemetry requires Collector configuration or a query backend")
 	}
 	if runtime.Extension != nil {
 		defer func() { shutdown(runtime.Extension.Shutdown) }()
@@ -96,23 +108,39 @@ func Run(ctx context.Context, cfg *config.Telemetry, runtime *Runtime) (resultEr
 	view := telemetry.NewView(cfg.RouteCapacity)
 	defer view.InvalidateSync()
 	fatal := make(chan error, 1)
-	collector, err := telemetry.NewCollector(ctx, *cfg, view, backend, runtime.Collector, runtime.Logger, fatal)
-	if err != nil {
-		return err
+	if cfg.Collector != nil {
+		// Do not pass a typed nil local pointer into the exporter interface.
+		var writer interface {
+			Write(context.Context, []extension.Sample) error
+		}
+		if local != nil {
+			writer = local
+		}
+		collector, err := telemetry.NewCollector(ctx, *cfg, view, writer, runtime.Collector, runtime.Logger, fatal)
+		if err != nil {
+			return err
+		}
+		defer func() { shutdown(collector.Shutdown) }()
+		if err := collector.Start(ctx); err != nil {
+			return fmt.Errorf("telemetry Collector start: %w", err)
+		}
 	}
-	defer func() { shutdown(collector.Shutdown) }()
-	if err := collector.Start(ctx); err != nil {
-		return fmt.Errorf("telemetry Collector start: %w", err)
+	var handler extension.MetricsHandler
+	switch cfg.Query.Handler {
+	case "e2b":
+		handler = telemetry.E2BHandler(cfg.Query.E2B)
+	case "custom":
+		handler = runtime.MetricsHandler
 	}
 	registration := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}, Telemetry: &routesync.Telemetry{}}
-	if reader != nil {
+	if reader != nil && handler != nil {
 		listener, release, err := listenQuery(cfg.APISocket)
 		if err != nil {
 			return fmt.Errorf("telemetry query listen: %w", err)
 		}
 		defer release()
 		defer listener.Close()
-		server := &http.Server{Handler: telemetry.QueryHandler(reader), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10,
+		server := &http.Server{Handler: telemetry.QueryHandler(reader, handler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10,
 			BaseContext: func(net.Listener) context.Context { return ctx }}
 		done := make(chan struct{})
 		go func() {
@@ -146,18 +174,24 @@ func Run(ctx context.Context, cfg *config.Telemetry, runtime *Runtime) (resultEr
 	// First revoke the query lease, then drain query/ingress, then Collector,
 	// extension, and finally TSDB. Storage remains alive for every consumer.
 	defer func() { stopSubscription(); <-subDone }()
-	runtime.Logger.Info("telemetry started", "storage", cfg.Telemetry.Storage.Type, "query", reader != nil)
+	runtime.Logger.Info("telemetry started", "query_backend", cfg.Query.Backend, "query_handler", cfg.Query.Handler, "local", local != nil, "collector", cfg.Collector != nil)
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-fatal:
 		cancel()
 		return fmt.Errorf("telemetry component failed: %w", err)
-	case err, ok := <-storageErrors:
+	case err, ok := <-localErrors:
 		cancel()
 		if !ok || err == nil {
-			err = errors.New("primary storage health reporter stopped")
+			err = errors.New("local TSDB health reporter stopped")
 		}
-		return fmt.Errorf("telemetry primary storage failed: %w", err)
+		return fmt.Errorf("telemetry local TSDB failed: %w", err)
+	case err, ok := <-queryErrors:
+		cancel()
+		if !ok || err == nil {
+			err = errors.New("query backend health reporter stopped")
+		}
+		return fmt.Errorf("telemetry query backend failed: %w", err)
 	}
 }

@@ -134,7 +134,7 @@ func TestOTLPProxyNetNSCollectorIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ProxyNetNS = ns.String()
-	cfg.Telemetry.Storage.Type = "none"
+	cfg.Query.Backend = "none"
 	cfg.Collector = map[string]any{
 		"receivers": map[string]any{"sandboxotlp": map[string]any{"http_listen": hostHTTP.Listener.Addr().String(), "grpc_listen": hostGRPC.Addr().String()}},
 		"exporters": map[string]any{"otlp_http/host": map[string]any{"endpoint": sink.URL}},
@@ -220,14 +220,14 @@ func TestOTLPProxyNetNSCollectorIsolation(t *testing.T) {
 		_, _ = w.Write(snappy.Encode(nil, raw))
 	}))
 	defer querySink.Close()
-	queryConfig := cfg.Telemetry.Storage
+	queryConfig := cfg.Query
 	queryConfig.Prometheus.Endpoint = querySink.URL
 	reader, err := NewPrometheus(queryConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Shutdown(context.Background())
-	if _, _, _, err := reader.Bounds(ctx, "sid"); err != nil {
+	if _, _, _, err := reader.Bounds(ctx, envdSelection("sid")); err != nil {
 		t.Fatal("remote query left the host namespace", err)
 	}
 	select {

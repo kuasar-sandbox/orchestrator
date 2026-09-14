@@ -15,13 +15,13 @@ api_socket: /run/sandbox/telemetry.sock
 route_capacity: 65536
 paths:
   # telemetry_executable: /opt/kuasar/bin/custom-telemetry
-telemetry:
-  storage:
-    type: local
-    path: /var/lib/sandbox/telemetry
-    retention: 168h
-    max_size: 10GiB
-    max_series: 1000000
+query: {backend: local, handler: e2b}
+local:
+  enabled: true
+  path: /var/lib/sandbox/telemetry
+  retention: 168h
+  max_size: 10GiB
+  max_series: 1000000
 collector:
   receivers:
     envd:
@@ -44,7 +44,7 @@ collector:
       send_batch_size: 8192
       send_batch_max_size: 8192
   exporters:
-    sandboxstorage: {}
+    sandboxlocal: {}
     # otlp_http/observability:
     #   endpoint: https://collector.example.com
   service:
@@ -55,5 +55,5 @@ collector:
       metrics:
         receivers: [envd, sandboxstats, sandboxotlp]
         processors: [batch]
-        exporters: [sandboxstorage]
+        exporters: [sandboxlocal]
 # See docs/telemetry.md for Collector pipelines and query backends.

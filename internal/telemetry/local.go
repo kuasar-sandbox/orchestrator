@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
-var ErrSeriesLimit = errors.New("telemetry: primary storage series limit reached")
+var ErrSeriesLimit = errors.New("telemetry: local storage series limit reached")
 
 // Local contains only the embedded TSDB; no Prometheus server, scrape manager,
 // rules, or alerting machinery. A transaction batches each Collector delivery.
@@ -80,11 +81,11 @@ func (s *seriesLimit) PostDeletion(series map[chunks.HeadSeriesRef]labels.Labels
 	s.count.Add(-int64(len(series)))
 }
 
-func OpenLocal(cfg config.TelemetryStorage, logger *slog.Logger) (*Local, error) {
+func OpenLocal(cfg config.TelemetryLocal, logger *slog.Logger) (*Local, error) {
 	return openLocalWithClock(cfg, logger, time.Now)
 }
 
-func openLocalWithClock(cfg config.TelemetryStorage, logger *slog.Logger, now func() time.Time) (*Local, error) {
+func openLocalWithClock(cfg config.TelemetryLocal, logger *slog.Logger, now func() time.Time) (*Local, error) {
 	retention, err := time.ParseDuration(cfg.Retention)
 	if err != nil {
 		return nil, err
@@ -247,25 +248,29 @@ func (l *Local) expireHead() error {
 	return nil
 }
 
-func resourceMatchers(id string) []*labels.Matcher {
-	names := make([]string, 0, len(resourceMetrics))
-	for _, metric := range resourceMetrics {
-		names = append(names, strings.ReplaceAll(metric.name, ".", `\.`))
+func selectionMatchers(selection extension.Selection) []*labels.Matcher {
+	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, SandboxIDAttribute, selection.SandboxID)}
+	if len(selection.Metrics) != 0 {
+		names := make([]string, 0, len(selection.Metrics))
+		for _, name := range selection.Metrics {
+			names = append(names, regexp.QuoteMeta(name))
+		}
+		matchers = append(matchers, labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, strings.Join(names, "|")))
 	}
-	return []*labels.Matcher{
-		labels.MustNewMatcher(labels.MatchEqual, SandboxIDAttribute, id),
-		labels.MustNewMatcher(labels.MatchEqual, sourceAttribute, "envd"),
-		labels.MustNewMatcher(labels.MatchEqual, "otel.kind", "Gauge"),
-		labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, strings.Join(names, "|")),
+	for key, value := range selection.Attributes {
+		if key != SandboxIDAttribute {
+			matchers = append(matchers, labels.MustNewMatcher(labels.MatchEqual, key, value))
+		}
 	}
+	return matchers
 }
 
-func (l *Local) scan(ctx context.Context, id string, start, end time.Time, visit func(extension.Field, int64, float64) error) (err error) {
+func (l *Local) scan(ctx context.Context, selection extension.Selection, start, end time.Time, visit seriesVisitor) (err error) {
 	if err := l.health(); err != nil {
 		return err
 	}
-	if id == "" {
-		return nil
+	if err := validateSelection(selection); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -279,13 +284,19 @@ func (l *Local) scan(ctx context.Context, id string, start, end time.Time, visit
 		return err
 	}
 	defer func() { err = errors.Join(err, querier.Close()) }()
-	set := querier.Select(ctx, false, &storage.SelectHints{Start: startMS, End: end.UnixMilli()}, resourceMatchers(id)...)
+	set := querier.Select(ctx, false, &storage.SelectHints{Start: startMS, End: end.UnixMilli()}, selectionMatchers(selection)...)
 	var iterator chunkenc.Iterator
 	for set.Next() {
 		series := set.At()
-		field, ok := metricField(series.Labels().Get(labels.MetricName))
-		if !ok {
-			continue
+		attributes := make(map[string]string, series.Labels().Len())
+		series.Labels().Range(func(label labels.Label) {
+			if label.Name != labels.MetricName {
+				attributes[label.Name] = label.Value
+			}
+		})
+		point, err := visit(series.Labels().Get(labels.MetricName), attributes)
+		if err != nil {
+			return err
 		}
 		iterator = series.Iterator(iterator)
 		for valueType := iterator.Next(); valueType != chunkenc.ValNone; valueType = iterator.Next() {
@@ -299,7 +310,7 @@ func (l *Local) scan(ctx context.Context, id string, start, end time.Time, visit
 			if stamp < startMS || stamp > end.UnixMilli() {
 				continue
 			}
-			if err := visit(field, stamp, value); err != nil {
+			if err := point(stamp, value); err != nil {
 				return err
 			}
 		}
@@ -310,34 +321,43 @@ func (l *Local) scan(ctx context.Context, id string, start, end time.Time, visit
 	return set.Err()
 }
 
-func (l *Local) Bounds(ctx context.Context, id string) (start, end time.Time, found bool, err error) {
-	err = l.scan(ctx, id, time.Unix(0, 0), maxQueryTime, func(_ extension.Field, stamp int64, _ float64) error {
-		value := time.UnixMilli(stamp).UTC()
-		if !found || value.Before(start) {
-			start = value
+func (l *Local) Bounds(ctx context.Context, selection extension.Selection) (start, end time.Time, found bool, err error) {
+	err = l.scan(ctx, selection, time.Unix(0, 0), maxQueryTime, func(name string, attributes map[string]string) (func(int64, float64) error, error) {
+		if !selectedSeries(selection, name, attributes) {
+			return nil, errors.New("local series outside selected scope")
 		}
-		if !found || value.After(end) {
-			end = value
-		}
-		found = true
-		return nil
+		return func(stamp int64, sample float64) error {
+			if math.IsNaN(sample) || math.IsInf(sample, 0) {
+				return nil
+			}
+			value := time.UnixMilli(stamp).UTC()
+			if !found || value.Before(start) {
+				start = value
+			}
+			if !found || value.After(end) {
+				end = value
+			}
+			found = true
+			return nil
+		}, nil
 	})
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	return
 }
 
-func (l *Local) Query(ctx context.Context, query extension.Query) ([]extension.Point, error) {
-	if err := ValidateRange(query.Start, query.End); err != nil {
-		return nil, err
-	}
-	buckets, err := newPointBuckets(query.Step)
+func (l *Local) Query(ctx context.Context, query extension.Query) ([]extension.Series, error) {
+	buckets, err := newSeriesBuckets(query)
 	if err != nil {
 		return nil, err
 	}
-	err = l.scan(ctx, query.SandboxID, query.Start, query.End, buckets.add)
+	err = l.scan(ctx, query.Selection, query.Start, query.End, buckets.visit)
 	if err != nil {
 		return nil, err
 	}
-	return buckets.points(), nil
+	result := buckets.result()
+	return result, ctx.Err()
 }
 
-var _ extension.Storage = (*Local)(nil)
+var _ extension.QueryBackend = (*Local)(nil)

@@ -33,7 +33,7 @@ func TestTelemetryTemplateDeployAndFinalValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "telemetry.yaml")
-	if err := os.WriteFile(path, []byte("telemetry:\n  storage:\n    type: prometheus\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("query:\n  backend: prometheus\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := renderTelemetryConfig(false, path); err == nil {

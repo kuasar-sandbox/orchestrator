@@ -193,6 +193,10 @@ package_release() {
   copy_file deploy/conductor.example.yaml deploy/conductor.example.yaml
   copy_file deploy/proxy.example.yaml deploy/proxy.example.yaml
   copy_file deploy/telemetry.example.yaml deploy/telemetry.example.yaml
+  copy_file deploy/telemetry-fanout.example.yaml deploy/telemetry-fanout.example.yaml
+  copy_file deploy/telemetry-prometheus.example.yaml deploy/telemetry-prometheus.example.yaml
+  copy_file deploy/telemetry-clickhouse.example.yaml deploy/telemetry-clickhouse.example.yaml
+  copy_file deploy/telemetry-query-only.example.yaml deploy/telemetry-query-only.example.yaml
   copy_file deploy/registry.example.yaml deploy/registry.example.yaml
   copy_file deploy/router.example.yaml deploy/router.example.yaml
   copy_file deploy/placer.example.yaml deploy/placer.example.yaml

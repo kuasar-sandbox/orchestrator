@@ -374,6 +374,10 @@ go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
   ./bin/e2b-key-ctl ./deploy/node-ctl.service \
   ./deploy/node-telemetry.service ./deploy/telemetry.example.yaml \
+  ./deploy/telemetry-fanout.example.yaml \
+  ./deploy/telemetry-prometheus.example.yaml \
+  ./deploy/telemetry-clickhouse.example.yaml \
+  ./deploy/telemetry-query-only.example.yaml \
   ./share/licenses/orchestrator/accelerator/LICENSE \
   ./share/licenses/orchestrator/connector/LICENSE \
   ./share/licenses/orchestrator/project/LICENSE \

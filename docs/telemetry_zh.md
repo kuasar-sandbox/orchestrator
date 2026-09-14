@@ -15,7 +15,7 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 每条命令使用独立服务。Conductor 拥有生命周期、API 鉴权、ownership 和 Plugin registry。
 Proxy 负责沙箱应用数据转发、MMDS 与即时 traffic observation。Telemetry 拥有自身的
 RouteEntry view、envd scrape、sandbox-facing OTLP metrics ingress、可信身份 enrichment、
-Collector pipeline、primary storage、exporter、历史查询及 E2B 转换。它不扩大 resource
+Collector pipeline、可选本地 TSDB、独立 exporter 与查询 backend、历史查询及 E2B 转换。它不扩大 resource
 controller，不改变 checkpoint 或生命周期策略。
 
 ```text
@@ -68,7 +68,7 @@ Conductor 使用正常 API key 鉴权，精确查找 SandboxID 并检查 ownersh
 method/path/raw query、body、status 与 relevant headers。它过滤 hop-by-hop headers，
 查询通道不支持 protocol upgrade。它不解释 metric 名、DTO、范围、step 或 storage 结果。
 不存在/不属于调用方的 sandbox 返回 404；无效鉴权沿用已有 API 行为。没有 live readable
-telemetry endpoint、UDS 请求失败或 primary reader 不可用返回 503。客户端取消传播到
+telemetry endpoint、UDS 请求失败或 query backend 不可用返回 503。客户端取消传播到
 HTTP UDS 和 backend query。查询不调用 Wake、Resume、import、reservation 或 guest
 control API；读取 paused 历史不会接触沙箱。
 
@@ -117,7 +117,7 @@ UDS、本地 generation 与 SandboxID，不能把一个 sandbox 的 UDS connecti
 | Processor | `filter`、`transform` | contrib 0.145.0 |
 | Exporter | `otlp`、`otlp_http`、`debug` | Collector 0.145.0 |
 | Exporter | `prometheusremotewrite`、`clickhouse` | contrib 0.145.0 |
-| 主存储适配 exporter | `sandboxstorage` | 当前 orchestrator 源码 |
+| 可选本地 exporter | `sandboxlocal` | 当前 orchestrator 源码 |
 | Connector | `routing` | contrib 0.145.0 |
 | Collector extension | `health_check` | contrib 0.145.0 |
 | Config provider | `env`、`file`、`yaml` | confmap 1.51.0 |
@@ -247,114 +247,169 @@ scope 最多 4,096 metrics。超限返回错误，不悄悄截断。
 gRPC server 的 10s deadline 在读取 message body 前就开始，停滞客户端不能无限期
 占用全局请求槽位。
 
-## 5. Primary storage 与 extra exporters
+## 5. 写入与查询独立装配
 
-`telemetry.storage` 选择唯一主存储，必须同时实现 Collector write 和
-`extension.Reader` history read. `collector.exporters` 与 `service.pipelines` 声明
-全部写入目的地及 fan-out 边, 不隐式成为 primary reader.`storage.type: none` 必须有
-exporter；telemetry 继续 collect/enrich/forward，但不注册 query API，公开 metrics 为 503。
+`collector` 是原生写入 graph. `query.backend` 独立选择 `none`、`local`、
+`prometheus`、`clickhouse` 或 `custom`; `query.handler` 选择 `none`、`e2b` 或
+`custom`. 只有 Reader 和 handler 都可用时才注册 query UDS. 没有 handler 时,
+公开 `/metrics` 返回 503. Conductor 的三个原生 stats API 在所有模式中都保留原始来源.
 
-### Local (显式启用)
+| 部署方式 | 配置 |
+|---|---|
+| 远端写入与查询 | 标准远端 exporter, 加上匹配的 `query.backend`/endpoint/schema/labels |
+| Write-only | Collector exporters, `query: {backend: none, handler: none}`; 不注册 query UDS |
+| Query-only | 选择 backend 和 handler, 完全省略 `collector`; 不需要 dummy receiver |
+| 本地写入与查询 | `local.enabled: true`, `sandboxlocal` exporter, `query.backend: local` |
+| 本地加远端 fan-out | 启用 local, 同时引用 `sandboxlocal` 与远端 exporter; 明确选择一个 query backend |
+| 定制查询合同 | 静态绑定 `Runtime.MetricsHandler`, 配置 `query.handler: custom` |
 
-Core `sandboxstorage` Collector exporter 指向 embedded Prometheus TSDB；`Local`
-backend 同时提供写入与同一 DB 的直接 reader。不启动 Prometheus web server、scrape manager、rule
-manager 或 Alertmanager。配置：
+未发布的 `telemetry.storage`、组合接口 `extension.Storage`、`Runtime.Storage` 和
+`Runtime.StorageHeaders` 直接被替换. 使用 `local`、`query`、`Runtime.QueryBackend`
+及 `Runtime.QueryHeaders`; 本地 Collector exporter 改为 `sandboxlocal`. 不保留解析
+alias 或第二条运行路径. 写 exporter 与读 backend 分别配置和验证: OTLP destination
+不自动成为 query backend. 远端错误不会改选本地数据库, 也不会变成成功的空历史.
 
-```yaml
-telemetry:
-  storage:
-    type: local
-    path: /var/lib/sandbox/telemetry
-    retention: 168h
-    max_size: 10GiB
-    max_series: 1000000
-```
+### 本地 TSDB
 
-DB 管理 WAL、replay、compaction 和 retention。Canonical batch 以事务追加，失败回滚；
-存储时间精度为毫秒，截断不足毫秒的部分。完全相同的重复 sample 幂等；同 timestamp
-不同值返回错误，不覆盖历史。接受 min(5m, retention) 内的乱序 sample，更旧数据失败。
-早于 wall-clock retention 的数据被省略，超过当前时间一分钟的数据被拒绝，避免污染
-head。即使没有新 sample，paused/deleted 沙箱的历史也继续过期。后台 head/block
-expiration 回收空闲数据，query 立即执行 retention 过滤。
-
-`max_size` 是 Prometheus TSDB retention-size 目标，不是文件系统硬配额：head/WAL、
-compaction 临时数据可以使占用超过该值。须预留磁盘余量并监控文件系统。
-`max_series` 限制 live head series（含 labels）；replay 后 head 已超限时启动失败。
-Scrape/ingress/request 上限限制单次操作增长。Storage health error、corruption/WAL
-recovery warning 和启动错误会传播为组件失败，不会悄悄开放不完整 reader。保留故障 DB
-用于离线诊断/备份恢复，不自动删除。进程重启 replay WAL；不额外承诺断电持久性。
-
-Canonical mapping 保留 UTF-8 OTel metric 名。可信身份使用直接 label，其他属性使用
-不发生命名碰撞的 `resource.`、`scope.`、`point.` label namespace，并包含 scope
-name/version、unit、metric kind。Sum 显式保留 temporality/monotonicity，不隐式把 delta
-转为 cumulative。Histogram/exponential histogram 转为 count/sum/cumulative-bucket
-scalar series；summary 转为 count/sum/quantile series。展开有界：histogram bounds/
-quantiles 最多 160 个，每次 write 最多 65,536 scalar samples。Scalar 主存储不索引
-exemplar 与 histogram min/max；extra OTLP exporter 保留 Collector pdata 表达。
-Float64 对大于 2^53 的整数存在通常的精度限制。E2B 只读取可信 envd gauge。
-
-### Prometheus-compatible readable primary
+只有 `local.enabled: true` 才创建本地存储. 选择远端 query backend 或启动 Collector
+本身都不创建本地 DB. Core `sandboxlocal` exporter 写入已有嵌入式 Prometheus TSDB;
+不运行 Prometheus server、scrape manager、rule manager 或 Alertmanager. 本地查询
+`query.backend: local` 同样要求显式启用 local. 完整配置见
+[本地部署示例](../deploy/telemetry.example.yaml).
 
 ```yaml
-telemetry:
-  storage:
-    type: prometheus
-    retention: 168h
-    prometheus:
-      endpoint: https://metrics.example.com/prometheus
-      headers: {Authorization: "Bearer REPLACE_WITH_PROTECTED_MATERIAL"}
+query: {backend: local, handler: e2b}
+local:
+  enabled: true
+  path: /var/lib/sandbox/telemetry
+  retention: 168h
+  max_size: 10GiB
+  max_series: 1000000
 ```
 
-Adapter 使用标准 Snappy/protobuf remote-write v1 写入 `<endpoint>/api/v1/write`，
-通过 `<endpoint>/api/v1/read` 协商 `STREAMED_XOR_CHUNKS`，再执行相同的 field-wise MAX。
-每次历史边界查找和数据查询各使用一次请求，包括长 retention 下的空历史和稀疏历史。
-Frame 校验 checksum，大小限制为 32 MiB，每次仅保留一个 frame；10s HTTP deadline
-覆盖整个 response body。完整 edge chunk 中的 sample 按精确、包含端点的范围过滤。
-只支持 `SAMPLES` 的后端可回退到单个 Snappy response，压缩前后均限制为 32 MiB；
-更大的历史需要 streaming。
-Backend 必须同时启用两个 API 并接受 Prometheus 3 UTF-8 metric/label 名；只有 query
-server 或 write-only exporter 不够。Remote read 保留精确观测，不引入 PromQL 的
-lookback/step interpolation。参见 [remote read API](https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/)。
-配置 retention 定义 read lookback/write age policy；后端 retention、容量与 cardinality
-控制需独立配置。
+TSDB 保留已有 WAL、replay、compaction 和 retention. WAL 合同独立于 native usage
+的 no-sync 合同. 每次 Collector delivery 是一个 transaction, 失败会 rollback.
+时间戳按毫秒保存, 截去不足毫秒部分. 完全相同的重复 sample 幂等; 同一时间戳存在
+冲突值则失败. 接受 min(5m, retention) 内的乱序 sample, 更旧数据失败. Wall-clock
+retention 排除过期观测, 即使所有沙箱均已暂停也继续回收空闲 head/block 数据.
+超过当前时间一分钟的写入失败. 缓存观测不会被盖上新时间.
 
-### ClickHouse readable primary
+`max_size` 是 retention 目标, 不是文件系统配额; head/WAL 和 compaction 临时数据
+可能超过它. `max_series` 限制 live head series, 并在 replay 后检查. 后台错误与
+corruption/WAL recovery warning 会停止组件、撤销 query lease. 启动不会删除损坏 DB.
+重启 replay WAL, 不新增断电持久性保证.
 
-```yaml
-telemetry:
-  storage:
-    type: clickhouse
-    retention: 168h
-    clickhouse:
-      endpoint: https://clickhouse.example.com:8443
-      database: default
-      table: sandbox_metrics
-      headers: {X-ClickHouse-User: telemetry, X-ClickHouse-Key: REPLACE_WITH_PROTECTED_MATERIAL}
-```
+Scalar 表达保留 OTel metric 名. 已接纳身份使用 `sandbox.id`、`sandbox.stable_id`
+和 `sandbox.telemetry.source` label. 其他属性带 `resource.`、`scope.`、`point.`
+前缀; scope name/version、unit、kind 使用 `otel.*`. Sum 保留 temporality/monotonicity.
+Histogram 与 exponential histogram 的 count/sum/cumulative bucket 保留原 metric
+名, 通过 `otel.part`/`otel.bound` 区分; summary 使用 count/sum/quantile parts.
+未记录的可选 Histogram sum 保持缺失. 每次写入最多展开 160 个 bounds/quantiles 和
+65,536 个 scalar samples. Exemplar 与 Histogram min/max 不属于此 scalar query
+表达. 其他 Collector exporter 保留各自支持的 pdata 表达. Float64 不能无损表示所有
+超过 2^53 的整数, 也不能替代 native usage 的无损账本.
 
-Database 必须已存在；telemetry 创建自身专用 MergeTree table 并按 retention 设置 TTL。
-服务账号只需该表的 CREATE/ALTER/INSERT/SELECT 权限，不需要无关表权限。改变 retention
-会更新 TTL。JSONEachRow 写入保留 canonical labels 与 DateTime64(3, UTC) timestamp。
-并发小写入使用有界 server-side async insert batching，并等待 flush 完成，传播错误
-与 backpressure。参数化 SQL 精确过滤 SandboxID、可信 envd source，整数 epoch 时间桶
-对每个 metric 独立 group/MAX。重复/乱序 row 保持该 MAX 结果。读取有 time、row、byte、
-thread、memory 上限，HTTP client disconnect 会取消 readonly query。不会把 HTTP 200
-中的错误正文当作数据。参见 [ClickHouse HTTP](https://clickhouse.com/docs/interfaces/http)
-与 [async inserts](https://clickhouse.com/docs/optimize/asynchronous-inserts)。
+### Prometheus remote read 与标准 remote write
 
-两种 external client 都限制连接池和响应大小、传播取消、拒绝 redirect，只访问操作方
-配置的 HTTP(S) destination。凭据也可通过 Runtime provider 提供。外部存储自己负责
-disk-size/cardinality enforcement；local 的 `max_size`/`max_series` 不配置外部 server。
-没有刻意延期的 external adapter。
+[Prometheus 部署示例](../deploy/telemetry-prometheus.example.yaml) 分别选择
+`prometheusremotewrite` exporter 和 `prometheus` query backend. Exporter 使用自身
+原生 queue、retry、batching 和 resource conversion 选项. Reader 只调用
+`<query.prometheus.endpoint>/api/v1/read`, 不实现 Write.
+[Query-only 部署示例](../deploy/telemetry-query-only.example.yaml) 可以直接查询已有
+远端数据库, 不启动 Collector.
 
-### 原生 exporter 与 custom primary
+已链接 exporter 将 name/label 中的标点转换为下划线.
+`resource_to_telemetry_conversion.enabled: true` 将已接纳身份带到每个 metric.
+默认查询映射将逻辑 `sandbox.id`、`sandbox.stable_id`、`sandbox.telemetry.source`
+对应到物理 `sandbox_id`、`sandbox_stable_id`、`sandbox_telemetry_source`.
+`query.prometheus.labels` 可显式声明其他映射, 包括为保留原 UTF-8 名称的后端声明
+同名映射. 重复或相互覆盖的映射验证失败. 结果属性使用配置的逻辑名; 其他远端 label
+保持存储名称, 包括 point labels. 物理身份 alias 不能替换必需的精确 SandboxID 匹配.
 
-在 `collector.exporters` 声明 exporter, 再由 `collector.service.pipelines` 引用完整 ID.
-[Collector fan-out 示例](../deploy/telemetry-fanout.example.yaml) 使用原生 batch、filter、
-transform、routing、两个 OTLP HTTP sink、queue 和 retry. Queue 大小、consumer、retry
-及 timeout 由原生 exporter 选项控制, 不会被生成的 graph 覆盖. 除非组件明确提供,
-queue 不代表持久历史. Export 失败不会暂停 sandbox. 静态集成遵循
-[扩展契约](extensions_zh.md#telemetry-bootstrap-与扩展).
+通用查询使用后端物理 metric 名. 示例设置 `add_metric_suffixes: false`, 并将七个
+E2B 字段映射到 `sandbox_memory_used` 等名称. 启用后缀时, 标准 unit/type 转换可能
+产生 `task_payload_bytes`, 或以 `_total` 结尾的 cumulative Sum 名称; 如果这些指标
+用于兼容 API, 应同步更新 E2B 映射. 查询代码不猜测 writer 的 namespace、名称规范化
+或 unit 后缀. Server retention、remote-write 接收和乱序策略须在 server 独立配置.
+Query 凭据须具有 remote-read 权限, 与 exporter 凭据无关.
+
+Reader 协商 `STREAMED_XOR_CHUNKS`, 验证每个 frame 的 CRC32C, 限制 frame 为 32 MiB,
+每次仅保留一个 frame. 提供 `SAMPLES` 的 server 使用单个 Snappy response, 压缩前后
+均限 32 MiB. Bounds 和 Query 各用一次请求, 包括空历史和长期稀疏历史. 10s HTTP
+期限覆盖 body. 完整 edge chunk 中的 sample 在聚合前按精确、包含端点的原始范围过滤.
+此 API 不引入 PromQL lookback、插值或最后值延长. 参见
+[remote read API](https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/).
+`query.lookback` 限制远端读取窗口, 默认 168h, 至少一分钟; 它不修改 exporter 写入
+或 server retention.
+
+Native histogram chunk 和 histogram sample 使用所链接的 Prometheus model 解码.
+结果保留实际 metric 名, `otel.part` 使用 `count`、`sum`、`native_bucket`;
+`otel.bound` 记录每个 native bucket 的实际开闭区间. Native bucket count 是独立
+bucket 的绝对计数, 不是累计 bucket. Reader 支持选择这些派生属性. Classic
+histogram 的 `_bucket`/`_sum`/`_count` series 和 summary quantile label 保留标准
+exporter 的实际表示. Stale marker 不变成观测, 也不延长之前的值. 两种 unit suffix
+配置和五类指标均通过真实 server 验证.
+
+### ClickHouse 标准 schema 与只读查询
+
+[ClickHouse 部署示例](../deploy/telemetry-clickhouse.example.yaml) 使用已链接的标准
+`clickhouse` exporter 及其五张原生 metrics 表: `otel_metrics_gauge`、
+`otel_metrics_sum`、`otel_metrics_summary`、`otel_metrics_histogram` 和
+`otel_metrics_exponential_histogram`. Exporter 控制 database 创建、`create_schema`、
+TTL、queue/retry 和写入权限. Reader 经独立配置的 HTTP(S) endpoint、凭据、database
+与 `query.clickhouse.tables` 执行 SELECT. 它不建表、不改 TTL、不要求 Write.
+旧 `sandbox_metrics` canonical 表不属于此 schema. 缺表、schema 不匹配或远端故障
+都会报错, 不会变成空数据.
+
+Reader 先匹配 `ResourceAttributes['sandbox.id']`, 再读取 row. 它使用标准 exporter
+schema 中的 `MetricName`、`TimeUnix`、`Value`、resource/scope/point maps 与 metric
+kind 列. 排除 `Flags.NoRecordedValue` row. Gauge/Sum 保留原 metric name/unit,
+属性使用本地 scalar namespace. Summary parts 包括 count、sum 和 quantile;
+显式 Histogram parts 包括 count 和 cumulative bucket. 标准 schema 未保留
+Histogram `HasSum`, 因此不会把无法确定有效性的 sum 列发布为观测到零. Schema 也
+缺少 exponential `ZeroThreshold`: exponential 结果发布 count/zero_count 与已存储
+的 positive/negative bucket count, 使用 `otel.scale`, 并将原始 bucket index 放入
+`otel.bound`, 不编造数值边界. 这些 schema 限制不删除 Collector 或其他 exporter 的
+数据; 它们定义此 backend 的 scalar 读取映射.
+
+SandboxID、metric 名、相等属性、时间和 step 都通过 SQL 参数传递. Client 不提供
+SQL. 时间先投影到毫秒, 再做包含端点的过滤, 与 local/Prometheus 精度一致. Raw 查询
+保留观测时间. MAX 先过滤原始 row, 再按完整属性集和 epoch 对齐 bucket 独立分组.
+相同的重复观测去重; 同一毫秒的冲突 raw 值报错, 不任意挑选. 乱序/重复插入不改变
+MAX. 缺失 Gauge 不延长到后续 bucket.
+
+读请求限制 server 执行九秒、两个线程、256 MiB server memory、700,000 rows 与
+32 MiB response; HTTP client 断连会取消 readonly query, HTTP-200 错误 body 也会
+被拒绝. 参见 [ClickHouse HTTP](https://clickhouse.com/docs/interfaces/http).
+两个远端 client 均限制连接池、传播取消、拒绝 redirect, 只访问受保护的操作方配置
+目标. `Runtime.QueryHeaders` 替换读凭据; exporter 凭据通过原生 Collector config
+provider 读取. 查询或认证错误都不回退本地 DB. 外部 size/cardinality 控制仍属于
+外部 server.
+
+### Fan-out 与静态扩展
+
+每种 type 注册一次 factory, 由原生 Collector 配置声明各个实例与连接.
+[Fan-out 示例](../deploy/telemetry-fanout.example.yaml) 使用 batch/filter/transform/
+routing 和两个带 queue/retry 的 OTLP HTTP sink. 添加 `local.enabled` 和
+`sandboxlocal` destination 即可启用本地 fan-out; Reader 仍由 `query.backend`
+显式选择. Queue 持久性只遵循配置组件自身的合同. Export 故障不暂停或唤醒沙箱.
+参见[静态扩展](extensions_zh.md#telemetry-bootstrap-与扩展).
+
+`extension.Reader` 接受 `Selection{SandboxID, Metrics, Attributes}` 和
+`Query{Selection, Start, End, Step, Aggregation}`, 返回包含 metric 名、完整属性及
+时间/数值点的 `[]Series`. Metrics 使用精确名称, attributes 使用相等条件, 空 metric
+列表选择该精确沙箱内所有名称. 不存在公共七字段 enum、来源白名单或公开 SQL/PromQL
+输入. `Raw` 或省略 aggregation 时 Step 必须为零; `Max` 要求正数整毫秒 Step.
+查询支持 1970–2299 年、最多 64 个 metric 名、110 个相等属性、100,000 条 series 与
+700,000 个点. 缺失点保持缺失, 负 Gauge 合法. Bounds 对保留观测应用同一 Selection.
+
+`Runtime.QueryBackend` 构造 Reader 加 Shutdown, 不要求 Write.
+`Runtime.MetricsHandler` 按 `QueryScope` 提供标准 `http.Handler`. Scope Reader 永久
+绑定 conductor 授权的精确 SandboxID, 拒绝通过其他 SID、属性 selector 或不同 context
+替换它. 部署配置与静态扩展仍受信任. 定制 JSON 合同不等同于 E2B 兼容; E2B SDK 应
+选择内建 E2B handler. 可构建的[定制 handler](../examples/custom-telemetry/query.go)
+发布任意 raw series; 其 [query-only 配置](../examples/custom-telemetry/query.yaml)
+不启动 Collector 或本地存储.
 
 ## 6. E2B 历史查询
 
@@ -366,7 +421,9 @@ correlation。RunID 继续用于 runner/run-plane、systemd/pidfile、MMDSv2、l
 不作为 telemetry label、resource attribute、TSDB identity、query key 或 pause/resume
 series discriminator。
 
-Telemetry handler 解析非负整数 Unix-second boundary（最大至 UTC 2299-12-31），
+`query.handler: e2b` 选择独立 E2B adapter, 使用七项 `query.e2b.metrics`
+映射与 `query.e2b.source` (默认 `envd`). 部署方可显式选择具有相同观测语义的其他
+source. 通用 Reader 不限制这组映射或来源. 此 handler 解析非负整数 Unix-second boundary（最大至 UTC 2299-12-31），
 从第一条/最后一条保留历史补齐省略的 start/end，验证 start <= end，计算 step，调用
 Reader，再按 epoch 对齐桶对七个字段分别取 MAX：
 
@@ -417,7 +474,7 @@ bootstrap 选择受信静态 App，不使用 Go runtime plugin。参见
 [custom telemetry](../examples/custom-telemetry/README_zh.md)。
 
 关闭时先停止 route subscription、撤销 query lease，drain query/OTLP ingress，再关闭
-Collector receivers/processors/exporters，然后 extension，最后 primary storage。
+Collector receivers/processors/exporters，然后 extension, 最后 query backend 与可选 local TSDB.
 启动失败也按相同资源 ownership 回收，即使启动失败也取消 extension 保留的后台工作。
 Storage path 应持久化；不要让 conductor/Proxy 的 systemd dependency require telemetry，
 telemetry 故障不得改变 sandbox lifecycle。
@@ -429,17 +486,26 @@ GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/confi
 GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
-TELEMETRY_CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 GOWORK=off go test ./internal/telemetry -run TestClickHouseIntegration -count=1
-TELEMETRY_PROMETHEUS_TEST_URL=http://127.0.0.1:9090 GOWORK=off go test ./internal/telemetry -run TestPrometheusIntegration -count=1
+bash test/e2e/e2e_telemetry_backends.sh # requires Go, Docker and exact component sources
 make test vet build
 make test-e2e # 要求组装的项目 BIN 与真实 KVM host
 ```
 
-可选 live-engine test 应使用可丢弃 endpoint。ClickHouse test 只创建/删除唯一命名测试表。
-Prometheus test 写入唯一命名 sandbox series（由后端 retention 回收），要求启用 remote
-write、配置至少 5m 的 out-of-order window，验证 streaming、UTF-8 label、重复/乱序 sample、
-field MAX 和精确时间边界。
-Density benchmark 对 1k/10k/50k synthetic targets 测真实 5s 周期，报告 scrape count、
+组件自有 backend case 从固定 manifest digest 创建临时 Prometheus 3.5.0 和
+ClickHouse 25.8 容器, 只向 loopback 发布端口, 记录实际版本与镜像身份, 并在退出时
+删除自己创建的容器和 volume. 两个引擎与所有具名 case 均必须执行; 缺少前提条件、
+skip 和失败均报错. 仅当源码不在普通 source/assembled 布局时设置
+`TELEMETRY_SOURCE_ROOT`; 可选 `TELEMETRY_BACKEND_OUT_DIR` 用于保留 JSON test
+event 和引擎日志. 具备能力的 source CI 通过 `test/e2e/run_all.sh` 执行此 case.
+每个 ClickHouse fixture 只创建/删除五张唯一命名的标准 exporter 表, Prometheus
+测试数据只存在于可丢弃的 server 内.
+
+覆盖实际原生部署启动、名称/unit/resource label 转换、五类指标、重复/乱序 sample、
+raw/MAX 边界、缺测、精确 SID、local/remote fan-out, 以及路由删除后已接纳 batch
+仍可发布. Case 还从精确源码构建并执行 node-ctl 和 custom-telemetry, 经过 sealed
+bootstrap, 沿真实 Plugin lease/query UDS 从真实 Prometheus 查询非 E2B 指标, 并
+验证 query-only 无 Collector graph/本地 DB 的退出清理. 普通 unit 调用可以跳过
+这些外部 fixture, 但 skip 不计为 backend 验收. Density benchmark 对 1k/10k/50k synthetic targets 测真实 5s 周期，报告 scrape count、
 goroutine/FD 峰值（含 fixture server）、allocation、TSDB batch write 与 local query
 成本。Receiver 与 TSDB 分开测量，不声称是端到端生产容量。时间数字不作为普通 CI gate，
 应在代表性 host/workload 重复测量。

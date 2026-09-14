@@ -13,7 +13,7 @@ func TestTelemetryDefaultsAndStrictDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Telemetry.Storage.Type != "none" || cfg.Collector != nil {
+	if cfg.Query.Backend != "none" || cfg.Query.Handler != "none" || cfg.Local.Enabled || cfg.Collector != nil {
 		t.Fatalf("defaults %+v", cfg)
 	}
 	for _, raw := range []string{"unknown: true", "telemetry:\n  scrape:\n    bogus: 1", "telemetry:\n  storage:\n    type: local\n    type: none", "{}\n---\n{}", "api_socket: relative", "paths:\n  telemetry_executable: relative", "proxy_netns: ../escape", "telemetry:\n  storage:\n    type: sqlite", "telemetry:\n  scrape:\n    timeout: 6s", "telemetry:\n  otlp:\n    grpc_listen: localhost:invalid"} {
@@ -77,8 +77,8 @@ func TestTelemetryFinalValidationAndClone(t *testing.T) {
 	}
 
 	for _, modify := range []func(*Telemetry){
-		func(c *Telemetry) { c.Telemetry.Storage.Retention = "0s" }, func(c *Telemetry) { c.Telemetry.Storage.MaxSize = "1MiB" },
-		func(c *Telemetry) { c.Telemetry.Storage.MaxSeries = 0 }, func(c *Telemetry) { c.APISocket = c.ConfigSocket },
+		func(c *Telemetry) { c.Local.Retention = "0s" }, func(c *Telemetry) { c.Local.MaxSize = "1MiB" },
+		func(c *Telemetry) { c.Local.MaxSeries = 0 }, func(c *Telemetry) { c.APISocket = c.ConfigSocket },
 	} {
 		candidate := cfg.Clone()
 		modify(candidate)
@@ -90,7 +90,7 @@ func TestTelemetryFinalValidationAndClone(t *testing.T) {
 
 func TestTelemetryExternalStorageValidation(t *testing.T) {
 	for _, kind := range []string{"prometheus", "clickhouse"} {
-		cfg, err := DecodeTelemetry(strings.NewReader("telemetry:\n  storage:\n    type: " + kind))
+		cfg, err := DecodeTelemetry(strings.NewReader("query:\n  backend: " + kind))
 		if err != nil {
 			t.Fatal("omitted endpoint must be configurable by a custom hook", err)
 		}
@@ -98,12 +98,63 @@ func TestTelemetryExternalStorageValidation(t *testing.T) {
 			t.Fatal("missing final endpoint accepted")
 		}
 		for _, endpoint := range []string{"file:///tmp/db", "https://user:password@example.com", "http://example.com?query=unsafe"} {
-			if _, err := DecodeTelemetry(strings.NewReader("telemetry:\n  storage:\n    type: " + kind + "\n    " + kind + ":\n      endpoint: " + endpoint)); err == nil {
+			if _, err := DecodeTelemetry(strings.NewReader("query:\n  backend: " + kind + "\n  " + kind + ":\n    endpoint: " + endpoint)); err == nil {
 				t.Fatal("malformed explicit endpoint accepted")
 			}
 		}
 	}
-	if _, err := DecodeTelemetry(strings.NewReader("telemetry:\n  storage:\n    type: clickhouse\n    clickhouse:\n      endpoint: http://localhost:8123\n      table: 'metrics; DROP TABLE other'")); err == nil {
+	if _, err := DecodeTelemetry(strings.NewReader("query:\n  backend: clickhouse\n  clickhouse:\n    endpoint: http://localhost:8123\n    tables:\n      gauge: 'metrics; DROP TABLE other'")); err == nil {
 		t.Fatal("SQL identifier injection")
+	}
+}
+
+func TestTelemetryIndependentReadWriteConfiguration(t *testing.T) {
+	for name, raw := range map[string]string{
+		"write-only":              "collector: {receivers: {}, exporters: {}, service: {pipelines: {}}}",
+		"query-only":              "query: {backend: prometheus, prometheus: {endpoint: https://prometheus.example.com}}",
+		"local-read":              "local: {enabled: true}\nquery: {backend: local}",
+		"local-write-remote-read": "local: {enabled: true}\nquery: {backend: clickhouse, clickhouse: {endpoint: https://clickhouse.example.com}}",
+		"custom-query":            "query: {backend: custom, handler: custom, e2b: {metrics: {}}}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := DecodeTelemetry(strings.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateTelemetryFinal(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.Local.Enabled && cfg.Local.Path != "" {
+				t.Fatal("implicit local storage path")
+			}
+		})
+	}
+	for _, raw := range []string{
+		"query: {backend: local}", "query: {backend: none, handler: e2b}",
+		"query: {backend: custom, handler: e2b, e2b: {metrics: {cpuCount: one}}}",
+		"query: {backend: prometheus, prometheus: {labels: {sandbox.id: same, sandbox.stable_id: same}}}",
+		"query: {backend: prometheus, prometheus: {labels: {sandbox.id: sandbox_id, sandbox_id: alias}}}",
+		"query: {backend: prometheus, prometheus: {labels: {sandbox.id: __name__}}}",
+		"query: {backend: clickhouse, clickhouse: {tables: {sum: 'bad-table'}}}",
+		"query: {backend: custom, handler: sql}",
+		"telemetry: {storage: {type: none}}", "storage: {type: local}",
+	} {
+		if _, err := DecodeTelemetry(strings.NewReader(raw)); err == nil {
+			t.Fatalf("invalid query contract accepted: %s", raw)
+		}
+	}
+	cfg, err := DecodeTelemetry(strings.NewReader("query: {backend: prometheus, prometheus: {endpoint: https://prometheus.example.com}}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clone := cfg.Clone()
+	clone.Query.Prometheus.Labels["sandbox.id"] = "other_id"
+	clone.Query.E2B.Metrics["cpuCount"] = "other_metric"
+	if cfg.Query.Prometheus.Labels["sandbox.id"] != "sandbox_id" || cfg.Query.E2B.Metrics["cpuCount"] != "sandbox.cpu.count" {
+		t.Fatal("query config clone aliases maps")
+	}
+	clone.Query.E2B.Metrics["cpuCount"] = clone.Query.E2B.Metrics["memTotal"]
+	if err := ValidateTelemetryFinal(clone); err == nil {
+		t.Fatal("duplicate E2B mapping after Configure")
 	}
 }

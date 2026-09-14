@@ -1,6 +1,6 @@
 package telemetry
 
-import extension "github.com/kuasar-sandbox/orchestrator/app/telemetry/extension"
+import "time"
 
 const (
 	SandboxIDAttribute = "sandbox.id"
@@ -20,11 +20,23 @@ var resourceMetrics = [...]struct {
 	{"sandbox.disk.used", "By"},
 }
 
-func metricField(name string) (extension.Field, bool) {
-	for i, metric := range resourceMetrics {
-		if name == metric.name {
-			return extension.Field(i), true
-		}
-	}
-	return 0, false
+// The seven-field mapping belongs only to the envd receiver and E2B adapter.
+// Generic readers/exporters have no field enumeration or source restriction.
+type e2bField uint8
+
+const (
+	e2bCPUCount e2bField = iota
+	e2bCPUUsedPct
+	e2bMemTotal
+	e2bMemUsed
+	e2bMemCache
+	e2bDiskTotal
+	e2bDiskUsed
+	e2bFieldCount
+)
+
+type e2bPoint struct {
+	Timestamp time.Time
+	Field     e2bField
+	Value     float64
 }

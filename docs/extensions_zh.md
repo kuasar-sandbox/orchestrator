@@ -276,7 +276,7 @@ dispatch path；Hook 不能把它重定向到另一个 executable。
 app := telemetry.New(telemetry.Hooks{
     Configure: func(ctx context.Context, cfg *telemetry.Config, rt *telemetry.Runtime) error {
         rt.Extension = myExtension
-        // 可选绑定 rt.Storage、rt.StorageHeaders、rt.Collector。
+        // 可选绑定 rt.QueryBackend、rt.QueryHeaders、rt.MetricsHandler、rt.Collector。
         return nil
     },
 })
@@ -285,8 +285,9 @@ err := app.Run() // RunContext(ctx) 使用显式父生命周期。
 
 New 无副作用，App 只能运行一次。Configure 是唯一 startup hook，早于 store/listener/
 receiver 副作用。Core 冻结 config，解析 authoritative material provider、最终校验，
-然后打开 primary storage，启动 extension、Collector、query listener、Plugin subscriber。
-`Runtime` 拒绝 JSON 序列化/反序列化，包含进程内 Logger、Extension、Storage、StorageHeaders 及可选 advanced Collector binding。私有协议也不要序列化 Runtime，
+然后打开显式 local TSDB 和选定 query backend, 启动 extension、可选 Collector graph、
+选定 HTTP query handler 和 Plugin subscriber.
+`Runtime` 拒绝 JSON 序列化/反序列化，包含进程内 Logger、Extension、QueryBackend、QueryHeaders、MetricsHandler 及可选 advanced Collector binding。私有协议也不要序列化 Runtime，
 Hook 返回后不要保留并修改 Configure 的声明。
 
 `app/telemetry/extension` 是普通 provider-neutral 叶包：
@@ -294,17 +295,24 @@ Hook 返回后不要保留并修改 Configure 的声明。
 | Binding | 契约 |
 |---|---|
 | `Extension.Start(ctx, Host)` / `Shutdown(ctx)` | 每进程一个对象。Start 早于 ingress；Start 失败也执行 Shutdown。保留工作属于传入 context，必须随取消停止 |
-| `Host.Reader()` | 选定主存储的 Reader；forwarding-only 为 nil；不提供 lifecycle、raw RouteEntry、secret 或 receiver handle |
-| `Reader.Bounds(ctx, SandboxID)` | 精确 sandbox 的首末保留观测、found/error；不 fallback StableID |
-| `Reader.Query(ctx, Query)` | Query 包含精确 SandboxID、Start/End/Step；返回 Field/Point 观测，可为 raw 或按 epoch 对齐桶各字段独立 MAX |
-| `Storage` | Reader 加 `Write(ctx, []Sample)` 与 Shutdown；canonical Sample 包含 metric、labels、timestamp、value。Core 仅由 Collector exporter 调用 Write |
+| `Host.Reader()` | 选定查询 backend 的 Reader; write-only 为 nil;不提供 lifecycle、raw RouteEntry、secret 或 receiver handle |
+| `Reader.Bounds(ctx, Selection)` | 对精确 SandboxID、metric 名和相等属性返回首末保留观测及 found/error; 不 fallback StableID |
+| `Reader.Query(ctx, Query)` | Selection 加 Start/End、Raw 或逐 series 独立 Max 与 Step; 返回含 metric、完整属性和时间/数值点的 `[]Series` |
+| `QueryBackend` | Reader 加 Shutdown, 不要求 Write |
+| `MetricsHandler(QueryScope)` | 创建标准 HTTP handler, 接收已授权 SandboxID 与永久限定 scope 的 Reader; 定制输出属于独立 HTTP 合同 |
 | `HealthReporter.Errors()` | 可选不可恢复后台错误 channel；收到报告或 channel 关闭时撤销查询可用性并停止组件 |
 
-`Runtime.Storage` 是接收 context 和独立 storage 声明副本的 factory，只与
-`storage.type: custom` 配对。错误或 nil 结果不回退 local。如果构造返回已拥有的 backend
-同时返回 error，core 仍关闭该 backend。`Runtime.StorageHeaders(ctx)` 为内建
-Prometheus/ClickHouse primary 替换整个 credential map. 空 map 同样 authoritative,
-provider 失败不使用旧 YAML 凭据, 返回 map 会被复制. 原生 exporter 凭据使用 confmap
+`Runtime.QueryBackend` 接受 context 和复制的 `TelemetryQuery` 声明, 仅与
+`query.backend: custom` 配对. 错误或 nil 结果不回退 local. 构造同时返回已拥有的
+backend 与 error 时, core 仍关闭该 backend. `Runtime.QueryHeaders(ctx)` 替换内建
+Prometheus/ClickHouse backend 的完整读凭据 map. 空 map 也 authoritative; provider
+失败不使用旧 YAML 凭据. 返回 map 会被复制. `Runtime.MetricsHandler` 必须与
+`query.handler: custom` 配对. Handler 获得 `QueryScope.Reader`, 即使改用另一
+context 或身份属性 selector 也不能替换已授权精确 SandboxID. 通用 Reader 不包含七字段
+enum 或固定来源表. 默认 E2B adapter 拥有其七项可配置映射和默认 envd source.
+Query-only 省略 Collector; 只有 `local.enabled` 才打开 TSDB, 只有 Collector 的
+`sandboxlocal` exporter 写入它. 定制 backend 不需要 exporter 或 dummy Write 方法.
+原生 exporter 凭据使用 confmap
 provider, 如组件配置内的 `${env:NAME}` 或 `${file:/path}`. 旧 ExporterHeaders binding
 和逐组件 Configure wrapper 已移除; 静态 config provider 可按相同 Collector resolver
 契约提供私有材料.
@@ -326,8 +334,8 @@ paused saved usage. 普通基础设施 receiver 不要求 SandboxID. `applicatio
 须维护期望的数据归属. 它们不会得到额外 discovery、生命周期或网络绑定权威.
 
 关闭时先撤销 Plugin lease、drain query/ingress，再依次关闭 Collector、Extension、
-primary storage；每步 cleanup 都有有界 context。Extension 在 Shutdown 后不能继续使用
-Reader。Core identity、Collector-only primary write、SandboxID lookup 和 no-Wake 规则
+query backend 与可选 local TSDB; 每步 cleanup 都有有界 context。Extension 在 Shutdown 后不能继续使用
+Reader。Core identity、Collector-only collection write、SandboxID lookup 和 no-Wake 规则
 不可配置。完整默认值、storage/network/query 契约由 [Telemetry](telemetry_zh.md) 维护；
 可构建 [custom telemetry 示例](../examples/custom-telemetry/README_zh.md) 将普通 lifecycle/
 material 代码与 advanced Collector 代码分开。

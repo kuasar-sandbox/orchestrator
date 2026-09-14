@@ -86,9 +86,9 @@ func TestCollectorAcceptsBeforeDetachedContextAndRouteDeletion(t *testing.T) {
 			cfg.Collector = map[string]any{
 				"receivers":  map[string]any{"envd": map[string]any{"collection_interval": "1s"}},
 				"processors": map[string]any{"privateprocessor": map[string]any{}},
-				"exporters":  map[string]any{"sandboxstorage": map[string]any{}, "privateexporter": map[string]any{}},
+				"exporters":  map[string]any{"sandboxlocal": map[string]any{}, "privateexporter": map[string]any{}},
 				"service": map[string]any{"telemetry": map[string]any{"metrics": map[string]any{"level": "none"}}, "pipelines": map[string]any{"metrics": map[string]any{
-					"receivers": []any{"envd"}, "processors": []any{"privateprocessor"}, "exporters": []any{"sandboxstorage", "privateexporter"},
+					"receivers": []any{"envd"}, "processors": []any{"privateprocessor"}, "exporters": []any{"sandboxlocal", "privateexporter"},
 				}}},
 			}
 			collector, err := NewCollector(context.Background(), *cfg, view, backend, customotel.Components{
