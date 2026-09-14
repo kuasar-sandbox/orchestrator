@@ -223,7 +223,10 @@ remap、pause 或 stream invalidation 会关闭连接，不会把旧连接变成
 
 来源接纳时, envd 校验当前 target, sandbox OTLP 校验已固定身份的连接.
 Core 在每个 pdata resource 上覆盖 `sandbox.id`、`sandbox.stable_id` 和
-`sandbox.telemetry.source`, 移除 point/scope 中冲突身份. Envd 使用 `envd` 来源,
+`sandbox.telemetry.source`, 移除 point/scope 中冲突身份. 规范化为相同标准 exporter
+label 的拼写(如 `sandbox_id` 或 `sandbox-telemetry-source`)也属于保留身份属性,
+在写入可信身份前移除, 避免 Guest 属性在导出时混入可信 SID、StableID 或 source
+值. Envd 使用 `envd` 来源,
 guest OTLP 使用 `otlp`; 全局不将来源限制为这两个名称. Guest 即使复制 envd 指标名,
 也不能伪造 envd 来源. 入站移除旧平台精确 key `sandbox.run_id`、`run_id`、`runId`、
 `RunID`; 保留 `application.run_id` 等用户属性.

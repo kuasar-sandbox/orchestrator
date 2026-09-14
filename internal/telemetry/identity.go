@@ -5,6 +5,7 @@ import (
 	"errors"
 	"unicode/utf8"
 
+	"github.com/prometheus/otlptranslator"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -48,9 +49,31 @@ func forbiddenAttribute(key string) bool {
 	}
 }
 
+func reservedIdentityAttribute(key string) bool {
+	switch key {
+	case SandboxIDAttribute, StableIDAttribute, sourceAttribute:
+		return true
+	}
+	// Standard exporters can normalize punctuation and merge colliding label
+	// values. Reserve those spellings at acceptance too, before any async work.
+	// Collapsing repeated underscores covers both linked normalization modes;
+	// the trusted canonical labels contain only single separators.
+	namer := otlptranslator.LabelNamer{}
+	normalized, err := namer.Build(key)
+	if err != nil {
+		return false
+	}
+	switch normalized {
+	case "sandbox_id", "sandbox_stable_id", "sandbox_telemetry_source":
+		return true
+	default:
+		return false
+	}
+}
+
 func boundedAttributes(attrs pcommon.Map, removeIdentity bool) error {
 	attrs.RemoveIf(func(key string, _ pcommon.Value) bool {
-		return forbiddenAttribute(key) || (removeIdentity && (key == SandboxIDAttribute || key == StableIDAttribute || key == sourceAttribute))
+		return forbiddenAttribute(key) || (removeIdentity && reservedIdentityAttribute(key))
 	})
 	if attrs.Len() > 32 {
 		return ErrInvalidMetrics

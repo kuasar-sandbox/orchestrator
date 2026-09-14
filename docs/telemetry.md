@@ -264,7 +264,10 @@ of turning it into the successor sandbox's connection.
 At source acceptance, envd validates the current target and sandbox OTLP validates
 the pinned connection. Core overwrites `sandbox.id`, `sandbox.stable_id` and
 `sandbox.telemetry.source` on each pdata resource and removes conflicting
-point/scope identity. EnvD uses source `envd`, guest OTLP uses `otlp`; sources are
+point/scope identity. Spellings that normalize to the same standard exporter
+labels (for example `sandbox_id` or `sandbox-telemetry-source`) are reserved too
+and removed before stamping, so Guest attributes cannot merge into trusted
+SID, StableID or source values during export. EnvD uses source `envd`, guest OTLP uses `otlp`; sources are
 not globally restricted to those two names. Guest metrics cannot forge envd
 source even when they copy its metric names. The exact obsolete platform keys
 `sandbox.run_id`, `run_id`, `runId` and `RunID` are removed at ingress; user
