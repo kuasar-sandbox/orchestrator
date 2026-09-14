@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -15,9 +16,10 @@ import (
 )
 
 type resourceStatsProviderStub struct {
-	stats api.ResourceStats
-	found bool
-	calls int
+	stats        api.ResourceStats
+	found        bool
+	calls        int
+	beforeReturn func()
 }
 
 type trafficStatsProviderStub struct {
@@ -38,6 +40,9 @@ func (p *trafficStatsProviderStub) SandboxTrafficStats(_ context.Context, sandbo
 
 func (p *resourceStatsProviderStub) SandboxResourceStats(string) (api.ResourceStats, bool) {
 	p.calls++
+	if p.beforeReturn != nil {
+		p.beforeReturn()
+	}
 	return p.stats, p.found
 }
 
@@ -171,6 +176,52 @@ func TestResourceStatsRejectsChangedRuntimeBinding(t *testing.T) {
 	})
 	if _, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret)); !errors.Is(err, api.ErrStatsUnavailable) {
 		t.Fatal("old runtime published as current", err)
+	}
+}
+
+func TestResourceStatsRejectsDeletedRowAfterOwnerRead(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{ID: "deleted-resource", RunID: "run", RunDir: t.TempDir(), Profile: types.ProfileBare, State: types.StateRunning,
+		APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64)}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	startResourceOwner(t, sb, func(ctl.Request) (ctl.Response, error) {
+		if err := o.st.Delete(context.Background(), sb.ID); err != nil {
+			return ctl.Response{}, err
+		}
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID}}, nil
+	})
+	stats, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret))
+	if stats != nil || !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("deleted row published: %+v, %v", stats, err)
+	}
+}
+
+func TestResourceStatsPostReadCancellationIsUnavailable(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{ID: "cancel-resource", RunID: "run", RunDir: t.TempDir(), Profile: types.ProfileBare, State: types.StateRunning,
+		APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64)}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	startResourceOwner(t, sb, func(ctl.Request) (ctl.Response, error) {
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID}}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	provider := &resourceStatsProviderStub{beforeReturn: cancel}
+	o.SetSandboxResourceProvider(provider)
+	stats, err := o.ResourceStats(ctx, sb.ID, mintTestAPIKey(t, sb.APISecret))
+	if provider.calls != 1 || stats != nil || !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("post-read cancellation: calls=%d stats=%+v err=%v", provider.calls, stats, err)
+	}
+	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	if err := o.statsBindingCurrent(expired, sb); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("post-read deadline: %v", err)
 	}
 }
 

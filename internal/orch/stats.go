@@ -84,9 +84,9 @@ func (o *Orchestrator) readResourceStats(ctx context.Context, sb *types.Sandbox)
 func (o *Orchestrator) statsBindingCurrent(ctx context.Context, expected *types.Sandbox) error {
 	current, err := o.st.Get(ctx, expected.ID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: validate current binding: %v", api.ErrStatsUnavailable, err)
 	}
-	if current.RunID != expected.RunID || current.RunDir != expected.RunDir || current.State != expected.State ||
+	if current == nil || current.RunID != expected.RunID || current.RunDir != expected.RunDir || current.State != expected.State ||
 		current.VswitchPort != expected.VswitchPort || current.FloatingIP != expected.FloatingIP || current.CreatedUnix != expected.CreatedUnix {
 		return api.ErrStatsUnavailable
 	}
