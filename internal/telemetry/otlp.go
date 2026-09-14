@@ -14,7 +14,6 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
-	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
@@ -106,14 +105,11 @@ func (l *identityListener) Accept() (net.Conn, error) {
 }
 
 func (r *otlpReceiver) Start(ctx context.Context, _ component.Host) (err error) {
-	var ns *netns.NetNS
-	if r.cfg.SandboxNetNS != "" {
-		ns, err = netns.Open(r.cfg.SandboxNetNS)
-		if err != nil {
-			return err
-		}
-		defer ns.Close()
+	ns, err := appnet.OpenProxyNetNS(r.cfg.ProxyNetNS)
+	if err != nil {
+		return err
 	}
+	defer ns.Close()
 	listen := func(address string) (net.Listener, error) {
 		ln, err := appnet.ListenTCPInNetNS(ns, address)
 		if err != nil {

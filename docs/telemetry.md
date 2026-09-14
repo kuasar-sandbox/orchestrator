@@ -118,8 +118,18 @@ scrapes and `concurrency` idle scrape connections.
 
 ## 4. Direct sandbox-facing OTLP
 
-Telemetry itself binds both listeners in `sandbox_netns`, using the same network
+Telemetry itself binds both listeners in `proxy_netns`, using the same network
 namespace primitives as Proxy/MMDS. Empty means the process's current namespace.
+`proxy_netns` is the canonical YAML/JSON key and `ProxyNetNS` the Go field.
+Configurations from the early Preview that used `sandbox_netns` must rename
+that key; strict decoding rejects it, including when both keys are present.
+Telemetry was not part of the existing Stable configuration contract.
+An unknown namespace name/path, failed setns or failed bind aborts startup;
+already-created listeners and application resources are closed. There is no
+fallback to the host namespace. Only listener creation runs inside the selected
+namespace; the calling thread returns to its original namespace. This setting
+does not move the process or change conductor/query/envd UDS, remote exporters
+or query clients. Those retain their normal process network environment.
 The supported signal is metrics: OTLP/gRPC MetricsService on 4317 and OTLP/HTTP
 `POST /v1/metrics` on 4318 (protobuf or JSON, optionally gzip). No OTLP token
 identity scheme is added; application traces/logs are not accepted by this metrics
@@ -136,7 +146,7 @@ MMDS mapping and add these service mappings to the deployment's vswitch command:
 --mgmt-service=169.254.169.254:4318:127.0.0.1:4318
 ```
 
-Set `sandbox_netns: sandbox-proxy`, `grpc_listen: 127.0.0.1:4317` and
+Set `proxy_netns: sandbox-proxy`, `grpc_listen: 127.0.0.1:4317` and
 `http_listen: 127.0.0.1:4318`. Guest exporters use
 `http://169.254.169.254:4318` (or the gRPC port). Connector's existing slot-derived
 SNAT converts the shared guest inner IP to its assigned FloatingIP; service DNAT
@@ -147,6 +157,12 @@ header. Existing loopback management deployments need their management interface
 address in the mappings and the existing FloatingIP return route. See the
 [connector management network](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md).
 Use the actual management namespace/device names of the node, not a second switch.
+The [deployment template](../deploy/telemetry.example.yaml) includes the matching
+management-service mappings. Both protocols are exercised through that existing
+path by the component's real guest E2E. The privileged Collector regression also
+reserves the same ports on the host, sends HTTP and gRPC inside an isolated
+namespace, verifies source identity and checks export to a host-only destination.
+Unprivileged skips are not evidence for this network behavior.
 
 The route view indexes SandboxID and FloatingIP and reuses MMDS's IPv4 parsing,
 active-state and reverse-lookup consistency rules. Identity comes from the

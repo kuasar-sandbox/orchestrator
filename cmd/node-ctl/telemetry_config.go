@@ -45,7 +45,8 @@ const telemetryConfigSkeleton = `# node-ctl telemetry serve --config <this>
 config_socket: /run/sandbox/node-ctl.socket
 api_socket: /run/sandbox/telemetry.sock
 # Bind OTLP directly in the sandbox-facing network namespace, as for Proxy/MMDS.
-# sandbox_netns: sandbox-proxy
+# proxy_netns: sandbox-proxy
+# Applies only to the sandbox OTLP listeners, not remote exporter/query clients.
 route_capacity: 65536
 paths:
   # telemetry_executable: /opt/kuasar/bin/custom-telemetry

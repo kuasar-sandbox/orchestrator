@@ -3,7 +3,15 @@
 config_socket: /run/sandbox/node-ctl.socket
 api_socket: /run/sandbox/telemetry.sock
 # Use the namespace carrying the existing connector management path.
-# sandbox_netns: sandbox-proxy
+# proxy_netns: sandbox-proxy
+# For loopback listeners in the existing connector management namespace, add
+# these to the actual vswitch start command, retaining its MMDS mapping:
+#   --mgmt-extract=sandbox-proxy:sw0m0:169.254.169.254/32
+#   --mgmt-service=169.254.169.254:4317:127.0.0.1:4317
+#   --mgmt-service=169.254.169.254:4318:127.0.0.1:4318
+# Enable route_localnet on that management device and bind the OTLP addresses
+# below to 127.0.0.1. Empty proxy_netns uses the current process namespace.
+# This never changes the network used by remote exporters/query clients or UDS.
 route_capacity: 65536
 paths:
   # telemetry_executable: /opt/kuasar/bin/custom-telemetry

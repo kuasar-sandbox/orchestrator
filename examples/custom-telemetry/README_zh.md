@@ -14,6 +14,11 @@ root 或服务 UID 属主。在独立 `telemetry.yaml` 的 `paths.telemetry_exec
 启动。直接执行会被拒绝。node-ctl 校验文件、创建 sealed bootstrap 并原地替换进程；
 定制启动失败不会回退到内置实现。
 
+`proxy_netns` 配置通过 `Config.ProxyNetNS` 传入 `Configure`.
+它选择两种沙箱 OTLP listener 的 namespace, 不移动 executable 或其远端 client.
+早期 Preview 的 `sandbox_netns` key 必须改名, strict bootstrap/config decode 拒绝旧名称.
+部署方法见 [management 网络](../../docs/telemetry_zh.md#4-直接面向沙箱的-otlp).
+
 `Configure` 在 store/listener 启动前执行一次。Config 存放声明，Runtime 存放不可序列化
 的进程内绑定。本例保留选定的 primary storage，记录扩展启动/停止，并可从
 `TELEMETRY_EXPORTER_AUTHORIZATION` 提供 extra exporter 的 Authorization header。

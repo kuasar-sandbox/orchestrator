@@ -77,7 +77,7 @@ func TestConfigureOnceFreezesConfigAndRuntime(t *testing.T) {
 }
 
 func TestAppRejectsInvalidBootstrapAndHooksBeforeCore(t *testing.T) {
-	for _, phase := range []string{"missing", "wrong-executable", "duplicate", "unknown", "trailing", "hook", "path-mutation", "final-validation", "provider"} {
+	for _, phase := range []string{"missing", "wrong-executable", "duplicate", "unknown", "legacy-netns", "trailing", "hook", "path-mutation", "final-validation", "final-netns", "provider"} {
 		t.Run(phase, func(t *testing.T) {
 			boot := bootstrap(t)
 			app := New(Hooks{Configure: func(_ context.Context, cfg *Config, runtime *Runtime) error {
@@ -88,6 +88,8 @@ func TestAppRejectsInvalidBootstrapAndHooksBeforeCore(t *testing.T) {
 					cfg.Paths.TelemetryExecutable = "/another"
 				case "final-validation":
 					cfg.Telemetry.Scrape.Concurrency = 0
+				case "final-netns":
+					cfg.ProxyNetNS = "../invalid"
 				case "provider":
 					cfg.Telemetry.Exporters = []config.TelemetryExporter{{Name: "extra", Type: "otlphttp", Endpoint: "http://example.com"}}
 					runtime.ExporterHeaders = func(context.Context, string) (map[string]string, error) { return nil, errors.New("provider failed") }
@@ -104,6 +106,8 @@ func TestAppRejectsInvalidBootstrapAndHooksBeforeCore(t *testing.T) {
 					boot.Config = []byte(`{"config_socket":"/a","config_socket":"/b"}`)
 				case "unknown":
 					boot.Config = []byte(`{"unknown":true}`)
+				case "legacy-netns":
+					boot.Config = []byte(`{"sandbox_netns":"sandbox-proxy"}`)
 				case "trailing":
 					boot.Config = append(boot.Config, []byte(` {}`)...)
 				}
