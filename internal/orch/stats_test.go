@@ -172,7 +172,7 @@ func TestResourceStatsRejectsChangedRuntimeBinding(t *testing.T) {
 		if err := o.st.Put(context.Background(), &replacement); err != nil {
 			return ctl.Response{}, err
 		}
-		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID}}, nil
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID, CPUCapacity: 2, CPUAllocatable: .5, MemoryCapacity: 4096, MemoryHeadroom: 1024}}, nil
 	})
 	if _, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret)); !errors.Is(err, api.ErrStatsUnavailable) {
 		t.Fatal("old runtime published as current", err)
@@ -191,7 +191,7 @@ func TestResourceStatsRejectsDeletedRowAfterOwnerRead(t *testing.T) {
 		if err := o.st.Delete(context.Background(), sb.ID); err != nil {
 			return ctl.Response{}, err
 		}
-		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID}}, nil
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID, CPUCapacity: 2, CPUAllocatable: .5, MemoryCapacity: 4096, MemoryHeadroom: 1024}}, nil
 	})
 	stats, err := o.ResourceStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret))
 	if stats != nil || !errors.Is(err, api.ErrStatsUnavailable) {
@@ -208,7 +208,7 @@ func TestResourceStatsPostReadCancellationIsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	startResourceOwner(t, sb, func(ctl.Request) (ctl.Response, error) {
-		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID}}, nil
+		return ctl.Response{ResourceStats: &ctl.ResourceStats{SandboxID: sb.ID, CPUCapacity: 2, CPUAllocatable: .5, MemoryCapacity: 4096, MemoryHeadroom: 1024}}, nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
