@@ -136,7 +136,8 @@ def main():
         targets = []
         for fd in (Path("/proc") / str(args.conductor_pid) / "fd").iterdir():
             try:
-                targets.append(os.readlink(fd))
+                target = os.readlink(fd)
+                targets.append(target.removesuffix(" (deleted)"))
             except FileNotFoundError:
                 pass
         return targets
@@ -254,8 +255,8 @@ def main():
         fds_after = conductor_fds()
         for build_id in (bid, wb, rb):
             for root in (args.run_root, args.base_root):
-                prefix = str(Path(root) / "builds" / build_id) + "/"
-                assert not any(fd.startswith(prefix) for fd in fds_after), (build_id, fds_after)
+                directory = str(Path(root) / "builds" / build_id)
+                assert not any(fd == directory or fd.startswith(directory + "/") for fd in fds_after), (build_id, fds_after)
         item = {"conductor_pid": args.conductor_pid, "conductor_fds_before": len(fds_before),
                 "conductor_fds_after": len(fds_after), "build_directory_fds_retained": 0, "mode": mode, "hang_build": bid, "transient_id": tid, "unit": unit,
                 "phase_sandbox": before["phase_sandbox_id"], "port": before["runtime_vswitch_port"],
