@@ -24,7 +24,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -729,7 +728,6 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			claimed.Status = types.BuildBuilding
 			claimed.ExecutionClaimed = true
 			claimed.ExecutionClaimedUnix = now.Unix()
-			claimed.EnforcementStatus = "pending"
 			o.publishBuildState(claimed.BuildID, "building", "", "")
 			o.observeBuildUpsert(claimed)
 			o.buildCapacityChanged()
@@ -1048,7 +1046,7 @@ func (o *Orchestrator) commitBuildCompletion(ctx context.Context, build *types.B
 			if err == nil {
 				terminal.RunID = ""
 				terminal.ExecutionClaimed, terminal.ExecutionClaimedUnix = false, 0
-				terminal.EnforcementStatus, terminal.Phase, terminal.PhaseSandboxID = "", "", ""
+				terminal.Phase, terminal.PhaseSandboxID = "", ""
 				terminal.ExecutionResult = nil
 				terminal.Metadata = cloneStringMapWithout(terminal.Metadata, sandboxcfg.NsMMDS)
 				*build = *terminal
@@ -1519,28 +1517,14 @@ func (o *Orchestrator) fencePendingBuildResult(
 	return accepted, true, err
 }
 
-// prepareBuilderUnit is the assignment publication barrier: runtime limits are
-// applied and read back before the run-id becomes durable. runPool publishes
-// the assignment to run-builder only after this callback returns successfully.
+// prepareBuilderUnit durably binds the already-claimed Build to this exact
+// run-id. runPool publishes the assignment to run-builder only after this
+// callback returns successfully.
 func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, runID string) (string, error) {
 	unit := o.builderUnit(runID)
-	properties, err := builderResourceProperties(b.Resources)
-	if err != nil {
-		return "", err
-	}
-	if err := o.lc.SetResources(ctx, unit, properties); err != nil {
-		return "", err
-	}
-	effective, err := o.lc.Resources(ctx, unit, "Service")
-	if err != nil {
-		return "", err
-	}
-	if effective != properties {
-		return "", fmt.Errorf("build: unit %s resource properties effective=%+v want=%+v", unit, effective, properties)
-	}
 	unlockEvent := o.lockBuildEvent(b.BuildID)
 	defer unlockEventFence(unlockEvent)
-	bound, err := o.st.BindBuildRun(ctx, b.BuildID, runID, "cpu,memory")
+	bound, err := o.st.BindBuildRun(ctx, b.BuildID, runID)
 	if err != nil {
 		return "", err
 	}
@@ -1548,7 +1532,6 @@ func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, r
 		return "", fmt.Errorf("build: execution ownership lost before run assignment")
 	}
 	b.RunID = runID
-	b.EnforcementStatus = "cpu,memory"
 	o.observeBuildUpsert(b)
 	return unit, nil
 }
@@ -1705,7 +1688,7 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 	// durable fence through directory removal; PutBuildTerminal releases it in
 	// its transaction after matching the exact cleaned runtime snapshot.
 	runtimeLastFence := !current.ExecutionClaimed && current.ExecutionClaimedUnix == 0 && current.RunID == "" &&
-		current.EnforcementStatus == "" && current.Phase == "" && current.PhaseSandboxID == "" && current.ExecutionResult == nil
+		current.Phase == "" && current.PhaseSandboxID == "" && current.ExecutionResult == nil
 	var cleanupErr error
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1813,19 +1796,6 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pe
 			}
 		}
 	}
-}
-
-func builderResourceProperties(resources types.BuildResources) (launcher.ResourceProperties, error) {
-	if resources.CPU < 0 || resources.Memory < 0 {
-		return launcher.ResourceProperties{}, fmt.Errorf("negative build resource property")
-	}
-	if resources.CPU > int64(^uint64(0)/1000) {
-		return launcher.ResourceProperties{}, fmt.Errorf("build resources CPU overflows systemd quota")
-	}
-	return launcher.ResourceProperties{
-		CPUQuotaPerSecUSec: uint64(resources.CPU) * 1000,
-		MemoryMax:          uint64(resources.Memory),
-	}, nil
 }
 
 func (o *Orchestrator) waitBuilderUnitExit(ctx context.Context, unit string, timeout time.Duration) error {

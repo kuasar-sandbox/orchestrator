@@ -72,13 +72,7 @@ func (l *sandboxFinalizerLauncher) List(_ context.Context, pattern string) ([]la
 	return []launcher.Unit{{Name: l.unit, ActiveState: l.state}}, nil
 }
 func (*sandboxFinalizerLauncher) Reload(context.Context) error { return nil }
-func (*sandboxFinalizerLauncher) SetResources(context.Context, string, launcher.ResourceProperties) error {
-	return nil
-}
-func (*sandboxFinalizerLauncher) Resources(context.Context, string, string) (launcher.ResourceProperties, error) {
-	return launcher.ResourceProperties{}, nil
-}
-func (*sandboxFinalizerLauncher) Close() error { return nil }
+func (*sandboxFinalizerLauncher) Close() error                 { return nil }
 
 func (l *sandboxFinalizerLauncher) clearFaults() {
 	l.mu.Lock()

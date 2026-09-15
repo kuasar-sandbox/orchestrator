@@ -25,6 +25,8 @@ node reservation loop
 
 The normal reservation loop neither samples nor writes sandbox cgroups, calls CH APIs, receives guest `MemReport`, nor sends balloon targets. Recovery inventory does read process/cgroup identity, liveness and conservative limits (§8.1); it does not use those reads to implement the guest Budget loop. The controller atomically handles sandbox-initiated reservation requests. Heartbeat returns a reservation echo, not an execution command.
 
+Builder registration/execution ledgers remain separate from these per-Sandbox reservations. Each actual Build phase uses ordinary sandbox-ctl admission and release. Build.Resources configures A/B resources; final Sandbox resources resolve independently. Builder service/slice only supplies ownership, delegation and group cleanup, with no orchestrator CPU/memory enforcement. The existing VMM leaf policy and conservative recovery inventory remain unchanged.
+
 ### 1.2 Terminology
 
 | Name | Definition | Owner |

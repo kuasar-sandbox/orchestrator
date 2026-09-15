@@ -114,10 +114,8 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-# Keep #205's finite CPUQuota assertions while avoiding an additional parent
-# throttle around each independently limited phase VM. A Build leaves the
-# configured host reservation available; admission aggregate limits scale with
-# max_builds.
+# Keep the existing Build admission and A/B resource vectors. Runtime limits
+# belong to sandbox-ctl at the VMM leaf; no parent service/slice quota applies.
 HOST_CPU="$(nproc)"
 BUILDER_CPU=$((HOST_CPU > 2 ? 2 : 1))
 BUILDER_CPU_MILLI=$((BUILDER_CPU * 1000))
@@ -356,7 +354,7 @@ mmds:
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
-units: { dir: $UNIT_DIR }
+units: { dir: $UNIT_DIR, builder_pool_size: 1 }
 sandbox:
   resources:
     capacity: { cpu: 2, memory: 2GiB }
@@ -526,7 +524,7 @@ import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute("""
         select status, run_id, execution_claimed, execution_claimed_unix,
-               enforcement_status, phase, phase_sandbox_id,
+               phase, phase_sandbox_id,
                runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
                runtime_envd_access_token_enc, runtime_prepare_json,
                execution_result_json
@@ -784,8 +782,8 @@ register() { # name [profile] [target-json] [sandbox-config=0|1] → sets TID/BI
     expected_profile="${2:-e2b}"
     target_json="${3:-}"
     sandbox_config="${4:-0}"
-    # The finite, asserted Builder quota equals host capacity; the phase
-    # A/B sandbox is derived from that Build quota. Target Sandbox capacity is
+    # A/B sandbox resources derive from this immutable Build vector.
+    # Parent services/slices add no CPU/memory policy. Target Sandbox capacity is
     # a separate Create input and is included only for Sandbox-producing cases.
     body="{\"name\":\"$1\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
     [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
@@ -842,7 +840,7 @@ PY
     done
     [ -n "$phase" ] || fail "build $bid never exposed active phase $expected_phase"
 
-    python3 - "$WORK/resp.body" "$BUILDER_CPU_MILLI" <<'PY' || fail "active Build status resources/enforcement"
+    python3 - "$WORK/resp.body" "$BUILDER_CPU_MILLI" <<'PY' || fail "active Build status admission/phase"
 import json, sys
 status = json.load(open(sys.argv[1]))
 assert status["resources"] == {
@@ -851,7 +849,7 @@ assert status["resources"] == {
     "storageBytes": 4 << 30,
 }, status
 assert status["executionClaimed"] is True, status
-assert status["systemdEnforcement"] == "cpu,memory", status
+assert "systemdEnforcement" not in status, status
 assert status["storageEnforcement"] == "admission-only", status
 PY
 
@@ -964,7 +962,7 @@ PY
     if [ "$memory_high" = "max" ] || [ -z "$memory_high" ]; then
         fail "phase VMM did not leave deferred memory.high after a trusted report (last=${memory_high:-missing})"
     fi
-    python3 - "$unit_path" "$slice_path" "$vmm_path" "$BUILDER_CPU_MILLI" "$BUILDER_EXECUTION_CPU_MILLI" <<'PY' || fail "effective per-Build/aggregate/phase cgroup limits"
+    python3 - "$unit_path" "$slice_path" "$vmm_path" "$ctl_path" "$BUILDER_CPU_MILLI" <<'PY' || fail "parent/ctl isolation and VMM resource limits"
 import pathlib, sys
 
 def assert_cpu(path, milli):
@@ -972,15 +970,20 @@ def assert_cpu(path, milli):
     assert quota != "max", (path, quota, period)
     assert int(quota) * 1000 == int(period) * milli, (path, quota, period, milli)
 
-unit, pool, vmm = map(pathlib.Path, sys.argv[1:4])
-build_cpu, execution_cpu = map(int, sys.argv[4:])
-assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
-assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
-assert_cpu(unit, build_cpu)
-assert_cpu(pool, execution_cpu)
+unit, pool, vmm, ctl = map(pathlib.Path, sys.argv[1:5])
+build_cpu = int(sys.argv[5])
+for parent in (unit, pool, ctl):
+    assert (parent / "memory.max").read_text().strip() == "max", parent
+    assert (parent / "cpu.max").read_text().split()[0] == "max", parent
+assert (ctl / "memory.high").read_text().strip() == "max", ctl
+# Existing sandbox-ctl policy: capacity plus the node's default 32MiB overhead.
+assert int((vmm / "memory.max").read_text()) == (6 << 30) + (32 << 20), vmm
+assert 0 < int((vmm / "memory.high").read_text()) <= (6 << 30) + (32 << 20), vmm
 assert_cpu(vmm, build_cpu)
+assert int((vmm / "cpu.weight").read_text()) == min(10000, max(1, build_cpu // 10)), vmm
+print("parent service/slice/ctl: cpu.max=max memory.max=max; VMM capacity/weight/high retained")
 PY
-    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified (memory.high=$memory_high)"
+    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; parent limits absent and VMM policy/ctl isolation verified (memory.high=$memory_high)"
 }
 diag() { # bid — failure diagnostics (BuildRunDir/BuildBaseDir are reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"

@@ -181,7 +181,7 @@ paths:
 #   runner: sandbox-runner@.service
 #   builder: sandbox-builder@.service
 #   runner_pool_size: 0
-#   builder_pool_size: 0 # required when execution CPU or memory is capped
+#   builder_pool_size: 0 # idle workers; independent of execution admission resources
 #   pool_wait_timeout: 5s
 #   install: true
 sandbox:                                          # sandbox-instance defaults
@@ -223,7 +223,7 @@ builder:                                           # Build resources are separat
   queue_ttl: 30m                                  # waiting for execution admission
   terminal_ttl: 24h                              # owner-free ready/error Build history
   diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4  # build VM writable disk (pull cache + export scratch)
-  # Build CPU/memory also enforce each builder service; execution aggregate CPU/memory enforce sandbox-builder.slice.
+  # Build resources configure A/B sandboxes and admission; sandbox-ctl owns VMM limits.
   # storage is admission-only until a filesystem quota backend is configured in a future change.
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
   # platform: linux/amd64

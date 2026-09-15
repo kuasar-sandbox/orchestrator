@@ -63,7 +63,7 @@ func projectBuild(build *types.Build) conductorextension.BuildView {
 		Steps:     projectSteps(build.Steps), StartCommand: build.StartCmd, ReadyCommand: build.ReadyCmd,
 		Metadata: cloneMap(build.Metadata), Builder: projectBuildOptions(build.Builder),
 		RunID: build.RunID, ExecutionClaimed: build.ExecutionClaimed,
-		EnforcementStatus: build.EnforcementStatus, Phase: build.Phase, PhaseSandboxID: build.PhaseSandboxID,
+		Phase: build.Phase, PhaseSandboxID: build.PhaseSandboxID,
 		RuntimeVSwitchPort: build.RuntimeVswitchPort, RuntimeFloatingIP: build.RuntimeFloatingIP,
 		RuntimePortMAC: build.RuntimePortMAC, ClusterGroup: build.ClusterGroup,
 	}

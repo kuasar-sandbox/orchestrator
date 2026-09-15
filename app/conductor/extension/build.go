@@ -101,7 +101,6 @@ type BuildView struct {
 	Builder                BuildOptions
 	RunID                  string
 	ExecutionClaimed       bool
-	EnforcementStatus      string
 	Phase                  string
 	PhaseSandboxID         string
 	RuntimeVSwitchPort     string

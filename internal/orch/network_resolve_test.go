@@ -287,8 +287,8 @@ func TestBuildSpecCarriesResolvedAndTemplateNetworks(t *testing.T) {
 	o := testOrchCfg(t, buildNetworkTestConfig())
 	b := &types.Build{
 		BuildID: "build-spec", Profile: types.ProfileE2B,
-		// The outer Build demand is deliberately unrelated to the phase sandbox
-		// document carried below.
+		// This network projection fixture supplies its resolved resource document
+		// below; A/B resource derivation is covered by the resource resolver tests.
 		Resources: types.BuildResources{CPU: 9000, Memory: 16 << 30},
 	}
 	runtimeNetwork := sandboxcfg.NetworkSpec{

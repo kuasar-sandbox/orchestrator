@@ -292,7 +292,7 @@ func TestBuildRuntimeOnlyOwnershipSurvivesDirectoryCleanup(t *testing.T) {
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := testOrchCfg(t, cfg)
 	b := buildReconcileRow(t, "")
-	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix, b.EnforcementStatus = types.BuildError, false, 0, ""
+	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix = types.BuildError, false, 0
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestBuildRuntimeOnlyNonterminalIntentCompletes(t *testing.T) {
 				cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 				o := testOrchCfg(t, cfg)
 				b := buildReconcileRow(t, "")
-				b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix, b.EnforcementStatus = state, false, 0, ""
+				b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix = state, false, 0
 				if err := o.st.PutBuild(ctx, b); err != nil {
 					t.Fatal(err)
 				}
@@ -420,7 +420,7 @@ func TestBuildOwnerFreeBuildingIntentCannotReportRecoverySuccess(t *testing.T) {
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := testOrchCfg(t, cfg)
 	b := buildReconcileRow(t, "")
-	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix, b.EnforcementStatus = types.BuildBuilding, false, 0, ""
+	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix = types.BuildBuilding, false, 0
 	b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimePrepareJSON = "", "", "", ""
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)

@@ -564,8 +564,8 @@ type BootConfig struct {
 }
 
 // BuilderConfig is the build-instance settings. Durable registration/execution
-// admission uses each immutable BuildResources vector; execution CPU/memory are
-// additionally enforced on the aggregate slice and each builder service.
+// admission uses each immutable BuildResources vector. The same vector defines
+// A/B sandbox resources; sandbox-ctl owns their runtime resource limits.
 // Builds run INSIDE build sandboxes (tenant network + isolation): import and
 // step execution happen in microVMs booted from the same guest runtime; only artifact
 // streaming and the final uploads run on the host (run-builder).
@@ -1162,10 +1162,6 @@ func (c *Conductor) validateDeclarative() error {
 	}
 	if c.Units.BuilderPoolSize < 0 {
 		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
-	}
-	if c.Units.BuilderPoolSize > 0 &&
-		(execution.Resources.CPU > 0 || execution.Resources.Memory > 0) {
-		return fmt.Errorf("config: units.builder_pool_size must be 0 when builder.admission.execution configures CPU or memory; idle builders are not execution-admitted")
 	}
 	poolWait, err := time.ParseDuration(c.Units.PoolWaitTimeout)
 	if err != nil {
