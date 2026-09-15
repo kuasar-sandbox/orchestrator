@@ -13,16 +13,46 @@
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 只定义不可变 **Build.Resources**,绝不改 Sandbox capacity。`X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400。Builder `target` 是 register-only immutable 定义；`X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources，不供 A/B 使用。`profile∈{e2b,bare}`,省略取 `e2b`;响应暴露 requested `target`（省略即 auto） |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
-| status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段、requested `target`、终态 derived `kind`，及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`、`executionClaimed`、`runID`、`systemdEnforcement`、`storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
+| status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段、requested `target`、终态 derived `kind`，及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`、`cancelRequested`、`deleteRequested`、`executionClaimed`、`runID`、`systemdEnforcement`、`storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [§5](#5-按目标执行与发布) |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile`、requested `target` 和 resolved artifact `kind` |
+
+### 1.1 取消与删除 Build 记录
+
+Cancel 停止执行并清理本地资源,保留 Build 诊断行. DELETE 精确删除一条 Build 行及其拥有的附属数据库数据. 两者沿用 Build 认证和 ownership 校验,不申请注册或执行准入,容量满时仍可调用. 这是 E2B 风格 API 的项目扩展;DELETE 不删除远端模板或产物.
+
+```http
+POST /templates/{transientID}/builds/{buildID}/cancel
+DELETE /templates/{transientID}
+DELETE /templates/{transientID}?cancel=true
+DELETE /templates/{transientID}
+X-Kuasar-Sandbox-Builder: {"cancel":true}
+```
+
+均无需请求体. 只接受注册返回的 transient TemplateID,兼容当前单机 UUID 与集群随机 ID 格式. canonical/PersistID、name、alias、远端引用和非法 transient ID 返回 400. 合法但不存在或非 owner 返回 404;Cancel 还要求路径两个 ID 对应同一行. 即使 List 展示成功后的 canonical ID,调用方仍应保留注册 ID.
+
+DELETE 按字段 presence 合并 `Header.cancel > Query.cancel > false`. Header 缺省或 `{}` 保留 Query;`{"cancel":false}` 覆盖 `?cancel=true`,`{"cancel":true}` 覆盖 `?cancel=false`. 先分别严格校验两种输入,低优先级非法即使被覆盖也返回 400. Query cancel 只能出现一次且值精确为 true/false. Header 只能出现一份,必须是仅允许 cancel 字段的单一 JSON object. 空 Header、null、数组、重复/未知字段、非 bool、第二个 JSON value 和尾随内容均拒绝. 动作 parser 与 BuildOptions 分离:cancel 不进入 builder_json/metadata,Register/Trigger 拒绝 cancel,DELETE 拒绝 target/resources/referer/registry. 不提供 force 或产物删除选项.
+
+| 持久条件 | Cancel | DELETE | DELETE cancel=true |
+|---|---|---|---|
+| registered/waiting,无执行或清理归属 | 204,保留 error 行 | 与 claim 原子竞争后删行,204 | 相同 |
+| 任何执行/清理归属,此前无删除意图 | 持久取消,202 | 无副作用,409 | 同事务持久取消和删除,202 |
+| 已接受删除,仍未完成 | 保留意图,202 | 保留意图,202 | 保留意图,202 |
+| ready/error,完全无归属 | 保留既有结果,204 | 删行,204 | 相同 |
+| 行不存在、非 owner 或 Cancel ID 不匹配 | 404 | 404 | 404 |
+
+归属包括取得 claim 但还没有 RunID/pending 准备、assignment、host prepare、活动 phase 和已接受结果但未清理. 已取消但清理未完仍有归属. 单纯 waiting 不要求 cancel=true. 重复请求保留首次时间,只能增强意图.
+
+Cancel 204 表示执行和清理均已完成;未被其他操作删除的记录保留. DELETE 204 表示节点行及附属数据库数据确实已删除,执行和本地清理归属均解除. 只有意图成功提交才能返回 202. DELETE 202 提供相对 `Location: /templates/{transientID}/builds/{buildID}/status`. 轮询既有接口,通过 cancelRequested/deleteRequested 和 executionClaimed 查看进度;SDK status 保持 building/ready/error. 最终删行后为 404;网络错误和 5xx 不代表完成. 再次删除已不存在的行返回 404,不保存墓碑维持 204.
+
+`node-ctl builder cancel <build-id>` 和 `node-ctl builder delete <transient-template-id> [--cancel]` 经本地管理 socket 调用同一 Core 操作. `node-ctl builder status` 展示用量对应的 Build 身份、意图、claim 与资源向量.
 
 ## 2. 模板 ID 与工件权威
 
 ```
 persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
                                             profile∈{e2b,bare}; kind∈{img,sbx,snp}
-transient templateID = transient-<uuidv7>       构建注册期临时句柄,build 完即弃
+transient templateID = transient-<registration-id>  保留以查询、取消和删除 Build 记录
 ```
 
 - **持久 id 自描述**:payload 是 `manifest://<key>` 或
@@ -31,7 +61,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   和 canonical portable ref。snp 可在 Connect 时显式选择 cold,但 TemplateID 的缺省仍是 memory。
   local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
 - **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
-  之后只用持久 id。Build status、临时 id、name/alias 与本机 list 仅在终态 Build row 的
+  之后启动使用持久 id,取消和删除记录仍用注册临时 id。Build status、临时 id、name/alias 与本机 list 仅在终态 Build row 的
   retention window 内可用。
 - **无独立 templates 表**:canonical TemplateID 本身编码 profile、artifact kind 与 portable ref，
   其制品才是长期 launch authority。`builds` 只承担构建执行、短期 status/index/alias，不是模板
@@ -48,7 +78,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
 | `units.builder_pool_size` | `0` | 预启动 idle Builder 数;有 execution CPU/memory 聚合上限时必须为零。共享 units.dir/install/pool_wait_timeout 见 Node §3;完整 unit 与 claim/readback 顺序见 §4.1 |
 | `builder.admission.execution.max_builds` | `2` | 同时持有 durable execution claim 的 Build 上限 |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | 不限制 | execution 的聚合资源向量;CPU/memory 同时施加到 `sandbox-builder.slice`,storage V1 仅准入记账 |
-| `builder.admission.registration` | 完整继承 resolved execution | 所有非终态 Build 的注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
+| `builder.admission.registration` | 完整继承 resolved execution | 未带 cancel/delete 意图的 registered/waiting/building Build 注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
 | `builder.registration_ttl` / `.queue_ttl` | `1h` / `30m` | 未 Trigger 的 registered Build 与 waiting Build 的持久超时;终态可查询并释放 registration usage |
 | `builder.terminal_ttl` | `24h` | 已完成 cleanup、无 execution/runtime/result owner 的 `ready/error` Build 历史保留期；必须为正 Go duration |
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
@@ -73,7 +103,7 @@ resolved execution。仅缺少当前 schema marker 的不兼容开发数据库�
 
 ### 3.1 请求级 Builder 输入
 
-构建端点额外接受 **build-only** 命名空间 `kuasar-sandbox.builder`,对应请求头
+构建注册额外接受 **build-only** 命名空间 `kuasar-sandbox.builder`,对应请求头
 `X-Kuasar-Sandbox-Builder`,当前形态:
 
 ```json
@@ -513,11 +543,11 @@ capacity（如有）为默认、供最终 Sandbox E/C0 使用，Image target 为
 两者不互相推导。Build.Resources 本身不进入 nodectl，因此 active phase 只出现一条普通
 Sandbox reservation，不存在双重记账；`target=sandbox,memory=false` 没有 C reservation。
 
-ready/error 都是 retention-bounded Build history。终态事务原子写 `finished_unix` 并释放 registration usage。执行过的 Build 先完成完整
-unit/cgroup、network、runtime/result 与 BuildRunDir/BuildBaseDir cleanup ，再 terminal commit 释放 execution
-claim；只有 fully-cleaned 且无 claim 的 row 才可能在 `builder.terminal_ttl` 到期时被有界 reaper 删除。status、register-time
-transient TemplateID、name/alias 与本机 list 随 row 消失；返回过的 canonical TemplateID 用于
-Create 或 `fromTemplate` 均不受影响。
+ready/error 是有保留期的 Build 历史. registration usage 在 cancel/delete 意图提交或正常终态转换时释放.
+终态事务写入 `finished_unix`. 执行过的 Build 先完成 unit/cgroup、network、runtime/result 与
+BuildRunDir/BuildBaseDir 清理, 再由终态提交释放 execution claim. 完全清理且无 claim 的行可立即
+显式删除, 或在 `builder.terminal_ttl` 到期时由有界 reaper 删除. status、注册 transient ID、name/alias
+与本机 list 随行消失; 已返回的 canonical TemplateID 用于 Create 或 `fromTemplate` 均不受影响.
 
 **镜像拉取凭据**(按优先级解析,无凭据则匿名):
 
@@ -557,7 +587,8 @@ builds         build_id PK, template_id(transient-…), persist_id(<profile>-<ki
                enforcement_status, phase, phase_sandbox_id,
                runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
                runtime_envd_access_token_enc, runtime_prepare_json,
-               execution_result_json, created_unix, finished_unix
+               execution_result_json, created_unix, finished_unix,
+               cancel_requested_unix, delete_requested_unix
 build_mmds_route_secret_values
                build_id PK/FK builds(build_id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
@@ -608,3 +639,17 @@ execution claim。phase 子进程的自清理不是最终正确性
 `RemoveAll` 影响。
 
 共享 SQLite 基础设施与终态 reaper 由 [节点可靠性](node_zh.md#14-可靠性) 维护;Build schema 与恢复由本节维护。Build 行是有保留期的执行/status/alias 记录，不是永久模板目录；已发布 canonical template ref 不依赖原 Build 行。
+
+### 6.1 取消、预算与恢复
+
+registration usage 只统计 status IN (registered, waiting, building) 且两个意图时间均为零的行. execution usage 统计全部 execution_claimed=1 的行,独立于 status 和意图. 数量和 CPU/memory/storage 向量、真实准入 SQL、管理、metrics 和节点上报采用相同口径. waiting 数量与 oldest waiting 只包含仍可执行的记录. 接受取消/删除的事务提交即释放注册容量;exact unit 停止、本地清理和 PutBuildTerminal 成功后才释放执行容量. 正常成功、失败和总超时仍自动清理. 容量变化以可合并通知唤醒既有 FIFO pool 和节点用量上报,周期检查继续兜底.
+
+现有进程内执行 owner 在 claim 发布前登记. 意图阻止新的 Trigger/claim/assignment/bootstrap/prepare/phase/result 推进,通知唯一 owner 停止 exact RunID unit,覆盖阶段 VM 和辅助进程. host prepare 先退出或回滚未提交资源,再由同一 owner 清理精确网络、运行入口、BuildRunDir 和 BuildBaseDir. Build 锁只保护短身份及数据库/事件提交,不等待 unit stop 或目录删除. cleanup CAS 在取消后仍有效. HTTP 断开不撤销已接受意图;清理的外部操作使用独立有界上下文.
+
+取消和结果接受按持久先后裁决:cancel-first 拒绝新结果,以 `build cancelled by user` 结束;result-first 保留已接受的成功/失败及相同结果重放,继续停止和清理. direct Image 复用采用同一终态条件. 旧回调不能 upsert 复活已删行或影响后继 transient 身份. 数据库提交先于观察通知;真实硬删除后才发 BuildDelete. error 导致观察集合移除是另一事实.
+
+清理完成后 PutBuildTerminal 释放 claim,再单独条件硬删除. 最终 DELETE 失败保留 delete 意图,不重新占执行预算. 立即重试、既有生命周期有界补偿和启动恢复继续处理,不等 terminal_ttl. Stop/状态回读/detach/目录/终态失败保留必要归属以重试. 启动先处理 cancel/delete 再收养流水线:停止活 unit、清理已退出 unit、直接删无归属 marked 终态行,不为已取消任务重读源产物或重置原执行截止时间.
+
+两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
+
+按现有版本协调一起升级 node/router/Registry writer. 回退到不理解意图的旧 writer 前,停止接受新的取消/删除,由当前版本收敛全部待处理操作. 有未完成意图时,加法 schema 本身不能保证安全回退. 不增加长期双 writer、新任务表或兼容服务. 记录删除后已发布 canonical img/sbx/snp 引用、已有 Sandbox、下游 fromTemplate 和共享产物的其他 Build 仍可用;绝不删除远端内容.

@@ -389,10 +389,10 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 			t.Fatal(err)
 		}
 	}
-	if expired, err := st.ExpireBuild(ctx, registered.BuildID, types.BuildRegistered, "registration TTL"); err != nil || !expired {
+	if expired, err := st.ExpireBuild(ctx, registered.BuildID, registered.TemplateID, types.BuildRegistered, "registration TTL"); err != nil || !expired {
 		t.Fatalf("expire registered: %v %v", expired, err)
 	}
-	if expired, err := st.ExpireBuild(ctx, waiting.BuildID, types.BuildWaiting, "queue TTL"); err != nil || !expired {
+	if expired, err := st.ExpireBuild(ctx, waiting.BuildID, waiting.TemplateID, types.BuildWaiting, "queue TTL"); err != nil || !expired {
 		t.Fatalf("expire waiting: %v %v", expired, err)
 	}
 	usage, err := st.BuildUsage(ctx)

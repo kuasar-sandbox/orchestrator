@@ -90,10 +90,7 @@ func (s *Store) TerminalBuildsForRetention(ctx context.Context, cutoffUnix int64
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds
 		WHERE status IN (?,?) AND finished_unix>0 AND finished_unix<=?
-		  AND execution_claimed=0 AND execution_claimed_unix=0 AND run_id=''
-		  AND enforcement_status='' AND phase='' AND phase_sandbox_id=''
-		  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
-		  AND runtime_envd_access_token_enc='' AND runtime_prepare_json='' AND execution_result_json=''
+		  AND `+buildOwnerFreeSQL+`
 		ORDER BY finished_unix ASC,build_id ASC LIMIT ?`,
 		string(types.BuildReady), string(types.BuildError), cutoffUnix, retentionBatchLimit(limit))
 	if err != nil {
@@ -126,12 +123,9 @@ func (s *Store) DeleteTerminalBuildForRetention(ctx context.Context, build *type
 		return false, nil
 	}
 	result, err := s.db.ExecContext(ctx, `DELETE FROM builds
-		WHERE build_id=? AND status=? AND finished_unix=? AND finished_unix<=?
-		  AND execution_claimed=0 AND execution_claimed_unix=0 AND run_id=''
-		  AND enforcement_status='' AND phase='' AND phase_sandbox_id=''
-		  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
-		  AND runtime_envd_access_token_enc='' AND runtime_prepare_json='' AND execution_result_json=''`,
-		build.BuildID, string(build.Status), build.FinishedUnix, cutoffUnix)
+		WHERE build_id=? AND template_id=? AND status=? AND finished_unix=? AND finished_unix<=?
+		  AND `+buildOwnerFreeSQL+``,
+		build.BuildID, build.TemplateID, string(build.Status), build.FinishedUnix, cutoffUnix)
 	if err != nil {
 		return false, fmt.Errorf("store: prune terminal build %s: %w", build.BuildID, err)
 	}

@@ -130,7 +130,7 @@ BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<Bui
 | `proxy serve` | Independent data-plane master/workers (§2.3 and [node-proxy.md](node-proxy.md)) |
 | `run-sandbox` / `run-builder` | Launchers inside systemd units, not interactive commands (§2.4 and §6) |
 | `resource` | `status`/`list`/`drain`: inspect reservations and drain admission ([node-resource.md](node-resource.md) §2) |
-| `builder status` | Inspect durable two-level Build admission ([Build §5](node-build.md#5-target-aware-execution-and-publication)) |
+| `builder status` / `builder cancel <build-id>` / `builder delete <transient-template-id> [--cancel]` | Inspect durable usage, transient IDs, operation intent and claims; cancel execution or delete one Build record ([Build §1.1](node-build.md#11-cancel-and-delete-a-build-record)) |
 | `config` | Normalize/validate configuration or print a commented template |
 | `manifest-key` | `add`/`remove`/`check`/`list`: manage credential-pair allowlisting for create/build/import (§7); Registry also writes leased entries (§10) |
 | `export-sandbox` / `import-sandbox` | Promote paused sandboxes to templates or migrate them (§8.1) |
@@ -1235,8 +1235,8 @@ sandbox{
 }
 delete{sid}
 build_sync_begin{}
-build_upsert{build_event:{build_id, state, template_id?, reason?}}
-build_delete{build_event:{build_id}}
+build_upsert{build_event:{build_id, state, template_id, persist_id?, reason?}}
+build_delete{build_event:{build_id, template_id}}
 build_sync_end{}
 bookmark{full_sync}
 ```
@@ -1249,7 +1249,9 @@ Sandbox events do not self-report Registry-owned cluster context. Before dispatc
 
 The bookmark ending a full Sandbox Range carries full_sync=true. Node-link owner compares seen SIDs only against the ownership baseline captured before subscription, then rechecks that each current entry still matches before deletion. This protects newly dispatched/rebound tasks during synchronization. Incremental-replay bookmarks only advance the resume token.
 
-Existing post-registration Build projection has an independent bracket. Node subscribes to live Build changes, sends build_sync_begin, every retained local cluster Build row, then build_sync_end. The set includes registered/waiting/building and ready/error within retention. Registry fences these frames by NodeID session: once a new link takes effect, an overlapping old connection cannot alter projection. An unconditional per-Build fence orders each durable transition and live publication, independently of conductor Extension. Changes during snapshot follow end in order; slow subscribers disconnect and rebuild a complete snapshot. At build_sync_end, Registry deletes only unseen post-registration projection/refs from the preconnection immutable `(NodeID, BuildID)` baseline that still belong exactly to that node. Registry-owned BuildStarting ambiguous-dispatch intent is not node projection; an empty snapshot cannot establish definitive rejection. This protects new registrations and converges lost live build_delete on reconnection. Registry runs no separate terminal TTL. Long snapshots do not block control replies: the shared writer drains bounded command ACKs and coalesced heartbeats between items; live Build changes still wait for build_sync_end.
+Build events preserve registration template_id independently of terminal persist_id. Hard deletion carries the original template_id, so late events cannot affect a new same-BuildID registration. Only committed node hard deletion emits BuildDelete; an error row leaving an observer collection is not hard deletion.
+
+Existing post-registration Build projection has an independent bracket. Node subscribes to live Build changes, sends build_sync_begin, every retained local cluster Build row, then build_sync_end. The set includes registered/waiting/building and ready/error within retention. Registry fences these frames by NodeID session: once a new link takes effect, an overlapping old connection cannot alter projection. An unconditional per-Build fence orders each durable transition and live publication, independently of conductor Extension. Changes during snapshot follow end in order; slow subscribers disconnect and rebuild a complete snapshot. At build_sync_end, Registry deletes only unseen post-registration projection/refs from the preconnection immutable `(NodeID, BuildID, TemplateID)` baseline that still belong exactly to that node. Registry-owned BuildStarting ambiguous-dispatch intent is not node projection; an empty snapshot cannot establish definitive rejection. This protects new registrations and converges lost live build_delete on reconnection. Registry runs no separate terminal TTL. Long snapshots do not block control replies: the shared writer drains bounded command ACKs and coalesced heartbeats between items; live Build changes still wait for build_sync_end.
 
 ### 10.4 Command acceptance
 

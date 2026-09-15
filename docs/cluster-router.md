@@ -107,7 +107,8 @@ The router does not participate in registry member health detection and subscrib
 | list/get | group | Read the group shard; individual sandbox lookup also uses the identity described above. |
 | data plane | group + route_key + stable sandbox_id + target | With known NodeSandboxID/DataEndpoint, open a one-use node CONNECT, including paused/starting states. Fall back to `operation=data` only for a missing target or typed stale response; a miss starts with Resolve. |
 | build register | group + build_id | Normalize the body/Builder header into Build.Resources, parse the phase ResourcePatch independently, then call `ReserveBuild`. The selected node performs final registration admission. |
-| build status/files | group + build_id | ResolveBuild returns APIEndpoint; cache it and forward to the node conductor. Never fall back to DataEndpoint if it is missing. |
+| build trigger/status/files/cancel | group + build_id | ResolveBuild returns APIEndpoint; cache it and forward to the node conductor. Never fall back to DataEndpoint if it is missing. |
+| build delete | group + transient TemplateID | Resolve the original node APIEndpoint from the existing projection; forward Query/Header unchanged for final node authorization and execution |
 
 `route_key` locates a route within a group; `sandbox_id` is the stable public identity. The registry generates SandboxID on the first create. Same-node resume, cross-node migration, and re-placement do not change it. Protected routes additionally carry the current `node_sandbox_id=<sandbox_id>-g<N>`. The router addresses sandboxes by stable SandboxID and substitutes NodeSandboxID only at the node boundary; public responses do not expose NodeSandboxID.
 
@@ -203,7 +204,10 @@ API-key authentication cannot be disabled. Create/connect/exec-session pass the 
 | get/pause/timeout/export | Resolve the current route, use APIEndpoint only, and replace public SandboxID with NodeSandboxID in the forwarded path. Rewrite typed get responses to stable SandboxID. |
 | get/list | Read the group's route_link records. |
 | build register | Generate stable build_id/template_id, strictly merge registration resource body/header/E2B capacity leaves, and call ReserveBuild. The node validates again before saving the build. |
-| build status/files | Locate the node by group+build_id; cache and forward through BuildReserveResult.APIEndpoint only. |
+| build trigger/status/files/cancel | Locate the node by group+build_id; cache and forward through BuildReserveResult.APIEndpoint only. |
+| build delete | Transient TemplateID only; resolve the original node from the existing projection and preserve Query/Header |
+
+DELETE `/templates/{transientID}?cancel=true` and `X-Kuasar-Sandbox-Builder: {"cancel":true}` share the node action parser. Each input is strictly validated independently. Explicit Header.cancel > Query.cancel > false; `{}` preserves Query and explicit false overrides true. Router does not parse this as registration BuildOptions. Lookup failure or incomplete ownership returns 503; an unreachable node returns 502, never successful deletion or an invented 404. DELETE 202 preserves the node relative Status Location; only final node hard deletion completes the operation. See [Build actions](node-build.md#11-cancel-and-delete-a-build-record).
 
 Sandbox control and Build follow-up use a different node endpoint from ordinary data/CONNECT/native exec. Missing APIEndpoint for control/build never falls back to DataEndpoint; missing DataEndpoint for data/exec never falls back to APIEndpoint.
 

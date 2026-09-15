@@ -379,7 +379,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 					if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
 						return errors.New("node-link: BuildDelete outside a valid Build sync")
 					}
-					if err := r.applyBuildDelete(ctx, nr.NodeID, m.Build.BuildID); err != nil {
+					if err := r.applyBuildDelete(ctx, nr.NodeID, m.Build.BuildID, m.Build.TemplateID); err != nil {
 						return fmt.Errorf("node-link: apply BuildDelete: %w", err)
 					}
 				case routesync.TypeBuildSyncEnd:

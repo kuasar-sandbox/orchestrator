@@ -11,6 +11,8 @@
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain>                      # node reservation controller inspection (hosted in serve via resource_listen)
 //	node-ctl builder status                                    # durable Builder admission status (admin socket)
+//	node-ctl builder cancel <build-id>                          # cancel execution, retain diagnostics
+//	node-ctl builder delete <transient-template-id> [--cancel]  # delete a Build record
 //	node-ctl version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.

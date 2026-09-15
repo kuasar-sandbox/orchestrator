@@ -1269,7 +1269,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		terminal := existing.State == "ready" || existing.State == "error"
 		event := &routesync.BuildEvent{
 			Kind: routesync.BuildUpsert, BuildID: existing.BuildID, State: existing.State,
-			TemplateID: existing.TemplateID, Reason: existing.Reason,
+			TemplateID: existing.TemplateID, PersistID: existing.PersistID, Reason: existing.Reason,
 		}
 		n.mu.Unlock()
 		if conflict {
@@ -1400,7 +1400,7 @@ func (n *stubNode) RangeBuilds(ctx context.Context, fn func(routesync.BuildEvent
 	for _, build := range n.builds {
 		events = append(events, routesync.BuildEvent{
 			Kind: routesync.BuildUpsert, BuildID: build.BuildID, State: build.State,
-			TemplateID: build.TemplateID, Reason: build.Reason,
+			TemplateID: build.TemplateID, PersistID: build.PersistID, Reason: build.Reason,
 		})
 	}
 	n.mu.Unlock()
@@ -1545,13 +1545,13 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	wasBuilding := b.State == "building"
 	b.State = state
 	b.ExecutionReady = false
-	if templateID != "" {
-		b.TemplateID = templateID
+	if templateID != "" && templateID != b.TemplateID {
+		b.PersistID = templateID
 	}
 	if reason != "" {
 		b.Reason = reason
 	}
-	ev := &routesync.BuildEvent{Kind: routesync.BuildUpsert, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
+	ev := &routesync.BuildEvent{Kind: routesync.BuildUpsert, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, PersistID: b.PersistID, Reason: b.Reason}
 	n.mu.Unlock()
 	if publish {
 		n.publishBuildEvent(ev)
@@ -1634,7 +1634,7 @@ func (n *stubNode) scheduleBuildExecutions() {
 		b.State = "building"
 		b.ExecutionReady = false
 		events = append(events, &routesync.BuildEvent{
-			Kind: routesync.BuildUpsert, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+			Kind: routesync.BuildUpsert, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, PersistID: b.PersistID, Reason: b.Reason,
 		})
 	}
 	n.mu.Unlock()
@@ -1967,6 +1967,7 @@ type stubBuild struct {
 	Secure                   bool                      `json:"secure,omitempty"`
 	State                    string                    `json:"state"`
 	TemplateID               string                    `json:"template_id,omitempty"`
+	PersistID                string                    `json:"persist_id,omitempty"`
 	Reason                   string                    `json:"reason,omitempty"`
 	Resources                *routesync.BuildResources `json:"resources,omitempty"`
 	RegistrationImageRepo    string                    `json:"-"`
@@ -1983,7 +1984,7 @@ type stubBuild struct {
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
 	return buildSnapshot{
-		NodeID: nodeID, BuildID: b.BuildID, Profile: b.Profile, Metadata: cloneStringMap(b.Metadata), State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+		NodeID: nodeID, BuildID: b.BuildID, Profile: b.Profile, Metadata: cloneStringMap(b.Metadata), State: b.State, TemplateID: b.TemplateID, PersistID: b.PersistID, Reason: b.Reason,
 		Resources: cloneBuildResources(b.Resources), Behavior: b.Behavior, CreatedAt: b.CreatedAt,
 	}
 }
@@ -2218,6 +2219,7 @@ type buildSnapshot struct {
 	Metadata   map[string]string         `json:"metadata,omitempty"`
 	State      string                    `json:"state"`
 	TemplateID string                    `json:"template_id,omitempty"`
+	PersistID  string                    `json:"persist_id,omitempty"`
 	Reason     string                    `json:"reason,omitempty"`
 	Resources  *routesync.BuildResources `json:"resources,omitempty"`
 	Behavior   stubBehavior              `json:"behavior,omitempty"`

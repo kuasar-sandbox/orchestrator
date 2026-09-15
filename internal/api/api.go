@@ -385,6 +385,8 @@ type Core interface {
 	RegisterBuild(ctx context.Context, apiKey string, spec RegisterSpec) (*types.Build, error)
 	TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
+	CancelBuild(ctx context.Context, apiKey, templateID, buildID string) (BuildActionResult, error)
+	DeleteBuild(ctx context.Context, apiKey, templateID string, options DeleteBuildOptions) (BuildActionResult, error)
 	// BuildLogs returns the build's progress log entries from offset onward
 	// (the SDK polls /status with ?logsOffset and streams them via on_build_logs).
 	BuildLogs(ctx context.Context, apiKey, templateID, buildID string, offset int) ([]BuildLogEntry, error)
@@ -469,6 +471,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v3/templates", a.auth(a.registerTemplate))
 	mux.HandleFunc("POST /v2/templates/{tid}/builds/{bid}", a.auth(a.triggerBuild))
 	mux.HandleFunc("GET /templates/{tid}/builds/{bid}/status", a.auth(a.buildStatus))
+	mux.HandleFunc("POST /templates/{tid}/builds/{bid}/cancel", a.auth(a.cancelBuild))
+	mux.HandleFunc("DELETE /templates/{tid}", a.auth(a.deleteBuild))
 	mux.HandleFunc("GET /templates/{tid}/files/{hash}", a.auth(a.buildFiles))
 	mux.HandleFunc("GET /templates", a.auth(a.listTemplates))
 	// Sandbox export / import (orchestrator extension; api-key authed like the rest,
@@ -895,10 +899,15 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		Metadata        map[string]string `json:"metadata"`
 		EnvVars         map[string]string `json:"envVars"`
 		Secure          bool              `json:"secure"`
+		Cancel          json.RawMessage   `json:"cancel"`
 		AutoPauseMemory json.RawMessage   `json:"autoPauseMemory"`
 	}
 	if err := decodeBuildRequest(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
+		return
+	}
+	if len(body.Cancel) != 0 || r.URL.Query().Has("cancel") {
+		writeErr(w, http.StatusBadRequest, "cancel is a Build action, not a Build definition")
 		return
 	}
 	if len(body.AutoPauseMemory) != 0 {
@@ -1001,9 +1010,14 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		MemoryMB     json.RawMessage      `json:"memoryMB"`
 		MemoryMBSn   json.RawMessage      `json:"memory_mb"`
 		Metadata     map[string]string    `json:"metadata"`
+		Cancel       json.RawMessage      `json:"cancel"`
 	}
 	if err := decodeBuildRequest(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
+		return
+	}
+	if len(body.Cancel) != 0 || r.URL.Query().Has("cancel") {
+		writeErr(w, http.StatusBadRequest, "cancel is a Build action, not a Build definition")
 		return
 	}
 	if _, present := r.Header[http.CanonicalHeaderKey(builderHeader)]; present {
@@ -1138,6 +1152,8 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 			"storageBytes": b.Resources.Storage,
 		},
 		"executionClaimed":   b.ExecutionClaimed,
+		"cancelRequested":    b.CancelRequestedUnix != 0,
+		"deleteRequested":    b.DeleteRequestedUnix != 0,
 		"runID":              b.RunID,
 		"systemdEnforcement": b.EnforcementStatus,
 		"storageEnforcement": "admission-only",

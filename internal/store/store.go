@@ -120,6 +120,8 @@ CREATE TABLE IF NOT EXISTS builds (
   runtime_envd_access_token_enc TEXT NOT NULL DEFAULT '',
   runtime_prepare_json TEXT NOT NULL DEFAULT '',
   execution_result_json TEXT NOT NULL DEFAULT '',
+  cancel_requested_unix INTEGER NOT NULL DEFAULT 0,
+  delete_requested_unix INTEGER NOT NULL DEFAULT 0,
   finished_unix INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
@@ -203,6 +205,12 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	if err := ensureColumn(ctx, db, "sandboxes", "dead_unix", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		db.Close()
 		return nil, err
+	}
+	for _, column := range []string{"cancel_requested_unix", "delete_requested_unix"} {
+		if err := ensureColumn(ctx, db, "builds", column, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	if err := ensureColumn(ctx, db, "builds", "finished_unix", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		db.Close()
@@ -1265,7 +1273,7 @@ var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,
   registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
   resources_cpu,resources_memory,resources_storage,metadata_json,builder_json,instance_config_enc,
   waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix`
+  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix,cancel_requested_unix,delete_requested_unix`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
@@ -1277,7 +1285,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.RegistrationRequestDigest, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &meta, &builder, &instanceConfigEnc,
 		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
-		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON, &b.FinishedUnix); err != nil {
+		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON, &b.FinishedUnix, &b.CancelRequestedUnix, &b.DeleteRequestedUnix); err != nil {
 		return nil, err
 	}
 	b.ExecutionClaimed = executionClaimed != 0
@@ -1337,8 +1345,8 @@ const buildInsertSQL = `
 	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,metadata_json,builder_json,instance_config_enc,
 	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix,cancel_requested_unix,delete_requested_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -1364,7 +1372,10 @@ const buildUpsertSQL = buildInsertSQL + `
 	  runtime_envd_access_token_enc=excluded.runtime_envd_access_token_enc,
 	  runtime_prepare_json=excluded.runtime_prepare_json,
 	  execution_result_json=excluded.execution_result_json,
-	  finished_unix=excluded.finished_unix`
+	  finished_unix=excluded.finished_unix,
+ cancel_requested_unix=CASE WHEN builds.cancel_requested_unix=0 THEN excluded.cancel_requested_unix ELSE builds.cancel_requested_unix END,
+ delete_requested_unix=CASE WHEN builds.delete_requested_unix=0 THEN excluded.delete_requested_unix ELSE builds.delete_requested_unix END
+ WHERE builds.template_id=excluded.template_id`
 
 const buildInsertOnlySQL = buildInsertSQL + ` ON CONFLICT(build_id) DO NOTHING`
 
@@ -1441,7 +1452,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		mj(b.Metadata), mb(b.Builder), instanceConfigEnc, b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
 		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
-		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON, b.FinishedUnix,
+		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON, b.FinishedUnix, b.CancelRequestedUnix, b.DeleteRequestedUnix,
 	}, nil
 }
 
@@ -1501,10 +1512,10 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, b *types.Build) (bool, e
 		waiting_sequence=(SELECT CASE
 			WHEN COALESCE(MAX(waiting_sequence),0) >= 9223372036854775807 THEN NULL
 			ELSE COALESCE(MAX(waiting_sequence),0)+1 END FROM builds)
-		WHERE build_id=? AND status=?`,
+		WHERE build_id=? AND template_id=? AND status=? AND cancel_requested_unix=0 AND delete_requested_unix=0`,
 		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON,
 		registryAuthEnc, string(types.BuildWaiting), b.WaitingUnix,
-		b.BuildID, string(types.BuildRegistered))
+		b.BuildID, b.TemplateID, string(types.BuildRegistered))
 	if err != nil {
 		return false, fmt.Errorf("store: commit build trigger %s: %w", b.BuildID, err)
 	}
@@ -1623,7 +1634,7 @@ func (s *Store) BuildingTaskIdentity(ctx context.Context, buildID, runID string)
 	}
 	var one int
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM builds
-		WHERE build_id=? AND run_id=? AND status=? AND execution_claimed=1`,
+		WHERE build_id=? AND run_id=? AND status=? AND execution_claimed=1 AND cancel_requested_unix=0 AND delete_requested_unix=0`,
 		buildID, runID, string(types.BuildBuilding)).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -1636,8 +1647,8 @@ func (s *Store) BuildingTaskIdentity(ctx context.Context, buildID, runID string)
 
 // GetBuildByTemplateID looks a build up by its (transient) template id — the
 // handle the files endpoint receives (GET /templates/{tid}/files/{hash}), which
-// carries no build id. The transient template id is a per-build uuidv7, so this
-// is unique. Returns nil when unknown.
+// carries no build id. Registration assigns a unique transient identity using
+// the standalone or cluster generator. Returns nil when unknown.
 func (s *Store) GetBuildByTemplateID(ctx context.Context, templateID string) (*types.Build, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE template_id=?`, templateID)
 	b, err := s.scanBuild(row)

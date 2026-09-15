@@ -176,7 +176,7 @@ func TestBuildMissingAPIEndpointDoesNotUseDataEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound || dataHits.Load() != 0 {
+	if resp.StatusCode != http.StatusServiceUnavailable || dataHits.Load() != 0 {
 		t.Fatalf("missing build API endpoint status=%d data hits=%d", resp.StatusCode, dataHits.Load())
 	}
 }

@@ -65,7 +65,7 @@ func TestTerminalTransitionsPersistTimestampsAtomically(t *testing.T) {
 	if err := st.PutBuild(ctx, expired); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.ExpireBuild(ctx, expired.BuildID, types.BuildRegistered, "expired"); err != nil || !changed {
+	if changed, err := st.ExpireBuild(ctx, expired.BuildID, expired.TemplateID, types.BuildRegistered, "expired"); err != nil || !changed {
 		t.Fatalf("ExpireBuild = %t, %v", changed, err)
 	}
 	expired, err = st.GetBuild(ctx, expired.BuildID)

@@ -655,7 +655,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 			select {
 			case event := <-buildEvents:
 				if event.BuildID != cmd.BuildID || event.State != string(tc.state) ||
-					event.TemplateID != tc.templateID || event.Reason != tc.reason {
+					event.TemplateID != cmd.TemplateRef || event.PersistID != tc.templateID || event.Reason != tc.reason {
 					t.Fatalf("terminal replay BuildEvent = %+v", event)
 				}
 			case <-time.After(time.Second):

@@ -269,6 +269,8 @@ func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && isTemplateCollectionPath(path):
 		// e2b build register: reserve a build node, forward, record build_id -> node.
 		rt.handleBuildRegister(w, r)
+	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/templates/"):
+		rt.handleBuildDelete(w, r)
 	case strings.Contains(path, "/builds/"):
 		// build trigger / status / files: route by build_id to the recorded node.
 		rt.handleBuildForward(w, r)
@@ -699,6 +701,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		EnvVars         map[string]string `json:"envVars"`
 		Secure          bool              `json:"secure"`
 		AutoPauseMemory json.RawMessage   `json:"autoPauseMemory"`
+		Cancel          json.RawMessage   `json:"cancel"`
 	}
 	rawBody, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
 	if err != nil || len(rawBody) > 1<<20 {
@@ -711,6 +714,10 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := strictjson.DecodeAllowUnknown(rawBody, &body); err != nil {
 		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.Cancel) != 0 || r.URL.Query().Has("cancel") {
+		http.Error(w, "cancel is only valid for Build cancellation or deletion", http.StatusBadRequest)
 		return
 	}
 	if len(body.AutoPauseMemory) != 0 {
@@ -855,6 +862,13 @@ func nonEmptySlice(s string) []string {
 // (router restart: the in-memory build map is lost but route_link build state is
 // replicated).
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel") {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 5 || parts[0] != "templates" || types.ValidateTransientID(parts[1]) != nil || types.ValidateBuildID(parts[3]) != nil {
+			http.Error(w, "transient template ID and BuildID required", http.StatusBadRequest)
+			return
+		}
+	}
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
@@ -869,10 +883,14 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	e, ok := rt.builds[cacheKey]
 	rt.buildsMu.Unlock()
 	node := e.node
-	if !ok {
+	if !ok || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel")) {
 		res, rerr := rt.routeLinkResolveBuild(r.Context(), group, bid)
-		if rerr != nil || res.APIEndpoint == "" {
-			http.Error(w, "unknown build "+bid, http.StatusNotFound)
+		if rerr != nil {
+			writeBuildResolveError(w, rerr)
+			return
+		}
+		if res == nil || res.APIEndpoint == "" {
+			http.Error(w, "build node unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		node = res.APIEndpoint
@@ -881,6 +899,42 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 		rt.buildsMu.Unlock()
 	}
 	rt.forwardBuild(w, r, node)
+}
+
+func writeBuildResolveError(w http.ResponseWriter, err error) {
+	status := http.StatusServiceUnavailable
+	var response *routeLinkCallError
+	if errors.As(err, &response) && response.status == http.StatusNotFound {
+		status = http.StatusNotFound
+	}
+	http.Error(w, "build lookup unavailable", status)
+}
+
+func (rt *Router) handleBuildDelete(w http.ResponseWriter, r *http.Request) {
+	templateID := strings.TrimPrefix(r.URL.Path, "/templates/")
+	if types.ValidateTransientID(templateID) != nil {
+		http.Error(w, "transient template ID required", http.StatusBadRequest)
+		return
+	}
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
+		return
+	}
+	path := fmt.Sprintf("%s?group=%s&template_id=%s", registry.RouteLinkBuildPath, url.QueryEscape(group), url.QueryEscape(templateID))
+	var res buildReserveResult
+	if err := rt.routeLinkCall(r.Context(), group, http.MethodGet, path, nil, nil, &res); err != nil {
+		writeBuildResolveError(w, err)
+		return
+	}
+	if res.APIEndpoint == "" || res.BuildID == "" || res.TemplateID != templateID {
+		http.Error(w, "incomplete build binding", http.StatusServiceUnavailable)
+		return
+	}
+	rt.forwardBuild(w, r, res.APIEndpoint)
 }
 
 func buildCacheKey(group, buildID string) string {

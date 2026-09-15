@@ -44,7 +44,8 @@ type BuildRecord struct {
 	RegistrationTarget            *types.BuildTarget        `json:"registration_target,omitempty"`
 	RegistrationTargetSet         bool                      `json:"registration_target_set,omitempty"`
 	State                         BuildState                `json:"state"`
-	TemplateID                    string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
+	TemplateID                    string                    `json:"template_id,omitempty"` // immutable registration transient ID
+	PersistID                     string                    `json:"persist_id,omitempty"`
 	Reason                        string                    `json:"reason,omitempty"`
 	CreatedU                      int64                     `json:"created_unix,omitempty"`
 

@@ -12,16 +12,46 @@ These implement the e2b v2 Build-system endpoint family used by SDK Template.bui
 |---|---|---|
 | Register | POST /v3/templates → 202 | name/tags/profile?/cpuCount/memoryMB/metadata?/envVars?/secure? define immutable Build.Resources, never Sandbox capacity. X-Kuasar-Sandbox-Builder.resources may assert identical CPU/memory and add storage; disagreement returns 400. Builder target is register-only immutable input. X-Kuasar-Sandbox-Resource configures final template resources, not A/B. Profile defaults e2b and accepts e2b/bare. Response exposes requested target, auto when omitted |
 | Trigger | POST /v2/templates/{tid}/builds/{bid} → 202 | fromImage/fromTemplate/fromImageRegistry username/password/steps/startCmd/readyCmd. Only one registered→waiting transition. Compatibility cpuCount/memoryMB may only assert registration values; increase/decrease returns 400 before credential/COPY/queue side effects. Trigger metadata, Builder/Resource and other general configuration headers are rejected. Insufficient execution capacity leaves FIFO waiting on the fixed node |
-| Status | GET /templates/{tid}/builds/{bid}/status | SDK fields, requested target, terminal derived kind, canonical resources cpuMilli/memoryBytes/storageBytes, executionClaimed/runID/systemdEnforcement/storageEnforcement and phase name/sandboxID. In-progress SDK status remains building while retaining internal phase/claim details |
+| Status | GET /templates/{tid}/builds/{bid}/status | SDK fields, requested target, terminal derived kind, canonical resources cpuMilli/memoryBytes/storageBytes, cancelRequested/deleteRequested, executionClaimed/runID/systemdEnforcement/storageEnforcement and phase name/sandboxID. In-progress SDK status remains building while retaining internal phase/claim details |
 | Files | GET /templates/{tid}/files/{hash} → 201 | Resolve tid→Build→owner, then return present/url. present skips duplicate upload; URL is a direct-bucket presigned PUT, never bytes through control plane. No files_storage returns 501; missing/non-owned tid returns 404 ([§5](#5-target-aware-execution-and-publication)) |
 | List | GET /templates | Tenant's ready templates with persistent templateID, immutable profile, requested target and resolved artifact kind |
+
+### 1.1 Cancel and delete a Build record
+
+Cancel stops execution and cleans local resources while retaining the diagnostic Build row. DELETE removes exactly one Build row and its owned database data. Both use existing Build authentication and ownership checks, without registration or execution admission, including when capacity is full. These are project extensions to the E2B-style API; DELETE does not remove remote templates or artifacts.
+
+```http
+POST /templates/{transientID}/builds/{buildID}/cancel
+DELETE /templates/{transientID}
+DELETE /templates/{transientID}?cancel=true
+DELETE /templates/{transientID}
+X-Kuasar-Sandbox-Builder: {"cancel":true}
+```
+
+No request body is needed. Only the transient TemplateID returned by registration is accepted, including the current standalone UUID and cluster random-ID forms. Canonical/PersistID, name, alias, remote reference and malformed transient IDs return 400. A valid missing or non-owned identity returns 404; Cancel also requires both path IDs to identify the same row. Keep the registration ID even when List displays the successful canonical ID.
+
+DELETE resolves `Header.cancel > Query.cancel > false` by field presence. An absent Header or `{}` preserves Query; `{"cancel":false}` overrides `?cancel=true`, and `{"cancel":true}` overrides `?cancel=false`. Both inputs are independently validated before merging, so an invalid lower-priority value still returns 400. Query `cancel` must occur once with exactly `true` or `false`. The Header must occur once and contain one JSON object with only `cancel`, if provided. Empty Header, null, arrays, duplicate/unknown keys, non-boolean values, second JSON values and trailing content are rejected. This action parser is separate from BuildOptions: cancel never enters builder_json or metadata, Register/Trigger reject it, and DELETE rejects target/resources/referer/registry. There is no force or artifact deletion option.
+
+| Durable condition | Cancel | DELETE | DELETE with cancel=true |
+|---|---|---|---|
+| registered/waiting, no execution or cleanup owner | 204, error row retained | 204, row deleted atomically against claim | Same |
+| Any execution/cleanup owner, no previous delete intent | 202, cancel persisted | 409, no change | 202, cancel and delete persisted together |
+| Previously accepted delete still incomplete | 202, intent retained | 202, intent retained | 202, intent retained |
+| ready/error, entirely owner-free | 204, existing result retained | 204, row deleted | Same |
+| Row missing, non-owned, or Cancel ID mismatch | 404 | 404 | 404 |
+
+Ownership includes claim before RunID/owner preparation, assignment, host preparation, active phases and accepted results awaiting cleanup. A cancelled Build with unfinished cleanup still has ownership. Waiting alone does not require cancel=true. Repeated requests preserve the first timestamps and can only strengthen intent.
+
+Cancel 204 means execution and cleanup are complete; its row remains unless another operation deleted it. DELETE 204 means the node row and owned database data are actually gone and all execution/local cleanup ownership is released. A 202 is returned only after durable intent commit. DELETE 202 provides a relative `Location: /templates/{transientID}/builds/{buildID}/status`. Poll that existing endpoint: `cancelRequested` and `deleteRequested` describe progress alongside `executionClaimed`; SDK status remains building/ready/error. Final deletion yields 404. Network errors and 5xx are not completion. A later request for an already deleted row returns 404; no tombstone preserves 204.
+
+`node-ctl builder cancel <build-id>` and `node-ctl builder delete <transient-template-id> [--cancel]` invoke the same Core operations through the local admin socket. `node-ctl builder status` shows the Build identities, intents, claims and resource vectors behind usage.
 
 ## 2. Template IDs and artifact authority
 
 ```
 persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
                                             profile∈{e2b,bare}; kind∈{img,sbx,snp}
-transient templateID = transient-<uuidv7>       Temporary registration handle; use the persistent ID after Build
+transient templateID = transient-<registration-id>  Retain for Build status, cancellation and record deletion
 ```
 
 - **Persistent IDs are self-describing.** Their payload is canonical manifest:// or a content-identified located file ref, e.g. `file://<digest>.image@digest:<digest>@location:<name>`; encrypted tarstreams use @hmac, Bundles use @manifest. Runtime parses profile, kind (img cold image, sbx cold Sandbox E, snp memory Snapshot S) and portable ref. Connect may explicitly cold-start an snp source, while that template's default is memory. Unlocated local refs, host absolute paths, noncanonical refs or mismatched artifact kinds fail.
@@ -37,7 +67,7 @@ These Conductor configuration fields govern the Build service. Shared process, p
 | `units.builder_pool_size` | `0` | Prestarted idle Builder count; must be zero with aggregate execution CPU/memory limits. Shared units.dir/install/pool_wait_timeout remain in Node §3; complete unit and claim/readback ordering are in §4.1 |
 | `builder.admission.execution.max_builds` | `2` | Maximum simultaneous durable execution claims |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | Unlimited | Aggregate execution vector; CPU/memory also constrain sandbox-builder.slice, while V1 storage is admission accounting only |
-| `builder.admission.registration` | Entire resolved execution block | Registration limits for nonterminal Builds. An explicit block does not inherit missing fields; each finite dimension must be at least execution's |
+| `builder.admission.registration` | Entire resolved execution block | Registration limits for registered/waiting/building Builds without cancel/delete intent. An explicit block does not inherit missing fields; each finite dimension must be at least execution's |
 | `builder.registration_ttl` / `.queue_ttl` | `1h` / `30m` | Durable expiry for untriggered registered and queued waiting Builds; terminal rows remain queryable but release registration usage |
 | `builder.terminal_ttl` | `24h` | Positive Go duration retaining ready/error history after cleanup and release of execution/runtime/result ownership |
 | `builder.insecure_registry` | `false` | Allow plaintext HTTP for base-image pulls, e.g. a local development registry |
@@ -61,7 +91,7 @@ An explicit registration block does not inherit omitted execution dimensions; an
 
 ### 3.1 Request-scoped Builder input
 
-Build endpoints additionally accept build-only kuasar-sandbox.builder / X-Kuasar-Sandbox-Builder:
+Build registration additionally accepts build-only kuasar-sandbox.builder / X-Kuasar-Sandbox-Builder:
 
 ```json
 {
@@ -212,7 +242,7 @@ Top-level E and C's initial C0 use one BuildColdConfig projection: source E non-
 
 Each actual A/B/C phase has its own SID and uses ordinary sandbox-ctl controller Admit/heartbeat/Release, fully tearing down/releasing before the next phase. A/B resources derive only from immutable Build.Resources. Registration Create resources instead use E portable capacity defaults where present for final E/C0; Image has exact-zero target resources and need not resolve them. Neither derives from the other. Build.Resources itself never enters nodectl, so each active phase has one ordinary Sandbox reservation without double accounting. Disk-only E has no C reservation.
 
-Ready/error are retained Build history. Terminal transition atomically records finished_unix and releases registration usage. An executed Build first completes unit/cgroup/network/runtime/result/directory cleanup, then terminal commit releases its execution claim. Only fully cleaned, unclaimed rows can be reaped after terminal_ttl. Status, transient registration TemplateID, names/aliases and local listing disappear with the row; previously returned canonical TemplateIDs still work for Create/fromTemplate.
+Ready/error are retained Build history. Registration usage ends at cancel/delete intent commit or normal terminal transition. Terminal commit records finished_unix. An executed Build first completes unit/cgroup/network/runtime/result/directory cleanup, then terminal commit releases its execution claim. Fully cleaned, unclaimed rows can be explicitly deleted immediately or reaped after terminal_ttl. Status, transient registration TemplateID, names/aliases and local listing disappear with the row; previously returned canonical TemplateIDs still work for Create/fromTemplate.
 
 **Image-pull credentials, in priority order, otherwise anonymous:**
 
@@ -243,7 +273,8 @@ builds         build_id PK, template_id(transient-…), persist_id(<profile>-<ki
                enforcement_status, phase, phase_sandbox_id,
                runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
                runtime_envd_access_token_enc, runtime_prepare_json,
-               execution_result_json, created_unix, finished_unix
+               execution_result_json, created_unix, finished_unix,
+               cancel_requested_unix, delete_requested_unix
 build_mmds_route_secret_values
                build_id PK/FK builds(build_id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
@@ -265,3 +296,17 @@ Builder reconciles in the same startup gate. All live ownership is reconstructed
 Build rows store no directory paths. Derive both Build directories from BuildID and current RunRoot/BaseRoot. Every terminal path first fences exact unit/cgroup, detaches, clears runtime ownership and removes both directories; terminal commit atomically clears RunID/result and releases execution claim. Phase child cleanup is not final correctness authority. Node database, config socket and runner pidfile are outside object directories and unaffected by object RemoveAll.
 
 Shared SQLite infrastructure and the terminal reaper remain in [node reliability](node.md#14-reliability); this section owns the Build schema and recovery. Build rows are retention-bounded execution/status/alias records, not a permanent template catalog. Published canonical template references remain usable independently of their Build row.
+
+### 6.1 Cancellation, budgets and recovery
+
+Registration usage counts only status IN (registered, waiting, building) with both intent timestamps zero. Execution usage counts every execution_claimed=1 row regardless of status or intent. Counts and CPU/memory/storage vectors, actual admission SQL, management, metrics and node reports use these same definitions. Waiting count and oldest waiting include only executable entries. Accepting cancellation/deletion releases registration capacity at commit; execution capacity remains until exact unit stop, local cleanup and PutBuildTerminal succeed. Normal success, failure and timeout still clean up automatically. Capacity changes wake the existing FIFO pool and node usage reporting with coalesced notifications; periodic checks remain the fallback.
+
+The existing process-local execution owner is installed before claim publication. Intent stops further trigger/claim/assignment/bootstrap/prepare/phase/result advancement, and notifies that owner to stop the exact RunID unit, including phase VMs and helpers. Host preparation exits or rolls back its uncommitted resources before that same owner cleans the exact network, runtime entry, BuildRunDir and BuildBaseDir. Build locks cover short identity and database/event commits, never unit stop or directory removal. Cleanup CAS remains valid after cancellation. HTTP disconnect does not revoke accepted intent; cleanup uses independent bounded external-operation contexts.
+
+Cancellation and result acceptance are ordered durably: cancel-first rejects new results and finishes with reason `build cancelled by user`; result-first keeps the accepted success/failure, including identical result replay, while stopping and cleaning. Direct Image reuse follows the same terminal condition. Old callbacks cannot upsert deleted rows or affect a replacement transient identity. Database commits precede observation; only actual hard deletion emits BuildDelete. Error removal from an observer collection is a separate fact.
+
+Cleanup completes before PutBuildTerminal releases the claim; conditional hard deletion follows as a separate commit. A final DELETE failure preserves delete intent without charging execution again. Immediate retry, bounded lifecycle compensation and startup recovery continue without waiting for terminal_ttl. Stop/readback/detach/directory/terminal failures retain necessary ownership for retry. Startup handles cancel/delete before adopting a pipeline: stop live units, clean exited units, delete owner-free marked terminal rows, never reread source artifacts for cancelled work or reset the original execution deadline.
+
+The two intent columns migrate additively as INTEGER NOT NULL DEFAULT 0; existing rows start at zero. Registry retains immutable registration transient ID separately from result PersistID and resolves group + transient ID to the original node. Full node sync refreshes the projection under existing Registry bindings and removes missing rows after a lost BuildDelete. It does not reconstruct lost Registry ownership shards (§13 of cluster.md). Router forwards Query and Builder Header unchanged; node ownership is authoritative. Unavailable nodes, incomplete projection or failed authoritative lookup return service errors and never cause reassignment or speculative deletion.
+
+Upgrade node/router/Registry writers together under the existing version coordination. Before reverting to a writer that does not understand intent, stop new cancellation/deletion acceptance and converge all pending operations using the current version. An additive schema alone does not make rollback safe while intent remains. No long-term dual writer, new task table or compatibility service is required. Published canonical img/sbx/snp references, existing Sandboxes, downstream fromTemplate and other Builds sharing an artifact remain usable after record deletion; remote content is never removed.

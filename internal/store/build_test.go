@@ -46,7 +46,7 @@ func buildTriggerCandidate(base *types.Build, label string) *types.Build {
 	candidate := *base
 	// These registration/lifecycle fields deliberately differ. The trigger
 	// commit must never write them.
-	candidate.TemplateID = "transient-candidate-" + label
+	// TemplateID is now an exact lifecycle precondition, not a mutable field.
 	candidate.PersistID = "persist-candidate-" + label
 	candidate.APISecret = "api-candidate-" + label
 	candidate.ManifestKey = "manifest-candidate-" + label

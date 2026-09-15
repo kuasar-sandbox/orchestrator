@@ -121,6 +121,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if templateID == "" {
 		templateID = "transient-" + newID()
 	}
+	ref.TemplateID = templateID
 	excluded := placementExclusions{}
 	var lastFailure error
 	if req.BuildID != "" {
@@ -138,6 +139,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			// A prior dispatch had an ambiguous result. Re-establish the node
 			// ownership index and replay the exact stored intent to the same node;
 			// neither current placement nor Provider output may change it.
+			ref.TemplateID = rec.TemplateID
 			if err := r.stores.AddNodeBuildRef(ctx, rec.NodeID, ref); err != nil {
 				return nil, err
 			}
@@ -560,12 +562,15 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 	if err != nil {
 		return fmt.Errorf("lookup build owner: %w", err)
 	}
-	if !found {
+	if !found || (ref.TemplateID != "" && ref.TemplateID != e.TemplateID) {
 		return nil
 	}
 	state := BuildState(e.State)
 	update := func(writeCtx context.Context) error {
 		return r.updateBuildProjection(writeCtx, ref.Group, e.BuildID, nodeID, func(rec *BuildRecord) {
+			if e.TemplateID != "" && types.IsTransientID(rec.TemplateID) && rec.TemplateID != e.TemplateID {
+				return
+			}
 			rec.State = state
 			// A state event can outrun or survive loss of the synchronous registration
 			// ACK. Keep the exact replay envelope until that ACK's accepted target is
@@ -574,8 +579,11 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 				rec.RegistrationImageRepo = ""
 				rec.RegistrationRegistryAuth = ""
 			}
-			if e.TemplateID != "" {
+			if types.IsTransientID(e.TemplateID) {
 				rec.TemplateID = e.TemplateID
+			}
+			if e.PersistID != "" {
+				rec.PersistID = e.PersistID
 			}
 			rec.Reason = e.Reason
 		})
@@ -596,7 +604,7 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 // applyBuildDelete removes only the projection bound to this exact node. The
 // node's SQLite deletion is the lifecycle decision; Registry has no terminal
 // timer of its own.
-func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string) error {
+func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID, templateID string) error {
 	if nodeID == "" || buildID == "" {
 		return nil
 	}
@@ -605,12 +613,15 @@ func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string)
 		if err != nil {
 			return fmt.Errorf("lookup build delete owner: %w", err)
 		}
-		if !found {
+		if !found || (ref.TemplateID != "" && ref.TemplateID != templateID) {
 			return nil
 		}
 		record, revision, recordFound, err := r.stores.getRouteBuildShard(ctx, ref.Group, buildID)
 		if err != nil {
 			return fmt.Errorf("read build delete projection: %w", err)
+		}
+		if recordFound && templateID != "" && record.TemplateID != templateID {
+			return nil
 		}
 		if recordFound && record.NodeID == nodeID {
 			// BuildStarting is the Registry's immutable pre-accept dispatch
@@ -662,7 +673,7 @@ func (r *Registry) applyNodeBuildFullSnapshot(ctx context.Context, nodeID string
 		if !found || current != baseline {
 			continue
 		}
-		if err := r.applyBuildDelete(ctx, nodeID, baseline.BuildID); err != nil {
+		if err := r.applyBuildDelete(ctx, nodeID, baseline.BuildID, baseline.TemplateID); err != nil {
 			return err
 		}
 	}
@@ -722,16 +733,53 @@ func (r *Registry) lookupNodeBuildRefVersion(ctx context.Context, nodeID, buildI
 // ResolveBuild maps a group's build_id to its node (router restart recovery: the
 // router's in-memory build map is lost, but route_link replicated build state is
 // still group-sharded).
-func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*BuildReserveResult, bool) {
+func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*BuildReserveResult, bool, error) {
 	b, found, err := r.stores.GetBuildInGroup(ctx, group, buildID)
-	if err != nil || !found || b.State == BuildStarting || !b.RegistrationTargetSet {
-		return nil, false
+	if err != nil || !found {
+		return nil, false, err
 	}
-	return &BuildReserveResult{
-		BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID,
-		APIEndpoint: r.nodeAPIEndpoint(ctx, b.NodeID), Profile: b.Profile,
-		Target: cloneBuildTarget(b.RegistrationTarget),
-	}, true
+	return r.resolveBuildRecord(ctx, b)
+}
+
+func (r *Registry) resolveBuildRecord(ctx context.Context, b *BuildRecord) (*BuildReserveResult, bool, error) {
+	if b.State == BuildStarting || !b.RegistrationTargetSet {
+		return nil, false, fmt.Errorf("build registration binding is not yet complete")
+	}
+	result := r.buildReserveResult(ctx, b)
+	if result.APIEndpoint == "" {
+		return nil, false, fmt.Errorf("build node API endpoint is unavailable")
+	}
+	return result, true, nil
+}
+
+// ResolveBuildByTemplate reads only the group's existing retained projection.
+// Missing registration IDs indicate an incomplete upgrade/full sync, not 404.
+func (r *Registry) ResolveBuildByTemplate(ctx context.Context, group, templateID string) (*BuildReserveResult, bool, error) {
+	var match *BuildRecord
+	incomplete := false
+	err := r.stores.RangeBuildsInGroup(ctx, group, func(b *BuildRecord) error {
+		if types.ValidateTransientID(b.TemplateID) != nil {
+			incomplete = true
+		}
+		if b.TemplateID == templateID {
+			if match != nil {
+				return fmt.Errorf("ambiguous transient build identity")
+			}
+			copy := *b
+			match = &copy
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if match != nil {
+		return r.resolveBuildRecord(ctx, match)
+	}
+	if incomplete {
+		return nil, false, fmt.Errorf("build transient projection requires node full sync")
+	}
+	return nil, false, nil
 }
 
 func acceptedBuildRegistrationTarget(ack *routesync.CmdAck) (*types.BuildTarget, error) {
