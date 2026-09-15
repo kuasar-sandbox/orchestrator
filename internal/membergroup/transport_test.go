@@ -34,7 +34,7 @@ func TestStreamClientsShareTLSSettingsWithoutMutatingConfig(t *testing.T) {
 			a, b := newStreamClient(cfg), newStreamClient(cfg)
 			defer a.CloseIdleConnections()
 			defer b.CloseIdleConnections()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			testCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
 			ready, start := make(chan struct{}), make(chan struct{})
@@ -43,22 +43,22 @@ func TestStreamClientsShareTLSSettingsWithoutMutatingConfig(t *testing.T) {
 				// handshake together with the other Transport's initialization.
 				var readyOnce sync.Once
 				tr := a.Transport.(*http.Transport)
-				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+				tr.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+					conn, err := (&net.Dialer{}).DialContext(testCtx, network, addr)
 					readyOnce.Do(func() { close(ready) })
 					select {
 					case <-start:
-					case <-ctx.Done():
+					case <-testCtx.Done():
 						if conn != nil {
 							_ = conn.Close()
 						}
-						return nil, ctx.Err()
+						return nil, testCtx.Err()
 					}
 					return conn, err
 				}
 			}
 			request := func(c *http.Client) error {
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+				req, err := http.NewRequestWithContext(testCtx, http.MethodGet, srv.URL, nil)
 				if err != nil {
 					return err
 				}
@@ -78,8 +78,8 @@ func TestStreamClientsShareTLSSettingsWithoutMutatingConfig(t *testing.T) {
 				go func() { done <- request(a) }()
 				select {
 				case <-ready:
-				case <-ctx.Done():
-					t.Fatal(ctx.Err())
+				case <-testCtx.Done():
+					t.Fatal(testCtx.Err())
 				}
 			} else {
 				// Both initializations may append to the protocol list's spare capacity.
