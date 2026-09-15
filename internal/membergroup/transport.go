@@ -183,6 +183,10 @@ func NewHTTPTransport(label, selfName string, resolve Resolver, tlsCfg *tls.Conf
 }
 
 func newStreamClient(tlsCfg *tls.Config) *http.Client {
+	// Each Transport initializes HTTP/2 by updating its TLS configuration.
+	if tlsCfg != nil {
+		tlsCfg = tlsCfg.Clone()
+	}
 	tr := &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
 	return &http.Client{Transport: tr}
 }
