@@ -545,7 +545,7 @@ func testBuild(id string, state types.BuildState, created int64) *types.Build {
 		Resources: types.BuildResources{CPU: 1000, Memory: 1024, Storage: 2048},
 		Steps:     []types.TemplateStep{{Type: "RUN", Args: []string{"echo", "hello"}}}, StartCmd: "start", ReadyCmd: "ready",
 		Metadata: map[string]string{"key": "build"}, RunID: "run-" + id,
-		EnforcementStatus: "cpu,memory", Phase: "b", PhaseSandboxID: "phase-sandbox", RuntimeVswitchPort: "port-2",
+		Phase: "b", PhaseSandboxID: "phase-sandbox", RuntimeVswitchPort: "port-2",
 		RuntimeFloatingIP: "192.0.2.2", RuntimePortMAC: "02:00:00:00:00:02", RuntimeEnvdAccessToken: "not projected",
 		RuntimePrepareJSON: `{"not":"projected"}`, RegistryAuth: "not projected", ClusterGroup: "cluster-group",
 		Builder: types.BuildOptions{

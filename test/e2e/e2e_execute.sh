@@ -130,9 +130,9 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/
     || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
-# Give the outer Builder unit the host's full CPU capacity. The phase Sandbox
-# keeps its independent 2-vCPU resource contract below, while the parent unit
-# no longer introduces a second CPU bottleneck around snapshot teardown.
+# Preserve the existing Build admission vector and its derived A/B CPU.
+# Target Sandbox CPU resolves independently from the configuration below;
+# parent Builder services/slices do not add a CPU policy.
 BUILDER_CPU="$(nproc)"
 
 WORK="$(mktemp -d /tmp/e-XXXXXX)"

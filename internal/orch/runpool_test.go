@@ -15,20 +15,18 @@ import (
 )
 
 type runPoolTestLauncher struct {
-	started   chan string
-	stopped   chan string
-	reset     chan string
-	startFn   func(context.Context, string) error
-	stopFn    func(context.Context, string) error
-	resources map[string]launcher.ResourceProperties
+	started chan string
+	stopped chan string
+	reset   chan string
+	startFn func(context.Context, string) error
+	stopFn  func(context.Context, string) error
 }
 
 func newRunPoolTestLauncher() *runPoolTestLauncher {
 	l := &runPoolTestLauncher{
-		started:   make(chan string, 512),
-		stopped:   make(chan string, 512),
-		reset:     make(chan string, 512),
-		resources: make(map[string]launcher.ResourceProperties),
+		started: make(chan string, 512),
+		stopped: make(chan string, 512),
+		reset:   make(chan string, 512),
 	}
 	l.startFn = func(ctx context.Context, unit string) error {
 		select {
@@ -65,14 +63,7 @@ func (l *runPoolTestLauncher) List(context.Context, string) ([]launcher.Unit, er
 	return nil, nil
 }
 func (l *runPoolTestLauncher) Reload(context.Context) error { return nil }
-func (l *runPoolTestLauncher) SetResources(_ context.Context, unit string, p launcher.ResourceProperties) error {
-	l.resources[unit] = p
-	return nil
-}
-func (l *runPoolTestLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
-	return l.resources[unit], nil
-}
-func (l *runPoolTestLauncher) Close() error { return nil }
+func (l *runPoolTestLauncher) Close() error                 { return nil }
 
 func testRunUnit(runID string) string { return "sandbox-runner@" + runID + ".service" }
 

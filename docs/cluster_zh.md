@@ -1041,6 +1041,12 @@ changes 继续缓存在独立 subscription 中，必须等 `build_sync_end` 后�
 
 Cancel 以 group + BuildID 定位原节点. DELETE 在既有 Build 投影中以 group + 不可变注册 transient TemplateID 定位; 成功后 PersistID 单独保留. Router 原样转发 DELETE Query 与 Builder Header, 由节点动作 parser 和 ownership 校验裁决. Header 的显式 cancel > Query > false; {} 不覆盖 Query. 节点不可达、投影不完整或权威查询失败返回服务错误. Registry 不提前删归属、不释放节点执行用量、不把取消改派其他节点. BuildStarting 歧义注册与既有 binding 合同保持不变. 状态、重试、恢复和协调升级/回退见 [Build 动作](node-build_zh.md#11-取消与删除-build-记录).
 
+Build 放置继续使用 registration headroom,由选中节点的持久准入事务最终裁决. 节点保留
+execution 准入, FIFO 和 exact run-id 归属,注册不做 systemd quota 编码校验. Build.Resources
+同时解析 A/B Sandbox 规格,目标 Sandbox 独立解析. 节点 Builder unit/slice 负责生命周期
+与委托,阶段 VMM 资源限额仅由 sandbox-ctl 执行.
+
+
 ## 13. 状态所有权与灾备边界
 
 node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/build record、`node_link` 中的

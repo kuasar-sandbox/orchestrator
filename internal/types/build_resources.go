@@ -7,8 +7,8 @@ import (
 )
 
 // BuildResources is the immutable resource demand of one Build. CPU is stored
-// in milli-CPU and memory/storage in bytes. It is intentionally unrelated to a
-// phase sandbox's capacity, allocatable, startup, or controller resources.
+// in milli-CPU and memory/storage in bytes. It supplies admission/accounting
+// and A/B execution sandbox resources. Target Sandbox resources are independent.
 type BuildResources struct {
 	CPU     int64 `json:"cpu" yaml:"cpu"`
 	Memory  int64 `json:"memory" yaml:"memory"`

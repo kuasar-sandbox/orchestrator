@@ -7,14 +7,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 )
 
 // InstallUnits generates and installs the systemd template units (+ slices)
 // node-ctl drives, then daemon-reloads if anything changed. When
-// install_units=false, the operator manages unit files out of band and this
-// method only verifies explicitly configured aggregate builder limits.
+// units.install=false, the operator manages unit files out of band and this
+// method performs no file or systemd operations.
 //
 //   - <runner>  (sandbox-runner@.service): one run-id unit that waits for a sandbox
 //     assignment, then exec-replaces into sandbox-ctl run with config pulled over
@@ -28,13 +27,13 @@ import (
 // reaper and the builder resource pool can account and reclaim them.
 func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 	if o.cfg.Units.Install != nil && !*o.cfg.Units.Install {
-		return o.verifyBuilderSlice(ctx)
+		return nil
 	}
 	files := map[string]string{
 		o.cfg.Units.Runner:      o.runnerUnitFile(),
 		o.cfg.Units.Builder:     o.builderUnitFile(),
-		"sandbox-runner.slice":  sliceFile("kuasar sandbox runners", ""),
-		"sandbox-builder.slice": sliceFile("kuasar image builders", o.builderSliceCaps()),
+		"sandbox-runner.slice":  sliceFile("kuasar sandbox runners"),
+		"sandbox-builder.slice": sliceFile("kuasar image builders"),
 	}
 	changed := false
 	for name, content := range files {
@@ -53,7 +52,7 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 			return err
 		}
 	}
-	return o.verifyBuilderSlice(ctx)
+	return nil
 }
 
 func (o *Orchestrator) runnerUnitFile() string {
@@ -113,57 +112,8 @@ Delegate=yes
 `, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
 }
 
-func sliceFile(desc, caps string) string {
-	return fmt.Sprintf("[Unit]\nDescription=%s\nBefore=slices.target\n\n[Slice]\n%s", desc, caps)
-}
-
-// builderSliceCaps renders the cgroup ceiling for the builder pool from config.
-func (o *Orchestrator) builderSliceCaps() string {
-	var b strings.Builder
-	limit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
-	if err != nil {
-		return ""
-	}
-	if limit.Resources.CPU > 0 {
-		fmt.Fprintf(&b, "CPUQuota=%s%%\n", formatMilliPercent(limit.Resources.CPU))
-	}
-	if limit.Resources.Memory > 0 {
-		fmt.Fprintf(&b, "MemoryMax=%d\n", limit.Resources.Memory)
-	}
-	return b.String()
-}
-
-func formatMilliPercent(cpuMilli int64) string {
-	whole, fraction := cpuMilli/10, cpuMilli%10
-	if fraction == 0 {
-		return fmt.Sprintf("%d", whole)
-	}
-	return fmt.Sprintf("%d.%d", whole, fraction)
-}
-
-func (o *Orchestrator) verifyBuilderSlice(ctx context.Context) error {
-	limit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
-	if err != nil {
-		return err
-	}
-	want, err := builderResourceProperties(limit.Resources)
-	if err != nil {
-		return err
-	}
-	if want.CPUQuotaPerSecUSec == 0 && want.MemoryMax == 0 {
-		return nil
-	}
-	got, err := o.lc.Resources(ctx, "sandbox-builder.slice", "Slice")
-	if err != nil {
-		return fmt.Errorf("orch: verify sandbox-builder.slice resource limits: %w", err)
-	}
-	if want.CPUQuotaPerSecUSec != 0 && got.CPUQuotaPerSecUSec != want.CPUQuotaPerSecUSec {
-		return fmt.Errorf("orch: sandbox-builder.slice CPUQuota effective=%d want=%d", got.CPUQuotaPerSecUSec, want.CPUQuotaPerSecUSec)
-	}
-	if want.MemoryMax != 0 && got.MemoryMax != want.MemoryMax {
-		return fmt.Errorf("orch: sandbox-builder.slice MemoryMax effective=%d want=%d", got.MemoryMax, want.MemoryMax)
-	}
-	return nil
+func sliceFile(desc string) string {
+	return fmt.Sprintf("[Unit]\nDescription=%s\nBefore=slices.target\n\n[Slice]\n", desc)
 }
 
 // --- unit-name helpers (honor the configurable template names) ---

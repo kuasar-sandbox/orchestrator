@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -290,21 +291,23 @@ func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, buil
 	// stale pre-check and oversubscribe the durable ledger.
 	insertSelect := strings.Replace(buildInsertSQL, "\n\tVALUES (", "\n\tSELECT ", 1)
 	insertSelect = strings.TrimSuffix(insertSelect, ")") + `
-	WHERE (?=0 OR (SELECT COUNT(*) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)`
+	WHERE (SELECT COUNT(*) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0) <= ?
+	  AND COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?
+	  AND COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?
+	  AND COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?`
+	// Unlimited policy dimensions still need representable durable sums, as
+	// in BuildAdmissionLimit.AllowsAdd. AllowsOne checked each request above.
 	headroom := func(configured, requested int64) int64 {
 		if configured == 0 {
-			return 0
+			configured = math.MaxInt64
 		}
 		return configured - requested
 	}
 	args = append(args,
-		limit.MaxBuilds, headroom(limit.MaxBuilds, 1),
-		limit.Resources.CPU, headroom(limit.Resources.CPU, build.Resources.CPU),
-		limit.Resources.Memory, headroom(limit.Resources.Memory, build.Resources.Memory),
-		limit.Resources.Storage, headroom(limit.Resources.Storage, build.Resources.Storage),
+		headroom(limit.MaxBuilds, 1),
+		headroom(limit.Resources.CPU, build.Resources.CPU),
+		headroom(limit.Resources.Memory, build.Resources.Memory),
+		headroom(limit.Resources.Storage, build.Resources.Storage),
 	)
 	result, err := tx.ExecContext(ctx, insertSelect, args...)
 	if err != nil {
@@ -625,7 +628,7 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build, cleanedRuntime *typ
 	result, err := tx.ExecContext(ctx, `UPDATE builds SET
 		persist_id=?,kind=?,start_cmd=?,ready_cmd=?,status=?,reason=?,run_id='',
 		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
-		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',
+		execution_claimed_unix=0,phase='',phase_sandbox_id='',
 		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json='',
 		execution_result_json='',finished_unix=?
 		WHERE build_id=? AND template_id=? AND run_id=? AND status=? AND execution_claimed=? AND execution_claimed_unix=?

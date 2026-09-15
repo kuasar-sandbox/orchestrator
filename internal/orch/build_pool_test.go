@@ -21,10 +21,6 @@ import (
 )
 
 type assignmentOrderLauncher struct {
-	events []string
-	value  launcher.ResourceProperties
-	setErr error
-	onRead func()
 	onList func()
 }
 
@@ -38,22 +34,7 @@ func (l *assignmentOrderLauncher) List(context.Context, string) ([]launcher.Unit
 	return nil, nil
 }
 func (l *assignmentOrderLauncher) Reload(context.Context) error { return nil }
-func (l *assignmentOrderLauncher) SetResources(_ context.Context, _ string, value launcher.ResourceProperties) error {
-	l.events = append(l.events, "set")
-	if l.setErr != nil {
-		return l.setErr
-	}
-	l.value = value
-	return nil
-}
-func (l *assignmentOrderLauncher) Resources(context.Context, string, string) (launcher.ResourceProperties, error) {
-	l.events = append(l.events, "read")
-	if l.onRead != nil {
-		l.onRead()
-	}
-	return l.value, nil
-}
-func (l *assignmentOrderLauncher) Close() error { return nil }
+func (l *assignmentOrderLauncher) Close() error                 { return nil }
 
 func TestClaimWaitingBuildSurvivesRunIDPersistence(t *testing.T) {
 	o := testOrch(t)
@@ -100,7 +81,7 @@ func TestClaimWaitingBuildSurvivesRunIDPersistence(t *testing.T) {
 	}
 }
 
-func TestPrepareBuilderUnitAppliesAndVerifiesLimitsBeforeDurableAssignment(t *testing.T) {
+func TestPrepareBuilderUnitDurablyBindsClaimBeforeAssignment(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Units.Builder = "sandbox-builder@.service"
 	ctx := context.Background()
@@ -115,33 +96,24 @@ func TestPrepareBuilderUnitAppliesAndVerifiesLimitsBeforeDurableAssignment(t *te
 		t.Fatal(err)
 	}
 	lc := &assignmentOrderLauncher{}
-	lc.onRead = func() {
-		stored, err := o.st.GetBuild(ctx, b.BuildID)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		if stored.RunID != "" {
-			t.Errorf("run id became visible before effective properties were read: %q", stored.RunID)
-		}
-	}
 	o.lc = lc
 	runID := "br-00000000-0000-7000-8000-000000000205"
 	unit, err := o.prepareBuilderUnit(ctx, b, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unit != "sandbox-builder@"+runID+".service" || strings.Join(lc.events, ",") != "set,read" {
-		t.Fatalf("assignment barrier unit=%q events=%v", unit, lc.events)
+	if unit != "sandbox-builder@"+runID+".service" {
+		t.Fatalf("assignment barrier unit=%q", unit)
 	}
 	stored, err := o.st.GetBuild(ctx, b.BuildID)
-	if err != nil || stored.RunID != runID || stored.EnforcementStatus != "cpu,memory" {
+	if err != nil || stored.RunID != runID {
 		t.Fatalf("durable assignment = %+v, %v", stored, err)
 	}
 }
 
-func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
-	o := testOrch(t)
+func TestPrepareBuilderUnitBindFailureDoesNotPublishOwnership(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bind.db")
+	o := testOrchCfgAt(t, &config.Config{}, dbPath)
 	o.cfg.Units.Builder = "sandbox-builder@.service"
 	ctx := context.Background()
 	manifestKey := strings.Repeat("c", 64)
@@ -154,14 +126,21 @@ func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	wantErr := errors.New("set property failed")
-	o.lc = &assignmentOrderLauncher{setErr: wantErr}
-	if _, err := o.prepareBuilderUnit(ctx, b, "br-failed"); !errors.Is(err, wantErr) {
+	raw, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec("CREATE TRIGGER fail_run_bind BEFORE UPDATE OF run_id ON builds BEGIN SELECT RAISE(ABORT, 'bind failed'); END"); err != nil {
+		t.Fatal(err)
+	}
+	o.lc = &assignmentOrderLauncher{}
+	if _, err := o.prepareBuilderUnit(ctx, b, "br-failed"); err == nil || !strings.Contains(err.Error(), "bind failed") {
 		t.Fatalf("prepare error = %v", err)
 	}
 	stored, err := o.st.GetBuild(ctx, b.BuildID)
-	if err != nil || stored.RunID != "" || stored.EnforcementStatus != "" {
-		t.Fatalf("failed property application bound run = %+v, %v", stored, err)
+	if err != nil || stored.RunID != "" || !stored.ExecutionClaimed || b.RunID != "" {
+		t.Fatalf("failed durable binding changed ownership = %+v, %v", stored, err)
 	}
 }
 
@@ -545,5 +524,93 @@ func TestTerminalPersistenceFailureRetainsClaimAndRetriesSafely(t *testing.T) {
 	}
 	if stored.Status != types.BuildError || stored.ExecutionClaimed {
 		t.Fatalf("terminal retry result = %+v", stored)
+	}
+}
+
+func TestFiniteExecutionIdlePoolBindsBeforePublishingAssignment(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Units.Builder = "sandbox-builder@.service"
+	cpu, memory := config.CPUCores("2"), "2GiB"
+	o.cfg.Units.BuilderPoolSize = 1
+	o.cfg.Builder.Admission.Execution = &config.BuildAdmissionLimitConfig{
+		Resources: config.BuildAdmissionResourcesConfig{CPU: &cpu, Memory: &memory},
+	}
+	lc := newRunPoolTestLauncher()
+	o.lc = lc
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := newRunPool(runKindBuild, o.cfg.Units.BuilderPoolSize, time.Second, t.TempDir(), lc, o.builderUnit, o.log)
+	if err := pool.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var runID string
+	select {
+	case unit := <-lc.started:
+		runID = o.builderUnitToRunID(unit)
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle builder did not start")
+	}
+	if runID == "" {
+		t.Fatal("invalid builder run-id")
+	}
+	waiter := &runWaitReq{runID: runID, ctx: ctx, resp: make(chan runWaitResp, 1)}
+	select {
+	case pool.waitCh <- waiter:
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle builder did not wait")
+	}
+	usage, err := o.st.BuildUsage(ctx)
+	if err != nil || usage.RegistrationBuilds != 0 || usage.ExecutionBuilds != 0 {
+		t.Fatalf("idle pool charged Build ledger: %+v, %v", usage, err)
+	}
+	b := observerBuildingFixture(t, "pool-bind")
+	b.Status, b.RunID, b.ExecutionClaimed, b.ExecutionClaimedUnix = types.BuildWaiting, "", false, 0
+	b.Resources = types.BuildResources{CPU: 1000, Memory: 1 << 30}
+	if err := o.st.PutBuild(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	limit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won, err := o.st.ClaimBuildExecution(ctx, b.BuildID, limit, time.Now()); err != nil || !won {
+		t.Fatalf("claim=%t, %v", won, err)
+	}
+	b, err = o.st.GetBuild(ctx, b.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assigned, err := pool.Assign(ctx, b.BuildID, func(exact string) error {
+		if _, err := o.prepareBuilderUnit(ctx, b, exact); err != nil {
+			return err
+		}
+		stored, err := o.st.GetBuild(ctx, b.BuildID)
+		if err != nil {
+			return err
+		}
+		if stored.RunID != exact || !stored.ExecutionClaimed {
+			return errors.New("assignment crossed durable binding")
+		}
+		select {
+		case <-waiter.resp:
+			return errors.New("worker received assignment before commit returned")
+		default:
+		}
+		return nil
+	})
+	if err != nil || assigned != runID {
+		t.Fatalf("assignment=%q, %v", assigned, err)
+	}
+	select {
+	case result := <-waiter.resp:
+		if result.err != nil || !result.ok || result.taskID != b.BuildID {
+			t.Fatalf("worker result=%+v", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("bound assignment not published")
+	}
+	usage, err = o.st.BuildUsage(ctx)
+	if err != nil || usage.ExecutionBuilds != 1 || usage.Execution.CPU != 1000 {
+		t.Fatalf("active ledger=%+v, %v", usage, err)
 	}
 }

@@ -91,10 +91,6 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err := resources.ValidateRequired(); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	if _, err := builderResourceProperties(resources); err != nil {
-		o.recordRegistrationRejection("systemd_encoding")
-		return nil, fmt.Errorf("%w: build resources cannot be enforced by systemd: %v", api.ErrBadRequest, err)
-	}
 	executionLimit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if err != nil {
 		return nil, err

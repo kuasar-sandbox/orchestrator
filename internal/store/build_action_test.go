@@ -28,7 +28,6 @@ func TestBuildActionStateMatrix(t *testing.T) {
 					b.Status, b.ExecutionClaimed = state, owned
 					if owned {
 						b.ExecutionClaimedUnix = 123
-						b.EnforcementStatus = "pending"
 					}
 					b.Reason = "original diagnosis"
 					if err := st.PutBuild(ctx, b); err != nil {
