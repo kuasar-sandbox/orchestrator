@@ -229,9 +229,9 @@ type Build struct {
 	RunID                     string   // current systemd builder runner instance id
 	Names                     []string // user-supplied name(s) + persist id (when ready)
 	Aliases                   []string // user-supplied alias(es) + persist id (when ready)
-	// Resources is the immutable outer Build demand used by registration and
-	// execution admission plus systemd enforcement. It never becomes sandbox
-	// capacity/allocatable/startup and never enters a snapshot.
+	// Resources is the immutable Build demand used by registration/execution
+	// admission and A/B execution sandbox resource resolution. Final Sandbox
+	// resources are resolved independently; this vector is not snapshot metadata.
 	Resources BuildResources
 	// Metadata configures the portable artifact produced by this Build. Build-only
 	// options and instance-only secrets are removed before it is stored here;
@@ -255,7 +255,6 @@ type Build struct {
 	WaitingSequence      int64
 	ExecutionClaimed     bool
 	ExecutionClaimedUnix int64
-	EnforcementStatus    string
 	Phase                string
 	PhaseSandboxID       string
 	// Runtime network ownership is persisted only while execution is claimed so

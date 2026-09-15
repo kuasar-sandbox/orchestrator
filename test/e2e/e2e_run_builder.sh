@@ -7,8 +7,8 @@
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
 # as an envd-managed process. One durable conductor database is exercised
-# across publication-policy restarts, fifteen successful builds, one
-# deterministic failed build, and six creates:
+# across publication-policy restarts and live conductor recovery, successful
+# builds, failure/timeout/cancellation cleanup, and real Sandbox creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #       auto image requires request DNS to resolve the private registry name
@@ -16,6 +16,7 @@
 #       boots the steps VM from manifest://, applies RUN/ENV/WORKDIR, exports
 #       (config merge), runs startCmd/readyCmd on the production runtime,
 #       snapshots, then ONE publish uploads bundle + image + overlay
+#       survives conductor SIGKILL in B with the same claim, run-id and VMM
 #   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
 #       reads S only to select E, materializes E's root, and INHERITS its
 #       startCmd/readyCmd (reaching ready proves both ran)
@@ -66,6 +67,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
 . "$SCRIPT_DIR/lib/build_fixture_units.sh"
+. "$SCRIPT_DIR/lib/vmm_cgroup.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # Builds with steps/startCmd carry the e2b contract: envd runs them as
@@ -114,10 +116,8 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-# Keep #205's finite CPUQuota assertions while avoiding an additional parent
-# throttle around each independently limited phase VM. A Build leaves the
-# configured host reservation available; admission aggregate limits scale with
-# max_builds.
+# Keep the existing Build admission and A/B resource vectors. Runtime limits
+# belong to sandbox-ctl at the VMM leaf; no parent service/slice quota applies.
 HOST_CPU="$(nproc)"
 BUILDER_CPU=$((HOST_CPU > 2 ? 2 : 1))
 BUILDER_CPU_MILLI=$((BUILDER_CPU * 1000))
@@ -356,7 +356,7 @@ mmds:
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
-units: { dir: $UNIT_DIR }
+units: { dir: $UNIT_DIR, builder_pool_size: 1 }
 sandbox:
   resources:
     capacity: { cpu: 2, memory: 2GiB }
@@ -425,6 +425,18 @@ stop_conductor() {
     if kill -0 "$stopped_pid" 2>/dev/null; then
         kill -KILL "$stopped_pid" 2>/dev/null || true
     fi
+    wait "$stopped_pid" 2>/dev/null || true
+    for index in "${!PIDS[@]}"; do
+        [ "${PIDS[$index]}" != "$stopped_pid" ] || PIDS[index]=""
+    done
+    CONDUCTOR_PID=""
+}
+crash_conductor() {
+    # Kill only this test's conductor. The live Build unit and its guest must
+    # survive, retaining their existing durable ownership for reconciliation.
+    local stopped_pid="$CONDUCTOR_PID" index
+    [ -n "$stopped_pid" ] || fail "no test conductor to crash"
+    kill -KILL "$stopped_pid" || fail "crash test conductor $stopped_pid"
     wait "$stopped_pid" 2>/dev/null || true
     for index in "${!PIDS[@]}"; do
         [ "${PIDS[$index]}" != "$stopped_pid" ] || PIDS[index]=""
@@ -526,7 +538,7 @@ import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute("""
         select status, run_id, execution_claimed, execution_claimed_unix,
-               enforcement_status, phase, phase_sandbox_id,
+               phase, phase_sandbox_id,
                runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
                runtime_envd_access_token_enc, runtime_prepare_json,
                execution_result_json
@@ -535,6 +547,67 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 assert row is not None and row[0] == sys.argv[3], row
 assert row[1] == "" and row[2] == 0 and row[3] == 0, row
 assert all(value == "" for value in row[4:]), row
+PY
+}
+live_build_signature() { # $1=build id; phase-reservations.json must be current
+    python3 - "$WORK" "$1" <<'PY'
+import hashlib, json, pathlib, sqlite3, sys
+work = pathlib.Path(sys.argv[1])
+with sqlite3.connect(work / "lib/node-ctl.db", timeout=5) as db:
+    db.row_factory = sqlite3.Row
+    row = db.execute("select * from builds where build_id=?", (sys.argv[2],)).fetchone()
+assert row is not None, "live Build row is missing"
+row = dict(row)
+assert row["status"] == "building" and row["run_id"], "live Build lost its run-id"
+assert row["execution_claimed"] == 1 and row["execution_claimed_unix"] > 0, "live claim is missing"
+assert row["phase"] == "b" and row["phase_sandbox_id"], "expected live phase B"
+assert row["runtime_prepare_json"] and row["runtime_vswitch_port"], "preparation is missing"
+assert not row["execution_result_json"], "Build already accepted a result"
+reservations = json.loads((work / "phase-reservations.json").read_text())
+matches = [item for item in reservations if item["sandbox_id"] == row["phase_sandbox_id"]]
+assert len(matches) == 1, "live phase must have exactly one reservation"
+reservation = matches[0]
+vmm = pathlib.Path(reservation["cgroup_path"])
+vmm_members = [int(pid) for pid in (vmm / "cgroup.procs").read_text().split()]
+# The existing VMM membership check accepts kernel tasks outside this PID
+# namespace, which cgroup.procs renders as 0. They have no inspectable /proc
+# identity. Keep every visible member, including associated KVM workers.
+vmm_pids = [pid for pid in vmm_members if pid != 0]
+assert vmm_pids, "phase VMM is not populated"
+builder_pid = int((work / "run/runners" / (row["run_id"] + ".pid")).read_text())
+ctl_pid = reservation["peer_pid"]
+pids = {
+    builder_pid, ctl_pid, *vmm_pids,
+}
+assert len(pids) >= 3 and all(pid > 0 for pid in pids), (
+    "missing builder/ctl/VMM processes", builder_pid, ctl_pid, vmm_members)
+print(f"live ownership: builder={builder_pid} ctl={ctl_pid} vmm_members={vmm_members}", file=sys.stderr)
+# Include process start ticks so PID reuse cannot masquerade as live adoption.
+processes = {}
+for pid in sorted(pids):
+    stat = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    assert stat[0] != "Z", f"process {pid} is a zombie"
+    processes[str(pid)] = stat[19]
+# Compare every durable value, including ciphertext and preparation, without
+# writing the values themselves into test output or another plaintext fixture.
+raw = json.dumps(row, sort_keys=True, default=lambda value: value.hex()).encode()
+print(json.dumps({"run_id": row["run_id"], "row_sha256": hashlib.sha256(raw).hexdigest(),
+                  "processes": processes, "vmm_path": str(vmm)}, sort_keys=True))
+PY
+}
+assert_build_processes_gone() { # $1=live signature JSON
+    python3 - "$1" <<'PY'
+import json, pathlib, sys
+signature = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for pid, start in signature["processes"].items():
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        continue
+    assert stat[19] != start, f"Build process {pid} still exists after claim release"
+events = pathlib.Path(signature["vmm_path"]) / "cgroup.events"
+if events.exists():
+    assert "populated 0" in events.read_text().splitlines(), "VMM still populated after claim release"
 PY
 }
 build_trigger_signature() { # $1=build id
@@ -784,8 +857,8 @@ register() { # name [profile] [target-json] [sandbox-config=0|1] → sets TID/BI
     expected_profile="${2:-e2b}"
     target_json="${3:-}"
     sandbox_config="${4:-0}"
-    # The finite, asserted Builder quota equals host capacity; the phase
-    # A/B sandbox is derived from that Build quota. Target Sandbox capacity is
+    # A/B sandbox resources derive from this immutable Build vector.
+    # Parent services/slices add no CPU/memory policy. Target Sandbox capacity is
     # a separate Create input and is included only for Sandbox-producing cases.
     body="{\"name\":\"$1\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
     [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
@@ -842,7 +915,7 @@ PY
     done
     [ -n "$phase" ] || fail "build $bid never exposed active phase $expected_phase"
 
-    python3 - "$WORK/resp.body" "$BUILDER_CPU_MILLI" <<'PY' || fail "active Build status resources/enforcement"
+    python3 - "$WORK/resp.body" "$BUILDER_CPU_MILLI" <<'PY' || fail "active Build status admission/phase"
 import json, sys
 status = json.load(open(sys.argv[1]))
 assert status["resources"] == {
@@ -851,7 +924,7 @@ assert status["resources"] == {
     "storageBytes": 4 << 30,
 }, status
 assert status["executionClaimed"] is True, status
-assert status["systemdEnforcement"] == "cpu,memory", status
+assert "systemdEnforcement" not in status, status
 assert status["storageEnforcement"] == "admission-only", status
 PY
 
@@ -943,6 +1016,8 @@ PY
     ctl_path="$(dirname "$vmm_path")/ctl"
     unit_path=$(dirname "$vmm_path")
     slice_path=$(dirname "$unit_path")
+    e2e_assert_vmm_cgroup_members /proc "$vmm_path/cgroup.procs" \
+        || fail "phase VMM membership does not match Cloud Hypervisor and its KVM workers"
     grep -Eq '/sandbox-builder.slice/.+/ctl$' "/proc/$build_pid/cgroup" \
         || fail "run-builder pid $build_pid is not in its ctl subgroup"
     grep -Eq '/sandbox-builder.slice/.+/ctl$' "/proc/$sandbox_ctl_pid/cgroup" \
@@ -953,9 +1028,8 @@ PY
     [ "$(cat "$ctl_path/memory.high")" = "max" ] || fail "builder ctl subgroup inherited a low memory.high"
     # Cold start deliberately leaves VMM memory.high=max through launch ACK and
     # settled.  The first trusted guest report starts the initial shrink, and
-    # high becomes finite only after balloon current converges.  The B2 phase
-    # stays alive for 20 seconds specifically so active enforcement can be
-    # inspected; wait inside that window instead of racing the report barrier.
+    # high becomes finite only after balloon current converges. B2 waits on a
+    # guest marker while these checks and live recovery inspect its resources.
     for _ in $(seq 1 60); do
         memory_high=$(cat "$vmm_path/memory.high" 2>/dev/null || true)
         [ "$memory_high" != "max" ] && [ -n "$memory_high" ] && break
@@ -964,7 +1038,7 @@ PY
     if [ "$memory_high" = "max" ] || [ -z "$memory_high" ]; then
         fail "phase VMM did not leave deferred memory.high after a trusted report (last=${memory_high:-missing})"
     fi
-    python3 - "$unit_path" "$slice_path" "$vmm_path" "$BUILDER_CPU_MILLI" "$BUILDER_EXECUTION_CPU_MILLI" <<'PY' || fail "effective per-Build/aggregate/phase cgroup limits"
+    python3 - "$unit_path" "$slice_path" "$vmm_path" "$ctl_path" "$BUILDER_CPU_MILLI" <<'PY' || fail "parent/ctl isolation and VMM resource limits"
 import pathlib, sys
 
 def assert_cpu(path, milli):
@@ -972,15 +1046,20 @@ def assert_cpu(path, milli):
     assert quota != "max", (path, quota, period)
     assert int(quota) * 1000 == int(period) * milli, (path, quota, period, milli)
 
-unit, pool, vmm = map(pathlib.Path, sys.argv[1:4])
-build_cpu, execution_cpu = map(int, sys.argv[4:])
-assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
-assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
-assert_cpu(unit, build_cpu)
-assert_cpu(pool, execution_cpu)
+unit, pool, vmm, ctl = map(pathlib.Path, sys.argv[1:5])
+build_cpu = int(sys.argv[5])
+for parent in (unit, pool, ctl):
+    assert (parent / "memory.max").read_text().strip() == "max", parent
+    assert (parent / "cpu.max").read_text().split()[0] == "max", parent
+assert (ctl / "memory.high").read_text().strip() == "max", ctl
+# Existing sandbox-ctl policy: capacity plus the node's default 32MiB overhead.
+assert int((vmm / "memory.max").read_text()) == (6 << 30) + (32 << 20), vmm
+assert 0 < int((vmm / "memory.high").read_text()) <= (6 << 30) + (32 << 20), vmm
 assert_cpu(vmm, build_cpu)
+assert int((vmm / "cpu.weight").read_text()) == min(10000, max(1, build_cpu // 10)), vmm
+print("parent service/slice/ctl: cpu.max=max memory.max=max; VMM capacity/weight/high retained")
 PY
-    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified (memory.high=$memory_high)"
+    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; parent limits absent and VMM policy/ctl isolation verified (memory.high=$memory_high)"
 }
 diag() { # bid — failure diagnostics (BuildRunDir/BuildBaseDir are reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
@@ -1330,7 +1409,7 @@ B2_TID="$TID"; B2_BID="$BID"
 B2_BODY=$(cat <<EOF
 {"fromTemplate":"$B1_PERSIST",
  "steps":[
-   {"type":"RUN","args":["sleep 20; useradd -m -d /home/user user || adduser -D user"]},
+   {"type":"RUN","args":["touch /tmp/issue374-recovery-started; while [ ! -e /tmp/issue374-recovery-ready ]; do sleep 0.1; done; rm /tmp/issue374-recovery-started /tmp/issue374-recovery-ready; useradd -m -d /home/user user || adduser -D user"]},
    {"type":"RUN","args":["grep -Eq '^0::/user(/|$)' /proc/self/cgroup && test ! -s /sys/fs/cgroup/cgroup.procs && for group in user ptys socats; do test -d /sys/fs/cgroup/\$group && test -e /sys/fs/cgroup/\$group/cpu.weight && test -e /sys/fs/cgroup/\$group/memory.max && test -e /sys/fs/cgroup/\$group/io.weight || exit 1; done"]},
    {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
    {"type":"ENV","args":["BUILT","yes"]},
@@ -1342,6 +1421,24 @@ EOF
 code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B2 trigger = $code (want 202)"; }
 assert_active_build_accounting "$B2_TID" "$B2_BID" b
+timeout -k 5s 20 "$BIN/sandbox-ctl" exec --path-id b --run-root "$WORK/run/builds/$B2_BID" \
+    -- /bin/sh -c 'while [ ! -e /tmp/issue374-recovery-started ]; do sleep 0.1; done' \
+    || fail "B2 guest RUN did not start before conductor crash"
+live_build_signature "$B2_BID" >"$WORK/b2-before-recovery.json" \
+    || fail "B2 live ownership signature before conductor crash"
+crash_conductor
+start_conductor
+wait_phase_reservation b "$B2_BID" || fail "B2 reservation did not reconnect after conductor crash"
+assert_active_build_accounting "$B2_TID" "$B2_BID" b
+live_build_signature "$B2_BID" >"$WORK/b2-after-recovery.json" \
+    || fail "B2 live ownership signature after conductor crash"
+cmp "$WORK/b2-before-recovery.json" "$WORK/b2-after-recovery.json" \
+    || fail "B2 recovery changed durable ownership or replaced a live worker/VMM"
+grep -F 'reconcile: adopted live build' "$WORK/orch.log" | grep -Fq "$B2_BID" \
+    || fail "B2 was not adopted as the same live Build"
+timeout -k 5s 20 "$BIN/sandbox-ctl" exec --path-id b --run-root "$WORK/run/builds/$B2_BID" \
+    -- /bin/touch /tmp/issue374-recovery-ready || fail "B2 recovered guest exec could not release RUN"
+echo "==> PASS: B2 live recovery retained the exact run-id, claim, durable row and worker/ctl/VMM processes"
 # A has already self-cleaned. Plant a marker in its sibling path while B is
 # active; observing it after C starts proves B cleanup was scoped to PathID=b.
 mkdir -p "$WORK/run/builds/$B2_BID/a"
@@ -1354,6 +1451,8 @@ wait_ready "$B2_TID" "$B2_BID" B2 null snp
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
 assert_terminal_build_unowned "$B2_BID" ready || fail "B2 terminal row retained execution ownership"
+assert_build_processes_gone "$WORK/b2-before-recovery.json" \
+    || fail "B2 recovered execution released its claim before all processes exited"
 [ ! -e "$WORK/run/builds/$B2_BID" ] || fail "terminal Build retained BuildRunDir"
 [ ! -e "$WORK/lib/builds/$B2_BID" ] || fail "terminal Build retained BuildBaseDir"
 echo "==> PASS: B2 ready → $B2_PERSIST"

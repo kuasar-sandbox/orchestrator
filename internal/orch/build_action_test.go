@@ -13,39 +13,25 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
-	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-type cancelAssignmentLauncher struct {
-	*runPoolTestLauncher
-	entered, release chan struct{}
-}
-
-func (l *cancelAssignmentLauncher) Resources(ctx context.Context, unit, kind string) (launcher.ResourceProperties, error) {
-	close(l.entered)
-	<-l.release
-	return l.runPoolTestLauncher.Resources(ctx, unit, kind)
-}
-
 func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	cfg := buildNetworkTestConfig()
 	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = t.TempDir(), t.TempDir()
 	cfg.Units.Builder, cfg.Builder.TotalTimeoutSec = "sandbox-builder@.service", 120
 	o := testOrchCfg(t, cfg)
-	lc := &cancelAssignmentLauncher{newRunPoolTestLauncher(), make(chan struct{}), make(chan struct{})}
+	lc := newRunPoolTestLauncher()
 	o.lc, o.vs = lc, stubVS{}
 	o.builderRunPool = newRunPool(runKindBuild, 0, time.Second, cfg.Paths.RunRoot, lc, o.builderUnit, o.log)
 	ctx, stop := context.WithCancel(context.Background())
 	var poolDone chan struct{}
-	released := false
+	unlockBinding := func() {}
 	t.Cleanup(func() {
-		if !released {
-			close(lc.release)
-		}
+		unlockBinding()
 		stop()
 		if poolDone != nil {
 			select {
@@ -79,15 +65,29 @@ func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no unit")
 	}
+	// Hold the same event fence used by Cancel/Delete while the selected
+	// worker reaches durable binding. No launcher resource operation remains
+	// between selection and binding, so use the real mutation fence to order
+	// the cancellation-first case deterministically.
+	unlockBinding = o.lockBuildEvent(b.BuildID)
 	assignment := make(chan error, 1)
 	go func() {
 		_, _, err := o.WaitAssignment(ctx, runKindBuild, o.builderUnitToRunID(unit))
 		assignment <- err
 	}()
-	select {
-	case <-lc.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("no assignment preparation")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		o.buildEventFences.mu.Lock()
+		lock := o.buildEventFences.locks[b.BuildID]
+		waiting := lock != nil && lock.refs >= 2
+		o.buildEventFences.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("assignment did not reach durable binding fence")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	o.pendMu.Lock()
 	owner := o.pend[b.BuildID]
@@ -96,10 +96,13 @@ func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	if err != nil || row.RunID != "" || !row.ExecutionClaimed || owner == nil || owner.cancelExecution == nil {
 		t.Fatalf("prebinding ownership = %+v, %v", row, err)
 	}
-	res, err := o.DeleteBuild(ctx, key, b.TemplateID, api.DeleteBuildOptions{Cancel: true})
-	if err != nil || !res.Pending {
-		t.Fatalf("delete before binding = %+v, %v", res, err)
+	// Commit the action and notify its sole owner under the event fence,
+	// matching requestBuildAction's cancellation-first transaction boundary.
+	_, deleted, pending, err := o.st.RequestBuildAction(ctx, row, true, true, time.Now())
+	if err != nil || deleted || !pending {
+		t.Fatalf("delete before binding: deleted=%v pending=%v err=%v", deleted, pending, err)
 	}
+	owner.cancelExecution()
 	select {
 	case stopped := <-lc.stopped:
 		if stopped != unit {
@@ -112,8 +115,8 @@ func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	if err != nil || usage.ExecutionBuilds != 1 {
 		t.Fatalf("claim released before preparation joined: %+v, %v", usage, err)
 	}
-	close(lc.release)
-	released = true
+	unlockBinding()
+	unlockBinding = func() {}
 	select {
 	case err := <-assignment:
 		if err == nil {

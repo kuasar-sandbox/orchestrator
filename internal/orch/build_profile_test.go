@@ -69,7 +69,7 @@ func TestRegisterBuildPersistsBareProfile(t *testing.T) {
 	}
 }
 
-func TestRegisterBuildRejectsCPUThatSystemdCannotEncode(t *testing.T) {
+func TestRegisterBuildHasNoSystemdQuotaEncodingGate(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("direct", func(t *testing.T) {
@@ -81,12 +81,12 @@ func TestRegisterBuildRejectsCPUThatSystemdCannotEncode(t *testing.T) {
 				CPU: math.MaxInt64, Memory: 1 << 30,
 			},
 		})
-		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "cannot be enforced by systemd") {
-			t.Fatalf("RegisterBuild error = %v, want systemd encoding rejection", err)
+		if err != nil {
+			t.Fatalf("RegisterBuild rejected resources at removed systemd gate: %v", err)
 		}
 		usage, usageErr := o.st.BuildUsage(ctx)
-		if usageErr != nil || usage.RegistrationBuilds != 0 {
-			t.Fatalf("invalid CPU consumed registration admission: %+v, %v", usage, usageErr)
+		if usageErr != nil || usage.RegistrationBuilds != 1 {
+			t.Fatalf("resource registration did not consume admission: %+v, %v", usage, usageErr)
 		}
 	})
 
@@ -96,12 +96,12 @@ func TestRegisterBuildRejectsCPUThatSystemdCannotEncode(t *testing.T) {
 		cmd := clusterBuildRegisterCommand("build-systemd-overflow", fingerprint)
 		cmd.BuildResources.CPU = math.MaxInt64
 		err := o.registerClusterBuild(ctx, cmd)
-		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "cannot be enforced by systemd") {
-			t.Fatalf("registerClusterBuild error = %v, want systemd encoding rejection", err)
+		if err != nil {
+			t.Fatalf("registerClusterBuild rejected resources at removed systemd gate: %v", err)
 		}
 		stored, getErr := o.st.GetBuild(ctx, cmd.BuildID)
-		if getErr != nil || stored != nil {
-			t.Fatalf("invalid cluster Build persisted = %+v, %v", stored, getErr)
+		if getErr != nil || stored == nil || stored.Resources.CPU != math.MaxInt64 {
+			t.Fatalf("cluster Build resources changed = %+v, %v", stored, getErr)
 		}
 	})
 }

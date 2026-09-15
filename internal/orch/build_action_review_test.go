@@ -2,11 +2,11 @@ package orch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,22 +29,25 @@ func TestCancelledRecoveryPrecedesUnrelatedAdoptionFailure(t *testing.T) {
 	}
 	other := buildReconcileRow(t, "br-review-other")
 	other.BuildID, other.TemplateID = "other-build", "transient-other-build"
+	// Missing durable execution ownership is still a real adoption failure;
+	// parent unit resource attributes no longer participate in recovery.
+	other.ExecutionClaimed, other.ExecutionClaimedUnix = false, 0
 	if err := o.st.PutBuild(ctx, other); err != nil {
 		t.Fatal(err)
 	}
 	cancelUnit, otherUnit := o.builderUnit(cancelled.RunID), o.builderUnit(other.RunID)
-	lc := &reconcileLauncher{units: []launcher.Unit{{Name: cancelUnit, ActiveState: "active"}, {Name: otherUnit, ActiveState: "active"}}, resourcesErrByUnit: map[string]error{otherUnit: errors.New("other live Build readback unavailable")}}
+	lc := &reconcileLauncher{units: []launcher.Unit{{Name: cancelUnit, ActiveState: "active"}, {Name: otherUnit, ActiveState: "active"}}}
 	o.lc, o.vs = lc, &reconcileVS{}
 	err := o.ReconcileBuilds(ctx)
-	if err == nil {
-		t.Fatal("expected other Build read failure")
+	if err == nil || !strings.Contains(err.Error(), "building row has no execution claim") {
+		t.Fatalf("expected other Build ownership failure, got %v", err)
 	}
 	for _, unit := range lc.stopped {
 		if unit == cancelUnit {
 			return
 		}
 	}
-	t.Fatalf("durably cancelled unit was not stopped before unrelated recovery read failed: stopped=%v err=%v", lc.stopped, err)
+	t.Fatalf("durably cancelled unit was not stopped before unrelated ownership validation failed: stopped=%v err=%v", lc.stopped, err)
 }
 
 func TestPostTerminalDeleteFencesRegistrationReplay(t *testing.T) {
@@ -292,7 +295,7 @@ func TestBuildRuntimeOnlyOwnershipSurvivesDirectoryCleanup(t *testing.T) {
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := testOrchCfg(t, cfg)
 	b := buildReconcileRow(t, "")
-	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix, b.EnforcementStatus = types.BuildError, false, 0, ""
+	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix = types.BuildError, false, 0
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +340,7 @@ func TestBuildRuntimeOnlyNonterminalIntentCompletes(t *testing.T) {
 				cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 				o := testOrchCfg(t, cfg)
 				b := buildReconcileRow(t, "")
-				b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix, b.EnforcementStatus = state, false, 0, ""
+				b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix = state, false, 0
 				if err := o.st.PutBuild(ctx, b); err != nil {
 					t.Fatal(err)
 				}
@@ -420,7 +423,7 @@ func TestBuildOwnerFreeBuildingIntentCannotReportRecoverySuccess(t *testing.T) {
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := testOrchCfg(t, cfg)
 	b := buildReconcileRow(t, "")
-	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix, b.EnforcementStatus = types.BuildBuilding, false, 0, ""
+	b.Status, b.ExecutionClaimed, b.ExecutionClaimedUnix = types.BuildBuilding, false, 0
 	b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimePrepareJSON = "", "", "", ""
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)

@@ -133,7 +133,7 @@ func markBuildRemoved(build *types.Build, reason string) {
 	build.Reason = reason
 	build.ExecutionClaimed = false
 	build.ExecutionClaimedUnix = 0
-	build.EnforcementStatus = ""
+
 	build.Phase = ""
 	build.PhaseSandboxID = ""
 	build.RuntimeVswitchPort = ""

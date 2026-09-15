@@ -782,6 +782,9 @@ Ready/error status, transient TemplateID, name/alias and local/Registry Build li
 
 Cancel resolves group + BuildID to the original node. DELETE resolves group + immutable registration transient TemplateID in the existing Build projection, retaining PersistID separately after success. Router forwards DELETE Query and Builder Header unchanged for the node action parser and ownership check. Header explicit cancel takes precedence over Query, then false; {} does not override Query. Unavailable nodes, incomplete projection and failed authoritative lookup return service errors. Registry does not pre-delete ownership, release node execution usage or reassign cancellation to another node. BuildStarting ambiguous registration and the existing binding contract remain unchanged. See [Build actions](node-build.md#11-cancel-and-delete-a-build-record) for status, retry, recovery and coordinated upgrade/rollback.
 
+Build placement continues to use registration headroom and the selected node's durable admission decision. The node retains execution admission, FIFO and exact run-ID ownership. Registration performs no systemd quota-encoding validation. Build.Resources also resolves A/B Sandbox resources; target Sandbox resources remain independent. The node's Builder units/slice manage lifecycle and delegation, while sandbox-ctl alone applies phase VMM resource limits.
+
+
 ## 13. State ownership and disaster-recovery boundaries
 
 The node is the authority for sandbox/build execution state. Sandbox/build records in `route_link`, reverse ownership in `node_link`, and admission-related projections derive from node facts for routing, queries or scheduling; operator files cannot create or transfer them. A terminal Build remains a projection of one node execution. Its produced template/manifest is durably reusable; the BuildRecord is not.

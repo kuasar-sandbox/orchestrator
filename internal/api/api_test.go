@@ -1571,7 +1571,7 @@ func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
 		Status: types.BuildBuilding, Resources: types.BuildResources{
 			CPU: 2500, Memory: 3 << 30, Storage: 64 << 30,
 		},
-		ExecutionClaimed: true, RunID: "br-observed", EnforcementStatus: "cpu,memory",
+		ExecutionClaimed: true, RunID: "br-observed",
 		Phase: "b", PhaseSandboxID: "build-build-observed-b",
 	}})
 	response := migrationRequest(t, handler, apiKey, http.MethodGet,
@@ -1585,9 +1585,9 @@ func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
 			MemoryBytes  int64 `json:"memoryBytes"`
 			StorageBytes int64 `json:"storageBytes"`
 		} `json:"resources"`
-		ExecutionClaimed   bool              `json:"executionClaimed"`
-		RunID              string            `json:"runID"`
-		SystemdEnforcement string            `json:"systemdEnforcement"`
+		ExecutionClaimed bool   `json:"executionClaimed"`
+		RunID            string `json:"runID"`
+
 		StorageEnforcement string            `json:"storageEnforcement"`
 		Target             types.BuildTarget `json:"target"`
 		Kind               types.Kind        `json:"kind"`
@@ -1603,12 +1603,15 @@ func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
+	if _, present := fields["systemdEnforcement"]; present {
+		t.Fatalf("obsolete systemdEnforcement exposed: %s", response.Body.String())
+	}
 	if _, present := fields["kind"]; present {
 		t.Fatalf("nonterminal build status exposed terminal kind: %s", response.Body.String())
 	}
 	if body.Resources.CPUMilli != 2500 || body.Resources.MemoryBytes != 3<<30 ||
 		body.Resources.StorageBytes != 64<<30 || !body.ExecutionClaimed ||
-		body.RunID != "br-observed" || body.SystemdEnforcement != "cpu,memory" ||
+		body.RunID != "br-observed" ||
 		body.StorageEnforcement != "admission-only" || body.Phase.Name != "b" ||
 		body.Phase.SandboxID != "build-build-observed-b" || body.Kind != "" ||
 		body.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) {

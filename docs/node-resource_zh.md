@@ -31,6 +31,11 @@ node reservation loop
 (§8.1),但不据此实现 Guest Budget loop。Controller 原子处理 sandbox 主动请求;
 Heartbeat 返回 reservation echo,不是执行命令。
 
+Builder registration/execution 两本账与逐 Sandbox reservation 分开. 每个实际 Build 阶段
+沿用普通 sandbox-ctl Admit/Release. Build.Resources 配置 A/B 规格,目标 Sandbox 独立解析.
+Builder service/slice 只承担归属, 委托和整组回收,orchestrator 不增加 CPU/内存限额;
+现役 VMM 叶子策略和保守只读 recovery inventory 保持不变.
+
 ### 1.2 术语
 
 | 名称 | 定义 | 所有者 |

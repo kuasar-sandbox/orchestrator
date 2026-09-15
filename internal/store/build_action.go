@@ -17,7 +17,7 @@ var ErrBuildDeleteConflict = errors.New("build still has execution or cleanup ow
 // Shared by explicit deletion and retention. Intent prevents new work, never
 // cleanup; terminal status alone is not an ownership-release fence.
 const buildOwnerFreeSQL = `execution_claimed=0 AND execution_claimed_unix=0 AND run_id=''
- AND enforcement_status='' AND phase='' AND phase_sandbox_id=''
+ AND phase='' AND phase_sandbox_id=''
  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
  AND runtime_envd_access_token_enc='' AND runtime_prepare_json='' AND execution_result_json=''`
 

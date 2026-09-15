@@ -8,7 +8,6 @@ import (
 	"fmt"
 
 	"github.com/coreos/go-systemd/v22/dbus"
-	godbus "github.com/godbus/dbus/v5"
 )
 
 // Unit is a minimal view of a systemd unit's liveness.
@@ -16,11 +15,6 @@ type Unit struct {
 	Name        string
 	ActiveState string // active | activating | failed | inactive | ...
 	SubState    string
-}
-
-type ResourceProperties struct {
-	CPUQuotaPerSecUSec uint64
-	MemoryMax          uint64
 }
 
 // Launcher supervises sandbox-ctl instances.
@@ -36,11 +30,6 @@ type Launcher interface {
 	List(ctx context.Context, pattern string) ([]Unit, error)
 	// Reload re-reads unit files after node-ctl installs/updates them.
 	Reload(ctx context.Context) error
-	// SetResources applies runtime-only cgroup limits to an already-started
-	// preassigned service or slice.
-	SetResources(ctx context.Context, unit string, properties ResourceProperties) error
-	// Resources reads the effective service/slice values used to gate assignment.
-	Resources(ctx context.Context, unit, unitType string) (ResourceProperties, error)
 	Close() error
 }
 
@@ -88,50 +77,6 @@ func (s *Systemd) Reload(ctx context.Context) error {
 		return fmt.Errorf("launcher: daemon-reload: %w", err)
 	}
 	return nil
-}
-
-func (s *Systemd) SetResources(ctx context.Context, unit string, properties ResourceProperties) error {
-	var values []dbus.Property
-	if properties.CPUQuotaPerSecUSec != 0 {
-		values = append(values, dbus.Property{Name: "CPUQuotaPerSecUSec", Value: godbus.MakeVariant(properties.CPUQuotaPerSecUSec)})
-	}
-	if properties.MemoryMax != 0 {
-		values = append(values, dbus.Property{Name: "MemoryMax", Value: godbus.MakeVariant(properties.MemoryMax)})
-	}
-	if len(values) == 0 {
-		return nil
-	}
-	if err := s.conn.SetUnitPropertiesContext(ctx, unit, true, values...); err != nil {
-		return fmt.Errorf("launcher: set resources for %s: %w", unit, err)
-	}
-	return nil
-}
-
-func (s *Systemd) Resources(ctx context.Context, unit, unitType string) (ResourceProperties, error) {
-	properties, err := s.conn.GetUnitTypePropertiesContext(ctx, unit, unitType)
-	if err != nil {
-		return ResourceProperties{}, fmt.Errorf("launcher: read resources for %s: %w", unit, err)
-	}
-	readUint64 := func(name string) (uint64, error) {
-		value, ok := properties[name]
-		if !ok {
-			return 0, fmt.Errorf("launcher: %s has no %s property", unit, name)
-		}
-		parsed, ok := value.(uint64)
-		if !ok {
-			return 0, fmt.Errorf("launcher: %s property %s has type %T", unit, name, value)
-		}
-		return parsed, nil
-	}
-	cpu, err := readUint64("CPUQuotaPerSecUSec")
-	if err != nil {
-		return ResourceProperties{}, err
-	}
-	memory, err := readUint64("MemoryMax")
-	if err != nil {
-		return ResourceProperties{}, err
-	}
-	return ResourceProperties{CPUQuotaPerSecUSec: cpu, MemoryMax: memory}, nil
 }
 
 func (s *Systemd) List(ctx context.Context, pattern string) ([]Unit, error) {

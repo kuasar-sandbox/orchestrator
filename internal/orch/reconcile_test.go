@@ -29,16 +29,15 @@ import (
 )
 
 type reconcileLauncher struct {
-	mu                 sync.Mutex
-	units              []launcher.Unit
-	stopped            []string
-	reset              []string
-	resources          launcher.ResourceProperties
-	resourcesErr       error
-	resourcesErrByUnit map[string]error
+	mu      sync.Mutex
+	units   []launcher.Unit
+	stopped []string
+	reset   []string
+
 	stopErr            error
 	inactiveAfterLists int
 	listCalls          int
+	reloads            int
 }
 
 func (l *reconcileLauncher) Start(context.Context, string) error { return nil }
@@ -79,18 +78,8 @@ func (l *reconcileLauncher) List(_ context.Context, pattern string) ([]launcher.
 	}
 	return matched, nil
 }
-func (l *reconcileLauncher) Reload(context.Context) error { return nil }
-func (l *reconcileLauncher) SetResources(_ context.Context, _ string, p launcher.ResourceProperties) error {
-	l.resources = p
-	return nil
-}
-func (l *reconcileLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
-	if err := l.resourcesErrByUnit[unit]; err != nil {
-		return launcher.ResourceProperties{}, err
-	}
-	return l.resources, l.resourcesErr
-}
-func (l *reconcileLauncher) Close() error { return nil }
+func (l *reconcileLauncher) Reload(context.Context) error { l.reloads++; return nil }
+func (l *reconcileLauncher) Close() error                 { return nil }
 
 func (l *reconcileLauncher) setUnitState(name, state string) {
 	l.mu.Lock()
@@ -486,10 +475,6 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	}
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000,
-			MemoryMax:          1 << 30,
-		},
 	}
 	vs := &reconcileVS{}
 	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -669,10 +654,6 @@ func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.
 
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000,
-			MemoryMax:          1 << 30,
-		},
 	}
 	vs := &reconcileVS{}
 	o := New(cfg, st, lc, vs,
@@ -1077,7 +1058,7 @@ func TestRangeClusterBuildsAfterAcceptedResultReconcileExceedsSubscriberBuffer(t
 	}
 }
 
-func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
+func TestReconcileFailsClosedWhenLiveBuildPreparationIsInvalid(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -1091,15 +1072,12 @@ func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
 	runID := "br-00000000-0000-7000-8000-000000000004"
 	unit := "sandbox-builder@" + runID + ".service"
 	build := buildReconcileRow(t, runID)
+	build.RuntimePrepareJSON = "invalid runtime preparation"
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 999_000,
-			MemoryMax:          1 << 30,
-		},
 	}
 	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1111,18 +1089,18 @@ func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stored.Status != types.BuildError || stored.ExecutionClaimed ||
-		!strings.Contains(stored.Reason, "resource enforcement does not match") {
-		t.Fatalf("mismatched live build = %+v", stored)
+		!strings.Contains(stored.Reason, "runtime preparation") {
+		t.Fatalf("invalid live build = %+v", stored)
 	}
 	if !containsString(lc.stopped, unit) {
-		t.Fatalf("mismatched unit was not stopped: %v", lc.stopped)
+		t.Fatalf("invalid unit was not stopped: %v", lc.stopped)
 	}
 	if _, _, ok, err := o.BuildSpecFor(context.Background(), "build:"+build.BuildID); err != nil || ok {
-		t.Fatalf("mismatched unit was adopted: ok=%t err=%v", ok, err)
+		t.Fatalf("invalid unit was adopted: ok=%t err=%v", ok, err)
 	}
 }
 
-func TestReconcilePreservesLiveBuildWhenResourceReadFails(t *testing.T) {
+func TestReconcileAdoptsLiveBuildWithoutParentResourceInterface(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -1139,31 +1117,38 @@ func TestReconcilePreservesLiveBuildWhenResourceReadFails(t *testing.T) {
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
-	readErr := errors.New("transient D-Bus read failure")
 	lc := &reconcileLauncher{
-		units:        []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resourcesErr: readErr,
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
 	}
 	vs := &reconcileVS{}
 	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, vs,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	err = o.Reconcile(context.Background())
-	if !errors.Is(err, readErr) {
-		t.Fatalf("Reconcile error = %v, want transient read failure", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		if err := o.DrainBuilds(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := o.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID); err != nil || !ok {
+		t.Fatalf("live Build not adopted: %t, %v", ok, err)
 	}
 	stored, getErr := st.GetBuild(context.Background(), build.BuildID)
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
 	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed || stored.RunID != runID {
-		t.Fatalf("resource read failure changed durable live build: %+v", stored)
+		t.Fatalf("adoption changed durable live build: %+v", stored)
 	}
 	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
-		t.Fatalf("resource read failure touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
+		t.Fatalf("adoption touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
 	}
 	if len(vs.detached) != 0 {
-		t.Fatalf("resource read failure detached live network ownership: %v", vs.detached)
+		t.Fatalf("adoption detached live network ownership: %v", vs.detached)
 	}
 }
 
@@ -1185,9 +1170,6 @@ func TestReconcileAdoptsSnapshotBuildStillPreparing(t *testing.T) {
 	}
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000, MemoryMax: 1 << 30,
-		},
 	}
 	vs := &reconcileVS{attach: &vswitch.Port{
 		Port: "27", FloatingIP: "192.0.2.27", MAC: "02:00:00:00:00:27", InnerIP: "10.0.0.5",
@@ -1243,9 +1225,6 @@ func TestReconcileFailsClosedForPortWithoutDurablePreparation(t *testing.T) {
 	}
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000, MemoryMax: 1 << 30,
-		},
 	}
 	vs := &reconcileVS{}
 	o := New(buildReconcileConfig(t.TempDir()), st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1329,9 +1308,6 @@ func testPreparedSnapshotRecovery(t *testing.T, explicit bool) {
 	cfg.Checkpoint.DropCaches = orchCheckpointBool(false)
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000, MemoryMax: 1 << 30,
-		},
 	}
 	vs := &reconcileVS{}
 	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1393,25 +1369,22 @@ func TestReconcilePreflightsAllLiveBuildsBeforeAdoption(t *testing.T) {
 		build := buildReconcileRow(t, runID)
 		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", 20+i)
 		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", 20+i)
+		if i == 1 {
+			build.ExecutionClaimed = false
+		}
 		if err := st.PutBuild(context.Background(), build); err != nil {
 			t.Fatal(err)
 		}
 		builds = append(builds, build)
 		units = append(units, launcher.Unit{Name: "sandbox-builder@" + runID + ".service", ActiveState: "active"})
 	}
-	readErr := errors.New("second unit D-Bus read failure")
 	lc := &reconcileLauncher{
 		units: units,
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000,
-			MemoryMax:          1 << 30,
-		},
-		resourcesErrByUnit: map[string]error{units[1].Name: readErr},
 	}
 	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	if err := o.Reconcile(context.Background()); !errors.Is(err, readErr) {
+	if err := o.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "building row has no execution claim") {
 		t.Fatalf("Reconcile error = %v, want later preflight failure", err)
 	}
 	o.pendMu.Lock()
@@ -1428,7 +1401,7 @@ func TestReconcilePreflightsAllLiveBuildsBeforeAdoption(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
+		if stored.Status != types.BuildBuilding || stored.ExecutionClaimed != build.ExecutionClaimed {
 			t.Fatalf("preflight failure changed build %s: %+v", build.BuildID, stored)
 		}
 	}
@@ -1448,6 +1421,7 @@ func TestReconcileRetainsClaimWhenLiveBuilderCannotBeStopped(t *testing.T) {
 	runID := "br-00000000-0000-7000-8000-000000000005"
 	unit := "sandbox-builder@" + runID + ".service"
 	build := buildReconcileRow(t, runID)
+	build.RuntimePrepareJSON = "invalid runtime preparation"
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
@@ -1455,10 +1429,6 @@ func TestReconcileRetainsClaimWhenLiveBuilderCannotBeStopped(t *testing.T) {
 	lc := &reconcileLauncher{
 		units:   []launcher.Unit{{Name: unit, ActiveState: "active"}},
 		stopErr: stopErr,
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 999_000,
-			MemoryMax:          1 << 30,
-		},
 	}
 	vs := &reconcileVS{}
 	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, vs,
@@ -1557,7 +1527,7 @@ func buildReconcileRow(t *testing.T, runID string) *types.Build {
 		Profile: types.ProfileBare, Status: types.BuildBuilding,
 		Resources:        types.BuildResources{CPU: 1000, Memory: 1 << 30},
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), RunID: runID,
-		EnforcementStatus: "cpu,memory", RuntimeVswitchPort: "17", RuntimeFloatingIP: "192.0.2.17",
+		RuntimeVswitchPort: "17", RuntimeFloatingIP: "192.0.2.17",
 		RuntimePortMAC: "02:00:00:00:00:17", RuntimePrepareJSON: runtimePrepare, CreatedUnix: time.Now().Unix(),
 	}
 }

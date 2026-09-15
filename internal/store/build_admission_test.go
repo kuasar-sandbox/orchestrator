@@ -534,7 +534,7 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	terminal, err := st.GetBuild(ctx, b.BuildID)
-	if err != nil || terminal.RunID != "" || terminal.EnforcementStatus != "" ||
+	if err != nil || terminal.RunID != "" ||
 		terminal.ExecutionResult != nil || terminal.ExecutionClaimed ||
 		terminal.RuntimeVswitchPort != "" || terminal.RuntimeEnvdAccessToken != "" || terminal.RuntimePrepareJSON != "" {
 		t.Fatalf("terminal result cleanup = %+v, err=%v", terminal, err)

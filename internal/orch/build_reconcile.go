@@ -119,11 +119,11 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 		if !build.ExecutionClaimed {
 			return fmt.Errorf("reconcile build %s: building row has no execution claim", build.BuildID)
 		}
-		unit, isLive := live[build.RunID]
+		_, isLive := live[build.RunID]
 		if !isLive || build.ExecutionResult != nil {
 			continue
 		}
-		prep, err := o.prepareLiveBuild(ctx, build, unit)
+		prep, err := o.prepareLiveBuild(ctx, build)
 		if err != nil {
 			return err
 		}
@@ -174,25 +174,13 @@ type liveBuildPreparation struct {
 	failureReason    string
 }
 
-func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build, unit string) (*liveBuildPreparation, error) {
+func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build) (*liveBuildPreparation, error) {
 	prep := &liveBuildPreparation{}
 	if build.RunID == "" {
 		prep.failureReason = "live build has no durable run ownership"
 		return prep, nil
 	}
-	wantProperties, err := builderResourceProperties(build.Resources)
-	if err != nil {
-		prep.failureReason = "live build has invalid resource properties: " + err.Error()
-		return prep, nil
-	}
-	gotProperties, err := o.lc.Resources(ctx, unit, "Service")
-	if err != nil {
-		return nil, fmt.Errorf("read live build resource enforcement for %s: %w", unit, err)
-	}
-	if gotProperties != wantProperties {
-		prep.failureReason = fmt.Sprintf("live build resource enforcement does not match: effective=%+v want=%+v", gotProperties, wantProperties)
-		return prep, nil
-	}
+	var err error
 	prep.sourceTemplate, err = buildUsesSandboxTemplate(build)
 	if err != nil {
 		prep.failureReason = "cannot classify live build: " + err.Error()

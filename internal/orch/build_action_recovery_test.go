@@ -31,7 +31,6 @@ func TestBuildActionRecoveryPrioritizesIntentAndAcceptedResult(t *testing.T) {
 				b.FromTemplate = "missing-source-that-must-not-be-opened"
 				b.RuntimePrepareJSON = "corrupt preparation"
 				if phase == "pre-binding" {
-					b.EnforcementStatus = ""
 					b.RuntimeVswitchPort = ""
 					b.RuntimeFloatingIP = ""
 					b.RuntimePortMAC = ""
@@ -42,7 +41,6 @@ func TestBuildActionRecoveryPrioritizesIntentAndAcceptedResult(t *testing.T) {
 					b.ExecutionClaimed = false
 					b.ExecutionClaimedUnix = 0
 					b.RunID = ""
-					b.EnforcementStatus = ""
 					b.RuntimeVswitchPort = ""
 					b.RuntimeFloatingIP = ""
 					b.RuntimePortMAC = ""
@@ -78,7 +76,7 @@ func TestBuildActionRecoveryPrioritizesIntentAndAcceptedResult(t *testing.T) {
 					}
 				}
 				unit := "sandbox-builder@br-372-recovery.service"
-				lc := &reconcileLauncher{resourcesErr: errors.New("cancelled recovery must not adopt or read unit resources")}
+				lc := &reconcileLauncher{}
 				if phase != "exited" && phase != "terminal" {
 					lc.units = []launcher.Unit{{Name: unit, ActiveState: "active"}}
 				}

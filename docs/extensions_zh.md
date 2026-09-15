@@ -361,7 +361,7 @@ typed `Kind`、`SandboxID`/`BuildID string` 与 `View *SandboxView`/`*BuildView`
 完整非秘密字段定义见 [SandboxView 与枚举](../app/conductor/extension/sandbox.go) 和
 [BuildView、BuildResources、BuildOptions](../app/conductor/extension/build.go)。BuildView 包含
 不可变 resources、requested Builder target、source/steps/commands、注册/排队/执行时间、
-当前 RunID/claim/enforcement/phase/network、cluster group 和凭据指纹。两类 source 都不暴露
+当前 RunID/claim/phase/network, cluster group 和凭据指纹. 两类 source 都不暴露
 原始凭据、MMDS secret value 或可变 core 对象;下述快照/收敛规则适用于每个字段。
 
 在启动期 `Configure` hook 中设置 `conductor.Runtime.Extension`。该对象实现稳定的基本契约：

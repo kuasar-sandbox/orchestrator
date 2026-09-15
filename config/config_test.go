@@ -221,7 +221,7 @@ builder:
 	}
 }
 
-func TestBuilderIdlePoolCannotConsumeCappedExecutionSlice(t *testing.T) {
+func TestBuilderIdlePoolAllowsFiniteExecutionResources(t *testing.T) {
 	base := `
 api: { domain: example.test }
 encryption_key: test-key
@@ -240,8 +240,8 @@ builder:
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := LoadConductor(writeConfig(t, base+resource))
-			if err == nil || !strings.Contains(err.Error(), "units.builder_pool_size must be 0") {
-				t.Fatalf("Load error = %v, want capped-slice idle-pool rejection", err)
+			if err != nil {
+				t.Fatalf("finite execution admission with idle pool: %v", err)
 			}
 		})
 	}

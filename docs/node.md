@@ -309,7 +309,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `paths.plugin_pidfile` | Empty | Multiline PID allowlist for Proxy/agent plugin registration; otherwise socket mode 0600 alone |
 | `units.dir` | `/etc/systemd/system` | Template-unit installation directory |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | Template-unit names |
-| `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | Idle prestarted RunID unit counts; zero still starts on-demand units through WaitAssignment. With aggregate execution CPU or memory limits, builder pool size must be zero so unclaimed idle processes do not occupy the limited Builder slice |
+| `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | Idle prestarted RunID unit counts; zero still starts on-demand units through WaitAssignment. Finite execution admission resources permit a nonzero Builder pool; idle units hold no Build claim |
 | `units.pool_wait_timeout` | `5s` | Positive budget from StartUnit through entry into WaitAssignment; timeout cleans that RunID and replenishes the pool |
 | `units.install` | `true` | False delegates unit installation to operations |
 | `sandbox.timeout_sec` | `300` | Default sandbox TTL in seconds |
@@ -841,7 +841,7 @@ The complete request-scoped `kuasar-sandbox.builder` input and target rules are 
 
 ## 5. Process management through systemd template units
 
-At startup, conductor generates two templates and sandbox-runner.slice/sandbox-builder.slice under units.dir; it calls D-Bus Reload only when content changes. With units.install=false, operations manages them. Generated ExecStart uses the exact original node-ctl path retained by runtime resolution/bootstrap, including custom conductor mode (§3).
+At startup, conductor generates two templates and sandbox-runner.slice/sandbox-builder.slice under units.dir; it calls D-Bus Reload only when content changes. With units.install=false, operations manages them; conductor neither writes files nor reads or validates operator resource properties. Generated ExecStart uses the exact original node-ctl path retained by runtime resolution/bootstrap, including custom conductor mode (§3).
 
 **Runner unit** (`%i` is RunID):
 
@@ -863,7 +863,7 @@ Slice=sandbox-runner.slice
 Delegate=yes
 ```
 
-The complete Builder unit and aggregate enforcement rules are in [Build §4.1](node-build.md#41-builder-unit-and-process-enforcement).
+The complete Builder unit lifecycle and resource ownership rules are in [Build §4.1](node-build.md#41-builder-unit-and-process-lifecycle).
 
 Both ExecStart programs lock the RunID pidfile, then wait for business-ID assignment over config-socket. Runner connects readiness immediately after obtaining SID, locks `<RunDir>/<SandboxID>.pid` and requests exact-run bootstrap. Artifact tasks prepare E/S locally and complete the second stage before obtaining final LaunchSpec, then execve sandbox-ctl run with the same unit PID/cgroup. Type=exec requires no sd_notify. Builder process/child-VM and result behavior is defined in [Build §4](node-build.md#4-task-handoff).
 
@@ -1387,7 +1387,8 @@ Feature E2E lives with implementation in orchestrator/test/e2e/. Lightweight clu
 |---|---|
 | e2e_orchestrator.sh | Unit auto-install; /health and 401 control paths; Build register/trigger/status and cross-key ownership 404; bare create/list/kill with KVM. |
 | e2e_runtask.sh | Pure-userspace launchers without root/systemd/KVM: pidfile locking/duplicate rejection, exact-run bootstrap, single-stage cold/two-stage restore, execve, TASK_* and duplicate MANIFEST_KEY stripping; config CLI round trips. |
-| e2e_run_builder.sh | Real target-aware pipeline with KVM/vswitch/store-ctl/zot and guest pulls through management VIP: IMG/SBX/SNP; all source kinds; image/checkpoint publication matrix; Manifest/named Bundle; top-level E without full staging/C; portable C image refs; local/Bundle checkpoints; S→E cold selection; fixed memory-C wait; closure and canonical Create after row TTL. Also COPY/bare, resource isolation, terminal cleanup and log/DB/artifact secrecy. |
+| e2e_builder_unit_upgrade.sh | Isolated real systemd: generated slice update, preserved live runtime properties, and exact-source one-time removal; checks actual cgroup values after reload. |
+| e2e_run_builder.sh | Real target-aware pipeline with KVM/vswitch/store-ctl/zot and guest pulls through management VIP: IMG/SBX/SNP; all source kinds; image/checkpoint publication matrix; Manifest/named Bundle; top-level E without full staging/C; portable C image refs; local/Bundle checkpoints; S→E cold selection; fixed memory-C wait; closure and canonical Create after row TTL. Also COPY/bare, parent/ctl isolation with finite VMM limits, live conductor recovery preserving the exact claim/run-id/processes, real total-timeout fencing and claim/reservation release, terminal cleanup and log/DB/artifact secrecy. |
 | e2e_execute.sh | Real template cold launch/guest exec; persistent RunDir/BaseDir with diff/checkpoint only in BaseDir; no large RunRoot artifacts; PathID native exec; local Pause/Resume and restore policy; failed Create's owner-free dead; explicit finalizer removes row/directories while preserving node files. |
 | e2e_mmds_routes.sh | Execute's Proxy topology for static/secret lifecycle and local UDS service. |
 | e2e_mmds_routes_proxy_restart.sh | Proxy topology for MMDS full resync/fail-closed recovery. |

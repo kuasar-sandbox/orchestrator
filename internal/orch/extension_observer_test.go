@@ -59,7 +59,7 @@ func TestTerminalObserverRunsAfterCorePublicationAndNotAfterFailedPersistence(t 
 	recorder := &objectObserverRecorder{}
 	o.SetExtensionObserver(recorder)
 	build := observerBuildingFixture(t, "terminal-observer")
-	build.EnforcementStatus = "cpu,memory"
+
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
@@ -75,8 +75,7 @@ func TestTerminalObserverRunsAfterCorePublicationAndNotAfterFailedPersistence(t 
 	recorder.mu.Lock()
 	observedTerminal := cloneBuildForObservation(recorder.builds[0])
 	recorder.mu.Unlock()
-	if observedTerminal.EnforcementStatus != storedTerminal.EnforcementStatus ||
-		observedTerminal.ExecutionClaimed != storedTerminal.ExecutionClaimed ||
+	if observedTerminal.ExecutionClaimed != storedTerminal.ExecutionClaimed ||
 		observedTerminal.Phase != storedTerminal.Phase ||
 		observedTerminal.RuntimeVswitchPort != storedTerminal.RuntimeVswitchPort {
 		t.Fatalf("terminal observer diverged from durable row: observed=%+v stored=%+v", observedTerminal, storedTerminal)

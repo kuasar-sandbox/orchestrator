@@ -111,7 +111,6 @@ CREATE TABLE IF NOT EXISTS builds (
   waiting_sequence  INTEGER NOT NULL DEFAULT 0,
   execution_claimed INTEGER NOT NULL DEFAULT 0,
   execution_claimed_unix INTEGER NOT NULL DEFAULT 0,
-  enforcement_status TEXT NOT NULL DEFAULT '',
   phase              TEXT NOT NULL DEFAULT '',
   phase_sandbox_id   TEXT NOT NULL DEFAULT '',
   runtime_vswitch_port TEXT NOT NULL DEFAULT '',
@@ -193,6 +192,21 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	if err := requireColumn(ctx, db, "builds", "instance_config_enc"); err != nil {
 		db.Close()
 		return nil, err
+	}
+	// #374 removes only the obsolete parent-systemd enforcement marker from
+	// supported schemas. Do not rewrite business rows or rebuild their tables.
+	var enforcementColumn int
+	if err := db.QueryRowContext(ctx,
+		"SELECT count(*) FROM pragma_table_info('builds') WHERE name='enforcement_status'",
+	).Scan(&enforcementColumn); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: inspect obsolete build enforcement column: %w", err)
+	}
+	if enforcementColumn != 0 {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE builds DROP COLUMN enforcement_status"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: drop obsolete build enforcement column: %w", err)
+		}
 	}
 	if err := ensureColumn(ctx, db, "builds", "runtime_prepare_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
@@ -1272,7 +1286,7 @@ var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,
   from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
   registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
   resources_cpu,resources_memory,resources_storage,metadata_json,builder_json,instance_config_enc,
-  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
+  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,phase,phase_sandbox_id,
   runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix,cancel_requested_unix,delete_requested_unix`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
@@ -1284,7 +1298,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc,
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.RegistrationRequestDigest, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &meta, &builder, &instanceConfigEnc,
-		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
+		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.Phase, &b.PhaseSandboxID,
 		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON, &b.FinishedUnix, &b.CancelRequestedUnix, &b.DeleteRequestedUnix); err != nil {
 		return nil, err
 	}
@@ -1344,9 +1358,9 @@ const buildInsertSQL = `
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
 	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,metadata_json,builder_json,instance_config_enc,
-	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
+	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,phase,phase_sandbox_id,
 	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix,cancel_requested_unix,delete_requested_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -1364,7 +1378,7 @@ const buildUpsertSQL = buildInsertSQL + `
 	  waiting_unix=excluded.waiting_unix, waiting_sequence=excluded.waiting_sequence,
 	  execution_claimed=excluded.execution_claimed,
 	  execution_claimed_unix=excluded.execution_claimed_unix,
-	  enforcement_status=excluded.enforcement_status, phase=excluded.phase,
+	  phase=excluded.phase,
 	  phase_sandbox_id=excluded.phase_sandbox_id,
 	  runtime_vswitch_port=excluded.runtime_vswitch_port,
 	  runtime_floating_ip=excluded.runtime_floating_ip,
@@ -1451,7 +1465,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		b.Resources.CPU, b.Resources.Memory, b.Resources.Storage,
 		mj(b.Metadata), mb(b.Builder), instanceConfigEnc, b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
-		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
+		b.Phase, b.PhaseSandboxID,
 		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON, b.FinishedUnix, b.CancelRequestedUnix, b.DeleteRequestedUnix,
 	}, nil
 }

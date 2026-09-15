@@ -48,8 +48,8 @@ type countingLauncher struct {
 	stopGate            <-chan struct{}
 	listedUnits         []launcher.Unit
 	resourceMu          sync.Mutex
-	resources           map[string]launcher.ResourceProperties
-	lastTaskError       error
+
+	lastTaskError error
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -236,21 +236,7 @@ func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error
 	return append([]launcher.Unit(nil), l.listedUnits...), nil
 }
 func (l *countingLauncher) Reload(context.Context) error { return nil }
-func (l *countingLauncher) SetResources(_ context.Context, unit string, p launcher.ResourceProperties) error {
-	l.resourceMu.Lock()
-	defer l.resourceMu.Unlock()
-	if l.resources == nil {
-		l.resources = make(map[string]launcher.ResourceProperties)
-	}
-	l.resources[unit] = p
-	return nil
-}
-func (l *countingLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
-	l.resourceMu.Lock()
-	defer l.resourceMu.Unlock()
-	return l.resources[unit], nil
-}
-func (l *countingLauncher) Close() error { return nil }
+func (l *countingLauncher) Close() error                 { return nil }
 
 // stubVS is a no-op vswitch that hands back a fixed port (satisfies vsClient).
 type stubVS struct{}

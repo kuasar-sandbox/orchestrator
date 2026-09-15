@@ -1166,7 +1166,6 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 		"cancelRequested":    b.CancelRequestedUnix != 0,
 		"deleteRequested":    b.DeleteRequestedUnix != 0,
 		"runID":              b.RunID,
-		"systemdEnforcement": b.EnforcementStatus,
 		"storageEnforcement": "admission-only",
 	}
 	if b.Kind != "" {

@@ -30,7 +30,7 @@ func retentionTerminalBuild(id string, status types.BuildState, finishedUnix int
 	build.RunID = ""
 	build.ExecutionClaimed = false
 	build.ExecutionClaimedUnix = 0
-	build.EnforcementStatus = ""
+
 	build.Phase = ""
 	build.PhaseSandboxID = ""
 	build.RuntimeVswitchPort = ""

@@ -24,7 +24,6 @@ type orderedCleanupLauncher struct {
 	resetCalls atomic.Int32
 	stopErr    error
 	resetErr   error
-	resources  launcher.ResourceProperties
 }
 
 func (*orderedCleanupLauncher) Start(context.Context, string) error { return nil }
@@ -48,14 +47,7 @@ func (l *orderedCleanupLauncher) List(_ context.Context, unit string) ([]launche
 	return nil, nil
 }
 func (*orderedCleanupLauncher) Reload(context.Context) error { return nil }
-func (l *orderedCleanupLauncher) SetResources(_ context.Context, _ string, p launcher.ResourceProperties) error {
-	l.resources = p
-	return nil
-}
-func (l *orderedCleanupLauncher) Resources(context.Context, string, string) (launcher.ResourceProperties, error) {
-	return l.resources, nil
-}
-func (*orderedCleanupLauncher) Close() error { return nil }
+func (*orderedCleanupLauncher) Close() error                 { return nil }
 
 type transientAcceptedResultLauncher struct {
 	orderedCleanupLauncher
