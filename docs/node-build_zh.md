@@ -588,6 +588,7 @@ registry TLS 是**单次 Build 的信任策略**,经 register-time 的 `X-Kuasar
 claim 后先持久绑定 exact run-id,最后发布 assignment. execution CPU/memory 保留为聚合
 准入上限;storage V1 为 admission-only. `node-ctl builder status` 和 metrics 暴露配置, 持久用量, headroom, 队列与
 拒绝/过期计数。旧 `max_concurrent/cpu_quota/memory_max/vcpu/memory` 配置直接拒绝。
+两处原子准入写入也在无限维度拒绝 aggregate int64 溢出, 保护账本算术, 不添加配置资源上限.
 
 每个实际运行的 A/B/C phase 使用独立 SID，通过普通 `sandbox-ctl run` 的 controller
 Admit/heartbeat/Release，并在 teardown/Release 完成后才进入下一阶段。A/B execution VM

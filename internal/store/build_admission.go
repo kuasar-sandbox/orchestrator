@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -108,24 +109,26 @@ func (s *Store) ClaimBuildExecution(ctx context.Context, buildID string, limit t
 	if !limit.AllowsOne(b.Resources) {
 		return false, fmt.Errorf("%w: %s", ErrBuildExecutionUnfit, buildID)
 	}
+	// Unlimited policy dimensions still need representable durable sums, as
+	// in BuildAdmissionLimit.AllowsAdd. AllowsOne checked each request above.
 	headroom := func(configured, requested int64) int64 {
 		if configured == 0 {
-			return 0
+			configured = math.MaxInt64
 		}
 		return configured - requested
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
 		SET status=?, execution_claimed=1, execution_claimed_unix=?
 		WHERE build_id=? AND template_id=? AND status=? AND execution_claimed=0 AND cancel_requested_unix=0 AND delete_requested_unix=0
-		  AND (?=0 OR (SELECT COUNT(*) FROM builds WHERE execution_claimed=1) <= ?)
-		  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE execution_claimed=1),0) <= ?)
-		  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE execution_claimed=1),0) <= ?)
-		  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE execution_claimed=1),0) <= ?)`,
+		  AND (SELECT COUNT(*) FROM builds WHERE execution_claimed=1) <= ?
+		  AND COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE execution_claimed=1),0) <= ?
+		  AND COALESCE((SELECT SUM(resources_memory) FROM builds WHERE execution_claimed=1),0) <= ?
+		  AND COALESCE((SELECT SUM(resources_storage) FROM builds WHERE execution_claimed=1),0) <= ?`,
 		string(types.BuildBuilding), now.Unix(), buildID, b.TemplateID, string(types.BuildWaiting),
-		limit.MaxBuilds, headroom(limit.MaxBuilds, 1),
-		limit.Resources.CPU, headroom(limit.Resources.CPU, b.Resources.CPU),
-		limit.Resources.Memory, headroom(limit.Resources.Memory, b.Resources.Memory),
-		limit.Resources.Storage, headroom(limit.Resources.Storage, b.Resources.Storage))
+		headroom(limit.MaxBuilds, 1),
+		headroom(limit.Resources.CPU, b.Resources.CPU),
+		headroom(limit.Resources.Memory, b.Resources.Memory),
+		headroom(limit.Resources.Storage, b.Resources.Storage))
 	if err != nil {
 		return false, fmt.Errorf("store: claim build %s execution: %w", buildID, err)
 	}

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -290,21 +291,23 @@ func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, buil
 	// stale pre-check and oversubscribe the durable ledger.
 	insertSelect := strings.Replace(buildInsertSQL, "\n\tVALUES (", "\n\tSELECT ", 1)
 	insertSelect = strings.TrimSuffix(insertSelect, ")") + `
-	WHERE (?=0 OR (SELECT COUNT(*) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)`
+	WHERE (SELECT COUNT(*) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0) <= ?
+	  AND COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?
+	  AND COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?
+	  AND COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?`
+	// Unlimited policy dimensions still need representable durable sums, as
+	// in BuildAdmissionLimit.AllowsAdd. AllowsOne checked each request above.
 	headroom := func(configured, requested int64) int64 {
 		if configured == 0 {
-			return 0
+			configured = math.MaxInt64
 		}
 		return configured - requested
 	}
 	args = append(args,
-		limit.MaxBuilds, headroom(limit.MaxBuilds, 1),
-		limit.Resources.CPU, headroom(limit.Resources.CPU, build.Resources.CPU),
-		limit.Resources.Memory, headroom(limit.Resources.Memory, build.Resources.Memory),
-		limit.Resources.Storage, headroom(limit.Resources.Storage, build.Resources.Storage),
+		headroom(limit.MaxBuilds, 1),
+		headroom(limit.Resources.CPU, build.Resources.CPU),
+		headroom(limit.Resources.Memory, build.Resources.Memory),
+		headroom(limit.Resources.Storage, build.Resources.Storage),
 	)
 	result, err := tx.ExecContext(ctx, insertSelect, args...)
 	if err != nil {
