@@ -51,6 +51,14 @@ func enforcementMigrationRows(t *testing.T, db *sql.DB, query string) [][]any {
 }
 
 func TestOpenDropsBuildEnforcementPreservingBusinessData(t *testing.T) {
+	for _, withActions := range []bool{false, true} {
+		t.Run(fmt.Sprintf("action-columns=%t", withActions), func(t *testing.T) {
+			testDropBuildEnforcementPreservingBusinessData(t, withActions)
+		})
+	}
+}
+
+func testDropBuildEnforcementPreservingBusinessData(t *testing.T, withActions bool) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "old.db")
 	box, err := secretbox.NewFromColonHex(strings.Repeat("a", 64))
@@ -89,6 +97,12 @@ func TestOpenDropsBuildEnforcementPreservingBusinessData(t *testing.T) {
 			b.Resources = types.BuildResources{CPU: 2000, Memory: 2 << 30, Storage: 4 << 30}
 			b.WaitingUnix, b.WaitingSequence = 50, int64(i*3+j+1)
 			b.Env = map[string]string{"SECRET": "instance-secret"}
+			if withActions && j > 0 {
+				b.CancelRequestedUnix = 70
+				if j == 2 {
+					b.DeleteRequestedUnix = 80
+				}
+			}
 			if state != types.BuildReady && state != types.BuildError {
 				b.FinishedUnix = 0
 			}
@@ -131,6 +145,16 @@ func TestOpenDropsBuildEnforcementPreservingBusinessData(t *testing.T) {
 	before := map[string][][]any{}
 	for name, query := range queries {
 		before[name] = enforcementMigrationRows(t, db, query)
+	}
+	if !withActions {
+		// The supported pre-#373 schema has neither action column. Their
+		// existing additive initialization must still compose with this drop;
+		// every business value and the absent columns' zero defaults survive.
+		for _, column := range []string{"cancel_requested_unix", "delete_requested_unix"} {
+			if _, err := db.Exec("ALTER TABLE builds DROP COLUMN " + column); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if err := old.Close(); err != nil {
 		t.Fatal(err)
