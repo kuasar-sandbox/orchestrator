@@ -11,7 +11,7 @@
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 只定义不可变 **Build.Resources**,绝不改 Sandbox capacity。`X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400。Builder `target` 是 register-only immutable 定义；`X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources，不供 A/B 使用。`profile∈{e2b,bare}`,省略取 `e2b`;响应暴露 requested `target`（省略即 auto） |
+| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应暴露 requested `target`(省略即 auto) |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段, requested `target`, 终态 derived `kind`, 及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`, `cancelRequested`, `deleteRequested`, `executionClaimed`, `runID`, `storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [§5](#5-按目标执行与发布) |
@@ -700,7 +700,7 @@ registration usage 只统计 status IN (registered, waiting, building) 且两个
 
 取消和结果接受按持久先后裁决:cancel-first 拒绝新结果,以 `build cancelled by user` 结束;result-first 保留已接受的成功/失败及相同结果重放,继续停止和清理. direct Image 复用采用同一终态条件. 旧回调不能 upsert 复活已删行或影响后继 transient 身份. 数据库提交先于观察通知;真实硬删除后才发 BuildDelete. error 导致观察集合移除是另一事实.
 
-清理完成后 PutBuildTerminal 释放 claim,提交后立即通知容量变化,再按既有注册/retention 锁单独条件硬删除. 等待终态发布的注册重放不能重新插入已删除身份. 最终 DELETE 失败保留 delete 意图,不重新占执行预算. 立即重试、既有生命周期有界补偿和启动恢复继续处理,不等 terminal_ttl. Stop/状态回读/detach/目录/终态失败保留必要归属以重试. 启动先处理 cancel/delete 再收养流水线:停止活 unit、清理已退出 unit、直接删无归属 marked 终态行,不为已取消任务重读源产物或重置原执行截止时间.
+清理完成后 PutBuildTerminal 释放 claim,提交后立即通知容量变化,再按既有注册/retention 锁单独条件硬删除. 等待终态发布的注册重放不能重新插入已删除身份. 最终 DELETE 失败保留 delete 意图,不重新占执行预算. 立即重试、既有生命周期有界补偿和启动恢复继续处理,不等 terminal_ttl. Stop/unit 存活状态回读/detach/目录/终态失败保留必要归属以重试. 启动先处理 cancel/delete 再收养流水线:停止活 unit、清理已退出 unit、直接删无归属 marked 终态行,不为已取消任务重读源产物或重置原执行截止时间.
 
 两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 缺少 transient 字段的旧 owner ref 只依据仍匹配的 route/binding 补齐. provisional 插入、注册 ACK/拒绝及重放 ref 更新均比较原身份和当前 revision,迟到操作不能覆盖后继记录. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
 
