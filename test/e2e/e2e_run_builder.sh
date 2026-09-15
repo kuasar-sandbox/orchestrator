@@ -67,6 +67,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
 . "$SCRIPT_DIR/lib/build_fixture_units.sh"
+. "$SCRIPT_DIR/lib/vmm_cgroup.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # Builds with steps/startCmd carry the e2b contract: envd runs them as
@@ -567,13 +568,20 @@ matches = [item for item in reservations if item["sandbox_id"] == row["phase_san
 assert len(matches) == 1, "live phase must have exactly one reservation"
 reservation = matches[0]
 vmm = pathlib.Path(reservation["cgroup_path"])
-vmm_pids = [int(pid) for pid in (vmm / "cgroup.procs").read_text().split()]
+vmm_members = [int(pid) for pid in (vmm / "cgroup.procs").read_text().split()]
+# The existing VMM membership check accepts kernel tasks outside this PID
+# namespace, which cgroup.procs renders as 0. They have no inspectable /proc
+# identity. Keep every visible member, including associated KVM workers.
+vmm_pids = [pid for pid in vmm_members if pid != 0]
 assert vmm_pids, "phase VMM is not populated"
+builder_pid = int((work / "run/runners" / (row["run_id"] + ".pid")).read_text())
+ctl_pid = reservation["peer_pid"]
 pids = {
-    int((work / "run/runners" / (row["run_id"] + ".pid")).read_text()),
-    reservation["peer_pid"], *vmm_pids,
+    builder_pid, ctl_pid, *vmm_pids,
 }
-assert len(pids) >= 3 and all(pid > 0 for pid in pids), "missing builder/ctl/VMM processes"
+assert len(pids) >= 3 and all(pid > 0 for pid in pids), (
+    "missing builder/ctl/VMM processes", builder_pid, ctl_pid, vmm_members)
+print(f"live ownership: builder={builder_pid} ctl={ctl_pid} vmm_members={vmm_members}", file=sys.stderr)
 # Include process start ticks so PID reuse cannot masquerade as live adoption.
 processes = {}
 for pid in sorted(pids):
@@ -1008,6 +1016,8 @@ PY
     ctl_path="$(dirname "$vmm_path")/ctl"
     unit_path=$(dirname "$vmm_path")
     slice_path=$(dirname "$unit_path")
+    e2e_assert_vmm_cgroup_members /proc "$vmm_path/cgroup.procs" \
+        || fail "phase VMM membership does not match Cloud Hypervisor and its KVM workers"
     grep -Eq '/sandbox-builder.slice/.+/ctl$' "/proc/$build_pid/cgroup" \
         || fail "run-builder pid $build_pid is not in its ctl subgroup"
     grep -Eq '/sandbox-builder.slice/.+/ctl$' "/proc/$sandbox_ctl_pid/cgroup" \
