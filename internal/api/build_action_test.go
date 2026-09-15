@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestDeleteBuildOptionsStrictPresence(t *testing.T) {
@@ -142,6 +144,31 @@ func TestRegisterAndTriggerRejectCancelActionField(t *testing.T) {
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("%s action header = %d", path, response.Code)
 			}
+		}
+	}
+}
+
+func TestRegisterAndTriggerRejectMalformedCancelQueryBeforeCore(t *testing.T) {
+	for _, path := range []string{"/v3/templates", "/v2/templates/transient-test/builds/test"} {
+		for _, query := range []string{"cancel=true", "cancel=false", "cancel=%ZZ", "%63ancel=%ZZ", "cancel=true;other=false", "other=%ZZ&cancel=false", "cancel=false&cancel=true"} {
+			t.Run(path+"/"+query, func(t *testing.T) {
+				calls := 0
+				core := &buildMMDSCoreStub{
+					register: func(context.Context, string, RegisterSpec) (*types.Build, error) {
+						calls++
+						return nil, errors.New("unexpected registration")
+					},
+					trigger: func(context.Context, string, string, string, TriggerSpec, BuildAuth) error {
+						calls++
+						return nil
+					},
+				}
+				handler, key := newMigrationTestHandler(t, core)
+				response := migrationRequest(t, handler, key, http.MethodPost, path+"?"+query, strings.NewReader(`{"cpuCount":1,"memoryMB":512}`), nil)
+				if response.Code != http.StatusBadRequest || calls != 0 {
+					t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+				}
+			})
 		}
 	}
 }

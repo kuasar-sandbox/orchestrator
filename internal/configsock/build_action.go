@@ -25,6 +25,10 @@ func (s *Server) handleAdminBuildAction(w http.ResponseWriter, r *http.Request) 
 		}
 		result, err = s.deps.BuilderActionAdmin.DeleteBuildAdmin(r.Context(), r.PathValue("tid"), options)
 	} else {
+		if r.URL.RawQuery != "" || len(r.Header.Values("X-Kuasar-Sandbox-Builder")) != 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Cancel accepts no action options"})
+			return
+		}
 		result, err = s.deps.BuilderActionAdmin.CancelBuildAdmin(r.Context(), r.PathValue("bid"))
 	}
 	if err != nil {

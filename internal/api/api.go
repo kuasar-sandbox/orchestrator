@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -906,7 +907,12 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
 		return
 	}
-	if len(body.Cancel) != 0 || r.URL.Query().Has("cancel") {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid Build query")
+		return
+	}
+	if len(body.Cancel) != 0 || query.Has("cancel") {
 		writeErr(w, http.StatusBadRequest, "cancel is a Build action, not a Build definition")
 		return
 	}
@@ -1016,7 +1022,12 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
 		return
 	}
-	if len(body.Cancel) != 0 || r.URL.Query().Has("cancel") {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid Build query")
+		return
+	}
+	if len(body.Cancel) != 0 || query.Has("cancel") {
 		writeErr(w, http.StatusBadRequest, "cancel is a Build action, not a Build definition")
 		return
 	}

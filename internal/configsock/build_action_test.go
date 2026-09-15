@@ -63,6 +63,31 @@ func TestBuildActionAdminUsesPeerGateAndSharedActionParser(t *testing.T) {
 	}
 	mustWrite(t, pf, strconv.Itoa(os.Getpid())+"\n")
 	for _, tc := range []struct {
+		query  string
+		header []string
+	}{
+		{query: "cancel=true"}, {query: "cancel=false"}, {query: "cancel=%ZZ"}, {query: "delete=true"},
+		{header: []string{""}}, {header: []string{`{}`}}, {header: []string{`null`}},
+		{header: []string{`{"cancel":false}`}}, {header: []string{`{"cancel":true}`, `{}`}},
+	} {
+		before := admin.calls
+		req, err := http.NewRequest(http.MethodPost, "http://localhost"+cancelPath+"?"+tc.query, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.header != nil {
+			req.Header[http.CanonicalHeaderKey("X-Kuasar-Sandbox-Builder")] = tc.header
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || admin.calls != before {
+			t.Fatalf("cancel options %+v: status=%d calls=%d -> %d", tc, resp.StatusCode, before, admin.calls)
+		}
+	}
+	for _, tc := range []struct {
 		query, header string
 		cancel        bool
 		code          int

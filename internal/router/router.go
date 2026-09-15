@@ -716,7 +716,12 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(body.Cancel) != 0 || r.URL.Query().Has("cancel") {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "invalid Build query", http.StatusBadRequest)
+		return
+	}
+	if len(body.Cancel) != 0 || query.Has("cancel") {
 		http.Error(w, "cancel is only valid for Build cancellation or deletion", http.StatusBadRequest)
 		return
 	}

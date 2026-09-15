@@ -29,7 +29,7 @@ DELETE /templates/{transientID}
 X-Kuasar-Sandbox-Builder: {"cancel":true}
 ```
 
-均无需请求体. 只接受注册返回的 transient TemplateID,兼容当前单机 UUID 与集群随机 ID 格式. canonical/PersistID、name、alias、远端引用和非法 transient ID 返回 400. 合法但不存在或非 owner 返回 404;Cancel 还要求路径两个 ID 对应同一行. 即使 List 展示成功后的 canonical ID,调用方仍应保留注册 ID.
+均无需请求体. Cancel 不接受 Query 选项或 Builder Header,本地管理入口执行相同校验. 只接受注册返回的 transient TemplateID,兼容当前单机 UUID 与集群随机 ID 格式. canonical/PersistID、name、alias、远端引用和非法 transient ID 返回 400. 合法但不存在或非 owner 返回 404;Cancel 还要求路径两个 ID 对应同一行. 即使 List 展示成功后的 canonical ID,调用方仍应保留注册 ID.
 
 DELETE 按字段 presence 合并 `Header.cancel > Query.cancel > false`. Header 缺省或 `{}` 保留 Query;`{"cancel":false}` 覆盖 `?cancel=true`,`{"cancel":true}` 覆盖 `?cancel=false`. 先分别严格校验两种输入,低优先级非法即使被覆盖也返回 400. Query cancel 只能出现一次且值精确为 true/false. Header 只能出现一份,必须是仅允许 cancel 字段的单一 JSON object. 空 Header、null、数组、重复/未知字段、非 bool、第二个 JSON value 和尾随内容均拒绝. 动作 parser 与 BuildOptions 分离:cancel 不进入 builder_json/metadata,Register/Trigger 拒绝 cancel,DELETE 拒绝 target/resources/referer/registry. 不提供 force 或产物删除选项.
 

@@ -138,6 +138,9 @@ func TestBuildRegistrationRejectsCancelBeforeClusterDispatch(t *testing.T) {
 	for _, tc := range []struct{ body, query, header string }{
 		{`{"cancel":true}`, "", ""}, {`{"cancel":false}`, "", ""}, {`{"cancel":null}`, "", ""}, {`{"cancel":"false"}`, "", ""},
 		{`{}`, "cancel=false", ""}, {`{}`, "cancel=", ""}, {`{}`, "", `{"cancel":true}`},
+		{`{"cpuCount":1,"memoryMB":512}`, "cancel=%ZZ", ""},
+		{`{"cpuCount":1,"memoryMB":512}`, "%63ancel=%ZZ", ""},
+		{`{"cpuCount":1,"memoryMB":512}`, "cancel=true;other=false", ""},
 	} {
 		req, _ := http.NewRequest("POST", front.URL+"/v3/templates?"+tc.query, strings.NewReader(tc.body))
 		req.Host = "api.test.local"
