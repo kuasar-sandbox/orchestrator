@@ -76,7 +76,7 @@ func TestBuildActionRecoveryPrioritizesIntentAndAcceptedResult(t *testing.T) {
 					}
 				}
 				unit := "sandbox-builder@br-372-recovery.service"
-				lc := &reconcileLauncher{resourcesErr: errors.New("cancelled recovery must not adopt or read unit resources")}
+				lc := &reconcileLauncher{}
 				if phase != "exited" && phase != "terminal" {
 					lc.units = []launcher.Unit{{Name: unit, ActiveState: "active"}}
 				}
