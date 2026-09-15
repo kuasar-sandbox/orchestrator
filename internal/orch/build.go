@@ -1011,9 +1011,10 @@ func (o *Orchestrator) commitBuildCompletion(ctx context.Context, build *types.B
 	delay := 20 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanedPort := build.RuntimeVswitchPort
 		unlock := o.lockBuildEvent(build.BuildID)
 		current, err := o.st.GetBuild(writeCtx, build.BuildID)
-		if err == nil && (current == nil || current.TemplateID != build.TemplateID || current.RunID != build.RunID || !current.ExecutionClaimed) {
+		if err == nil && (current == nil || current.TemplateID != build.TemplateID || current.RunID != build.RunID) {
 			unlock()
 			cancel()
 			o.log.Warn("build terminal ownership lost", "bid", build.BuildID)
@@ -1021,7 +1022,9 @@ func (o *Orchestrator) commitBuildCompletion(ctx context.Context, build *types.B
 		}
 		if err == nil {
 			terminal := cloneBuildForObservation(current)
-			if publish == nil { // callers already supplied their terminal diagnosis
+			if current.Status == types.BuildReady || current.Status == types.BuildError {
+				// Recovery releases remaining ownership without rewriting an accepted terminal result.
+			} else if publish == nil { // callers already supplied their terminal diagnosis
 				terminal.Status, terminal.Reason = build.Status, build.Reason
 				terminal.PersistID, terminal.Kind = build.PersistID, build.Kind
 				terminal.Names, terminal.Aliases = build.Names, build.Aliases
@@ -1036,33 +1039,47 @@ func (o *Orchestrator) commitBuildCompletion(ctx context.Context, build *types.B
 				buildTerminalOutcome(terminal, accepted, cause)
 				result, runErr = accepted, cause
 			}
-			err = o.st.PutBuildTerminal(writeCtx, terminal)
+			// A runtime-only recovery retains these exact fields until this
+			// transaction. runBuildUnit/retry/recovery have already joined local
+			// preparation, stopped the unit, and removed both directories.
+			terminal.RuntimeVswitchPort, terminal.RuntimeFloatingIP, terminal.RuntimePortMAC = "", "", ""
+			terminal.RuntimeEnvdAccessToken, terminal.RuntimePrepareJSON = "", ""
+			err = o.st.PutBuildTerminal(writeCtx, terminal, build)
 			if err == nil {
 				terminal.RunID = ""
 				terminal.ExecutionClaimed, terminal.ExecutionClaimedUnix = false, 0
 				terminal.EnforcementStatus, terminal.Phase, terminal.PhaseSandboxID = "", "", ""
 				terminal.ExecutionResult = nil
 				terminal.Metadata = cloneStringMapWithout(terminal.Metadata, sandboxcfg.NsMMDS)
-				terminal.FinishedUnix = time.Now().Unix()
 				*build = *terminal
 				if publish != nil {
 					o.publishTerminalBuild(publish, terminal, terminal.PersistID)
 				}
-				if terminal.DeleteRequestedUnix != 0 {
-					deleted, deleteErr := o.st.DeleteRequestedBuild(writeCtx, terminal)
-					if deleteErr != nil {
-						o.log.Warn("delete terminal build; retry scheduled", "bid", build.BuildID, "err", deleteErr)
-					} else if deleted {
-						o.finishBuildDeletion(terminal)
-					}
-				}
+
 			}
 		}
 		unlock()
 		cancel()
+		if errors.Is(err, store.ErrBuildExecutionOwnership) {
+			return false
+		}
 		if err == nil {
+			if cleanedPort != "" {
+				o.networkAllocationMu.Lock()
+				delete(o.detachedPortsPending, cleanedPort)
+				o.networkAllocationMu.Unlock()
+			}
 			o.refreshBuildAdmissionGauges(context.Background())
 			o.buildCapacityChanged()
+			// Registration replay takes retention before the event fence. Release
+			// the terminal fence before entering that same order for hard deletion.
+			if build.DeleteRequestedUnix != 0 {
+				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if _, deleteErr := o.deleteRequestedBuild(deleteCtx, build); deleteErr != nil {
+					o.log.Warn("delete terminal build; retry scheduled", "bid", build.BuildID, "err", deleteErr)
+				}
+				deleteCancel()
+			}
 			if publish != nil {
 				if build.Status == types.BuildReady {
 					o.log.Info("build ready", "bid", build.BuildID, "template", build.PersistID)
@@ -1658,6 +1675,37 @@ type buildRuntimeCleanupProgress struct {
 
 func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, persisted bool) (buildRuntimeCleanupProgress, error) {
 	progress := buildRuntimeCleanupProgress{port: port, persisted: persisted}
+	// The owner pointer predates phase reports. Read SQLite after the exact
+	// runner has stopped and host preparation has joined, before reclaiming any
+	// resources. A disconnected phase may still own a controller reservation.
+	readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	current, err := o.st.GetBuild(readCtx, b.BuildID)
+	readCancel()
+	if err != nil {
+		return progress, err
+	}
+	if current == nil || current.TemplateID != b.TemplateID || current.RunID != b.RunID {
+		return progress, fmt.Errorf("%w: build runtime cleanup identity changed", store.ErrBuildExecutionOwnership)
+	}
+	if current.PhaseSandboxID != "" {
+		phaseCtx, phaseCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := o.waitBuildPhaseResourceReleased(phaseCtx, current.PhaseSandboxID)
+		phaseCancel()
+		if err != nil {
+			return progress, fmt.Errorf("wait for build phase %s resource release: %w", current.PhaseSandboxID, err)
+		}
+	}
+	// Recovery also handles partially cleared runtime fields without a port.
+	if current.RuntimeVswitchPort != "" || current.RuntimeFloatingIP != "" || current.RuntimePortMAC != "" ||
+		current.RuntimeEnvdAccessToken != "" || current.RuntimePrepareJSON != "" {
+		persisted = true
+		progress.persisted = true
+	}
+	// Some recovered rows retain only runtime ownership. Keep that final
+	// durable fence through directory removal; PutBuildTerminal releases it in
+	// its transaction after matching the exact cleaned runtime snapshot.
+	runtimeLastFence := !current.ExecutionClaimed && current.ExecutionClaimedUnix == 0 && current.RunID == "" &&
+		current.EnforcementStatus == "" && current.Phase == "" && current.PhaseSandboxID == "" && current.ExecutionResult == nil
 	var cleanupErr error
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1676,10 +1724,10 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 				progress.port = ""
 			}
 		}
-		if cleanupErr == nil && persisted {
+		if cleanupErr == nil && persisted && !runtimeLastFence {
 			unlockEvent := o.lockBuildEvent(b.BuildID)
 			defer unlockEventFence(unlockEvent)
-			cleared, err := o.st.ClearBuildRuntimeOwnership(cleanupCtx, b.BuildID, b.RunID, port)
+			cleared, err := o.st.ClearBuildRuntimeOwnership(cleanupCtx, b.BuildID, b.TemplateID, b.RunID, port)
 			if err != nil {
 				cleanupErr = errors.Join(cleanupErr, err)
 			} else if !cleared {

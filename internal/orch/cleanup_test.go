@@ -424,6 +424,11 @@ func TestRecoveredBuildPreparationFailureRetainsDirectoriesUntilUnitFence(t *tes
 		BuildID: "recovered-build-fence", Status: types.BuildBuilding,
 		RunID: "br-00000000-0000-7000-8000-000000000289", ExecutionClaimed: true,
 	}
+	build.TemplateID = "transient-" + build.BuildID
+	build.APISecret, build.ManifestKey = strings.Repeat("1", 64), strings.Repeat("2", 64)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
 	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID)
 	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID)
 	for _, path := range []string{runDir, baseDir} {

@@ -151,7 +151,7 @@ func TestConcurrentTerminalBuildReapAndSameIDRegistrationStayOrdered(t *testing.
 		}
 		build.Status = types.BuildError
 		build.Reason = "old terminal"
-		if err := o.st.PutBuildTerminal(ctx, build); err != nil {
+		if err := o.st.PutBuildTerminal(ctx, build, nil); err != nil {
 			t.Fatal(err)
 		}
 		now := time.Now()

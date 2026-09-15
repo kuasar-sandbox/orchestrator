@@ -887,7 +887,8 @@ cluster:
 EOF
     step "starting cluster conductor node_id=$node_id (API :${NODE_PORT}, no manual manifest-key add)"
     "$BIN/node-ctl" conductor serve --config "$WORK/cluster-node.yaml" > >(tee "$WORK/cluster-node.log" >&2) 2>&1 &
-    PIDS+=("$!")
+    CLUSTER_CONDUCTOR_PID=$!
+    PIDS+=("$CLUSTER_CONDUCTOR_PID")
     wait_api_health "$NODE_PORT" "cluster node-ctl"
     write_proxy_config "$WORK/cluster-proxy.yaml" \
         "$WORK/cn.sock" "$WORK/cr" "127.0.0.1:$NODE_DATA_PORT" - \
@@ -1083,7 +1084,7 @@ run_cluster_flow
 BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/lib/build_actions.py" \
     --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
     --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
-    --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" \
+    --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
     --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
     --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" &
 ACTION_TEST_PID=$!

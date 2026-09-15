@@ -40,16 +40,27 @@ func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	o.lc, o.vs = lc, stubVS{}
 	o.builderRunPool = newRunPool(runKindBuild, 0, time.Second, cfg.Paths.RunRoot, lc, o.builderUnit, o.log)
 	ctx, stop := context.WithCancel(context.Background())
+	var poolDone chan struct{}
 	released := false
 	t.Cleanup(func() {
 		if !released {
 			close(lc.release)
 		}
 		stop()
+		if poolDone != nil {
+			select {
+			case <-poolDone:
+			case <-time.After(5 * time.Second):
+				t.Error("BuildPool did not stop")
+			}
+		}
 		drain, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := o.DrainBuilds(drain); err != nil {
 			t.Error(err)
+		}
+		if err := o.st.Close(); err != nil {
+			t.Error("close drained Build store:", err)
 		}
 	})
 	if err := o.builderRunPool.Start(ctx); err != nil {
@@ -60,7 +71,8 @@ func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	if err := o.TriggerBuild(ctx, key, b.TemplateID, b.BuildID, api.TriggerSpec{FromImage: "registry.test/hang:v1"}, api.BuildAuth{}); err != nil {
 		t.Fatal(err)
 	}
-	go o.BuildPool(ctx, time.Hour)
+	poolDone = make(chan struct{})
+	go func() { defer close(poolDone); o.BuildPool(ctx, time.Hour) }()
 	var unit string
 	select {
 	case unit = <-lc.started:

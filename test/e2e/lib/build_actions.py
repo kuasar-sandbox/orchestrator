@@ -36,6 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("url", "host", "db", "run-root", "base-root", "socket", "bin", "switch", "source", "evidence"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--conductor-pid", type=int, required=True)
     parser.add_argument("--group", default="")
     parser.add_argument("--cpu", type=int, default=2)
     parser.add_argument("--timeout-only", type=int, default=0, metavar="SECONDS")
@@ -131,7 +132,17 @@ def main():
         for root in (args.run_root, args.base_root):
             assert not (Path(root) / "builds" / bid).exists(), (root, bid)
 
+    def conductor_fds():
+        targets = []
+        for fd in (Path("/proc") / str(args.conductor_pid) / "fd").iterdir():
+            try:
+                targets.append(os.readlink(fd))
+            except FileNotFoundError:
+                pass
+        return targets
+
     for mode in (("timeout",) if args.timeout_only else ("cancel", "query", "header")):
+        fds_before = conductor_fds()
         tid, bid = register(mode + "-hang")
         marker = "ISSUE372_HANG_" + bid
         trigger(tid, bid, "echo " + marker + "; while :; do sleep 1; done")
@@ -227,8 +238,8 @@ def main():
                 assert sandbox["state"] != "dead", sandbox
                 return sandbox["state"] == "running"
             wait_for("canonical Create after explicit Build deletion", running)
-            command(str(Path(args.bin) / "sandbox-ctl"), "exec", "--uds",
-                    str(Path(args.run_root) / "sandboxes" / sid / "ctl.sock"), "--", "/bin/true")
+            command(str(Path(args.bin) / "sandbox-ctl"), "exec", "--run-root",
+                    str(Path(args.run_root) / "sandboxes"), "--sandbox-id", sid, "--", "/bin/true")
             require("DELETE", "/sandboxes/" + sid, 204)
         rt, rb = register(mode + "-canonical-reuse", target)
         require("POST", f"/v2/templates/{rt}/builds/{rb}", 202, {"fromTemplate": canonical})
@@ -240,7 +251,13 @@ def main():
         if mode in ("cancel", "timeout"):
             assert row(bid) is not None, "diagnostic row disappeared"
             require("DELETE", "/templates/" + tid, 204)
-        item = {"mode": mode, "hang_build": bid, "transient_id": tid, "unit": unit,
+        fds_after = conductor_fds()
+        for build_id in (bid, wb, rb):
+            for root in (args.run_root, args.base_root):
+                prefix = str(Path(root) / "builds" / build_id) + "/"
+                assert not any(fd.startswith(prefix) for fd in fds_after), (build_id, fds_after)
+        item = {"conductor_pid": args.conductor_pid, "conductor_fds_before": len(fds_before),
+                "conductor_fds_after": len(fds_after), "build_directory_fds_retained": 0, "mode": mode, "hang_build": bid, "transient_id": tid, "unit": unit,
                 "phase_sandbox": before["phase_sandbox_id"], "port": before["runtime_vswitch_port"],
                 "cgroup": str(cg), "stopped_pids": list(processes), "seconds": round(elapsed, 3),
                 "next_build": wb, "next_status": "ready", "canonical_reused": canonical, "create_exec_verified": not bool(args.group)}

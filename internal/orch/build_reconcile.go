@@ -21,9 +21,12 @@ import (
 // an absent unit is cleaned and terminally failed. In both cases the claim is
 // released only after exact host ownership cleanup.
 func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
+	// A committed terminal deletion is independent of unit enumeration and
+	// ordinary execution recovery. Never defer it to terminal TTL.
+	deletionErr := o.reapRequestedBuilds(ctx)
 	units, err := o.lc.List(ctx, o.builderPattern())
 	if err != nil {
-		return fmt.Errorf("reconcile builder units: %w", err)
+		return errors.Join(deletionErr, fmt.Errorf("reconcile builder units: %w", err))
 	}
 	live := make(map[string]string)
 	all := make(map[string]string)
@@ -38,27 +41,86 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 		}
 	}
 
-	building, err := o.st.BuildsByStatus(ctx, types.BuildBuilding)
+	building, err := o.st.BuildsRequiringRecovery(ctx)
 	if err != nil {
 		return err
 	}
 	knownRuns := make(map[string]bool, len(building))
-	prepared := make(map[string]*liveBuildPreparation, len(building))
-	// Validate every live worker before adopting any of them. If one external
-	// read is transiently unavailable, startup can retry without canceling
-	// monitors that this same reconciliation pass already started.
 	for _, build := range building {
+		if build.RunID != "" {
+			knownRuns[build.RunID] = true
+		}
+	}
+	needsCleanup := func(build *types.Build) bool {
+		return build.CancelRequestedUnix != 0 || build.DeleteRequestedUnix != 0 ||
+			build.Status != types.BuildBuilding
+	}
+	finishOwnership := func(build *types.Build) error {
+		if err := types.ValidateBuildID(build.BuildID); err != nil {
+			return err
+		}
+		if build.RunID != "" {
+			if err := o.stopBuilderUnit(o.builderUnit(build.RunID)); err != nil {
+				return err
+			}
+		}
+		if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, build.RuntimeVswitchPort != ""); err != nil {
+			return err
+		}
+		if !o.commitBuildCompletion(ctx, build, nil, errors.New(store.BuildCancelledReason), func(_, _, _, _ string) { o.publishCommittedBuild(build) }) {
+			return fmt.Errorf("reconcile build %s did not commit terminal ownership release", build.BuildID)
+		}
+		return nil
+	}
+	// Stop every bound cancelled/terminal owner before any unrelated adoption
+	// preflight. One unavailable ordinary worker must not keep these units live.
+	cleanupErrs := []error{deletionErr}
+	cleaned := make(map[string]bool)
+	for _, build := range building {
+		if needsCleanup(build) && build.RunID != "" {
+			if err := finishOwnership(build); err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			} else {
+				cleaned[build.BuildID] = true
+			}
+		}
+	}
+	// A claim may have preceded durable RunID binding. Fence old unbound pool
+	// units before releasing those claims; they cannot join this config socket.
+	for runID, unit := range all {
+		if knownRuns[runID] {
+			continue
+		}
+		o.log.Info("reconcile: orphan builder", "run_id", runID, "unit", unit)
+		if err := o.stopBuilderUnit(unit); err != nil {
+			return errors.Join(append(cleanupErrs, err)...)
+		}
+		_ = o.lc.ResetFailed(ctx, unit)
+	}
+	for _, build := range building {
+		if needsCleanup(build) && build.RunID == "" && !cleaned[build.BuildID] {
+			if err := finishOwnership(build); err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			}
+		}
+	}
+	if err := errors.Join(cleanupErrs...); err != nil {
+		return err
+	}
+	prepared := make(map[string]*liveBuildPreparation, len(building))
+	// Validate all ordinary live workers before starting any adoption monitor.
+	for _, build := range building {
+		if needsCleanup(build) {
+			continue
+		}
 		if err := types.ValidateBuildID(build.BuildID); err != nil {
 			return fmt.Errorf("reconcile build: %w", err)
 		}
 		if !build.ExecutionClaimed {
 			return fmt.Errorf("reconcile build %s: building row has no execution claim", build.BuildID)
 		}
-		if build.RunID != "" {
-			knownRuns[build.RunID] = true
-		}
 		unit, isLive := live[build.RunID]
-		if !isLive || build.ExecutionResult != nil || build.CancelRequestedUnix != 0 || build.DeleteRequestedUnix != 0 {
+		if !isLive || build.ExecutionResult != nil {
 			continue
 		}
 		prep, err := o.prepareLiveBuild(ctx, build, unit)
@@ -68,33 +130,8 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 		prepared[build.BuildID] = prep
 	}
 
-	// Prestarted units from the previous config-socket cannot join the new pool;
-	// stop them after all durable run-id owners have been identified.
-	for runID, unit := range all {
-		if knownRuns[runID] {
-			continue
-		}
-		o.log.Info("reconcile: orphan builder", "run_id", runID, "unit", unit)
-		if err := o.stopBuilderUnit(unit); err != nil {
-			return err
-		}
-		_ = o.lc.ResetFailed(ctx, unit)
-	}
-
 	for _, build := range building {
-		if build.CancelRequestedUnix != 0 || build.DeleteRequestedUnix != 0 {
-			if build.RunID != "" {
-				if err := o.stopBuilderUnit(o.builderUnit(build.RunID)); err != nil {
-					return err
-				}
-			}
-			if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, build.RuntimeVswitchPort != ""); err != nil {
-				return err
-			}
-			o.completeBuild(ctx, build, nil, errors.New(store.BuildCancelledReason))
-			if build.ExecutionClaimed {
-				return fmt.Errorf("reconcile cancelled build %s retained execution claim", build.BuildID)
-			}
+		if needsCleanup(build) {
 			continue
 		}
 		unit, isLive := live[build.RunID]

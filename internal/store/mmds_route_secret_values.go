@@ -563,7 +563,7 @@ func (s *Store) DeleteBuildMMDSRouteSecretValues(ctx context.Context, buildID st
 // its builder-only execution ownership, MMDS routes, and confidential values.
 // The build row remains as retention-bounded status/index history, but no runner
 // or builder input can survive as terminal ownership or template metadata.
-func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error {
+func (s *Store) PutBuildTerminal(ctx context.Context, build, cleanedRuntime *types.Build) error {
 	if build == nil {
 		return errors.New("build is required")
 	}
@@ -582,11 +582,42 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 	}
 	defer tx.Rollback()
 	current, err := s.scanBuild(tx.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE build_id=? AND template_id=? AND run_id=?`, build.BuildID, build.TemplateID, build.RunID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: terminal build identity or ownership changed", ErrBuildExecutionOwnership)
+	}
 	if err != nil {
 		return fmt.Errorf("store: finish build identity: %w", err)
 	}
+	// The normal path has already cleared runtime under its retained claim.
+	// A recovery whose runtime is the last ownership fence supplies the exact
+	// snapshot only after local cleanup; release that fence in this transaction.
+	expectedPort, expectedIP, expectedMAC, expectedToken, expectedPrepare := "", "", "", "", ""
+	if cleanedRuntime != nil {
+		if cleanedRuntime.BuildID != current.BuildID || cleanedRuntime.TemplateID != current.TemplateID || cleanedRuntime.RunID != current.RunID ||
+			cleanedRuntime.ExecutionClaimed != current.ExecutionClaimed || cleanedRuntime.ExecutionClaimedUnix != current.ExecutionClaimedUnix {
+			return fmt.Errorf("%w: cleaned build lifecycle changed", ErrBuildExecutionOwnership)
+		}
+		expectedPort, expectedIP, expectedMAC = cleanedRuntime.RuntimeVswitchPort, cleanedRuntime.RuntimeFloatingIP, cleanedRuntime.RuntimePortMAC
+		expectedToken, expectedPrepare = cleanedRuntime.RuntimeEnvdAccessToken, cleanedRuntime.RuntimePrepareJSON
+	}
+	if current.RuntimeVswitchPort != expectedPort || current.RuntimeFloatingIP != expectedIP || current.RuntimePortMAC != expectedMAC ||
+		current.RuntimeEnvdAccessToken != expectedToken || current.RuntimePrepareJSON != expectedPrepare {
+		return fmt.Errorf("%w: cleaned build runtime changed", ErrBuildExecutionOwnership)
+	}
+	if !current.ExecutionClaimed && current.CancelRequestedUnix == 0 && current.DeleteRequestedUnix == 0 && current.Status == types.BuildBuilding {
+		return fmt.Errorf("%w: building row has no execution claim", ErrBuildExecutionOwnership)
+	}
 	terminal.CancelRequestedUnix, terminal.DeleteRequestedUnix = current.CancelRequestedUnix, current.DeleteRequestedUnix
-	if current.CancelRequestedUnix != 0 && current.ExecutionResult == nil {
+	terminal.FinishedUnix = time.Now().Unix()
+	if current.Status == types.BuildReady || current.Status == types.BuildError {
+		terminal.Status, terminal.Reason = current.Status, current.Reason
+		if current.FinishedUnix != 0 {
+			terminal.FinishedUnix = current.FinishedUnix
+		}
+		terminal.PersistID, terminal.Kind = current.PersistID, current.Kind
+		terminal.StartCmd, terminal.ReadyCmd = current.StartCmd, current.ReadyCmd
+		terminal.Names, terminal.Aliases = current.Names, current.Aliases
+	} else if current.CancelRequestedUnix != 0 && current.ExecutionResult == nil {
 		terminal.Status, terminal.Reason = types.BuildError, BuildCancelledReason
 		terminal.PersistID, terminal.Kind = current.PersistID, current.Kind
 		terminal.Names, terminal.Aliases = current.Names, current.Aliases
@@ -596,13 +627,13 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
 		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',
 		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json='',
-		execution_result_json='',finished_unix=unixepoch()
-		WHERE build_id=? AND template_id=? AND run_id=? AND status=? AND execution_claimed=1
-		  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
-		  AND runtime_envd_access_token_enc='' AND runtime_prepare_json=''`,
+		execution_result_json='',finished_unix=?
+		WHERE build_id=? AND template_id=? AND run_id=? AND status=? AND execution_claimed=? AND execution_claimed_unix=?
+		  AND runtime_vswitch_port=? AND runtime_floating_ip=? AND runtime_port_mac=?
+		  AND runtime_prepare_json=?`,
 		terminal.PersistID, string(terminal.Kind), terminal.StartCmd, terminal.ReadyCmd,
 		string(terminal.Status), terminal.Reason, mjs(terminal.Names), mjs(terminal.Aliases),
-		mj(terminal.Metadata), terminal.BuildID, terminal.TemplateID, terminal.RunID, string(types.BuildBuilding))
+		mj(terminal.Metadata), terminal.FinishedUnix, terminal.BuildID, terminal.TemplateID, terminal.RunID, string(current.Status), current.ExecutionClaimed, current.ExecutionClaimedUnix, expectedPort, expectedIP, expectedMAC, expectedPrepare)
 	if err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}

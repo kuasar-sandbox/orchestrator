@@ -81,7 +81,7 @@ func TestTerminalTransitionsPersistTimestampsAtomically(t *testing.T) {
 	}
 	finished.Status = types.BuildReady
 	finished.PersistID = "e2b:img:manifest://finished"
-	if err := st.PutBuildTerminal(ctx, finished); err != nil {
+	if err := st.PutBuildTerminal(ctx, finished, nil); err != nil {
 		t.Fatal(err)
 	}
 	finished, err = st.GetBuild(ctx, finished.BuildID)
@@ -251,7 +251,7 @@ func TestConcurrentBuildTerminalCommitAndRetention(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			terminalErr = st.PutBuildTerminal(ctx, &terminal)
+			terminalErr = st.PutBuildTerminal(ctx, &terminal, nil)
 		}()
 		go func() {
 			defer wg.Done()

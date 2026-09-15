@@ -1258,7 +1258,7 @@ start_conductor
 BUILD_ACTION_API_KEY="$AK" python3 "$SCRIPT_DIR/lib/build_actions.py" \
     --url "http://127.0.0.1:$PORT" --host "api.$DOMAIN" \
     --db "$WORK/lib/node-ctl.db" --run-root "$WORK/run" --base-root "$WORK/lib" \
-    --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" \
+    --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CONDUCTOR_PID" \
     --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --evidence "$WORK/build-actions.json"
 # A separate normal-timeout regression follows the three active cancellations.
 # Their original 1200-second execution deadline was unchanged.
@@ -1275,7 +1275,7 @@ start_conductor
 BUILD_ACTION_API_KEY="$AK" python3 "$SCRIPT_DIR/lib/build_actions.py" \
     --url "http://127.0.0.1:$PORT" --host "api.$DOMAIN" \
     --db "$WORK/lib/node-ctl.db" --run-root "$WORK/run" --base-root "$WORK/lib" \
-    --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" \
+    --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CONDUCTOR_PID" \
     --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --timeout-only 90 --evidence "$WORK/build-timeout.json"
 stop_conductor
 python3 - "$WORK/config.yaml" <<'PY_CONFIG'

@@ -515,7 +515,7 @@ func TestBuildProjectionCASPreservesConcurrentRegistrationAcceptance(t *testing.
 		// projection without erasing its target.
 		if firstUpdate {
 			firstUpdate = false
-			_, acceptErr = reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, want)
+			_, acceptErr = reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, "", want)
 		}
 		rec.State = BuildBuilding
 	})

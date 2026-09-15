@@ -116,3 +116,23 @@ func (s *Store) BuildsPendingDeletion(ctx context.Context, limit int) ([]*types.
 	}
 	return builds, rows.Err()
 }
+
+// BuildsRequiringRecovery includes every retained ownership shape, including
+// terminal rows whose runner or local cleanup was not yet released.
+func (s *Store) BuildsRequiringRecovery(ctx context.Context) ([]*types.Build, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds
+ WHERE status='building' OR NOT (`+buildOwnerFreeSQL+`) ORDER BY created_unix,build_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var builds []*types.Build
+	for rows.Next() {
+		build, err := s.scanBuild(rows)
+		if err != nil {
+			return nil, err
+		}
+		builds = append(builds, build)
+	}
+	return builds, rows.Err()
+}

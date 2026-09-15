@@ -100,18 +100,23 @@ func (o *Orchestrator) reapRequestedBuilds(ctx context.Context) error {
 	}
 	var errs []error
 	for _, build := range builds {
-		unlock := o.buildRetention.Lock(build.BuildID)
-		event := o.lockBuildEvent(build.BuildID)
-		deleted, err := o.st.DeleteRequestedBuild(ctx, build)
-		if err != nil {
+		if _, err := o.deleteRequestedBuild(ctx, build); err != nil {
 			errs = append(errs, err)
-		} else if deleted {
-			o.finishBuildDeletion(build)
 		}
-		event()
-		unlock()
 	}
 	return errors.Join(errs...)
+}
+
+func (o *Orchestrator) deleteRequestedBuild(ctx context.Context, build *types.Build) (bool, error) {
+	unlock := o.buildRetention.Lock(build.BuildID)
+	defer unlock()
+	event := o.lockBuildEvent(build.BuildID)
+	defer event()
+	deleted, err := o.st.DeleteRequestedBuild(ctx, build)
+	if err == nil && deleted {
+		o.finishBuildDeletion(build)
+	}
+	return deleted, err
 }
 
 func (o *Orchestrator) releaseBuildOwner(build *types.Build, owner *pendingBuild) {

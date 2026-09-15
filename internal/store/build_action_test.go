@@ -273,7 +273,7 @@ func TestBuildDeleteOwnedMMDSAndRetryWithoutTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.Status = types.BuildError
-	if err := st.PutBuildTerminal(ctx, b); err != nil {
+	if err := st.PutBuildTerminal(ctx, b, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.DeleteRequestedBuild(ctx, b); err == nil {
@@ -306,7 +306,7 @@ func TestBuildDeleteOwnedMMDSAndRetryWithoutTTL(t *testing.T) {
 	if deleted, err := st.DeleteRequestedBuild(ctx, b); err != nil || deleted {
 		t.Fatal("old identity affected replacement")
 	}
-	if err := st.PutBuildTerminal(ctx, b); err == nil {
+	if err := st.PutBuildTerminal(ctx, b, nil); err == nil {
 		t.Fatal("old terminal writer affected replacement")
 	}
 }

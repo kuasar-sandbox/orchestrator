@@ -632,10 +632,9 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
   重启不重置或延长任一预算。
 
 Build row 不存目录字段；Reconcile 只用 BuildID 与当前 RunRoot/BaseRoot 重新派生
-BuildRunDir/BuildBaseDir。任何终态都先 fence exact unit/cgroup、detach port、清 runtime
-ownership，并删除两个目录；terminal commit 再原子清空 RunID、execution result 并释放
-execution claim。phase 子进程的自清理不是最终正确性
-依据。节点级数据库、config socket 与 runner pidfile 不位于对象目录内，不受 Sandbox/Build
+BuildRunDir/BuildBaseDir. 任何终态都先 fence exact unit/cgroup, 等待动态阶段资源预留释放,
+detach port 并删除两个目录. 清理完成前保留持久归属; terminal commit 再原子清空 RunID、
+execution result 并释放 execution claim. phase 子进程的自清理不是最终正确性依据.节点级数据库、config socket 与 runner pidfile 不位于对象目录内，不受 Sandbox/Build
 `RemoveAll` 影响。
 
 共享 SQLite 基础设施与终态 reaper 由 [节点可靠性](node_zh.md#14-可靠性) 维护;Build schema 与恢复由本节维护。Build 行是有保留期的执行/status/alias 记录，不是永久模板目录；已发布 canonical template ref 不依赖原 Build 行。
@@ -644,12 +643,12 @@ execution claim。phase 子进程的自清理不是最终正确性
 
 registration usage 只统计 status IN (registered, waiting, building) 且两个意图时间均为零的行. execution usage 统计全部 execution_claimed=1 的行,独立于 status 和意图. 数量和 CPU/memory/storage 向量、真实准入 SQL、管理、metrics 和节点上报采用相同口径. waiting 数量与 oldest waiting 只包含仍可执行的记录. 接受取消/删除的事务提交即释放注册容量;exact unit 停止、本地清理和 PutBuildTerminal 成功后才释放执行容量. 正常成功、失败和总超时仍自动清理. 容量变化以可合并通知唤醒既有 FIFO pool 和节点用量上报,周期检查继续兜底.
 
-现有进程内执行 owner 在 claim 发布前登记. 意图阻止新的 Trigger/claim/assignment/bootstrap/prepare/phase/result 推进,通知唯一 owner 停止 exact RunID unit,覆盖阶段 VM 和辅助进程. host prepare 先退出或回滚未提交资源,再由同一 owner 清理精确网络、运行入口、BuildRunDir 和 BuildBaseDir. Build 锁只保护短身份及数据库/事件提交,不等待 unit stop 或目录删除. cleanup CAS 在取消后仍有效. HTTP 断开不撤销已接受意图;清理的外部操作使用独立有界上下文.
+现有进程内执行 owner 在 claim 发布前登记. 意图阻止新的 Trigger/claim/assignment/bootstrap/prepare/phase/result 推进,通知唯一 owner 停止 exact RunID unit,覆盖阶段 VM 和辅助进程. host prepare 先退出或回滚未提交资源,再由同一 owner 清理精确网络、运行入口、BuildRunDir 和 BuildBaseDir. unit 停止后,清理读取持久化 PhaseSandboxID,等待既有资源控制器释放对应预留. 若 runtime 字段是最后的归属,则保留到两个目录删除完成,由 PutBuildTerminal 条件提交释放. Build 锁只保护短身份及数据库/事件提交,不等待 unit stop 或目录删除. cleanup CAS 在取消后仍有效. HTTP 断开不撤销已接受意图;清理的外部操作使用独立有界上下文.
 
 取消和结果接受按持久先后裁决:cancel-first 拒绝新结果,以 `build cancelled by user` 结束;result-first 保留已接受的成功/失败及相同结果重放,继续停止和清理. direct Image 复用采用同一终态条件. 旧回调不能 upsert 复活已删行或影响后继 transient 身份. 数据库提交先于观察通知;真实硬删除后才发 BuildDelete. error 导致观察集合移除是另一事实.
 
-清理完成后 PutBuildTerminal 释放 claim,再单独条件硬删除. 最终 DELETE 失败保留 delete 意图,不重新占执行预算. 立即重试、既有生命周期有界补偿和启动恢复继续处理,不等 terminal_ttl. Stop/状态回读/detach/目录/终态失败保留必要归属以重试. 启动先处理 cancel/delete 再收养流水线:停止活 unit、清理已退出 unit、直接删无归属 marked 终态行,不为已取消任务重读源产物或重置原执行截止时间.
+清理完成后 PutBuildTerminal 释放 claim,提交后立即通知容量变化,再按既有注册/retention 锁单独条件硬删除. 等待终态发布的注册重放不能重新插入已删除身份. 最终 DELETE 失败保留 delete 意图,不重新占执行预算. 立即重试、既有生命周期有界补偿和启动恢复继续处理,不等 terminal_ttl. Stop/状态回读/detach/目录/终态失败保留必要归属以重试. 启动先处理 cancel/delete 再收养流水线:停止活 unit、清理已退出 unit、直接删无归属 marked 终态行,不为已取消任务重读源产物或重置原执行截止时间.
 
-两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
+两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 缺少 transient 字段的旧 owner ref 只依据仍匹配的 route/binding 补齐. provisional 插入、注册 ACK/拒绝及重放 ref 更新均比较原身份和当前 revision,迟到操作不能覆盖后继记录. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
 
 按现有版本协调一起升级 node/router/Registry writer. 回退到不理解意图的旧 writer 前,停止接受新的取消/删除,由当前版本收敛全部待处理操作. 有未完成意图时,加法 schema 本身不能保证安全回退. 不增加长期双 writer、新任务表或兼容服务. 记录删除后已发布 canonical img/sbx/snp 引用、已有 Sandbox、下游 fromTemplate 和共享产物的其他 Build 仍可用;绝不删除远端内容.

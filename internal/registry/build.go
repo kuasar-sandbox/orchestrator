@@ -140,7 +140,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			// ownership index and replay the exact stored intent to the same node;
 			// neither current placement nor Provider output may change it.
 			ref.TemplateID = rec.TemplateID
-			if err := r.stores.AddNodeBuildRef(ctx, rec.NodeID, ref); err != nil {
+			if err := r.refreshBuildRegistrationRef(ctx, rec, ref); err != nil {
 				return nil, err
 			}
 			ack, err := r.dispatchBuildRegistration(ctx, rec)
@@ -152,7 +152,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 				if err != nil {
 					return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", rec.NodeID, err)
 				}
-				registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, target)
+				registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, rec.TemplateID, target)
 				if err != nil {
 					return nil, err
 				}
@@ -240,11 +240,15 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			registrationMMDSSecrets: cloneStringMap(mmdsSecrets),
 			registrationCredentials: cloneBuildCredentials(credentials),
 		}
-		if err := r.stores.PutBuild(ctx, rec); err != nil {
+		if _, inserted, err := r.stores.casRouteBuildShard(ctx, rec, 0); err != nil {
 			return nil, err
+		} else if !inserted {
+			return nil, fmt.Errorf("registry: build %s registration appeared during placement", buildID)
 		}
 		if err := r.stores.AddNodeBuildRef(ctx, id, ref); err != nil {
-			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			if cleanupErr := r.removeBuildRegistrationRoute(ctx, rec); cleanupErr != nil {
+				return nil, errors.Join(err, cleanupErr)
+			}
 			if errors.Is(err, errNodeBuildIDConflict) {
 				lastFailure = err
 				excluded.add(id)
@@ -274,7 +278,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if err != nil {
 			return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", id, err)
 		}
-		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, target)
+		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, rec.TemplateID, target)
 		if err != nil {
 			return nil, err
 		}
@@ -465,20 +469,97 @@ func ambiguousBuildRegistrationError(nodeID string, ack *routesync.CmdAck) error
 	return fmt.Errorf("registry: build_register ambiguous on node %s: status=%q http_status=%d reason=%s", nodeID, ack.Status, ack.HTTPStatus, ack.Reason)
 }
 
-func (r *Registry) removeBuildRegistrationIntent(ctx context.Context, rec *BuildRecord) error {
-	if err := r.stores.DeleteBuild(ctx, rec.Group, rec.BuildID); err != nil {
+// A replay may cross deletion while accessing another shard. Check the route
+// both before and after publishing the ref, and remove only the stale identity
+// if the original registration ceased to be current. Never dispatch it then.
+func (r *Registry) refreshBuildRegistrationRef(ctx context.Context, expected *BuildRecord, ref clusterstate.NodeBuildRef) error {
+	matches := func() (bool, error) {
+		current, found, err := r.stores.GetBuildInGroup(ctx, expected.Group, expected.BuildID)
+		return found && current != nil && current.NodeID == expected.NodeID && current.TemplateID == expected.TemplateID, err
+	}
+	if ok, err := matches(); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("registry: build %s registration changed before replay ref", expected.BuildID)
+	}
+	if err := r.stores.AddNodeBuildRef(ctx, expected.NodeID, ref); err != nil {
 		return err
 	}
-	return r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.BuildID)
+	if ok, err := matches(); err != nil {
+		return err // An unavailable authority is not proof that its ref is stale.
+	} else if ok {
+		return nil
+	}
+	current, revision, found, err := r.lookupNodeBuildRefVersion(ctx, expected.NodeID, expected.BuildID)
+	if err != nil {
+		return err
+	}
+	if found && current.Group == expected.Group && current.TemplateID == expected.TemplateID {
+		if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, expected.NodeID, expected.BuildID, revision); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("registry: build %s registration changed while refreshing replay ref", expected.BuildID)
 }
 
-func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID string, target *types.BuildTarget) (*BuildRecord, error) {
+// A failed owner-ref insert owns only its original provisional route. It must
+// neither remove another lifecycle's route nor touch that lifecycle's ref.
+func (r *Registry) removeBuildRegistrationRoute(ctx context.Context, expected *BuildRecord) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		current, revision, found, err := r.stores.getRouteBuildShard(ctx, expected.Group, expected.BuildID)
+		if err != nil {
+			return err
+		}
+		if !found || current.TemplateID != expected.TemplateID || current.NodeID != expected.NodeID || current.State != BuildStarting {
+			return fmt.Errorf("registry: build %s provisional registration changed", expected.BuildID)
+		}
+		if deleted, err := r.stores.deleteRouteBuildShardIfRevision(ctx, expected.Group, expected.BuildID, revision); err != nil {
+			return err
+		} else if deleted {
+			return nil
+		}
+	}
+	return fmt.Errorf("registry: build %s provisional registration cleanup conflicted", expected.BuildID)
+}
+
+func (r *Registry) removeBuildRegistrationIntent(ctx context.Context, expected *BuildRecord) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		ref, refRevision, refFound, err := r.lookupNodeBuildRefVersion(ctx, expected.NodeID, expected.BuildID)
+		if err != nil {
+			return err
+		}
+		current, revision, found, err := r.stores.getRouteBuildShard(ctx, expected.Group, expected.BuildID)
+		if err != nil {
+			return err
+		}
+		if !found || current.NodeID != expected.NodeID || current.TemplateID != expected.TemplateID || current.State != BuildStarting ||
+			(refFound && (ref.Group != expected.Group || ref.TemplateID != expected.TemplateID)) {
+			return fmt.Errorf("registry: build %s registration intent changed before rejection", expected.BuildID)
+		}
+		deleted, err := r.stores.deleteRouteBuildShardIfRevision(ctx, expected.Group, expected.BuildID, revision)
+		if err != nil {
+			return err
+		}
+		if !deleted {
+			continue
+		}
+		if refFound {
+			if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, expected.NodeID, expected.BuildID, refRevision); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("registry: build %s registration rejection conflicted", expected.BuildID)
+}
+
+func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID, templateID string, target *types.BuildTarget) (*BuildRecord, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		current, revision, found, err := r.stores.getRouteBuildShard(ctx, group, buildID)
 		if err != nil {
 			return nil, err
 		}
-		if !found || current.NodeID != nodeID {
+		if !found || current.NodeID != nodeID || current.TemplateID != templateID {
 			return nil, fmt.Errorf("registry: build %s registration intent changed before acceptance", buildID)
 		}
 		if current.RegistrationTargetSet {

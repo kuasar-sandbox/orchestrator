@@ -231,14 +231,14 @@ func (s *Store) SetBuildRuntimePreparation(ctx context.Context, buildID, runID, 
 // ClearBuildRuntimeOwnership records that the exact assigned runner's connector
 // preparation was released while retaining its execution claim until directory
 // cleanup and the terminal Build commit complete.
-func (s *Store) ClearBuildRuntimeOwnership(ctx context.Context, buildID, runID, vswitchPort string) (bool, error) {
-	if buildID == "" || runID == "" || vswitchPort == "" {
-		return false, fmt.Errorf("store: clear build runtime ownership: build id, run id, and vswitch port are required")
+func (s *Store) ClearBuildRuntimeOwnership(ctx context.Context, buildID, templateID, runID, vswitchPort string) (bool, error) {
+	if buildID == "" || templateID == "" {
+		return false, fmt.Errorf("store: clear build runtime ownership: build id and transient identity are required")
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
 		SET runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json=''
-		WHERE build_id=? AND status=? AND execution_claimed=1 AND run_id=? AND runtime_vswitch_port=?`,
-		buildID, string(types.BuildBuilding), runID, vswitchPort)
+		WHERE build_id=? AND template_id=? AND run_id=? AND runtime_vswitch_port=?`,
+		buildID, templateID, runID, vswitchPort)
 	if err != nil {
 		return false, fmt.Errorf("store: clear build %s runtime ownership: %w", buildID, err)
 	}

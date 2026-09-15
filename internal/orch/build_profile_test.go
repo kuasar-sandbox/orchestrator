@@ -630,7 +630,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 				t.Fatal(err)
 			}
 			stored.Status, stored.PersistID, stored.Reason = tc.state, tc.templateID, tc.reason
-			if err := o.st.PutBuildTerminal(ctx, stored); err != nil {
+			if err := o.st.PutBuildTerminal(ctx, stored, nil); err != nil {
 				t.Fatal(err)
 			}
 			terminal, err := o.st.GetBuild(ctx, cmd.BuildID)
