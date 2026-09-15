@@ -15,69 +15,89 @@ import (
 )
 
 func TestStreamClientsShareTLSSettingsWithoutMutatingConfig(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-	pool := x509.NewCertPool()
-	pool.AddCert(srv.Certificate())
-	cfg := &tls.Config{RootCAs: pool, NextProtos: []string{"h2"}}
-	a, b := newStreamClient(cfg), newStreamClient(cfg)
-	defer a.CloseIdleConnections()
-	defer b.CloseIdleConnections()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	for _, tc := range []struct {
+		name        string
+		waitForDial bool
+	}{
+		{name: "handshake_and_initialization", waitForDial: true},
+		{name: "concurrent_initializations"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+			pool := x509.NewCertPool()
+			pool.AddCert(srv.Certificate())
+			protocols := []string{"h2", "reserved"}
+			cfg := &tls.Config{RootCAs: pool, NextProtos: protocols[:1]}
+			a, b := newStreamClient(cfg), newStreamClient(cfg)
+			defer a.CloseIdleConnections()
+			defer b.CloseIdleConnections()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-	// The first Transport has initialized HTTP/2 defaults when it reaches Dial.
-	// Release its TLS handshake together with the second Transport's first
-	// request, so both clients must safely use the caller's shared settings.
-	ready, start := make(chan struct{}), make(chan struct{})
-	var readyOnce sync.Once
-	tr := a.Transport.(*http.Transport)
-	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
-		readyOnce.Do(func() { close(ready) })
-		select {
-		case <-start:
-		case <-ctx.Done():
-			if conn != nil {
-				_ = conn.Close()
+			ready, start := make(chan struct{}), make(chan struct{})
+			if tc.waitForDial {
+				// HTTP/2 defaults are initialized before Dial. Release the first TLS
+				// handshake together with the other Transport's initialization.
+				var readyOnce sync.Once
+				tr := a.Transport.(*http.Transport)
+				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+					readyOnce.Do(func() { close(ready) })
+					select {
+					case <-start:
+					case <-ctx.Done():
+						if conn != nil {
+							_ = conn.Close()
+						}
+						return nil, ctx.Err()
+					}
+					return conn, err
+				}
 			}
-			return nil, ctx.Err()
-		}
-		return conn, err
-	}
-	request := func(c *http.Client) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
-		if err != nil {
-			return err
-		}
-		resp, err := c.Do(req)
-		if err != nil {
-			return err
-		}
-		_, err = io.Copy(io.Discard, resp.Body)
-		closeErr := resp.Body.Close()
-		if err != nil {
-			return err
-		}
-		return closeErr
-	}
-	done := make(chan error, 2)
-	go func() { done <- request(a) }()
-	select {
-	case <-ready:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	go func() { <-start; done <- request(b) }()
-	close(start)
-	for range 2 {
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	}
-	if !slices.Equal(cfg.NextProtos, []string{"h2"}) {
-		t.Errorf("caller TLS protocols changed to %v", cfg.NextProtos)
+			request := func(c *http.Client) error {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+				if err != nil {
+					return err
+				}
+				resp, err := c.Do(req)
+				if err != nil {
+					return err
+				}
+				_, err = io.Copy(io.Discard, resp.Body)
+				closeErr := resp.Body.Close()
+				if err != nil {
+					return err
+				}
+				return closeErr
+			}
+			done := make(chan error, 2)
+			if tc.waitForDial {
+				go func() { done <- request(a) }()
+				select {
+				case <-ready:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			} else {
+				// Both initializations may append to the protocol list's spare capacity.
+				go func() { <-start; done <- request(a) }()
+			}
+			go func() { <-start; done <- request(b) }()
+			close(start)
+			for range 2 {
+				if err := <-done; err != nil {
+					t.Error(err)
+				}
+			}
+			if !slices.Equal(cfg.NextProtos, []string{"h2"}) {
+				t.Errorf("caller TLS protocols changed to %v", cfg.NextProtos)
+			}
+			if !slices.Equal(protocols, []string{"h2", "reserved"}) {
+				t.Errorf("caller TLS protocol backing array changed to %v", protocols)
+			}
+		})
 	}
 }
