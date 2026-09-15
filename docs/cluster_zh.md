@@ -595,11 +595,11 @@ node_link 维护以下 recordSet:
 - `sandbox`:该 node 上 sandbox 的
   `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`
   完整归属表。
-- `build`:该 node 上 build 的 `build_id -> group` 完整归属表。
+- `build`:该 node 上 build 的 `build_id -> {group,template_id}` 完整归属表。
 - `key_pair`:selector patch 刷新的 APISecret+ManifestKey pair cache。
 
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`key_pair`
-recordSet。sandbox/build 表由 cluster 在任务下发前写入。Registration usage 只统计非终态 Build row，在 ready/error transition 时释放；已执行 Build 必须先完成 exact host cleanup，才提交终态并释放 execution ownership。保留终态历史不会继续占用准入额度。归属记录保留到对应 node terminal retention 删除 Build row 并发送 `BuildDelete`；
+recordSet。sandbox/build 表由 cluster 在任务下发前写入。registration usage 只统计无 cancel/delete 意图的 registered/waiting/building 行. execution usage 独立统计全部 claim, 包含取消及清理中的任务. 意图提交释放注册容量; exact host cleanup 与终态提交后才释放执行容量. 无归属终态历史不占准入额度. 归属保留到显式删除或节点 terminal retention 实际删除 Build 行并发送 `BuildDelete`;
 Registry 随后 exact-delete 对应 Build projection 与 owner ref。key_pair 由 selector patch 更新。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
 build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
@@ -1026,18 +1026,20 @@ ambiguous registration 静默改放另一节点。相同 build_id 在不同 node
 
 BuildUpsert/Delete 只携带 node-local Build 投影；nodelink owner 以 immutable `(node_id,build_id)` ref
 查得 group。终态 Upsert 更新查询投影，durable node heartbeat 报告 claim usage。exact execution owner
-cleanup 后的 terminal commit 释放 execution ownership，row 同时不再计入 registration usage；节点 TTL 随后删除保留历史并发送 `BuildDelete`，Registry 再删除 exact projection/ref。源码见 [durable usage query](../internal/store/build_admission.go) 与 [registration transaction](../internal/store/mmds_route_secret_values.go)。北向查询与 router cache 始终带 group。节点把每次 Build durable transition 与对应 live publication 放在无条件的
+cleanup 后的 terminal commit 释放 execution ownership; cancel/delete 意图提交已提前释放 registration usage. 显式删除(包括清理后的持久 delete 意图)或节点 TTL 实际删除行后, 携带不可变 transient TemplateID 发送 BuildDelete, Registry 只删除匹配的 projection/ref. 源码见 [durable usage query](../internal/store/build_admission.go) 与 [registration transaction](../internal/store/mmds_route_secret_values.go)。北向查询与 router cache 始终带 group。节点把每次 Build durable transition 与对应 live publication 放在无条件的
 per-Build fence 内；该顺序不依赖 conductor Extension 是否启用，因此 waiting 不会在 building/terminal
 之后迟到覆盖 Registry projection。
 
-ready/error status、临时 TemplateID、name/alias 与本机/Registry Build list 只在节点
-`builder.terminal_ttl` retention window 内可用。canonical TemplateID 自编码 profile、kind 与 portable
+ready/error status、临时 TemplateID、name/alias 与本机/Registry Build list 可用到显式删除或节点
+`builder.terminal_ttl` 到期. canonical TemplateID 自编码 profile、kind 与 portable
 artifact ref，Build row 删除后仍可长期用于 img/sbx/snp Create；Create 不从旧 Build projection 或
 metadata 恢复 IMG 配置；canonical `fromTemplate` 同样不依赖旧 projection。Registry 不另设 timer，
 也不延长节点定义的窗口。重叠连接期间，Registry 只接受当前 active node-link session 的 Build
 frames；会话替换与 Build store mutation 由同一 NodeID fence 排序，旧连接不能删除新一代同 ID Build。
 reconnect snapshot 期间，节点仍通过同一个 stream writer 有界穿插 command ACK/heartbeat；Build live
 changes 继续缓存在独立 subscription 中，必须等 `build_sync_end` 后才发送。
+
+Cancel 以 group + BuildID 定位原节点. DELETE 在既有 Build 投影中以 group + 不可变注册 transient TemplateID 定位; 成功后 PersistID 单独保留. Router 原样转发 DELETE Query 与 Builder Header, 由节点动作 parser 和 ownership 校验裁决. Header 的显式 cancel > Query > false; {} 不覆盖 Query. 节点不可达、投影不完整或权威查询失败返回服务错误. Registry 不提前删归属、不释放节点执行用量、不把取消改派其他节点. BuildStarting 歧义注册与既有 binding 合同保持不变. 状态、重试、恢复和协调升级/回退见 [Build 动作](node-build_zh.md#11-取消与删除-build-记录).
 
 ## 13. 状态所有权与灾备边界
 

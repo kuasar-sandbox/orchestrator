@@ -23,14 +23,22 @@ func ValidateBuildID(id string) error {
 
 func ValidBuildID(id string) bool { return ValidateBuildID(id) == nil }
 
-// TransientPrefix marks the register-time templateID the e2b SDK first receives,
-// "transient-<uuidv7>". It is a throwaway handle: once the build is ready, the
-// self-describing persist id "<profile>-<kind>-<base64url(portable-ref)>" is surfaced via the
-// template's names+aliases and used for everything afterwards.
+// TransientPrefix marks the immutable registration handle. Standalone and
+// cluster registrations use their existing ID generators. Keep this handle for
+// Build status/cancellation/deletion; successful canonical IDs identify artifacts.
 const TransientPrefix = "transient-"
 
 // IsTransientID reports whether s is a register-time transient templateID.
 func IsTransientID(s string) bool { return strings.HasPrefix(s, TransientPrefix) }
+
+// ValidateTransientID accepts the registration handles produced by both node
+// and cluster registration without imposing a UUID-only suffix.
+func ValidateTransientID(id string) error {
+	if !IsTransientID(id) || !buildIDRe.MatchString(strings.TrimPrefix(id, TransientPrefix)) {
+		return fmt.Errorf("template ID must be a registered transient ID")
+	}
+	return nil
+}
 
 // BuildState is the lifecycle of a template build. The builds row is retained
 // only as bounded status/index history; a canonical TemplateID and its portable
@@ -184,8 +192,8 @@ type BuildResult struct {
 
 // Build is one template build plus its retention-bounded status/index history.
 type Build struct {
-	BuildID      string  // e2b build id (uuidv7)
-	TemplateID   string  // transient-<uuidv7>, the register-time handle
+	BuildID      string  // node or cluster Build business identity
+	TemplateID   string  // immutable transient registration handle
 	PersistID    string  // <profile>-<kind>-<base64url(portable-ref)>, set when ready
 	APISecret    string  // per-tenant API authentication root (hex)
 	ManifestKey  string  // per-tenant manifest encryption root (hex)
@@ -267,6 +275,10 @@ type Build struct {
 	// run-builder's report. Terminal persistence clears it together with the
 	// execution claim after the unit and host runtime have been reclaimed.
 	ExecutionResult *BuildResult
+
+	// Intent timestamps are monotonic lifecycle data, never BuildOptions.
+	CancelRequestedUnix int64
+	DeleteRequestedUnix int64
 
 	CreatedUnix  int64
 	FinishedUnix int64 // terminal ready/error commit time; 0 while nonterminal

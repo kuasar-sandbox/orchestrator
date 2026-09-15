@@ -68,6 +68,8 @@ const (
 	PathRunBuildPhase              = "/internal/run/build-phase"
 	PathAdminManifestKey           = "/internal/admin/manifest-keys"
 	PathAdminBuilderAdmission      = "/internal/admin/builder-admission"
+	PathAdminBuildCancel           = "/internal/admin/builds/{bid}/cancel"
+	PathAdminBuildDelete           = "/internal/admin/templates/{tid}"
 	PathAdminMMDSRouteSecretPut    = "PUT /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 	PathAdminMMDSRouteSecretDelete = "DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 
@@ -343,6 +345,11 @@ type BuilderAdmissionAdmin interface {
 	BuilderAdmissionStatus(ctx context.Context) (BuilderAdmissionStatus, error)
 }
 
+type BuilderActionAdmin interface {
+	CancelBuildAdmin(context.Context, string) (api.BuildActionResult, error)
+	DeleteBuildAdmin(context.Context, string, api.DeleteBuildOptions) (api.BuildActionResult, error)
+}
+
 type BuildAdmissionHeadroom struct {
 	MaxBuilds *int64 `json:"max_builds,omitempty"`
 	CPU       *int64 `json:"cpu_milli,omitempty"`
@@ -357,7 +364,21 @@ type BuildAdmissionLevelStatus struct {
 	Available  BuildAdmissionHeadroom    `json:"available"`
 }
 
+type BuilderBuildStatus struct {
+	BuildID              string               `json:"buildID"`
+	TemplateID           string               `json:"templateID"`
+	Status               types.BuildState     `json:"status"`
+	Resources            types.BuildResources `json:"resources"`
+	RunID                string               `json:"runID,omitempty"`
+	WaitingUnix          int64                `json:"waitingUnix,omitempty"`
+	ExecutionClaimed     bool                 `json:"executionClaimed"`
+	ExecutionClaimedUnix int64                `json:"executionClaimedUnix,omitempty"`
+	CancelRequested      bool                 `json:"cancelRequested"`
+	DeleteRequested      bool                 `json:"deleteRequested"`
+}
+
 type BuilderAdmissionStatus struct {
+	Builds              []BuilderBuildStatus      `json:"builds"`
 	Registration        BuildAdmissionLevelStatus `json:"registration"`
 	Execution           BuildAdmissionLevelStatus `json:"execution"`
 	WaitingBuilds       int64                     `json:"waiting_builds"`
@@ -393,6 +414,7 @@ type Deps struct {
 	Provider                     Provider // exact-run task bootstrap/prepare and reports
 	Admin                        Admin    // admin plane (manifest-key allowlist)
 	MMDSRouteSecretAdmin         MMDSRouteSecretAdmin
+	BuilderActionAdmin           BuilderActionAdmin
 	BuilderAdmissionAdmin        BuilderAdmissionAdmin
 	MaxMMDSRouteSecretValueBytes int
 	API                          http.Handler     // api plane (e2b control plane + export/import); the fallback
@@ -475,6 +497,10 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc("POST "+PathRunBuildPhase, s.handleBuildPhase)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	if s.deps.BuilderActionAdmin != nil {
+		mux.HandleFunc("POST "+PathAdminBuildCancel, s.handleAdminBuildAction)
+		mux.HandleFunc("DELETE "+PathAdminBuildDelete, s.handleAdminBuildAction)
+	}
 	if s.deps.BuilderAdmissionAdmin != nil {
 		mux.HandleFunc("GET "+PathAdminBuilderAdmission, s.handleAdminBuilderAdmission)
 	}

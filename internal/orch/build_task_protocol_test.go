@@ -34,6 +34,10 @@ func TestBuildTaskBootstrapUsesExactRunAndSourceTwoStage(t *testing.T) {
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), RunID: "br-current",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 	}
+	if build.ManifestKey == "" {
+		build.ManifestKey = strings.Repeat("c", 64)
+	}
+	build.APISecret = deriveTestAPISecret(t, build.ManifestKey)
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +73,14 @@ func TestBuildTaskBootstrapUsesExactRunAndSourceTwoStage(t *testing.T) {
 
 func TestBuildTaskFastPathReturnsFinalInBootstrap(t *testing.T) {
 	o := testOrch(t)
-	build := &types.Build{BuildID: "build-fast", RunID: "br-fast", ManifestKey: strings.Repeat("c", 64)}
+	build := &types.Build{BuildID: "build-fast", TemplateID: "transient-build-fast", RunID: "br-fast", Status: types.BuildBuilding, ExecutionClaimed: true, ManifestKey: strings.Repeat("c", 64)}
+	if build.ManifestKey == "" {
+		build.ManifestKey = strings.Repeat("c", 64)
+	}
+	build.APISecret = deriveTestAPISecret(t, build.ManifestKey)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
 	handoff := newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID))
 	want := &configsock.BuildSpec{BuildID: build.BuildID, RunID: build.RunID}
 	handoff.PublishFinal(want, nil)
@@ -83,7 +94,14 @@ func TestBuildTaskFastPathReturnsFinalInBootstrap(t *testing.T) {
 
 func TestCompleteBuildPrepareExactRunReplayAndConflict(t *testing.T) {
 	o := testOrch(t)
-	build := &types.Build{BuildID: "build-complete", RunID: "br-complete"}
+	build := &types.Build{BuildID: "build-complete", TemplateID: "transient-build-complete", RunID: "br-complete", Status: types.BuildBuilding, ExecutionClaimed: true}
+	if build.ManifestKey == "" {
+		build.ManifestKey = strings.Repeat("c", 64)
+	}
+	build.APISecret = deriveTestAPISecret(t, build.ManifestKey)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
 	handoff := newBuildTaskHandoff(true, "")
 	o.pend[build.BuildID] = &pendingBuild{build: build, sourceTemplate: true, handoff: handoff}
 	want := &configsock.BuildSpec{BuildID: build.BuildID, RunID: build.RunID}

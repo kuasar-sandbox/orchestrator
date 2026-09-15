@@ -37,28 +37,44 @@ type BuildAdmissionUsage struct {
 
 // BuildUsage reconstructs both ledgers exclusively from durable Build rows.
 func (s *Store) BuildUsage(ctx context.Context) (BuildAdmissionUsage, error) {
+	usage, _, err := s.buildUsage(ctx, false)
+	return usage, err
+}
+
+func (s *Store) BuildUsageDetails(ctx context.Context) (BuildAdmissionUsage, []*types.Build, error) {
+	return s.buildUsage(ctx, true)
+}
+
+func (s *Store) buildUsage(ctx context.Context, details bool) (BuildAdmissionUsage, []*types.Build, error) {
+	var builds []*types.Build
 	rows, err := s.db.QueryContext(ctx, `SELECT status,resources_cpu,resources_memory,resources_storage,
-		execution_claimed,waiting_unix FROM builds WHERE status NOT IN (?,?)`,
-		string(types.BuildReady), string(types.BuildError))
+		execution_claimed,waiting_unix,cancel_requested_unix,delete_requested_unix,build_id,template_id,run_id,execution_claimed_unix FROM builds ORDER BY created_unix,build_id`)
 	if err != nil {
-		return BuildAdmissionUsage{}, fmt.Errorf("store: build admission usage: %w", err)
+		return BuildAdmissionUsage{}, nil, fmt.Errorf("store: build admission usage: %w", err)
 	}
 	defer rows.Close()
 	var usage BuildAdmissionUsage
 	for rows.Next() {
-		var status string
+		var status, buildID, templateID, runID string
+		var claimedUnix int64
 		var resources types.BuildResources
 		var claimed int
-		var waitingUnix int64
-		if err := rows.Scan(&status, &resources.CPU, &resources.Memory, &resources.Storage, &claimed, &waitingUnix); err != nil {
-			return BuildAdmissionUsage{}, fmt.Errorf("store: build admission usage: %w", err)
+		var waitingUnix, cancelUnix, deleteUnix int64
+		if err := rows.Scan(&status, &resources.CPU, &resources.Memory, &resources.Storage, &claimed, &waitingUnix, &cancelUnix, &deleteUnix, &buildID, &templateID, &runID, &claimedUnix); err != nil {
+			return BuildAdmissionUsage{}, nil, fmt.Errorf("store: build admission usage: %w", err)
 		}
-		usage.RegistrationBuilds++
-		usage.Registration, err = usage.Registration.Add(resources)
-		if err != nil {
-			return BuildAdmissionUsage{}, fmt.Errorf("store: registration usage: %w", err)
+		if details {
+			builds = append(builds, &types.Build{BuildID: buildID, TemplateID: templateID, Status: types.BuildState(status), Resources: resources, RunID: runID, WaitingUnix: waitingUnix, ExecutionClaimed: claimed != 0, ExecutionClaimedUnix: claimedUnix, CancelRequestedUnix: cancelUnix, DeleteRequestedUnix: deleteUnix})
 		}
-		if types.BuildState(status) == types.BuildWaiting {
+		executable := cancelUnix == 0 && deleteUnix == 0 && (types.BuildState(status) == types.BuildRegistered || types.BuildState(status) == types.BuildWaiting || types.BuildState(status) == types.BuildBuilding)
+		if executable {
+			usage.RegistrationBuilds++
+			usage.Registration, err = usage.Registration.Add(resources)
+			if err != nil {
+				return BuildAdmissionUsage{}, nil, fmt.Errorf("store: registration usage: %w", err)
+			}
+		}
+		if executable && types.BuildState(status) == types.BuildWaiting {
 			usage.WaitingBuilds++
 			if waitingUnix > 0 && (usage.OldestWaitingUnix == 0 || waitingUnix < usage.OldestWaitingUnix) {
 				usage.OldestWaitingUnix = waitingUnix
@@ -68,14 +84,14 @@ func (s *Store) BuildUsage(ctx context.Context) (BuildAdmissionUsage, error) {
 			usage.ExecutionBuilds++
 			usage.Execution, err = usage.Execution.Add(resources)
 			if err != nil {
-				return BuildAdmissionUsage{}, fmt.Errorf("store: execution usage: %w", err)
+				return BuildAdmissionUsage{}, nil, fmt.Errorf("store: execution usage: %w", err)
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return BuildAdmissionUsage{}, fmt.Errorf("store: build admission usage: %w", err)
+		return BuildAdmissionUsage{}, nil, fmt.Errorf("store: build admission usage: %w", err)
 	}
-	return usage, nil
+	return usage, builds, nil
 }
 
 // ClaimBuildExecution is the execution-admission linearization point. The
@@ -86,7 +102,7 @@ func (s *Store) ClaimBuildExecution(ctx context.Context, buildID string, limit t
 	if err != nil {
 		return false, err
 	}
-	if b == nil || b.Status != types.BuildWaiting || b.ExecutionClaimed {
+	if b == nil || b.Status != types.BuildWaiting || b.ExecutionClaimed || b.CancelRequestedUnix != 0 || b.DeleteRequestedUnix != 0 {
 		return false, nil
 	}
 	if !limit.AllowsOne(b.Resources) {
@@ -100,12 +116,12 @@ func (s *Store) ClaimBuildExecution(ctx context.Context, buildID string, limit t
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
 		SET status=?, execution_claimed=1, execution_claimed_unix=?, enforcement_status='pending'
-		WHERE build_id=? AND status=? AND execution_claimed=0
+		WHERE build_id=? AND template_id=? AND status=? AND execution_claimed=0 AND cancel_requested_unix=0 AND delete_requested_unix=0
 		  AND (?=0 OR (SELECT COUNT(*) FROM builds WHERE execution_claimed=1) <= ?)
 		  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE execution_claimed=1),0) <= ?)
 		  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE execution_claimed=1),0) <= ?)
 		  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE execution_claimed=1),0) <= ?)`,
-		string(types.BuildBuilding), now.Unix(), buildID, string(types.BuildWaiting),
+		string(types.BuildBuilding), now.Unix(), buildID, b.TemplateID, string(types.BuildWaiting),
 		limit.MaxBuilds, headroom(limit.MaxBuilds, 1),
 		limit.Resources.CPU, headroom(limit.Resources.CPU, b.Resources.CPU),
 		limit.Resources.Memory, headroom(limit.Resources.Memory, b.Resources.Memory),
@@ -127,7 +143,7 @@ func (s *Store) BindBuildRun(ctx context.Context, buildID, runID, enforcementSta
 		return false, fmt.Errorf("store: bind build %s: empty run id", buildID)
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds SET run_id=?,enforcement_status=?
-		WHERE build_id=? AND status=? AND execution_claimed=1 AND run_id=''`,
+		WHERE build_id=? AND status=? AND execution_claimed=1 AND run_id='' AND cancel_requested_unix=0 AND delete_requested_unix=0`,
 		runID, enforcementStatus, buildID, string(types.BuildBuilding))
 	if err != nil {
 		return false, fmt.Errorf("store: bind build %s: %w", buildID, err)
@@ -152,7 +168,7 @@ func (s *Store) AcceptBuildResult(ctx context.Context, buildID, runID string, re
 	canonical := string(encoded)
 	updated, err := s.db.ExecContext(ctx, `UPDATE builds SET execution_result_json=?
 		WHERE build_id=? AND run_id=? AND status=? AND execution_claimed=1
-		  AND execution_result_json=''`,
+		  AND execution_result_json='' AND cancel_requested_unix=0 AND delete_requested_unix=0`,
 		canonical, buildID, runID, string(types.BuildBuilding))
 	if err != nil {
 		return false, fmt.Errorf("store: accept build %s result: %w", buildID, err)
@@ -202,7 +218,7 @@ func (s *Store) SetBuildRuntimePreparation(ctx context.Context, buildID, runID, 
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
 		SET runtime_vswitch_port=?,runtime_floating_ip=?,runtime_port_mac=?,runtime_envd_access_token_enc=?,runtime_prepare_json=?
 		WHERE build_id=? AND status=? AND execution_claimed=1 AND run_id=?
-		  AND runtime_vswitch_port='' AND runtime_prepare_json=''`,
+		  AND runtime_vswitch_port='' AND runtime_prepare_json='' AND cancel_requested_unix=0 AND delete_requested_unix=0`,
 		vswitchPort, floatingIP, portMAC, tokenEnc, runtimePrepareJSON,
 		buildID, string(types.BuildBuilding), runID)
 	if err != nil {
@@ -215,14 +231,14 @@ func (s *Store) SetBuildRuntimePreparation(ctx context.Context, buildID, runID, 
 // ClearBuildRuntimeOwnership records that the exact assigned runner's connector
 // preparation was released while retaining its execution claim until directory
 // cleanup and the terminal Build commit complete.
-func (s *Store) ClearBuildRuntimeOwnership(ctx context.Context, buildID, runID, vswitchPort string) (bool, error) {
-	if buildID == "" || runID == "" || vswitchPort == "" {
-		return false, fmt.Errorf("store: clear build runtime ownership: build id, run id, and vswitch port are required")
+func (s *Store) ClearBuildRuntimeOwnership(ctx context.Context, buildID, templateID, runID, vswitchPort string) (bool, error) {
+	if buildID == "" || templateID == "" {
+		return false, fmt.Errorf("store: clear build runtime ownership: build id and transient identity are required")
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
 		SET runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json=''
-		WHERE build_id=? AND status=? AND execution_claimed=1 AND run_id=? AND runtime_vswitch_port=?`,
-		buildID, string(types.BuildBuilding), runID, vswitchPort)
+		WHERE build_id=? AND template_id=? AND run_id=? AND runtime_vswitch_port=?`,
+		buildID, templateID, runID, vswitchPort)
 	if err != nil {
 		return false, fmt.Errorf("store: clear build %s runtime ownership: %w", buildID, err)
 	}
@@ -237,6 +253,7 @@ func (s *Store) SetBuildPhase(ctx context.Context, buildID, phase, sandboxID, st
 	case "starting":
 		query = `UPDATE builds SET phase=?,phase_sandbox_id=?
 			WHERE build_id=? AND status=? AND execution_claimed=1
+			  AND cancel_requested_unix=0 AND delete_requested_unix=0
 			  AND (phase='' OR (phase=? AND phase_sandbox_id=?))`
 		args = []any{phase, sandboxID, buildID, string(types.BuildBuilding), phase, sandboxID}
 	case "finished":
@@ -267,7 +284,7 @@ func (s *Store) SetBuildPhase(ctx context.Context, buildID, phase, sandboxID, st
 
 // ExpireBuild atomically terminates an untriggered or queued Build. It returns
 // false if another lifecycle transition won first.
-func (s *Store) ExpireBuild(ctx context.Context, buildID string, from types.BuildState, reason string) (bool, error) {
+func (s *Store) ExpireBuild(ctx context.Context, buildID, templateID string, from types.BuildState, reason string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("store: expire build %s: %w", buildID, err)
@@ -275,7 +292,7 @@ func (s *Store) ExpireBuild(ctx context.Context, buildID string, from types.Buil
 	defer tx.Rollback()
 	var metadataJSON string
 	if err := tx.QueryRowContext(ctx, `SELECT metadata_json FROM builds
-		WHERE build_id=? AND status=? AND execution_claimed=0`, buildID, string(from)).Scan(&metadataJSON); err != nil {
+		WHERE build_id=? AND template_id=? AND status=? AND cancel_requested_unix=0 AND delete_requested_unix=0 AND `+buildOwnerFreeSQL, buildID, templateID, string(from)).Scan(&metadataJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
@@ -288,8 +305,8 @@ func (s *Store) ExpireBuild(ctx context.Context, buildID string, from types.Buil
 	res, err := tx.ExecContext(ctx, `UPDATE builds SET status=?,reason=?,execution_claimed=0,
 		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',metadata_json=?,
 		finished_unix=unixepoch()
-		WHERE build_id=? AND status=? AND execution_claimed=0`,
-		string(types.BuildError), reason, metadataJSON, buildID, string(from))
+		WHERE build_id=? AND template_id=? AND status=? AND cancel_requested_unix=0 AND delete_requested_unix=0 AND `+buildOwnerFreeSQL,
+		string(types.BuildError), reason, metadataJSON, buildID, templateID, string(from))
 	if err != nil {
 		return false, fmt.Errorf("store: expire build %s: %w", buildID, err)
 	}

@@ -119,7 +119,8 @@ type BuildEvent struct {
 	Kind       BuildEventKind `json:"-"`
 	BuildID    string         `json:"build_id"`
 	State      string         `json:"state"`
-	TemplateID string         `json:"template_id,omitempty"`
+	TemplateID string         `json:"template_id,omitempty"` // immutable registration handle
+	PersistID  string         `json:"persist_id,omitempty"`  // successful result, independent of registration identity
 	Reason     string         `json:"reason,omitempty"`
 }
 

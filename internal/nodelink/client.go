@@ -212,11 +212,18 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	go func() {
 		t := time.NewTicker(c.heartbeat)
 		defer t.Stop()
+		var changes <-chan struct{}
+		if source, ok := c.node.(interface{ HeartbeatChanges() <-chan struct{} }); ok {
+			changes = source.HeartbeatChanges()
+		}
 		for {
 			select {
 			case <-sctx.Done():
 				return
 			case <-t.C:
+			case <-changes:
+			}
+			{
 				hb := c.node.Heartbeat()
 				if hb == nil {
 					continue

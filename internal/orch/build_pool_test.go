@@ -176,6 +176,11 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 		Resources:        types.BuildResources{CPU: 1000, Memory: 1 << 30},
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Add(-2 * time.Minute).Unix(),
 	}
+	b.TemplateID = "transient-" + b.BuildID
+	b.APISecret, b.ManifestKey = strings.Repeat("1", 64), strings.Repeat("2", 64)
+	if err := o.st.PutBuild(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := o.runBuildUnit(context.Background(), b); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expired assignment = %v, want deadline exceeded", err)
 	}
@@ -282,6 +287,11 @@ func TestRunBuildUnitCleansDirectoriesWhenRequestResolutionFails(t *testing.T) {
 		BuildID: "build-invalid-request-input", Profile: types.ProfileBare,
 		Status: types.BuildBuilding, ExecutionClaimed: true,
 		Metadata: map[string]string{sandboxcfg.NsResource: `{"capacity":`},
+	}
+	b.TemplateID = "transient-" + b.BuildID
+	b.APISecret, b.ManifestKey = strings.Repeat("1", 64), strings.Repeat("2", 64)
+	if err := o.st.PutBuild(context.Background(), b); err != nil {
+		t.Fatal(err)
 	}
 	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)
 	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)

@@ -290,7 +290,15 @@ func (p *runPool) loop(ctx context.Context) {
 			}
 			if err := req.commit(w.runID); err != nil {
 				replyConsume(req, runConsumeResp{err: err})
-				idle = append([]idleRun{w}, idle...)
+				if p.kind == runKindBuild {
+					// Build preparation can be cancelled after touching this unit.
+					// Its original owner must fence the exact unit before releasing
+					// its claim; never lend that unit to another Build meanwhile.
+					replyWait(w.req, runWaitResp{err: err})
+					queueControl(runControlReq{op: "stop", runID: w.runID})
+				} else {
+					idle = append([]idleRun{w}, idle...)
+				}
 				continue
 			}
 			replyWait(w.req, runWaitResp{taskID: req.taskID, ok: true})

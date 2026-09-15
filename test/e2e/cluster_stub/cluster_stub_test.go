@@ -521,7 +521,7 @@ func TestClusterStubBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
 	cmd := h.node.waitCommand(t, routesync.CmdBuildRegister)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if resolved, found := h.reg.ResolveBuild(h.ctx, testGroup, cmd.BuildID); found && resolved.BuildID == cmd.BuildID {
+		if resolved, found, _ := h.reg.ResolveBuild(h.ctx, testGroup, cmd.BuildID); found && resolved.BuildID == cmd.BuildID {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -536,7 +536,7 @@ func TestClusterStubBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
 	h.node = startNodeStub(t, h.ctx, h.links.URL, h.apiNodeEndpoint, h.dataNodeEndpoint)
 	deadline = time.Now().Add(3 * time.Second)
 	for {
-		_, found := h.reg.ResolveBuild(h.ctx, testGroup, cmd.BuildID)
+		_, found, _ := h.reg.ResolveBuild(h.ctx, testGroup, cmd.BuildID)
 		_, refFound, refErr := h.reg.Stores().GetNodeBuildRef(h.ctx, "n1", cmd.BuildID)
 		if !found && !refFound && refErr == nil {
 			break

@@ -65,6 +65,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
+. "$SCRIPT_DIR/lib/build_fixture_units.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # Builds with steps/startCmd carry the e2b contract: envd runs them as
@@ -80,7 +81,7 @@ if [ -z "${VGW_BIN:-}" ]; then
     VGW_BIN="$(command -v versitygw 2>/dev/null || true)"
 fi
 VGW_BIN="${VGW_BIN:-}"
-SWITCH="${SWITCH:-swbld}"; SW_NETNS="${SW_NETNS:-e2ebld_sw}"; SW_MGMT="${SW_MGMT:-swbldm0}"
+SWITCH="${SWITCH:-b${BASHPID}}"; SW_NETNS="${SW_NETNS:-e2ebld_${BASHPID}}"; SW_MGMT="${SW_MGMT:-${SWITCH}m0}"
 MGMT_VIP="169.254.169.254"                   # host-side mgmt NIC IP; guests route 0/0 here
 
 skip() {
@@ -138,12 +139,14 @@ done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot" "$WORK/vgw" "$WORK/ref-locations"
 REF_LOCATION_PARENT="file://$WORK/ref-locations"
 declare -a PIDS=() TAGS=()
+SW_STARTED=""
+NETNS_CREATED=""
 cleanup() {
     set +e
-    systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    stop_build_fixture_units "$WORK" 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-    "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1
-    ip netns del "$SW_NETNS" 2>/dev/null
+    [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1
+    [ -n "$NETNS_CREATED" ] && ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
@@ -198,9 +201,10 @@ echo "==> zot up (0.0.0.0:$ZOT_PORT); seeded $E2E_IMAGE → $PUSH_REF (guest pul
 
 # ---- vswitch (guest network for the build sandboxes) -----------------------
 MMDS_PORT="$(free_port)"
-"$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
-ip netns del "$SW_NETNS" 2>/dev/null || true
+if "$BIN/connector-ctl" vswitch status "$SWITCH" >/dev/null 2>&1; then fail "fixture switch already exists: $SWITCH"; fi
 ip netns add "$SW_NETNS"
+NETNS_CREATED=1
+SW_STARTED=1
 # The extraction CIDRs classify guest traffic; this test owns the management
 # VIP address used to reach Zot and MMDS on the host. No NAT is required.
 "$BIN/connector-ctl" vswitch serve "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
@@ -1237,6 +1241,51 @@ assert matches[0].get("target") is None, matches[0]
 assert matches[0].get("kind") == "img", matches[0]
 PY
 echo "==> PASS: B1 ready → $B1_PERSIST"
+
+# ---- #372: actual hang cancellation and immediate capacity recovery --------
+# Keep diagnostics past these assertions; restore the canonical TTL/capacity
+# afterwards so the existing retention and resource-vector cases still run.
+stop_conductor
+python3 - "$WORK/config.yaml" <<'PY_CONFIG'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+assert "max_builds: 2" in s and "terminal_ttl: 5s" in s
+p.write_text(s.replace("max_builds: 2", "max_builds: 1").replace("terminal_ttl: 5s", "terminal_ttl: 1h"))
+PY_CONFIG
+start_conductor
+BUILD_ACTION_API_KEY="$AK" python3 "$SCRIPT_DIR/lib/build_actions.py" \
+    --url "http://127.0.0.1:$PORT" --host "api.$DOMAIN" \
+    --db "$WORK/lib/node-ctl.db" --run-root "$WORK/run" --base-root "$WORK/lib" \
+    --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CONDUCTOR_PID" \
+    --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --evidence "$WORK/build-actions.json"
+# A separate normal-timeout regression follows the three active cancellations.
+# Their original 1200-second execution deadline was unchanged.
+stop_conductor
+python3 - "$WORK/config.yaml" <<'PY_CONFIG'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+assert "total_timeout_sec: 1200" in s
+p.write_text(s.replace("total_timeout_sec: 1200", "total_timeout_sec: 90"))
+PY_CONFIG
+start_conductor
+BUILD_ACTION_API_KEY="$AK" python3 "$SCRIPT_DIR/lib/build_actions.py" \
+    --url "http://127.0.0.1:$PORT" --host "api.$DOMAIN" \
+    --db "$WORK/lib/node-ctl.db" --run-root "$WORK/run" --base-root "$WORK/lib" \
+    --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CONDUCTOR_PID" \
+    --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --timeout-only 90 --evidence "$WORK/build-timeout.json"
+stop_conductor
+python3 - "$WORK/config.yaml" <<'PY_CONFIG'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+p.write_text(s.replace("max_builds: 1\n", "max_builds: 2\n").replace("terminal_ttl: 1h", "terminal_ttl: 5s").replace("total_timeout_sec: 90", "total_timeout_sec: 1200"))
+PY_CONFIG
+start_conductor
 
 # ---- BF: deterministic business failure → API error + collected unit -------
 echo "==> BF: deterministic RUN failure keeps API/journal evidence without a failed unit"

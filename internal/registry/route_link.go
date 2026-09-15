@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // route_link paths. Routers dial this link for group-scoped route/build
@@ -161,7 +162,22 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 // serveBuild resolves a build_id to its node (router restart recovery, §7.5).
 func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	res, found := r.ResolveBuild(req.Context(), q.Get("group"), q.Get("build_id"))
+	var res *BuildReserveResult
+	var found bool
+	var err error
+	if q.Has("template_id") {
+		if types.ValidateTransientID(q.Get("template_id")) != nil || q.Has("build_id") {
+			http.Error(w, "invalid transient build lookup", http.StatusBadRequest)
+			return
+		}
+		res, found, err = r.ResolveBuildByTemplate(req.Context(), q.Get("group"), q.Get("template_id"))
+	} else {
+		res, found, err = r.ResolveBuild(req.Context(), q.Get("group"), q.Get("build_id"))
+	}
+	if err != nil {
+		http.Error(w, "build lookup unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if !found {
 		http.Error(w, "build not found", http.StatusNotFound)
 		return

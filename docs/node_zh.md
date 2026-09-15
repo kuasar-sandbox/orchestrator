@@ -219,7 +219,7 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 | `proxy serve` | 启动独立数据面 master/worker(见 §2.3 与 node-proxy.md) |
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
 | `resource` | `status`/`list`/`drain`:reservation 控制器巡检与 admission 排空(node-resource.md §2) |
-| `builder status` | 查看构建两级准入、持久用量、headroom 与队列（[Build §5](node-build_zh.md#5-按目标执行与发布)） |
+| `builder status` / `builder cancel <build-id>` / `builder delete <transient-template-id> [--cancel]` | 查看持久用量、transient ID、操作意图与 claim; 取消执行或删除一条 Build 记录 ([Build §1.1](node-build_zh.md#11-取消与删除-build-记录)) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
 | `manifest-key` | `add`/`remove`/`check`/`list`:create/build/import 凭据对白名单管理(§7;集群下另由 registry 租约写入,§10) |
 | `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移(§8.1) |
@@ -1881,8 +1881,8 @@ sandbox{
 }
 delete{sid}
 build_sync_begin{}
-build_upsert{build_event:{build_id, state, template_id?, reason?}}
-build_delete{build_event:{build_id}}
+build_upsert{build_event:{build_id, state, template_id, persist_id?, reason?}}
+build_delete{build_event:{build_id, template_id}}
 build_sync_end{}
 bookmark{full_sync}
 ```
@@ -1910,14 +1910,17 @@ Sandbox 全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner �
 订阅建立前捕获的本节点归属表基线比较;清理前再次确认当前表项仍与基线一致,避免删除
 同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token。
 
-当前仍存在的 post-registration Registry Build projection 使用独立 bracket：节点先订阅 live Build
+Build 事件分别保留注册 template_id 与终态 persist_id. 硬删除携带原 template_id, 迟到事件不能影响
+同 BuildID 的新注册. 只有节点硬删除提交后才发 BuildDelete; error 行离开 observer 集合不等于硬删除.
+
+当前仍存在的 post-registration Registry Build projection 使用独立 bracket:节点先订阅 live Build
 变化，再发送 `build_sync_begin`、SQLite 中该节点仍保留的全部 cluster Build row、
 `build_sync_end`；集合包含 registered/waiting/building，也包含 retention window 内的 ready/error。
 Registry 以 NodeID session fence 接受这些 frame；新 node-link 生效后，旧重叠连接的 Build frame
 不会再修改 projection。节点侧每个 Build durable transition 与其 live publication 也由无条件
 per-Build fence 排序，不依赖 conductor Extension。
 snapshot 期间发生的变化在 end 之后按顺序发送，慢订阅者会断线并重做完整 snapshot。Registry 在
-`build_sync_end` 只删除连接建立前 immutable `(NodeID, BuildID)` binding 基线中未出现、且删除时
+`build_sync_end` 只删除连接建立前 immutable `(NodeID, BuildID, TemplateID)` binding 基线中未出现、且删除时
 仍精确属于该节点的 post-registration projection/ref；Registry-owned `BuildStarting` ambiguous
 dispatch intent 不是节点 projection，空 snapshot 不能将其当作 definitive rejection。同步期间的
 新注册因此不会被误删，丢失的 live

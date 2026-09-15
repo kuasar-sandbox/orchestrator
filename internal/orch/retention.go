@@ -14,6 +14,9 @@ import (
 // emitted only after the exact durable delete commits.
 func (o *Orchestrator) reapTerminalHistory(ctx context.Context, now time.Time) error {
 	var errs []error
+	if err := o.reapRequestedBuilds(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	if ttl := o.cfg.Sandbox.DeadTTLDur(); ttl <= 0 {
 		errs = append(errs, errors.New("sandbox.dead_ttl is not a positive duration"))
 	} else if err := o.reapDeadSandboxes(ctx, now.Add(-ttl).Unix()); err != nil {

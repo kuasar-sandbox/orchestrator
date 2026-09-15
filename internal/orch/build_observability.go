@@ -41,7 +41,7 @@ func (o *Orchestrator) BuilderAdmissionStatus(ctx context.Context) (configsock.B
 	if err != nil {
 		return configsock.BuilderAdmissionStatus{}, err
 	}
-	usage, err := o.st.BuildUsage(ctx)
+	usage, builds, err := o.st.BuildUsageDetails(ctx)
 	if err != nil {
 		return configsock.BuilderAdmissionStatus{}, err
 	}
@@ -63,7 +63,12 @@ func (o *Orchestrator) BuilderAdmissionStatus(ctx context.Context) (configsock.B
 			oldestAge = 0
 		}
 	}
+	entries := make([]configsock.BuilderBuildStatus, 0, len(builds))
+	for _, b := range builds {
+		entries = append(entries, configsock.BuilderBuildStatus{BuildID: b.BuildID, TemplateID: b.TemplateID, Status: b.Status, Resources: b.Resources, RunID: b.RunID, WaitingUnix: b.WaitingUnix, ExecutionClaimed: b.ExecutionClaimed, ExecutionClaimedUnix: b.ExecutionClaimedUnix, CancelRequested: b.CancelRequestedUnix != 0, DeleteRequested: b.DeleteRequestedUnix != 0})
+	}
 	return configsock.BuilderAdmissionStatus{
+		Builds:        entries,
 		Registration:  admissionLevelStatus(registration, usage.RegistrationBuilds, usage.Registration),
 		Execution:     admissionLevelStatus(execution, usage.ExecutionBuilds, usage.Execution),
 		WaitingBuilds: usage.WaitingBuilds, OldestWaitAgeSec: oldestAge,

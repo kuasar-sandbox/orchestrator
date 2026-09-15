@@ -98,8 +98,9 @@ type NodeSandboxRef struct {
 }
 
 type NodeBuildRef struct {
-	Group   string `json:"group"`
-	BuildID string `json:"build_id"`
+	Group      string `json:"group"`
+	BuildID    string `json:"build_id"`
+	TemplateID string `json:"template_id"`
 }
 
 // NodeListEntry is the low-frequency WATCH_LIST catalog consumed by placer.

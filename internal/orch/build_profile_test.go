@@ -630,7 +630,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 				t.Fatal(err)
 			}
 			stored.Status, stored.PersistID, stored.Reason = tc.state, tc.templateID, tc.reason
-			if err := o.st.PutBuildTerminal(ctx, stored); err != nil {
+			if err := o.st.PutBuildTerminal(ctx, stored, nil); err != nil {
 				t.Fatal(err)
 			}
 			terminal, err := o.st.GetBuild(ctx, cmd.BuildID)
@@ -655,7 +655,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 			select {
 			case event := <-buildEvents:
 				if event.BuildID != cmd.BuildID || event.State != string(tc.state) ||
-					event.TemplateID != tc.templateID || event.Reason != tc.reason {
+					event.TemplateID != cmd.TemplateRef || event.PersistID != tc.templateID || event.Reason != tc.reason {
 					t.Fatalf("terminal replay BuildEvent = %+v", event)
 				}
 			case <-time.After(time.Second):
