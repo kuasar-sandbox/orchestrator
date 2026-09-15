@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,11 @@ func NewHTTPTransport(label, selfName string, resolve Resolver, tlsCfg *tls.Conf
 }
 
 func newStreamClient(tlsCfg *tls.Config) *http.Client {
+	// HTTP/2 initialization updates the config and may append to NextProtos.
+	if tlsCfg != nil {
+		tlsCfg = tlsCfg.Clone()
+		tlsCfg.NextProtos = slices.Clone(tlsCfg.NextProtos)
+	}
 	tr := &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
 	return &http.Client{Transport: tr}
 }
