@@ -7,8 +7,8 @@
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
 # as an envd-managed process. One durable conductor database is exercised
-# across publication-policy restarts, fifteen successful builds, one
-# deterministic failed build, and six creates:
+# across publication-policy restarts and live conductor recovery, successful
+# builds, failure/timeout/cancellation cleanup, and real Sandbox creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #       auto image requires request DNS to resolve the private registry name
@@ -16,6 +16,7 @@
 #       boots the steps VM from manifest://, applies RUN/ENV/WORKDIR, exports
 #       (config merge), runs startCmd/readyCmd on the production runtime,
 #       snapshots, then ONE publish uploads bundle + image + overlay
+#       survives conductor SIGKILL in B with the same claim, run-id and VMM
 #   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
 #       reads S only to select E, materializes E's root, and INHERITS its
 #       startCmd/readyCmd (reaching ready proves both ran)
@@ -429,6 +430,18 @@ stop_conductor() {
     done
     CONDUCTOR_PID=""
 }
+crash_conductor() {
+    # Kill only this test's conductor. The live Build unit and its guest must
+    # survive, retaining their existing durable ownership for reconciliation.
+    local stopped_pid="$CONDUCTOR_PID" index
+    [ -n "$stopped_pid" ] || fail "no test conductor to crash"
+    kill -KILL "$stopped_pid" || fail "crash test conductor $stopped_pid"
+    wait "$stopped_pid" 2>/dev/null || true
+    for index in "${!PIDS[@]}"; do
+        [ "${PIDS[$index]}" != "$stopped_pid" ] || PIDS[index]=""
+    done
+    CONDUCTOR_PID=""
+}
 configure_checkpoint_policy() { # mode remote-manifest
     python3 - "$WORK/config.yaml" "$1" "$2" "$REF_LOCATION_PARENT" <<'PY'
 import pathlib, sys
@@ -533,6 +546,60 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 assert row is not None and row[0] == sys.argv[3], row
 assert row[1] == "" and row[2] == 0 and row[3] == 0, row
 assert all(value == "" for value in row[4:]), row
+PY
+}
+live_build_signature() { # $1=build id; phase-reservations.json must be current
+    python3 - "$WORK" "$1" <<'PY'
+import hashlib, json, pathlib, sqlite3, sys
+work = pathlib.Path(sys.argv[1])
+with sqlite3.connect(work / "lib/node-ctl.db", timeout=5) as db:
+    db.row_factory = sqlite3.Row
+    row = db.execute("select * from builds where build_id=?", (sys.argv[2],)).fetchone()
+assert row is not None, "live Build row is missing"
+row = dict(row)
+assert row["status"] == "building" and row["run_id"], "live Build lost its run-id"
+assert row["execution_claimed"] == 1 and row["execution_claimed_unix"] > 0, "live claim is missing"
+assert row["phase"] == "b" and row["phase_sandbox_id"], "expected live phase B"
+assert row["runtime_prepare_json"] and row["runtime_vswitch_port"], "preparation is missing"
+assert not row["execution_result_json"], "Build already accepted a result"
+reservations = json.loads((work / "phase-reservations.json").read_text())
+matches = [item for item in reservations if item["sandbox_id"] == row["phase_sandbox_id"]]
+assert len(matches) == 1, "live phase must have exactly one reservation"
+reservation = matches[0]
+vmm = pathlib.Path(reservation["cgroup_path"])
+vmm_pids = [int(pid) for pid in (vmm / "cgroup.procs").read_text().split()]
+assert vmm_pids, "phase VMM is not populated"
+pids = {
+    int((work / "run/runners" / (row["run_id"] + ".pid")).read_text()),
+    reservation["peer_pid"], *vmm_pids,
+}
+assert len(pids) >= 3 and all(pid > 0 for pid in pids), "missing builder/ctl/VMM processes"
+# Include process start ticks so PID reuse cannot masquerade as live adoption.
+processes = {}
+for pid in sorted(pids):
+    stat = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    assert stat[0] != "Z", f"process {pid} is a zombie"
+    processes[str(pid)] = stat[19]
+# Compare every durable value, including ciphertext and preparation, without
+# writing the values themselves into test output or another plaintext fixture.
+raw = json.dumps(row, sort_keys=True, default=lambda value: value.hex()).encode()
+print(json.dumps({"run_id": row["run_id"], "row_sha256": hashlib.sha256(raw).hexdigest(),
+                  "processes": processes, "vmm_path": str(vmm)}, sort_keys=True))
+PY
+}
+assert_build_processes_gone() { # $1=live signature JSON
+    python3 - "$1" <<'PY'
+import json, pathlib, sys
+signature = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for pid, start in signature["processes"].items():
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        continue
+    assert stat[19] != start, f"Build process {pid} still exists after claim release"
+events = pathlib.Path(signature["vmm_path"]) / "cgroup.events"
+if events.exists():
+    assert "populated 0" in events.read_text().splitlines(), "VMM still populated after claim release"
 PY
 }
 build_trigger_signature() { # $1=build id
@@ -951,9 +1018,8 @@ PY
     [ "$(cat "$ctl_path/memory.high")" = "max" ] || fail "builder ctl subgroup inherited a low memory.high"
     # Cold start deliberately leaves VMM memory.high=max through launch ACK and
     # settled.  The first trusted guest report starts the initial shrink, and
-    # high becomes finite only after balloon current converges.  The B2 phase
-    # stays alive for 20 seconds specifically so active enforcement can be
-    # inspected; wait inside that window instead of racing the report barrier.
+    # high becomes finite only after balloon current converges. B2 waits on a
+    # guest marker while these checks and live recovery inspect its resources.
     for _ in $(seq 1 60); do
         memory_high=$(cat "$vmm_path/memory.high" 2>/dev/null || true)
         [ "$memory_high" != "max" ] && [ -n "$memory_high" ] && break
@@ -1333,7 +1399,7 @@ B2_TID="$TID"; B2_BID="$BID"
 B2_BODY=$(cat <<EOF
 {"fromTemplate":"$B1_PERSIST",
  "steps":[
-   {"type":"RUN","args":["sleep 20; useradd -m -d /home/user user || adduser -D user"]},
+   {"type":"RUN","args":["touch /tmp/issue374-recovery-started; while [ ! -e /tmp/issue374-recovery-ready ]; do sleep 0.1; done; rm /tmp/issue374-recovery-started /tmp/issue374-recovery-ready; useradd -m -d /home/user user || adduser -D user"]},
    {"type":"RUN","args":["grep -Eq '^0::/user(/|$)' /proc/self/cgroup && test ! -s /sys/fs/cgroup/cgroup.procs && for group in user ptys socats; do test -d /sys/fs/cgroup/\$group && test -e /sys/fs/cgroup/\$group/cpu.weight && test -e /sys/fs/cgroup/\$group/memory.max && test -e /sys/fs/cgroup/\$group/io.weight || exit 1; done"]},
    {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
    {"type":"ENV","args":["BUILT","yes"]},
@@ -1345,6 +1411,24 @@ EOF
 code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B2 trigger = $code (want 202)"; }
 assert_active_build_accounting "$B2_TID" "$B2_BID" b
+timeout -k 5s 20 "$BIN/sandbox-ctl" exec --path-id b --run-root "$WORK/run/builds/$B2_BID" \
+    -- /bin/sh -c 'while [ ! -e /tmp/issue374-recovery-started ]; do sleep 0.1; done' \
+    || fail "B2 guest RUN did not start before conductor crash"
+live_build_signature "$B2_BID" >"$WORK/b2-before-recovery.json" \
+    || fail "B2 live ownership signature before conductor crash"
+crash_conductor
+start_conductor
+wait_phase_reservation b "$B2_BID" || fail "B2 reservation did not reconnect after conductor crash"
+assert_active_build_accounting "$B2_TID" "$B2_BID" b
+live_build_signature "$B2_BID" >"$WORK/b2-after-recovery.json" \
+    || fail "B2 live ownership signature after conductor crash"
+cmp "$WORK/b2-before-recovery.json" "$WORK/b2-after-recovery.json" \
+    || fail "B2 recovery changed durable ownership or replaced a live worker/VMM"
+grep -F 'reconcile: adopted live build' "$WORK/orch.log" | grep -Fq "$B2_BID" \
+    || fail "B2 was not adopted as the same live Build"
+timeout -k 5s 20 "$BIN/sandbox-ctl" exec --path-id b --run-root "$WORK/run/builds/$B2_BID" \
+    -- /bin/touch /tmp/issue374-recovery-ready || fail "B2 recovered guest exec could not release RUN"
+echo "==> PASS: B2 live recovery retained the exact run-id, claim, durable row and worker/ctl/VMM processes"
 # A has already self-cleaned. Plant a marker in its sibling path while B is
 # active; observing it after C starts proves B cleanup was scoped to PathID=b.
 mkdir -p "$WORK/run/builds/$B2_BID/a"
@@ -1357,6 +1441,8 @@ wait_ready "$B2_TID" "$B2_BID" B2 null snp
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
 assert_terminal_build_unowned "$B2_BID" ready || fail "B2 terminal row retained execution ownership"
+assert_build_processes_gone "$WORK/b2-before-recovery.json" \
+    || fail "B2 recovered execution released its claim before all processes exited"
 [ ! -e "$WORK/run/builds/$B2_BID" ] || fail "terminal Build retained BuildRunDir"
 [ ! -e "$WORK/lib/builds/$B2_BID" ] || fail "terminal Build retained BuildBaseDir"
 echo "==> PASS: B2 ready → $B2_PERSIST"
