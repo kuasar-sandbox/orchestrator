@@ -142,6 +142,39 @@ def main():
                 pass
         return targets
 
+    def exec_sandbox(sid):
+        command(str(Path(args.bin) / "sandbox-ctl"), "exec", "--run-root",
+                str(Path(args.run_root) / "sandboxes"), "--sandbox-id", sid, "--", "/bin/true")
+
+    def create_sandbox(canonical):
+        created, _ = require("POST", "/sandboxes", 201, {"templateID": canonical, "timeout": 120})
+        sid = created["sandboxID"]
+
+        def running():
+            sandbox, _ = require("GET", "/sandboxes/" + sid, 200)
+            assert sandbox["state"] != "dead", sandbox
+            return sandbox["state"] == "running"
+
+        wait_for("canonical Create guest ready", running)
+        with sqlite3.connect("file:" + args.db + "?mode=ro", uri=True, timeout=5) as db:
+            actual = db.execute("SELECT template_id FROM sandboxes WHERE id=?", (sid,)).fetchone()
+        assert actual == (canonical,), (sid, actual, canonical)
+        exec_sandbox(sid)
+        return sid
+
+    def delete_sandbox(sid):
+        require("DELETE", "/sandboxes/" + sid, 204)
+
+        def cleaned():
+            with sqlite3.connect("file:" + args.db + "?mode=ro", uri=True, timeout=5) as db:
+                retained = db.execute("SELECT 1 FROM sandboxes WHERE id=?", (sid,)).fetchone()
+            return retained is None and all(not (Path(root) / "sandboxes" / sid).exists()
+                                            for root in (args.run_root, args.base_root))
+
+        # Sandbox DELETE accepts asynchronous cleanup. Do not overlap the next
+        # Create/Build with this guest's remaining resource ownership.
+        wait_for("exact sandbox cleanup after DELETE", cleaned)
+
     for mode in (("timeout",) if args.timeout_only else ("cancel", "query", "header")):
         fds_before = conductor_fds()
         tid, bid = register(mode + "-hang")
@@ -223,25 +256,48 @@ def main():
         # A successful Build's original transient ID still routes after its
         # result has changed to a canonical reference; deletion cannot touch it.
         canonical = ready["templateID"]
+        expected_kind = "snp" if target and target["memory"] else "sbx" if target else "img"
+        assert canonical.startswith("e2b-" + expected_kind + "-"), (expected_kind, canonical)
         if args.restart_request and mode == "cancel":
             Path(args.restart_request).touch()
             wait_for("fixture Router/Registry restart", lambda: Path(args.restart_ready).exists(), 60)
             value, _ = require("GET", status_path(wt, wb), 200)
             assert value["status"] == "ready" and value["templateID"] == canonical, value
+
+        # Image reuse has the exact same PersistID, so deleting the waiter
+        # must preserve a concurrently retained Build of the same artifact.
+        peer = None
+        if target is None:
+            pt, pb = register(mode + "-canonical-peer")
+            require("POST", f"/v2/templates/{pt}/builds/{pb}", 202, {"fromTemplate": canonical})
+            peer_ready = wait_for("same-artifact peer completes", lambda: check_terminal(pt, pb, "ready"))
+            assert peer_ready["templateID"] == canonical, (peer_ready, canonical)
+            peer_before = row(pb)
+            assert pt != wt and pb != wb and peer_before["persist_id"] == row(wb)["persist_id"] == canonical
+            assert peer_before["execution_claimed"] == 0, peer_before
+            peer = (pt, pb, peer_before)
+
+        # Standalone Create takes the canonical ID. Cluster Create follows its
+        # group template configuration; cluster reference coverage below uses
+        # Build fromTemplate and the simultaneously retained image peer.
+        existing_sid = create_sandbox(canonical) if not args.group else None
         require("DELETE", "/templates/" + canonical, 400)
         require("DELETE", "/templates/" + wt, 204)
         assert row(wb) is None
+        if existing_sid:
+            existing, _ = require("GET", "/sandboxes/" + existing_sid, 200)
+            assert existing["state"] == "running", existing
+            exec_sandbox(existing_sid)
+            delete_sandbox(existing_sid)
+        if peer:
+            pt, pb, peer_before = peer
+            peer_ready, _ = require("GET", status_path(pt, pb), 200)
+            assert peer_ready["status"] == "ready" and peer_ready["templateID"] == canonical, peer_ready
+            assert row(pb) == peer_before, (peer_before, row(pb))
+
         if not args.group:
-            created, _ = require("POST", "/sandboxes", 201, {"templateID": canonical, "timeout": 120})
-            sid = created["sandboxID"]
-            def running():
-                sandbox, _ = require("GET", "/sandboxes/" + sid, 200)
-                assert sandbox["state"] != "dead", sandbox
-                return sandbox["state"] == "running"
-            wait_for("canonical Create after explicit Build deletion", running)
-            command(str(Path(args.bin) / "sandbox-ctl"), "exec", "--run-root",
-                    str(Path(args.run_root) / "sandboxes"), "--sandbox-id", sid, "--", "/bin/true")
-            require("DELETE", "/sandboxes/" + sid, 204)
+            sid = create_sandbox(canonical)
+            delete_sandbox(sid)
         rt, rb = register(mode + "-canonical-reuse", target)
         require("POST", f"/v2/templates/{rt}/builds/{rb}", 202, {"fromTemplate": canonical})
         reused = wait_for("canonical fromTemplate survives Build deletion", lambda: check_terminal(rt, rb, "ready"))
@@ -249,11 +305,14 @@ def main():
         if target is None:
             assert reused["templateID"] == canonical, (reused, canonical)
         require("DELETE", "/templates/" + rt, 204)
+        if peer:
+            require("DELETE", "/templates/" + peer[0], 204)
+            assert row(peer[1]) is None
         if mode in ("cancel", "timeout"):
             assert row(bid) is not None, "diagnostic row disappeared"
             require("DELETE", "/templates/" + tid, 204)
         fds_after = conductor_fds()
-        for build_id in (bid, wb, rb):
+        for build_id in (bid, wb, rb) + ((peer[1],) if peer else ()):
             for root in (args.run_root, args.base_root):
                 directory = str(Path(root) / "builds" / build_id)
                 assert not any(fd == directory or fd.startswith(directory + "/") for fd in fds_after), (build_id, fds_after)
@@ -261,7 +320,10 @@ def main():
                 "conductor_fds_after": len(fds_after), "build_directory_fds_retained": 0, "mode": mode, "hang_build": bid, "transient_id": tid, "unit": unit,
                 "phase_sandbox": before["phase_sandbox_id"], "port": before["runtime_vswitch_port"],
                 "cgroup": str(cg), "stopped_pids": list(processes), "seconds": round(elapsed, 3),
-                "next_build": wb, "next_status": "ready", "canonical_reused": canonical, "create_exec_verified": not bool(args.group)}
+                "next_build": wb, "next_status": "ready", "canonical_reused": canonical,
+                "canonical_kind": expected_kind, "create_exec_verified": not bool(args.group),
+                "existing_sandbox": existing_sid, "existing_sandbox_exec_after_delete": bool(existing_sid),
+                "same_artifact_peer": peer[1] if peer else None, "same_artifact_peer_preserved": bool(peer)}
         evidence.append(item)
         Path(args.evidence).write_text(json.dumps(evidence, indent=2) + "\n")
         print("==> PASS: issue372 " + json.dumps(item), flush=True)
