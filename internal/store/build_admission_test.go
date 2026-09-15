@@ -53,7 +53,7 @@ func TestRegistrationAdmissionChecksEveryDimensionAndReleasesAtTerminal(t *testi
 			}
 			first.Status = types.BuildError
 			first.Reason = "done"
-			if err := st.PutBuildTerminal(ctx, first); err != nil {
+			if err := st.PutBuildTerminal(ctx, first, nil); err != nil {
 				t.Fatal(err)
 			}
 			if _, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, second, limit, "", nil); err != nil || !inserted {
@@ -320,7 +320,7 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 	}
 	terminal.Status = types.BuildError
 	terminal.Reason = "completed before delayed registration ACK"
-	if err := st.PutBuildTerminal(ctx, &terminal); err != nil {
+	if err := st.PutBuildTerminal(ctx, &terminal, nil); err != nil {
 		t.Fatal(err)
 	}
 	terminalStored, err := st.GetBuild(ctx, definition.BuildID)
@@ -389,10 +389,10 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 			t.Fatal(err)
 		}
 	}
-	if expired, err := st.ExpireBuild(ctx, registered.BuildID, types.BuildRegistered, "registration TTL"); err != nil || !expired {
+	if expired, err := st.ExpireBuild(ctx, registered.BuildID, registered.TemplateID, types.BuildRegistered, "registration TTL"); err != nil || !expired {
 		t.Fatalf("expire registered: %v %v", expired, err)
 	}
-	if expired, err := st.ExpireBuild(ctx, waiting.BuildID, types.BuildWaiting, "queue TTL"); err != nil || !expired {
+	if expired, err := st.ExpireBuild(ctx, waiting.BuildID, waiting.TemplateID, types.BuildWaiting, "queue TTL"); err != nil || !expired {
 		t.Fatalf("expire waiting: %v %v", expired, err)
 	}
 	usage, err := st.BuildUsage(ctx)
@@ -448,13 +448,13 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 		"8", "192.0.2.8", "02:00:00:00:00:08", "other-token", prepareJSON); err != nil || owned {
 		t.Fatalf("second runtime preparation = %t, %v", owned, err)
 	}
-	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, "br-stale", "7"); err != nil || cleared {
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.TemplateID, "br-stale", "7"); err != nil || cleared {
 		t.Fatalf("stale-run runtime clear = %t, %v", cleared, err)
 	}
-	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.RunID, "8"); err != nil || cleared {
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.TemplateID, runtime.RunID, "8"); err != nil || cleared {
 		t.Fatalf("stale-port runtime clear = %t, %v", cleared, err)
 	}
-	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.RunID, "7"); err != nil || !cleared {
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.TemplateID, runtime.RunID, "7"); err != nil || !cleared {
 		t.Fatalf("clear runtime preparation = %t, %v", cleared, err)
 	}
 	loaded, err = st.GetBuild(ctx, runtime.BuildID)
@@ -515,14 +515,14 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded.Status = types.BuildError
-	if err := st.PutBuildTerminal(ctx, loaded); err == nil || !strings.Contains(err.Error(), "runtime ownership cleanup is incomplete") {
+	if err := st.PutBuildTerminal(ctx, loaded, nil); err == nil || !strings.Contains(err.Error(), "runtime ownership cleanup is incomplete") {
 		t.Fatalf("terminal build with runtime ownership error = %v", err)
 	}
 	retained, err := st.GetBuild(ctx, b.BuildID)
 	if err != nil || retained == nil || !retained.ExecutionClaimed || retained.RuntimeVswitchPort != "7" || retained.ExecutionResult == nil {
 		t.Fatalf("rejected terminal lost cleanup ownership = %+v, %v", retained, err)
 	}
-	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, b.BuildID, b.RunID, "7"); err != nil || !cleared {
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, b.BuildID, b.TemplateID, b.RunID, "7"); err != nil || !cleared {
 		t.Fatalf("clear runtime ownership before terminal = %t, %v", cleared, err)
 	}
 	loaded, err = st.GetBuild(ctx, b.BuildID)
@@ -530,7 +530,7 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded.Status = types.BuildError
-	if err := st.PutBuildTerminal(ctx, loaded); err != nil {
+	if err := st.PutBuildTerminal(ctx, loaded, nil); err != nil {
 		t.Fatal(err)
 	}
 	terminal, err := st.GetBuild(ctx, b.BuildID)

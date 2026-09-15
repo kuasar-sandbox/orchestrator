@@ -40,9 +40,15 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 			return "", false, err
 		}
 		if found {
-			return buildID, true, nil
+			allowed, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
+			return buildID, allowed, err
 		}
-		return o.builderRunPool.WaitAssignment(ctx, runID)
+		buildID, found, err = o.builderRunPool.WaitAssignment(ctx, runID)
+		if err != nil || !found {
+			return buildID, found, err
+		}
+		allowed, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
+		return buildID, allowed, err
 	default:
 		return "", false, nil
 	}
@@ -58,15 +64,21 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 	if pend == nil {
 		return configsock.RejectBuildReport(fmt.Errorf("unknown build %s", buildID))
 	}
-	if pend.build.RunID != runID {
-		return configsock.RejectBuildReport(fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID))
-	}
-	if err := validateBuildResult(pend.build, result); err != nil {
-		return configsock.RejectBuildReport(fmt.Errorf("build %s result: %w", buildID, err))
-	}
 	pend.resultMu.Lock()
 	defer pend.resultMu.Unlock()
-	if pend.resultClosed {
+	unlockEvent := o.lockBuildEvent(buildID)
+	defer unlockEventFence(unlockEvent)
+	build, err := o.st.GetBuild(ctx, buildID)
+	if err != nil {
+		return err
+	}
+	if build == nil || build.RunID != runID || (pend.templateID != "" && build.TemplateID != pend.templateID) {
+		return configsock.RejectBuildReport(store.ErrBuildExecutionOwnership)
+	}
+	if err := validateBuildResult(build, result); err != nil {
+		return configsock.RejectBuildReport(err)
+	}
+	if pend.resultClosed && build.ExecutionResult == nil {
 		return configsock.RejectBuildReport(fmt.Errorf("build %s no longer accepts results for run %s", buildID, runID))
 	}
 	if _, err := o.st.AcceptBuildResult(ctx, buildID, runID, result); err != nil {
@@ -96,9 +108,6 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 	if pend == nil {
 		return configsock.RejectBuildReport(fmt.Errorf("unknown build %s", buildID))
 	}
-	if pend.build.RunID != runID {
-		return configsock.RejectBuildReport(fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID))
-	}
 	if state == "finished" {
 		// run-builder reports finished only after sandbox-ctl exited and the
 		// trusted phase VMM cgroup read back populated=0. In dynamic mode the
@@ -112,6 +121,13 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 	}
 	unlockEvent := o.lockBuildEvent(buildID)
 	defer unlockEventFence(unlockEvent)
+	current, err := o.st.GetBuild(ctx, buildID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.RunID != runID || current.TemplateID != pend.templateID && pend.templateID != "" {
+		return configsock.RejectBuildReport(store.ErrBuildExecutionOwnership)
+	}
 	if err := o.st.SetBuildPhase(ctx, buildID, phase, sandboxID, state); err != nil {
 		if errors.Is(err, store.ErrBuildExecutionOwnership) {
 			return configsock.RejectBuildReport(err)
@@ -120,7 +136,7 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 	}
 	o.log.Info("build phase", "bid", buildID, "run_id", runID, "phase", phase,
 		"sandbox_id", sandboxID, "state", state)
-	observed := cloneBuildForObservation(pend.build)
+	observed := cloneBuildForObservation(current)
 	if state == "finished" {
 		observed.Phase, observed.PhaseSandboxID = "", ""
 	} else {

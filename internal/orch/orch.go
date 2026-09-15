@@ -64,12 +64,14 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
-	launches    launchGroup            // sole process-local owner of create and resume attempts
-	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
-	buildOps    acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
-	deleteOps   acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
-	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
-	lifecycle   keyedLockGroup         // serialize lifecycle mutations for one sid
+	launches       launchGroup            // sole process-local owner of create and resume attempts
+	acceptedOps    acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+	buildWake      chan struct{}
+	buildUsageWake chan struct{}
+	buildOps       acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
+	deleteOps      acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
+	exports        exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
+	lifecycle      keyedLockGroup         // serialize lifecycle mutations for one sid
 
 	deleteMu            sync.Mutex
 	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
@@ -200,6 +202,8 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		subs:                 map[int]chan routesync.Event{},
 		routeFP:              uuid.NewString(),
 		pend:                 map[string]*pendingBuild{},
+		buildWake:            make(chan struct{}, 1),
+		buildUsageWake:       make(chan struct{}, 1),
 		buildRecoveryReady:   make(chan struct{}),
 		detachedPortsPending: map[string]struct{}{},
 		deleteActive:         map[string]struct{}{},

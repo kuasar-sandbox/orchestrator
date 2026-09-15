@@ -290,10 +290,10 @@ func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, buil
 	// stale pre-check and oversubscribe the durable ledger.
 	insertSelect := strings.Replace(buildInsertSQL, "\n\tVALUES (", "\n\tSELECT ", 1)
 	insertSelect = strings.TrimSuffix(insertSelect, ")") + `
-	WHERE (?=0 OR (SELECT COUNT(*) FROM builds WHERE status NOT IN (?,?)) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status NOT IN (?,?)),0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status NOT IN (?,?)),0) <= ?)
-	  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status NOT IN (?,?)),0) <= ?)`
+	WHERE (?=0 OR (SELECT COUNT(*) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0) <= ?)
+	  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)
+	  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)
+	  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status IN ('registered','waiting','building') AND cancel_requested_unix=0 AND delete_requested_unix=0),0) <= ?)`
 	headroom := func(configured, requested int64) int64 {
 		if configured == 0 {
 			return 0
@@ -301,10 +301,10 @@ func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, buil
 		return configured - requested
 	}
 	args = append(args,
-		limit.MaxBuilds, string(types.BuildReady), string(types.BuildError), headroom(limit.MaxBuilds, 1),
-		limit.Resources.CPU, string(types.BuildReady), string(types.BuildError), headroom(limit.Resources.CPU, build.Resources.CPU),
-		limit.Resources.Memory, string(types.BuildReady), string(types.BuildError), headroom(limit.Resources.Memory, build.Resources.Memory),
-		limit.Resources.Storage, string(types.BuildReady), string(types.BuildError), headroom(limit.Resources.Storage, build.Resources.Storage),
+		limit.MaxBuilds, headroom(limit.MaxBuilds, 1),
+		limit.Resources.CPU, headroom(limit.Resources.CPU, build.Resources.CPU),
+		limit.Resources.Memory, headroom(limit.Resources.Memory, build.Resources.Memory),
+		limit.Resources.Storage, headroom(limit.Resources.Storage, build.Resources.Storage),
 	)
 	result, err := tx.ExecContext(ctx, insertSelect, args...)
 	if err != nil {
@@ -563,7 +563,7 @@ func (s *Store) DeleteBuildMMDSRouteSecretValues(ctx context.Context, buildID st
 // its builder-only execution ownership, MMDS routes, and confidential values.
 // The build row remains as retention-bounded status/index history, but no runner
 // or builder input can survive as terminal ownership or template metadata.
-func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error {
+func (s *Store) PutBuildTerminal(ctx context.Context, build, cleanedRuntime *types.Build) error {
 	if build == nil {
 		return errors.New("build is required")
 	}
@@ -581,18 +581,59 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}
 	defer tx.Rollback()
+	current, err := s.scanBuild(tx.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE build_id=? AND template_id=? AND run_id=?`, build.BuildID, build.TemplateID, build.RunID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: terminal build identity or ownership changed", ErrBuildExecutionOwnership)
+	}
+	if err != nil {
+		return fmt.Errorf("store: finish build identity: %w", err)
+	}
+	// The normal path has already cleared runtime under its retained claim.
+	// A recovery whose runtime is the last ownership fence supplies the exact
+	// snapshot only after local cleanup; release that fence in this transaction.
+	expectedPort, expectedIP, expectedMAC, expectedToken, expectedPrepare := "", "", "", "", ""
+	if cleanedRuntime != nil {
+		if cleanedRuntime.BuildID != current.BuildID || cleanedRuntime.TemplateID != current.TemplateID || cleanedRuntime.RunID != current.RunID ||
+			cleanedRuntime.ExecutionClaimed != current.ExecutionClaimed || cleanedRuntime.ExecutionClaimedUnix != current.ExecutionClaimedUnix {
+			return fmt.Errorf("%w: cleaned build lifecycle changed", ErrBuildExecutionOwnership)
+		}
+		expectedPort, expectedIP, expectedMAC = cleanedRuntime.RuntimeVswitchPort, cleanedRuntime.RuntimeFloatingIP, cleanedRuntime.RuntimePortMAC
+		expectedToken, expectedPrepare = cleanedRuntime.RuntimeEnvdAccessToken, cleanedRuntime.RuntimePrepareJSON
+	}
+	if current.RuntimeVswitchPort != expectedPort || current.RuntimeFloatingIP != expectedIP || current.RuntimePortMAC != expectedMAC ||
+		current.RuntimeEnvdAccessToken != expectedToken || current.RuntimePrepareJSON != expectedPrepare {
+		return fmt.Errorf("%w: cleaned build runtime changed", ErrBuildExecutionOwnership)
+	}
+	if !current.ExecutionClaimed && current.CancelRequestedUnix == 0 && current.DeleteRequestedUnix == 0 && current.Status == types.BuildBuilding {
+		return fmt.Errorf("%w: building row has no execution claim", ErrBuildExecutionOwnership)
+	}
+	terminal.CancelRequestedUnix, terminal.DeleteRequestedUnix = current.CancelRequestedUnix, current.DeleteRequestedUnix
+	terminal.FinishedUnix = time.Now().Unix()
+	if current.Status == types.BuildReady || current.Status == types.BuildError {
+		terminal.Status, terminal.Reason = current.Status, current.Reason
+		if current.FinishedUnix != 0 {
+			terminal.FinishedUnix = current.FinishedUnix
+		}
+		terminal.PersistID, terminal.Kind = current.PersistID, current.Kind
+		terminal.StartCmd, terminal.ReadyCmd = current.StartCmd, current.ReadyCmd
+		terminal.Names, terminal.Aliases = current.Names, current.Aliases
+	} else if current.CancelRequestedUnix != 0 && current.ExecutionResult == nil {
+		terminal.Status, terminal.Reason = types.BuildError, BuildCancelledReason
+		terminal.PersistID, terminal.Kind = current.PersistID, current.Kind
+		terminal.Names, terminal.Aliases = current.Names, current.Aliases
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE builds SET
 		persist_id=?,kind=?,start_cmd=?,ready_cmd=?,status=?,reason=?,run_id='',
 		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
 		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',
 		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json='',
-		execution_result_json='',finished_unix=unixepoch()
-		WHERE build_id=? AND status=? AND execution_claimed=1
-		  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
-		  AND runtime_envd_access_token_enc='' AND runtime_prepare_json=''`,
+		execution_result_json='',finished_unix=?
+		WHERE build_id=? AND template_id=? AND run_id=? AND status=? AND execution_claimed=? AND execution_claimed_unix=?
+		  AND runtime_vswitch_port=? AND runtime_floating_ip=? AND runtime_port_mac=?
+		  AND runtime_prepare_json=?`,
 		terminal.PersistID, string(terminal.Kind), terminal.StartCmd, terminal.ReadyCmd,
 		string(terminal.Status), terminal.Reason, mjs(terminal.Names), mjs(terminal.Aliases),
-		mj(terminal.Metadata), terminal.BuildID, string(types.BuildBuilding))
+		mj(terminal.Metadata), terminal.FinishedUnix, terminal.BuildID, terminal.TemplateID, terminal.RunID, string(current.Status), current.ExecutionClaimed, current.ExecutionClaimedUnix, expectedPort, expectedIP, expectedMAC, expectedPrepare)
 	if err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}
@@ -606,5 +647,6 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}
+	*build = terminal
 	return nil
 }

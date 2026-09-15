@@ -229,7 +229,7 @@ func TestBuildMMDSRouteSecretValuesTerminalCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	build.Status = types.BuildError
-	if err := st.PutBuildTerminal(ctx, build); err != nil {
+	if err := st.PutBuildTerminal(ctx, build, nil); err != nil {
 		t.Fatal(err)
 	}
 	var count int

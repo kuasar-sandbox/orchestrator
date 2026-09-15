@@ -232,6 +232,20 @@ func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref cl
 			if existing.Group != ref.Group {
 				return errNodeBuildIDConflict
 			}
+			if existing.TemplateID != ref.TemplateID {
+				if existing.TemplateID != "" {
+					return errNodeBuildIDConflict
+				}
+				// Fill a pre-upgrade ref once from its still-current route;
+				// the original node binding and transient ID remain authoritative.
+				build, found, err := s.GetBuildInGroup(ctx, ref.Group, ref.BuildID)
+				if err != nil {
+					return err
+				}
+				if !found || build.NodeID != nodeID || build.TemplateID != ref.TemplateID {
+					return errNodeBuildIDConflict
+				}
+			}
 			if _, ok, err := sh.CAS(ctx, key, cur.Meta.Rev, value); err != nil {
 				return err
 			} else if ok {

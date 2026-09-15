@@ -121,6 +121,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if templateID == "" {
 		templateID = "transient-" + newID()
 	}
+	ref.TemplateID = templateID
 	excluded := placementExclusions{}
 	var lastFailure error
 	if req.BuildID != "" {
@@ -138,7 +139,8 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			// A prior dispatch had an ambiguous result. Re-establish the node
 			// ownership index and replay the exact stored intent to the same node;
 			// neither current placement nor Provider output may change it.
-			if err := r.stores.AddNodeBuildRef(ctx, rec.NodeID, ref); err != nil {
+			ref.TemplateID = rec.TemplateID
+			if err := r.refreshBuildRegistrationRef(ctx, rec, ref); err != nil {
 				return nil, err
 			}
 			ack, err := r.dispatchBuildRegistration(ctx, rec)
@@ -150,7 +152,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 				if err != nil {
 					return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", rec.NodeID, err)
 				}
-				registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, target)
+				registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, rec.TemplateID, target)
 				if err != nil {
 					return nil, err
 				}
@@ -238,11 +240,15 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			registrationMMDSSecrets: cloneStringMap(mmdsSecrets),
 			registrationCredentials: cloneBuildCredentials(credentials),
 		}
-		if err := r.stores.PutBuild(ctx, rec); err != nil {
+		if _, inserted, err := r.stores.casRouteBuildShard(ctx, rec, 0); err != nil {
 			return nil, err
+		} else if !inserted {
+			return nil, fmt.Errorf("registry: build %s registration appeared during placement", buildID)
 		}
 		if err := r.stores.AddNodeBuildRef(ctx, id, ref); err != nil {
-			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			if cleanupErr := r.removeBuildRegistrationRoute(ctx, rec); cleanupErr != nil {
+				return nil, errors.Join(err, cleanupErr)
+			}
 			if errors.Is(err, errNodeBuildIDConflict) {
 				lastFailure = err
 				excluded.add(id)
@@ -272,7 +278,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if err != nil {
 			return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", id, err)
 		}
-		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, target)
+		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, rec.TemplateID, target)
 		if err != nil {
 			return nil, err
 		}
@@ -463,20 +469,97 @@ func ambiguousBuildRegistrationError(nodeID string, ack *routesync.CmdAck) error
 	return fmt.Errorf("registry: build_register ambiguous on node %s: status=%q http_status=%d reason=%s", nodeID, ack.Status, ack.HTTPStatus, ack.Reason)
 }
 
-func (r *Registry) removeBuildRegistrationIntent(ctx context.Context, rec *BuildRecord) error {
-	if err := r.stores.DeleteBuild(ctx, rec.Group, rec.BuildID); err != nil {
+// A replay may cross deletion while accessing another shard. Check the route
+// both before and after publishing the ref, and remove only the stale identity
+// if the original registration ceased to be current. Never dispatch it then.
+func (r *Registry) refreshBuildRegistrationRef(ctx context.Context, expected *BuildRecord, ref clusterstate.NodeBuildRef) error {
+	matches := func() (bool, error) {
+		current, found, err := r.stores.GetBuildInGroup(ctx, expected.Group, expected.BuildID)
+		return found && current != nil && current.NodeID == expected.NodeID && current.TemplateID == expected.TemplateID, err
+	}
+	if ok, err := matches(); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("registry: build %s registration changed before replay ref", expected.BuildID)
+	}
+	if err := r.stores.AddNodeBuildRef(ctx, expected.NodeID, ref); err != nil {
 		return err
 	}
-	return r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.BuildID)
+	if ok, err := matches(); err != nil {
+		return err // An unavailable authority is not proof that its ref is stale.
+	} else if ok {
+		return nil
+	}
+	current, revision, found, err := r.lookupNodeBuildRefVersion(ctx, expected.NodeID, expected.BuildID)
+	if err != nil {
+		return err
+	}
+	if found && current.Group == expected.Group && current.TemplateID == expected.TemplateID {
+		if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, expected.NodeID, expected.BuildID, revision); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("registry: build %s registration changed while refreshing replay ref", expected.BuildID)
 }
 
-func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID string, target *types.BuildTarget) (*BuildRecord, error) {
+// A failed owner-ref insert owns only its original provisional route. It must
+// neither remove another lifecycle's route nor touch that lifecycle's ref.
+func (r *Registry) removeBuildRegistrationRoute(ctx context.Context, expected *BuildRecord) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		current, revision, found, err := r.stores.getRouteBuildShard(ctx, expected.Group, expected.BuildID)
+		if err != nil {
+			return err
+		}
+		if !found || current.TemplateID != expected.TemplateID || current.NodeID != expected.NodeID || current.State != BuildStarting {
+			return fmt.Errorf("registry: build %s provisional registration changed", expected.BuildID)
+		}
+		if deleted, err := r.stores.deleteRouteBuildShardIfRevision(ctx, expected.Group, expected.BuildID, revision); err != nil {
+			return err
+		} else if deleted {
+			return nil
+		}
+	}
+	return fmt.Errorf("registry: build %s provisional registration cleanup conflicted", expected.BuildID)
+}
+
+func (r *Registry) removeBuildRegistrationIntent(ctx context.Context, expected *BuildRecord) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		ref, refRevision, refFound, err := r.lookupNodeBuildRefVersion(ctx, expected.NodeID, expected.BuildID)
+		if err != nil {
+			return err
+		}
+		current, revision, found, err := r.stores.getRouteBuildShard(ctx, expected.Group, expected.BuildID)
+		if err != nil {
+			return err
+		}
+		if !found || current.NodeID != expected.NodeID || current.TemplateID != expected.TemplateID || current.State != BuildStarting ||
+			(refFound && (ref.Group != expected.Group || ref.TemplateID != expected.TemplateID)) {
+			return fmt.Errorf("registry: build %s registration intent changed before rejection", expected.BuildID)
+		}
+		deleted, err := r.stores.deleteRouteBuildShardIfRevision(ctx, expected.Group, expected.BuildID, revision)
+		if err != nil {
+			return err
+		}
+		if !deleted {
+			continue
+		}
+		if refFound {
+			if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, expected.NodeID, expected.BuildID, refRevision); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("registry: build %s registration rejection conflicted", expected.BuildID)
+}
+
+func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID, templateID string, target *types.BuildTarget) (*BuildRecord, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		current, revision, found, err := r.stores.getRouteBuildShard(ctx, group, buildID)
 		if err != nil {
 			return nil, err
 		}
-		if !found || current.NodeID != nodeID {
+		if !found || current.NodeID != nodeID || current.TemplateID != templateID {
 			return nil, fmt.Errorf("registry: build %s registration intent changed before acceptance", buildID)
 		}
 		if current.RegistrationTargetSet {
@@ -560,12 +643,15 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 	if err != nil {
 		return fmt.Errorf("lookup build owner: %w", err)
 	}
-	if !found {
+	if !found || (ref.TemplateID != "" && ref.TemplateID != e.TemplateID) {
 		return nil
 	}
 	state := BuildState(e.State)
 	update := func(writeCtx context.Context) error {
 		return r.updateBuildProjection(writeCtx, ref.Group, e.BuildID, nodeID, func(rec *BuildRecord) {
+			if e.TemplateID != "" && types.IsTransientID(rec.TemplateID) && rec.TemplateID != e.TemplateID {
+				return
+			}
 			rec.State = state
 			// A state event can outrun or survive loss of the synchronous registration
 			// ACK. Keep the exact replay envelope until that ACK's accepted target is
@@ -574,8 +660,11 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 				rec.RegistrationImageRepo = ""
 				rec.RegistrationRegistryAuth = ""
 			}
-			if e.TemplateID != "" {
+			if types.IsTransientID(e.TemplateID) {
 				rec.TemplateID = e.TemplateID
+			}
+			if e.PersistID != "" {
+				rec.PersistID = e.PersistID
 			}
 			rec.Reason = e.Reason
 		})
@@ -596,7 +685,7 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 // applyBuildDelete removes only the projection bound to this exact node. The
 // node's SQLite deletion is the lifecycle decision; Registry has no terminal
 // timer of its own.
-func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string) error {
+func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID, templateID string) error {
 	if nodeID == "" || buildID == "" {
 		return nil
 	}
@@ -605,12 +694,15 @@ func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string)
 		if err != nil {
 			return fmt.Errorf("lookup build delete owner: %w", err)
 		}
-		if !found {
+		if !found || (ref.TemplateID != "" && ref.TemplateID != templateID) {
 			return nil
 		}
 		record, revision, recordFound, err := r.stores.getRouteBuildShard(ctx, ref.Group, buildID)
 		if err != nil {
 			return fmt.Errorf("read build delete projection: %w", err)
+		}
+		if recordFound && templateID != "" && record.TemplateID != templateID {
+			return nil
 		}
 		if recordFound && record.NodeID == nodeID {
 			// BuildStarting is the Registry's immutable pre-accept dispatch
@@ -662,7 +754,7 @@ func (r *Registry) applyNodeBuildFullSnapshot(ctx context.Context, nodeID string
 		if !found || current != baseline {
 			continue
 		}
-		if err := r.applyBuildDelete(ctx, nodeID, baseline.BuildID); err != nil {
+		if err := r.applyBuildDelete(ctx, nodeID, baseline.BuildID, baseline.TemplateID); err != nil {
 			return err
 		}
 	}
@@ -722,16 +814,53 @@ func (r *Registry) lookupNodeBuildRefVersion(ctx context.Context, nodeID, buildI
 // ResolveBuild maps a group's build_id to its node (router restart recovery: the
 // router's in-memory build map is lost, but route_link replicated build state is
 // still group-sharded).
-func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*BuildReserveResult, bool) {
+func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*BuildReserveResult, bool, error) {
 	b, found, err := r.stores.GetBuildInGroup(ctx, group, buildID)
-	if err != nil || !found || b.State == BuildStarting || !b.RegistrationTargetSet {
-		return nil, false
+	if err != nil || !found {
+		return nil, false, err
 	}
-	return &BuildReserveResult{
-		BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID,
-		APIEndpoint: r.nodeAPIEndpoint(ctx, b.NodeID), Profile: b.Profile,
-		Target: cloneBuildTarget(b.RegistrationTarget),
-	}, true
+	return r.resolveBuildRecord(ctx, b)
+}
+
+func (r *Registry) resolveBuildRecord(ctx context.Context, b *BuildRecord) (*BuildReserveResult, bool, error) {
+	if b.State == BuildStarting || !b.RegistrationTargetSet {
+		return nil, false, fmt.Errorf("build registration binding is not yet complete")
+	}
+	result := r.buildReserveResult(ctx, b)
+	if result.APIEndpoint == "" {
+		return nil, false, fmt.Errorf("build node API endpoint is unavailable")
+	}
+	return result, true, nil
+}
+
+// ResolveBuildByTemplate reads only the group's existing retained projection.
+// Missing registration IDs indicate an incomplete upgrade/full sync, not 404.
+func (r *Registry) ResolveBuildByTemplate(ctx context.Context, group, templateID string) (*BuildReserveResult, bool, error) {
+	var match *BuildRecord
+	incomplete := false
+	err := r.stores.RangeBuildsInGroup(ctx, group, func(b *BuildRecord) error {
+		if types.ValidateTransientID(b.TemplateID) != nil {
+			incomplete = true
+		}
+		if b.TemplateID == templateID {
+			if match != nil {
+				return fmt.Errorf("ambiguous transient build identity")
+			}
+			copy := *b
+			match = &copy
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if match != nil {
+		return r.resolveBuildRecord(ctx, match)
+	}
+	if incomplete {
+		return nil, false, fmt.Errorf("build transient projection requires node full sync")
+	}
+	return nil, false, nil
 }
 
 func acceptedBuildRegistrationTarget(ack *routesync.CmdAck) (*types.BuildTarget, error) {

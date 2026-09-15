@@ -21,14 +21,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/proxy.sh"
+. "$SCRIPT_DIR/lib/build_fixture_units.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
-SWITCH="${SWITCH:-sw0}"
+SWITCH="${SWITCH:-c${BASHPID}}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 if [ -z "${ZOT_BIN:-}" ]; then
     ZOT_BIN="$(command -v zot || true)"
 fi
-SW_NETNS="${SW_NETNS:-e2e_cluster_sw}"
+SW_NETNS="${SW_NETNS:-e2ec_${BASHPID}}"
 
 step() { echo "==> $*" >&2; }
 
@@ -121,12 +122,13 @@ mkdir -p "$WORK/r" "$WORK/l" "$WORK/s" "$WORK/z/d" "$WORK/g" "$WORK/br" "$WORK/b
 declare -a PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
+NETNS_CREATED=""
 CLUSTER_EXEC_PID=""
 
 cleanup() {
     set +e
     rm -f "$WORK/create.credentials"
-    systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    stop_build_fixture_units "$WORK" 2>/dev/null
     [ -n "$CLUSTER_EXEC_PID" ] && kill "$CLUSTER_EXEC_PID" 2>/dev/null
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
         p="${PIDS[$i]}"
@@ -134,8 +136,7 @@ cleanup() {
         [ -n "$p" ] && wait "$p" 2>/dev/null
     done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1
-    ip netns del "$SW_NETNS" 2>/dev/null
-    ip netns del "$SWITCH" 2>/dev/null
+    [ -n "$NETNS_CREATED" ] && ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
@@ -573,10 +574,10 @@ EOF
     step "store-ctl + zot up; seeded $REF"
 
     MGMT_VIP="169.254.169.254"
-    "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
-    ip netns del "$SW_NETNS" 2>/dev/null || true
-    ip netns del "$SWITCH" 2>/dev/null || true
-    ip netns add "$SW_NETNS" 2>/dev/null || true
+    if "$BIN/connector-ctl" vswitch status "$SWITCH" >/dev/null 2>&1; then fail "fixture switch already exists: $SWITCH"; fi
+    ip netns add "$SW_NETNS"
+    NETNS_CREATED=1
+    SW_STARTED=1
     step "starting vswitch $SWITCH (netns=$SW_NETNS)"
     "$BIN/connector-ctl" vswitch start "$SWITCH" \
         --netns="$SW_NETNS" \
@@ -673,7 +674,7 @@ EOF
 
     kill "$build_pid" 2>/dev/null || true
     wait "$build_pid" 2>/dev/null || true
-    systemctl stop 'sandbox-builder@*.service' 2>/dev/null || true
+    stop_build_fixture_units "$WORK" 2>/dev/null || true
 }
 
 write_group_record() {
@@ -784,6 +785,7 @@ start_cluster_control_plane() {
         step "starting registry-$i (:${port})"
         "$BIN/cluster-ctl" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
         PIDS+=("$!")
+        [ "$i" != 1 ] || REGISTRY_ONE_PID=$!
         wait_port "$port" "registry-$i"
     done
     step "checking registry membership endpoint"
@@ -808,7 +810,8 @@ PY
 
     step "starting router (:${ROUTER_PORT})"
     "$BIN/cluster-ctl" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
-    PIDS+=("$!")
+    ROUTER_PID=$!
+    PIDS+=("$ROUTER_PID")
     wait_port "$ROUTER_PORT" router
 }
 
@@ -865,6 +868,12 @@ sandbox:
   network: { switch: $SWITCH }
   boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle, overlay_diff_template: $OVL }
 builder:
+  admission:
+    registration: { max_builds: 16 }
+    execution: { max_builds: 1 }
+  terminal_ttl: 1h
+  total_timeout_sec: 1200
+  step_timeout_sec: 180
   insecure_registry: true
   diff_template: $BLD
 checkpoint: { mode: local }
@@ -878,7 +887,8 @@ cluster:
 EOF
     step "starting cluster conductor node_id=$node_id (API :${NODE_PORT}, no manual manifest-key add)"
     "$BIN/node-ctl" conductor serve --config "$WORK/cluster-node.yaml" > >(tee "$WORK/cluster-node.log" >&2) 2>&1 &
-    PIDS+=("$!")
+    CLUSTER_CONDUCTOR_PID=$!
+    PIDS+=("$CLUSTER_CONDUCTOR_PID")
     wait_api_health "$NODE_PORT" "cluster node-ctl"
     write_proxy_config "$WORK/cluster-proxy.yaml" \
         "$WORK/cn.sock" "$WORK/cr" "127.0.0.1:$NODE_DATA_PORT" - \
@@ -1071,5 +1081,37 @@ fi
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
 run_cluster_flow
+BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/lib/build_actions.py" \
+    --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
+    --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
+    --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
+    --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
+    --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" &
+ACTION_TEST_PID=$!
+PIDS+=("$ACTION_TEST_PID")
+while kill -0 "$ACTION_TEST_PID" 2>/dev/null; do
+    if [ -e "$WORK/restart-request" ] && [ ! -e "$WORK/restart-ready" ]; then
+        kill "$ROUTER_PID"
+        wait "$ROUTER_PID" || true
+        if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
+            # The redirected node's sole node-link owner is another member.
+            # The route projection has three replicas; retain existing bindings.
+            kill "$REGISTRY_ONE_PID"
+            wait "$REGISTRY_ONE_PID" || true
+            "$BIN/cluster-ctl" registry --config "$WORK/registry-1.yaml" >>"$WORK/registry-1.log" 2>&1 &
+            REGISTRY_ONE_PID=$!
+            PIDS+=("$REGISTRY_ONE_PID")
+            wait_port "${CONTROL_PORTS[0]}" registry-1-restarted
+        fi
+        "$BIN/cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
+        ROUTER_PID=$!
+        PIDS+=("$ROUTER_PID")
+        wait_port "$ROUTER_PORT" router-restarted
+        touch "$WORK/restart-ready"
+        step "restarted control processes; testing retained transient routing from empty caches"
+    fi
+    sleep 0.1
+done
+wait "$ACTION_TEST_PID" || fail "Build action capacity/restart acceptance"
 
 echo "==> PASS: e2e_cluster_real $CLUSTER_REAL_CASE"

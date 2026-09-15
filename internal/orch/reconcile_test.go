@@ -1064,7 +1064,7 @@ func TestRangeClusterBuildsAfterAcceptedResultReconcileExceedsSubscriberBuffer(t
 
 	seen := make(map[string]bool, total)
 	if err := o.RangeBuilds(context.Background(), func(event routesync.BuildEvent) error {
-		if event.Kind != routesync.BuildUpsert || event.State != string(types.BuildReady) || event.TemplateID != wantTemplateID || event.Reason != "" {
+		if event.Kind != routesync.BuildUpsert || event.State != string(types.BuildReady) || !types.IsTransientID(event.TemplateID) || event.PersistID != wantTemplateID || event.Reason != "" {
 			t.Fatalf("full-sync accepted-result event = %+v", event)
 		}
 		seen[event.BuildID] = true

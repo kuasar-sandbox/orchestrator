@@ -121,7 +121,7 @@ func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	if res.Target == nil || *res.Target != *acceptedTarget {
 		t.Fatalf("ReserveBuild accepted target = %+v, want %+v", res.Target, acceptedTarget)
 	}
-	if resolved, found := reg.ResolveBuild(ctx, "/g", res.BuildID); !found || resolved.APIEndpoint != "node-api:7443" ||
+	if resolved, found, _ := reg.ResolveBuild(ctx, "/g", res.BuildID); !found || resolved.APIEndpoint != "node-api:7443" ||
 		resolved.Target == nil || *resolved.Target != *acceptedTarget {
 		t.Fatalf("ResolveBuild = %+v found=%v", resolved, found)
 	}
@@ -264,7 +264,7 @@ func TestBuildDeleteRemovesExactNodeProjectionAndOwnerRef(t *testing.T) {
 	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: record.Group, BuildID: buildID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.applyBuildDelete(ctx, "n1", buildID); err != nil {
+	if err := reg.applyBuildDelete(ctx, "n1", buildID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := reg.stores.GetBuildInGroup(ctx, record.Group, buildID); err != nil || found {
@@ -283,7 +283,7 @@ func TestBuildDeleteRemovesExactNodeProjectionAndOwnerRef(t *testing.T) {
 	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: replacement.Group, BuildID: buildID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.applyBuildDelete(ctx, "n1", buildID); err != nil {
+	if err := reg.applyBuildDelete(ctx, "n1", buildID, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err := reg.stores.GetBuildInGroup(ctx, replacement.Group, buildID)
@@ -335,7 +335,7 @@ func TestSupersededNodeLinkBuildDeleteCannotRemoveReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := reg.withActiveNodeBuildFrame(oldSession, func() error {
-		return reg.applyBuildDelete(ctx, nodeID, buildID)
+		return reg.applyBuildDelete(ctx, nodeID, buildID, "")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestSupersededNodeLinkBuildDeleteCannotRemoveReplacement(t *testing.T) {
 	called := false
 	err := reg.withActiveNodeBuildFrame(oldSession, func() error {
 		called = true
-		return reg.applyBuildDelete(ctx, nodeID, buildID)
+		return reg.applyBuildDelete(ctx, nodeID, buildID, "")
 	})
 	if !errors.Is(err, errSupersededNodeBuildSession) || called {
 		t.Fatalf("superseded BuildDelete called=%v err=%v", called, err)
@@ -515,7 +515,7 @@ func TestBuildProjectionCASPreservesConcurrentRegistrationAcceptance(t *testing.
 		// projection without erasing its target.
 		if firstUpdate {
 			firstUpdate = false
-			_, acceptErr = reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, want)
+			_, acceptErr = reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, "", want)
 		}
 		rec.State = BuildBuilding
 	})
@@ -597,7 +597,7 @@ func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 	if rec.RegistrationImageRepo != "repo" || rec.RegistrationRegistryAuth != "auth-json" {
 		t.Fatalf("ambiguous registration lost its replay envelope: %+v", rec)
 	}
-	if _, found := reg.ResolveBuild(ctx, "/g", "bld-fixed"); found {
+	if _, found, _ := reg.ResolveBuild(ctx, "/g", "bld-fixed"); found {
 		t.Fatal("ambiguous build became routable before durable node acceptance")
 	}
 	owner.ackErr = nil
@@ -642,7 +642,7 @@ func TestReserveBuildRecoversTargetWhenStateEventOutrunsAck(t *testing.T) {
 		projected.RegistrationImageRepo == "" || projected.RegistrationRegistryAuth == "" {
 		t.Fatalf("pre-ACK projection = %+v, found=%t err=%v", projected, found, err)
 	}
-	if _, found := reg.ResolveBuild(ctx, req.Group, req.BuildID); found {
+	if _, found, _ := reg.ResolveBuild(ctx, req.Group, req.BuildID); found {
 		t.Fatal("state projection exposed build before accepted target was durable")
 	}
 

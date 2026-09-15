@@ -404,6 +404,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		return err
 	}
 	o.refreshBuildAdmissionGauges(ctx)
+	o.buildCapacityChanged()
 	if registered.Status == types.BuildReady || registered.Status == types.BuildError {
 		templateID := ""
 		if registered.Status == types.BuildReady {
@@ -466,10 +467,11 @@ func buildProjectionEvent(build *types.Build) routesync.BuildEvent {
 		return event
 	}
 	event.BuildID = build.BuildID
+	event.TemplateID = build.TemplateID
 	event.State = string(build.Status)
 	event.Reason = build.Reason
 	if build.Status == types.BuildReady {
-		event.TemplateID = build.PersistID
+		event.PersistID = build.PersistID
 	}
 	return event
 }
@@ -489,28 +491,18 @@ func (o *Orchestrator) publishBuildEvent(event routesync.BuildEvent) {
 }
 
 // buildStateEvent constructs an event only for a cluster-owned Build. The
-// process-local map is a fast path; durable ClusterGroup is authoritative after
-// restart and after terminal cleanup removed transient credentials.
+// durable ClusterGroup is authoritative, including after terminal cleanup has
+// removed the process-local credential cache.
 func (o *Orchestrator) buildStateEvent(ctx context.Context, buildID, state, templateID, reason string) (*routesync.BuildEvent, bool, error) {
-	o.clusterBuildMu.Lock()
-	cb := o.clusterBuilds[buildID]
-	o.clusterBuildMu.Unlock()
-	if cb == nil {
-		// The process-local entry is only a fast path. Cluster ownership is a
-		// dedicated durable Build field, so controller restart cannot suppress
-		// building/terminal events or lose registration accounting convergence.
-		build, err := o.st.GetBuild(ctx, buildID)
-		if err != nil {
-			return nil, false, fmt.Errorf("resolve durable cluster build ownership: %w", err)
-		}
-		if build == nil {
-			return nil, false, nil
-		}
-		if build.ClusterGroup == "" {
-			return nil, false, nil // direct-node build
-		}
+	build, err := o.st.GetBuild(ctx, buildID)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve durable cluster build ownership: %w", err)
 	}
-	return &routesync.BuildEvent{Kind: routesync.BuildUpsert, BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}, true, nil
+	if build == nil || build.ClusterGroup == "" {
+		return nil, false, nil
+	}
+	event := buildProjectionEvent(build)
+	return &event, true, nil
 }
 
 func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
@@ -582,11 +574,20 @@ func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, s
 	}
 }
 
+// publishCommittedBuild uses the snapshot returned by the just-committed write.
+// Call under the Build event fence; no database retry or external I/O is needed.
+func (o *Orchestrator) publishCommittedBuild(build *types.Build) {
+	if build.ClusterGroup != "" {
+		o.publishBuildEvent(buildProjectionEvent(build))
+	}
+	o.forgetTerminalClusterBuild(build.BuildID, string(build.Status))
+}
+
 func (o *Orchestrator) publishBuildDelete(build *types.Build) {
 	if build == nil || build.ClusterGroup == "" {
 		return
 	}
-	o.publishBuildEvent(routesync.BuildEvent{Kind: routesync.BuildDelete, BuildID: build.BuildID})
+	o.publishBuildEvent(routesync.BuildEvent{Kind: routesync.BuildDelete, BuildID: build.BuildID, TemplateID: build.TemplateID})
 }
 
 // clusterBuildCreds returns a cluster build's image-pull credentials. The
