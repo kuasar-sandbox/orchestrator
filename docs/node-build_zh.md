@@ -13,7 +13,7 @@
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 只定义不可变 **Build.Resources**,绝不改 Sandbox capacity。`X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400。Builder `target` 是 register-only immutable 定义；`X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources，不供 A/B 使用。`profile∈{e2b,bare}`,省略取 `e2b`;响应暴露 requested `target`（省略即 auto） |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
-| status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段、requested `target`、终态 derived `kind`，及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`、`cancelRequested`、`deleteRequested`、`executionClaimed`、`runID`、`storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
+| status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段, requested `target`, 终态 derived `kind`, 及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`, `cancelRequested`, `deleteRequested`, `executionClaimed`, `runID`, `storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [§5](#5-按目标执行与发布) |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile`、requested `target` 和 resolved artifact `kind` |
 
@@ -75,7 +75,7 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `units.builder_pool_size` | `0` | 预启动 idle Builder 数;有限 execution 准入资源允许非零 pool,idle 单元不持有 Build claim。共享 units.dir/install/pool_wait_timeout 见 Node §3;完整 unit 与 claim/bind 顺序见 §4.1 |
+| `units.builder_pool_size` | `0` | 预启动 idle Builder 数;有限 execution 准入资源允许非零 pool,idle 单元不持有 Build claim. 共享 units.dir/install/pool_wait_timeout 见 Node §3;完整 unit 与 claim/bind 顺序见 §4.1 |
 | `builder.admission.execution.max_builds` | `2` | 同时持有 durable execution claim 的 Build 上限 |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | 不限制 | execution 的聚合准入资源向量;不生成 service/slice CPU 或内存策略,storage V1 仅准入记账 |
 | `builder.admission.registration` | 完整继承 resolved execution | 未带 cancel/delete 意图的 registered/waiting/building Build 注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
@@ -250,43 +250,43 @@ builder 取得 bid 后再锁
 直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
 保证 StopUnit/超时连阶段 VM 一并回收。
 
-Builder service 和 sandbox-builder.slice 负责进程归属、委托与整组回收,orchestrator 不增加
-CPU/内存限额或其它父级资源策略。有限 execution 准入资源允许非零 builder_pool_size;
-idle 单元不持有 Build claim。idle 与按需 worker 都必须先有持久 execution claim,再成功
-绑定 exact run-id,最后发布 assignment。绑定失败不发布 assignment,未分配 worker 与 Build
-沿用既有 pool 和归属清理规则。
+Builder service 和 sandbox-builder.slice 负责进程归属, 委托与整组回收,orchestrator 不增加
+CPU/内存限额或其它父级资源策略. 有限 execution 准入资源允许非零 builder_pool_size;
+idle 单元不持有 Build claim. idle 与按需 worker 都必须先有持久 execution claim,再成功
+绑定 exact run-id,最后发布 assignment. 绑定失败不发布 assignment,未分配 worker 与 Build
+沿用既有 pool 和归属清理规则.
 
 不可变 Build.Resources 同时用于准入/记账以及 resolveBuildExecutionResources 的 A/B 阶段
-规格。resolveBuildTargetResources 独立解析目标 Sandbox。sandbox-ctl 负责 VMM 的
-memory.max、memory.high、CPU capacity ceiling 和 weight;ctl 保留独立的同级 cgroup。
-恢复继续核对执行身份、存活、持久 preparation、已接受结果、deadline、phase 和清理归属,
-不读取 service/slice 资源属性。
+规格. resolveBuildTargetResources 独立解析目标 Sandbox. sandbox-ctl 负责 VMM 的
+memory.max, memory.high, CPU capacity ceiling 和 weight;ctl 保留独立的同级 cgroup.
+恢复继续核对执行身份, 存活, 持久 preparation, 已接受结果, deadline, phase 和清理归属,
+不读取 service/slice 资源属性.
 
 #### 既有部署的一次性升级
 
-外层 systemd enforcement 契约直接删除,不替换为父级 quota、weight、memory.high、overhead
-预算或后台清理器。新 unit instance 不接收 orchestrator 资源属性。更新项目生成的
+外层 systemd enforcement 契约直接删除,不替换为父级 quota, weight, memory.high, overhead
+预算或后台清理器. 新 unit instance 不接收 orchestrator 资源属性. 更新项目生成的
 sandbox-builder.slice 会删除 CPUQuota/MemoryMax 行并 reload systemd;既有 live service
-仍可能保留旧进程写入的 runtime properties,daemon-reload 不会删除这些属性的来源文件。
+仍可能保留旧进程写入的 runtime properties,daemon-reload 不会删除这些属性的来源文件.
 
 隔离用例 `test/e2e/e2e_builder_unit_upgrade.sh` 实际检查 reload 前后的 cgroup 文件:
-项目生成的 slice 解除旧策略,同一 live service 的 runtime 限额和 PID 保持。该 exact fixture
-执行结束、仅删除其两份已知属性文件后,新执行的 cpu.max 首字段为 max、memory.max=max。
-真实 Builder 套件另行检查相同父级值,同时保持 sandbox-ctl 的有限 VMM 叶子控制。
+项目生成的 slice 解除旧策略,同一 live service 的 runtime 限额和 PID 保持. 该 exact fixture
+执行结束, 仅删除其两份已知属性文件后,新执行的 cpu.max 首字段为 max, memory.max=max.
+真实 Builder 套件另行检查相同父级值,同时保持 sandbox-ctl 的有限 VMM 叶子控制.
 
 一次性操作步骤:
 
-1. 安排维护窗口,暂缓新 Build 提交,让已有 Build 按正常生命周期完成。核对 exact Build
-   状态、execution claim 和 runtime/phase 归属;不得为清理主动终止 live Build 或释放未完成
-   claim。升级 writer 前保留一致的数据库/配置备份。如带 live Build 升级,先保留其旧 runtime
-   设置直至完成;恢复不再以这些属性裁决执行有效性。
+1. 安排维护窗口,暂缓新 Build 提交,让已有 Build 按正常生命周期完成. 核对 exact Build
+   状态, execution claim 和 runtime/phase 归属;不得为清理主动终止 live Build 或释放未完成
+   claim. 升级 writer 前保留一致的数据库/配置备份. 如带 live Build 升级,先保留其旧 runtime
+   设置直至完成;恢复不再以这些属性裁决执行有效性.
 2. `units.install=true` 由新 conductor 更新项目生成的 slice 文件;`units.install=false` 的
-   文件调整属于运维。先核对 FragmentPath、DropInPaths 和文件内容,仅移除已确认由旧项目
-   生成的 CPUQuota/MemoryMax 指令,保留 operator drop-in 及其它单元属性。
-3. 逐个以 exact unit name 检查已经完成的旧 run。旧 SetResources 经 D-Bus 写 runtime-only
-   属性,通常对应下列两份文件。删除前确认来源,并确认 Build/unit 不再有执行或清理归属。
-   缺失或不同名称的文件需要检查,不得改为通配符或 systemctl revert,不得对模板、所有
-   instance 或祖先 slice 批量执行。
+   文件调整属于运维. 先核对 FragmentPath, DropInPaths 和文件内容,仅移除已确认由旧项目
+   生成的 CPUQuota/MemoryMax 指令,保留 operator drop-in 及其它单元属性.
+3. 逐个以 exact unit name 检查已经完成的旧 run. 旧 SetResources 经 D-Bus 写 runtime-only
+   属性,通常对应下列两份文件. 删除前确认来源,并确认 Build/unit 不再有执行或清理归属.
+   缺失或不同名称的文件需要检查,不得改为通配符或 systemctl revert,不得对模板, 所有
+   instance 或祖先 slice 批量执行.
 
 ```bash
 unit='sandbox-builder@<completed-run-id>.service'
@@ -299,16 +299,16 @@ systemctl daemon-reload
 ```
 
 4. 使用 `systemctl show --value -p ControlGroup <exact-unit>` 定位更新后的 slice 与新执行,
-   实际检查 cgroup 文件。在没有运维附加策略的隔离环境中,父 service/slice 的 cpu.max 首字段
-   为 max、memory.max=max,ctl 不进入 VMM 限额。VMM memory.max、memory.high、CPU capacity
-   ceiling/weight 继续由 sandbox-ctl 管理。已完成 service 可能已无 cgroup,不能据此证明后续
-   instance 的值;残留设置只能按已确认来源处理,不覆盖运维策略或任意祖先 slice。
+   实际检查 cgroup 文件. 在没有运维附加策略的隔离环境中,父 service/slice 的 cpu.max 首字段
+   为 max, memory.max=max,ctl 不进入 VMM 限额. VMM memory.max, memory.high, CPU capacity
+   ceiling/weight 继续由 sandbox-ctl 管理. 已完成 service 可能已无 cgroup,不能据此证明后续
+   instance 的值;残留设置只能按已确认来源处理,不覆盖运维策略或任意祖先 slice.
 
-Store.Open 独立处理受支持 schema:存在才删除 builds.enforcement_status 单列,保留业务行、
-凭据、已接受结果、claim 和全部真实归属,迁移错误使启动失败。重复 Open 安全,pre-#300
-拒绝边界不变。新 schema/API/BuildView 不含 systemd enforcement 字段,独立的
-storageEnforcement: admission-only 语义保留。旧 writer 仍引用已删除列,不支持混用或直接
-回退旧二进制;writer 版本协同和回退必须结合升级前的一致备份。
+Store.Open 独立处理受支持 schema:存在才删除 builds.enforcement_status 单列,保留业务行,
+凭据, 已接受结果, claim 和全部真实归属,迁移错误使启动失败. 重复 Open 安全,pre-#300
+拒绝边界不变. 新 schema/API/BuildView 不含 systemd enforcement 字段,独立的
+storageEnforcement: admission-only 语义保留. 旧 writer 仍引用已删除列,不支持混用或直接
+回退旧二进制;writer 版本协同和回退必须结合升级前的一致备份.
 
 
 ## 5. 按目标执行与发布
@@ -585,8 +585,8 @@ registry TLS 是**单次 Build 的信任策略**,经 register-time 的 `X-Kuasar
 `builder.admission.registration`,插入 immutable definition 并占用;Trigger 只做
 `registered→waiting`。scheduler 按 `waiting_sequence`(成功 Trigger 事务的持久提交顺序) 稳定 FIFO,在单条持久
 事务中按 `builder.admission.execution` 建 claim;不足保持 waiting,到 `queue_ttl` 后持久终态。
-claim 后先持久绑定 exact run-id,最后发布 assignment。execution CPU/memory 保留为聚合
-准入上限;storage V1 为 admission-only。`node-ctl builder status` 和 metrics 暴露配置、持久用量、headroom、队列与
+claim 后先持久绑定 exact run-id,最后发布 assignment. execution CPU/memory 保留为聚合
+准入上限;storage V1 为 admission-only. `node-ctl builder status` 和 metrics 暴露配置, 持久用量, headroom, 队列与
 拒绝/过期计数。旧 `max_concurrent/cpu_quota/memory_max/vcpu/memory` 配置直接拒绝。
 
 每个实际运行的 A/B/C phase 使用独立 SID，通过普通 `sandbox-ctl run` 的 controller
