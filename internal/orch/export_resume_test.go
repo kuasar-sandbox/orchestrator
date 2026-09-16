@@ -384,6 +384,7 @@ func TestExportDeleteTeardownFailurePreservesSourceForRetry(t *testing.T) {
 	_, apiKey := defaultTestCredentials(t, manifestKey)
 	sb := migrationSandbox(t, dir, "teardown-retry-source", manifestKey, "manifest://"+strings.Repeat("4", 64))
 	sb.RunID = "sr-00000000-0000-7000-8000-000000000008"
+	o.runs.restore(sb.RunID, instanceUnit(o.cfg.Units.Runner, sb.RunID))
 	sb.VswitchPort = "teardown-retry-port"
 	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
 		t.Fatal(err)

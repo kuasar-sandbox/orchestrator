@@ -13,6 +13,7 @@ import (
 )
 
 type runPool struct {
+	runs        *runIndex
 	kind        string
 	size        int
 	waitTimeout time.Duration
@@ -139,6 +140,7 @@ func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, boo
 
 func (p *runPool) loop(ctx context.Context) {
 	defer close(p.done)
+	defer p.runs.forgetWaiting(p)
 	type startingRun struct {
 		started time.Time
 	}
@@ -150,6 +152,9 @@ func (p *runPool) loop(ctx context.Context) {
 	defer tick.Stop()
 	queueControl := func(req runControlReq) {
 		if req.op == "stop" {
+			// Retired, unassigned runs cannot receive another task. Unit control
+			// retains its exact name independently of this routing index.
+			p.runs.forget(req.runID)
 			stopControls = append(stopControls, req)
 			return
 		}
@@ -177,6 +182,7 @@ func (p *runPool) loop(ctx context.Context) {
 				p.log.Error("run pool: new run id", "kind", p.kind, "err", err)
 				return created
 			}
+			p.runs.register(runID, p) // before a start can reach the control loop
 			starting[runID] = startingRun{}
 			created = append(created, runID)
 			queueControl(runControlReq{op: "start", runID: runID})
@@ -301,6 +307,7 @@ func (p *runPool) loop(ctx context.Context) {
 				}
 				continue
 			}
+			p.runs.assigned(w.runID)
 			replyWait(w.req, runWaitResp{taskID: req.taskID, ok: true})
 			replyConsume(req, runConsumeResp{runID: w.runID})
 		}

@@ -883,7 +883,7 @@ func TestSandboxDeleteWorkerConsumesSameIDSuccessorBeforeRetiring(t *testing.T) 
 	successor.VswitchPort = "port-288"
 	successor.FloatingIP = "192.0.2.88"
 	fixture.lc.mu.Lock()
-	fixture.lc.unit = fixture.o.runnerUnit(successor.RunID)
+	fixture.lc.unit = instanceUnit(fixture.o.cfg.Units.RunnerPoolConfigs()[0].Unit, successor.RunID)
 	fixture.lc.state = "active"
 	fixture.lc.mu.Unlock()
 	fixture.vs.mu.Lock()

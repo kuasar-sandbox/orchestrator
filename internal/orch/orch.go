@@ -113,8 +113,9 @@ type Orchestrator struct {
 	networkAllocationMu  sync.Mutex
 	detachedPortsPending map[string]struct{}
 
-	runnerPool     *runPool
-	builderRunPool *runPool
+	runnerPool     *runPools
+	builderRunPool *runPools
+	runs           runIndex
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 	// commitBuildTrigger is the registered -> waiting linearization point. Keeping
@@ -220,8 +221,8 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		nativeStatsSlots:     make(chan struct{}, conductorextension.MaxStatsConcurrency),
 	}
 	wait := cfg.Units.PoolWaitDuration()
-	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
-	o.builderRunPool = newRunPool(runKindBuild, cfg.Units.BuilderPoolSize, wait, cfg.Paths.RunRoot, lc, o.builderUnit, log.With("pool", "builder"))
+	o.runnerPool = newRunPools(runKindSandbox, cfg.Units.RunnerPoolConfigs(), wait, cfg.Paths.RunRoot, lc, &o.runs, log.With("kind", "runner"))
+	o.builderRunPool = newRunPools(runKindBuild, cfg.Units.BuilderPoolConfigs(), wait, cfg.Paths.RunRoot, lc, &o.runs, log.With("kind", "builder"))
 	return o
 }
 
@@ -379,6 +380,7 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
 			}
 			if err == nil {
+				o.runs.forget(sb.RunID)
 				o.releaseDetachedPortFence(sb.VswitchPort)
 				o.uncache(sid)
 				o.publishDelete(sid)
@@ -728,6 +730,7 @@ const (
 // turning an already released resource into a permanent retry error when a
 // different cleanup operation failed in the same pass.
 type launchCleanupProgress struct {
+	runID          string
 	unit           string
 	runnerStopped  bool
 	runnerReset    bool
@@ -746,6 +749,7 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 		runID = sb.RunID
 	}
 	if p.unit == "" && runID != "" {
+		p.runID = runID
 		p.unit = o.runnerUnit(runID)
 	}
 	if p.port == "" && sb.VswitchPort != "" {
@@ -760,6 +764,14 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 }
 
 func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, includeLocal bool) error {
+	if p.unit == "" && p.runID != "" && !p.runnerFenced {
+		unit, err := o.resolveRunUnit(ctx, runKindSandbox, p.runID)
+		if err != nil {
+			return err
+		}
+		p.unit = unit
+		p.runnerFenced = unit == ""
+	}
 	if p.unit != "" && !p.runnerFenced {
 		if !p.runnerStopped {
 			if err := o.lc.Stop(ctx, p.unit); err != nil {
@@ -954,6 +966,9 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 				if current == nil || current.VswitchPort != sb.VswitchPort {
 					o.releaseDetachedPortFence(sb.VswitchPort)
 				}
+				if current == nil || current.RunID != expectedRunID {
+					o.runs.forget(expectedRunID)
+				}
 				unlock()
 				cancel()
 				return errors.Join(firstCleanupErr, firstStoreErr)
@@ -990,6 +1005,7 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 			retryDelay = launchCleanupRetryMin
 			continue
 		}
+		o.runs.forget(expectedRunID)
 		o.releaseDetachedPortFence(sb.VswitchPort)
 		if attempt.Kind() == launchCreate {
 			dead, getErr := o.st.Get(ctx, sb.ID)
@@ -1400,6 +1416,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		if !changed {
 			return fmt.Errorf("orch: paused runner ownership changed for %s", sb.ID)
 		}
+		o.runs.forget(runID)
 		sb.RunID = ""
 	}
 	if port := sb.VswitchPort; port != "" {
@@ -2387,12 +2404,15 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 // network ownership but remain starting with their durable launch_mode; run-pool
 // startup retries that same accepted cold or memory decision.
 func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
-	units, err := o.lc.List(ctx, o.runnerPattern())
+	units, err := o.listRunUnits(ctx, runKindSandbox)
 	if err != nil {
 		return err
 	}
 	alive := map[string]bool{}
 	for _, u := range units {
+		if id := o.unitToRunID(u.Name); id != "" {
+			o.runs.restore(id, u.Name)
+		}
 		if u.ActiveState == "active" || u.ActiveState == "activating" {
 			alive[o.unitToRunID(u.Name)] = true
 		}
@@ -2484,6 +2504,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			if !changed {
 				return fmt.Errorf("reconcile: interrupted resume ownership changed for %s", sb.ID)
 			}
+			o.runs.forget(sb.RunID)
 			o.releaseDetachedPortFence(sb.VswitchPort)
 			recovered, getErr := o.st.Get(ctx, sb.ID)
 			if getErr != nil {
@@ -2504,6 +2525,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		if !changed {
 			return fmt.Errorf("reconcile: interrupted launch ownership changed for %s", sb.ID)
 		}
+		o.runs.forget(sb.RunID)
 		o.releaseDetachedPortFence(sb.VswitchPort)
 		if changed {
 			updated, getErr := o.st.Get(ctx, sb.ID)
@@ -2527,6 +2549,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		if !changed {
 			return fmt.Errorf("reconcile: running sandbox %s changed before dead commit", sb.ID)
 		}
+		o.runs.forget(sb.RunID)
 		o.releaseDetachedPortFence(sb.VswitchPort)
 		updated, err := o.st.Get(ctx, sb.ID)
 		if err != nil {
@@ -2550,6 +2573,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		o.log.Info("reconcile: orphan runner", "run_id", runID, "unit", u.Name)
 		_ = o.lc.Stop(ctx, u.Name)
 		_ = o.lc.ResetFailed(ctx, u.Name)
+		o.runs.forget(runID)
 	}
 	return nil
 }
@@ -2744,6 +2768,7 @@ func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types
 		progress.baseDir = sb.BaseDir
 	}
 	if sb.RunID != "" {
+		progress.runID = sb.RunID
 		progress.unit = o.runnerUnit(sb.RunID)
 	}
 	if err := progress.step(ctx, o, true); err != nil {

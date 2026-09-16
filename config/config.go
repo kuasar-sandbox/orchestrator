@@ -18,6 +18,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -80,6 +81,8 @@ func (c *Conductor) Clone() *Conductor {
 	}
 	out := *c
 	out.Units.Install = clonePtr(c.Units.Install)
+	out.Units.RunnerPools = slices.Clone(c.Units.RunnerPools)
+	out.Units.BuilderPools = slices.Clone(c.Units.BuilderPools)
 	out.Cluster.Labels = cloneMap(c.Cluster.Labels)
 	out.Sandbox.Network.DNS = cloneSlice(c.Sandbox.Network.DNS)
 	out.Sandbox.Resources.Allocatable.CPU = clonePtr(c.Sandbox.Resources.Allocatable.CPU)
@@ -359,13 +362,18 @@ type PathsConfig struct {
 
 // UnitsConfig manages the systemd template units (generated + installed at startup).
 type UnitsConfig struct {
-	Dir             string `yaml:"dir" json:"dir"`                             // default /etc/systemd/system
-	Runner          string `yaml:"runner" json:"runner"`                       // default sandbox-runner@.service
-	Builder         string `yaml:"builder" json:"builder"`                     // default sandbox-builder@.service
-	RunnerPoolSize  int    `yaml:"runner_pool_size" json:"runner_pool_size"`   // idle prestarted runner units; 0 = disabled
-	BuilderPoolSize int    `yaml:"builder_pool_size" json:"builder_pool_size"` // idle prestarted builder units; 0 = disabled
-	PoolWaitTimeout string `yaml:"pool_wait_timeout" json:"pool_wait_timeout"` // StartUnit -> WaitAssignment deadline; default 5s
-	Install         *bool  `yaml:"install" json:"install"`                     // default true; false = manage out of band
+	RunnerPools     []RunPoolConfig `yaml:"runner_pools,omitempty" json:"runner_pools,omitempty"`
+	BuilderPools    []RunPoolConfig `yaml:"builder_pools,omitempty" json:"builder_pools,omitempty"`
+	Dir             string          `yaml:"dir" json:"dir"`                             // default /etc/systemd/system
+	Runner          string          `yaml:"runner" json:"runner"`                       // default sandbox-runner@.service
+	Builder         string          `yaml:"builder" json:"builder"`                     // default sandbox-builder@.service
+	RunnerPoolSize  int             `yaml:"runner_pool_size" json:"runner_pool_size"`   // idle prestarted runner units; 0 = disabled
+	BuilderPoolSize int             `yaml:"builder_pool_size" json:"builder_pool_size"` // idle prestarted builder units; 0 = disabled
+	PoolWaitTimeout string          `yaml:"pool_wait_timeout" json:"pool_wait_timeout"` // StartUnit -> WaitAssignment deadline; default 5s
+	Install         *bool           `yaml:"install" json:"install"`                     // default true; false = manage out of band
+
+	runnerExplicit, builderExplicit   bool
+	runnerDefaulted, builderDefaulted bool
 }
 
 func (u UnitsConfig) PoolWaitDuration() time.Duration {
@@ -967,8 +975,7 @@ func (c *Conductor) applyDefaults() {
 		c.Paths.DBPath = filepath.Join(c.Paths.BaseRoot, "node-ctl.db")
 	}
 	def(&c.Units.Dir, "/etc/systemd/system")
-	def(&c.Units.Runner, "sandbox-runner@.service")
-	def(&c.Units.Builder, "sandbox-builder@.service")
+	c.Units.applyDefaults()
 	def(&c.Units.PoolWaitTimeout, "5s")
 	if c.Units.Install == nil {
 		t := true
@@ -1157,11 +1164,8 @@ func (c *Conductor) validateDeclarative() error {
 			return fmt.Errorf("config: builder.referer.validity must be positive")
 		}
 	}
-	if c.Units.RunnerPoolSize < 0 {
-		return fmt.Errorf("config: units.runner_pool_size must be >= 0")
-	}
-	if c.Units.BuilderPoolSize < 0 {
-		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
+	if err := c.Units.validate(); err != nil {
+		return err
 	}
 	poolWait, err := time.ParseDuration(c.Units.PoolWaitTimeout)
 	if err != nil {

@@ -64,7 +64,7 @@ These Conductor configuration fields govern the Build service. Shared process, p
 
 | Field | Default | Meaning |
 |---|---|---|
-| `units.builder_pool_size` | `0` | Prestarted idle Builder count; finite execution admission resources also permit a nonzero pool. Idle units hold no Build claim. Shared units.dir/install/pool_wait_timeout remain in Node §3; complete unit and claim/bind ordering are in §4.1 |
+| `units.builder_pools` | Absent | Each `{unit, size}` entry is an independent pool, including duplicates. size is the idle target; zero starts on demand. Absent uses legacy `builder` / `builder_pool_size` (defaults `sandbox-builder@.service` / `0`). See Node §3 for input conflicts and shared dir/install/pool_wait_timeout |
 | `builder.admission.execution.max_builds` | `2` | Maximum simultaneous durable execution claims |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | Unlimited | Aggregate execution admission vector; no service/slice CPU or memory policy. V1 storage is admission accounting only |
 | `builder.admission.registration` | Entire resolved execution block | Registration limits for registered/waiting/building Builds without cancel/delete intent. An explicit block does not inherit missing fields; each finite dimension must be at least execution's |
@@ -163,6 +163,22 @@ Delegate=yes
 ```
 
 Builder locks `<BuildRunDir>/builder.pid`, obtains exact-run bootstrap and, for artifacts, prepares the root before final BuildSpec; images receive final spec directly. It remains resident for the target-aware pipeline of up to three phases. Phase sandbox-ctl/CH processes are its descendants, charged to the entire builder unit. Results return through config-socket. KillMode=control-group makes StopUnit/timeouts cover phase VMs as well; normal systemd termination starts with SIGTERM and uses SIGKILL after the stop timeout if processes remain.
+
+Builder pools round-robin independently at the actual Assign boundary after global
+execution admission. The cursor lock does not cover waiting. Registration and
+rejected admission do not advance it; size does not affect the ratio and failure
+does not fall back to another pool. All phases of one Build use the same Builder,
+never ordinary runner pools. Global registration/execution ledgers, FIFO claims
+and cleanup/release order stay unchanged. Only installation/enumeration deduplicate
+shared templates; pools remain independent.
+
+RunID ownership is registered before StartUnit; actual unit ownership survives
+assignment until lifecycle cleanup. Restart restores actual units from configured
+templates, retaining the durable-binding-first WaitAssignment retry path. Cancel,
+terminal deletion, failure, accepted-result and pending-cleanup paths use the actual
+unit; enumeration failure cannot clear ownership. Keep templates with execution or
+pending cleanup in configuration. Old unassigned workers are cleaned as orphans;
+new pools independently replenish their idle targets.
 
 Builder services and sandbox-builder.slice provide process ownership, delegation and group reclamation. Orchestrator adds no CPU/memory limits or other parent resource policy. A nonzero builder_pool_size is independent of finite execution admission limits; idle units have no Build claim. Both idle and on-demand workers receive assignment only after a durable execution claim and successful exact run-ID binding. A failed binding publishes no assignment; the unassigned worker and Build retain the existing pool and ownership cleanup rules.
 

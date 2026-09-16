@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 )
 
@@ -30,10 +32,22 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 		return nil
 	}
 	files := map[string]string{
-		o.cfg.Units.Runner:      o.runnerUnitFile(),
-		o.cfg.Units.Builder:     o.builderUnitFile(),
 		"sandbox-runner.slice":  sliceFile("kuasar sandbox runners"),
 		"sandbox-builder.slice": sliceFile("kuasar image builders"),
+	}
+	for _, kind := range []struct {
+		pools   []config.RunPoolConfig
+		content string
+	}{
+		{o.cfg.Units.RunnerPoolConfigs(), o.runnerUnitFile()},
+		{o.cfg.Units.BuilderPoolConfigs(), o.builderUnitFile()},
+	} {
+		for _, pool := range kind.pools {
+			if old, exists := files[pool.Unit]; exists && old != kind.content {
+				return fmt.Errorf("orch: conflicting generated content for unit %s", pool.Unit)
+			}
+			files[pool.Unit] = kind.content
+		}
 	}
 	changed := false
 	for name, content := range files {
@@ -124,29 +138,85 @@ func instanceUnit(tmpl, id string) string {
 	return strings.TrimSuffix(tmpl, ".service") + id + ".service"
 }
 
-func (o *Orchestrator) runnerUnit(runID string) string {
-	return instanceUnit(o.cfg.Units.Runner, runID)
-}
-func (o *Orchestrator) builderUnit(runID string) string {
-	return instanceUnit(o.cfg.Units.Builder, runID)
+// The index contains actual names, never names guessed from a default template.
+func (o *Orchestrator) runnerUnit(runID string) string  { return o.runs.unit(runID) }
+func (o *Orchestrator) builderUnit(runID string) string { return o.runs.unit(runID) }
+
+func (o *Orchestrator) poolConfigs(kind string) []config.RunPoolConfig {
+	if kind == runKindBuild {
+		return o.cfg.Units.BuilderPoolConfigs()
+	}
+	return o.cfg.Units.RunnerPoolConfigs()
 }
 
-// runnerPattern is the ListUnitsByPatterns glob for live runner instances.
-func (o *Orchestrator) runnerPattern() string {
-	return strings.TrimSuffix(o.cfg.Units.Runner, ".service") + "*.service"
-}
-
-func (o *Orchestrator) builderPattern() string {
-	return strings.TrimSuffix(o.cfg.Units.Builder, ".service") + "*.service"
-}
-
-// unitToRunID extracts the run-id from a template instance unit name.
 func (o *Orchestrator) unitToRunID(name string) string {
-	return unitToRunIDFromTemplate(o.cfg.Units.Runner, name)
+	return o.runIDFromUnit(runKindSandbox, name)
+}
+func (o *Orchestrator) builderUnitToRunID(name string) string {
+	return o.runIDFromUnit(runKindBuild, name)
+}
+func (o *Orchestrator) runIDFromUnit(kind, name string) string {
+	for _, pool := range o.poolConfigs(kind) {
+		if id := unitToRunIDFromTemplate(pool.Unit, name); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
-func (o *Orchestrator) builderUnitToRunID(name string) string {
-	return unitToRunIDFromTemplate(o.cfg.Units.Builder, name)
+// listRunUnits deduplicates templates and instances, not pools. Publish recovered
+// associations only during recovery or exact-run lookup. No historical pool slot
+// can be inferred from a shared template.
+func (o *Orchestrator) listRunUnits(ctx context.Context, kind string) ([]launcher.Unit, error) {
+	templates := make(map[string]bool)
+	instances := make(map[string]bool)
+	owners := make(map[string]string)
+	var out []launcher.Unit
+	for _, pool := range o.poolConfigs(kind) {
+		if templates[pool.Unit] {
+			continue
+		}
+		templates[pool.Unit] = true
+		units, err := o.lc.List(ctx, strings.TrimSuffix(pool.Unit, ".service")+"*.service")
+		if err != nil {
+			return nil, err
+		}
+		for _, unit := range units {
+			id := unitToRunIDFromTemplate(pool.Unit, unit.Name)
+			if id == "" || instances[unit.Name] {
+				continue
+			}
+			if previous, exists := owners[id]; exists && previous != unit.Name {
+				return nil, fmt.Errorf("orch: run %s has conflicting units %s and %s", id, previous, unit.Name)
+			}
+			instances[unit.Name], owners[id] = true, unit.Name
+			out = append(out, unit)
+		}
+	}
+	return out, nil
+}
+
+// Missing process-local state must be resolved by authoritative enumeration,
+// including cleanup paths invoked before the main startup scan. Only a successful
+// complete scan can prove that systemd has already collected an instance.
+func (o *Orchestrator) resolveRunUnit(ctx context.Context, kind, runID string) (string, error) {
+	if runID == "" {
+		return "", nil
+	}
+	if unit := o.runs.unit(runID); unit != "" {
+		return unit, nil
+	}
+	units, err := o.listRunUnits(ctx, kind)
+	if err != nil {
+		return "", fmt.Errorf("orch: locate %s run %s: %w", kind, runID, err)
+	}
+	for _, unit := range units {
+		if o.runIDFromUnit(kind, unit.Name) == runID {
+			o.runs.restore(runID, unit.Name)
+			return unit.Name, nil
+		}
+	}
+	return "", nil
 }
 
 func unitToRunIDFromTemplate(template, name string) string {

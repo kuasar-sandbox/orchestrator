@@ -1255,7 +1255,14 @@ $MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
-units: { dir: $UNIT_DIR, runner: '${RUNNER_PREFIX}.service', builder: '${BUILDER_PREFIX}.service' }
+units:
+  dir: $UNIT_DIR
+  # Identical entries remain independent round-robin positions across cold,
+  # artifact, pause/resume, deletion and conductor-restart cases below.
+  runner_pools:
+    - {unit: '${RUNNER_PREFIX}.service', size: 0}
+    - {unit: '${RUNNER_PREFIX}.service', size: 0}
+  builder: '${BUILDER_PREFIX}.service'
 sandbox:
   timeout_sec: 120
   usage:

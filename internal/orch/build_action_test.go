@@ -26,7 +26,7 @@ func TestBuildCancelBeforeRunBindingRetainsExactUnitFence(t *testing.T) {
 	o := testOrchCfg(t, cfg)
 	lc := newRunPoolTestLauncher()
 	o.lc, o.vs = lc, stubVS{}
-	o.builderRunPool = newRunPool(runKindBuild, 0, time.Second, cfg.Paths.RunRoot, lc, o.builderUnit, o.log)
+	o.builderRunPool = newRunPools(runKindBuild, cfg.Units.BuilderPoolConfigs(), time.Second, cfg.Paths.RunRoot, lc, &o.runs, o.log)
 	ctx, stop := context.WithCancel(context.Background())
 	var poolDone chan struct{}
 	unlockBinding := func() {}
@@ -295,7 +295,7 @@ func TestBuildCancelDuringAttachStopsUnitBeforeOwnerRollback(t *testing.T) {
 			o := testOrchCfg(t, cfg)
 			lc := newRunPoolTestLauncher()
 			o.lc = lc
-			o.builderRunPool = newRunPool(runKindBuild, 0, time.Second, cfg.Paths.RunRoot, lc, o.builderUnit, o.log)
+			o.builderRunPool = newRunPools(runKindBuild, cfg.Units.BuilderPoolConfigs(), time.Second, cfg.Paths.RunRoot, lc, &o.runs, o.log)
 			ctx, stop := context.WithCancel(context.Background())
 			vs := &blockedKillAttachVS{entered: make(chan struct{}), gate: make(chan struct{}), detached: make(chan string, 4)}
 			o.vs = vs

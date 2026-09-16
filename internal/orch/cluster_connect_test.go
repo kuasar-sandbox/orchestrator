@@ -790,7 +790,7 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	o.cfg.Units.Runner = "sandbox-runner@.service"
 	lc := &countingLauncher{orch: o}
 	o.lc = lc
-	o.runnerPool = newRunPool(runKindSandbox, 0, o.cfg.Units.PoolWaitDuration(), o.cfg.Paths.RunRoot, lc, o.runnerUnit, o.log)
+	o.runnerPool = newRunPools(runKindSandbox, o.cfg.Units.RunnerPoolConfigs(), o.cfg.Units.PoolWaitDuration(), o.cfg.Paths.RunRoot, lc, &o.runs, o.log)
 	poolCtx, stopPool := context.WithCancel(context.Background())
 	t.Cleanup(stopPool)
 	if err := o.runnerPool.Start(poolCtx); err != nil {

@@ -352,6 +352,7 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 	if !deleted {
 		return fmt.Errorf("orch: sandbox %s deleting ownership changed before hard delete", sid)
 	}
+	o.runs.forget(sb.RunID)
 	o.clearDeadlineIntent(sid)
 	o.uncache(sid)
 	o.observeSandboxDelete(sb)
@@ -431,7 +432,13 @@ func sandboxHasLocalOwnership(sb *types.Sandbox) bool {
 // directory is removed. An already missing/inactive unit is an equivalent Stop
 // result, but ResetFailed and the final liveness readback remain mandatory.
 func (o *Orchestrator) fenceSandboxRunner(ctx context.Context, runID string) error {
-	unit := o.runnerUnit(runID)
+	unit, err := o.resolveRunUnit(ctx, runKindSandbox, runID)
+	if err != nil {
+		return err
+	}
+	if unit == "" {
+		return nil // successful enumeration proved absence
+	}
 	if err := o.lc.Stop(ctx, unit); err != nil {
 		active, listErr := o.sandboxUnitActive(ctx, unit)
 		if listErr != nil {

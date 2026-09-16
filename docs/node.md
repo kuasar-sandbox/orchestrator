@@ -308,6 +308,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `paths.admin_pidfile` | Empty | Multiline PID allowlist for admin, allowing `#` comments; otherwise socket mode 0600 alone |
 | `paths.plugin_pidfile` | Empty | Multiline PID allowlist for Proxy/agent plugin registration; otherwise socket mode 0600 alone |
 | `units.dir` | `/etc/systemd/system` | Template-unit installation directory |
+| `units.runner_pools` / `units.builder_pools` | Absent | Independent ordered pools of `{unit, size}`; see below |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | Template-unit names |
 | `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | Idle prestarted RunID unit counts; zero still starts on-demand units through WaitAssignment. Finite execution admission resources permit a nonzero Builder pool; idle units hold no Build claim |
 | `units.pool_wait_timeout` | `5s` | Positive budget from StartUnit through entry into WaitAssignment; timeout cleans that RunID and replenishes the pool |
@@ -347,6 +348,33 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `cluster.api_endpoint` | Required in cluster mode | Explicit advertised conductor host:port; never inferred from api.listen |
 | `cluster.data_endpoint` | Required in cluster mode | Explicit advertised Proxy host:port; never inferred from its bind listener |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource §3.2. Omitted/disabled means static cgroups |
+
+Each `units.runner_pools` / `units.builder_pools` entry contains only `unit` and
+`size`. Each entry creates an independent pool, including repeated templates and
+completely identical entries. `size >= 0` is the target number of idle prestarted
+workers, not execution capacity or round-robin weight; zero participates and
+starts on demand. `dir`, `install` and `pool_wait_timeout` are shared.
+
+```yaml
+units:
+  dir: /etc/systemd/system
+  install: true
+  pool_wait_timeout: 5s
+  runner_pools:
+    - {unit: sandbox-runner@.service, size: 8}
+    - {unit: sandbox-runner@.service, size: 4}
+    - {unit: sandbox-runner-special@.service, size: 0}
+  builder_pools:
+    - {unit: sandbox-builder@.service, size: 2}
+    - {unit: sandbox-builder@.service, size: 0}
+```
+
+When a list is absent, that kind uses its legacy `runner` / `runner_pool_size` or
+`builder` / `builder_pool_size` as one pool, retaining the template and size-zero
+defaults. Runner and Builder can independently use old or new input. Explicit
+empty lists, invalid entries and explicit old/new fields for the same kind
+(including an explicit old size of zero) are rejected; inserted defaults are not
+mixed input. Compatibility covers reading old configurations in the new binary.
 
 ### 3.1 Statically customized conductor
 
@@ -841,7 +869,7 @@ The complete request-scoped `kuasar-sandbox.builder` input and target rules are 
 
 ## 5. Process management through systemd template units
 
-At startup, conductor generates two templates and sandbox-runner.slice/sandbox-builder.slice under units.dir; it calls D-Bus Reload only when content changes. With units.install=false, operations manages them; conductor neither writes files nor reads or validates operator resource properties. Generated ExecStart uses the exact original node-ctl path retained by runtime resolution/bootstrap, including custom conductor mode (§3).
+At startup, conductor generates each configured template and the fixed sandbox-runner.slice/sandbox-builder.slice under units.dir; identical generated content for the same template is written once, while conflicting content under one name is rejected before writing; it calls D-Bus Reload only when content changes. With units.install=false, operations manages them; conductor neither writes files nor reads or validates operator resource properties. Generated ExecStart uses the exact original node-ctl path retained by runtime resolution/bootstrap, including custom conductor mode (§3).
 
 **Runner unit** (`%i` is RunID):
 
@@ -867,6 +895,23 @@ The complete Builder unit lifecycle and resource ownership rules are in [Build �
 
 Both ExecStart programs lock the RunID pidfile, then wait for business-ID assignment over config-socket. Runner connects readiness immediately after obtaining SID, locks `<RunDir>/<SandboxID>.pid` and requests exact-run bootstrap. Artifact tasks prepare E/S locally and complete the second stage before obtaining final LaunchSpec, then execve sandbox-ctl run with the same unit PID/cgroup. Type=exec requires no sd_notify. Builder process/child-VM and result behavior is defined in [Build §4](node-build.md#4-task-handoff).
 
+Runner and Builder each select the next list position at the existing Assign
+boundary and advance an independent cursor. Only selection holds the cursor
+lock; waiting for Assign does not. Registration, rejected Build admission and
+already bound RunIDs do not select again. Resume selects when it needs a new
+runner. There is no idle preference, failed-pool skipping, cross-pool fallback,
+weighting or resource scheduling. One Build stays with one Builder for all phases;
+its global registration/execution ledgers, FIFO claims and release order remain
+unchanged. NUMA and CPU affinity belong to externally managed units; conductor
+does not interpret them or create pool-specific slices or resource limits.
+
+Before StartUnit can run, conductor records RunID → creating pool for exact
+WaitAssignment routing, even when pools share a template. A separate RunID →
+actual unit association survives assignment until lifecycle cleanup. Durable
+binding still precedes publishing assignment. Builder retries first consult the
+durable Build binding. Neither RunID format nor the pidfile/config-socket,
+Delegate, ctl/vmm and trusted-FD contracts change.
+
 Conductor maintains target idle counts for each pool. Assignment consumes a unit already waiting in WaitAssignment and schedules asynchronous replenishment. With no idle unit, it creates a RunID and uses the same StartUnit/WaitAssignment path. A fixed control loop serializes Start/Stop requests received over a channel; there is no newly spawned start goroutine for every replenishment. pool_wait_timeout covers the full StartUnit-to-WaitAssignment interval. Start failure, wait timeout or canceled waiting connection triggers StopUnit plus ResetFailedUnit, then a new UUIDv7 RunID to refill the pool.
 
 Runner assignment budget begins at pool Assign and covers queuing, on-demand StartUnit and WaitAssignment. After selecting an idle runner, the pool calls the commit callback to bind RunID; only success publishes task ID and returns success. This is assignment's linearization point: later caller cancellation cannot reverse it. Pool loop alone answers pending cancellation/shutdown, exactly once per request.
@@ -875,7 +920,7 @@ Runner assignment budget begins at pool Assign and covers queuing, on-demand Sta
 
 - **Kill:** under the SID fence, exact-CAS full ownership into deleting, cancel active launch, withdraw cache and publish route Delete. Asynchronous finalization stops the unit and all CH descendants, resets failed state, releases TAPFD or detaches vswitch, removes directories and hard-deletes row. Route withdrawal does not await cleanup. The old launch claim remains until its attempt finishes local cleanup, preventing late CAS resurrection or an early same-SID successor. Guest restart policy cannot block host unit termination.
 - **Readiness:** before assigning a runner, conductor binds `<RunDir>/ready.sock` with directory 0700/socket 0600. Runner immediately connects. Conductor waits for artifact completion, readiness EOF, cancellation and absolute deadline together, so a task exiting during root reads fails immediately. The one-shot stream must be `control_ready\nready\nEOF`. Bare is ready then; e2b next sends mandatory POST /init as the first envd request, without /health as a startup gate. Health is for external checks after initialization. Artifact-launch absolute budget begins at successful Assign and covers root read, completion RPC, host resource/network preparation, final-spec wait, exec/startup, runtime wire and /init; final spec does not reset it. Cold fast path retains its post-handoff runtime budget. /init starts immediately, retries only connection/transport errors at 1ms/2ms/4ms/capped-5ms backoff, with at most 50ms per request. Only 204 succeeds; other statuses expose the status code without potentially sensitive response body. Protocol errors, early EOF, cancellation or total timeout fail launch: fresh starting becomes dead; resume returns paused. After durable acceptance but before runner assignment, failure uses the empty-RunID fence. Only /init success commits starting→running with the exact RunID and publishes running route.
-- **Liveness authority:** one ListUnitsByPatterns call for runner templates obtains the authoritative active RunID set for reconciliation with stored sandboxes.run_id (§14).
+- **Liveness authority:** ListUnitsByPatterns over distinct configured runner templates obtains the authoritative active RunID set for reconciliation with stored sandboxes.run_id (§14).
 - Host Restart=no and guest envd restart=always under sandbox-init are separate layers.
 
 ### 5.1 Cgroup separation and FD capability
@@ -1346,7 +1391,17 @@ Each MMDS owner has at most one secretbox ciphertext row; §7 owns AAD/transacti
 
 ### 14.2 Restart reconciliation
 
-Before opening APIs, config-socket routesync or node-link, conductor reconciles `ListUnitsByPatterns("sandbox-runner@*.service")`:
+Before any cleanup (including early Build cancellation/deletion), conductor can
+locate units by enumerating distinct configured templates with ListUnitsByPatterns.
+Each actual unit is reconciled once. Restart restores RunID → actual unit, not the
+historical pool position under a shared template. A missing index entry is not
+proof of process absence; enumeration errors preserve durable ownership and never
+cause a guess using the default template. Keep every template with execution or
+pending-cleanup ownership in configuration; removed-template discovery, migration,
+hot deletion and drain are outside this contract.
+
+Before opening APIs, config-socket routesync or node-link, conductor reconciles the
+configured runner unit set:
 
 - **Deleting:** already accepted explicit deletion with unfinished cleanup. Cancel the SID's launch owner and fence its exact unit. Under allocation fence, detach a nonempty exact network tuple and exact-clear all four fields; an empty tuple skips Detach. Remove canonical RunDir, BaseDir, then exact hard-delete. Any failure blocks startup and retains unfinished ownership. Directory retries never reacquire a durably cleared network owner. Deleting is excluded from full routes, Wake/Resume/Exec and all activation.
 - **Starting:** never adopt directly as running. Fresh Create first stops/resets exact runner, detaches and removes both directories, then exact-run CASes to dead. A valid ResumeSource identifies accepted Resume: release old ownership while retaining starting, source and durable launch_mode; remove only RunDir, retain BaseDir/checkpoint, clear runtime owner and enqueue recovery using the original cold/memory choice. Any stop/reset/detach/directory failure blocks startup without clearing unfinished fields or exposing APIs.
