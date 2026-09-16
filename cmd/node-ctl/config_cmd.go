@@ -178,10 +178,14 @@ paths:
   # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids # PID allowlist for the plugin plane (proxy/agent registration)
 # units:                                          # systemd template units (defaults shown)
 #   dir: /etc/systemd/system
-#   runner: sandbox-runner@.service
-#   builder: sandbox-builder@.service
-#   runner_pool_size: 0
-#   builder_pool_size: 0 # idle workers; independent of execution admission resources
+#   runner_pools:
+#     - {unit: sandbox-runner@.service, size: 0}
+#   builder_pools:
+#     - {unit: sandbox-builder@.service, size: 0}
+#   # Each entry is an independent round-robin slot; duplicate units/items are legal.
+#   # size is the idle target, not concurrency or weight; zero starts on demand.
+#   # Omit a list to use legacy runner/runner_pool_size or builder/builder_pool_size.
+#   # Empty lists and explicit old/new fields for the same kind are rejected.
 #   pool_wait_timeout: 5s
 #   install: true
 sandbox:                                          # sandbox-instance defaults

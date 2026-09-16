@@ -461,6 +461,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
+| `units.runner_pools` / `units.builder_pools` | 缺省 | 有序独立 `{unit, size}` pool 列表，见下文 |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
 | `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | 空闲预启动 run-id 单元数;0 = 不保留 idle,有任务时仍按需经 WaitAssignment 流程启动. 有限 execution CPU/memory 准入资源允许非零 Builder pool,idle 单元不持有 Build claim.  |
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
@@ -500,6 +501,30 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `cluster.api_endpoint` | (接入集群必填) | conductor control API 的显式 `host:port` advertised endpoint;不得从 `api.listen` 推导 |
 | `cluster.data_endpoint` | (接入集群必填) | Proxy sandbox data 的显式 `host:port` advertised endpoint;不得从 `proxy.data_listen` 推导 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
+
+`units.runner_pools` / `units.builder_pools` 每项仅包含 `unit` 和 `size`。
+每个列表项创建独立 pool，同类重复模板及完全相同的配置项也保留独立位置。
+`size >= 0` 是空闲预启动 worker 目标数，不是并发容量或轮询权重；0 仍参与轮询并按需启动。
+`dir`、`install`、`pool_wait_timeout` 由所有 pool 共享。
+
+```yaml
+units:
+  dir: /etc/systemd/system
+  install: true
+  pool_wait_timeout: 5s
+  runner_pools:
+    - {unit: sandbox-runner@.service, size: 8}
+    - {unit: sandbox-runner@.service, size: 4}
+    - {unit: sandbox-runner-special@.service, size: 0}
+  builder_pools:
+    - {unit: sandbox-builder@.service, size: 2}
+    - {unit: sandbox-builder@.service, size: 0}
+```
+
+对应列表缺省时，沿用旧 `runner` / `runner_pool_size` 或 `builder` / `builder_pool_size`
+形成一个 pool，保留原模板及 size=0 默认值。runner 与 builder 可分别使用新旧输入。
+显式空列表、非法项、同类显式新旧混用（包括显式旧 size=0）均拒绝；程序补入的默认值
+不算混用。兼容范围仅为新版读取旧配置。
 
 ### 3.1 静态定制 conductor
 
@@ -1145,10 +1170,22 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
 
-serve 启动时生成并安装两个模板单元 + 两个 slice(`sandbox-runner.slice`、
-`sandbox-builder.slice`)到 `units.dir`,内容变更才 `daemon-reload`(D-Bus `Reload`);
+serve 启动时生成并安装各配置模板及固定的两个 slice(`sandbox-runner.slice`、
+`sandbox-builder.slice`)到 `units.dir`；同名同内容只写一次，同名不同内容在写入前拒绝。
+内容变更才 `daemon-reload`(D-Bus `Reload`);
 `units.install: false` 则交由运维带外管理,程序不生成文件,也不读取或校验运维资源属性. ExecStart 里的 `node-ctl` 路径
 取自 serve 自身所在目录(自动发现,§3)。
+
+runner 与 builder 分别在现有实际 Assign 边界按列表位置取池并推进独立游标。
+锁只保护取池，不持锁等待 Assign。注册、被拒绝的 Build 准入及已绑定 RunID 不重新取池；
+Resume 需要新 runner 时使用同一入口。不增加 idle 优先、坏池跳过、跨池回退、权重或资源调度。
+一个 Build 全部阶段仍由同一 builder 执行；全局 registration/execution ledger、FIFO/claim
+及释放顺序不变。NUMA/绑核由运维 unit 提供，conductor 不理解或验证，不新增池级 slice 或资源限额。
+
+允许 StartUnit 前先登记 RunID → 创建它的 pool，让共享模板的 WaitAssignment 也精确路由。
+另保留 RunID → 实际 unit 到生命周期清理，assignment 完成不删除执行归属。
+仍先持久绑定 RunID 再发布 assignment，builder 重试先查持久 Build 绑定。
+RunID 格式、pidfile/config socket、Delegate、ctl/vmm 及可信 FD 合同不变。
 
 **runner 单元**(`%i` = run-id):
 
@@ -1214,8 +1251,7 @@ pool loop 唯一回复,每个请求恰有一次结果。
   paused;durable acceptance 后即使尚未分配 runner,失败也按空 run-id fence 收敛到该终态。
   只有 `/init` 成功后才以同一 run-id 把
   starting CAS 为 running 并发布 running route.
-- **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
-  run-id 集,再与库内 `sandboxes.run_id` 对账(§14)。
+- **存活权威**:按去重后的各配置 runner 模板调用 `ListUnitsByPatterns`，取得权威存活 run-id 集,再与库内 `sandboxes.run_id` 对账(§14)。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
   互不相干。
 
@@ -2090,8 +2126,12 @@ MMDS value 表每 owner 最多一行 secretbox ciphertext;AAD/事务/CAS/cleanup
 
 ### 14.2 重启对账
 
-conductor 在开放 API、config-socket routesync 和 node-link 前先以
-`ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
+任何实际清理前（包括 Build 前置取消/删除）都能按去重后的配置模板枚举并定位实际 unit，
+每个 unit 只对账一次。重启只恢复 RunID → 实际 unit，不恢复共享模板下历史 pool 序号。
+索引缺失不证明进程不存在；枚举错误保留持久归属，不能拼默认模板猜测。
+仍有执行或待清理归属的模板必须保留配置，不提供已删除模板自动发现、迁移、热删除或 drain。
+
+conductor 在开放 API、config-socket routesync 和 node-link 前按配置 runner unit 集合对账:
 
 - 库内 `deleting` 是已经接纳、尚未完成的显式删除.Reconcile 先取消同 SID 的 launch owner,
   fence exact unit;network tuple 非空时在 allocation fence 内 detach exact port 并 full-owner
