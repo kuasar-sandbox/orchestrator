@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
@@ -14,14 +15,7 @@ func (o *Orchestrator) RunPidFile(kind, runID string) (string, bool) {
 	if !validRunID(kind, runID) {
 		return "", false
 	}
-	switch kind {
-	case runKindSandbox:
-		return o.runnerPool.runPidFile(runID), true
-	case runKindBuild:
-		return o.builderRunPool.runPidFile(runID), true
-	default:
-		return "", false
-	}
+	return nodepath.RunnerPID(o.cfg.Paths.RunRoot, runID), true
 }
 
 func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (string, bool, error) {
@@ -30,7 +24,7 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 	}
 	switch kind {
 	case runKindSandbox:
-		return o.runnerPool.WaitAssignment(ctx, runID)
+		return o.runs.wait(ctx, runID)
 	case runKindBuild:
 		// BindBuildRun commits before runPool publishes its response. A retry after
 		// response loss (including across a controller restart) therefore resolves
@@ -43,7 +37,7 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 			allowed, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
 			return buildID, allowed, err
 		}
-		buildID, found, err = o.builderRunPool.WaitAssignment(ctx, runID)
+		buildID, found, err = o.runs.wait(ctx, runID)
 		if err != nil || !found {
 			return buildID, found, err
 		}

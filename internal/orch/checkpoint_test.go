@@ -390,6 +390,7 @@ func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *tes
 	if err := o.st.Put(lifecycleCtx, sb); err != nil {
 		t.Fatal(err)
 	}
+	o.runs.restore(sb.RunID, instanceUnit(cfg.Units.RunnerPoolConfigs()[0].Unit, sb.RunID))
 	o.cache(sb)
 
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
@@ -572,6 +573,7 @@ func newCheckpointPauseFixture(t *testing.T, cfg *config.Config, metadataRaw str
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
+	o.runs.restore(sb.RunID, instanceUnit(cfg.Units.RunnerPoolConfigs()[0].Unit, sb.RunID))
 	o.cache(sb)
 	return o, sb, apiKey, launcher, vs, argsPath
 }

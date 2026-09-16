@@ -1044,6 +1044,7 @@ func (o *Orchestrator) commitBuildCompletion(ctx context.Context, build *types.B
 			terminal.RuntimeEnvdAccessToken, terminal.RuntimePrepareJSON = "", ""
 			err = o.st.PutBuildTerminal(writeCtx, terminal, build)
 			if err == nil {
+				o.runs.forget(build.RunID)
 				terminal.RunID = ""
 				terminal.ExecutionClaimed, terminal.ExecutionClaimedUnix = false, 0
 				terminal.Phase, terminal.PhaseSandboxID = "", ""
@@ -1204,7 +1205,11 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	joinCancellation := func() {}
 	defer func() { joinCancellation() }()
 	if _, err := o.builderRunPool.Assign(buildCtx, b.BuildID, func(runID string) error {
-		unit = o.builderUnit(runID)
+		var locateErr error
+		unit, locateErr = o.resolveRunUnit(buildCtx, runKindBuild, runID)
+		if locateErr != nil {
+			return locateErr
+		}
 		joinCancellation = o.stopBuildOnCancellation(buildCtx, b.BuildID, unit)
 		_, err := o.prepareBuilderUnit(buildCtx, b, runID)
 		return err
@@ -1753,9 +1758,6 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pending *buildCleanupPendingError) (error, error) {
 	cause := pending.cause
 	unit := pending.unit
-	if unit == "" && b.RunID != "" {
-		unit = o.builderUnit(b.RunID)
-	}
 	port := pending.port
 	persisted := pending.persisted
 	if port == "" && b.RuntimeVswitchPort != "" {
@@ -1765,7 +1767,10 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pe
 	delay := 20 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		var cleanupErr error
-		if unit != "" {
+		if unit == "" && b.RunID != "" {
+			unit, cleanupErr = o.resolveRunUnit(ctx, runKindBuild, b.RunID)
+		}
+		if cleanupErr == nil && unit != "" {
 			cleanupErr = o.stopBuilderUnit(unit)
 		}
 		if cleanupErr == nil {
@@ -1832,6 +1837,19 @@ func (o *Orchestrator) fenceAcceptedBuildResultWithin(unit string, result buildR
 		}
 	}
 	return &result, nil
+}
+
+func (o *Orchestrator) stopBuilderRun(runID string) error {
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	unit, err := o.resolveRunUnit(ctx, runKindBuild, runID)
+	if err != nil {
+		return err
+	}
+	if unit == "" {
+		return nil
+	}
+	return o.stopBuilderUnit(unit)
 }
 
 // stopBuilderUnit is the execution-release fence. A successful systemd stop job

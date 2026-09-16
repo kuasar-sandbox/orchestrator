@@ -24,7 +24,7 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 	// A committed terminal deletion is independent of unit enumeration and
 	// ordinary execution recovery. Never defer it to terminal TTL.
 	deletionErr := o.reapRequestedBuilds(ctx)
-	units, err := o.lc.List(ctx, o.builderPattern())
+	units, err := o.listRunUnits(ctx, runKindBuild)
 	if err != nil {
 		return errors.Join(deletionErr, fmt.Errorf("reconcile builder units: %w", err))
 	}
@@ -35,6 +35,7 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 		if runID == "" {
 			continue
 		}
+		o.runs.restore(runID, unit.Name)
 		all[runID] = unit.Name
 		if builderUnitMayHaveProcesses(unit.ActiveState) {
 			live[runID] = unit.Name
@@ -60,7 +61,7 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 			return err
 		}
 		if build.RunID != "" {
-			if err := o.stopBuilderUnit(o.builderUnit(build.RunID)); err != nil {
+			if err := o.stopBuilderRun(build.RunID); err != nil {
 				return err
 			}
 		}
@@ -96,6 +97,7 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 			return errors.Join(append(cleanupErrs, err)...)
 		}
 		_ = o.lc.ResetFailed(ctx, unit)
+		o.runs.forget(runID)
 	}
 	for _, build := range building {
 		if needsCleanup(build) && build.RunID == "" && !cleaned[build.BuildID] {

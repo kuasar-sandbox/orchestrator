@@ -367,7 +367,7 @@ func TestAcceptedBuildResultSurvivesTransientFenceFailure(t *testing.T) {
 	o.cfg.Paths.RunRoot = t.TempDir()
 	o.cfg.Paths.BaseRoot = t.TempDir()
 	runID := "br-00000000-0000-7000-8000-000000000215"
-	unit := o.builderUnit(runID)
+	unit := instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, runID)
 	stopErr := errors.New("injected transient accepted-result stop failure")
 	lc := &transientAcceptedResultLauncher{unit: unit, active: true, firstErr: stopErr}
 	o.lc = lc
@@ -438,7 +438,7 @@ func TestRecoveredBuildPreparationFailureRetainsDirectoriesUntilUnitFence(t *tes
 		return os.RemoveAll(path)
 	}
 	cause := errors.New("recovered preparation failed")
-	unit := o.builderUnit(build.RunID)
+	unit := instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, build.RunID)
 	err := o.cleanupRecoveredBuildRuntime(build, cause, unit, "", false)
 	var pending *buildCleanupPendingError
 	if !errors.As(err, &pending) || !errors.Is(err, wantFenceErr) || !errors.Is(err, cause) {
@@ -514,7 +514,7 @@ func TestRecoveredBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) 
 	}
 
 	runErr := o.cleanupRecoveredBuildRuntime(
-		build, errors.New("runtime preparation was not committed"), o.builderUnit(build.RunID),
+		build, errors.New("runtime preparation was not committed"), instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, build.RunID),
 		"recovered-local-port-22", false,
 	)
 	var pending *buildCleanupPendingError
@@ -553,6 +553,7 @@ func TestLaunchCleanupRetriesInOwnershipOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	o.runs.restore(sb.RunID, instanceUnit(cfg.Units.Runner, sb.RunID))
 	attempt := &launchAttempt{sid: sb.ID, kind: launchCreate, runID: sb.RunID}
 
 	if err := o.stepLaunchCleanup(context.Background(), attempt, sb, true); !errors.Is(err, stopErr) {
@@ -613,6 +614,7 @@ func TestReconcileCleanupStopsBeforeLaterOwnership(t *testing.T) {
 		}
 	}
 
+	o.runs.restore(sb.RunID, instanceUnit(cfg.Units.Runner, sb.RunID))
 	if err := o.teardownPersistedOwnership(context.Background(), sb, false); !errors.Is(err, stopErr) {
 		t.Fatalf("reconcile cleanup error = %v, want stop failure", err)
 	}

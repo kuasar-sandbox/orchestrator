@@ -39,6 +39,7 @@ type MMDSRoutesConfig = publicconfig.MMDSRoutesConfig
 type MMDSServiceRegistryEntry = publicconfig.MMDSServiceRegistryEntry
 type PathsConfig = publicconfig.PathsConfig
 type UnitsConfig = publicconfig.UnitsConfig
+type RunPoolConfig = publicconfig.RunPoolConfig
 type SandboxConfig = publicconfig.SandboxConfig
 type ResourcesConfig = publicconfig.ResourcesConfig
 type ResourceCapacity = publicconfig.ResourceCapacity

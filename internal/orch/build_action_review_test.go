@@ -35,7 +35,7 @@ func TestCancelledRecoveryPrecedesUnrelatedAdoptionFailure(t *testing.T) {
 	if err := o.st.PutBuild(ctx, other); err != nil {
 		t.Fatal(err)
 	}
-	cancelUnit, otherUnit := o.builderUnit(cancelled.RunID), o.builderUnit(other.RunID)
+	cancelUnit, otherUnit := instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, cancelled.RunID), instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, other.RunID)
 	lc := &reconcileLauncher{units: []launcher.Unit{{Name: cancelUnit, ActiveState: "active"}, {Name: otherUnit, ActiveState: "active"}}}
 	o.lc, o.vs = lc, &reconcileVS{}
 	err := o.ReconcileBuilds(ctx)
@@ -136,11 +136,11 @@ func TestCancelledOwnerCleanupWaitsForDurablePhaseReservation(t *testing.T) {
 	}
 	provider := &cleanupPhaseReleaseBarrier{make(chan string, 1), make(chan struct{})}
 	o.SetSandboxResourceProvider(provider)
-	o.lc = &reconcileLauncher{units: []launcher.Unit{{Name: o.builderUnit(b.RunID), ActiveState: "active"}}}
+	o.lc = &reconcileLauncher{units: []launcher.Unit{{Name: instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, b.RunID), ActiveState: "active"}}}
 	o.vs = &reconcileVS{}
 	done := make(chan error, 1)
 	go func() {
-		cause, err := o.retryBuildCleanup(ctx, b, &buildCleanupPendingError{cause: context.Canceled, unit: o.builderUnit(b.RunID), port: b.RuntimeVswitchPort, persisted: true})
+		cause, err := o.retryBuildCleanup(ctx, b, &buildCleanupPendingError{cause: context.Canceled, unit: instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, b.RunID), port: b.RuntimeVswitchPort, persisted: true})
 		if err == nil {
 			o.completeBuild(ctx, b, nil, cause)
 		}
@@ -226,7 +226,7 @@ func TestRecoveryReleasesTerminalOwnershipWithoutChangingResult(t *testing.T) {
 					}
 					lc := &reconcileLauncher{}
 					if b.RunID != "" {
-						lc.units = []launcher.Unit{{Name: o.builderUnit(b.RunID), ActiveState: "active"}}
+						lc.units = []launcher.Unit{{Name: instanceUnit(o.cfg.Units.BuilderPoolConfigs()[0].Unit, b.RunID), ActiveState: "active"}}
 					}
 					o.lc, o.vs = lc, &reconcileVS{}
 					if err := o.ReconcileBuilds(ctx); err != nil {

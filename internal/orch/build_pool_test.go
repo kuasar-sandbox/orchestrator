@@ -98,6 +98,7 @@ func TestPrepareBuilderUnitDurablyBindsClaimBeforeAssignment(t *testing.T) {
 	lc := &assignmentOrderLauncher{}
 	o.lc = lc
 	runID := "br-00000000-0000-7000-8000-000000000205"
+	o.runs.restore(runID, instanceUnit(o.cfg.Units.Builder, runID))
 	unit, err := o.prepareBuilderUnit(ctx, b, runID)
 	if err != nil {
 		t.Fatal(err)
@@ -324,8 +325,8 @@ func TestRunBuildUnitFencesAssignedUnitBeforePreNetworkDirectoryCleanup(t *testi
 		return nil
 	}
 	o.lc = lc
-	o.builderRunPool = newRunPool(runKindBuild, 0, time.Second, cfg.Paths.RunRoot, lc,
-		o.builderUnit, o.log.With("pool", "builder-test"))
+	o.builderRunPool = newRunPools(runKindBuild, cfg.Units.BuilderPoolConfigs(), time.Second, cfg.Paths.RunRoot, lc,
+		&o.runs, o.log.With("pool", "builder-test"))
 	poolCtx, cancelPool := context.WithCancel(context.Background())
 	t.Cleanup(cancelPool)
 	if err := o.builderRunPool.Start(poolCtx); err != nil {
@@ -539,7 +540,7 @@ func TestFiniteExecutionIdlePoolBindsBeforePublishingAssignment(t *testing.T) {
 	o.lc = lc
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pool := newRunPool(runKindBuild, o.cfg.Units.BuilderPoolSize, time.Second, t.TempDir(), lc, o.builderUnit, o.log)
+	pool := newRunPools(runKindBuild, o.cfg.Units.BuilderPoolConfigs(), time.Second, t.TempDir(), lc, &o.runs, o.log).pools[0]
 	if err := pool.Start(ctx); err != nil {
 		t.Fatal(err)
 	}

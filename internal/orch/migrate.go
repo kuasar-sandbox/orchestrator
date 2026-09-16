@@ -226,6 +226,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		o.cache(current)
 		return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
 	}
+	o.runs.forget(current.RunID)
 	o.releaseDetachedPortFence(current.VswitchPort)
 	o.uncache(sid)
 	o.clearDeadlineIntent(sid)

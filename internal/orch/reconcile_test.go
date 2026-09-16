@@ -447,6 +447,12 @@ func TestReconcileRetriesSnapshotColdResumeWithDurableLaunchMode(t *testing.T) {
 }
 
 func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
+	for _, multiple := range []bool{false, true} {
+		t.Run(fmt.Sprintf("multiple=%t", multiple), func(t *testing.T) { testReconcileLiveBuild(t, multiple) })
+	}
+}
+
+func testReconcileLiveBuild(t *testing.T, multiple bool) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("1", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -461,6 +467,10 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	cfg := buildReconcileConfig(runRoot)
 	runID := "br-00000000-0000-7000-8000-000000000001"
 	unit := "sandbox-builder@" + runID + ".service"
+	if multiple {
+		cfg.Units = multiPoolUnits()
+		unit = instanceUnit("shared-build@.service", runID)
+	}
 	build := buildReconcileRow(t, runID)
 	for _, path := range []string{
 		nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID),
@@ -518,6 +528,12 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	if err := o.ReconcileBuilds(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if o.runs.unit(runID) != unit {
+		t.Fatal("adoption lost actual unit")
+	}
+	if o.runnerPool.next != 0 || o.builderRunPool.next != 0 {
+		t.Fatal("adoption advanced pool cursors")
+	}
 	if result := <-specDone; result.err != nil || !result.ok {
 		t.Fatalf("recovered BuildSpec = ok %v err %v", result.ok, result.err)
 	}
@@ -547,6 +563,9 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	}
 	if err := o.DrainBuilds(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if o.runs.unit(runID) != "" {
+		t.Fatal("completed adopted Build retained unit index")
 	}
 	if len(vs.detached) != 1 || vs.detached[0] != "17" {
 		t.Fatalf("detached ports = %v", vs.detached)

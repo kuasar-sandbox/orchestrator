@@ -356,7 +356,14 @@ mmds:
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
-units: { dir: $UNIT_DIR, builder_pool_size: 1 }
+units:
+  dir: $UNIT_DIR
+  # Shared template, different idle targets, and identical independent entries.
+  # Existing global admission, phase and live-recovery checks exercise all slots.
+  builder_pools:
+    - {unit: sandbox-builder@.service, size: 1}
+    - {unit: sandbox-builder@.service, size: 0}
+    - {unit: sandbox-builder@.service, size: 1}
 sandbox:
   resources:
     capacity: { cpu: 2, memory: 2GiB }
@@ -469,6 +476,16 @@ restart_conductor() { # mode remote-manifest
 }
 
 start_conductor
+# Before any registration, both size=1 entries must independently prewarm.
+# Count only this fixture's RunID pidfiles, never deployment units.
+idle_builders=0
+for _ in $(seq 1 100); do
+    idle_builders=$(find "$WORK/run/runners" -maxdepth 1 -name 'br-*.pid' -type f | wc -l)
+    [ "$idle_builders" -eq 2 ] && break
+    sleep 0.1
+done
+[ "$idle_builders" -eq 2 ] || fail "duplicate Builder pools prewarmed $idle_builders workers, want 2"
+echo "==> PASS: shared-template Builder pools independently prewarmed two workers"
 write_proxy_config "$WORK/proxy.yaml" \
     "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" - \
     "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" 1024 2 enforce 30s -
