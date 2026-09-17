@@ -964,6 +964,15 @@ Conductor selects a pool and its systemd template; the operator configures CPU
 placement and memory allocation on that template. This is host-side placement,
 not guest vNUMA topology or a NUMA-aware capacity scheduler.
 
+**NUMA isolation is an upper-layer application pattern built on multiple pools,
+not a new isolation capability implemented by Conductor.** The following is a
+deployment configuration example, not a project test specification. Project
+acceptance covers pool configuration, independent prewarming, simple round-robin,
+actual-unit lookup and the existing lifecycle, plus static example/documentation
+checks. Real NUMA hosts, page-distribution checks, NUMA E2E and performance tests
+are neither required nor scheduled for this feature; they are not merge
+prerequisites or outstanding delivery work.
+
 For a host with online, memory-bearing NUMA nodes 0 and 1, use distinct template
 names for distinct placement policies. The following replaces the `units` block
 in an otherwise complete Conductor configuration; omit the legacy single-pool
@@ -1035,7 +1044,7 @@ ownership. Keep runtime Sandbox resource enforcement with `sandbox-ctl`.
 With `install: true`, Conductor generates each named base template and the two
 existing fixed slices; the separately managed `.service.d/20-numa.conf` files
 supply placement. Do not put custom properties into generated base files, which
-Conductor rewrites. Verify these drop-ins on every deployed version. With
+Conductor rewrites. With
 `install: false`, operators instead install four independent real template files
 based on this version's generated runner/Builder templates (§5 and Build §4.1),
 plus `sandbox-runner.slice` and `sandbox-builder.slice`, then reload systemd.
@@ -1051,40 +1060,6 @@ processes remain under the selected unit; the Builder's A/B/C phases that actual
 run use that same Builder, not fresh pool selections. In-guest work runs through
 those phase VMMs. Do not bind only the Conductor daemon: systemd starts the units,
 so placement belongs on their templates. See [Build §4.1](node-build.md#41-builder-unit-and-process-lifecycle).
-
-**Verify effective placement, not only YAML or the supervising PID.** After
-starting this configuration, enumerate actual units and substitute one live name
-below (`<RunID>` is a placeholder, not a NUMA node ID). Repeat for both nodes,
-ordinary Sandbox execution and a running multi-phase Build:
-
-```sh
-systemctl list-units --all 'sandbox-runner-numa*@*.service' 'sandbox-builder-numa*@*.service'
-unit='sandbox-runner-numa0@<RunID>.service'
-systemctl cat "$unit"
-systemctl show "$unit" -p MainPID -p ControlGroup -p CPUAffinity \
-  -p AllowedCPUs -p EffectiveCPUs -p NUMAPolicy -p NUMAMask \
-  -p AllowedMemoryNodes -p EffectiveMemoryNodes
-cg=$(systemctl show "$unit" -p ControlGroup --value)
-test -n "$cg"
-# Enumerate ctl, vmm and any descendants; the delegated unit root may be empty.
-find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + | sort -nu |
-while read -r pid; do
-  test "$pid" -gt 0 && test -r "/proc/$pid/status" || continue
-  printf '\nPID %s\n' "$pid"
-  taskset -apc "$pid"
-  grep -E '^(Cpus_allowed_list|Mems_allowed_list):' "/proc/$pid/status"
-  numastat -p "$pid"
-  cat "/proc/$pid/numa_maps"
-done
-```
-
-Check all threads of `sandbox-ctl` and Cloud Hypervisor, including the host-side
-UFFD/I/O workers, and the guest-RAM mappings' actual `N0`/`N1` page distribution.
-Allocation policy does not prove that pre-existing/shared file-cache pages have
-moved; do not claim all RSS is node-local or infer performance gains from masks.
-Observe cold start, pause/resume, Build phases, and Conductor restart separately.
-This procedure is deployment acceptance guidance; the generic multi-pool E2E
-results alone are **not** physical multi-NUMA placement/performance evidence.
 
 The deployment retains these boundaries:
 

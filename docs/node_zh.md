@@ -1317,6 +1317,11 @@ pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CL
 配置 CPU 放置与内存分配策略。这是宿主侧部署能力，不是 guest vNUMA 拓扑，
 也不是 NUMA 感知的容量调度器。
 
+**NUMA 隔离是基于多池机制的上层应用模式，不是 Conductor 新增的隔离能力。**
+以下是部署配置示例，不是项目测试规范。项目只验收多池配置、独立预热、简单轮询、
+实际 unit 定位及既有生命周期，并静态检查示例与文档一致性；不要求或安排真实
+NUMA 主机验证、页分布检查、NUMA E2E 或性能测试，也不将其列为合入前置或遗留工作。
+
 对具有在线且带内存的 NUMA 节点 0、1 的主机，用不同模板名称表达不同放置策略。
 以下内容替换完整 Conductor 配置中的 `units` 块；不要同时保留旧单池字段。
 示例 size 只是空闲预热目标，不是推荐容量：
@@ -1383,7 +1388,7 @@ Sandbox 的运行时资源执行仍由 `sandbox-ctl` 管理。
 
 `install: true` 时，Conductor 生成各个命名基础模板及现有的两个固定 slice，
 独立管理的 `.service.d/20-numa.conf` 提供放置策略。不要把自定义属性写进会被
-Conductor 重写的基础文件；每个部署版本都应检查 drop-in 是否生效。
+Conductor 重写的基础文件。
 采用 `install: false` 时，运维应基于本版本生成的 runner/Builder 模板（§5 和 Build §4.1），
 安装四个独立的实际模板文件，以及 `sandbox-runner.slice`、`sandbox-builder.slice`，
 然后自行 reload systemd。保留当前部署的二进制路径、`%i` **RunID**、pidfile/config socket、
@@ -1396,38 +1401,6 @@ Conductor 重写的基础文件；每个部署版本都应检查 drop-in 是否�
 不按阶段重新取池；guest 内的工作通过这些阶段 VMM 执行。
 不要只给 Conductor daemon 绑核：unit 由 systemd 启动，放置策略必须配置到任务模板上。
 参见 [Build §4.1](node-build_zh.md#41-builder-unit-与进程生命周期)。
-
-**验证实际有效绑定，而不是只检查 YAML 或监督进程 PID。** 启动上述配置后枚举真实
-unit，把下例中的 unit 名替换为一个存活实例（`<RunID>` 是占位符，不是 NUMA 节点号）。
-对两个节点、普通 Sandbox 和运行中的多阶段 Build 分别执行：
-
-```sh
-systemctl list-units --all 'sandbox-runner-numa*@*.service' 'sandbox-builder-numa*@*.service'
-unit='sandbox-runner-numa0@<RunID>.service'
-systemctl cat "$unit"
-systemctl show "$unit" -p MainPID -p ControlGroup -p CPUAffinity \
-  -p AllowedCPUs -p EffectiveCPUs -p NUMAPolicy -p NUMAMask \
-  -p AllowedMemoryNodes -p EffectiveMemoryNodes
-cg=$(systemctl show "$unit" -p ControlGroup --value)
-test -n "$cg"
-# Enumerate ctl, vmm and any descendants; the delegated unit root may be empty.
-find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + | sort -nu |
-while read -r pid; do
-  test "$pid" -gt 0 && test -r "/proc/$pid/status" || continue
-  printf '\nPID %s\n' "$pid"
-  taskset -apc "$pid"
-  grep -E '^(Cpus_allowed_list|Mems_allowed_list):' "/proc/$pid/status"
-  numastat -p "$pid"
-  cat "/proc/$pid/numa_maps"
-done
-```
-
-检查 `sandbox-ctl` 和 Cloud Hypervisor 的所有线程（包括宿主侧 UFFD/I/O worker），
-并核对 guest RAM 映射的实际 `N0`/`N1` 页分布。分配策略不证明已有/共享文件缓存页
-已经迁移，不能据此宣称全部 RSS 位于本地节点，也不能从 mask 推导性能收益。
-冷启动、pause/resume、Build 阶段及 Conductor 重启应分别观察。
-以上是部署验收方法；通用多池 E2E 通过，**不等于**已经取得物理多 NUMA 节点的
-绑定或性能实测证据。
 
 部署仍遵循以下边界：
 
