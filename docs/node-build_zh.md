@@ -89,6 +89,8 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元不设置 `TimeoutStartSec`;另有独立的 60 秒 fencing/宿主清理窗口,见 §6) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw([§5](#5-按目标执行与发布)) |
 
+多池的主要应用场景是 NUMA 部署，双节点 runner/Builder 配置、systemd 放置策略 drop-in、安装顺序及应用边界（不要求 NUMA 实测）见 [Node §5.3](node_zh.md#numa-deployment)。仅在全局执行准入后选择一次 Builder pool；实际执行的 A/B/C 阶段保持在同一 Builder unit 及其宿主放置策略下。Builder size 是预热目标，不是每 NUMA 节点的并发/内存预算。由构建产物创建的后续 Sandbox 独立选择 runner，制品不会把它固定到 Build 宿主的 NUMA 节点。
+
 Builder 配置直接替换下列旧字段，不保留 alias：
 
 ```text

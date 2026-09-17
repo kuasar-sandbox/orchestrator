@@ -78,6 +78,8 @@ These Conductor configuration fields govern the Build service. Shared process, p
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | Guest pull/flatten, each RUN step, readyCmd polling and whole Build. Step budget also reaches the guest as Connect-Timeout-Ms. Ready polling interval is 2s; absent readyCmd waits 20s. The unit sets no TimeoutStartSec; fencing/host cleanup has a separate 60-second window (§6) |
 | `builder.files_storage` | Empty | COPY context S3/OBS storage: endpoint/region/bucket (required)/prefix/access_key/secret_key/force_path_style/presign_expiry. Empty returns 501 for COPY. Conductor only presigns/HEADs. Custom Runtime credentials override YAML/AWS defaults, support session token/expiry/refresh and never fall back after error. force_path_style defaults false; versitygw/minio use true. PUT expiry defaults 1h; GET uses total+5m. Local deployments may use versitygw ([§5](#5-target-aware-execution-and-publication)) |
 
+For the primary multi-pool NUMA deployment use case, see [Node §5.3](node.md#numa-deployment) for the two-node runner/Builder configuration, systemd placement drop-ins, installation order and application boundaries (not NUMA validation requirements). Select one Builder pool only after global execution admission; all A/B/C phases that actually execute stay under that Builder unit and its host placement. Builder size is a prewarm target, not a per-NUMA concurrency/memory budget. Later Sandboxes created from the output select their own runner; an artifact does not pin them to the Build host's NUMA node.
+
 The Builder schema replaces these legacy names without aliases:
 
 ```text

@@ -69,6 +69,10 @@ paths:
   # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids # PID allowlist gating the plugin plane
 
 # Systemd template units (generated + installed at startup, then daemon-reloaded).
+# Primary multi-pool use case: NUMA-local deployment. See docs/node.md#numa-deployment
+# and docs/node_zh.md#numa-deployment for topology, named templates, placement drop-ins
+# (install before prewarming), and application boundaries. No NUMA-host test is required.
+# Sharing one template does not give its pools different NUMA bindings.
 # units:
 #   dir: /etc/systemd/system
 #   runner_pools:
