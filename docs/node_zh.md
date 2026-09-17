@@ -502,6 +502,8 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `cluster.data_endpoint` | (接入集群必填) | Proxy sandbox data 的显式 `host:port` advertised endpoint;不得从 `proxy.data_listen` 推导 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
 
+多池的主要应用场景是 [NUMA 部署（§5.3）](#numa-deployment)：由不同 unit 模板承载不同节点的 CPU/内存放置策略，再轮询分配新执行。以下重复模板示例仅说明配置语义，不代表不同 NUMA 绑定。
+
 `units.runner_pools` / `units.builder_pools` 每项仅包含 `unit` 和 `size`。
 每个列表项创建独立 pool，同类重复模板及完全相同的配置项也保留独立位置。
 `size >= 0` 是空闲预启动 worker 目标数，不是并发容量或轮询权重；0 仍参与轮询并按需启动。
@@ -1305,6 +1307,147 @@ Build phase target 携 `KUASAR_BUILD_ID`、`KUASAR_RUN_ID`。字段不从环境�
 pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CLI、CH stderr、panic 与
 发送失败 fallback 保留原有出口。Builder 单元设置 `LogRateLimitIntervalSec=0`,runner 保留默认限流;
 这不保证 journal/storage 故障下零丢失、恰好一次持久化或零阻塞发送。
+
+<a id="numa-deployment"></a>
+
+### 5.3 使用多池进行 NUMA 部署
+
+多池的主要部署场景是：让单个 Sandbox 的宿主侧执行保持在一个 NUMA 节点内，
+同时把新的执行分散到多个节点。Conductor 选择 pool 及其 systemd 模板；运维在模板上
+配置 CPU 放置与内存分配策略。这是宿主侧部署能力，不是 guest vNUMA 拓扑，
+也不是 NUMA 感知的容量调度器。
+
+对具有在线且带内存的 NUMA 节点 0、1 的主机，用不同模板名称表达不同放置策略。
+以下内容替换完整 Conductor 配置中的 `units` 块；不要同时保留旧单池字段。
+示例 size 只是空闲预热目标，不是推荐容量：
+
+```yaml
+units:
+  dir: /etc/systemd/system
+  install: true
+  pool_wait_timeout: 5s
+  runner_pools:
+    - {unit: sandbox-runner-numa0@.service, size: 4}
+    - {unit: sandbox-runner-numa1@.service, size: 4}
+  builder_pools:
+    - {unit: sandbox-builder-numa0@.service, size: 1}
+    - {unit: sandbox-builder-numa1@.service, size: 1}
+```
+
+**先读取实际主机拓扑。** NUMA 节点号和逻辑 CPU 编号（含 SMT 线程）由机器决定，
+不能根据节点号推算 CPU 范围。确认 cgroup v2、`cpuset` controller 可用，
+且祖先 slice 允许两个目标节点及 CPU 集合：
+
+```sh
+lscpu -e=CPU,NODE,SOCKET,CORE
+numactl --hardware
+cat /sys/fs/cgroup/cgroup.controllers
+cat /sys/devices/system/node/node{0,1}/cpulist
+```
+
+**在启动 Conductor 和任何预热 worker 之前，安装运维管理的放置策略 drop-in。**
+在示例双节点主机上以 root 执行下列命令；所选节点必须有在线 CPU 和内存。
+示例使用节点完整 CPU 列表；需要为宿主服务保留 CPU 时，应将 `cpus` 改成部署选定的子集：
+
+```sh
+set -eu
+unit_dir=/etc/systemd/system
+for node in 0 1; do
+  cpus=$(cat "/sys/devices/system/node/node${node}/cpulist")
+  test -n "$cpus"
+  for kind in runner builder; do
+    dropin="$unit_dir/sandbox-${kind}-numa${node}@.service.d"
+    install -d -m 0755 "$dropin"
+    cat > "$dropin/20-numa.conf" <<EOF
+[Service]
+CPUAffinity=
+CPUAffinity=$cpus
+AllowedCPUs=
+AllowedCPUs=$cpus
+NUMAPolicy=bind
+NUMAMask=
+NUMAMask=$node
+AllowedMemoryNodes=
+AllowedMemoryNodes=$node
+EOF
+  done
+done
+systemctl daemon-reload
+```
+
+`CPUAffinity` 设置初始 CPU 亲和性；`AllowedCPUs` 通过 cgroup v2 约束整个 unit 子树。
+`NUMAPolicy=bind` 配合 `NUMAMask` 在 worker 创建线程/子进程前设置分配策略；
+`AllowedMemoryNodes` 约束 unit 允许使用的内存节点。这些是放置策略，**不是**
+`CPUQuota`、`MemoryMax`、`MemoryHigh`、每池 reservation 或 CPU 独占配置。
+Sandbox 的运行时资源执行仍由 `sandbox-ctl` 管理。
+
+`install: true` 时，Conductor 生成各个命名基础模板及现有的两个固定 slice，
+独立管理的 `.service.d/20-numa.conf` 提供放置策略。不要把自定义属性写进会被
+Conductor 重写的基础文件；每个部署版本都应检查 drop-in 是否生效。
+采用 `install: false` 时，运维应基于本版本生成的 runner/Builder 模板（§5 和 Build §4.1），
+安装四个独立的实际模板文件，以及 `sandbox-runner.slice`、`sandbox-builder.slice`，
+然后自行 reload systemd。保留当前部署的二进制路径、`%i` **RunID**、pidfile/config socket、
+`Delegate=yes`、`ctl/vmm`、清理行为及既有 slice 合同。不要用 unit alias 表达不同绑定。
+该模式下 Conductor 不执行任何模板安装或 reload。
+
+普通 runner 在两个 runner pool 间轮询；Builder 在两个 builder pool 间独立轮询。
+预热进程在分配业务前已处于对应放置策略下。Runner 的 exec 替换及 Builder 的子进程
+留在选定 unit 下；一个 Build 实际执行的 A/B/C 阶段仍由同一个 Builder 驱动，
+不按阶段重新取池；guest 内的工作通过这些阶段 VMM 执行。
+不要只给 Conductor daemon 绑核：unit 由 systemd 启动，放置策略必须配置到任务模板上。
+参见 [Build §4.1](node-build_zh.md#41-builder-unit-与进程生命周期)。
+
+**验证实际有效绑定，而不是只检查 YAML 或监督进程 PID。** 启动上述配置后枚举真实
+unit，把下例中的 unit 名替换为一个存活实例（`<RunID>` 是占位符，不是 NUMA 节点号）。
+对两个节点、普通 Sandbox 和运行中的多阶段 Build 分别执行：
+
+```sh
+systemctl list-units --all 'sandbox-runner-numa*@*.service' 'sandbox-builder-numa*@*.service'
+unit='sandbox-runner-numa0@<RunID>.service'
+systemctl cat "$unit"
+systemctl show "$unit" -p MainPID -p ControlGroup -p CPUAffinity \
+  -p AllowedCPUs -p EffectiveCPUs -p NUMAPolicy -p NUMAMask \
+  -p AllowedMemoryNodes -p EffectiveMemoryNodes
+cg=$(systemctl show "$unit" -p ControlGroup --value)
+test -n "$cg"
+# Enumerate ctl, vmm and any descendants; the delegated unit root may be empty.
+find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + | sort -nu |
+while read -r pid; do
+  test "$pid" -gt 0 && test -r "/proc/$pid/status" || continue
+  printf '\nPID %s\n' "$pid"
+  taskset -apc "$pid"
+  grep -E '^(Cpus_allowed_list|Mems_allowed_list):' "/proc/$pid/status"
+  numastat -p "$pid"
+  cat "/proc/$pid/numa_maps"
+done
+```
+
+检查 `sandbox-ctl` 和 Cloud Hypervisor 的所有线程（包括宿主侧 UFFD/I/O worker），
+并核对 guest RAM 映射的实际 `N0`/`N1` 页分布。分配策略不证明已有/共享文件缓存页
+已经迁移，不能据此宣称全部 RSS 位于本地节点，也不能从 mask 推导性能收益。
+冷启动、pause/resume、Build 阶段及 Conductor 重启应分别观察。
+以上是部署验收方法；通用多池 E2E 通过，**不等于**已经取得物理多 NUMA 节点的
+绑定或性能实测证据。
+
+部署仍遵循以下边界：
+
+- 两个 pool 共用一个模板，就共用该模板的放置策略；重复项不会自动绑定到不同节点。
+  `size` 不改变轮询权重，也不限制活动 worker。分配次数接近不代表 CPU/内存负载均衡，
+  更不代表按 NUMA 节点做准入；现有节点全局准入与 Build FIFO/claim 保持不变。
+- 已绑定执行保留实际 unit，Conductor 重启也不改变它。Pause/resume 需要新 runner 时
+  重新取池，可能使用另一 NUMA 节点；本特性不提供 NUMA 粘性、在线迁移，也不把宿主
+  节点身份写进可移植制品。活动或待清理执行仍依赖的模板必须保留在配置中。
+  修改/reload drop-in 不会让已有预热或已分配 worker 重新 exec 并取得新的进程策略；
+  应按生命周期安全安排 worker 更替，不要当成热迁移。
+- 严格单节点绑定可能在其他节点仍有空闲内存时触发本地回收或分配失败/OOM；
+  Conductor 不会自动换池重试。如有意用 `NUMAPolicy=preferred` 允许内存回退，
+  必须同时去掉或扩大单节点 `AllowedMemoryNodes`，因为 cpuset 限制优先。
+  这是以严格内存本地性换取回退，不是新增 NUMA 调度。
+
+设置语义参考：[systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html)、
+[systemd.resource-control(5)](https://manpages.debian.org/trixie/systemd/systemd.resource-control.5.en.html)、
+[Linux NUMA memory policy](https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html)、
+[cgroup v2 cpuset](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset)。
 
 ## 6. 本机控制 socket(run / task / admin / plugin / api 平面)
 

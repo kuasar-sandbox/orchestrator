@@ -349,6 +349,8 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `cluster.data_endpoint` | Required in cluster mode | Explicit advertised Proxy host:port; never inferred from its bind listener |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource §3.2. Omitted/disabled means static cgroups |
 
+The primary use case is [NUMA deployment (§5.3)](#numa-deployment): distinct templates carry per-node CPU/memory placement, and new executions are assigned round-robin. The repeated-template example below illustrates configuration semantics, not distinct NUMA bindings.
+
 Each `units.runner_pools` / `units.builder_pools` entry contains only `unit` and
 `size`. Each entry creates an independent pool, including repeated templates and
 completely identical entries. `size >= 0` is the target number of idle prestarted
@@ -951,6 +953,163 @@ Conductor constructs independent journald targets for runtime component diagnost
 | `console` | Runner/Build phase `--console` | Guest kernel dmesg | Host only; excluded from SDK Build logs |
 
 Native streams write directly to journal without temporary log files. Run-builder milestones and envd RUN replay use pure-Go `go-systemd/journal`. `--log-to` does not replace original process stderr: early CLI output, CH stderr, panics and failed-send fallback retain their existing sinks. Builder units set `LogRateLimitIntervalSec=0`; runners keep default rate limits. Neither policy guarantees lossless storage under journal/storage failure, exactly-once durability or nonblocking sends.
+
+<a id="numa-deployment"></a>
+
+### 5.3 NUMA deployment with multiple pools
+
+The primary deployment use case for multiple pools is to keep a Sandbox's host
+execution within a NUMA node while distributing new executions across nodes.
+Conductor selects a pool and its systemd template; the operator configures CPU
+placement and memory allocation on that template. This is host-side placement,
+not guest vNUMA topology or a NUMA-aware capacity scheduler.
+
+For a host with online, memory-bearing NUMA nodes 0 and 1, use distinct template
+names for distinct placement policies. The following replaces the `units` block
+in an otherwise complete Conductor configuration; omit the legacy single-pool
+fields. The sizes are illustrative idle-worker targets, not recommended capacity:
+
+```yaml
+units:
+  dir: /etc/systemd/system
+  install: true
+  pool_wait_timeout: 5s
+  runner_pools:
+    - {unit: sandbox-runner-numa0@.service, size: 4}
+    - {unit: sandbox-runner-numa1@.service, size: 4}
+  builder_pools:
+    - {unit: sandbox-builder-numa0@.service, size: 1}
+    - {unit: sandbox-builder-numa1@.service, size: 1}
+```
+
+**Inspect the actual host topology first.** Node IDs and logical CPU numbering
+are machine-specific, including SMT siblings; never infer a CPU range from the
+node number. Confirm cgroup v2 and the `cpuset` controller are available, and that
+the ancestor slices allow both target nodes/CPU sets:
+
+```sh
+lscpu -e=CPU,NODE,SOCKET,CORE
+numactl --hardware
+cat /sys/fs/cgroup/cgroup.controllers
+cat /sys/devices/system/node/node{0,1}/cpulist
+```
+
+**Install operator-owned placement drop-ins before starting Conductor or any
+prewarmed worker.** On the example two-node host, run this as root. Each selected
+node must have online CPUs and memory. The example uses that node's entire CPU
+list; adjust `cpus` to the deployment's intended subset when reserving host CPUs:
+
+```sh
+set -eu
+unit_dir=/etc/systemd/system
+for node in 0 1; do
+  cpus=$(cat "/sys/devices/system/node/node${node}/cpulist")
+  test -n "$cpus"
+  for kind in runner builder; do
+    dropin="$unit_dir/sandbox-${kind}-numa${node}@.service.d"
+    install -d -m 0755 "$dropin"
+    cat > "$dropin/20-numa.conf" <<EOF
+[Service]
+CPUAffinity=
+CPUAffinity=$cpus
+AllowedCPUs=
+AllowedCPUs=$cpus
+NUMAPolicy=bind
+NUMAMask=
+NUMAMask=$node
+AllowedMemoryNodes=
+AllowedMemoryNodes=$node
+EOF
+  done
+done
+systemctl daemon-reload
+```
+
+`CPUAffinity` sets the initial execution mask; `AllowedCPUs` bounds the entire
+unit subtree through cgroup v2. `NUMAPolicy=bind` with `NUMAMask` sets allocation
+policy before the worker creates threads/children; `AllowedMemoryNodes` bounds
+the unit's permitted memory nodes. These are placement settings, **not**
+`CPUQuota`, `MemoryMax`, `MemoryHigh`, a per-pool reservation, or exclusive CPU
+ownership. Keep runtime Sandbox resource enforcement with `sandbox-ctl`.
+
+With `install: true`, Conductor generates each named base template and the two
+existing fixed slices; the separately managed `.service.d/20-numa.conf` files
+supply placement. Do not put custom properties into generated base files, which
+Conductor rewrites. Verify these drop-ins on every deployed version. With
+`install: false`, operators instead install four independent real template files
+based on this version's generated runner/Builder templates (§5 and Build §4.1),
+plus `sandbox-runner.slice` and `sandbox-builder.slice`, then reload systemd.
+Preserve the deployment's executable paths, `%i` **RunID**, pidfile/config socket,
+`Delegate=yes`, `ctl/vmm`, cleanup, and existing slice contracts. Do not use unit
+aliases to represent different placements. Conductor does not install or reload
+anything in that mode.
+
+Runner assignments alternate between the two runner pools; Builder assignments
+independently alternate between the two Builder pools. A prewarmed process is
+already placed before assignment. Runner exec-replacement and Builder child
+processes remain under the selected unit; the Builder's A/B/C phases that actually
+run use that same Builder, not fresh pool selections. In-guest work runs through
+those phase VMMs. Do not bind only the Conductor daemon: systemd starts the units,
+so placement belongs on their templates. See [Build §4.1](node-build.md#41-builder-unit-and-process-lifecycle).
+
+**Verify effective placement, not only YAML or the supervising PID.** After
+starting this configuration, enumerate actual units and substitute one live name
+below (`<RunID>` is a placeholder, not a NUMA node ID). Repeat for both nodes,
+ordinary Sandbox execution and a running multi-phase Build:
+
+```sh
+systemctl list-units --all 'sandbox-runner-numa*@*.service' 'sandbox-builder-numa*@*.service'
+unit='sandbox-runner-numa0@<RunID>.service'
+systemctl cat "$unit"
+systemctl show "$unit" -p MainPID -p ControlGroup -p CPUAffinity \
+  -p AllowedCPUs -p EffectiveCPUs -p NUMAPolicy -p NUMAMask \
+  -p AllowedMemoryNodes -p EffectiveMemoryNodes
+cg=$(systemctl show "$unit" -p ControlGroup --value)
+test -n "$cg"
+# Enumerate ctl, vmm and any descendants; the delegated unit root may be empty.
+find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + | sort -nu |
+while read -r pid; do
+  test "$pid" -gt 0 && test -r "/proc/$pid/status" || continue
+  printf '\nPID %s\n' "$pid"
+  taskset -apc "$pid"
+  grep -E '^(Cpus_allowed_list|Mems_allowed_list):' "/proc/$pid/status"
+  numastat -p "$pid"
+  cat "/proc/$pid/numa_maps"
+done
+```
+
+Check all threads of `sandbox-ctl` and Cloud Hypervisor, including the host-side
+UFFD/I/O workers, and the guest-RAM mappings' actual `N0`/`N1` page distribution.
+Allocation policy does not prove that pre-existing/shared file-cache pages have
+moved; do not claim all RSS is node-local or infer performance gains from masks.
+Observe cold start, pause/resume, Build phases, and Conductor restart separately.
+This procedure is deployment acceptance guidance; the generic multi-pool E2E
+results alone are **not** physical multi-NUMA placement/performance evidence.
+
+The deployment retains these boundaries:
+
+- Two entries sharing one template share its placement policy; duplication does
+  not automatically bind them to different nodes. `size` does not weight the
+  round-robin sequence or limit active workers. Equal assignment counts are not
+  equal CPU/memory usage or per-NUMA admission budgets; existing node-global
+  admission and Build FIFO/claims remain unchanged.
+- A bound execution stays with its actual unit, including Conductor restart.
+  Pause/resume requiring a new runner selects again and may use the other node;
+  the feature supplies no sticky NUMA placement, live migration or host-node
+  identity in portable artifacts. Keep templates needed by active/pending-cleanup
+  executions configured. Changing/reloading drop-ins does not re-exec existing
+  prewarmed or assigned workers with the new process policy; plan an explicit
+  lifecycle-safe worker turnover rather than assuming hot migration.
+- Strict single-node binding can cause local reclaim or allocation failure/OOM
+  despite free memory elsewhere. Conductor does not retry another pool. A
+  deliberate `NUMAPolicy=preferred` fallback configuration must also remove or
+  widen single-node `AllowedMemoryNodes`; cpuset restrictions take precedence.
+  That trades strict memory locality for fallback, not NUMA-aware scheduling.
+
+Setting semantics: [systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html),
+[systemd.resource-control(5)](https://manpages.debian.org/trixie/systemd/systemd.resource-control.5.en.html),
+[Linux NUMA memory policy](https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html),
+and [cgroup v2 cpuset](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset).
 
 ## 6. Local control socket: run, task, admin, plugin and API planes
 
