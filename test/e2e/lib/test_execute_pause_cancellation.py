@@ -86,6 +86,8 @@ def terminate(signum, frame):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     os.kill(os.getpid(), signal.SIGTERM)
 signal.signal(signal.SIGTERM, terminate)
+if mode == "exit-before-term":
+    signal.signal(signal.SIGUSR1, lambda signum, frame: os._exit(0))
 os.write(int(os.environ["EVENT_FD"]), b"C")
 if mode == "early":
     raise SystemExit(0)
@@ -140,6 +142,22 @@ FORWARD_TO_SWITCH_OWNED=0 FORWARD_FROM_SWITCH_OWNED=0
 PROXY_VETH_OWNED=0 PROXY_NETNS_OWNED=0 SW_NETNS_OWNED=0
 systemctl() { :; }
 execute_state_restore_forwarding() { :; }
+kill() {
+    if [ "${IN_CLEANUP:-0}" = 1 ]; then
+        printf '%s\\n' "$*" >> "$WORK/cleanup-kills"
+    fi
+    if [ "${CLIENT_MODE:-}" = exit-before-term ] &&
+       [ "${TERM_RACE_TRIGGERED:-0}" = 0 ] && [ "${1:-}" = -TERM ]; then
+        TERM_RACE_TRIGGERED=1
+        # Hold the simulated exit until the test observes the still-blocked
+        # snapshot. Legitimate EXIT cleanup releases it immediately afterward.
+        printf R >&"$EVENT_FD"
+        read -r -u "$CONTROL_FD"
+        builtin kill -USR1 "$2"
+        wait "$2"
+    fi
+    builtin kill "$@"
+}
 '''
         if short_poll:
             # Only negative cases shorten the iteration source. The extracted
@@ -150,6 +168,7 @@ execute_state_restore_forwarding() { :; }
 trap 'exit 143' TERM
 pause_fixture_exit() {
     local status=$? pid
+    IN_CLEANUP=1
     cleanup
     # Record the real cleanup outcome before emergency fixture reaping. Tests
     # must fail on a surviving child even when the harness prevents a leak.
@@ -199,6 +218,13 @@ trap pause_fixture_exit EXIT
         if survivors.exists():
             self.assertEqual(survivors.read_text().strip(), "",
                              "E2E cleanup left child jobs before fixture fallback")
+
+    def assert_cleanup_did_not_target_client(self):
+        client_pid = (self.root / "client.pid").read_text().strip()
+        cleanup_kills = self.root / "cleanup-kills"
+        if cleanup_kills.exists():
+            targeted = [line.split()[-1] for line in cleanup_kills.read_text().splitlines()]
+            self.assertNotIn(client_pid, targeted)
 
     def test_exact_target_snapshot_waits_for_release(self):
         self.target.write_text("pause-target\n")
@@ -264,6 +290,7 @@ trap pause_fixture_exit EXIT
         driver = self.driver("early", 'wait "$PAUSE_CURL_PID"')
         self.completed(driver, 1, "Pause HTTP client completed before snapshot barrier")
         self.assertFalse(self.reached.exists())
+        self.assert_cleanup_did_not_target_client()
 
     def test_client_must_still_be_pending_after_arrival(self):
         driver = self.driver("early", '''
@@ -278,6 +305,18 @@ read -r -u "$CONTROL_FD"
         os.write(self.control_w, b"go\n")
         self.completed(driver, 1, "Pause HTTP client completed before deterministic cancellation")
         self.completed(wrapper)
+        self.assert_cleanup_did_not_target_client()
+
+    def test_client_exit_between_probe_and_sigterm_is_forgotten(self):
+        driver = self.driver("exit-before-term")
+        self.event(b"C")
+        wrapper = self.wrapper("snapshot", "--path-id", "pause-target")
+        self.event(b"R")
+        self.arrival(wrapper)
+        os.write(self.control_w, b"go\n")
+        self.completed(driver, 1, "could not cancel Pause HTTP client")
+        self.completed(wrapper)
+        self.assert_cleanup_did_not_target_client()
 
     def test_non_sigterm_exit_rejects(self):
         driver = self.driver("wrong-exit")

@@ -2073,12 +2073,32 @@ PAUSE_CURL_PID=$!
 PIDS+=("$PAUSE_CURL_PID")
 for _ in $(seq 1 1500); do
     [ -e "$PAUSE_BARRIER_REACHED" ] && break
-    kill -0 "$PAUSE_CURL_PID" 2>/dev/null || fail "Pause HTTP client completed before snapshot barrier"
+    if ! kill -0 "$PAUSE_CURL_PID" 2>/dev/null; then
+        wait "$PAUSE_CURL_PID" 2>/dev/null || true
+        for i in "${!PIDS[@]}"; do
+            [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+        done
+        fail "Pause HTTP client completed before snapshot barrier"
+    fi
     sleep 0.02
 done
 [ -e "$PAUSE_BARRIER_REACHED" ] || fail "accepted Pause did not reach deterministic snapshot barrier"
-kill -0 "$PAUSE_CURL_PID" 2>/dev/null || fail "Pause HTTP client completed before deterministic cancellation"
-kill -TERM "$PAUSE_CURL_PID" || fail "could not cancel Pause HTTP client"
+if ! kill -0 "$PAUSE_CURL_PID" 2>/dev/null; then
+    wait "$PAUSE_CURL_PID" 2>/dev/null || true
+    for i in "${!PIDS[@]}"; do
+        [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+    done
+    fail "Pause HTTP client completed before deterministic cancellation"
+fi
+if ! kill -TERM "$PAUSE_CURL_PID"; then
+    if ! kill -0 "$PAUSE_CURL_PID" 2>/dev/null; then
+        wait "$PAUSE_CURL_PID" 2>/dev/null || true
+        for i in "${!PIDS[@]}"; do
+            [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+        done
+    fi
+    fail "could not cancel Pause HTTP client"
+fi
 set +e
 wait "$PAUSE_CURL_PID"
 PAUSE_CURL_RC=$?
