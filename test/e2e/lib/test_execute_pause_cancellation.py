@@ -101,7 +101,7 @@ while True:
 
     def reap_fixture(self):
         # Release fixture handshakes even when an assertion fails. Each shell
-        # owns a separate session; its EXIT cleanup kills and waits for curl.
+        # owns a separate session; its EXIT trap also reaps surviving test jobs.
         os.close(self.control_w)
         self.release.touch()
         for process in self.processes:
@@ -146,7 +146,22 @@ execute_state_restore_forwarding() { :; }
             # E2E sleeps, deadline and assertions are otherwise unmodified.
             setup += 'seq() { [ "$*" = "1 1500" ] && command seq 1 2; }\n'
         script = setup + BARRIER_PATHS + FAIL + "\n" + CLEANUP
-        script += "trap 'exit 143' TERM\n" + LAUNCH
+        script += '''
+trap 'exit 143' TERM
+pause_fixture_exit() {
+    local status=$? pid
+    cleanup
+    # Record the real cleanup outcome before emergency fixture reaping. Tests
+    # must fail on a surviving child even when the harness prevents a leak.
+    jobs -pr > "$WORK/cleanup-survivors"
+    # Test-only fallback if the cleanup under test regresses. The wrapper is
+    # owned by Python, so this cannot mask a missing E2E barrier release.
+    for pid in $(jobs -pr); do kill -TERM "$pid" 2>/dev/null; done
+    wait
+    return "$status"
+}
+trap pause_fixture_exit EXIT
+''' + LAUNCH
         script += 'printf "%s\\n" "$PAUSE_CURL_PID" > "$WORK/client.pid"\n'
         script += between + "\n" + CANCEL
         script += 'printf "%s\\n" "$PAUSE_CURL_RC" > "$WORK/client.rc"\n'
@@ -170,13 +185,20 @@ execute_state_restore_forwarding() { :; }
             self.assertIsNone(wrapper.poll(), "wrapper exited before barrier")
             self.assertLess(time.monotonic(), deadline, "wrapper never reached barrier")
             time.sleep(0.005)
-        self.assertIsNone(wrapper.poll())
+        # Arrival alone could be observed just before an incorrectly unblocked
+        # exec. Assert that the real process stays blocked without a release.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            wrapper.wait(timeout=0.1)
         self.assertFalse(self.forwarded.exists(), "snapshot crossed unreleased barrier")
 
     def completed(self, process, status=0, diagnostic=""):
         stdout, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, status, stdout + stderr)
         self.assertIn(diagnostic, stderr)
+        survivors = self.root / "cleanup-survivors"
+        if survivors.exists():
+            self.assertEqual(survivors.read_text().strip(), "",
+                             "E2E cleanup left child jobs before fixture fallback")
 
     def test_exact_target_snapshot_waits_for_release(self):
         self.target.write_text("pause-target\n")
@@ -223,6 +245,8 @@ execute_state_restore_forwarding() { :; }
         # death. This checks wait-before-release without timing a fast exit.
         client_pid = int((self.root / "client.pid").read_text())
         os.kill(client_pid, 0)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.wait(timeout=0.1)
         self.assertFalse(self.release.exists())
         self.assertFalse(self.forwarded.exists())
         os.write(self.control_w, b"x")
