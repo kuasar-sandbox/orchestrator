@@ -329,7 +329,7 @@ stop_owned_units() {
 cleanup() {
     local forwarding_clean=1
     set +e
-    [ -e "$PAUSE_BARRIER_TARGET" ] && : > "$PAUSE_BARRIER_RELEASE"
+    [ -e "${PAUSE_BARRIER_TARGET:-}" ] && : > "$PAUSE_BARRIER_RELEASE"
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     stop_owned_units "$RUNNER_PREFIX" "$BUILDER_PREFIX"
     [ -n "$IMMEDIATE_DATA_PID" ] && kill "$IMMEDIATE_DATA_PID" 2>/dev/null
@@ -2083,11 +2083,15 @@ set +e
 wait "$PAUSE_CURL_PID"
 PAUSE_CURL_RC=$?
 set -e
+# The client has been reaped; cleanup must not signal a later user of its PID.
+for i in "${!PIDS[@]}"; do
+    [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+done
 [ "$PAUSE_CURL_RC" = 143 ] || fail "Pause HTTP client cancellation rc=$PAUSE_CURL_RC (want SIGTERM 143)"
 : > "$PAUSE_BARRIER_RELEASE"
 rm -f "$PAUSE_BARRIER_TARGET"
 wait_sandbox_state "$SID" paused 1200 || {
-    echo "==> pause client timed out but durable state did not become paused:"
+    echo "==> pause client canceled at snapshot barrier but durable state did not become paused:"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
     SID_JOURNAL=$(journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
