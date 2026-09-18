@@ -57,6 +57,19 @@ PROXY_WORKERS=2
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+build_custom_proxy() {
+    local go_bin
+    if [ -n "${GOROOT:-}" ]; then
+        go_bin="$GOROOT/bin/go"
+        [ -x "$go_bin" ] || skip "selected GOROOT has no executable go: $go_bin"
+    else
+        go_bin="$(command -v go || true)"
+        [ -n "$go_bin" ] || skip "go not on PATH (custom Proxy Extension build)"
+    fi
+    (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off "$go_bin" build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
+        || skip "failed to build examples/custom-proxy"
+}
+
 for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
@@ -94,10 +107,8 @@ else
         fi
     fi
     if [ -f "$CUSTOM_PROXY_SOURCE_ROOT/examples/custom-proxy/main.go" ]; then
-        command -v go >/dev/null 2>&1 || skip "go not on PATH (custom Proxy Extension build)"
         CUSTOM_PROXY_BIN="$WORK/custom-proxy"
-        (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
-            || skip "failed to build examples/custom-proxy"
+        build_custom_proxy
         CUSTOM_PROXY_EXTENSION_E2E=1
     else
         # Exact-assets packages contain the E2E suite but no component source.
