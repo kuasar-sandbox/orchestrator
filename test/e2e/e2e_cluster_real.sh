@@ -1081,12 +1081,17 @@ fi
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
 run_cluster_flow
+BUILD_ACTION_PLACER_ARGS=()
+if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
+    BUILD_ACTION_PLACER_ARGS=(--placer-url "http://127.0.0.1:$PLACER_PORT" --expected-node "$NODE_ID")
+fi
 BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/lib/build_actions.py" \
     --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
     --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
     --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
     --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
-    --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" &
+    --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" \
+    "${BUILD_ACTION_PLACER_ARGS[@]}" &
 ACTION_TEST_PID=$!
 PIDS+=("$ACTION_TEST_PID")
 while kill -0 "$ACTION_TEST_PID" 2>/dev/null; do
