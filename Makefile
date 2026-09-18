@@ -1,5 +1,3 @@
-[Reading 132 lines from start (total: 132 lines, 0 remaining)]
-
 # orchestrator — node orchestration, e2b-compatible control plane, independent
 # sandbox data Proxy, and node-level resource control. The node-ctl executable
 # provides the separately deployed conductor, Proxy, and telemetry roles.
