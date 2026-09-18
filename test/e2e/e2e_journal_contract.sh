@@ -4,6 +4,8 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SCRIPT_DIR/lib" -p test_journal_identity.py -v
+# Keep the privilege-boundary build regression in source and packaged owner CI.
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SCRIPT_DIR/lib" -p test_orchestrator_proxy_go.py -v
 SOURCE=""
 if command -v go >/dev/null 2>&1; then
     SOURCE="$(GOPROXY=off GOSUMDB=off go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/orchestrator 2>/dev/null || true)"

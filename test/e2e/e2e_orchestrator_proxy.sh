@@ -57,16 +57,14 @@ PROXY_WORKERS=2
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+e2e_go() {
+    # sudo may reset PATH while preserving the explicitly selected distribution.
+    # Keep its driver/compiler paired; an invalid explicit GOROOT must fail.
+    "${GOROOT:+$GOROOT/bin/}go" "$@"
+}
+
 build_custom_proxy() {
-    local go_bin
-    if [ -n "${GOROOT:-}" ]; then
-        go_bin="$GOROOT/bin/go"
-        [ -x "$go_bin" ] || skip "selected GOROOT has no executable go: $go_bin"
-    else
-        go_bin="$(command -v go || true)"
-        [ -n "$go_bin" ] || skip "go not on PATH (custom Proxy Extension build)"
-    fi
-    (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off "$go_bin" build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
+    (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off e2e_go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
         || skip "failed to build examples/custom-proxy"
 }
 

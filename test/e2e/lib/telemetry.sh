@@ -41,7 +41,7 @@ run_telemetry_guest_probe() {
     # their ordinary unprivileged unit-test skips cannot count as CI evidence.
     local telemetry_source="${CUSTOM_PROXY_SOURCE_ROOT:-$REPO_ROOT}"
     if [ -f "$telemetry_source/internal/telemetry/otlp_netns_linux_test.go" ]; then
-        (cd "$telemetry_source" && GOWORK=off CGO_ENABLED=0 go test -c -o "$WORK/telemetry.test" ./internal/telemetry)
+        (cd "$telemetry_source" && GOWORK=off CGO_ENABLED=0 e2e_go test -c -o "$WORK/telemetry.test" ./internal/telemetry)
         REQUIRE_TELEMETRY_NETNS=1 "$WORK/telemetry.test" -test.v -test.timeout=90s -test.run='^TestOTLPProxyNetNS' \
             >"$WORK/telemetry-netns.out" 2>&1 || { cat "$WORK/telemetry-netns.out"; fail "real Collector netns regression"; }
         cat "$WORK/telemetry-netns.out"
@@ -108,7 +108,7 @@ EOF
         || { cat "$WORK/telemetry-guest.out"; dump_logs; fail "guest OTLP through mgmt-extract FloatingIP path"; }
     # A dependency-free static HTTP/2 client sends a real unary MetricsService
     # request and checks gRPC trailers. The helper is built only for this case.
-    GOWORK=off CGO_ENABLED=0 go build -trimpath -o "$WORK/telemetry-grpc-probe" "$SCRIPT_DIR/telemetryprobe/main.go"
+    GOWORK=off CGO_ENABLED=0 e2e_go build -trimpath -o "$WORK/telemetry-grpc-probe" "$SCRIPT_DIR/telemetryprobe/main.go"
     code=$(curl --noproxy '*' --unix-socket "$ENVD_SOCK" -sS --max-time 20 \
         -o "$WORK/telemetry-upload.json" -w '%{http_code}' -H "X-Access-Token: $ENVD_TOKEN" \
         -F "file=@$WORK/telemetry-grpc-probe;filename=telemetry-grpc-probe" \
