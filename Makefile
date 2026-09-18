@@ -75,6 +75,7 @@ node-stub-ctl:
 
 test:
 	CGO_ENABLED=0 $(GO) test ./...
+	bash test/e2e/runtask_privilege_test.sh
 	bash test/e2e/vmm_cgroup_test.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_cluster_stub_diagnostics.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_ownership.py'

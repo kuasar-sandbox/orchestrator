@@ -25,6 +25,9 @@ skip() {
 }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+# shellcheck source=test/e2e/lib/runtask_privilege.sh
+. "$SCRIPT_DIR/lib/runtask_privilege.sh"
+
 for b in "$ORCH" "$SANDBOX" "$FLATTEN"; do [ -x "$b" ] || skip "missing $b — run 'make build'"; done
 # ---- CLI smokes -----------------------------------------------------------
 WORK="$(mktemp -d /tmp/e2e-runtask-XXXXXX)"
@@ -39,6 +42,13 @@ cleanup() {
     [ -n "$DUP_UNIT" ] && systemctl reset-failed "$DUP_UNIT.service" >/dev/null 2>&1
     [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
     [ -n "${E2E_KEEP:-}" ] && echo "kept $WORK" || rm -rf "$WORK"
+}
+cleanup_before_privilege_reexec() {
+    # This is the first, unprivileged CLI-smoke workspace. It must never survive
+    # re-entry, even when E2E_KEEP asks the new root invocation to retain its own
+    # diagnostic workspace.
+    rm -rf "$WORK"
+    trap - EXIT
 }
 trap cleanup EXIT
 echo "==> CLI: config --template + round-trip (validate)"
@@ -67,7 +77,7 @@ echo "==> PASS: run-sandbox/run-builder + sandbox-ctl info reject bad invocation
 # still keeps the CLI smokes useful and skips only this production-topology case.
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v systemd-run >/dev/null 2>&1 || skip "systemd-run not on PATH"
-[ "$(id -u)" -eq 0 ] || skip "run-sandbox handoff requires a delegated systemd unit"
+runtask_enter_privileged cleanup_before_privilege_reexec "$SCRIPT_DIR/e2e_runtask.sh" "$@"
 systemctl show-environment >/dev/null 2>&1 || skip "systemd manager is unavailable"
 
 SOCK="$WORK/node-ctl.socket"
