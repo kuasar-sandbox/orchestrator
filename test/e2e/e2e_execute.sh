@@ -185,6 +185,9 @@ ORCH_BIN_DIR="$WORK/orch-bin"
 SNAPSHOT_ARGV_LOG="$WORK/snapshot-argv.jsonl"
 EXPORT_ARGV_LOG="$WORK/export-argv.jsonl"
 RUN_ARGV_LOG="$WORK/run-argv.jsonl"
+PAUSE_BARRIER_TARGET="$WORK/pause-barrier-target"
+PAUSE_BARRIER_REACHED="$WORK/pause-barrier-reached"
+PAUSE_BARRIER_RELEASE="$WORK/pause-barrier-release"
 mkdir -p "$ORCH_BIN_DIR"
 cp "$BIN/node-ctl" "$ORCH_BIN_DIR/node-ctl"
 for b in connector-ctl flatten-ctl manifest-ctl; do
@@ -199,6 +202,18 @@ import json, sys
 with open(sys.argv[1], "a", encoding="utf-8") as output:
     output.write(json.dumps(sys.argv[2:]) + "\\n")
 PY
+fi
+path_id=""
+if [ "\${1:-}" = "snapshot" ] && [ -f "$PAUSE_BARRIER_TARGET" ]; then
+    previous=""
+    for arg in "\$@"; do
+        if [ "\$previous" = "--path-id" ]; then path_id="\$arg"; break; fi
+        previous="\$arg"
+    done
+    if [ "\$path_id" = "\$(cat "$PAUSE_BARRIER_TARGET")" ]; then
+        : > "$PAUSE_BARRIER_REACHED"
+        while [ ! -e "$PAUSE_BARRIER_RELEASE" ]; do sleep 0.02; done
+    fi
 fi
 if [ "\${1:-}" = "export" ]; then
     python3 - "$EXPORT_ARGV_LOG" "\$@" <<'PY'
@@ -314,6 +329,7 @@ stop_owned_units() {
 cleanup() {
     local forwarding_clean=1
     set +e
+    [ -e "${PAUSE_BARRIER_TARGET:-}" ] && : > "$PAUSE_BARRIER_RELEASE"
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     stop_owned_units "$RUNNER_PREFIX" "$BUILDER_PREFIX"
     [ -n "$IMMEDIATE_DATA_PID" ] && kill "$IMMEDIATE_DATA_PID" 2>/dev/null
@@ -2046,25 +2062,56 @@ freeze_service_probe || fail "envd freeze service disappeared before local pause
 FREEZE_COUNTER_BEFORE_B=$FREEZE_COUNTER
 
 UNSET_CALL=$(snapshot_argv_count)
-echo "==> local pause with all policy fields unset; disconnect caller after 0.5s: $SID"
+echo "==> local pause with all policy fields unset; deterministically disconnect accepted caller: $SID"
+printf '%s\n' "$SID" > "$PAUSE_BARRIER_TARGET"
+rm -f "$PAUSE_BARRIER_REACHED" "$PAUSE_BARRIER_RELEASE"
+curl -sS --noproxy '*' -o "$WORK/pause-cancel.body" -w '%{http_code}' -X POST \
+    -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H 'Content-Type: application/json' \
+    --data '{}' "http://127.0.0.1:$PORT/sandboxes/$SID/pause" \
+    >"$WORK/pause-cancel.code" 2>"$WORK/pause-cancel.stderr" &
+PAUSE_CURL_PID=$!
+PIDS+=("$PAUSE_CURL_PID")
+for _ in $(seq 1 1500); do
+    [ -e "$PAUSE_BARRIER_REACHED" ] && break
+    if ! kill -0 "$PAUSE_CURL_PID" 2>/dev/null; then
+        wait "$PAUSE_CURL_PID" 2>/dev/null || true
+        for i in "${!PIDS[@]}"; do
+            [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+        done
+        fail "Pause HTTP client completed before snapshot barrier"
+    fi
+    sleep 0.02
+done
+[ -e "$PAUSE_BARRIER_REACHED" ] || fail "accepted Pause did not reach deterministic snapshot barrier"
+if ! kill -0 "$PAUSE_CURL_PID" 2>/dev/null; then
+    wait "$PAUSE_CURL_PID" 2>/dev/null || true
+    for i in "${!PIDS[@]}"; do
+        [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+    done
+    fail "Pause HTTP client completed before deterministic cancellation"
+fi
+if ! kill -TERM "$PAUSE_CURL_PID"; then
+    if ! kill -0 "$PAUSE_CURL_PID" 2>/dev/null; then
+        wait "$PAUSE_CURL_PID" 2>/dev/null || true
+        for i in "${!PIDS[@]}"; do
+            [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+        done
+    fi
+    fail "could not cancel Pause HTTP client"
+fi
 set +e
-code=$(curl -sS --noproxy '*' --max-time 0.5 \
-    -o "$WORK/pause-cancel.body" -w '%{http_code}' \
-    -X POST \
-    -H "Host: api.$DOMAIN" \
-    -H "X-API-KEY: $AK" \
-    -H 'Content-Type: application/json' \
-    --data '{}' \
-    "http://127.0.0.1:$PORT/sandboxes/$SID/pause" \
-    2>"$WORK/pause-cancel.stderr")
+wait "$PAUSE_CURL_PID"
 PAUSE_CURL_RC=$?
 set -e
-[ "$PAUSE_CURL_RC" = "28" ] || {
-    cat "$WORK/pause-cancel.stderr" >&2
-    fail "pause cancellation curl rc=$PAUSE_CURL_RC http=$code (want timeout rc=28)"
-}
+# The client has been reaped; cleanup must not signal a later user of its PID.
+for i in "${!PIDS[@]}"; do
+    [ "${PIDS[$i]}" = "$PAUSE_CURL_PID" ] && unset 'PIDS[i]'
+done
+[ "$PAUSE_CURL_RC" = 143 ] || fail "Pause HTTP client cancellation rc=$PAUSE_CURL_RC (want SIGTERM 143)"
+: > "$PAUSE_BARRIER_RELEASE"
+rm -f "$PAUSE_BARRIER_TARGET"
 wait_sandbox_state "$SID" paused 1200 || {
-    echo "==> pause client timed out but durable state did not become paused:"
+    echo "==> pause client canceled at snapshot barrier but durable state did not become paused:"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
     SID_JOURNAL=$(journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
@@ -2092,7 +2139,7 @@ B_ARTIFACT="$(readlink -f "$B_LOCAL")"
 B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
 "$BIN/sandbox-ctl" info --json "$B_LOCAL" >"$WORK/b-local.json" \
     || fail "all-unset local B is not a readable snapshot bundle"
-echo "==> PASS: caller timed out, accepted all-unset Pause still committed B and passed no policy flags"
+echo "==> PASS: caller canceled at accepted barrier; all-unset Pause still committed B and passed no policy flags"
 
 echo "==> accept paused -> starting through POST /connect, then activate native exec immediately"
 code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113}')
