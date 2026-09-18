@@ -638,33 +638,53 @@ print(balloon.get("size", -1), info.get("memory_actual_size", -1))
 }
 
 wait_for_b2_guest_delivery() {
-    local sid="$1" pid="$2" node_reservation="$3" timeout="$4" target_baseline="$5"
+    local sid="$1" pid="$2" timeout="$3" target_baseline="$4"
     local capacity=$((B_CAP_MIB * 1024 * 1024))
     local deadline=$((SECONDS + timeout)) state="" target=-1 actual=-1 applied_budget=0
+    local node_reservation=-1 reservation_status=not_sampled ch_status=unavailable
     while [ "$SECONDS" -lt "$deadline" ]; do
+        target=-1 actual=-1 applied_budget=0 node_reservation=-1
+        ch_status=unavailable reservation_status=not_sampled
         state=$(read_ch_balloon_state "$sid" 2>/dev/null) || state=""
         if read -r target actual <<<"$state" \
-            && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] \
-            && [ "$target" -lt "$target_baseline" ]; then
+            && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]]; then
             [ "$target" -le "$capacity" ] && [ "$actual" -le "$capacity" ] \
                 || fail "$sid: CH balloon state exceeds Capacity (target=$target actual=$actual capacity=$capacity)"
-            applied_budget=$((capacity - target))
-            if [ "$applied_budget" -le "$node_reservation" ]; then
-                b2_timeline_event "$sid" \
-                    "grow_target_accepted target=$target current_budget=$actual applied_budget=$applied_budget node_reservation=$node_reservation"
-                return 0
+            ch_status=not_reduced
+            if [ "$target" -lt "$target_baseline" ]; then
+                ch_status=accepted
+                applied_budget=$((capacity - target))
+                # Read the exact live authorization after the CH observation.
+                # Later grants may supersede the one captured at the workload gate.
+                # Failed reads never retain an earlier, possibly larger value.
+                reservation_status=unavailable
+                if node_reservation=$(resource_reservation_memory "$sid") \
+                    && [[ "$node_reservation" =~ ^[0-9]+$ ]] \
+                    && [ "$node_reservation" -le "$capacity" ]; then
+                    reservation_status=insufficient
+                    if [ "$applied_budget" -le "$node_reservation" ]; then
+                        reservation_status=covered
+                    fi
+                fi
             fi
         fi
+        # Matching observations cannot hide an already-failed sandbox.
         if guest_self_cap_observed "$sid"; then
             b2_timeline_event "$sid" "self_cap_before_guest_delivery"
             fail "$sid: guest self-cap fired before controller grant delivery"
         fi
         kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before controller grant delivery"
+        if [ "$reservation_status" = covered ]; then
+            b2_timeline_event "$sid" \
+                "grow_target_accepted target=$target current_budget=$actual applied_budget=$applied_budget node_reservation=$node_reservation"
+            echo "$node_reservation"
+            return 0
+        fi
         sleep 0.25
     done
     b2_timeline_event "$sid" \
-        "grow_target_timeout target=$target current_budget=$actual applied_budget=$applied_budget node_reservation=$node_reservation"
-    fail "$sid: reserved grow target was not CH-accepted within ${timeout}s (target=$target actual=$actual reservation=$node_reservation)"
+        "grow_target_timeout ch_status=$ch_status target=$target current_budget=$actual applied_budget=$applied_budget reservation_status=$reservation_status node_reservation=$node_reservation"
+    fail "$sid: CH grow target lacked a live sufficient reservation within ${timeout}s (ch_status=$ch_status target=$target actual=$actual applied_budget=$applied_budget reservation_status=$reservation_status reservation=$node_reservation)"
 }
 
 wait_for_static_grow_delivery() {
@@ -1013,8 +1033,8 @@ phase_b2_dynamic_control() {
     b2_timeline_event "$sid" "grant_decision reservation=$node_reservation"
     b2_timeline_event "$sid" "grant_applied log=$grow_line"
 
-    wait_for_b2_guest_delivery \
-        "$sid" "$pid" "$node_reservation" "$B2_DELIVERY_TIMEOUT" "$target_reference"
+    node_reservation=$(wait_for_b2_guest_delivery \
+        "$sid" "$pid" "$B2_DELIVERY_TIMEOUT" "$target_reference")
     open_workload_gate "$sid" "$delivery_gate" delivery
     b2_timeline_event "$sid" "delivery_gate_open"
     wait_for_b2_workload "$sid" "$pid" 45
