@@ -16,6 +16,8 @@ import time
 import urllib.error
 import urllib.request
 
+from placer_readiness import wait_for_placer
+
 
 def command(*args):
     return subprocess.check_output(args, text=True, timeout=30).strip()
@@ -42,6 +44,8 @@ def main():
     parser.add_argument("--timeout-only", type=int, default=0, metavar="SECONDS")
     parser.add_argument("--restart-request")
     parser.add_argument("--restart-ready")
+    parser.add_argument("--placer-url")
+    parser.add_argument("--expected-node")
     args = parser.parse_args()
     key = os.environ["BUILD_ACTION_API_KEY"]
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -263,6 +267,12 @@ def main():
             wait_for("fixture Router/Registry restart", lambda: Path(args.restart_ready).exists(), 60)
             value, _ = require("GET", status_path(wt, wb), 200)
             assert value["status"] == "ready" and value["templateID"] == canonical, value
+            # Keep the retained-status request above as the first post-restart
+            # operation through empty Router/Registry caches. Only after that
+            # assertion may we synchronize the placer for new placements.
+            if args.placer_url:
+                assert args.expected_node, "--placer-url requires --expected-node"
+                wait_for_placer(args.placer_url, args.group, args.expected_node)
 
         # Image reuse has the exact same PersistID, so deleting the waiter
         # must preserve a concurrently retained Build of the same artifact.
