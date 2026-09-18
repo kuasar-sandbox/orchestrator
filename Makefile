@@ -81,6 +81,7 @@ test:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_pause_cancellation.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_recovery.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_density_*.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_orchestrator_proxy_go.py'
 
 vet:
 	CGO_ENABLED=0 $(GO) vet ./...
