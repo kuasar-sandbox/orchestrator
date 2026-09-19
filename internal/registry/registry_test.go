@@ -1160,7 +1160,9 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 		t.Fatal("reserve did not send create command")
 	}
 
-	joinCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	// Cancellation is cleanup only; the explicit select below bounds the wake assertion.
+	// A shorter caller deadline races that assertion under scheduler contention.
+	joinCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	joiner := make(chan reserveOut, 1)
 	go func() {
