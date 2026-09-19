@@ -57,6 +57,16 @@ trap 'rm -rf "$journal_work"' EXIT
 journal=(journalctl)
 if [ "$(id -u)" -ne 0 ]; then journal=(sudo -n journalctl); fi
 for script in "${cases[@]}"; do
+    case "${ORCHESTRATOR_E2E_GROUP:-all}:$(basename "$script")" in
+        a:e2e_builder_unit_upgrade.sh|a:e2e_cluster_real.sh|a:e2e_cluster_stub.sh|a:e2e_run_builder.sh)
+            ;;
+        a:*)
+            continue
+            ;;
+        b:e2e_builder_unit_upgrade.sh|b:e2e_cluster_real.sh|b:e2e_cluster_stub.sh|b:e2e_run_builder.sh)
+            continue
+            ;;
+    esac
     echo
     echo "========================================="
     echo "  orchestrator/$(basename "$script")"
