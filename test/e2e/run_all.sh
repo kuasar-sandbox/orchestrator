@@ -14,6 +14,23 @@ export REQUIRE_PROXY=1
 export REQUIRE_BUILDER=1
 export REQUIRE_RUNTASK=1
 
+# Source integration runs source-wide checks exactly once, before the KVM
+# lifecycle suite. Binary-only staged packages intentionally have no Go source.
+if [ -n "${CANDIDATE_REPOSITORY:-}" ]; then
+    source_root="$(go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/orchestrator)"
+    [ -f "$source_root/go.mod" ] || {
+        echo "orchestrator source integration checkout is missing" >&2
+        exit 1
+    }
+    (
+        cd "$source_root"
+        echo "==> orchestrator source unit, race and vet regressions"
+        CGO_ENABLED=0 go test -count=1 -timeout=5m ./...
+        CGO_ENABLED=1 go test -race -count=1 -timeout=5m ./...
+        CGO_ENABLED=0 go vet ./...
+    )
+fi
+
 # A cancelled execute case may be killed before its EXIT trap. Recover the
 # exact root-owned reservation before an earlier fixed-name case tries to add
 # the same floating-IP return route.
@@ -56,6 +73,20 @@ for script in "${cases[@]}"; do
         cursor="$(sed -n 's/^-- cursor: //p' "$journal_work/cursor" | tail -1)"
         [ -n "$cursor" ] || { echo "cannot capture native journal cursor" >&2; exit 1; }
     fi
+    case "$(basename "$script")" in
+        e2e_mmds_routes.sh|e2e_mmds_routes_proxy_restart.sh)
+            echo "==> covered by the corresponding owner lifecycle with MMDS enabled"
+            continue
+            ;;
+        e2e_execute.sh|e2e_orchestrator_proxy.sh)
+            export MMDS_ROUTES_E2E=1
+            export MMDS_SECRET_INITIAL_VALUE=MMDS_SECRET_INITIAL_GUEST_E2E
+            export REQ_MMDS_HEADER='{"secrets":{"e2e_secret":"MMDS_SECRET_INITIAL_GUEST_E2E"},"routes":[{"path":"/e2e/static","data":"MMDS_STATIC_GUEST_E2E"},{"path":"/e2e/secret","type":"secret","secret":"e2e_secret","content_type":"application/x-kuasar-e2e-secret"},{"path":"/e2e/unresolved","type":"secret","secret":"e2e_unresolved"},{"path":"/e2e/service","type":"service","service":"e2e_service"}]}'
+            ;;
+        *)
+            unset MMDS_ROUTES_E2E MMDS_SECRET_INITIAL_VALUE REQ_MMDS_HEADER || true
+            ;;
+    esac
     bash "$script"
     if [ -n "$kind" ]; then
         "${journal[@]}" --sync
