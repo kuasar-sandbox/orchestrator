@@ -9,20 +9,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SCRIPT_DIR/lib" -p t
 if [[ "${REQUIRE_PROXY:-0}" = 1 || -n "${GOROOT:-}" ]] || command -v go >/dev/null 2>&1; then
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SCRIPT_DIR/lib" -p test_orchestrator_proxy_go.py -v
 fi
-SOURCE=""
-if command -v go >/dev/null 2>&1; then
-    SOURCE="$(GOPROXY=off GOSUMDB=off go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/orchestrator 2>/dev/null || true)"
-fi
-if [[ -n "$SOURCE" && -f "$SOURCE/internal/orch/log_targets_test.go" ]]; then
-    (
-        cd "$SOURCE"
-        echo "==> journal contract: full orchestrator source checks ($SOURCE)"
-        go version
-        go test -count=1 -timeout=5m ./...
-        CGO_ENABLED=1 go test -race -count=1 -timeout=5m ./...
-        go vet ./...
-    )
-else
-    echo "Source-only Go checks unavailable; native identity checks remain in the owner lifecycle suite."
-fi
+# Source-wide checks are scheduled once by run_all.sh. This case only keeps
+# the journal/proxy contracts that need the packaged E2E surface.
+
 echo "==> e2e_journal_contract: OK"
