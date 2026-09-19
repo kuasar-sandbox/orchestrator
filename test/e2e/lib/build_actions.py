@@ -50,6 +50,7 @@ def main():
     key = os.environ["BUILD_ACTION_API_KEY"]
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     evidence = []
+    post_restart = False
 
     def request(method, path, body=None, header=None):
         headers = {"Host": args.host, "X-API-KEY": key}
@@ -86,6 +87,11 @@ def main():
             return dict(value) if value else None
 
     def register(label, target=None):
+        if post_restart and args.placer_url:
+            # Watch failover can invalidate a previously ready view between
+            # Build actions. Recheck before each new registration, not the write.
+            assert args.expected_node, "--placer-url requires --expected-node"
+            wait_for_placer(args.placer_url, args.group, args.expected_node)
         value, _ = require("POST", "/v3/templates", 202,
                            {"name": "issue372-" + label, "cpuCount": args.cpu, "memoryMB": 6144},
                            header=json.dumps({"target": target}) if target else None)
@@ -267,12 +273,9 @@ def main():
             wait_for("fixture Router/Registry restart", lambda: Path(args.restart_ready).exists(), 60)
             value, _ = require("GET", status_path(wt, wb), 200)
             assert value["status"] == "ready" and value["templateID"] == canonical, value
-            # Keep the retained-status request above as the first post-restart
-            # operation through empty Router/Registry caches. Only after that
-            # assertion may we synchronize the placer for new placements.
-            if args.placer_url:
-                assert args.expected_node, "--placer-url requires --expected-node"
-                wait_for_placer(args.placer_url, args.group, args.expected_node)
+            # Keep retained status as the first operation through empty caches.
+            # Later registrations each synchronize their current placement view.
+            post_restart = True
 
         # Image reuse has the exact same PersistID, so deleting the waiter
         # must preserve a concurrently retained Build of the same artifact.
