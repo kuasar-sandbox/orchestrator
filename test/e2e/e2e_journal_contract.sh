@@ -11,5 +11,6 @@ if [[ "${REQUIRE_PROXY:-0}" = 1 || -n "${GOROOT:-}" ]] || command -v go >/dev/nu
 fi
 # Source-wide checks are scheduled once by run_all.sh. This case only keeps
 # the journal/proxy contracts that need the packaged E2E surface.
+echo "Source-wide Go checks are owned by run_all.sh; native identity checks remain in the owner lifecycle suite."
 
 echo "==> e2e_journal_contract: OK"
