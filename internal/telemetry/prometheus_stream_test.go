@@ -117,8 +117,8 @@ func prometheusChunk(t testing.TB, id string, stamp int64) *prompb.ChunkedReadRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	appender.Append(stamp, 2)
-	appender.Append(stamp+1000, 4)
+	appender.Append(0, stamp, 2)
+	appender.Append(0, stamp+1000, 4)
 	return &prompb.ChunkedReadResponse{ChunkedSeries: []*prompb.ChunkedSeries{{
 		Labels: []prompb.Label{{Name: "__name__", Value: "sandbox.cpu.count"}, {Name: SandboxIDAttribute, Value: id}, {Name: sourceAttribute, Value: "envd"}, {Name: "otel.kind", Value: "Gauge"}},
 		Chunks: []prompb.Chunk{{Type: prompb.Chunk_XOR, MinTimeMs: stamp, MaxTimeMs: stamp + 1000, Data: chunk.Bytes()}},
