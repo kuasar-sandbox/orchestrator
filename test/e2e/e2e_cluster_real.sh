@@ -606,10 +606,10 @@ make_ext4_templates() {
     [ -x "$MKFS_EXT4" ] || skip "mkfs.ext4 not found"
     OVL="$WORK/overlay-1G.ext4"
     truncate -s 1G "$OVL"
-    "$MKFS_EXT4" -F -q -b 4096 "$OVL" >"$WORK/mkfs-overlay.log" 2>&1 || { cat "$WORK/mkfs-overlay.log"; fail "mkfs overlay"; }
+    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs-overlay.log" 2>&1 || { cat "$WORK/mkfs-overlay.log"; fail "mkfs overlay"; }
     BLD="$WORK/builder-2G.ext4"
     truncate -s 2G "$BLD"
-    "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-builder.log" 2>&1 || { cat "$WORK/mkfs-builder.log"; fail "mkfs builder"; }
+    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-builder.log" 2>&1 || { cat "$WORK/mkfs-builder.log"; fail "mkfs builder"; }
 }
 
 build_template_with_standalone_node() {

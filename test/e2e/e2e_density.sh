@@ -169,7 +169,7 @@ setup_sb() {
     ip tuntap add "${sid}-tap" mode tap 2>/dev/null || true
     ip link set "${sid}-tap" up
     truncate -s 1G "$WORK/${sid}.diff"
-    mkfs.ext4 -q -F "$WORK/${sid}.diff"
+    mkfs.ext4 -q -F -O ^has_journal "$WORK/${sid}.diff"
 }
 
 # emit_yaml SID MODE HEADROOM_MIB CAP_MIB STARTUP_MIB DUR CYCLES RMIN_MIB RMAX_MIB DEFLATE START_GATE DELIVERY_GATE
