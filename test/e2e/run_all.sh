@@ -14,14 +14,17 @@ export REQUIRE_PROXY=1
 export REQUIRE_BUILDER=1
 export REQUIRE_RUNTASK=1
 
-# Source integration runs source-wide checks exactly once, before the KVM
-# lifecycle suite. Binary-only staged packages intentionally have no Go source.
-if [ -n "${CANDIDATE_REPOSITORY:-}" ]; then
-    source_root="$(go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/orchestrator)"
-    [ -f "$source_root/go.mod" ] || {
-        echo "orchestrator source integration checkout is missing" >&2
-        exit 1
-    }
+# Source-wide checks run exactly once at the owner-suite boundary. CI source
+# mode requires the module; documented local source runs discover it directly.
+source_root=""
+if command -v go >/dev/null 2>&1; then
+    source_root="$(GOPROXY=off GOSUMDB=off go list -m -f '{{.Dir}}' github.com/kuasar-sandbox/orchestrator 2>/dev/null || true)"
+fi
+if [ -n "${CANDIDATE_REPOSITORY:-}" ] && { [ -z "$source_root" ] || [ ! -f "$source_root/go.mod" ]; }; then
+    echo "orchestrator source integration checkout is missing" >&2
+    exit 1
+fi
+if [ -n "$source_root" ] && [ -f "$source_root/go.mod" ]; then
     (
         cd "$source_root"
         echo "==> orchestrator source unit, race and vet regressions"
