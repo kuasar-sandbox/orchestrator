@@ -134,7 +134,7 @@ func TestPublishCheckpointArtifactArgsManifestStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"publish", "--quiet", "--manifest-config", "/etc/flatten/manifest.yaml",
+		"publish", "--json", "--quiet", "--manifest-config", "/etc/flatten/manifest.yaml",
 		"--ref-location", "source-image=file:///mnt/source", "/work/build.snapshot",
 	}
 	if !reflect.DeepEqual(args, want) {

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +23,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	fs := flag.NewFlagSet("export-sandbox", flag.ContinueOnError)
 	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
 	toTemplate := fs.Bool("to-template", false, "publish + print a reusable snapshot template id instead of a migration token")
+	asJSON := fs.Bool("json", false, "print the complete export result and publication references")
 	keepSource := fs.Bool("keep-source", false, "retain the paused source after successful export finalization (default: delete it)")
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -29,7 +32,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 		sid = fs.Arg(0)
 	}
 	if sid == "" {
-		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]")
+		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]")
 	}
 	apiKey := os.Getenv("E2B_API_KEY")
 	if apiKey == "" {
@@ -44,12 +47,18 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	if code != http.StatusOK {
 		return fmt.Errorf("export-sandbox: %s", apiMessage(resp))
 	}
-	var out struct {
-		Result string `json:"result"`
+	var out types.ExportResult
+	if err := strictjson.Decode(resp, &out); err != nil {
+		return fmt.Errorf("export-sandbox: %w", err)
 	}
-	_ = json.Unmarshal(resp, &out)
-	fmt.Println(out.Result)
-	return nil
+	if err := out.Validate(); err != nil {
+		return fmt.Errorf("export-sandbox: %w", err)
+	}
+	if *asJSON {
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+	_, err = fmt.Fprintln(os.Stdout, out.Result)
+	return err
 }
 
 // importSandboxCmd implements `node-ctl import-sandbox <token>` as a client of

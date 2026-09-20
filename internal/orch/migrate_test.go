@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -59,7 +60,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	}
 	o.cache(sb)
 
-	tok, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
+	tok, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, false, false)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestArtifactKindRoundTripsThroughTemplateAndMigrationToken(t *testing.T) {
 			}
 			o.cache(source)
 
-			templateID, err := o.ExportSandbox(ctx, apiKey, source.ID, true, true)
+			templateID, err := o.exportSandboxTokenForTest(ctx, apiKey, source.ID, true, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +147,7 @@ func TestArtifactKindRoundTripsThroughTemplateAndMigrationToken(t *testing.T) {
 				t.Fatalf("template = %+v, %v; want kind=%s ref=%s", template, err, test.templateKind, sourceRef)
 			}
 
-			token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+			token, err := o.exportSandboxTokenForTest(ctx, apiKey, source.ID, false, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,7 +324,7 @@ func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	mk := strings.Repeat("6", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
 
-	if _, err := o.ExportSandbox(ctx, apiKey, "missing", false, true); !errors.Is(err, api.ErrNotFound) {
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, "missing", false, true); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("missing export error = %v, want ErrNotFound", err)
 	}
 
@@ -332,10 +333,10 @@ func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := o.ExportSandbox(ctx, "wrong-api-key", sb.ID, false, true); !errors.Is(err, api.ErrNotFound) {
+	if _, err := o.exportSandboxTokenForTest(ctx, "wrong-api-key", sb.ID, false, true); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("non-owner export error = %v, want ErrNotFound", err)
 	}
-	if _, err := o.ExportSandbox(ctx, apiKey, sb.ID, false, true); !errors.Is(err, api.ErrBadRequest) {
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sb.ID, false, true); !errors.Is(err, api.ErrBadRequest) {
 		t.Fatalf("running export error = %v, want ErrBadRequest", err)
 	}
 }
@@ -361,7 +362,7 @@ func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 	if err := o.st.Put(ctx, source); err != nil {
 		t.Fatal(err)
 	}
-	token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+	token, err := o.exportSandboxTokenForTest(ctx, apiKey, source.ID, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +415,7 @@ func TestImportRejectsLocationUnsafeStableID(t *testing.T) {
 	if err := o.st.Put(ctx, source); err != nil {
 		t.Fatal(err)
 	}
-	token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+	token, err := o.exportSandboxTokenForTest(ctx, apiKey, source.ID, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +617,7 @@ func TestExportKeepSourceProducesPortableResultWithoutChangingSource(t *testing.
 			events, cancel := o.Subscribe()
 			defer cancel()
 
-			templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+			templateID, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true)
 			if err != nil {
 				t.Fatalf("export: %v", err)
 			}
@@ -628,7 +629,7 @@ func TestExportKeepSourceProducesPortableResultWithoutChangingSource(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(args), "publish --quiet") || !strings.Contains(string(args), localRef) ||
+			if !strings.Contains(string(args), "publish --json --quiet") || !strings.Contains(string(args), localRef) ||
 				strings.Contains(string(args), "upload-snapshot") {
 				t.Fatalf("publication argv = %q", args)
 			}
@@ -676,12 +677,12 @@ func TestExportRejectsUnownedLocalArtifactBeforePublishOrCleanup(t *testing.T) {
 	}
 	o.cache(sb)
 	publishCalled := false
-	o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error) {
+	o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error) {
 		publishCalled = true
-		return types.ResumeSource{}, nil
+		return artifact.PublishReport{}, nil
 	}
 
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil ||
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err == nil ||
 		!strings.Contains(err.Error(), "outside its owned capture path") {
 		t.Fatalf("unowned local artifact error = %v", err)
 	}
@@ -720,12 +721,12 @@ func TestExportRejectsNonCanonicalBaseDirBeforePublishOrCleanup(t *testing.T) {
 	}
 	o.cache(sb)
 	publishCalled := false
-	o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error) {
+	o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error) {
 		publishCalled = true
-		return types.ResumeSource{}, nil
+		return artifact.PublishReport{}, nil
 	}
 
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil ||
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err == nil ||
 		!strings.Contains(err.Error(), "does not match canonical path") {
 		t.Fatalf("non-canonical BaseDir error = %v", err)
 	}
@@ -760,7 +761,7 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 		"  case \"$a\" in\n" +
 		"    *=*)\n" +
 		"      n=${a%%=*}\n" +
-		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ".bundle@location:'\"$n\"\n" +
+		"      printf '%s\\n' '{\"snapshotRef\":\"file://" + strings.Repeat("c", 64) + ".bundle@location:'\"$n\"'\",\"sandboxRef\":\"manifest://" + strings.Repeat("e", 64) + "\",\"removedRefs\":[]}'\n" +
 		"      ;;\n" +
 		"  esac\n" +
 		"done\n"
@@ -774,7 +775,7 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	templateID, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -844,7 +845,7 @@ func TestExportKeepSourceSucceedsWithoutSourceWrites(t *testing.T) {
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	templateID, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true)
 	if err != nil || templateID == "" {
 		t.Fatalf("keep-source export should succeed without source writes: %q, %v", templateID, err)
 	}
@@ -885,7 +886,7 @@ func TestExportKeepSourceKeepsPortableSourceDespiteStaleLocalArtifact(t *testing
 	argsPath := filepath.Join(dir, "publish.args")
 	installPromoteRecordingStub(t, portableRef, argsPath)
 
-	result, err := o.ExportSandbox(ctx, apiKey, sb.ID, true, true)
+	result, err := o.exportSandboxTokenForTest(ctx, apiKey, sb.ID, true, true)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
@@ -932,11 +933,11 @@ func TestExportKeepSourceRepeatableFromSamePausedState(t *testing.T) {
 	o.cache(sb)
 	wantSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}
 
-	first, err := o.ExportSandbox(ctx, apiKey, sid, false, true)
+	first, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, false, true)
 	if err != nil || !strings.HasPrefix(first, "kmt1.") {
 		t.Fatalf("first export = %q, %v", first, err)
 	}
-	second, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	second, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true)
 	if err != nil {
 		t.Fatalf("second export: %v", err)
 	}
@@ -987,9 +988,9 @@ func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
 			Ref: "manifest://" + strings.Repeat("6", 64),
 		}.String(),
 		State: types.StateRunning, RunID: "cycle-run", VswitchPort: "cycle-port",
-		RunDir:     nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
-		BaseDir:    nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
-		APISecret:  apiSecret, ManifestKey: manifestKey, CreatedUnix: 1,
+		RunDir:    nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
+		BaseDir:   nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
+		APISecret: apiSecret, ManifestKey: manifestKey, CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -1026,7 +1027,7 @@ func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
 		t.Fatalf("re-paused source = %+v, %v", stored, err)
 	}
 
-	result, err := o.ExportSandbox(ctx, apiKey, sid, false, true)
+	result, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, false, true)
 	if err != nil || !strings.HasPrefix(result, "kmt1.") {
 		t.Fatalf("export after resume/pause cycle = %q, %v", result, err)
 	}
@@ -1066,7 +1067,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	tok, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
+	tok, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, false, false)
 	if err == nil || !strings.Contains(err.Error(), "delete source") || tok != "" {
 		t.Fatalf("move export returned the wrong token/error state: %v", err)
 	}
@@ -1111,7 +1112,11 @@ func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrat
 	cfg.Sandbox.Boot.Runtime = runtimePath
 	cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
-	return testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
+	o := testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
+	o.snapshotSandboxRef = func(context.Context, *types.Sandbox, types.ResumeSource) (string, error) {
+		return "manifest://" + strings.Repeat("e", 64), nil
+	}
+	return o
 }
 
 type migrationCredentials struct {
@@ -1168,7 +1173,7 @@ func installPromoteStub(t *testing.T, mref string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sandbox-ctl")
-	script := "#!/bin/sh\nprintf '%s\\n' '" + mref + "'\n"
+	script := "#!/bin/sh\n" + promoteReportScript(mref)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1179,7 +1184,7 @@ func installPromoteRecordingStub(t *testing.T, mref, argsPath string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sandbox-ctl")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\nprintf '%s\\n' '" + mref + "'\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\n" + promoteReportScript(mref)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -386,7 +386,7 @@ serve daemon **api 平面**的客户端(经本机控制 socket 调 `POST /sandbo
 与 `POST /sandboxes/import`),鉴权 `E2B_API_KEY` env(须属主)。语义见 §8.1。
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]
+node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
@@ -403,6 +403,11 @@ node-ctl import-sandbox <token> [--socket S]
   写入 paused 行并打印 sid;目标已存在返回 409。API body 可通过可选 `sandboxID` 指定另一
   个 node-local target,但不会改变逻辑认证主体或既有 service credential。随后调用
   `connect` 即可异步恢复。
+
+`--json` 输出完整的成功 Export API 响应；默认仍只打印一行 `result`（token 或
+TemplateID），发布进度不会进入 stdout。无效/尾随 JSON、被污染的 stdout、缺少 result
+或根、错误根角色、不安全本地引用，以及 TemplateID 与根不一致都会明确失败。客户端也
+检查响应读取错误，不会把空凭据打印为成功。完整响应契约见 §8.1.4。
 
 ### 2.8 `e2b-key-ctl`
 
@@ -1829,10 +1834,10 @@ memory restore 不声称重新注入它们。persistent env/files 只随明确�
 本机 E/S 都通过同一命令发布:
 
 ```text
-sandbox-ctl publish --manifest-config <cfg> [--to-ref-location <name>=<uri>] <artifact>
+sandbox-ctl publish --json --quiet --manifest-config <cfg> [--to-ref-location <name>=<uri>] <artifact>
 ```
 
-`promoteArtifact` 接受并返回 `ResumeSource`,kind 不变。没有 named location 时发布到 Manifest Store;
+发布适配器读取并验证 JSON 报告，保持 `ResumeSource` 的 kind 不变。没有 named location 时发布到 Manifest Store;
 配置 `checkpoint.remote.ref_location_parent` 时,publication name 为实体 id——sandbox 发布用
 StableID、build 发布用 BuildID(见 `reflocation.PublicationName`),URI 为
 `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`。local tarstream 可得到 located
@@ -1849,6 +1854,43 @@ named publication 收敛到同一个 BuildID 目录。目录内内容寻址的 `
 日期分区清理,而是基于引用可达性(portable ref / TemplateID / migration token 指向的目录与文件),
 属于未来 management plane 职责。conductor 与 task reader 共用 `internal/reflocation` 的
 deterministic 解析,location name 自足,恢复不依赖额外 side table。
+
+需属主鉴权的 `POST /sandboxes/{id}/export` 请求仍为
+`{"toTemplate":false,"keepSource":true}`。成功响应保留既有 `result`，恰好增加对应的
+发布根引用与 `removedRefs`。Sandbox 响应有三个字段：
+
+```json
+{"result":"kmt1.…","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":[]}
+```
+
+Snapshot 响应有四个字段：
+
+```json
+{"result":"kmt1.…","snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.snapshot"]}
+```
+
+`toTemplate:true` 仅把 `result` 的含义改为对应 `sbx`/`snp` TemplateID。Snapshot 始终
+返回最终 S 实际引用的 E，包括选中的 located Bundle 成员。发布适配器严格解析单个
+`sandbox-ctl publish --json` 文档，并在源 finalization **之前**检查期望 S/E 角色、
+portable 最终根、必需的最终 E、有序唯一差集和安全文件 basename，不把诊断 stderr 当作
+成功结果。Builder checkpoint publication 共用同一契约。Core 方法统一返回
+`types.ExportResult`，HTTP 的 `result` 字段继续兼容既有客户端。采用新内部 CLI 契约时，
+sandboxer 与 orchestrator 应部署来自相匹配来源集的版本。
+
+已 portable 的源不再发布，返回 `removedRefs:[]`；portable Snapshot 从根元数据和实际
+carrier 绑定取得 E，不扫描依赖图，也不读取内存/磁盘 payload。必需元数据缺失或无效时，
+在 finalization 前失败。普通、keep-source、move 和已受理的 detached-template 成功分支
+均携带同一套一致根引用与差集。Resume/preemption、属主检查、生命周期取消、幂等及并发
+继续遵守下文原有顺序。
+
+差集表示已知旧拓扑减去最终保留引用，不是字段改写事件或删除命令；包含确实退出的本地根
+和内部引用，最终拓扑中其他位置仍使用的共享引用会排除。skip 模式中被替换旧引用即使
+可读也按叶子处理，显式原生 lower 列表仍属于已知引用。JSON 报告不增加 payload 扫描、
+摘要或 staging 文件。所有公开的无 location 文件引用都只有 basename，并保留既有
+`@digest`、`@hmac` 或 `@manifest` 身份；已具名 location 保留合法表示。先按完整来源
+上下文比较，再投影。调用方在外部提供 checkpoint 目录；响应不含路径、上下文、标识或
+字段映射对象。Bundle selector 退出不代表应删除物理 carrier。即使报告差集，
+`keepSource` 仍保留原源与 checkpoint。本变更不增加 GC、自动删除或远端删除行为。
 
 `TemplateID` 为 `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
 

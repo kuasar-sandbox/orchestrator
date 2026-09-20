@@ -37,6 +37,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -131,7 +132,8 @@ type Orchestrator struct {
 	// listener starts. The raw resource_listen socket is never a sandbox policy
 	// source.
 	resourceControllerSocketIdentity string
-	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error)
+	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error)
+	snapshotSandboxRef               func(context.Context, *types.Sandbox, types.ResumeSource) (string, error)
 	removeSandboxRunDir              func(string) error
 	removeSandboxBaseDir             func(string) error
 	removeBuildRunDir                func(string) error
@@ -2840,11 +2842,11 @@ func appendSnapshotPolicyArgs(args []string, policy sandboxcfg.SnapshotPolicy) [
 
 // promote publishes a local Sandbox or Snapshot graph without booting it. The configured
 // publisher is either manifest storage or a named ref location.
-func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source types.ResumeSource) (types.ResumeSource, error) {
+func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source types.ResumeSource) (artifact.PublishReport, error) {
 	if !source.Valid() {
-		return types.ResumeSource{}, fmt.Errorf("orch: promote %s: invalid resume source", sb.ID)
+		return artifact.PublishReport{}, fmt.Errorf("orch: promote %s: invalid resume source", sb.ID)
 	}
-	args := []string{"publish", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
+	args := []string{"publish", "--json", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		// Publication location name: the sandbox's stable identity. The name
 		// is the directory key, so every publication of one logical entity —
@@ -2856,7 +2858,7 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 		locName := reflocation.PublicationName(sb.StableID())
 		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
 		if err != nil {
-			return types.ResumeSource{}, fmt.Errorf("orch: promote %s: %w", sb.ID, err)
+			return artifact.PublishReport{}, fmt.Errorf("orch: promote %s: %w", sb.ID, err)
 		}
 		args = append(args, "--to-ref-location", locName+"="+uri)
 	}
@@ -2866,25 +2868,13 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return types.ResumeSource{}, fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+		return artifact.PublishReport{}, fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
 	}
-	ref := strings.TrimSpace(out.String())
-	parsed, err := types.ParsePortableRef(ref)
-	validSuffix := true
-	if err == nil && parsed.Scheme == "file" {
-		switch source.Kind {
-		case types.ResumeSourceSandbox:
-			validSuffix = strings.HasSuffix(parsed.Path, ".sandbox") || strings.HasSuffix(parsed.Path, ".bundle")
-		case types.ResumeSourceSnapshot:
-			validSuffix = strings.HasSuffix(parsed.Path, ".snapshot") || strings.HasSuffix(parsed.Path, ".bundle")
-		default:
-			validSuffix = false
-		}
+	report, err := artifact.DecodePublishReport(out.Bytes(), artifactRole(source.Kind))
+	if err != nil {
+		return artifact.PublishReport{}, fmt.Errorf("orch: promote: %w", err)
 	}
-	if err != nil || !validSuffix {
-		return types.ResumeSource{}, fmt.Errorf("orch: promote %s: invalid %s ref %q", sb.ID, source.Kind, ref)
-	}
-	return types.ResumeSource{Kind: source.Kind, Ref: ref}, nil
+	return report, nil
 }
 
 // udsClient builds an HTTP client for envd. The request context carries the

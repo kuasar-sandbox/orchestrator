@@ -262,7 +262,7 @@ node-ctl manifest-key list   [--socket S]
 These clients use conductor's local **API plane** for `POST /sandboxes/{id}/export` and `POST /sandboxes/import`. `E2B_API_KEY` must authenticate the owner. See §8.1.
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]
+node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
@@ -270,6 +270,13 @@ node-ctl import-sandbox <token> [--socket S]
 - `export-sandbox <sid> --to-template` publishes paused E or S and prints persistent `sbx`/`snp` templateID for fan-out. Source retention is identical: `--keep-source` retains it; omission deletes it.
 - Resume remains allowed during local-artifact upload. If Resume wins first, KMT Export cancels upload and returns 409, whereas Template Export continues and returns templateID. Both abandon the source finalizer without updating/deleting source or local artifact.
 - `import-sandbox <token>` defaults to source NodeSandboxID, inserts a paused row without overwriting and prints SID; an existing target returns 409. API body may choose another node-local `sandboxID`, retaining logical authentication identity and service credentials. A subsequent Connect accepts asynchronous resume.
+
+`--json` prints the complete successful Export API response. Default output remains
+one `result` line (token or template ID); quiet publication progress never enters
+stdout. Invalid/trailing JSON, polluted stdout, missing result or roots, wrong
+root role, unsafe local refs and incoherent template/root pairs fail explicitly.
+The client also checks response read errors. No empty credential is printed as
+success. The full response contract is documented in §8.1.4.
 
 ### 2.8 `e2b-key-ctl`
 
@@ -1293,12 +1300,60 @@ Node-generated hosts/resolv.conf use ephemeral_files during cold launch, not por
 Both local E/S use:
 
 ```text
-sandbox-ctl publish --manifest-config <cfg> [--to-ref-location <name>=<uri>] <artifact>
+sandbox-ctl publish --json --quiet --manifest-config <cfg> [--to-ref-location <name>=<uri>] <artifact>
 ```
 
-promoteArtifact preserves ResumeSource kind. Without a named parent, it publishes to Manifest Store. With checkpoint.remote.ref_location_parent, name is the entity id — the sandbox StableID for E/S publication, the BuildID for build publication (see reflocation.PublicationName) — and URI is `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`. Tarstream results are located sandbox/snapshot refs using digest or hmac identity; Bundle results use manifest root selectors. Manifest config is supplied even for named publication because exact Bundle publication validates its Manifest graph. Bundle→Store verifies recorded admission, physical digest and salt domain and commits root last.
+The publication adapter consumes and validates the JSON report while preserving ResumeSource kind. Without a named parent, it publishes to Manifest Store. With checkpoint.remote.ref_location_parent, name is the entity id — the sandbox StableID for E/S publication, the BuildID for build publication (see reflocation.PublicationName) — and URI is `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`. Tarstream results are located sandbox/snapshot refs using digest or hmac identity; Bundle results use manifest root selectors. Manifest config is supplied even for named publication because exact Bundle publication validates its Manifest graph. Bundle→Store verifies recorded admission, physical digest and salt domain and commits root last.
 
 The name itself is the directory key: every publication of one logical entity — retries, process restarts, re-exports after an import changed the target id, cluster generations — converges on one directory where content-addressed `<digest>.<role>` files accumulate as versions and same-content files are deduplicated by the publisher. Two SHA-256 fan-out levels limit entries. GC must be reference-aware (reachability over the directories and files pointed to by portable refs / TemplateIDs / migration tokens), never age-based: publication age is not the lifetime of its references. Retention/reachability/in-flight-publication GC and safe remote deletion are outside node lifecycle. Conductor/tasks share deterministic internal/reflocation resolution; the location name is self-sufficient without side tables.
+
+The authenticated `POST /sandboxes/{id}/export` request remains
+`{"toTemplate":false,"keepSource":true}`. Its successful response preserves the
+existing `result` field and adds exactly the corresponding publication roots and
+`removedRefs`. A Sandbox response has three fields:
+
+```json
+{"result":"kmt1.…","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":[]}
+```
+
+A Snapshot response has four:
+
+```json
+{"result":"kmt1.…","snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.snapshot"]}
+```
+
+For `toTemplate:true`, only the meaning of `result` changes to the corresponding
+`sbx`/`snp` TemplateID. Snapshot always returns the E actually referenced by final
+S, including a selected located Bundle member. The publication adapter parses
+one strict `sandbox-ctl publish --json` document and checks expected S/E role,
+portable final roots, required final E, sorted unique removals and safe file
+basenames **before** source finalization. It never treats diagnostic stderr as a
+successful result. Builder checkpoint publication consumes the same contract.
+The Core method returns one `types.ExportResult`; the HTTP `result` field remains
+compatible with existing clients. Deploy sandboxer and orchestrator from the
+matching source set when adopting the new internal CLI contract.
+
+An already portable source is not republished and has `removedRefs:[]`. A
+portable Snapshot obtains E from root metadata and the selected carrier binding;
+it does not scan dependency graphs or read memory/disk payloads. Missing or
+invalid required metadata fails before finalization. The same roots and removals
+accompany normal, keep-source, move and accepted detached-template returns.
+Resume/preemption, ownership checks, lifecycle cancellation, idempotence and
+concurrency retain the ordering below.
+
+Removals describe the old known topology minus retained final references, not
+field rewrite events or deletion commands. They include local roots and internal
+refs that actually leave; shared refs retained elsewhere in the final topology
+are excluded. With skip verification, replaced old refs are leaves even if
+readable; explicit native lower lists remain known. No new payload scan, digest
+or staging file is introduced by JSON reporting. All unlocated public file refs
+are basenames with their existing `@digest`, `@hmac` or `@manifest` identity;
+named locations keep their legal representation. Full source scope is used for
+comparison before projection. The caller supplies the checkpoint directory
+externally; the response contains no path/context/identifier/field-mapping
+objects. A leaving Bundle selector does not imply deleting its physical carrier.
+`keepSource` retains the original source and checkpoint despite reported removals.
+No GC, automatic deletion or remote deletion behavior is added.
 
 TemplateID is `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
 

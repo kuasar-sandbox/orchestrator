@@ -356,3 +356,17 @@ Cleanup completes before PutBuildTerminal releases the claim; capacity notificat
 The two intent columns migrate additively as INTEGER NOT NULL DEFAULT 0; existing rows start at zero. Registry retains immutable registration transient ID separately from result PersistID and resolves group + transient ID to the original node. An older owner ref with a missing transient field is filled only from its still-matching route/binding. Provisional insertion, registration ACK/rejection and replay ref refresh compare the original identity and current revision so delayed work cannot replace a successor. Full node sync refreshes the projection under existing Registry bindings and removes missing rows after a lost BuildDelete. It does not reconstruct lost Registry ownership shards (§13 of cluster.md). Router forwards Query and Builder Header unchanged; node ownership is authoritative. Unavailable nodes, incomplete projection or failed authoritative lookup return service errors and never cause reassignment or speculative deletion.
 
 Upgrade node/router/Registry writers together under the existing version coordination. Before reverting to a writer that does not understand intent, stop new cancellation/deletion acceptance and converge all pending operations using the current version. An additive schema alone does not make rollback safe while intent remains. No long-term dual writer, new task table or compatibility service is required. Published canonical img/sbx/snp references, existing Sandboxes, downstream fromTemplate and other Builds sharing an artifact remain usable after record deletion; remote content is never removed.
+
+### Checkpoint publication reports
+
+The builder invokes `sandbox-ctl publish --json --quiet` for a checkpoint S and
+validates exactly `snapshotRef`, final `sandboxRef` and `removedRefs` before
+accepting the checkpoint. Roots must be portable and have the expected logical
+role; removals must be sorted, unique and safe public refs. Invalid/trailing JSON,
+missing roots and polluted stdout fail the build publication. Progress stderr is
+kept separate. The builder continues returning its canonical `snp` TemplateID;
+Export's additional HTTP report fields are documented in
+[node publication and migration](node.md#814-publication-templates-and-migration).
+Direct image/Sandbox `PublishSource` calls keep their existing role/ref contract,
+source ownership and streaming behavior. Reporting introduces no payload cache,
+extra staging files, GC or deletion authority.

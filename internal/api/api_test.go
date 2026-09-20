@@ -1064,8 +1064,8 @@ func TestImportSandboxAcceptsMaximumTokenAndTarget(t *testing.T) {
 }
 
 func TestExportSandboxMapsTokenTooLarge(t *testing.T) {
-	core := &migrationCoreStub{exportSandbox: func(context.Context, string, string, bool, bool) (string, error) {
-		return "", fmt.Errorf("private export detail: %w", migrationtoken.ErrTokenTooLarge)
+	core := &migrationCoreStub{exportSandbox: func(context.Context, string, string, bool, bool) (types.ExportResult, error) {
+		return types.ExportResult{}, fmt.Errorf("private export detail: %w", migrationtoken.ErrTokenTooLarge)
 	}}
 	h, apiKey := newMigrationTestHandler(t, core)
 	response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/export", strings.NewReader(`{}`), nil)
@@ -1078,8 +1078,8 @@ func TestExportSandboxMapsTokenTooLarge(t *testing.T) {
 }
 
 func TestExportSandboxMapsPreemptedResumeToConflict(t *testing.T) {
-	core := &migrationCoreStub{exportSandbox: func(context.Context, string, string, bool, bool) (string, error) {
-		return "", fmt.Errorf("private export detail: %w", ErrExportPreempted)
+	core := &migrationCoreStub{exportSandbox: func(context.Context, string, string, bool, bool) (types.ExportResult, error) {
+		return types.ExportResult{}, fmt.Errorf("private export detail: %w", ErrExportPreempted)
 	}}
 	h, apiKey := newMigrationTestHandler(t, core)
 	response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/export", strings.NewReader(`{}`), nil)
@@ -1657,7 +1657,7 @@ func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migra
 type migrationCoreStub struct {
 	Core
 	importSandbox func(context.Context, string, string, string) (string, error)
-	exportSandbox func(context.Context, string, string, bool, bool) (string, error)
+	exportSandbox func(context.Context, string, string, bool, bool) (types.ExportResult, error)
 	connect       func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error)
 }
 
@@ -1869,7 +1869,7 @@ func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, ta
 	return c.importSandbox(ctx, apiKey, token, targetID)
 }
 
-func (c *migrationCoreStub) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
+func (c *migrationCoreStub) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error) {
 	return c.exportSandbox(ctx, apiKey, sid, toTemplate, keepSource)
 }
 

@@ -717,3 +717,13 @@ registration usage 只统计 status IN (registered, waiting, building) 且两个
 两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 缺少 transient 字段的旧 owner ref 只依据仍匹配的 route/binding 补齐. provisional 插入、注册 ACK/拒绝及重放 ref 更新均比较原身份和当前 revision,迟到操作不能覆盖后继记录. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
 
 按现有版本协调一起升级 node/router/Registry writer. 回退到不理解意图的旧 writer 前,停止接受新的取消/删除,由当前版本收敛全部待处理操作. 有未完成意图时,加法 schema 本身不能保证安全回退. 不增加长期双 writer、新任务表或兼容服务. 记录删除后已发布 canonical img/sbx/snp 引用、已有 Sandbox、下游 fromTemplate 和共享产物的其他 Build 仍可用;绝不删除远端内容.
+
+### Checkpoint 发布报告
+
+Builder 对 checkpoint S 调用 `sandbox-ctl publish --json --quiet`，接受 checkpoint
+前验证且只接受 `snapshotRef`、最终 `sandboxRef` 和 `removedRefs`。根必须 portable
+且角色正确；差集必须有序、唯一并采用安全的公开引用。无效/尾随 JSON、缺少根和 stdout
+污染都会使发布失败，进度 stderr 单独处理。Builder 继续返回规范 `snp` TemplateID；
+Export 新增 HTTP 报告字段见[节点发布与迁移](node_zh.md#814-publishtemplate-与-migration)。
+直接发布 image/Sandbox 的 `PublishSource` 调用保持既有 role/ref 契约、source 所有权和
+流式行为。报告不增加 payload 缓存、额外 staging 文件、GC 或删除权限。
