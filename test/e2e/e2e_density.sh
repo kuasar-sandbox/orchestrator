@@ -1030,6 +1030,8 @@ phase_b2_dynamic_control() {
     [[ "$node_reservation" =~ ^[0-9]+$ ]] \
         || fail "$sid: could not parse node reservation after grant"
     grow_line=$(grep -m1 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grow_line="missing"
+    phase_a_grow_events_valid "$sid" "$((B2_STARTUP_MIB * 1024 * 1024))" "$((B_CAP_MIB * 1024 * 1024))" \
+        || fail "$sid: dynamic grow evidence is missing, malformed, or not covered by reservation"
     b2_timeline_event "$sid" "grant_decision reservation=$node_reservation"
     b2_timeline_event "$sid" "grant_applied log=$grow_line"
 
@@ -1212,7 +1214,8 @@ phase_d_controller_restart() {
 
 # ---------- run all phases ----------
 
-phase_a
+# B2 subsumes the former Phase A dynamic grow/reservation/no-OOM proof while
+# sharing the exact workload with B1 for the static-vs-dynamic comparison.
 phase_b1_static_control
 phase_b2_dynamic_control
 phase_c
@@ -1220,7 +1223,6 @@ phase_d_controller_restart
 
 echo
 echo "==> e2e_density: PASS"
-echo "    Phase A: auto resource allocation (1 sandbox, controller-driven)"
 echo "    Phase B1: static → sandbox-local CH target grow + workload liveness"
 echo "    Phase B2: dynamic + same headroom/workload → proactive reservation, no self-cap/OOM"
 echo "    Phase C: 4 admits ok, 5th rejected by water mark"

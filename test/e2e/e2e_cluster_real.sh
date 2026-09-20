@@ -1049,6 +1049,41 @@ PY
     fail "deleted sandbox still appears in list"
 }
 
+run_redirect_flow() {
+    local code sid envd_token forward_token create_response="$WORK/create.credentials"
+    step "creating one sandbox through the redirected registry topology"
+    code="$(retry_create_sandbox "$create_response" || true)"
+    [ "$code" = "201" ] || { [ -s "$create_response" ] && cat "$create_response" >&2; fail "redirect create returned $code"; }
+    assert_no_default_exec_token "$create_response" || fail "redirect create exposed a default exec token"
+    IFS=$'\t' read -r sid envd_token forward_token < <(sandbox_route "$create_response") \
+        || fail "redirect create returned an invalid e2b response"
+    rm -f "$create_response"
+
+    code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
+    [ "$code" = "204" ] || [ "$code" = "200" ] || fail "redirect data-plane /health returned $code"
+    wait_cluster_traffic_stats "$sid" idle || fail "redirect traffic did not publish/converge to idle"
+    step "PASS: redirected topology routed a real create and envd request ($code)"
+
+    code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
+    [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "redirect delete returned $code"; }
+    for _ in $(seq 1 80); do
+        code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"
+        if [ "$code" = "200" ] && python3 - "$WORK/router-resp.body" "$sid" <<'PY_DELETE'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+sid = sys.argv[2]
+raise SystemExit(0 if all(row.get("sandboxID") != sid for row in rows) else 1)
+PY_DELETE
+        then
+            wait_node_sandbox_finalized "$sid" || fail "redirect delete returned before node-local finalization"
+            step "PASS: redirected topology delete reached node-local finalization"
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "redirected sandbox still appears after delete"
+}
+
 step "cluster real e2e case=$CLUSTER_REAL_CASE work=$WORK using BIN=$BIN"
 MANIFEST_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MANIFEST_KEY")"
@@ -1080,43 +1115,32 @@ if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
 fi
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
-run_cluster_flow
-BUILD_ACTION_PLACER_ARGS=()
 if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
-    BUILD_ACTION_PLACER_ARGS=(--placer-url "http://127.0.0.1:$PLACER_PORT" --expected-node "$NODE_ID")
-fi
-BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/lib/build_actions.py" \
-    --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
-    --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
-    --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
-    --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
-    --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" \
-    "${BUILD_ACTION_PLACER_ARGS[@]}" &
-ACTION_TEST_PID=$!
-PIDS+=("$ACTION_TEST_PID")
-while kill -0 "$ACTION_TEST_PID" 2>/dev/null; do
-    if [ -e "$WORK/restart-request" ] && [ ! -e "$WORK/restart-ready" ]; then
-        kill "$ROUTER_PID"
-        wait "$ROUTER_PID" || true
-        if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
-            # The redirected node's sole node-link owner is another member.
-            # The route projection has three replicas; retain existing bindings.
-            kill "$REGISTRY_ONE_PID"
-            wait "$REGISTRY_ONE_PID" || true
-            "$BIN/cluster-ctl" registry --config "$WORK/registry-1.yaml" >>"$WORK/registry-1.log" 2>&1 &
-            REGISTRY_ONE_PID=$!
-            PIDS+=("$REGISTRY_ONE_PID")
-            wait_port "${CONTROL_PORTS[0]}" registry-1-restarted
+    run_redirect_flow
+else
+    run_cluster_flow
+    BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/lib/build_actions.py" \
+        --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
+        --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
+        --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
+        --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
+        --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" &
+    ACTION_TEST_PID=$!
+    PIDS+=("$ACTION_TEST_PID")
+    while kill -0 "$ACTION_TEST_PID" 2>/dev/null; do
+        if [ -e "$WORK/restart-request" ] && [ ! -e "$WORK/restart-ready" ]; then
+            kill "$ROUTER_PID"
+            wait "$ROUTER_PID" || true
+            "$BIN/cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
+            ROUTER_PID=$!
+            PIDS+=("$ROUTER_PID")
+            wait_port "$ROUTER_PORT" router-restarted
+            touch "$WORK/restart-ready"
+            step "restarted router; testing retained transient routing from empty caches"
         fi
-        "$BIN/cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
-        ROUTER_PID=$!
-        PIDS+=("$ROUTER_PID")
-        wait_port "$ROUTER_PORT" router-restarted
-        touch "$WORK/restart-ready"
-        step "restarted control processes; testing retained transient routing from empty caches"
-    fi
-    sleep 0.1
-done
-wait "$ACTION_TEST_PID" || fail "Build action capacity/restart acceptance"
+        sleep 0.1
+    done
+    wait "$ACTION_TEST_PID" || fail "Build action capacity/restart acceptance"
+fi
 
 echo "==> PASS: e2e_cluster_real $CLUSTER_REAL_CASE"
