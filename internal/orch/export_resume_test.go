@@ -101,7 +101,7 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 		State:        types.StatePaused,
 		APISecret:    apiSecret,
 		ManifestKey:  manifestKey,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef},
 		RunDir:       nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sid),
 		BaseDir:      nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sid),
 		CreatedUnix:  1,
@@ -149,7 +149,7 @@ func assertLocalResumeWon(t *testing.T, fixture exportResumeFixture) {
 	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning
 	}, "running after export-time resume")
-	if stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("resumed source = %+v, want local snapshot %q", stored.ResumeSource, fixture.localRef)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -285,7 +285,7 @@ func TestAcceptedResumePreemptsExportBeforeAsyncSnapshotFailure(t *testing.T) {
 	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(sb *types.Sandbox) bool {
 		return sb.State == types.StatePaused
 	}, "paused after async snapshot preparation failure")
-	if stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("source after failed Resume = %+v", stored)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -433,7 +433,7 @@ func TestExportKeepSourcePreservesLocalResumeSource(t *testing.T) {
 	publisher := newBlockingExportPublisher(portableRef)
 	publisher.Release()
 	fixture.o.artifactPublisher = publisher.Publish
-	localSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}
+	localSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}
 
 	result, err := fixture.o.exportSandboxTokenForTest(fixture.ctx, fixture.apiKey, fixture.sb.ID, false, true)
 	if err != nil || !strings.HasPrefix(result, "kmt1.") {
@@ -497,7 +497,7 @@ func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
 	}
 	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
 	if err != nil || stored == nil || stored.State != types.StatePaused ||
-		stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+		stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("kept source = %+v, %v", stored, err)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -596,7 +596,7 @@ func TestCanceledExportSkipsSourceFinalization(t *testing.T) {
 		t.Fatalf("canceled ExportSandbox error = %v", result.err)
 	}
 	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("source after canceled export = %+v, %v", stored, err)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -615,7 +615,7 @@ func TestExportRejectsAfterLifecycleCancellation(t *testing.T) {
 		t.Fatalf("ExportSandbox after lifecycle cancellation = %q, %v", result, err)
 	}
 	stored, getErr := fixture.o.st.Get(context.Background(), fixture.sb.ID)
-	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("rejected export changed source = %+v, %v", stored, getErr)
 	}
 	if _, statErr := os.Stat(fixture.localRef); statErr != nil {
@@ -649,7 +649,7 @@ func TestExportLifecycleCancellationBeforeFinalizerPreservesSource(t *testing.T)
 		t.Fatalf("shutdown-fenced export = %q, %v", result.result, result.err)
 	}
 	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("shutdown-fenced export changed source = %+v, %v", stored, err)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {

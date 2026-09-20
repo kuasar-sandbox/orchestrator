@@ -31,7 +31,7 @@ func (s *Store) DeadSandboxesForRetention(ctx context.Context, cutoffUnix int64,
 		  AND launch_mode='' AND run_id=''
 		  AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
 		  AND run_dir='' AND base_dir='' AND envd_uds='' AND ci_uds=''
-		  AND resume_source_kind='' AND resume_source_ref=''
+		  AND resume_source_kind='' AND resume_source_ref='' AND resume_sandbox_ref=''
 		ORDER BY dead_unix ASC,id ASC LIMIT ?`,
 		string(types.StateDead), cutoffUnix, retentionBatchLimit(limit))
 	if err != nil {
@@ -69,7 +69,7 @@ func (s *Store) DeleteDeadSandboxForRetention(ctx context.Context, sandbox *type
 		  AND launch_mode='' AND run_id=''
 		  AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
 		  AND run_dir='' AND base_dir='' AND envd_uds='' AND ci_uds=''
-		  AND resume_source_kind='' AND resume_source_ref=''`,
+		  AND resume_source_kind='' AND resume_source_ref='' AND resume_sandbox_ref=''`,
 		sandbox.ID, string(types.StateDead), sandbox.DeadUnix, cutoffUnix)
 	if err != nil {
 		return false, fmt.Errorf("store: prune dead sandbox %s: %w", sandbox.ID, err)

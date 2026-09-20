@@ -38,7 +38,7 @@ func TestSandboxIdentityRoundTrip(t *testing.T) {
 		ID: "import-target", Profile: types.ProfileE2B, StableIDValue: "source-stable-id",
 		TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), State: types.StatePaused,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 2,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
 	}
 	setTestSandboxServiceCredentials(standalone)
 	if err := st.Put(ctx, standalone); err != nil {
@@ -115,7 +115,7 @@ func TestSandboxStableIDIsNotUnique(t *testing.T) {
 			APISecret:     pair.APISecret,
 			ManifestKey:   pair.ManifestKey,
 			CreatedUnix:   1,
-			ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("f", 64)},
+			ResumeSource:  types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("f", 64)},
 		}
 		setTestSandboxServiceCredentials(sb)
 		if err := st.InsertSandbox(ctx, sb); err != nil {
@@ -151,7 +151,7 @@ func TestSandboxSystemIdentityIsInsertBound(t *testing.T) {
 	sb.Cluster = &types.ClusterSandboxContext{Group: "/replacement", RouteKey: "other"}
 	sb.StableIDValue = "replacement"
 	sb.State = types.StatePaused
-	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64)}
+	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64)}
 	setTestSandboxServiceCredentials(sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
@@ -181,7 +181,7 @@ func TestCASRunStateFencesStaleRunner(t *testing.T) {
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	source := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
+	source := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
 	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "sandbox-stale", source); err != nil || changed {
 		t.Fatalf("stale runner state change = %v, %v", changed, err)
 	}
@@ -264,7 +264,7 @@ func TestSandboxListDefaultExcludesInternalLifecycleStates(t *testing.T) {
 			sb.LaunchMode = types.LaunchImage
 		}
 		if row.state == types.StatePaused {
-			sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
+			sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
 		}
 		setTestSandboxServiceCredentials(sb)
 		if err := st.Put(ctx, sb); err != nil {

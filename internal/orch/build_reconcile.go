@@ -213,6 +213,20 @@ func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build)
 		prep.failureReason = err.Error()
 		return prep, nil
 	}
+	if prep.sourceTemplate {
+		tmpl, parseErr := types.ParseTemplateID(build.FromTemplate)
+		kind := types.ResumeSourceSandbox
+		if tmpl.Kind == types.KindSnp {
+			kind = types.ResumeSourceSnapshot
+		}
+		if parseErr != nil || validatePreparedPair(configsock.ArtifactPrepareSummary{RootSource: durable.RootSource}, types.ResumeSource{Kind: kind, Ref: tmpl.Ref}) != nil {
+			prep.failureReason = "durable root pair differs from the build source"
+			return prep, nil
+		}
+	} else if !durable.RootSource.Empty() {
+		prep.failureReason = "image build has an unexpected durable artifact pair"
+		return prep, nil
+	}
 	prep.durable = &durable
 	preflightPending := &pendingBuild{
 		build:                  build,
@@ -265,8 +279,9 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		return o.failInterruptedBuild(ctx, build, prep.failureReason)
 	}
 	expectedDigest := ""
+	var expectedSource types.ResumeSource
 	if prep.durable != nil {
-		expectedDigest = prep.durable.PrepareDigest
+		expectedDigest, expectedSource = prep.durable.PrepareDigest, prep.durable.RootSource
 	}
 	executionCtx, cancelExecution := context.WithCancel(ctx)
 	pend := &pendingBuild{
@@ -275,7 +290,7 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		runDir:         nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID),
 		baseDir:        nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
 		sourceTemplate: prep.sourceTemplate,
-		handoff:        newBuildTaskHandoff(prep.sourceTemplate, expectedDigest),
+		handoff:        newBuildTaskHandoff(prep.sourceTemplate, expectedDigest, expectedSource),
 		spec:           prep.spec, resources: prep.resources, sandboxResources: prep.sandboxResources,
 		result: make(chan configsock.BuildResult, 1),
 	}
@@ -435,6 +450,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	}()
 
 	prepareDigest := fastBuildPrepareDigest(build.BuildID)
+	var rootSource types.ResumeSource
 	var inherited sandboxcfg.NetworkSpec
 	if pend.sourceTemplate {
 		summary, early, err := o.waitBuildPrepare(buildCtx, pend, unit)
@@ -458,7 +474,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 				return nil, "", false, nil, buildFailed("resource_resolve", err)
 			}
 		}
-		prepareDigest = summary.ResolutionDigest
+		prepareDigest, rootSource = summary.ResolutionDigest, summary.RootSource
 	}
 	var err error
 	pend.network, pend.templateNetwork, err = o.resolveBuildNetworks(
@@ -489,7 +505,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 		}
 	}
 	durable := buildRuntimePreparation{
-		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
+		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest, RootSource: rootSource,
 		SourceHasBuildCommands: pend.sourceHasBuildCommands,
 		Network:                pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,

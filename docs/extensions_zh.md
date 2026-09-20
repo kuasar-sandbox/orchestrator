@@ -384,7 +384,7 @@ type Host interface {
 
 `SandboxSource`、`BuildSource` 各提供单点 `Get` 和回调式 `Watch`。返回视图是独立深拷贝，包含丰富的持久和运行状态以及不可逆凭据指纹，省略原始凭据、access token、沙箱环境变量值、MMDS secret 值和 Build cleanup/runtime-prepare 内部数据。这是在日常事件中减少敏感数据及误日志，不限制受信进程内代码原本能访问的内容。
 
-`SandboxView` 直接暴露 typed lifecycle 投影：`ResumeSourceKind`、`ResumeSourceRef`、`ArtifactLocation`、`AutoPauseMemory`、`LaunchMode`。`ArtifactLocation` 与 E/S 类型正交；running 行也可能保留 source 以持有节点本地工件。`LaunchMode` 仅在 starting 时非空，它是已持久化、已解析的启动决定，不是请求该行为的 trigger。内部 `deleting` 表示持久 cleanup ownership，绝不是路由或激活状态；core finalizer 完成前，它保留 exact runner、RunDir、BaseDir。网络 tuple 在 allocation fence 下 connector Detach 和持久清除均成功前保持原值；清除操作原子移除全部四个网络字段。
+`SandboxView` 直接暴露 typed lifecycle 投影：`ResumeSourceKind`、`ResumeSourceRef`、`ResumeSandboxRef`、`ArtifactLocation`、`AutoPauseMemory`、`LaunchMode`。`ArtifactLocation` 与 E/S 类型正交；running 行也可能保留 source 以持有节点本地工件。`LaunchMode` 仅在 starting 时非空，它是已持久化、已解析的启动决定，不是请求该行为的 trigger。内部 `deleting` 表示持久 cleanup ownership，绝不是路由或激活状态；core finalizer 完成前，它保留 exact runner、RunDir、BaseDir。网络 tuple 在 allocation fence 下 connector Detach 和持久清除均成功前保持原值；清除操作原子移除全部四个网络字段。
 
 `SandboxSource.Watch` 覆盖全部持久 Sandbox 行。`BuildSource.Watch` 覆盖当前 registered、waiting、building、ready 集合；live 转入 error 时发出包含最终视图与原因的 `BuildRemove`。这个 removal 不是持久事件：重同步后，失败 Build 只是缺席于当前集合，`BuildSource.Get` 仍能读取其持久 error 行。
 

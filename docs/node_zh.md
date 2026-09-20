@@ -485,7 +485,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
 | `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl、mkfs.erofs(§11) |
-| `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方 `mkfs.ext4` 于稀疏文件提供;restore 不需要(overlay 链来自快照) |
+| `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏文件提供;restore 不需要(overlay 链来自快照) |
 | `checkpoint.mode` | `local` | 暂停态本机 capture:`local` = 现有 tarstream,`bundle` = multi-Manifest ZIP Bundle；输出固定在 Sandbox `BaseDir/checkpoint`(§1.6、§8.1) |
 | `checkpoint.merge_ref` / `.drop_caches` | 未设置 | Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省 |
 | `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute hostless `file://` URI；Builder checkpoint 类 graph 和 `export-sandbox` 的 named-location parent，也用于解析 located Build image Bundle；不改变 Pause capture mode |
@@ -506,6 +506,12 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `cluster.api_endpoint` | (接入集群必填) | conductor control API 的显式 `host:port` advertised endpoint;不得从 `api.listen` 推导 |
 | `cluster.data_endpoint` | (接入集群必填) | Proxy sandbox data 的显式 `host:port` advertised endpoint;不得从 `proxy.data_listen` 推导 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
+
+新建 `sandbox.boot.overlay_diff_template` 和 `builder.diff_template` 时，使用
+`mkfs.ext4 -O ^has_journal`，避免可丢弃工作盘的文件系统 journal 占用及元数据
+日志写入。这不影响 journald 或应用日志，也不提供崩溃恢复保证。已有带 journal
+的模板和用户自带镜像继续兼容；sync/quiesce、快照/恢复及挂载行为保持不变。
+此约定仅适用于新建空模板，不要重新格式化已有数据盘。
 
 多池的主要应用场景是 [NUMA 部署（§5.3）](#numa-deployment)：由不同 unit 模板承载不同节点的 CPU/内存放置策略，再轮询分配新执行。以下重复模板示例仅说明配置语义，不代表不同 NUMA 绑定。
 
@@ -1728,19 +1734,19 @@ durable Sandbox row,不通过 metadata 隧道传递。
 
 ```text
 CaptureSnapshot:
-  sandbox-ctl snapshot --sandbox-id <sid> --output <dir> --mode <local|bundle> \
+  sandbox-ctl snapshot --json --path-id <sid> --output <dir> --mode <local|bundle> \
     --run-root <run-root> [--merge-ref=...] [--drop-caches=...]
-  -> ResumeSource{kind:snapshot, ref:<dir>/<sid>.snapshot}
+  -> ResumeSource{kind:snapshot, ref:<actual S basename + identity>, sandboxRef:<actual E basename + identity>}
 
 CaptureSandbox:
-  sandbox-ctl export --sandbox-id <sid> --output <dir> --mode <local|bundle> \
+  sandbox-ctl export --json --path-id <sid> --output <dir> --mode <local|bundle> \
     --run-root <run-root>
-  -> ResumeSource{kind:sandbox, ref:<dir>/<sid>.sandbox}
+  -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
 
 Pause 的顺序固定为 resolve request -> accepted operation -> runtime capture ->
 `CommitRunningPaused(id, exactRunID, ResumeSource)` -> stop/reset exact runner -> detach exact network ->
-RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与 source kind/ref;之后非空
+RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
 RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
 exact-CAS 清 network；任一步失败保留尚需重试的字段。RunDir 删除失败不允许新的 Resume/Wake/Exec
 取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 及其中
@@ -1786,8 +1792,8 @@ proxy SHM 不携 source kind 或 cold gate。已鉴权的首个 E 请求保持 p
 
 #### 8.1.3 Task-local artifact prepare 与三种 config
 
-artifact launch 的 tenant task 先执行 `internal/taskartifact`。`ArtifactPrepareSpec` 至少携 root
-source kind/ref、durable launch mode、manifest config、ref-location parent、relative dir、max refs
+artifact launch 的 tenant task 先执行 `internal/taskartifact`。`ArtifactPrepareSpec` v5 携 RunID、root
+source kind/ref、已受理的 E（若存在）、durable launch mode、manifest config、ref-location parent、relative dir、max refs
 和 absolute deadline。task 持有 `MANIFEST_KEY`,由官方 sandboxer reader 实际打开/解密制品;
 conductor 不读取、解密或解析 tenant artifact。
 
@@ -1801,11 +1807,12 @@ E + memory -> reject during request mode admission; invalid task spec fails befo
 ```
 
 remote Manifest 的 S+cold 选择 `manifest://E`;local tarstream 解析相对、content-identified E file ref;
-Manifest Bundle 生成指向同一 Bundle file 并以 E Manifest key 为 selector 的 file ref,不假设远端
-Store 已有 E。Result 中的 `PreparedSource`、ref-location URI、carrier/Bundle binding 和 cfg 只留在
+Manifest Bundle preparation 保留 reader 实际选择的 current/sibling carrier 与 E selector，
+或实际远端 Manifest fallback；不假定 E 位于 S carrier 中。Result 中的 `PreparedSource`、ref-location URI、carrier/Bundle binding 和 cfg 只留在
 task 进程。task 在本地严格解析 artifact network metadata,拒绝 duplicate/unknown/malformed 字段,
-只把 typed network topology 与 capacity、required ref count、`resolution_digest` 组成 bounded summary
-交给 conductor;原始 metadata 不跨 task 边界。digest 覆盖 root source、launch mode、selected source、
+只把完整根 S/E 对、typed network topology、capacity、disk topology、required ref count、
+`resolution_digest` 组成 bounded summary 交给 conductor；原始 metadata 不跨 task 边界。
+digest 覆盖 RunID、完整根对、launch mode、selected source、
 closure、locations、carrier binding、capacity/network summary。相同 runID + digest replay 返回同一结果;
 冲突 replay fail closed。
 最终 `taskrun` 只根据 task-local `PreparedSource` 追加 `--from <E>` 或 `--restore <S>`。
@@ -1877,9 +1884,32 @@ portable 最终根、必需的最终 E、有序唯一差集和安全文件 basen
 `types.ExportResult`，HTTP 的 `result` 字段继续兼容既有客户端。采用新内部 CLI 契约时，
 sandboxer 与 orchestrator 应部署来自相匹配来源集的版本。
 
-已 portable 的源不再发布，返回 `removedRefs:[]`；portable Snapshot 从根元数据和实际
-carrier 绑定取得 E，不扫描依赖图，也不读取内存/磁盘 payload。必需元数据缺失或无效时，
-在 finalization 前失败。普通、keep-source、move 和已受理的 detached-template 成功分支
+Capture 使用 `sandbox-ctl snapshot --json` 或 `export --json`，验证完整结果后才原子
+提交 running→paused。Snapshot 保存生产者返回的 S 与 E，包括单根 Bundle 中的两个
+Manifest selector。E-only capture 会清除旧 Snapshot 及其关联。公开本地引用仅有
+basename，并保留身份限定符；执行时使用该 sandbox 的 checkpoint 目录解析。capture
+失败绝不提交半对。本地发布的报告和 token 同时使用 S1/E1；keep-source 的 SQLite 与
+cache 继续保存 S0/E0。`removedRefs` 不进入 SQLite 或 token。
+
+外部 S-only 模板仅是初次 starting 阶段的 preparation 输入，此时持久 source 为空，
+不是有效的 paused source。现有 tenant task 解析 S 时取得 E，bounded summary 只增加
+根 S/E 身份，不把完整配置或 MANIFEST_KEY 相关解析移入 conductor。resolution_digest
+绑定 RunID、完整根对、launch mode、所选 source、闭包、location、carrier 及原有摘要。
+相同摘要重试幂等，E 不同的重试冲突；只有匹配根、RunID 和 starting 状态的 worker
+能够把完整对与 running 一起提交。失败保持初始 source 未受理；重启不恢复缺失 E 的对。
+preparation 不得替换已导入或已持久保存的 E。
+
+**RFC-142 升级：**先停止旧 conductor，排空或退役其管理的 sandbox，并预先保留需要的
+工件和记录。启动本版本前，操作员必须明确清空旧本地 sandbox 数据库；此配对 schema
+不提供 ALTER、迁移、回填或双读兼容。进程拒绝旧 schema，绝不为升级自动删除用户数据。
+部署匹配版本的 sandboxer/orchestrator 后重新创建本地记录。缺少必填 `resumeSandboxRef`
+字段的旧迁移 token（包括缺少 E 的 Snapshot token）无效；废弃过期 token，从具有完整
+对的记录重新导出。不得用旧 token 或读取
+S 元数据重建持久对。参见[配对 source 契约](rfc-142-pairs_zh.md)。
+
+已 portable 的源不再发布，返回 `removedRefs:[]`；portable Snapshot 直接返回 SQLite
+中保存的精确 S/E 对。即使两份工件都离线，Export 也不打开工件、不配置存储、不检查
+元数据、不启动元数据子进程。缺少 E 的 paused 对无效，绝不通过读取 S 修复。普通、keep-source、move 和已受理的 detached-template 成功分支
 均携带同一套一致根引用与差集。Resume/preemption、属主检查、生命周期取消、幂等及并发
 继续遵守下文原有顺序。
 
@@ -1904,8 +1934,11 @@ paused E 转模板得到 `KindSbx`;paused S 得到 `KindSnp`。两者均可 publ
 build pipeline 的 Snapshot 输出仍是 `snp`,但 publication 同样调用 `sandbox-ctl publish`,不依赖
 单独的 Snapshot publication 命令。
 
-KMT V1 payload 直接携 `resumeSourceKind`、`resumeSourceRef` 和 `autoPauseMemory`,不接受旧
-`snapshotRef` payload。Import 原样恢复 E/S kind/ref、deadline、portable env/metadata 和既有
+KMT V1 payload 直接携 `resumeSourceKind`、`resumeSourceRef`、`resumeSandboxRef` 和
+`autoPauseMemory`。Snapshot 必须在 `resumeSandboxRef` 中携带关联 E；E-only 的该字段必须
+为空。缺失字段、重复或未知 JSON 字段以及错误组合均被拒绝，包括缺少 E 的旧 Snapshot
+token。目标 Expectations 同时比较 S 和 E。Import 不访问工件，原子恢复完整对、deadline、
+portable env/metadata 和既有
 ServiceSecret/Envd/Traffic/Forward token;目标 node 从本地 trusted key table 取得 APISecret +
 ManifestKey 并校验 fingerprints、runtime digest 和 profile。token 不携 raw tenant roots、host path、
 MMDS secret value、cluster Group/RouteKey 或 generation。
@@ -2261,7 +2294,7 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
-               resume_source_kind, resume_source_ref, auto_pause_memory, launch_mode,
+               resume_source_kind, resume_source_ref, resume_sandbox_ref, auto_pause_memory, launch_mode,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
                created_unix
@@ -2273,7 +2306,7 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
 ```
 
 Build schema、准入与记录权威见 [Build §6](node-build_zh.md#6-持久化恢复与保留)。
-`resume_source_kind/ref` 是 paused E/S 的 typed root;`auto_pause_memory` 只决定 TTL CaptureKind;
+`resume_source_kind/ref` 是 paused E/S 的 typed root，`resume_sandbox_ref` 保存 Snapshot 的精确关联 E；`auto_pause_memory` 只决定 TTL CaptureKind;
 `launch_mode` 是 starting 中已接受的实际 image/cold/memory 模式。生命周期
 schema 直接替换旧单字符串 lifecycle 模型,不保留双读/双写或迁移 shim;已有开发数据库须重建。
 

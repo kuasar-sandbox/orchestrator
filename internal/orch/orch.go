@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -133,7 +134,6 @@ type Orchestrator struct {
 	// source.
 	resourceControllerSocketIdentity string
 	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error)
-	snapshotSandboxRef               func(context.Context, *types.Sandbox, types.ResumeSource) (string, error)
 	removeSandboxRunDir              func(string) error
 	removeSandboxBaseDir             func(string) error
 	removeBuildRunDir                func(string) error
@@ -503,7 +503,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if preparation == nil {
 		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
 	}
-	if preparation.Source.Valid() {
+	if !preparation.Source.Empty() {
 		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation)
 	}
 	prepareStarted := time.Now()
@@ -2036,7 +2036,7 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 		return nil, err
 	}
 	source := sandboxcfg.SourceForLaunch(sb, tmpl)
-	if source.Valid() {
+	if !source.Empty() {
 		// Artifact content is intentionally unavailable during synchronous
 		// admission. Request-owned fields and immutable node defaults are still
 		// checked here; inherited fields and capacity arrive asynchronously from
@@ -2233,7 +2233,7 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		Env:       sandboxTaskEnv(sb),
 	}
 	source := sandboxcfg.SourceForLaunch(sb, tmpl)
-	if !source.Valid() {
+	if source.Empty() {
 		locations, err := o.singleRefLocations(tmpl.Ref)
 		if err != nil {
 			return nil, false, err
@@ -2258,6 +2258,8 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		return nil, false, err
 	}
 	response.Prepare = &configsock.ArtifactPrepareSpec{
+		RunID:                    runID,
+		RootSandboxRef:           source.SandboxRef,
 		RootSourceKind:           string(source.Kind),
 		RootRef:                  taskRootRef,
 		LaunchMode:               string(sb.LaunchMode),
@@ -2294,6 +2296,20 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 	if !ok || attempt.RunID() != runID {
 		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
 	}
+	sb, err := o.st.Get(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if sb == nil || sb.RunID != runID || (sb.State != types.StateStarting && sb.State != types.StateRunning) {
+		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
+	}
+	tmpl, err := types.ParseTemplateID(sb.TemplateID)
+	if err != nil {
+		return nil, configsock.RejectArtifactPrepare(err)
+	}
+	if err := validatePreparedPair(summary, sandboxcfg.SourceForLaunch(sb, tmpl)); err != nil {
+		return nil, configsock.RejectArtifactPrepare(err)
+	}
 	replay, err := attempt.SubmitPrepare(runID, summary)
 	if err != nil {
 		return nil, configsock.RejectArtifactPrepare(err)
@@ -2302,7 +2318,20 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 		o.log.Info("sandbox task artifact prepare replay", "sid", sandboxID, "run_id", runID,
 			"task_artifact_prepare_replay_total", 1)
 	}
-	return attempt.WaitFinalSpec(ctx)
+	final, err := attempt.WaitFinalSpec(ctx)
+	if err != nil {
+		return nil, err
+	}
+	current, err := o.st.Get(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.RunID != runID || (current.State != types.StateStarting && current.State != types.StateRunning) ||
+		current.TemplateID != sb.TemplateID || current.CreatedUnix != sb.CreatedUnix ||
+		validatePreparedPair(summary, sandboxcfg.SourceForLaunch(current, tmpl)) != nil {
+		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
+	}
+	return final, nil
 }
 
 func (o *Orchestrator) singleRefLocations(raw string) (map[string]string, error) {
@@ -2780,54 +2809,52 @@ func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types
 	return nil
 }
 
-// capture dispatches one typed pause request. Publication remains outside this
-// runtime operation; both capture paths first create a node-local artifact.
+// capture consumes the producer's complete JSON result before publishing a
+// paused row. Local references remain content-identified basenames; execution
+// resolves them in this sandbox's checkpoint directory.
 func (o *Orchestrator) capture(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (sandboxcfg.CaptureResult, error) {
 	if err := validateCaptureRequest(request); err != nil {
 		return sandboxcfg.CaptureResult{}, err
 	}
-	var source types.ResumeSource
-	var err error
-	switch request.Kind {
-	case types.CaptureSnapshot:
-		source.Ref, err = o.snapshotLocal(ctx, sb, request.SnapshotPolicy)
-		source.Kind = types.ResumeSourceSnapshot
-	case types.CaptureSandbox:
-		source.Ref, err = o.exportSandboxLocal(ctx, sb)
-		source.Kind = types.ResumeSourceSandbox
-	}
+	source, err := o.snapshotLocal(ctx, sb, request)
 	if err != nil {
 		return sandboxcfg.CaptureResult{}, err
 	}
 	return sandboxcfg.CaptureResult{Source: source}, nil
 }
 
-// snapshotLocal writes the selected checkpoint format to BaseDir/checkpoint and
-// returns its stable .snapshot symlink (node-bound; restorable only on this node). The lower
-// chain (the base template) stays remote, carried by reference.
-func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.SnapshotPolicy) (string, error) {
+func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (types.ResumeSource, error) {
 	dir := filepath.Join(sb.BaseDir, "checkpoint")
-	args := []string{"snapshot", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
-	args = appendSnapshotPolicyArgs(args, policy)
-	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
-	var errb bytes.Buffer
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("orch: snapshot %s (mode %s): %w: %s", sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
+	command := "snapshot"
+	kind := types.ResumeSourceSnapshot
+	if request.Kind == types.CaptureSandbox {
+		command, kind = "export", types.ResumeSourceSandbox
 	}
-	return filepath.Join(dir, sb.ID+".snapshot"), nil
+	args := []string{command, "--json", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
+	if request.Kind == types.CaptureSnapshot {
+		args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
+	}
+	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return types.ResumeSource{}, fmt.Errorf("orch: %s %s (mode %s): %w: %s", command, sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
+	}
+	return decodeCaptureSource(out.Bytes(), kind)
 }
 
-func (o *Orchestrator) exportSandboxLocal(ctx context.Context, sb *types.Sandbox) (string, error) {
-	dir := filepath.Join(sb.BaseDir, "checkpoint")
-	args := []string{"export", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
-	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
-	var errb bytes.Buffer
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("orch: export sandbox %s (mode %s): %w: %s", sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
+// decodeCaptureSource is shared by capture adapters regardless of whether the
+// producer writes local files, a Bundle, or uploads Manifest objects.
+func decodeCaptureSource(data []byte, kind types.ResumeSourceKind) (types.ResumeSource, error) {
+	report, err := artifact.DecodeCaptureReport(data, artifactRole(kind))
+	if err != nil {
+		return types.ResumeSource{}, fmt.Errorf("orch: %s capture result: %w", kind, err)
 	}
-	return filepath.Join(dir, sb.ID+".sandbox"), nil
+	source := types.ResumeSource{Kind: kind, Ref: report.SandboxRef}
+	if kind == types.ResumeSourceSnapshot {
+		source.Ref, source.SandboxRef = report.SnapshotRef, report.SandboxRef
+	}
+	return source, nil
 }
 
 func appendSnapshotPolicyArgs(args []string, policy sandboxcfg.SnapshotPolicy) []string {
@@ -2862,7 +2889,25 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 		}
 		args = append(args, "--to-ref-location", locName+"="+uri)
 	}
-	args = append(args, source.Ref)
+	root := source.Ref
+	if !types.IsPortableRef(root) {
+		dir, err := o.ownedLocalArtifactDir(sb, source)
+		if err != nil {
+			return artifact.PublishReport{}, err
+		}
+		// Resolve only the artifact argument in its checkpoint context. Keep
+		// the process cwd so relative Manifest config/storage paths retain
+		// their configured meaning; public reports still project basenames.
+		if strings.HasPrefix(root, "file://") {
+			ref, err := manifest.ParseRef(root)
+			if err != nil {
+				return artifact.PublishReport{}, err
+			}
+			ref.Path = filepath.Join(dir, ref.Path)
+			root = ref.String()
+		}
+	}
+	args = append(args, root)
 	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer

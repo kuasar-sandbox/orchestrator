@@ -119,12 +119,12 @@ func TestMultiPoolSandboxRecoveryAndIndexLifetime(t *testing.T) {
 			switch state {
 			case "paused":
 				sb.State = types.StatePaused
-				sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+				sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
 			case "starting", "resuming":
 				sb.State = types.StateStarting
 				sb.LaunchMode = types.LaunchImage
 				if state == "resuming" {
-					sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+					sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
 					sb.LaunchMode = types.LaunchMemory
 				}
 			}
@@ -203,7 +203,7 @@ func TestMultiPoolMissingIndexDoesNotClearOwnershipOnEnumerationError(t *testing
 				f.sb.LaunchMode = types.LaunchImage
 			}
 			if state == "paused" {
-				f.sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+				f.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
 			}
 			if err := o.st.Put(context.Background(), f.sb); err != nil {
 				t.Fatal(err)

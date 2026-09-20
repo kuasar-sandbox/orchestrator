@@ -122,7 +122,7 @@ func TestRunningConnectMemoryDoesNotRestart(t *testing.T) {
 		ID: "running-memory-option", Profile: types.ProfileBare,
 		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:        types.StateRunning,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:    deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "running-memory-option"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "running-memory-option"),
 		CreatedUnix: 1, DeadlineUnix: 100,
@@ -157,7 +157,7 @@ func TestSnapshotColdFailureRollsBackOriginalSnapshot(t *testing.T) {
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	manifestKey := strings.Repeat("d", 64)
 	_, apiKey := defaultTestCredentials(t, manifestKey)
-	source := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64)}
+	source := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64)}
 	sb := &types.Sandbox{
 		ID: "snapshot-cold-failure", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("f", 64)}.String(),
@@ -314,8 +314,9 @@ func newResumeModeFixture(t *testing.T, sourceKind types.ResumeSourceKind, block
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
 		State:      types.StatePaused,
 		ResumeSource: types.ResumeSource{
-			Kind: sourceKind,
-			Ref:  "file://" + strings.Repeat("8", 64) + extension + "@location:resume-mode",
+			SandboxRef: map[types.ResumeSourceKind]string{types.ResumeSourceSnapshot: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}[sourceKind],
+			Kind:       sourceKind,
+			Ref:        "file://" + strings.Repeat("8", 64) + extension + "@location:resume-mode",
 		},
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "resume-mode-target"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "resume-mode-target"), CreatedUnix: 1,

@@ -125,7 +125,7 @@ func TestPausedResumeSnapshotReadFailureReturnsToPausedAsynchronously(t *testing
 			Ref: "manifest://" + strings.Repeat("d", 64),
 		}.String(),
 		State: types.StatePaused,
-		ResumeSource: types.ResumeSource{
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64),
 		},
 		APISecret:   deriveTestAPISecret(t, strings.Repeat("f", 64)),

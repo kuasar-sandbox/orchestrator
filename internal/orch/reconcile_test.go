@@ -168,7 +168,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeStarting.ID = "resume-starting"
 	resumeStarting.State = types.StateStarting
 	resumeStarting.RunID = resumeStartingRun
-	resumeStarting.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
+	resumeStarting.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
 	resumeStarting.LaunchMode = types.LaunchMemory
 	resumeStarting.DeadlineUnix = 1_900_000_111
 	resumeStarting.RunDir = nodepath.SandboxRunDir(cfg.Paths.RunRoot, resumeStarting.ID)
@@ -376,7 +376,7 @@ func TestReconcileRetriesSnapshotColdResumeWithDurableLaunchMode(t *testing.T) {
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
 	oldRunID := "sr-00000000-0000-7000-8000-000000000077"
 	manifestKey := strings.Repeat("a", 64)
-	source := types.ResumeSource{
+	source := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://" + strings.Repeat("c", 64),
 	}
@@ -804,7 +804,7 @@ func TestRecoveredAcceptedResultWinsCanceledMonitor(t *testing.T) {
 		ImageRef: "manifest://" + strings.Repeat("d", 64),
 	}
 	pend := &pendingBuild{
-		handoff: newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID)),
+		handoff: newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID), types.ResumeSource{}),
 		result:  make(chan configsock.BuildResult, 1),
 	}
 	pend.result <- accepted
@@ -1209,7 +1209,7 @@ func TestReconcileAdoptsSnapshotBuildStillPreparing(t *testing.T) {
 		cancel()
 		t.Fatalf("preparing build was prematurely committed: %+v, %v", stored, err)
 	}
-	final, err := o.CompleteBuildPrepare(context.Background(), build.BuildID, runID, validBuildPrepareSummary())
+	final, err := o.CompleteBuildPrepare(context.Background(), build.BuildID, runID, buildPairSummary(t, build.FromTemplate))
 	if err != nil || final == nil || final.BuildID != build.BuildID {
 		cancel()
 		t.Fatalf("recovered preparing completion = %+v, %v", final, err)
@@ -1304,7 +1304,7 @@ func testPreparedSnapshotRecovery(t *testing.T, explicit bool) {
 		MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true),
 	}
 	build.RuntimePrepareJSON, err = encodeBuildRuntimePreparation(buildRuntimePreparation{
-		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: digest,
+		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: digest, RootSource: buildPairSummary(t, build.FromTemplate).RootSource,
 		SourceHasBuildCommands: true,
 		Network:                durableNetwork, TemplateNetwork: durableTemplateNetwork,
 		Resources: durableResources, SandboxResources: durableResources,
@@ -1335,7 +1335,7 @@ func testPreparedSnapshotRecovery(t *testing.T, explicit bool) {
 		cancel()
 		t.Fatal(err)
 	}
-	summary := validBuildPrepareSummary()
+	summary := buildPairSummary(t, build.FromTemplate)
 	summary.ResolutionDigest = digest
 	summary.HasBuildCommands = true
 	final, err := o.CompleteBuildPrepare(context.Background(), build.BuildID, runID, summary)

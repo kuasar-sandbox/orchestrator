@@ -314,7 +314,7 @@ func TestResumeExactRunNetworkCASMissCleansDurablePortBeforePaused(t *testing.T)
 	sb, _ := launchTestSandbox(t, cfg, types.ProfileBare, "resume-network-cas")
 	sb.State = types.StatePaused
 	sb.LaunchMode = ""
-	sb.ResumeSource = types.ResumeSource{
+	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://" + strings.Repeat("6", 64),
 	}
@@ -441,6 +441,7 @@ func TestRestoreInvalidInheritedNetworkFailsClosed(t *testing.T) {
 
 func TestValidateSandboxPrepareSummaryRejectsInvalidNetwork(t *testing.T) {
 	summary := configsock.ArtifactPrepareSummary{
+		RootSource:         types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64), SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 		PreparedSourceKind: string(types.ResumeSourceSnapshot),
 		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},

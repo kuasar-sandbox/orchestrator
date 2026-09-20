@@ -16,7 +16,9 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -42,18 +44,37 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						ctx := context.Background()
 						dir := t.TempDir()
 						o := migrationOrchestrator(t, dir, []byte("runtime"))
-						o.snapshotSandboxRef = nil
+						// The source basename uses checkpoint context; relative node
+						// configuration must still use the conductor's original cwd.
+						configPath := filepath.Join(dir, "manifest.yaml")
+						if err := os.WriteFile(configPath, []byte("chunker: {mode: fixed, fixed: {size: 4KiB}}\ncrypto: {chunk: aes, manifest: aes}\n"), 0600); err != nil {
+							t.Fatal(err)
+						}
+						cwd, err := os.Getwd()
+						if err != nil {
+							t.Fatal(err)
+						}
+						o.cfg.ManifestConfig, err = filepath.Rel(cwd, configPath)
+						if err != nil {
+							t.Fatal(err)
+						}
 						output := filepath.Join(dir, "published")
 						o.cfg.Checkpoint.Remote.RefLocationParent = "file://" + output
 						mk := strings.Repeat("6", 64)
-						_, apiKey := defaultTestCredentials(t, mk)
+						apiSecret, apiKey := defaultTestCredentials(t, mk)
+						if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil {
+							t.Fatal(err)
+						}
 						sid := "report-source"
 						suffix := ".sandbox"
 						if kind == types.ResumeSourceSnapshot {
 							suffix = ".snapshot"
 						}
 						local := makeLocalArtifact(t, dir, sid, suffix)
-						sink := snapshot.NewFileSink(filepath.Dir(local), "report", nil, false, nil)
+						if err := os.Remove(local); err != nil {
+							t.Fatal(err)
+						}
+						sink := snapshot.NewFileSink(filepath.Dir(local), sid, nil, false, nil)
 						cfg := &rtconfig.PortableSandboxConfig{
 							Version: 1, Resources: rtconfig.PortableResourcesConfig{Capacity: rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"}, Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "1GiB"}},
 							Boot:   rtconfig.PortableBootConfig{Kernel: "file://kernel@digest:" + mk, Runtime: "file://runtime@digest:" + mk, Root: rtconfig.PortableRootConfig{Base: "self"}},
@@ -72,40 +93,68 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						sourcePath := ePath
+						sourceRef, sourcePath := eRef, ePath
 						if kind == types.ResumeSourceSnapshot {
 							scfg, _ := snapshot.MarshalConfig(&snapshot.Config{Version: 1, SandboxRef: eRef})
 							s, err := snapshotfile.BuildSource(sparse.Dense(bytes.NewReader(body), uint64(len(body))), []byte("{}"), []byte("{}"), scfg)
 							if err != nil {
 								t.Fatal(err)
 							}
-							_, sourcePath, err = sink.AbsorbSnapshot(ctx, s)
+							sourceRef, sourcePath, err = sink.AbsorbSnapshot(ctx, s)
 							if err != nil {
 								t.Fatal(err)
 							}
 						}
-						if err := os.Rename(sourcePath, local); err != nil {
+						if kind == types.ResumeSourceSnapshot {
+							err = sink.CommitSnapshot(ctx, sourceRef, sourcePath)
+						} else {
+							err = sink.CommitSandbox(ctx, sourceRef, sourcePath)
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := sink.Close(); err != nil {
 							t.Fatal(err)
 						}
 						sb := migrationSandbox(t, dir, sid, mk, local)
-						sb.ResumeSource.Kind = kind
+						sb.ResumeSource = types.ResumeSource{Kind: kind, Ref: sourceRef}
+						if kind == types.ResumeSourceSnapshot {
+							sb.ResumeSource.SandboxRef = eRef
+						}
 						if err := o.st.Put(ctx, sb); err != nil {
 							t.Fatal(err)
 						}
 						o.cache(sb)
 						if portable {
-							initial, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+							initial, err := o.ExportSandbox(ctx, apiKey, sid, false, true)
 							if err != nil {
 								t.Fatal(err)
 							}
-							sb.ResumeSource.Ref = initial.SandboxRef
-							if kind == types.ResumeSourceSnapshot {
-								sb.ResumeSource.Ref = initial.SnapshotRef
+							original, err := o.st.Get(ctx, sid)
+							if err != nil || original.ResumeSource != sb.ResumeSource {
+								t.Fatalf("local keep-source changed S0/E0: %+v %v", original, err)
 							}
-							if err := o.st.Put(ctx, sb); err != nil {
+							if _, err := o.ImportSandbox(ctx, apiKey, initial.Result, "report-imported"); err != nil {
 								t.Fatal(err)
 							}
-							o.cache(sb)
+							sid = "report-imported"
+							sb, err = o.st.Get(ctx, sid)
+							if err != nil {
+								t.Fatal(err)
+							}
+							// Every S/E carrier and any source store is unavailable. A
+							// portable Export must use only the authenticated DB pair.
+							if err := os.RemoveAll(output); err != nil {
+								t.Fatal(err)
+							}
+							if err := os.RemoveAll(filepath.Dir(local)); err != nil {
+								t.Fatal(err)
+							}
+							o.cfg.ManifestConfig = filepath.Join(dir, "missing-config.yaml")
+							o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error) {
+								t.Error("portable Export invoked artifact publisher")
+								return artifact.PublishReport{}, fmt.Errorf("artifact access prohibited")
+							}
 						}
 						request := httptest.NewRequest(http.MethodPost, "/sandboxes/"+sid+"/export", strings.NewReader(fmt.Sprintf(`{"toTemplate":%t,"keepSource":%t}`, template, keep)))
 						request.Header.Set("X-API-KEY", apiKey)
@@ -139,23 +188,49 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						if len(fields) != want {
 							t.Fatalf("shape=%s", response.Body.String())
 						}
-						storage, _ := artifact.NewProcessStorage(nil)
-						location, err := reflocation.Resolve(o.cfg.Checkpoint.Remote.RefLocationParent, sid)
-						if err != nil {
-							t.Fatal(err)
+						if !portable {
+							storage, _ := artifact.NewProcessStorage(nil)
+							location, err := reflocation.Resolve(o.cfg.Checkpoint.Remote.RefLocationParent, sid)
+							if err != nil {
+								t.Fatal(err)
+							}
+							locations := rtconfig.RefLocations{sid: location.Path}
+							root := result.SandboxRef
+							if kind == types.ResumeSourceSnapshot {
+								root = result.SnapshotRef
+							}
+							info, err := storage.Inspect(ctx, root, locations)
+							storage.Close()
+							if err != nil {
+								t.Fatal(err)
+							}
+							if kind == types.ResumeSourceSnapshot && result.SandboxRef != info.Snapshot.SandboxRef {
+								t.Fatal("incoherent final S/E")
+							}
+						} else {
+							wantE := sb.ResumeSource.Ref
+							if kind == types.ResumeSourceSnapshot {
+								wantE = sb.ResumeSource.SandboxRef
+								if result.SnapshotRef != sb.ResumeSource.Ref {
+									t.Fatal("offline S changed")
+								}
+							}
+							if result.SandboxRef != wantE {
+								t.Fatal("offline E changed")
+							}
 						}
-						locations := rtconfig.RefLocations{sid: location.Path}
-						root := result.SandboxRef
-						if kind == types.ResumeSourceSnapshot {
-							root = result.SnapshotRef
-						}
-						info, err := storage.Inspect(ctx, root, locations)
-						storage.Close()
-						if err != nil {
-							t.Fatal(err)
-						}
-						if kind == types.ResumeSourceSnapshot && result.SandboxRef != info.Snapshot.SandboxRef {
-							t.Fatal("incoherent final S/E")
+						if !template {
+							payload, err := migrationtoken.Open(migrationtoken.KeyMaterial{APISecret: apiSecret, ManifestKey: mk}, result.Result)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if kind == types.ResumeSourceSnapshot {
+								if payload.ResumeSourceRef != result.SnapshotRef || payload.ResumeSandboxRef != result.SandboxRef {
+									t.Fatal("token/report pair mismatch")
+								}
+							} else if payload.ResumeSourceRef != result.SandboxRef || payload.ResumeSandboxRef != "" {
+								t.Fatal("E-only token retained S")
+							}
 						}
 						stored, err := o.st.Get(ctx, sid)
 						if err != nil {

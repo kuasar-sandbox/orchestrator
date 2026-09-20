@@ -7,14 +7,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// ArtifactPrepareSchemaVersion 4 binds the Build-only image Bundle publication
-// preflight into task-local source preparation. Version 3 added portable
-// allocatable/deflate resource defaults and an explicit Build-only source-image
-// config read. Version 2
-// replaced the v1 Snapshot-only wire with typed E/S sources, durable launch
-// mode, a selected prepared source, and bounded network/disk topology summaries.
-// Old runners fail closed before the secret-bearing provider call.
-const ArtifactPrepareSchemaVersion = 4
+// ArtifactPrepareSchemaVersion 5 returns the exact root S/E pair from existing
+// task-local preparation and binds it to the run's resolution digest. Older
+// runners cannot complete this protocol.
+const ArtifactPrepareSchemaVersion = 5
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -25,9 +21,12 @@ type SandboxTaskRequest struct {
 
 // ArtifactPrepareSpec is the complete non-secret resolution request for one
 // tenant-bound runner. RootSourceKind and LaunchMode are durable lifecycle
-// values. Artifact bytes, MANIFEST_KEY, and the selected prepared reference
-// never cross back into the conductor process.
+// values. Artifact bytes, configs and MANIFEST_KEY stay in the tenant task.
+// RootSandboxRef is required for an already accepted Snapshot pair; an initial
+// external Snapshot template may omit it until this preparation resolves E.
 type ArtifactPrepareSpec struct {
+	RunID                 string `json:"run_id"`
+	RootSandboxRef        string `json:"root_sandbox_ref,omitempty"`
 	RootSourceKind        string `json:"root_source_kind"`
 	RootRef               string `json:"root_ref"`
 	LaunchMode            string `json:"launch_mode"`
@@ -81,8 +80,9 @@ type ArtifactNetwork struct {
 // the one launch worker for its exact run. ResolutionDigest is an idempotency
 // fingerprint, not an authentication credential.
 type ArtifactPrepareSummary struct {
-	SchemaVersion      int    `json:"schema_version"`
-	PreparedSourceKind string `json:"prepared_source_kind"`
+	RootSource         types.ResumeSource `json:"root_source"`
+	SchemaVersion      int                `json:"schema_version"`
+	PreparedSourceKind string             `json:"prepared_source_kind"`
 	// HasBuildCommands is Build-only and gated by BuildTaskSchemaVersion 6.
 	// Source command text stays task-local; ordinary Sandbox summaries omit it.
 	HasBuildCommands bool                       `json:"has_build_commands,omitempty"`
@@ -108,6 +108,7 @@ func CloneArtifactPrepareSummary(summary ArtifactPrepareSummary) ArtifactPrepare
 // EqualArtifactPrepareSummary compares the complete immutable task handoff.
 func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
 	return a.SchemaVersion == b.SchemaVersion &&
+		a.RootSource == b.RootSource &&
 		a.PreparedSourceKind == b.PreparedSourceKind &&
 		a.HasBuildCommands == b.HasBuildCommands &&
 		equalArtifactCapacity(a.Capacity, b.Capacity) &&

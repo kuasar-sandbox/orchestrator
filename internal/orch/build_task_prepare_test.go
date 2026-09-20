@@ -16,6 +16,7 @@ import (
 
 func validBuildPrepareSummary() configsock.ArtifactPrepareSummary {
 	return configsock.ArtifactPrepareSummary{
+		RootSource:         types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("a", 64)},
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 		PreparedSourceKind: string(types.ResumeSourceSandbox),
 		Capacity: configsock.ArtifactCapacity{
@@ -31,7 +32,7 @@ func validBuildPrepareSummary() configsock.ArtifactPrepareSummary {
 }
 
 func TestBuildTaskHandoffIdenticalReplayReturnsOneFinalResult(t *testing.T) {
-	h := newBuildTaskHandoff(true, "")
+	h := newBuildTaskHandoff(true, "", types.ResumeSource{})
 	summary := validBuildPrepareSummary()
 	if replay, err := h.Submit(summary); err != nil || replay {
 		t.Fatalf("first submit = replay %t, err %v", replay, err)
@@ -58,7 +59,7 @@ func TestBuildTaskHandoffIdenticalReplayReturnsOneFinalResult(t *testing.T) {
 }
 
 func TestBuildTaskHandoffConflictingReplayFailsClosed(t *testing.T) {
-	h := newBuildTaskHandoff(true, "")
+	h := newBuildTaskHandoff(true, "", types.ResumeSource{})
 	first := validBuildPrepareSummary()
 	if _, err := h.Submit(first); err != nil {
 		t.Fatal(err)
@@ -79,7 +80,7 @@ func TestBuildTaskHandoffConflictingReplayFailsClosed(t *testing.T) {
 
 func TestRecoveredBuildTaskHandoffAcceptsOnlyDurableDigest(t *testing.T) {
 	want := validBuildPrepareSummary()
-	h := newBuildTaskHandoff(true, want.ResolutionDigest)
+	h := newBuildTaskHandoff(true, want.ResolutionDigest, want.RootSource)
 	if replay, err := h.Submit(want); err != nil || !replay {
 		t.Fatalf("durable replay = replay %t, err %v", replay, err)
 	}
@@ -134,6 +135,7 @@ func TestBuildRuntimePreparationRoundTripFreezesResolvedInputs(t *testing.T) {
 	want := buildRuntimePreparation{
 		SchemaVersion:          buildRuntimePrepareSchemaVersion,
 		PrepareDigest:          strings.Repeat("d", 64),
+		RootSource:             types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("1", 64), SandboxRef: "manifest://" + strings.Repeat("2", 64)},
 		SourceHasBuildCommands: true,
 		Network:                sandboxcfg.NetworkSpec{Hostname: "build", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1"},
 		TemplateNetwork: sandboxcfg.NetworkSpec{
@@ -186,7 +188,7 @@ func TestPublishBuildFinalInstallsMMDSRouteBeforeReleasingTask(t *testing.T) {
 		Profile: types.ProfileE2B, RunID: "br-final-route-order", CreatedUnix: time.Now().Unix(),
 		Builder: types.BuildOptions{Target: &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}},
 	}
-	handoff := newBuildTaskHandoff(false, "")
+	handoff := newBuildTaskHandoff(false, "", types.ResumeSource{})
 	pend := &pendingBuild{build: b, handoff: handoff}
 	final := &configsock.BuildSpec{BuildID: b.BuildID, RunID: b.RunID}
 
@@ -235,7 +237,7 @@ func TestPublishBuildFinalSkipsPhaseCMMDSRouteForNonMemoryTargets(t *testing.T) 
 				Profile: types.ProfileE2B,
 				Builder: types.BuildOptions{Target: target},
 			}
-			pend := &pendingBuild{build: b, handoff: newBuildTaskHandoff(false, "")}
+			pend := &pendingBuild{build: b, handoff: newBuildTaskHandoff(false, "", types.ResumeSource{})}
 			if row := o.publishBuildFinal(pend, &configsock.BuildSpec{BuildID: b.BuildID}); row != nil {
 				t.Fatalf("non-memory target published Phase C MMDS row: %+v", row)
 			}
@@ -275,5 +277,38 @@ func TestArtifactPrepareFailureResultIsVisibleWithoutBuildJournal(t *testing.T) 
 	}
 	if publishedState != "error" || publishedReason != want {
 		t.Fatalf("published prepare failure = state %q reason %q", publishedState, publishedReason)
+	}
+}
+
+func buildPairSummary(t *testing.T, raw string) configsock.ArtifactPrepareSummary {
+	t.Helper()
+	tmpl, err := types.ParseTemplateID(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := validBuildPrepareSummary()
+	summary.RootSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: tmpl.Ref}
+	if tmpl.Kind == types.KindSnp {
+		summary.RootSource.Kind = types.ResumeSourceSnapshot
+		summary.RootSource.SandboxRef = "manifest://" + strings.Repeat("b", 64)
+	}
+	return summary
+}
+
+func TestRecoveredBuildTaskHandoffRejectsDifferentEWithSameDigest(t *testing.T) {
+	want := validBuildPrepareSummary()
+	want.RootSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("1", 64), SandboxRef: "manifest://" + strings.Repeat("2", 64)}
+	h := newBuildTaskHandoff(true, want.ResolutionDigest, want.RootSource)
+	if replay, err := h.Submit(want); err != nil || !replay {
+		t.Fatalf("paired retry=%t %v", replay, err)
+	}
+	wrong := want
+	wrong.RootSource.SandboxRef = "manifest://" + strings.Repeat("3", 64)
+	if _, err := h.Submit(wrong); err == nil {
+		t.Fatal("recovered builder accepted different E with same digest")
+	}
+	h.PublishFinal(&configsock.BuildSpec{BuildID: "must-not-escape"}, nil)
+	if final, err := h.WaitFinal(context.Background()); err == nil || final != nil {
+		t.Fatalf("conflicting final=%+v %v", final, err)
 	}
 }

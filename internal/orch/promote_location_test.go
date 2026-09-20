@@ -314,7 +314,7 @@ func TestPromoteRepublishReusesName(t *testing.T) {
 	if err != nil || current == nil {
 		t.Fatalf("get paused row: %v", err)
 	}
-	current.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}
+	current.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef}
 	if err := o.st.Put(ctx, current); err != nil {
 		t.Fatal(err)
 	}

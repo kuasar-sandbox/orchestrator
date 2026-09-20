@@ -19,6 +19,7 @@ var requiredPayloadFields = map[string]struct{}{
 	"runtimeDigest":          {},
 	"resumeSourceKind":       {},
 	"resumeSourceRef":        {},
+	"resumeSandboxRef":       {},
 	"createdUnix":            {},
 	"deadlineUnix":           {},
 	"autoPauseMemory":        {},
@@ -105,6 +106,8 @@ func decodePayloadField(payload *MigrationTokenPayloadV1, field string, raw json
 		return decodeStrict(raw, &payload.ResumeSourceKind)
 	case "resumeSourceRef":
 		return decodeStrict(raw, &payload.ResumeSourceRef)
+	case "resumeSandboxRef":
+		return decodeStrict(raw, &payload.ResumeSandboxRef)
 	case "env":
 		value, err := decodeStringMap(raw)
 		payload.Env = value

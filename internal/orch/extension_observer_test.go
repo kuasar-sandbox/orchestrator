@@ -159,7 +159,7 @@ func TestSandboxObserverPublishesCommittedDeadlineAndDelete(t *testing.T) {
 		ID: "observer-sandbox", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("c", 64)}.String(),
 		State:      types.StatePaused, APISecret: apiSecret, ManifestKey: manifestKey,
-		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("d", 64)},
+		ResumeSource:  types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("d", 64)},
 		ServiceSecret: serviceSecret, ForwardAccessToken: forward, CreatedUnix: time.Now().Unix(),
 		RunDir:   nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, "observer-sandbox"),
 		BaseDir:  nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, "observer-sandbox"),

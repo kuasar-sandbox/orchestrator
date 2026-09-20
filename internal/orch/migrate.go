@@ -15,13 +15,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
-	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	artifactresult "github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
@@ -102,6 +104,9 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	// mutates the source row, cache, route, or local checkpoint.
 	artifact := source.ResumeSource
 	report := artifactresult.PublishReport{SandboxRef: artifact.Ref, RemovedRefs: []string{}}
+	if artifact.Kind == types.ResumeSourceSnapshot {
+		report.SnapshotRef, report.SandboxRef = artifact.Ref, artifact.SandboxRef
+	}
 	localArtifactDir := ""
 	if !types.IsPortableRef(artifact.Ref) {
 		localArtifactDir, err = o.ownedLocalArtifactDir(source, artifact)
@@ -125,24 +130,10 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		report = published
 		artifact.Ref = report.SandboxRef
 		if artifact.Kind == types.ResumeSourceSnapshot {
-			artifact.Ref = report.SnapshotRef
-		}
-	} else if artifact.Kind == types.ResumeSourceSnapshot {
-		read := o.snapshotSandboxRef
-		if read == nil {
-			read = func(ctx context.Context, sb *types.Sandbox, source types.ResumeSource) (string, error) {
-				return taskartifact.SnapshotSandboxRef(ctx, source, o.cfg.ManifestConfig, sb.ManifestKey, o.cfg.Checkpoint.Remote.RefLocationParent)
-			}
-		}
-		report.SnapshotRef = artifact.Ref
-		report.SandboxRef, err = read(opCtx, source, artifact)
-		if err != nil {
-			if o.exports.State(attempt) == exportPreempted {
-				return types.ExportResult{}, exportPreemptedError(sid)
-			}
-			return types.ExportResult{}, err
+			artifact.Ref, artifact.SandboxRef = report.SnapshotRef, report.SandboxRef
 		}
 	}
+
 	if err := report.Validate(artifactRole(artifact.Kind)); err != nil {
 		return types.ExportResult{}, err
 	}
@@ -283,19 +274,35 @@ func (o *Orchestrator) ownedLocalArtifactDir(sb *types.Sandbox, source types.Res
 	if sb.BaseDir != wantBaseDir {
 		return "", fmt.Errorf("export-sandbox: sandbox BaseDir %q does not match canonical path %q", sb.BaseDir, wantBaseDir)
 	}
-	var suffix string
-	switch source.Kind {
-	case types.ResumeSourceSandbox:
-		suffix = ".sandbox"
-	case types.ResumeSourceSnapshot:
-		suffix = ".snapshot"
-	default:
-		return "", fmt.Errorf("export-sandbox: invalid local resume source kind %q", source.Kind)
-	}
 	dir := filepath.Join(wantBaseDir, "checkpoint")
-	wantRef := filepath.Join(dir, sb.ID+suffix)
-	if filepath.Clean(source.Ref) != wantRef {
-		return "", fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", source.Kind)
+	if !source.Valid() {
+		return "", fmt.Errorf("export-sandbox: incomplete local source")
+	}
+	check := func(raw string, role types.ResumeSourceKind) error {
+		if types.IsPortableRef(raw) {
+			return nil
+		}
+		if !strings.HasPrefix(raw, "file://") {
+			if filepath.Clean(raw) == filepath.Join(dir, sb.ID+"."+string(role)) {
+				return nil
+			}
+			return fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", role)
+		}
+		ref, err := manifest.ParseRef(raw)
+		if err != nil || ref.Location != "" || ref.Digest == "" ||
+			ref.Path != filepath.Base(ref.Path) || ref.Path == "." || ref.Path == ".." || strings.ContainsAny(ref.Path, `/\`) ||
+			(!strings.HasSuffix(ref.Path, ".bundle") && !strings.HasSuffix(ref.Path, "."+string(role))) {
+			return fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", role)
+		}
+		return nil
+	}
+	if err := check(source.Ref, source.Kind); err != nil {
+		return "", err
+	}
+	if source.Kind == types.ResumeSourceSnapshot {
+		if err := check(source.SandboxRef, types.ResumeSourceSandbox); err != nil {
+			return "", err
+		}
 	}
 	return dir, nil
 }
@@ -360,6 +367,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 			RuntimeDigest:          dig,
 			ResumeSourceKind:       source.Kind,
 			ResumeSourceRef:        source.Ref,
+			ResumeSandboxRef:       source.SandboxRef,
 			Env:                    sb.Env,
 			Metadata:               metadata,
 			CreatedUnix:            sb.CreatedUnix,
@@ -512,8 +520,9 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		APISecret:     pair.APISecret,
 		ManifestKey:   pair.ManifestKey,
 		ResumeSource: types.ResumeSource{
-			Kind: payload.ResumeSourceKind,
-			Ref:  payload.ResumeSourceRef,
+			Kind:       payload.ResumeSourceKind,
+			Ref:        payload.ResumeSourceRef,
+			SandboxRef: payload.ResumeSandboxRef,
 		},
 		AutoPauseMemory:    payload.AutoPauseMemory,
 		ServiceSecret:      payload.ServiceSecret,

@@ -334,7 +334,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30` + `169.254.0.22` / `169.254.1.1/31` + `169.254.1.0` | Per-profile `{inner_ip,nexthop}` reused inside guests; floating IP uniquely identifies a sandbox. e2b's /30 and gateway support envd port forwarding |
 | `sandbox.boot.kernel` | — | vmlinux path |
 | `sandbox.boot.runtime` | — | Single guest runtime Bundle: offset-zero EROFS plus digest-marker ZIP, containing envd, flatten-ctl and mkfs.erofs (§11) |
-| `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with mkfs.ext4. Restore obtains the layer graph from artifacts |
+| `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with `mkfs.ext4 -O ^has_journal`. Restore obtains the layer graph from artifacts |
 | `checkpoint.mode` | `local` | Local paused capture: role tarstream or multi-Manifest ZIP Bundle; output stays in Sandbox BaseDir/checkpoint (§1.6, §8.1) |
 | `checkpoint.merge_ref` / `.drop_caches` | Unset | Node tri-state Pause policy. Explicit true/false reaches sandbox-ctl snapshot; omitted/YAML null uses sandboxer's default |
 | `checkpoint.remote.ref_location_parent` | Empty | Optional absolute hostless file URI. Named-location parent for Build checkpoint graphs/export-sandbox and located Build image Bundle resolution; does not change Pause mode |
@@ -355,6 +355,14 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `cluster.api_endpoint` | Required in cluster mode | Explicit advertised conductor host:port; never inferred from api.listen |
 | `cluster.data_endpoint` | Required in cluster mode | Explicit advertised Proxy host:port; never inferred from its bind listener |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource §3.2. Omitted/disabled means static cgroups |
+
+For new `sandbox.boot.overlay_diff_template` and `builder.diff_template` files,
+use `mkfs.ext4 -O ^has_journal` to avoid filesystem journal capacity and metadata
+writes on disposable work disks. This does not disable journald or application
+logs and is not a crash-recovery guarantee. Existing journaled templates and
+user-supplied images remain compatible; sync/quiesce, snapshot/restore and mount
+behavior are unchanged. Apply this only when creating a new empty template,
+never by reformatting an existing data disk.
 
 The primary use case is [NUMA deployment (§5.3)](#numa-deployment): distinct templates carry per-node CPU/memory placement, and new executions are assigned round-robin. The repeated-template example below illustrates configuration semantics, not distinct NUMA bindings.
 
@@ -1178,7 +1186,7 @@ CaptureKind, ResumeSource, ResumeMode, LaunchMode and ResumeTrigger are separate
 | Concept | Values | Responsibility |
 |---|---|---|
 | CaptureKind | snapshot / sandbox | Whether this Pause captures S or E |
-| ResumeSource | kind snapshot/sandbox plus ref | Resumable artifact root owned by paused row |
+| ResumeSource | kind/ref plus SandboxRef for Snapshot | Exact S/E pair, or E-only root, owned by the row |
 | ResumeMode | auto / memory / cold | Caller selection for this resume |
 | LaunchMode | image / memory / cold | Resolved mode actually executed by starting |
 | ResumeTrigger | connect / wake / route / exec / exec-session | Low-cardinality observation source, not mode or permission |
@@ -1243,14 +1251,14 @@ checkpoint.mode accepts local/bundle for both CaptureKinds:
 
 ```text
 CaptureSnapshot:
-  sandbox-ctl snapshot --sandbox-id <sid> --output <dir> --mode <local|bundle> \
+  sandbox-ctl snapshot --json --path-id <sid> --output <dir> --mode <local|bundle> \
     --run-root <run-root> [--merge-ref=...] [--drop-caches=...]
-  -> ResumeSource{kind:snapshot, ref:<dir>/<sid>.snapshot}
+  -> ResumeSource{kind:snapshot, ref:<actual S basename + identity>, sandboxRef:<actual E basename + identity>}
 
 CaptureSandbox:
-  sandbox-ctl export --sandbox-id <sid> --output <dir> --mode <local|bundle> \
+  sandbox-ctl export --json --path-id <sid> --output <dir> --mode <local|bundle> \
     --run-root <run-root>
-  -> ResumeSource{kind:sandbox, ref:<dir>/<sid>.sandbox}
+  -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
 
 Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. RunDir removal failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
@@ -1276,7 +1284,7 @@ Ordinary Proxy ingress and native exec activation call OnWake with ResumeTrigger
 
 #### 8.1.3 Task-local preparation and three configuration types
 
-Artifact launch runs internal/taskartifact inside its tenant task. ArtifactPrepareSpec includes source kind/ref, durable mode, manifest config, location parent, relative directory, max refs and absolute deadline. With its MANIFEST_KEY, the task uses sandboxer's real readers to open/decrypt artifacts; conductor does not.
+Artifact launch runs internal/taskartifact inside its tenant task. ArtifactPrepareSpec v5 includes RunID, source kind/ref, its already accepted E if present, durable mode, manifest config, location parent, relative directory, max refs and absolute deadline. With its MANIFEST_KEY, the task uses sandboxer's real readers to open/decrypt artifacts; conductor does not.
 
 ```text
 E + cold   -> open E, parse sandbox.runtime.cfg, compute disk closure, prepared=E
@@ -1285,7 +1293,7 @@ S + cold   -> open S, resolve/open S.sandbox_ref E, compute disk closure, prepar
 E + memory -> reject during request mode admission; invalid task spec fails before VM launch
 ```
 
-For remote Manifest S+cold, selected source is manifest://E. Local tarstream resolves relative content-identified E refs. Bundle selection points to the same physical Bundle with E's Manifest selector, without assuming remote Store already contains E. PreparedSource, ref-location URIs, carrier/Bundle binding and full config remain task-local. Network metadata is strictly decoded there, rejecting unknown/duplicate/malformed fields. Only typed network, capacity, required-ref count and resolution_digest reach conductor. Digest covers root, launch mode, selected source, closure, locations, carrier binding and capacity/network summary. Same RunID/digest replay returns the same result; conflicting replay fails. taskrun appends --from E or --restore S only from local PreparedSource.
+For remote Manifest S+cold, selected source is manifest://E. Local tarstream resolves relative content-identified E refs. Bundle preparation preserves the reader's actual current/sibling carrier and E selector, or its remote Manifest fallback; it never assumes E is in the S carrier. PreparedSource for runtime argv, ref-location URIs, carrier/Bundle binding and full config remain task-local. The summary additionally returns the exact root S/E identities. Network metadata is strictly decoded there, rejecting unknown/duplicate/malformed fields. Only the paired root identity, typed network, capacity, disk topology, required-ref count and resolution_digest reach conductor. Digest covers RunID, the complete root pair, launch mode, selected source, closure, locations, carrier binding and capacity/network summary. An external S-only template is an initial preparation input while the durable source is empty; it is not a valid paused source. The existing tenant task read resolves E, and the exact starting worker commits S/E together with running state. Failure leaves the initial source unaccepted; restart does not recover an incomplete pair. Preparation cannot replace E in an imported or persisted pair. Same RunID/digest replay returns the same result; conflicting replay fails. taskrun appends --from E or --restore S only from local PreparedSource.
 
 Runtime uses three explicit DTOs:
 
@@ -1333,10 +1341,32 @@ The Core method returns one `types.ExportResult`; the HTTP `result` field remain
 compatible with existing clients. Deploy sandboxer and orchestrator from the
 matching source set when adopting the new internal CLI contract.
 
+Capture uses `sandbox-ctl snapshot --json` or `export --json` and validates the
+complete result before the atomic running→paused commit. Snapshot stores the
+producer's S and E, including both selectors for a single-root Bundle. E-only
+capture clears the old Snapshot and association. Local refs remain basenames
+with their identity qualifiers; execution resolves them using the sandbox's
+checkpoint directory. Capture failure never commits a partial pair. Local
+publication returns S1/E1 in both report and token; keep-source retains S0/E0 in
+SQLite and the cache. `removedRefs` is never stored in SQLite or tokens.
+
+**RFC-142 upgrade:** stop the old conductor and drain or retire its managed
+sandboxes, preserving any artifacts and records you need before proceeding.
+The operator must explicitly clear the old local sandbox database before
+starting this version; there is no ALTER, migration, backfill or dual-read path
+for the pair schema. The process rejects the old schema and never deletes user
+data to upgrade it. Deploy the matching sandboxer/orchestrator versions and
+recreate local records. Old migration tokens without the required `resumeSandboxRef` field, including
+Snapshot tokens missing E, are invalid; discard stale tokens and re-export from a
+complete paired record.
+Do not use an old token or an S metadata read to reconstruct a durable pair.
+See [paired source contract](rfc-142-pairs.md).
+
 An already portable source is not republished and has `removedRefs:[]`. A
-portable Snapshot obtains E from root metadata and the selected carrier binding;
-it does not scan dependency graphs or read memory/disk payloads. Missing or
-invalid required metadata fails before finalization. The same roots and removals
+portable Snapshot returns the exact S/E pair already stored in SQLite. Export
+does not open artifacts, configure storage, inspect metadata or start a metadata
+subprocess, even when both artifacts are offline. An incomplete paused pair is
+invalid and is never repaired by reading S. The same roots and removals
 accompany normal, keep-source, move and accepted detached-template returns.
 Resume/preemption, ownership checks, lifecycle cancellation, idempotence and
 concurrency retain the ordering below.
@@ -1365,7 +1395,7 @@ snp: manifest ref,or located .snapshot/.bundle
 
 Paused E promotes to sbx, S to snp; E is not rejected for lacking memory. Build Snapshot also yields snp, publishing through the same sandbox-ctl publish rather than a special Snapshot-only publisher.
 
-KMT V1 directly contains resumeSourceKind/ref and autoPauseMemory and rejects legacy snapshotRef payloads. Import restores kind/ref, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
+KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Target expectations compare both S and E. Import performs no artifact access and atomically restores the complete pair, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
 
 Publish phase does not hold a long lifecycle lock. Finalization acquires per-SID lock against the exact original ResumeSource. Resume winning BeginResume cancels KMT export with 409; template publication can finish detached and return ID without source cleanup. If the finalizer wins, keepSource returns the export result and leaves the source untouched — same ResumeSource, row, cache, route and local checkpoint (#336); without keepSource, exact teardown precedes row/cache/route/local-artifact deletion. Teardown/Store failure retains retryable durable ownership. Local cleanup never deletes remote/located artifacts.
 
@@ -1561,7 +1591,7 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
-               resume_source_kind, resume_source_ref, auto_pause_memory, launch_mode,
+               resume_source_kind, resume_source_ref, resume_sandbox_ref, auto_pause_memory, launch_mode,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
                created_unix
@@ -1572,7 +1602,7 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
                manifest_key_enc, label, created_unix, expires_unix, registry_auth_enc
 ```
 
-Build schema, admission and record authority are in [Build §6](node-build.md#6-persistence-recovery-and-retention). Resume_source_kind/ref is paused E/S's typed root, auto_pause_memory selects only TTL CaptureKind, and launch_mode records accepted image/cold/memory in starting. This lifecycle schema replaces the old single-string model without dual reading/writing or a migration shim; incompatible development databases must be rebuilt.
+Build schema, admission and record authority are in [Build §6](node-build.md#6-persistence-recovery-and-retention). Resume_source_kind/ref is paused E/S's typed root and resume_sandbox_ref is Snapshot's exact associated E; auto_pause_memory selects only TTL CaptureKind, and launch_mode records accepted image/cold/memory in starting. This lifecycle schema replaces the old single-string model without dual reading/writing or a migration shim; incompatible development databases must be rebuilt.
 
 Root/service credentials in *_enc use AES-256-GCM; both *_hash values are full SHA-256. The first 24 hash characters only index candidate preselection (§7).
 

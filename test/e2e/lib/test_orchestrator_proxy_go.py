@@ -59,6 +59,8 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
             "telemetry_source": str(self.source),
             "GOTOOLCHAIN": os.environ.get("GOTOOLCHAIN", "auto"),
         }
+        # Each fixture selects its own driver; the outer E2E may carry a Go entry.
+        env.pop("KUASAR_E2E_GO", None)
         if goroot_marker == "unset":
             env.pop("GOROOT", None)
         else:
@@ -205,10 +207,18 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         self.assertTrue((self.root / "telemetry-grpc-probe").is_file())
         self.assertFalse(self.log.exists(), "real builds invoked the mismatched PATH driver")
 
+    def test_carried_go_entry_wins_after_sudo_path_reset(self):
+        selected = self.fake_go(self.root / "chosen", "carried-go")
+        alternate = self.root / "secure"
+        self.fake_go(alternate, "wrong-system-go", 47)
+        result = self.run_build(path=alternate, extra={"KUASAR_E2E_GO": str(selected)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().splitlines()[0], "carried-go")
+
     def test_helper_is_wired_to_runtime_callers(self):
         self.assertEqual(SOURCE.count("\n        build_custom_proxy\n"), 1)
         self.assertIn("run_telemetry_guest_probe", SOURCE)
-        self.assertIn('"${GOROOT:+$GOROOT/bin/}go" "$@"', GO)
+        self.assertIn('"${KUASAR_E2E_GO:-${GOROOT:+$GOROOT/bin/}go}" "$@"', GO)
         self.assertNotIn("GOTOOLCHAIN=local", GO)
 
 

@@ -247,6 +247,7 @@ func TestResolveBuildNetworksFromTemplatePrecedence(t *testing.T) {
 
 func TestBuildPrepareSummaryStrictlyParsesSandboxMetadata(t *testing.T) {
 	_, got, err := validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
+		RootSource:         types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("a", 64)},
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 		PreparedSourceKind: string(types.ResumeSourceSandbox),
 		Capacity: configsock.ArtifactCapacity{
@@ -268,6 +269,7 @@ func TestBuildPrepareSummaryStrictlyParsesSandboxMetadata(t *testing.T) {
 	}
 
 	_, _, err = validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
+		RootSource:         types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("a", 64)},
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 		PreparedSourceKind: string(types.ResumeSourceSandbox),
 		Capacity: configsock.ArtifactCapacity{

@@ -278,7 +278,7 @@ and accidental logging; it does not restrict what trusted in-process code could
 otherwise access.
 
 `SandboxView` exposes the typed lifecycle projection directly:
-`ResumeSourceKind`, `ResumeSourceRef`, `ArtifactLocation`,
+`ResumeSourceKind`, `ResumeSourceRef`, `ResumeSandboxRef`, `ArtifactLocation`,
 `AutoPauseMemory`, and `LaunchMode`. `ArtifactLocation` is orthogonal to E/S
 kind, and a running row may retain a source for node-local artifact ownership.
 `LaunchMode` is non-empty only while `starting`; it is the durable, already

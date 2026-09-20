@@ -794,11 +794,44 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute("""
         select state, run_id, vswitch_port, floatingip, inner_ip, port_mac,
                run_dir, base_dir, envd_uds, ci_uds,
-               resume_source_kind, resume_source_ref
+               resume_source_kind, resume_source_ref, resume_sandbox_ref
           from sandboxes where id=?
     """, (sys.argv[2],)).fetchone()
 if row is None or row[0] != "dead" or any(row[1:]):
     raise SystemExit(f"dead sandbox retained local ownership: {row!r}")
+PY
+}
+# Capture identity is a complete content-identified pair; directory ownership is
+# execution context rather than part of the public JSON/database file spelling.
+checkpoint_pair() { # $1=sandbox id, $2=kind, $3=semantic alias
+    python3 - "$WORK/lib/node-ctl.db" "$1" "$2" "$3" <<'PY'
+import json, os, re, sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select state, resume_source_kind, resume_source_ref, resume_sandbox_ref, launch_mode from sandboxes where id=?", (sys.argv[2],)).fetchone()
+if row is None or row[:2] != ("paused", sys.argv[3]) or row[4]:
+    raise SystemExit(f"invalid paused checkpoint: {row!r}")
+def physical(ref):
+    match = re.fullmatch(r"file://([^/@]+)@(digest|hmac|manifest):([0-9a-f]{64})", ref)
+    if not match or match[1] in (".", "..") or "\\" in match[1]:
+        raise SystemExit(f"checkpoint must retain a content-identified basename: {ref!r}")
+    path = os.path.join(os.path.dirname(sys.argv[4]), match[1])
+    if not os.path.isfile(path):
+        raise SystemExit(f"checkpoint carrier unavailable: {ref!r}")
+    return path
+if os.path.realpath(physical(row[2])) != os.path.realpath(sys.argv[4]):
+    raise SystemExit(f"checkpoint root differs from committed alias: {row!r}")
+if row[1] == "snapshot":
+    physical(row[3])
+elif row[3]:
+    raise SystemExit(f"E-only checkpoint retained Snapshot association: {row!r}")
+print(json.dumps(row, separators=(",", ":")))
+PY
+}
+checkpoint_runtime_ref() { # $1=validated pair JSON, $2=checkpoint directory
+    python3 - "$1" "$2" <<'PY'
+import json, os, sys
+root = json.loads(sys.argv[1])[2]
+print("file://" + os.path.join(sys.argv[2], root.removeprefix("file://")))
 PY
 }
 wait_sandbox_state() { # $1=sandbox id, $2=state, $3=attempts(optional)
@@ -1233,11 +1266,11 @@ MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 [ -x "$MKFS_EXT4" ] || skip "mkfs.ext4 not found (overlay template)"
 OVL="$WORK/overlay-1G.ext4"
 truncate -s 1G "$OVL"
-"$MKFS_EXT4" -F -q -b 4096 "$OVL" >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "mkfs.ext4 overlay template"; }
+"$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "mkfs.ext4 overlay template"; }
 echo "==> overlay diff_template: $OVL ($(du -h "$OVL" | cut -f1) on disk)"
 BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export scratch)
 truncate -s 2G "$BLD"
-"$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
+"$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
 CHECKPOINT_ROOT="$WORK/lib/sandboxes"
 write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller, $3=local|bundle
@@ -2130,7 +2163,7 @@ assert_paused_usage_export "$SID" "$WORK/usage-$SID-paused.json"
 # this host wall-clock interval.
 sleep 3
 assert_snapshot_argv "$UNSET_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "all-unset local Pause did not pass the configured mode"
 B_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 [ -f "$B_LOCAL" ] || fail "local Pause did not create $B_LOCAL"
@@ -2195,7 +2228,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
     '{"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "portable W pause=$code (want 204)"; }
 assert_snapshot_argv "$PORTABLE_W_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "portable W Pause policy did not reach sandbox-ctl exactly"
 W_PORTABLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
@@ -2254,6 +2287,8 @@ B_ROOT_TOP_PATH="$CHECKPOINT_ROOT/$SID/checkpoint/$B_ROOT_TOP_BASENAME"
 rm -f -- "$B_ROOT_TOP_PATH"
 echo "==> PASS: W -> local B is separate; B root disk top was merged and removed"
 
+W_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$W_PORTABLE_LOCAL") || fail "invalid W capture pair"
+W_RUNTIME_REF=$(checkpoint_runtime_ref "$W_LOCAL_PAIR" "$CHECKPOINT_ROOT/$SID/checkpoint")
 PROMOTION_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
     || fail "independent keep-source export of local W failed"
@@ -2277,18 +2312,8 @@ PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
     || fail "published W ref is not manifest://<64hex>: $PORTABLE_W_REF"
 # keep-source must leave the paused source row bit-for-bit unchanged after both
 # exports, and must retain the local checkpoint it resumes from (#336).
-python3 - "$WORK/lib/node-ctl.db" "$SID" "$W_PORTABLE_LOCAL" <<'PY' \
-    || fail "keep-source export rewrote the W source row"
-import sqlite3, sys
-with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute(
-        "select state, resume_source_kind, resume_source_ref from sandboxes where id=?",
-        (sys.argv[2],),
-    ).fetchone()
-want = ("paused", "snapshot", sys.argv[3])
-if row != want:
-    raise SystemExit(f"keep-source W source row={row!r}, want {want!r}")
-PY
+[ "$(checkpoint_pair "$SID" snapshot "$W_PORTABLE_LOCAL")" = "$W_LOCAL_PAIR" ] \
+    || fail "keep-source export rewrote the W S/E pair"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "keep-source export removed the retained W checkpoint"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$PORTABLE_W_REF" >"$WORK/w-portable-manifest.json" \
@@ -2360,7 +2385,7 @@ W_RESUME_RUN_ID=$(sandbox_run_id "$SID")
 # either backend=file prefetch log variant (started or skipped).
 assert_run_source_mode "$W_RESUME_RUN_CALL" "$SID" restore \
     || fail "retained W resume did not execute run --restore"
-assert_run_option_value "$W_RESUME_RUN_CALL" "$SID" "--restore" "$W_PORTABLE_LOCAL" \
+assert_run_option_value "$W_RESUME_RUN_CALL" "$SID" "--restore" "$W_RUNTIME_REF" \
     || fail "retained W resume did not select the retained local checkpoint"
 W_RESUME_UNIT="${RUNNER_PREFIX}$W_RESUME_RUN_ID.service"
 # The prefetch identity ("backend=file parent_layers=N") is emitted whether or
@@ -2506,7 +2531,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
 unset REQ_CHECKPOINT_HEADER
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "policy pause=$code (want 204)"; }
 assert_snapshot_argv "$POLICY_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "Pause body/header policy did not reach sandbox-ctl exactly"
 W_POLICY="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
@@ -2538,22 +2563,12 @@ E_LOCAL_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "local Sandbox E pause=$code (want 204)"; }
 assert_export_argv "$E_LOCAL_EXPORT_CALL" \
-    export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "Pause(memory=false) did not execute sandbox-ctl export in local mode"
 E_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.sandbox"
 [ -e "$E_LOCAL" ] || fail "Pause(memory=false) did not create $E_LOCAL"
-python3 - "$WORK/lib/node-ctl.db" "$SID" "$E_LOCAL" <<'PY' \
+checkpoint_pair "$SID" sandbox "$E_LOCAL" >/dev/null \
     || fail "local Sandbox E durable source is incorrect"
-import sqlite3, sys
-with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute(
-        "select state, resume_source_kind, resume_source_ref, launch_mode from sandboxes where id=?",
-        (sys.argv[2],),
-    ).fetchone()
-want = ("paused", "sandbox", sys.argv[3], "")
-if row != want:
-    raise SystemExit(f"durable E row={row!r}, want={want!r}")
-PY
 code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"memory":true}')
 [ "$code" = "409" ] || { cat "$WORK/resp.body"; fail "Sandbox E Connect(memory=true)=$code (want 409)"; }
 [ "$(sandbox_state "$SID")" = "paused" ] || fail "memory-unavailable conflict changed paused Sandbox E state"
@@ -2622,7 +2637,7 @@ done
 [ -n "$AUTO_PAUSED" ] || { sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "reaper did not auto-pause policy sandbox (last state=$state)"; }
 wait_paused_cleanup "$SID" || fail "auto-paused runtime ownership did not durably clear"
 assert_snapshot_argv "$AUTO_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "auto-pause did not resolve metadata > node fieldwise"
 [ -f "$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot" ] || fail "auto-pause did not create local W"
@@ -2656,7 +2671,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false explicit Pause({})=$code"; }
 wait_paused_cleanup "$SID" || fail "explicit paused runtime ownership did not durably clear"
 assert_snapshot_argv "$AUTO_E_EXPLICIT_S_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=true --drop-caches=false \
     || fail "explicit Pause({}) inherited AutoPauseMemory=false instead of capturing Snapshot S"
 python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
@@ -2687,7 +2702,7 @@ done
 [ -n "$AUTO_E_PAUSED" ] || fail "autoPauseMemory=false TTL did not pause"
 wait_paused_cleanup "$SID" || fail "TTL paused runtime ownership did not durably clear"
 assert_export_argv "$AUTO_E_TTL_CALL" \
-    export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
+    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "autoPauseMemory=false TTL did not capture Sandbox E"
 python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
     || fail "autoPauseMemory=false TTL durable source is incorrect"
@@ -2734,7 +2749,7 @@ BUNDLE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle pause=$code"; }
 assert_snapshot_argv "$BUNDLE_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     --merge-ref=false \
     || fail "bundle Pause did not pass --mode bundle exactly"
 BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
@@ -2757,7 +2772,7 @@ BUNDLE_B_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle B pause=$code"; }
 assert_snapshot_argv "$BUNDLE_B_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     --merge-ref=false \
     || fail "bundle B Pause did not pass --mode bundle exactly"
 BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
@@ -2810,7 +2825,7 @@ BUNDLE_PROMOTE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle C promote pause=$code"; }
 assert_snapshot_argv "$BUNDLE_PROMOTE_CALL" \
-    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    snapshot --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     --merge-ref=false \
     || fail "bundle C Pause did not pass --mode bundle exactly"
 BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
@@ -2853,6 +2868,7 @@ bad = [value for value in strings(cfg) if value.startswith("file://") and "@mani
 if bad:
     raise SystemExit(f"physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
 PY
+BUNDLE_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle capture pair"
 BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
     || fail "bundle keep-source export failed"
@@ -2860,18 +2876,8 @@ case "$BUNDLE_TOKEN" in kmt1.*) ;; *) fail "bundle export returned a non-KMT res
 # keep-source must leave the paused source row unchanged and retain its local
 # checkpoint (#336). The published root stays content-addressed under the
 # local bundle's ManifestKey, which the Store lookup below proves.
-python3 - "$WORK/lib/node-ctl.db" "$SID" "$BUNDLE_LOCAL" <<'PY' \
-    || fail "bundle keep-source export rewrote the source row"
-import sqlite3, sys
-with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute(
-        "select state, resume_source_kind, resume_source_ref from sandboxes where id=?",
-        (sys.argv[2],),
-    ).fetchone()
-want = ("paused", "snapshot", sys.argv[3])
-if row != want:
-    raise SystemExit(f"keep-source Bundle source row={row!r}, want {want!r}")
-PY
+[ "$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL")" = "$BUNDLE_LOCAL_PAIR" ] \
+    || fail "Bundle keep-source export rewrote the S/E pair"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "bundle keep-source export removed the retained checkpoint"
 BUNDLE_REMOTE_REF="manifest://$BUNDLE_ROOT_KEY"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
@@ -2888,12 +2894,14 @@ E_BUNDLE_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "Bundle Sandbox E pause=$code"; }
 assert_export_argv "$E_BUNDLE_EXPORT_CALL" \
-    export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
+    export --json --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     || fail "Pause(memory=false) did not execute Bundle export"
 E_BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.sandbox"
 [ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E did not retain $E_BUNDLE_LOCAL symlink"
 E_BUNDLE_TARGET=$(readlink -f "$E_BUNDLE_LOCAL")
 case "$E_BUNDLE_TARGET" in *.bundle) ;; *) fail "Bundle Sandbox E target is not .bundle: $E_BUNDLE_TARGET" ;; esac
+E_BUNDLE_PAIR=$(checkpoint_pair "$SID" sandbox "$E_BUNDLE_LOCAL") || fail "invalid E-only Bundle capture"
+E_BUNDLE_RUNTIME_REF=$(checkpoint_runtime_ref "$E_BUNDLE_PAIR" "$CHECKPOINT_ROOT/$SID/checkpoint")
 E_BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
     || fail "Bundle Sandbox E publish failed"
@@ -2901,18 +2909,8 @@ case "$E_BUNDLE_TOKEN" in kmt1.*) ;; *) fail "Bundle Sandbox E export returned a
 # keep-source leaves the paused Bundle E row pointing at its retained local
 # checkpoint (#336); the published artifact lands in the Store under the
 # bundle's content-addressed root key.
-python3 - "$WORK/lib/node-ctl.db" "$SID" "$E_BUNDLE_LOCAL" <<'PY' \
-    || fail "Bundle Sandbox E keep-source export rewrote the source row"
-import sqlite3, sys
-with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute(
-        "select state, resume_source_kind, resume_source_ref from sandboxes where id=?",
-        (sys.argv[2],),
-    ).fetchone()
-want = ("paused", "sandbox", sys.argv[3])
-if row != want:
-    raise SystemExit(f"keep-source Bundle E source row={row!r}, want {want!r}")
-PY
+[ "$(checkpoint_pair "$SID" sandbox "$E_BUNDLE_LOCAL")" = "$E_BUNDLE_PAIR" ] \
+    || fail "Bundle Sandbox E keep-source export rewrote the source"
 [ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E keep-source export removed the retained local symlink"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Bundle Sandbox E keep-source export removed the retained local directory"
 E_BUNDLE_REMOTE_REF="manifest://$(basename "$E_BUNDLE_TARGET" .bundle)"
@@ -2924,7 +2922,7 @@ exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_E_WAKE_$RANDOM"
 wait_sandbox_state "$SID" running 1200 || fail "retained Bundle Sandbox E did not cold Wake"
 assert_run_source_mode "$E_BUNDLE_RUN_CALL" "$SID" from \
     || fail "Bundle Sandbox E Wake did not execute run --from"
-assert_run_option_value "$E_BUNDLE_RUN_CALL" "$SID" "--from" "$E_BUNDLE_LOCAL" \
+assert_run_option_value "$E_BUNDLE_RUN_CALL" "$SID" "--from" "$E_BUNDLE_RUNTIME_REF" \
     || fail "Bundle Sandbox E Wake did not select the retained local checkpoint"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-read.out" 2>&1 || true

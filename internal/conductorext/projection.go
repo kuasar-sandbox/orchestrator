@@ -19,6 +19,7 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		PortMAC:          sandbox.PortMAC,
 		ResumeSourceKind: conductorextension.ResumeSourceKind(sandbox.ResumeSource.Kind),
 		ResumeSourceRef:  sandbox.ResumeSource.Ref,
+		ResumeSandboxRef: sandbox.ResumeSource.SandboxRef,
 		ArtifactLocation: artifactLocation(sandbox.ResumeSource.Ref),
 		AutoPauseMemory:  sandbox.AutoPauseMemory,
 		LaunchMode:       conductorextension.LaunchMode(sandbox.LaunchMode),

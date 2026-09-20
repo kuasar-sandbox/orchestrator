@@ -76,11 +76,17 @@ func (k ResumeSourceKind) Valid() bool {
 type ResumeSource struct {
 	Kind ResumeSourceKind `json:"kind"`
 	Ref  string           `json:"ref"`
+	// SandboxRef is the exact E associated with a Snapshot root. It is empty
+	// for an E-only source, whose identity is already in Ref.
+	SandboxRef string `json:"sandboxRef,omitempty"`
 }
 
-func (s ResumeSource) Empty() bool { return s.Kind == "" && s.Ref == "" }
+func (s ResumeSource) Empty() bool { return s.Kind == "" && s.Ref == "" && s.SandboxRef == "" }
 
-func (s ResumeSource) Valid() bool { return s.Kind.Valid() && s.Ref != "" }
+func (s ResumeSource) Valid() bool {
+	return s.Ref != "" && ((s.Kind == ResumeSourceSnapshot && s.SandboxRef != "") ||
+		(s.Kind == ResumeSourceSandbox && s.SandboxRef == ""))
+}
 
 type ArtifactDiskMode string
 

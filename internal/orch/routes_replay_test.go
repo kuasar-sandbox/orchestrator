@@ -28,7 +28,7 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 		Metadata: map[string]string{
 			sandboxcfg.NsTraffic: `{"max_inflight":{"total":32,"forward":0}}`,
 		},
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("4", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("4", 64)},
 	}
 	apiFingerprint, err := store.APISecretHash(apiSecret)
 	if err != nil {

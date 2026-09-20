@@ -137,7 +137,7 @@ func TestResourceStatsMissingRuntimeAndPaused(t *testing.T) {
 				sb.LaunchMode = types.LaunchImage
 			}
 			if state == types.StatePaused {
-				sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
+				sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
 			}
 			materializeTestSandboxCredentials(t, sb)
 			if err := o.st.Put(context.Background(), sb); err != nil {

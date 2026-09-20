@@ -732,7 +732,7 @@ func TestPrepareManifestStoreSandboxAndSnapshotModes(t *testing.T) {
 		{name: "sandbox cold", rootKind: types.ResumeSourceSandbox, launchMode: types.LaunchCold, rootRef: sandboxRef,
 			want: types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: sandboxRef}},
 		{name: "snapshot memory", rootKind: types.ResumeSourceSnapshot, launchMode: types.LaunchMemory, rootRef: snapshotRef,
-			want: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: snapshotRef}},
+			want: types.ResumeSource{SandboxRef: sandboxRef, Kind: types.ResumeSourceSnapshot, Ref: snapshotRef}},
 		{name: "snapshot cold", rootKind: types.ResumeSourceSnapshot, launchMode: types.LaunchCold, rootRef: snapshotRef,
 			want: types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: sandboxRef}},
 	}

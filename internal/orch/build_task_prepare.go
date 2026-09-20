@@ -20,7 +20,7 @@ import (
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
 
-const buildRuntimePrepareSchemaVersion = 4
+const buildRuntimePrepareSchemaVersion = 5
 
 // buildRuntimePreparation is the non-secret durable authority committed in the
 // same SQLite UPDATE as the exact connector port. It freezes every node-policy
@@ -28,6 +28,7 @@ const buildRuntimePrepareSchemaVersion = 4
 type buildRuntimePreparation struct {
 	SchemaVersion          int                       `json:"schema_version"`
 	PrepareDigest          string                    `json:"prepare_digest"`
+	RootSource             types.ResumeSource        `json:"root_source"`
 	SourceHasBuildCommands bool                      `json:"source_has_build_commands"`
 	Network                sandboxcfg.NetworkSpec    `json:"network"`
 	TemplateNetwork        sandboxcfg.NetworkSpec    `json:"template_network"`
@@ -70,6 +71,9 @@ func validateBuildRuntimePreparation(prep buildRuntimePreparation) error {
 	if prep.SchemaVersion != buildRuntimePrepareSchemaVersion {
 		return fmt.Errorf("build: unsupported durable runtime preparation schema %d", prep.SchemaVersion)
 	}
+	if !prep.RootSource.Empty() && (!prep.RootSource.Valid() || len(prep.RootSource.Ref) > 4096 || len(prep.RootSource.SandboxRef) > 4096) {
+		return errors.New("build: durable root pair is incomplete or oversized")
+	}
 	digest, err := hex.DecodeString(prep.PrepareDigest)
 	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != prep.PrepareDigest {
 		return errors.New("build: durable prepare digest is not SHA-256")
@@ -110,6 +114,9 @@ func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (con
 	}
 	if types.ResumeSourceKind(summary.PreparedSourceKind) != types.ResumeSourceSandbox {
 		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: prepared source kind %q is not Sandbox", summary.PreparedSourceKind)
+	}
+	if !summary.RootSource.Valid() || len(summary.RootSource.Ref) > 4096 || len(summary.RootSource.SandboxRef) > 4096 {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: incomplete or oversized source pair")
 	}
 	digest, err := hex.DecodeString(summary.ResolutionDigest)
 	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != summary.ResolutionDigest {
@@ -153,6 +160,7 @@ type buildTaskHandoff struct {
 
 	source         bool
 	expectedDigest string
+	expectedSource types.ResumeSource
 	summary        *configsock.ArtifactPrepareSummary
 	prepareReady   chan struct{}
 
@@ -164,9 +172,9 @@ type buildTaskHandoff struct {
 	conflictReady chan struct{}
 }
 
-func newBuildTaskHandoff(source bool, expectedDigest string) *buildTaskHandoff {
+func newBuildTaskHandoff(source bool, expectedDigest string, expectedSource types.ResumeSource) *buildTaskHandoff {
 	return &buildTaskHandoff{
-		source: source, expectedDigest: expectedDigest,
+		source: source, expectedDigest: expectedDigest, expectedSource: expectedSource,
 		prepareReady: make(chan struct{}), finalReady: make(chan struct{}), conflictReady: make(chan struct{}),
 	}
 }
@@ -181,7 +189,7 @@ func (h *buildTaskHandoff) Submit(summary configsock.ArtifactPrepareSummary) (bo
 		return false, h.conflict
 	}
 	if h.expectedDigest != "" {
-		if summary.ResolutionDigest == h.expectedDigest {
+		if summary.ResolutionDigest == h.expectedDigest && summary.RootSource == h.expectedSource {
 			return true, nil
 		}
 		return false, h.setConflictLocked(errors.New("build: artifact prepare conflicts with durable preparation"))

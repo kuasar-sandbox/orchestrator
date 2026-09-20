@@ -184,7 +184,7 @@ mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
-mkfs.ext4 -q -F "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 
 # Spec semantics:
 #   capacity    = guest-visible vCPU + RAM (passed to CH --cpus / --memory-zone)

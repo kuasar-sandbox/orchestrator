@@ -2,15 +2,11 @@ package orch
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -79,69 +75,25 @@ func TestInvalidPublicationReportPreservesMoveSource(t *testing.T) {
 	}
 }
 
-func TestPortableSnapshotMetadataResume(t *testing.T) {
+func TestPortableSnapshotUsesStoredPairWithoutArtifacts(t *testing.T) {
+	fixture := newExportResumeFixture(t)
+	source := types.ResumeSource{Kind: types.ResumeSourceSnapshot,
+		Ref:        "file://unavailable.snapshot@digest:" + strings.Repeat("1", 64) + "@location:offline",
+		SandboxRef: "file://unavailable.sandbox@digest:" + strings.Repeat("2", 64) + "@location:offline"}
+	fixture.sb.ResumeSource = source
+	if err := fixture.o.st.Put(fixture.ctx, fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	fixture.o.cfg.ManifestConfig = filepath.Join(t.TempDir(), "missing-storage.yaml")
+	fixture.o.cfg.Checkpoint.Remote.RefLocationParent = "file:///unavailable"
+	fixture.o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error) {
+		t.Fatal("portable Export attempted artifact publication")
+		return artifact.PublishReport{}, nil
+	}
 	for _, template := range []bool{false, true} {
-		t.Run(fmt.Sprint(template), func(t *testing.T) {
-			fixture := newExportResumeFixture(t)
-			source := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
-			fixture.sb.ResumeSource = source
-			if err := fixture.o.st.Put(fixture.ctx, fixture.sb); err != nil {
-				t.Fatal(err)
-			}
-			fixture.o.cache(fixture.sb)
-			started := make(chan struct{})
-			release := make(chan struct{})
-			var releaseOnce sync.Once
-			finish := func() { releaseOnce.Do(func() { close(release) }) }
-			defer finish()
-			e := "manifest://" + strings.Repeat("e", 64)
-			fixture.o.snapshotSandboxRef = func(ctx context.Context, _ *types.Sandbox, _ types.ResumeSource) (string, error) {
-				close(started)
-				select {
-				case <-release:
-					return e, nil
-				case <-ctx.Done():
-					return "", context.Cause(ctx)
-				}
-			}
-			type outcome struct {
-				result types.ExportResult
-				err    error
-			}
-			done := make(chan outcome, 1)
-			go func() {
-				result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, template, false)
-				done <- outcome{result, err}
-			}()
-			select {
-			case <-started:
-			case <-time.After(3 * time.Second):
-				t.Fatal("metadata read did not start")
-			}
-			connected, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{})
-			if err != nil || connected == nil || connected.State != types.StateStarting {
-				t.Fatalf("resume=%+v err=%v", connected, err)
-			}
-			finish()
-			select {
-			case out := <-done:
-				if template {
-					if out.err != nil || out.result.SnapshotRef != source.Ref || out.result.SandboxRef != e || len(out.result.RemovedRefs) != 0 {
-						t.Fatalf("detached result=%+v err=%v", out.result, out.err)
-					}
-				} else if !errors.Is(out.err, api.ErrExportPreempted) {
-					t.Fatalf("preempt=%v", out.err)
-				}
-			case <-time.After(3 * time.Second):
-				t.Fatal("metadata export did not complete")
-			}
-			if _, err := os.Stat(fixture.localRef); err != nil {
-				t.Fatal("resume-winning metadata export removed checkpoint")
-			}
-			stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
-			if err != nil || stored == nil || stored.ResumeSource != source {
-				t.Fatal("metadata export finalized resumed source")
-			}
-		})
+		result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, template, true)
+		if err != nil || result.SnapshotRef != source.Ref || result.SandboxRef != source.SandboxRef || len(result.RemovedRefs) != 0 {
+			t.Fatalf("portable result=%+v err=%v", result, err)
+		}
 	}
 }

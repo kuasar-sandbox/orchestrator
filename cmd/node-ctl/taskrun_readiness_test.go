@@ -175,7 +175,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			return &configsock.SandboxTaskSpec{
 				SandboxID: "sid", RunID: "run-1", Workdir: "/task-work",
 				Env: map[string]string{"MANIFEST_KEY": "authoritative-key", "KUASAR_RUN_ID": "run-1"},
-				Prepare: &configsock.ArtifactPrepareSpec{
+				Prepare: &configsock.ArtifactPrepareSpec{RunID: "run-1",
 					RootRef: "manifest://root", AbsoluteDeadlineUnixNano: time.Now().Add(time.Minute).UnixNano(),
 				},
 			}, nil
@@ -187,7 +187,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 				t.Fatalf("prepare environment/root = %q/%q", os.Getenv("MANIFEST_KEY"), spec.RootRef)
 			}
 			return &taskartifact.Result{
-				PreparedSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://root"},
+				PreparedSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://root"},
 				Summary: configsock.ArtifactPrepareSummary{
 					SchemaVersion: configsock.ArtifactPrepareSchemaVersion, PreparedSourceKind: string(types.ResumeSourceSnapshot),
 					ResolutionDigest: strings.Repeat("1", 64), RequiredRefCount: 2,
