@@ -56,6 +56,17 @@ for script in "${cases[@]}"; do
         cursor="$(sed -n 's/^-- cursor: //p' "$journal_work/cursor" | tail -1)"
         [ -n "$cursor" ] || { echo "cannot capture native journal cursor" >&2; exit 1; }
     fi
+    case "$(basename "$script")" in
+        e2e_mmds_routes.sh|e2e_mmds_routes_proxy_restart.sh)
+            echo "==> covered by the corresponding owner lifecycle with MMDS enabled"
+            continue ;;
+        e2e_execute.sh|e2e_orchestrator_proxy.sh)
+            export MMDS_ROUTES_E2E=1
+            export MMDS_SECRET_INITIAL_VALUE=MMDS_SECRET_INITIAL_GUEST_E2E
+            export REQ_MMDS_HEADER='{"secrets":{"e2e_secret":"MMDS_SECRET_INITIAL_GUEST_E2E"},"routes":[{"path":"/e2e/static","data":"MMDS_STATIC_GUEST_E2E"},{"path":"/e2e/secret","type":"secret","secret":"e2e_secret","content_type":"application/x-kuasar-e2e-secret"},{"path":"/e2e/unresolved","type":"secret","secret":"e2e_unresolved"},{"path":"/e2e/service","type":"service","service":"e2e_service"}]}'
+            ;;
+        *) unset MMDS_ROUTES_E2E MMDS_SECRET_INITIAL_VALUE REQ_MMDS_HEADER || true ;;
+    esac
     bash "$script"
     if [ -n "$kind" ]; then
         "${journal[@]}" --sync

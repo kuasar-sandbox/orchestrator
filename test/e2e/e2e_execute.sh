@@ -2620,7 +2620,7 @@ AUTO_CALL=$(snapshot_argv_count)
 code=$(req POST /sandboxes "$AK" "$AUTO_BODY")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "auto-pause create=$code"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
-code=$(req POST "/sandboxes/$SID/timeout" "$AK" '{"timeout":15}')
+code=$(req POST "/sandboxes/$SID/timeout" "$AK" '{"timeout":1}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "arm auto-pause timeout=$code"; }
 AUTO_PAUSED=""
 for _ in $(seq 1 180); do
@@ -2692,7 +2692,7 @@ assert_run_source_mode "$AUTO_E_MEMORY_RUN_CALL" "$SID" restore \
     || fail "ordinary Wake of explicit Snapshot S did not default to memory restore"
 
 AUTO_E_TTL_CALL=$(export_argv_count)
-code=$(req POST "/sandboxes/$SID/timeout" "$AK" '{"timeout":15}')
+code=$(req POST "/sandboxes/$SID/timeout" "$AK" '{"timeout":1}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "arm autoPauseMemory=false timeout=$code"; }
 AUTO_E_PAUSED=""
 for _ in $(seq 1 180); do
