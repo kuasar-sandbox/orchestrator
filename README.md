@@ -90,6 +90,8 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 
 ## Build and test
 
+Builds use environment-provided Go and inherit its `GOROOT` and `GOTOOLCHAIN` selection. Release automation requires a working `gh` with `api --slurp` support on `PATH`; the project does not install, replace, or authenticate these environment tools against fixed binary digests.
+
 The Go binaries are built with `CGO_ENABLED=0`.
 
 ```bash

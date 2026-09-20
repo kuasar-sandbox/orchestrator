@@ -44,8 +44,11 @@ jobs:
           ref: main
           persist-credentials: false
 
-      - name: Install pinned GitHub CLI
-        run: bash scripts/install-gh-cli.sh
+      - name: Check environment GitHub CLI
+        run: |
+          gh --version
+          gh_help="$(gh api --help)"
+          [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
 
       - name: Reconcile source-ordered main Stable Latest
         env:
