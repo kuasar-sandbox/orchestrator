@@ -101,7 +101,7 @@ make test-e2e                   # component owner suite; requires the assembled 
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
-Source builds require Go 1.24 or newer and sibling checkouts of `accelerator`,
+Source builds require Go 1.26.1 or newer and sibling checkouts of `accelerator`,
 `connector` and `sandboxer`, even for a change confined to this repository. The
 internal `require` versions identify each dependency's target formal release;
 Daily Preview development uses the same target without its preview suffix. A
