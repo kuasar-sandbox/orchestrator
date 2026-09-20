@@ -327,7 +327,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30` + `169.254.0.22` / `169.254.1.1/31` + `169.254.1.0` | Per-profile `{inner_ip,nexthop}` reused inside guests; floating IP uniquely identifies a sandbox. e2b's /30 and gateway support envd port forwarding |
 | `sandbox.boot.kernel` | — | vmlinux path |
 | `sandbox.boot.runtime` | — | Single guest runtime Bundle: offset-zero EROFS plus digest-marker ZIP, containing envd, flatten-ctl and mkfs.erofs (§11) |
-| `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with mkfs.ext4. Restore obtains the layer graph from artifacts |
+| `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with `mkfs.ext4 -O ^has_journal`. Restore obtains the layer graph from artifacts |
 | `checkpoint.mode` | `local` | Local paused capture: role tarstream or multi-Manifest ZIP Bundle; output stays in Sandbox BaseDir/checkpoint (§1.6, §8.1) |
 | `checkpoint.merge_ref` / `.drop_caches` | Unset | Node tri-state Pause policy. Explicit true/false reaches sandbox-ctl snapshot; omitted/YAML null uses sandboxer's default |
 | `checkpoint.remote.ref_location_parent` | Empty | Optional absolute hostless file URI. Named-location parent for Build checkpoint graphs/export-sandbox and located Build image Bundle resolution; does not change Pause mode |
@@ -348,6 +348,14 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `cluster.api_endpoint` | Required in cluster mode | Explicit advertised conductor host:port; never inferred from api.listen |
 | `cluster.data_endpoint` | Required in cluster mode | Explicit advertised Proxy host:port; never inferred from its bind listener |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource §3.2. Omitted/disabled means static cgroups |
+
+For new `sandbox.boot.overlay_diff_template` and `builder.diff_template` files,
+use `mkfs.ext4 -O ^has_journal` to avoid filesystem journal capacity and metadata
+writes on disposable work disks. This does not disable journald or application
+logs and is not a crash-recovery guarantee. Existing journaled templates and
+user-supplied images remain compatible; sync/quiesce, snapshot/restore and mount
+behavior are unchanged. Apply this only when creating a new empty template,
+never by reformatting an existing data disk.
 
 The primary use case is [NUMA deployment (§5.3)](#numa-deployment): distinct templates carry per-node CPU/memory placement, and new executions are assigned round-robin. The repeated-template example below illustrates configuration semantics, not distinct NUMA bindings.
 

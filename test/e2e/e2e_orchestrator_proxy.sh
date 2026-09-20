@@ -596,10 +596,10 @@ MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 [ -x "$MKFS_EXT4" ] || skip "mkfs.ext4 not found (overlay template)"
 OVL="$WORK/overlay-1G.ext4"
 truncate -s 1G "$OVL"
-"$MKFS_EXT4" -F -q -b 4096 "$OVL" >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "mkfs.ext4 overlay template"; }
+"$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "mkfs.ext4 overlay template"; }
 BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export scratch)
 truncate -s 2G "$BLD"
-"$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
+"$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
 # ---- conductor config ------------------------------------------------------
 cat > "$WORK/config.yaml" <<EOF

@@ -303,9 +303,9 @@ crypto:
 EOF
 MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 OVL="$WORK/overlay-1G.ext4"             # cold-boot overlay upper (template VMs)
-truncate -s 1G "$OVL" && "$MKFS_EXT4" -F -q -b 4096 "$OVL"
+truncate -s 1G "$OVL" && "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL"
 BLDDIFF="$WORK/builder-2G.ext4"         # build VM writable disk (pull cache + steps delta + export scratch)
-truncate -s 2G "$BLDDIFF" && "$MKFS_EXT4" -F -q -b 4096 "$BLDDIFF"
+truncate -s 2G "$BLDDIFF" && "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLDDIFF"
 
 # ---- versitygw (S3 gateway for COPY build contexts) ------------------------
 # Backs builder.files_storage: the client direct-uploads a COPY context here
