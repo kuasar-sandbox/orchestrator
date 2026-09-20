@@ -24,7 +24,7 @@ if [ -n "${CANDIDATE_REPOSITORY:-}" ] && { [ -z "$source_root" ] || [ ! -f "$sou
     echo "orchestrator source integration checkout is missing" >&2
     exit 1
 fi
-if [ -n "$source_root" ] && [ -f "$source_root/go.mod" ]; then
+if [ "${ORCHESTRATOR_E2E_GROUP:-all}" != b ] && [ -n "$source_root" ] && [ -f "$source_root/go.mod" ]; then
     (
         cd "$source_root"
         echo "==> orchestrator source unit, race and vet regressions"
