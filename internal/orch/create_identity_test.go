@@ -169,7 +169,7 @@ func TestCreateIdentityRetainedStateConflicts(t *testing.T) {
 			case types.StateStarting:
 				existing.LaunchMode = types.LaunchImage
 			case types.StatePaused:
-				existing.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+				existing.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
 			case types.StateDead:
 				existing.DeadUnix = 1
 			}

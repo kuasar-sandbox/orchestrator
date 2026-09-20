@@ -23,7 +23,7 @@ func usageSandbox(t *testing.T, o *Orchestrator) (*types.Sandbox, usage.Record, 
 	t.Helper()
 	sb := &types.Sandbox{ID: "usage-sid", StableIDValue: "stable-alias", Profile: types.ProfileBare, State: types.StatePaused,
 		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
 		BaseDir:      t.TempDir(), APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64)}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {

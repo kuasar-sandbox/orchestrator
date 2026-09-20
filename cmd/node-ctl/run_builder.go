@@ -108,6 +108,9 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if bootstrap.BuildID != bid || bootstrap.RunID != *runID {
 		return fmt.Errorf("build task bootstrap identity mismatch")
 	}
+	if bootstrap.Prepare != nil && bootstrap.Prepare.RunID != *runID {
+		return fmt.Errorf("build preparation RunID mismatch")
+	}
 	if (bootstrap.Final == nil) == (bootstrap.Prepare == nil) {
 		return fmt.Errorf("build task bootstrap must contain exactly one of final or prepare")
 	}
@@ -172,7 +175,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 	spec.Env = mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	if prepared != nil {
-		if prepared.PreparedSource.Kind != types.ResumeSourceSandbox || prepared.PreparedSource.Ref == "" || prepared.SourceSandboxConfig == nil {
+		if prepared.PreparedSource.Kind != types.ResumeSourceSandbox || !prepared.PreparedSource.Valid() || prepared.SourceSandboxConfig == nil {
 			return fmt.Errorf("prepared build source is not a complete Sandbox E")
 		}
 		spec.SourceSandboxRef = prepared.PreparedSource.Ref

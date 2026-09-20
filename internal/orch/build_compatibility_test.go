@@ -174,7 +174,7 @@ func TestRecoveredAutoPreparesOnlyResolvedTarget(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				pend := &pendingBuild{build: b, spec: spec, resources: resources, sourceTemplate: true, handoff: newBuildTaskHandoff(true, ""), result: make(chan configsock.BuildResult, 1)}
+				pend := &pendingBuild{build: b, spec: spec, resources: resources, sourceTemplate: true, handoff: newBuildTaskHandoff(true, "", types.ResumeSource{}), result: make(chan configsock.BuildResult, 1)}
 				summary := validBuildPrepareSummary()
 				summary.HasBuildCommands = commands
 				if _, err = pend.handoff.Submit(summary); err != nil {
@@ -202,7 +202,7 @@ func TestRecoveredAutoPreparesOnlyResolvedTarget(t *testing.T) {
 }
 
 func TestBuildPrepareReplayBindsCommandPresence(t *testing.T) {
-	h := newBuildTaskHandoff(true, "")
+	h := newBuildTaskHandoff(true, "", types.ResumeSource{})
 	summary := validBuildPrepareSummary()
 	if _, err := h.Submit(summary); err != nil {
 		t.Fatal(err)

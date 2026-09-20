@@ -20,7 +20,7 @@ func TestPausedCleanupRetryReloadsAfterCompetingAttempt(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "paused-competing-cleanup")
 	fixture.sb.State = types.StatePaused
 	fixture.sb.RunID, fixture.sb.VswitchPort, fixture.sb.FloatingIP = "", "", ""
-	fixture.sb.ResumeSource = types.ResumeSource{
+	fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://" + strings.Repeat("c", 64),
 	}

@@ -402,7 +402,7 @@ type Core interface {
 	// publishes a paused Sandbox E or Snapshot S as a same-kind reusable template
 	// (toTemplate) or an opaque kmt1 migration token; keepSource independently
 	// controls source finalization.
-	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error)
+	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error)
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
 }
 
@@ -1229,7 +1229,7 @@ func (a *API) exportSandbox(w http.ResponseWriter, r *http.Request) {
 		a.failMigrate(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"result": out})
+	writeJSON(w, 200, out)
 }
 
 func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {

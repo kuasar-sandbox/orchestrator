@@ -1,6 +1,6 @@
 // Package taskartifact performs tenant-bound task-local Artifact preparation.
-// It owns MANIFEST_KEY-dependent reads and never returns an artifact reference
-// or portable config to the conductor process.
+// It owns MANIFEST_KEY-dependent reads. Only the exact root S/E identities and
+// bounded summary return to conductor; portable configs stay in the task.
 package taskartifact
 
 import (
@@ -68,6 +68,8 @@ type canonicalLocation struct {
 }
 
 type canonicalResolution struct {
+	RunID                string                      `json:"run_id"`
+	RootSource           types.ResumeSource          `json:"root_source"`
 	SchemaVersion        int                         `json:"schema_version"`
 	SourceKind           string                      `json:"source_kind"`
 	SourceRef            string                      `json:"source_ref"`
@@ -181,6 +183,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		}
 	}
 
+	rootSource := types.ResumeSource{Kind: sourceKind, Ref: spec.RootRef}
 	readStarted := time.Now()
 	var (
 		prepared            types.ResumeSource
@@ -211,9 +214,13 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			}
 			return nil, errors.Join(readErr, closeErr)
 		}
-		selectedSandbox, err := selectSandboxFromSnapshot(spec.RootRef, document.Config.SandboxRef, spec.RelativeDir, pathLocations, binding)
+		selectedSandbox := document.SandboxRef
+		rootSource.SandboxRef, err = pairedSandboxIdentity(spec.RootRef, selectedSandbox, spec.RelativeDir, pathLocations)
 		if err != nil {
 			return nil, err
+		}
+		if spec.RootSandboxRef != "" && spec.RootSandboxRef != rootSource.SandboxRef {
+			return nil, errors.New("task artifact prepare: Snapshot E differs from the accepted pair")
 		}
 		if name, locationErr := refLocationName(selectedSandbox); locationErr != nil {
 			return nil, fmt.Errorf("task artifact prepare: selected Sandbox E ref: %w", locationErr)
@@ -248,7 +255,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			return nil, err
 		}
 		if launchMode == types.LaunchMemory {
-			prepared = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: spec.RootRef}
+			prepared = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: spec.RootRef, SandboxRef: selectedSandbox}
 			refs = append(refs, spec.RootRef)
 			refs = append(refs, document.Config.FromRefs...)
 		} else {
@@ -257,6 +264,9 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		refs = append(refs, selectedSandbox)
 		refs = append(refs, portableArtifactRefs(sandboxCfg)...)
 	case types.ResumeSourceSandbox:
+		if spec.RootSandboxRef != "" {
+			return nil, errors.New("task artifact prepare: E-only source has a Snapshot association")
+		}
 		storage, err := artifact.NewProcessStorage(manifestCfg)
 		if err != nil {
 			return nil, fmt.Errorf("task artifact prepare: initialize Sandbox reader: %w", err)
@@ -344,6 +354,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	hasBuildCommands := spec.ReadSourceImageConfig && sourceSandboxConfig != nil &&
 		(sourceSandboxConfig.Metadata[sandboxcfg.E2BStartCommandMetadata] != "" || sourceSandboxConfig.Metadata[sandboxcfg.E2BReadyCommandMetadata] != "")
 	canonical := canonicalResolution{
+		RunID: spec.RunID, RootSource: rootSource,
 		SchemaVersion: configsock.ArtifactPrepareSchemaVersion,
 		SourceKind:    string(sourceKind), SourceRef: spec.RootRef, LaunchMode: string(launchMode),
 		ReadImageConfig:      spec.ReadSourceImageConfig,
@@ -359,11 +370,18 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		return nil, fmt.Errorf("task artifact prepare: canonical resolution: %w", err)
 	}
 	digest := sha256.Sum256(encoded)
+	// Runtime runs from RunDir, not the checkpoint directory. Resolve only the
+	// task-local argv here; the durable paired identity keeps its original refs.
+	if ref, err := manifest.ParseRef(prepared.Ref); err == nil && ref.Scheme == manifest.RefSchemeFile && ref.Location == "" && !filepath.IsAbs(ref.Path) {
+		ref.Path = filepath.Join(spec.RelativeDir, ref.Path)
+		prepared.Ref = ref.String()
+	}
 	return &Result{
 		PreparedSource:      prepared,
 		SourceSandboxConfig: sourceSandboxConfig,
 		SourceImageConfig:   append([]byte(nil), sourceImageConfig...),
 		Summary: configsock.ArtifactPrepareSummary{
+			RootSource:         rootSource,
 			SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 			PreparedSourceKind: string(prepared.Kind), Capacity: capacity,
 			HasBuildCommands: hasBuildCommands,
@@ -683,57 +701,29 @@ func portableArtifactRefs(cfg *rtconfig.PortableSandboxConfig) []string {
 	return refs
 }
 
-func selectSandboxFromSnapshot(root, sandboxRef, relativeDir string, locations rtconfig.RefLocations, binding CarrierBinding) (string, error) {
-	eRef, err := manifest.ParseRef(sandboxRef)
+// pairedSandboxIdentity uses the same namespace as the input S. A local
+// checkpoint's basename remains a basename; located and Manifest identities
+// retain their portable spelling. Resolution itself stays task-local.
+func pairedSandboxIdentity(root, selected, relativeDir string, locations rtconfig.RefLocations) (string, error) {
+	r, err := manifest.ParseRef(root)
+	if err != nil || r.Scheme != manifest.RefSchemeFile || (r.Location == "" && filepath.IsAbs(r.Path)) {
+		return selected, nil
+	}
+	e, err := manifest.ParseRef(selected)
 	if err != nil {
-		return "", fmt.Errorf("task artifact prepare: Snapshot sandbox_ref: %w", err)
+		return "", err
 	}
-	if binding.Format == "bundle" && eRef.Scheme == manifest.RefSchemeManifest {
-		rootRef, err := physicalRootFileRef(root, relativeDir, locations)
-		if err != nil {
-			return "", err
+	if e.Scheme == manifest.RefSchemeFile && e.Location == "" && filepath.IsAbs(e.Path) {
+		// A relative child of a located S inherits that same physical namespace.
+		// It must not become an absolute host path in the durable portable pair.
+		rootDir := sourceRelativeDir(root, relativeDir, locations)
+		rel, err := filepath.Rel(rootDir, e.Path)
+		if err != nil || filepath.Base(rel) != rel || rel == "." || rel == ".." {
+			return "", errors.New("task artifact prepare: E is outside the checkpoint namespace")
 		}
-		rootRef.DigestScheme = "manifest"
-		rootRef.Digest = eRef.Path
-		if err := rootRef.Validate(); err != nil {
-			return "", fmt.Errorf("task artifact prepare: Bundle Sandbox selector: %w", err)
-		}
-		return rootRef.String(), nil
+		e.Path, e.Location = rel, r.Location
 	}
-	if eRef.Scheme == manifest.RefSchemeFile && eRef.Location == "" && !filepath.IsAbs(eRef.Path) {
-		rootPath, isFile, err := rootFilePath(root, relativeDir, locations)
-		if err != nil {
-			return "", err
-		}
-		if !isFile {
-			return "", errors.New("task artifact prepare: relative Sandbox E ref has no local Snapshot parent")
-		}
-		eRef.Path = filepath.Join(filepath.Dir(rootPath), eRef.Path)
-		if err := eRef.Validate(); err != nil {
-			return "", fmt.Errorf("task artifact prepare: resolve local Sandbox E: %w", err)
-		}
-		return eRef.String(), nil
-	}
-	return eRef.String(), nil
-}
-
-func physicalRootFileRef(root, relativeDir string, locations rtconfig.RefLocations) (manifest.Ref, error) {
-	if strings.HasPrefix(root, "file://") {
-		ref, err := manifest.ParseRef(root)
-		if err != nil {
-			return manifest.Ref{}, err
-		}
-		ref.DigestScheme, ref.Digest = "", ""
-		return ref, nil
-	}
-	path, isFile, err := rootFilePath(root, relativeDir, locations)
-	if err != nil {
-		return manifest.Ref{}, err
-	}
-	if !isFile {
-		return manifest.Ref{}, errors.New("task artifact prepare: Bundle root has no file carrier")
-	}
-	return manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}, nil
+	return e.String(), nil
 }
 
 func validateRootResolution(raw, relativeDir string) error {

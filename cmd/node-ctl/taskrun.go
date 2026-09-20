@@ -67,6 +67,9 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if (bootstrap.Final == nil) == (bootstrap.Prepare == nil) {
 		return fmt.Errorf("sandbox task bootstrap must contain exactly one of final or prepare")
 	}
+	if bootstrap.Prepare != nil && bootstrap.Prepare.RunID != runID {
+		return fmt.Errorf("sandbox preparation RunID mismatch")
+	}
 	if _, ok := bootstrap.Env["MANIFEST_KEY"]; !ok {
 		return fmt.Errorf("sandbox task bootstrap has no authoritative manifest key")
 	}

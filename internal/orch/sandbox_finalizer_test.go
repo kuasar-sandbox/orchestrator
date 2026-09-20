@@ -942,7 +942,7 @@ func TestPausedCleanupFailureBlocksResumeUntilRunDirIsRemoved(t *testing.T) {
 	})
 	fixture.sb.State = types.StatePaused
 	fixture.sb.RunID, fixture.sb.VswitchPort, fixture.sb.FloatingIP = "", "", ""
-	fixture.sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+	fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
 	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
 		t.Fatal(err)
 	}
@@ -990,7 +990,7 @@ func TestPausedCleanupFailureBlocksResumeUntilRunDirIsRemoved(t *testing.T) {
 func TestPausedNetworkStoreFailureRetriesWithoutAnotherAdmission(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "paused-network-store-retry")
 	fixture.sb.State = types.StatePaused
-	fixture.sb.ResumeSource = types.ResumeSource{
+	fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 	}
@@ -1165,7 +1165,7 @@ func TestPausedCleanupRetainsOwnershipAtUnitAndNetworkFailures(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newSandboxFinalizerFixture(t, "paused-cleanup-"+test.name)
 			fixture.sb.State = types.StatePaused
-			fixture.sb.ResumeSource = types.ResumeSource{
+			fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 				Kind: types.ResumeSourceSnapshot,
 				Ref:  "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 			}
@@ -1228,7 +1228,7 @@ func TestKillFinalizesFullyCleanedPausedSandbox(t *testing.T) {
 	fixture.sb.RunID = ""
 	fixture.sb.VswitchPort, fixture.sb.FloatingIP, fixture.sb.InnerIP, fixture.sb.PortMAC = "", "", "", ""
 	fixture.sb.RunDir, fixture.sb.EnvdUDS, fixture.sb.CiUDS = "", "", ""
-	fixture.sb.ResumeSource = types.ResumeSource{
+	fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 	}
@@ -1255,7 +1255,7 @@ func TestKillFinalizesFullyCleanedPausedSandbox(t *testing.T) {
 func TestRejectedResumePublishesCompletedPausedCleanup(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "paused-cleanup-hook-reject")
 	fixture.sb.State = types.StatePaused
-	fixture.sb.ResumeSource = types.ResumeSource{
+	fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	}
@@ -1291,7 +1291,7 @@ func TestRejectedResumePublishesCompletedPausedCleanup(t *testing.T) {
 func TestPausedCleanupSerializesConcurrentResumeAdmission(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "paused-cleanup-resume-race")
 	fixture.sb.State = types.StatePaused
-	fixture.sb.ResumeSource = types.ResumeSource{
+	fixture.sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot,
 		Ref:  "manifest://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 	}

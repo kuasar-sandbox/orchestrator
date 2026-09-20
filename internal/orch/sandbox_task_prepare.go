@@ -172,6 +172,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		return launchFailed("artifact_prepare", awaitArtifactReadinessResult(launchCtx, readinessResult))
 	}
 
+	if err := validatePreparedPair(summary, preparation.Source); err != nil {
+		return launchFailed("artifact_prepare", err)
+	}
 	artifactCapacity, inheritedNetwork, err := validateArtifactPrepareSummary(summary, sb.LaunchMode)
 	if err != nil {
 		return launchFailed("artifact_prepare", err)
@@ -210,6 +213,15 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	// port immediately; rollback retains it only when that detach itself fails.
 	unlock := o.lifecycle.Lock(sb.ID)
 	if err := launchCtx.Err(); err != nil {
+		unlock()
+		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
+	}
+	current, err := o.st.Get(launchCtx, sb.ID)
+	if err != nil || current == nil || current.State != types.StateStarting || current.RunID != sb.RunID ||
+		current.LaunchMode != sb.LaunchMode || current.ResumeSource != sb.ResumeSource || current.TemplateID != sb.TemplateID || current.CreatedUnix != sb.CreatedUnix {
+		if err == nil {
+			err = errLaunchOwnershipLost
+		}
 		unlock()
 		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
 	}
@@ -267,7 +279,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 
 	unlock = o.lifecycle.Lock(sb.ID)
 	defer unlock()
-	changed, err = o.st.CommitStartingRunning(launchCtx, sb.ID, sb.RunID)
+	changed, err = o.st.CommitPreparedRunning(launchCtx, sb, summary.RootSource)
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: commit launch %s: %w", sb.ID, err))
 	}
@@ -279,16 +291,19 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	}
 	running := o.mutateCached(sb.ID, func(cached *types.Sandbox) {
 		cached.State = types.StateRunning
+		cached.ResumeSource = summary.RootSource
 		cached.RunID = sb.RunID
 		cached.LaunchMode = ""
 	})
 	if running == nil {
 		running = cloneSandbox(sb)
 		running.State = types.StateRunning
+		running.ResumeSource = summary.RootSource
 		running.LaunchMode = ""
 		o.cache(running)
 	}
 	sb.State = types.StateRunning
+	sb.ResumeSource = summary.RootSource
 	sb.LaunchMode = ""
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
@@ -308,6 +323,16 @@ func (o *Orchestrator) resolveArtifactResources(spec sandboxcfg.SandboxSpec, art
 	})
 }
 
+// validatePreparedPair admits S-only input only from the launch's explicit
+// template preparation input. Durable sources must match E as well as S.
+func validatePreparedPair(summary configsock.ArtifactPrepareSummary, expected types.ResumeSource) error {
+	if !summary.RootSource.Valid() || summary.RootSource.Kind != expected.Kind || summary.RootSource.Ref != expected.Ref ||
+		(expected.SandboxRef != "" && summary.RootSource.SandboxRef != expected.SandboxRef) {
+		return errors.New("orch: prepared root pair conflicts with the accepted source")
+	}
+	return nil
+}
+
 func validateArtifactPrepareSummary(summary configsock.ArtifactPrepareSummary, mode types.LaunchMode) (rtconfig.CapacityConfig, sandboxcfg.NetworkSpec, error) {
 	if summary.SchemaVersion != configsock.ArtifactPrepareSchemaVersion {
 		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: unsupported artifact prepare schema %d", summary.SchemaVersion)
@@ -325,8 +350,11 @@ func validateArtifactPrepareSummary(summary configsock.ArtifactPrepareSummary, m
 		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf(
 			"orch: prepared source kind %q conflicts with launch mode %q", summary.PreparedSourceKind, mode)
 	}
+	if !summary.RootSource.Valid() || len(summary.RootSource.Ref) > 4096 || len(summary.RootSource.SandboxRef) > 4096 {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, errors.New("orch: artifact root pair is incomplete or oversized")
+	}
 	digest, err := hex.DecodeString(summary.ResolutionDigest)
-	if err != nil || len(digest) != 32 {
+	if err != nil || len(digest) != 32 || hex.EncodeToString(digest) != summary.ResolutionDigest {
 		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, errors.New("orch: artifact resolution digest is not SHA-256")
 	}
 	capacity := rtconfig.CapacityConfig{CPU: summary.Capacity.CPU, Memory: summary.Capacity.Memory}

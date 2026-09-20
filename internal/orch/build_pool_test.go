@@ -240,7 +240,7 @@ func TestWaitBuildResultRechecksAcceptedResultAfterInactiveReadback(t *testing.T
 		ImageRef: "manifest://" + strings.Repeat("a", 64),
 	}
 	pend := &pendingBuild{
-		handoff: newBuildTaskHandoff(false, ""),
+		handoff: newBuildTaskHandoff(false, "", types.ResumeSource{}),
 		result:  make(chan configsock.BuildResult, 1),
 	}
 	published := false

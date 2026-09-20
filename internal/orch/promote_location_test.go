@@ -44,7 +44,7 @@ func TestPromotePublishesUnderBareEntityID(t *testing.T) {
 		"  case \"$a\" in\n" +
 		"    *=*)\n" +
 		"      n=${a%%=*}\n" +
-		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ".snapshot@location:'\"$n\"\n" +
+		"      printf '%s\\n' '{\"snapshotRef\":\"file://" + strings.Repeat("c", 64) + ".snapshot@location:'\"$n\"'\",\"sandboxRef\":\"manifest://" + strings.Repeat("e", 64) + "\",\"removedRefs\":[]}'\n" +
 		"      ;;\n" +
 		"  esac\n" +
 		"done\n"
@@ -53,7 +53,7 @@ func TestPromotePublishesUnderBareEntityID(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	templateID, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func writeEchoSandboxCtl(t *testing.T, binDir, argsPath, ext string) {
 		"  case \"$a\" in\n" +
 		"    *=*)\n" +
 		"      n=${a%%=*}\n" +
-		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ext + "@location:'\"$n\"\n" +
+		"      printf '%s\\n' '{\"snapshotRef\":\"file://" + strings.Repeat("c", 64) + ext + "@location:'\"$n\"'\",\"sandboxRef\":\"manifest://" + strings.Repeat("e", 64) + "\",\"removedRefs\":[]}'\n" +
 		"      ;;\n" +
 		"  esac\n" +
 		"done\n"
@@ -178,7 +178,7 @@ func TestPromoteKeysPublicationByStableID(t *testing.T) {
 	}
 	o.cache(sb)
 
-	templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	templateID, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestPromoteSharedStableIDPublishesToOneLocation(t *testing.T) {
 			t.Fatal(err)
 		}
 		o.cache(sb)
-		if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err != nil {
+		if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err != nil {
 			t.Fatal(err)
 		}
 		_, uri := recordedPromotePair(t, argsPath)
@@ -263,7 +263,7 @@ func TestPromoteForkPublishesWithoutParentLocationRegistration(t *testing.T) {
 	}
 	o.cache(sb)
 
-	if _, err := o.ExportSandbox(ctx, apiKey, fork, true, true); err != nil {
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, fork, true, true); err != nil {
 		t.Fatal(err)
 	}
 	args, err := os.ReadFile(argsPath)
@@ -300,7 +300,7 @@ func TestPromoteRepublishReusesName(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err != nil {
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err != nil {
 		t.Fatal(err)
 	}
 	first, err := os.ReadFile(argsPath)
@@ -314,12 +314,12 @@ func TestPromoteRepublishReusesName(t *testing.T) {
 	if err != nil || current == nil {
 		t.Fatalf("get paused row: %v", err)
 	}
-	current.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}
+	current.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef}
 	if err := o.st.Put(ctx, current); err != nil {
 		t.Fatal(err)
 	}
 	o.cache(current)
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err != nil {
+	if _, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, true, true); err != nil {
 		t.Fatal(err)
 	}
 	second, err := os.ReadFile(argsPath)

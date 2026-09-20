@@ -19,6 +19,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
+const checkpointSnapshotRef = "file://produced.snapshot@digest:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const checkpointSandboxRef = "file://associated.sandbox@digest:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 func orchCheckpointBool(value bool) *bool { return &value }
 
 func orchSnapshotCapture(policy sandboxcfg.SnapshotPolicy) sandboxcfg.CaptureRequest {
@@ -115,7 +118,7 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
-			want := []string{"snapshot", "--path-id", sb.ID, "--output", checkpointDir, "--mode", tc.mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
+			want := []string{"snapshot", "--json", "--path-id", sb.ID, "--output", checkpointDir, "--mode", tc.mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
 			want = append(want, tc.wantTail...)
 			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
 				t.Fatalf("snapshot argv = %#v, want %#v", got, want)
@@ -124,9 +127,9 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
+			if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: checkpointSandboxRef,
 				Kind: types.ResumeSourceSnapshot,
-				Ref:  filepath.Join(checkpointDir, sb.ID+".snapshot"),
+				Ref:  checkpointSnapshotRef,
 			}) {
 				t.Fatalf("paused sandbox = %+v", stored)
 			}
@@ -146,13 +149,13 @@ func TestPauseSandboxCaptureAndTTLAutoPauseSelection(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
-			want := []string{"export", "--path-id", sb.ID, "--output", checkpointDir, "--mode", mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
+			want := []string{"export", "--json", "--path-id", sb.ID, "--output", checkpointDir, "--mode", mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
 			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
 				t.Fatalf("export argv = %#v, want %#v", got, want)
 			}
 			stored, err := o.st.Get(context.Background(), sb.ID)
 			if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
-				Kind: types.ResumeSourceSandbox, Ref: filepath.Join(checkpointDir, sb.ID+".sandbox"),
+				Kind: types.ResumeSourceSandbox, Ref: checkpointSandboxRef,
 			}) || stored.RunID != "" || stored.VswitchPort != "" {
 				t.Fatalf("paused Sandbox E = %+v, %v", stored, err)
 			}
@@ -344,9 +347,9 @@ func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
+	if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: checkpointSandboxRef,
 		Kind: types.ResumeSourceSnapshot,
-		Ref:  filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".snapshot"),
+		Ref:  checkpointSnapshotRef,
 	}) {
 		t.Fatalf("pause after cancellation was not committed: %+v", stored)
 	}
@@ -594,7 +597,13 @@ if [ -n "${CHECKPOINT_STARTED_FILE:-}" ]; then
     sleep 0.01
   done
 fi
-printf '%s\n' "${CHECKPOINT_STDOUT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+if [ -n "${CHECKPOINT_STDOUT:-}" ]; then
+  printf '%s\n' "$CHECKPOINT_STDOUT"
+elif [ "$1" = "snapshot" ]; then
+  printf '%s\n' '{"snapshotRef":"file://produced.snapshot@digest:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRef":"file://associated.sandbox@digest:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","removedRefs":[]}'
+else
+  printf '%s\n' '{"sandboxRef":"file://associated.sandbox@digest:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","removedRefs":[]}'
+fi
 `
 	if err := os.WriteFile(filepath.Join(dir, config.BinSandboxCtl), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

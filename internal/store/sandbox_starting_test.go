@@ -172,7 +172,7 @@ func TestResetStartingOwnershipForRecoveryPreservesAcceptedModeAndSource(t *test
 	ctx := context.Background()
 	sb := sandboxInsertFixture("recover-cold-resume", 0)
 	sb.State = types.StateStarting
-	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
 	sb.LaunchMode = types.LaunchCold
 	sb.RunID = "run-current"
 	sb.FloatingIP = "192.0.2.20"
@@ -202,12 +202,12 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 	st := testStore(t)
 	ctx := context.Background()
 	sb := sandboxInsertFixture("pause-cas", 0)
-	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-old"}
+	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-old"}
 	if err := st.InsertSandbox(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 
-	staleSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-stale"}
+	staleSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-stale"}
 	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", staleSource); err != nil || changed {
 		t.Fatalf("stale CommitRunningPaused = %v, %v; want CAS miss", changed, err)
 	}
@@ -223,7 +223,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 		BEGIN SELECT RAISE(ABORT, 'forced pause commit failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	failedSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-failed"}
+	failedSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-failed"}
 	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, failedSource); err == nil || changed {
 		t.Fatalf("failed CommitRunningPaused = %v, %v; want propagated error", changed, err)
 	}
@@ -238,7 +238,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 		t.Fatal(err)
 	}
 
-	currentSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
+	currentSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
 	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, currentSource); err != nil || !changed {
 		t.Fatalf("CommitRunningPaused = %v, %v", changed, err)
 	}
@@ -249,7 +249,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 	if got.State != types.StatePaused || got.ResumeSource != currentSource || got.RunID != sb.RunID || got.LaunchMode != "" {
 		t.Fatalf("committed pause = %+v", got)
 	}
-	lateSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-late"}
+	lateSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-late"}
 	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, lateSource); err != nil || changed {
 		t.Fatalf("late CommitRunningPaused = %v, %v; want CAS miss", changed, err)
 	}
@@ -644,7 +644,7 @@ func TestDeadSandboxRejectsCleanupOwnership(t *testing.T) {
 			case "base-dir":
 				sb.BaseDir = "/owned/base"
 			case "artifact":
-				sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "owned.snapshot"}
+				sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "owned.snapshot"}
 			}
 			if err := st.InsertSandbox(context.Background(), sb); err == nil {
 				t.Fatal("dead sandbox accepted cleanup ownership")

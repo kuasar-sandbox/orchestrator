@@ -69,6 +69,7 @@ type SandboxView struct {
 	PortMAC                string
 	ResumeSourceKind       ResumeSourceKind
 	ResumeSourceRef        string
+	ResumeSandboxRef       string
 	ArtifactLocation       ArtifactLocation
 	AutoPauseMemory        bool
 	LaunchMode             LaunchMode

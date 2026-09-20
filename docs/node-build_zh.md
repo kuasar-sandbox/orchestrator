@@ -194,27 +194,27 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   删除旧 broad `publish_location_parent`；v4 增加 register-time requested target，并把 SBX/SNP
   source 收敛为通用 cold Sandbox E；v3 以 `run_dir`/`base_dir` 替代混合语义 workdir，
   `checkpoint_mode` 自 v2 起必需),sandbox ArtifactPrepare
-  schema 仍独立为 v4（v4 增加 Build-only image Bundle publication preflight；v3 增加只供 Build source 使用的 image-config 读取 capability、同一
+  schema 独立为 v5（v5 返回精确根 S/E 对，并以 RunID 与 resolution digest 绑定；v4 增加 Build-only image Bundle publication preflight；v3 增加只供 Build source 使用的 image-config 读取 capability、同一
   Bundle 内 E/image 的 carrier scope，以及 portable allocatable/deflate resource defaults；v2 以 typed E/S、durable
   LaunchMode 和 bounded network/disk summary 取代旧 v1 Snapshot-only wire),两个版本号独立演进；bootstrap 和 build prepare 的版本不匹配均在读取
   secret-bearing provider 前返回 400,
   防止旧 task 静默忽略必需的 publication 语义。参见 [build_task.go](../internal/configsock/build_task.go)
-  与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。可选的 Build-only 命令存在性摘要与 digest 字段受 BuildTask v6 gate 保护,不回传命令文本;普通 Sandbox summary 与 digest 保持原样。认证后返回 task env 与 exactly one of
+  与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。可选的 Build-only 命令存在性摘要与 digest 字段受 BuildTask v6 gate 保护,不回传命令文本;普通 Sandbox preparation 不使用该 Build-only 字段。认证后返回 task env 与 exactly one of
   `Final|Prepare`。Final 是
   **BuildSpec(构建工作单)**:`{build_id, profile, run_dir, base_dir, from_image | from_template
   (+kind), requested_target?, checkpoint_mode, steps[], start_cmd, ready_cmd, paths, net,
   resources, sandbox_resources, sandbox_spec/namespaces/env, mmds_enabled, envd_token,
   insecure, platform, timeouts}`；task env 含
-  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据。artifact Prepare 含 source kind/ref、LaunchMode、manifest config、
+  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据。artifact Prepare 含 RunID、source kind/ref、恢复已准备 Snapshot 时的受理 E、LaunchMode、manifest config、
   ref-location parent、ref 上限和从 execution claim 起算的绝对 deadline。task 读取根 cfg 后向
-  `POST /internal/task/build/prepare` 提交 `{build_id,run_id,version,summary}`；相同 digest replay 返回同一 final result，
+  `POST /internal/task/build/prepare` 提交 `{build_id,run_id,version,summary}`；相同对与 digest replay 返回同一 final result，
   冲突返回 409，HTTP waiter 取消不撤销已接受 summary。`paths` 是宿主侧工件与工具
   (kernel / runtime / 两个 diff template / sandbox-ctl /
   flatten-ctl / manifest-ctl / manifest_config);`net` 是 serve 预先 attach 的
   网络槽(tapfd transport、mac、inner_ip、nexthop、hostname、dns),全构建复用。
   SBX task 直接读取 E；SNP task 只读取 S 的 `sandbox_ref` 来定位并读取 E，丢弃 S memory
-  payload/from-refs。二者返回 conductor 的仍只有 bounded summary；完整 E config 与选中的
-  source ref 只留在 run-builder 进程内，随后强制 Phase B materialize。
+  payload/from-refs。返回 conductor 的 bounded summary 包含精确根 S/E 对；完整 E config
+  与选中的 runtime argv source ref 留在 run-builder 进程内，随后强制 Phase B materialize。
   run-builder 据此自建阶段沙箱([§5](#5-按目标执行与发布));仅在该构建单元运行期间可取(serve 持挂
   pending 状态,单元退出即失效)。
 
@@ -349,8 +349,8 @@ request-only spec/resource policy解析 → 从 builder pool 分配,再以 exact
 语义读根 cfg 并提交 summary，image fast path无需第二次 RPC → strict解析继承network并与本次请求合并 → 配
 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经 `connector-ctl vswitch attach` 分配一个网络槽
 (整个构建复用,各阶段顺序交接 tapfd)→ 铸 envd token → 在一个 exact-run SQLite CAS 中原子写入
-port/token 与非秘密 `runtime_prepare_json`(prepare digest、resolved build/template network、
-独立的 A/B execution 与 target Sandbox resources)。runtime preparation schema v4 同时冻结来源命令存在性以保持恢复语义;
+port/token 与非秘密 `runtime_prepare_json`(完整根对与 prepare digest、resolved build/template network、
+独立的 A/B execution 与 target Sandbox resources)。runtime preparation schema v5 同时冻结已受理的根 S/E 对、digest 和来源命令存在性以保持恢复语义；重启后 replay 仍同时比较对与 digest；
 仅实际 Sandbox target 解析目标 resources,仅 memory=true 解析 checkpoint/instance policy → (e2b + `mmds.enabled` 且实际 target 为 memory Sandbox 时)
 先挂一行 synthetic sandbox route → 返回最终
 BuildSpec。route 必须先于 final handoff 可见，避免 task 取得 spec 后立即启动 phase C 时尚无法
@@ -717,3 +717,13 @@ registration usage 只统计 status IN (registered, waiting, building) 且两个
 两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 缺少 transient 字段的旧 owner ref 只依据仍匹配的 route/binding 补齐. provisional 插入、注册 ACK/拒绝及重放 ref 更新均比较原身份和当前 revision,迟到操作不能覆盖后继记录. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
 
 按现有版本协调一起升级 node/router/Registry writer. 回退到不理解意图的旧 writer 前,停止接受新的取消/删除,由当前版本收敛全部待处理操作. 有未完成意图时,加法 schema 本身不能保证安全回退. 不增加长期双 writer、新任务表或兼容服务. 记录删除后已发布 canonical img/sbx/snp 引用、已有 Sandbox、下游 fromTemplate 和共享产物的其他 Build 仍可用;绝不删除远端内容.
+
+### Checkpoint 发布报告
+
+Builder 对 checkpoint S 调用 `sandbox-ctl publish --json --quiet`，接受 checkpoint
+前验证且只接受 `snapshotRef`、最终 `sandboxRef` 和 `removedRefs`。根必须 portable
+且角色正确；差集必须有序、唯一并采用安全的公开引用。无效/尾随 JSON、缺少根和 stdout
+污染都会使发布失败，进度 stderr 单独处理。Builder 继续返回规范 `snp` TemplateID；
+Export 新增 HTTP 报告字段见[节点发布与迁移](node_zh.md#814-publishtemplate-与-migration)。
+直接发布 image/Sandbox 的 `PublishSource` 调用保持既有 role/ref 契约、source 所有权和
+流式行为。报告不增加 payload 缓存、额外 staging 文件、GC 或删除权限。

@@ -9,13 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -284,10 +284,11 @@ func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w (%s)", err, firstLine(out))
 	}
-	ref := strings.TrimSpace(string(out))
-	if _, err := types.ParsePortableRef(ref); err != nil {
-		return "", fmt.Errorf("publish output %q: %w", ref, err)
+	report, err := artifact.DecodePublishReport(out, artifact.RoleSnapshot)
+	if err != nil {
+		return "", err
 	}
+	ref := report.SnapshotRef
 	p.progress("published template checkpoint snapshot: %s", ref)
 	return ref, nil
 }
@@ -298,7 +299,7 @@ func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
 // one build converges on one directory where content-addressed files
 // accumulate as versions.
 func publishCheckpointArtifactArgs(spec *configsock.BuildSpec, target CheckpointClassPublicationTarget, artifact string) ([]string, error) {
-	args := []string{"publish", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
+	args := []string{"publish", "--json", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
 	switch target {
 	case CheckpointClassManifestStore:
 	case CheckpointClassRefLocation:

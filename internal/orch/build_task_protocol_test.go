@@ -45,7 +45,7 @@ func TestBuildTaskBootstrapUsesExactRunAndSourceTwoStage(t *testing.T) {
 	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
 	o.pend[build.BuildID] = &pendingBuild{
 		build: build, runDir: runDir, baseDir: baseDir, sourceTemplate: true,
-		handoff: newBuildTaskHandoff(true, ""), result: make(chan configsock.BuildResult, 1),
+		handoff: newBuildTaskHandoff(true, "", types.ResumeSource{}), result: make(chan configsock.BuildResult, 1),
 	}
 
 	if _, found, err := o.BuildTaskAuth(context.Background(), build.BuildID, "br-stale"); err != nil || found {
@@ -81,7 +81,7 @@ func TestBuildTaskFastPathReturnsFinalInBootstrap(t *testing.T) {
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
-	handoff := newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID))
+	handoff := newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID), types.ResumeSource{})
 	want := &configsock.BuildSpec{BuildID: build.BuildID, RunID: build.RunID}
 	handoff.PublishFinal(want, nil)
 	o.pend[build.BuildID] = &pendingBuild{build: build, handoff: handoff}
@@ -94,7 +94,7 @@ func TestBuildTaskFastPathReturnsFinalInBootstrap(t *testing.T) {
 
 func TestCompleteBuildPrepareExactRunReplayAndConflict(t *testing.T) {
 	o := testOrch(t)
-	build := &types.Build{BuildID: "build-complete", TemplateID: "transient-build-complete", RunID: "br-complete", Status: types.BuildBuilding, ExecutionClaimed: true}
+	build := &types.Build{FromTemplate: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSbx, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), BuildID: "build-complete", TemplateID: "transient-build-complete", RunID: "br-complete", Status: types.BuildBuilding, ExecutionClaimed: true}
 	if build.ManifestKey == "" {
 		build.ManifestKey = strings.Repeat("c", 64)
 	}
@@ -102,7 +102,7 @@ func TestCompleteBuildPrepareExactRunReplayAndConflict(t *testing.T) {
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
-	handoff := newBuildTaskHandoff(true, "")
+	handoff := newBuildTaskHandoff(true, "", types.ResumeSource{})
 	o.pend[build.BuildID] = &pendingBuild{build: build, sourceTemplate: true, handoff: handoff}
 	want := &configsock.BuildSpec{BuildID: build.BuildID, RunID: build.RunID}
 	summary := validBuildPrepareSummary()
@@ -143,7 +143,7 @@ func TestBuildTaskEndpointsReturnRetryableErrorDuringRecovery(t *testing.T) {
 	o := &Orchestrator{
 		buildRecoveryReady: make(chan struct{}),
 		pend: map[string]*pendingBuild{
-			build.BuildID: {build: build, handoff: newBuildTaskHandoff(true, "")},
+			build.BuildID: {build: build, handoff: newBuildTaskHandoff(true, "", types.ResumeSource{})},
 		},
 	}
 	if _, _, err := o.BuildTaskSpecFor(context.Background(), build.BuildID, build.RunID); !errors.Is(err, errBuildRecoveryInProgress) {

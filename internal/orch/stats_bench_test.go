@@ -45,7 +45,7 @@ func BenchmarkNativeUsageBatch(b *testing.B) {
 				sb := &types.Sandbox{ID: id, BaseDir: base, Profile: types.ProfileBare, State: types.StatePaused,
 					APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64),
 					TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-					ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}}
+					ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}}
 				if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
 					b.Fatal(err)
 				}

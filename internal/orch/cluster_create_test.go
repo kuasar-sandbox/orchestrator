@@ -552,7 +552,7 @@ func TestHandleClusterConnectRejectsContextMismatch(t *testing.T) {
 		Cluster:       &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
 		StableIDValue: "stable",
 		State:         types.StatePaused,
-		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
+		ResumeSource:  types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:     deriveTestAPISecret(t, manifestKey),
 		ManifestKey:   manifestKey,
 	}

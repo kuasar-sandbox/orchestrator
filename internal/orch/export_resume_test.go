@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
 type blockingExportPublisher struct {
@@ -39,19 +40,19 @@ func newBlockingExportPublisher(ref string) *blockingExportPublisher {
 	}
 }
 
-func (p *blockingExportPublisher) Publish(ctx context.Context, _ *types.Sandbox, source types.ResumeSource) (types.ResumeSource, error) {
+func (p *blockingExportPublisher) Publish(ctx context.Context, _ *types.Sandbox, source types.ResumeSource) (artifact.PublishReport, error) {
 	p.startOnce.Do(func() { close(p.started) })
 	defer p.finishOnce.Do(func() { close(p.finished) })
 	select {
 	case <-p.release:
-		return types.ResumeSource{Kind: source.Kind, Ref: p.ref}, nil
+		return testPublicationReport(source.Kind, p.ref), nil
 	case <-ctx.Done():
 		cause := context.Cause(ctx)
 		select {
 		case p.canceled <- cause:
 		default:
 		}
-		return types.ResumeSource{}, cause
+		return artifact.PublishReport{}, cause
 	}
 }
 
@@ -100,7 +101,7 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 		State:        types.StatePaused,
 		APISecret:    apiSecret,
 		ManifestKey:  manifestKey,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef},
 		RunDir:       nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sid),
 		BaseDir:      nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sid),
 		CreatedUnix:  1,
@@ -117,7 +118,7 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 func startExport(o *Orchestrator, ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) <-chan asyncExportResult {
 	done := make(chan asyncExportResult, 1)
 	go func() {
-		result, err := o.ExportSandbox(ctx, apiKey, sid, toTemplate, keepSource)
+		result, err := o.exportSandboxTokenForTest(ctx, apiKey, sid, toTemplate, keepSource)
 		done <- asyncExportResult{result: result, err: err}
 	}()
 	return done
@@ -148,7 +149,7 @@ func assertLocalResumeWon(t *testing.T, fixture exportResumeFixture) {
 	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning
 	}, "running after export-time resume")
-	if stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("resumed source = %+v, want local snapshot %q", stored.ResumeSource, fixture.localRef)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -232,13 +233,10 @@ func TestExportExternalWakePreemptsKMTPublish(t *testing.T) {
 
 func TestExportRejectsPublisherChangingArtifactKind(t *testing.T) {
 	fixture := newExportResumeFixture(t)
-	fixture.o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error) {
-		return types.ResumeSource{
-			Kind: types.ResumeSourceSandbox,
-			Ref:  "manifest://" + strings.Repeat("e", 64),
-		}, nil
+	fixture.o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error) {
+		return testPublicationReport(types.ResumeSourceSandbox, "manifest://"+strings.Repeat("e", 64)), nil
 	}
-	if _, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, true); err == nil ||
+	if _, err := fixture.o.exportSandboxTokenForTest(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, true); err == nil ||
 		!strings.Contains(err.Error(), "publisher changed") {
 		t.Fatalf("publisher kind-change error = %v", err)
 	}
@@ -287,7 +285,7 @@ func TestAcceptedResumePreemptsExportBeforeAsyncSnapshotFailure(t *testing.T) {
 	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(sb *types.Sandbox) bool {
 		return sb.State == types.StatePaused
 	}, "paused after async snapshot preparation failure")
-	if stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("source after failed Resume = %+v", stored)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -307,7 +305,7 @@ func TestTemplateExportDeletesUnkeptSource(t *testing.T) {
 	events, cancelEvents := fixture.o.Subscribe()
 	defer cancelEvents()
 
-	result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, false)
+	result, err := fixture.o.exportSandboxTokenForTest(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +351,7 @@ func TestTemplateExportDeletesPortableUnkeptSource(t *testing.T) {
 	}
 	o.cache(sb)
 
-	result, err := o.ExportSandbox(context.Background(), apiKey, sb.ID, true, false)
+	result, err := o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +392,7 @@ func TestExportDeleteTeardownFailurePreservesSourceForRetry(t *testing.T) {
 	}
 	o.cache(sb)
 
-	result, err := o.ExportSandbox(context.Background(), apiKey, sb.ID, true, false)
+	result, err := o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
 	if result != "" || !errors.Is(err, stopErr) {
 		t.Fatalf("export with failed source teardown = %q, %v", result, err)
 	}
@@ -409,7 +407,7 @@ func TestExportDeleteTeardownFailurePreservesSourceForRetry(t *testing.T) {
 		t.Fatalf("failed Stop advanced to detach: %d", vs.detachCalls.Load())
 	}
 
-	result, err = o.ExportSandbox(context.Background(), apiKey, sb.ID, true, false)
+	result, err = o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
 	if err != nil {
 		t.Fatalf("retry export: %v", err)
 	}
@@ -435,9 +433,9 @@ func TestExportKeepSourcePreservesLocalResumeSource(t *testing.T) {
 	publisher := newBlockingExportPublisher(portableRef)
 	publisher.Release()
 	fixture.o.artifactPublisher = publisher.Publish
-	localSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}
+	localSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}
 
-	result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, false, true)
+	result, err := fixture.o.exportSandboxTokenForTest(fixture.ctx, fixture.apiKey, fixture.sb.ID, false, true)
 	if err != nil || !strings.HasPrefix(result, "kmt1.") {
 		t.Fatalf("retained KMT export = %q, %v", result, err)
 	}
@@ -490,7 +488,7 @@ func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
 	events, cancelEvents := fixture.o.Subscribe()
 	defer cancelEvents()
 
-	kept, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, true)
+	kept, err := fixture.o.exportSandboxTokenForTest(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,14 +497,14 @@ func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
 	}
 	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
 	if err != nil || stored == nil || stored.State != types.StatePaused ||
-		stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+		stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("kept source = %+v, %v", stored, err)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
 		t.Fatalf("kept export removed the local snapshot: %v", err)
 	}
 
-	result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, false)
+	result, err := fixture.o.exportSandboxTokenForTest(fixture.ctx, fixture.apiKey, fixture.sb.ID, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +596,7 @@ func TestCanceledExportSkipsSourceFinalization(t *testing.T) {
 		t.Fatalf("canceled ExportSandbox error = %v", result.err)
 	}
 	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("source after canceled export = %+v, %v", stored, err)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -612,12 +610,12 @@ func TestExportRejectsAfterLifecycleCancellation(t *testing.T) {
 	fixture.o.SetLifecycleContext(serviceCtx)
 	stopService()
 
-	result, err := fixture.o.ExportSandbox(context.Background(), fixture.apiKey, fixture.sb.ID, true, false)
+	result, err := fixture.o.exportSandboxTokenForTest(context.Background(), fixture.apiKey, fixture.sb.ID, true, false)
 	if result != "" || !errors.Is(err, context.Canceled) {
 		t.Fatalf("ExportSandbox after lifecycle cancellation = %q, %v", result, err)
 	}
 	stored, getErr := fixture.o.st.Get(context.Background(), fixture.sb.ID)
-	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("rejected export changed source = %+v, %v", stored, getErr)
 	}
 	if _, statErr := os.Stat(fixture.localRef); statErr != nil {
@@ -651,7 +649,7 @@ func TestExportLifecycleCancellationBeforeFinalizerPreservesSource(t *testing.T)
 		t.Fatalf("shutdown-fenced export = %q, %v", result.result, result.err)
 	}
 	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
 		t.Fatalf("shutdown-fenced export changed source = %+v, %v", stored, err)
 	}
 	if _, err := os.Stat(fixture.localRef); err != nil {
@@ -677,7 +675,7 @@ func TestDrainPausesWaitsForAcceptedExport(t *testing.T) {
 		t.Fatalf("DrainPauses returned before accepted export completed: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if result, err := fixture.o.ExportSandbox(context.Background(), fixture.apiKey, fixture.sb.ID, true, true); result != "" || !errors.Is(err, context.Canceled) {
+	if result, err := fixture.o.exportSandboxTokenForTest(context.Background(), fixture.apiKey, fixture.sb.ID, true, true); result != "" || !errors.Is(err, context.Canceled) {
 		t.Fatalf("ExportSandbox after drain admission closed = %q, %v", result, err)
 	}
 

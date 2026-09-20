@@ -411,7 +411,7 @@ func TestBuildRendersPrefetchOnlyForRestore(t *testing.T) {
 	}
 
 	resume := baseParams(types.ProfileE2B)
-	resume.Sandbox.ResumeSource = types.ResumeSource{
+	resume.Sandbox.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 		Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64),
 	}
 	resume.Sandbox.LaunchMode = types.LaunchMemory

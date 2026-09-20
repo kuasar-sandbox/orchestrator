@@ -72,7 +72,7 @@ func TestPausedAdmissionWaitsForFinishingLaunchOwner(t *testing.T) {
 			Kind:    types.KindImg,
 			Ref:     "manifest://" + strings.Repeat("b", 64),
 		}.String(),
-		State: types.StatePaused, ResumeSource: types.ResumeSource{
+		State: types.StatePaused, ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64),
 		},
 		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
@@ -167,7 +167,7 @@ func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 		Profile:    types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
 		State:      types.StatePaused,
-		ResumeSource: types.ResumeSource{
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64),
 		},
 		APISecret:    apiSecret,
@@ -247,7 +247,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 		sb := &types.Sandbox{
 			ID: id, Profile: types.ProfileBare,
 			TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("8", 64)}.String(),
-			State:      types.StatePaused, ResumeSource: types.ResumeSource{
+			State:      types.StatePaused, ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 				Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("9", 64),
 			},
 			APISecret: apiSecret, ManifestKey: mk,
@@ -349,7 +349,7 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 		Profile:      types.ProfileBare,
 		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("1", 64)}.String(),
 		State:        types.StatePaused,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("2", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("2", 64)},
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
 		RunDir:       nodepath.SandboxRunDir(cfg.Paths.RunRoot, "timeout-target"),
@@ -407,7 +407,7 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "deadline-retry", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("4", 64)}.String(),
-		State:      types.StatePaused, ResumeSource: types.ResumeSource{
+		State:      types.StatePaused, ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("3", 64),
 		}, APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
 		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "deadline-retry"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "deadline-retry"), CreatedUnix: 1,
@@ -508,7 +508,7 @@ func TestKillAssignedStartingResumeInterruptsReadinessWithoutResurrection(t *tes
 	sb := &types.Sandbox{
 		ID: "kill-readiness", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-		State:      types.StatePaused, ResumeSource: types.ResumeSource{
+		State:      types.StatePaused, ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64),
 		}, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "kill-readiness"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "kill-readiness"), CreatedUnix: 1,
@@ -672,7 +672,7 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 		Profile:      types.ProfileBare,
 		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
 		State:        types.StatePaused,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("8", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("8", 64)},
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
 		RunDir:       nodepath.SandboxRunDir(cfg.Paths.RunRoot, "blocked-resume-target"),

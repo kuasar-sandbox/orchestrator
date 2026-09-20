@@ -33,7 +33,7 @@ func sandboxInsertFixture(id string, candidate int) *types.Sandbox {
 		PortMAC:       fmt.Sprintf("02:00:00:00:00:%02x", candidate),
 		APISecret:     strings.Repeat(hexDigit, 64),
 		ManifestKey:   strings.Repeat(fmt.Sprintf("%x", candidate+9), 64),
-		ResumeSource: types.ResumeSource{
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			Kind: types.ResumeSourceSnapshot,
 			Ref:  fmt.Sprintf("snapshot-%d", candidate),
 		},

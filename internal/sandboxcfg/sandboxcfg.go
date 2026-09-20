@@ -822,8 +822,13 @@ func SourceForLaunch(sb *types.Sandbox, tmpl types.TemplateID) types.ResumeSourc
 	if sb == nil {
 		return types.ResumeSource{}
 	}
-	if sb.ResumeSource.Valid() {
+	if !sb.ResumeSource.Empty() {
 		return sb.ResumeSource
+	}
+	// An external template is an initial preparation input, not a durable
+	// paused source. Only its exact starting runner may confirm the S/E pair.
+	if sb.State != types.StateStarting {
+		return types.ResumeSource{}
 	}
 	switch {
 	case sb.LaunchMode == types.LaunchCold && tmpl.Kind == types.KindSbx:

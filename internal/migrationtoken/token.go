@@ -76,6 +76,7 @@ type MigrationTokenPayloadV1 struct {
 	RuntimeDigest    string                 `json:"runtimeDigest"`
 	ResumeSourceKind types.ResumeSourceKind `json:"resumeSourceKind"`
 	ResumeSourceRef  string                 `json:"resumeSourceRef"`
+	ResumeSandboxRef string                 `json:"resumeSandboxRef"`
 
 	Env      map[string]string `json:"env,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
@@ -212,7 +213,7 @@ func ValidateExpectations(payload MigrationTokenPayloadV1, expected Expectations
 		return fmt.Errorf("%w: runtime", ErrIncompatible)
 	}
 	if !expected.ResumeSource.Empty() &&
-		(payload.ResumeSourceKind != expected.ResumeSource.Kind || payload.ResumeSourceRef != expected.ResumeSource.Ref) {
+		(payload.ResumeSourceKind != expected.ResumeSource.Kind || payload.ResumeSourceRef != expected.ResumeSource.Ref || payload.ResumeSandboxRef != expected.ResumeSource.SandboxRef) {
 		return fmt.Errorf("%w: resume source", ErrIncompatible)
 	}
 	return nil
@@ -243,7 +244,7 @@ func validatePayload(payload MigrationTokenPayloadV1) error {
 	if !validHexDigest(payload.RuntimeDigest) {
 		return invalidPayload("runtime digest")
 	}
-	if !validResumeSource(types.ResumeSource{Kind: payload.ResumeSourceKind, Ref: payload.ResumeSourceRef}) {
+	if !validResumeSource(types.ResumeSource{Kind: payload.ResumeSourceKind, Ref: payload.ResumeSourceRef, SandboxRef: payload.ResumeSandboxRef}) {
 		return invalidPayload("resume source")
 	}
 	if payload.CreatedUnix <= 0 || payload.DeadlineUnix < 0 {
@@ -337,6 +338,9 @@ func validStringMap(values map[string]string) bool {
 
 func validResumeSource(source types.ResumeSource) bool {
 	if !source.Valid() {
+		return false
+	}
+	if source.Kind == types.ResumeSourceSnapshot && !validResumeSource(types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: source.SandboxRef}) {
 		return false
 	}
 	ref, err := types.ParsePortableRef(source.Ref)

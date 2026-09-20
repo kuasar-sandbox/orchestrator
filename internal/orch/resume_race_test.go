@@ -154,6 +154,13 @@ func (l *countingLauncher) runSandbox(runID string) {
 		if l.artifactSummary != nil {
 			summary = *l.artifactSummary
 		}
+		if summary.RootSource.Empty() {
+			summary.RootSource = types.ResumeSource{Kind: types.ResumeSourceKind(taskSpec.Prepare.RootSourceKind), Ref: taskSpec.Prepare.RootRef,
+				SandboxRef: taskSpec.Prepare.RootSandboxRef}
+			if summary.RootSource.Kind == types.ResumeSourceSnapshot && summary.RootSource.SandboxRef == "" {
+				summary.RootSource.SandboxRef = "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+			}
+		}
 		if _, err := l.orch.CompleteSandboxPrepare(ctx, sid, runID, summary); err != nil {
 			l.reportReadinessError(err)
 			return
@@ -286,7 +293,7 @@ func TestResumeRace_ConnectAndConcurrentAdmissionSingleLaunch(t *testing.T) {
 	sid := "sbx-race-1"
 	sb := &types.Sandbox{
 		ID: sid, Profile: types.ProfileBare, TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), State: types.StatePaused,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
+		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:    apiSecret,
 		ManifestKey:  mk,
 		RunDir:       nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),

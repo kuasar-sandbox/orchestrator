@@ -612,7 +612,7 @@ func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 	sb, _ := launchTestSandbox(t, cfg, types.ProfileBare, "rollback")
 	sb.State = types.StatePaused
 	sb.LaunchMode = ""
-	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
+	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -648,7 +648,7 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	sb, _ := launchTestSandbox(t, cfg, types.ProfileE2B, "init-rollback")
 	sb.State = types.StatePaused
 	sb.LaunchMode = ""
-	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
+	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}

@@ -1190,7 +1190,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		o.pend[b.BuildID] = pend
 	}
 	pend.runDir, pend.baseDir, pend.sourceTemplate = runDir, baseDir, sourceTemplate
-	pend.handoff = newBuildTaskHandoff(sourceTemplate, "")
+	pend.handoff = newBuildTaskHandoff(sourceTemplate, "", types.ResumeSource{})
 	pend.spec, pend.resources, pend.sandboxResources = spec, resources, sandboxResources
 	pend.result = make(chan configsock.BuildResult, 1)
 	o.pendMu.Unlock()
@@ -1224,6 +1224,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	}()
 
 	prepareDigest := fastBuildPrepareDigest(b.BuildID)
+	var rootSource types.ResumeSource
 	var inherited sandboxcfg.NetworkSpec
 	if sourceTemplate {
 		summary, early, waitErr := o.waitBuildPrepare(buildCtx, pend, unit)
@@ -1250,7 +1251,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 				return nil, buildFailed("resource_resolve", err)
 			}
 		}
-		prepareDigest = summary.ResolutionDigest
+		prepareDigest, rootSource = summary.ResolutionDigest, summary.RootSource
 		o.log.Info("build task artifact prepared", "bid", b.BuildID, "run_id", b.RunID,
 			"task_artifact_ref_count", summary.RequiredRefCount)
 	}
@@ -1281,7 +1282,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		}
 	}
 	durable := buildRuntimePreparation{
-		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
+		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest, RootSource: rootSource,
 		SourceHasBuildCommands: pend.sourceHasBuildCommands,
 		Network:                pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,
@@ -1939,12 +1940,20 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 		sourceKind = types.ResumeSourceSnapshot
 	}
 	response.Prepare = &configsock.ArtifactPrepareSpec{
+		RunID:          runID,
 		RootSourceKind: string(sourceKind),
 		RootRef:        rootRef, LaunchMode: string(types.LaunchCold), ManifestConfig: manifestConfig,
 		RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent,
 		RelativeDir:       checkpointDir, MaxRefs: maxRequiredArtifactRefs, ReadSourceImageConfig: true,
 		PreflightImageBundle:     o.cfg.Checkpoint.Remote.Manifest,
 		AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
+	}
+	if b.RuntimePrepareJSON != "" {
+		durable, err := decodeBuildRuntimePreparation(b.RuntimePrepareJSON)
+		if err != nil {
+			return nil, false, err
+		}
+		response.Prepare.RootSandboxRef = durable.RootSource.SandboxRef
 	}
 	return response, true, nil
 }
@@ -1965,6 +1974,26 @@ func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID 
 	}
 	if !allowed {
 		return nil, configsock.RejectBuildPrepare(store.ErrBuildExecutionOwnership)
+	}
+	if pend.sourceTemplate {
+		build, err := o.st.GetBuild(ctx, buildID)
+		if err != nil {
+			return nil, err
+		}
+		if build == nil || build.RunID != runID {
+			return nil, configsock.RejectBuildPrepare(store.ErrBuildExecutionOwnership)
+		}
+		tmpl, err := types.ParseTemplateID(build.FromTemplate)
+		if err != nil || (tmpl.Kind != types.KindSbx && tmpl.Kind != types.KindSnp) {
+			return nil, configsock.RejectBuildPrepare(errors.New("build: invalid artifact template"))
+		}
+		kind := types.ResumeSourceSandbox
+		if tmpl.Kind == types.KindSnp {
+			kind = types.ResumeSourceSnapshot
+		}
+		if err := validatePreparedPair(summary, types.ResumeSource{Kind: kind, Ref: tmpl.Ref}); err != nil {
+			return nil, configsock.RejectBuildPrepare(err)
+		}
 	}
 	replay, err := pend.handoff.Submit(summary)
 	if err != nil {

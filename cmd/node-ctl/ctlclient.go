@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,8 +57,10 @@ func udsDo(socket, method, path string, hdr map[string]string, reqBody any) (int
 	if err != nil {
 		return 0, nil, fmt.Errorf("reach orchestrator at %s: %w (is `node-ctl conductor serve` running?)", socket, err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
+	if err := errors.Join(readErr, resp.Body.Close()); err != nil {
+		return 0, nil, err
+	}
 	return resp.StatusCode, body, nil
 }
 

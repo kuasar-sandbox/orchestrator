@@ -15,6 +15,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -22,26 +25,27 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	artifactresult "github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
 // ExportSandbox publishes a paused sandbox artifact, then returns either a
 // reusable template id or an opaque kmt1 migration token. Publish does not hold
 // the source lifecycle lock: an accepted resume may preempt a KMT export or
 // detach a template export before the short source finalizer begins.
-func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
+func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return types.ExportResult{}, err
 	}
 	if apiKey == "" {
-		return "", fmt.Errorf("export-sandbox: API key is required: %w", api.ErrNotAllowed)
+		return types.ExportResult{}, fmt.Errorf("export-sandbox: API key is required: %w", api.ErrNotAllowed)
 	}
 	lifecycleCtx := o.launchContext()
 	finishOperation, err := o.acceptedOps.Begin(lifecycleCtx)
 	if err != nil {
-		return "", fmt.Errorf("orch: lifecycle is stopping: %w", err)
+		return types.ExportResult{}, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
 	opCtx, cancelUpload := context.WithCancelCause(ctx)
 	stopLifecycle := context.AfterFunc(lifecycleCtx, func() {
@@ -62,29 +66,29 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	for {
 		unlock, err := o.lockLifecycleMutation(opCtx, sid)
 		if err != nil {
-			return "", context.Cause(opCtx)
+			return types.ExportResult{}, context.Cause(opCtx)
 		}
 		sb, err := o.st.Get(opCtx, sid)
 		if err != nil {
 			unlock()
-			return "", err
+			return types.ExportResult{}, err
 		}
 		if !ownsSandbox(sb, apiKey) {
 			unlock()
-			return "", api.ErrNotFound
+			return types.ExportResult{}, api.ErrNotFound
 		}
 		if sb.State != types.StatePaused || !sb.ResumeSource.Valid() {
 			unlock()
-			return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
+			return types.ExportResult{}, fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
 		tmpl, err = types.ParseTemplateID(sb.TemplateID)
 		if err != nil {
 			unlock()
-			return "", err
+			return types.ExportResult{}, err
 		}
 		if sb.Profile != tmpl.Profile {
 			unlock()
-			return "", fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
+			return types.ExportResult{}, fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
 		}
 
 		source = cloneSandbox(sb)
@@ -99,34 +103,46 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	// Phase one only publishes and prepares the immutable result. It never
 	// mutates the source row, cache, route, or local checkpoint.
 	artifact := source.ResumeSource
+	report := artifactresult.PublishReport{SandboxRef: artifact.Ref, RemovedRefs: []string{}}
+	if artifact.Kind == types.ResumeSourceSnapshot {
+		report.SnapshotRef, report.SandboxRef = artifact.Ref, artifact.SandboxRef
+	}
 	localArtifactDir := ""
 	if !types.IsPortableRef(artifact.Ref) {
 		localArtifactDir, err = o.ownedLocalArtifactDir(source, artifact)
 		if err != nil {
-			return "", err
+			return types.ExportResult{}, err
 		}
 		publish := o.promote
 		if o.artifactPublisher != nil {
 			publish = o.artifactPublisher
 		}
-		portable, err := publish(opCtx, source, artifact)
+		published, err := publish(opCtx, source, artifact)
 		if err != nil {
 			if o.exports.State(attempt) == exportPreempted {
-				return "", exportPreemptedError(sid)
+				return types.ExportResult{}, exportPreemptedError(sid)
 			}
-			return "", err
+			return types.ExportResult{}, err
 		}
-		if !portable.Valid() || portable.Kind != artifact.Kind || !types.IsPortableRef(portable.Ref) {
-			return "", fmt.Errorf("export-sandbox: publisher changed or returned an invalid %s source", artifact.Kind)
+		if err := published.Validate(artifactRole(artifact.Kind)); err != nil {
+			return types.ExportResult{}, fmt.Errorf("export-sandbox: publisher changed or returned an invalid %s source", artifact.Kind)
 		}
-		artifact = portable
+		report = published
+		artifact.Ref = report.SandboxRef
+		if artifact.Kind == types.ResumeSourceSnapshot {
+			artifact.Ref, artifact.SandboxRef = report.SnapshotRef, report.SandboxRef
+		}
+	}
+
+	if err := report.Validate(artifactRole(artifact.Kind)); err != nil {
+		return types.ExportResult{}, err
 	}
 
 	if o.exports.State(attempt) == exportPreempted {
-		return "", exportPreemptedError(sid)
+		return types.ExportResult{}, exportPreemptedError(sid)
 	}
 	if err := opCtx.Err(); err != nil {
-		return "", context.Cause(opCtx)
+		return types.ExportResult{}, context.Cause(opCtx)
 	}
 	var result string
 	if toTemplate {
@@ -136,33 +152,38 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		}
 		result = types.TemplateID{Profile: tmpl.Profile, Kind: kind, Ref: artifact.Ref}.String()
 		if _, err := types.ParseTemplateID(result); err != nil {
-			return "", fmt.Errorf("export-sandbox: artifact template: %w", err)
+			return types.ExportResult{}, fmt.Errorf("export-sandbox: artifact template: %w", err)
 		}
 	} else {
 		var err error
 		result, err = o.mintSandboxToken(source, artifact)
 		if err != nil {
 			if o.exports.State(attempt) == exportPreempted {
-				return "", exportPreemptedError(sid)
+				return types.ExportResult{}, exportPreemptedError(sid)
 			}
-			return "", err
+			return types.ExportResult{}, err
 		}
+	}
+
+	response := types.ExportResult{Result: result, PublishReport: report}
+	if err := response.Validate(); err != nil {
+		return types.ExportResult{}, err
 	}
 
 	// A detached template result no longer owns source finalization. Returning it
 	// directly also keeps accepted resume launch commits independent of upload.
 	switch o.exports.State(attempt) {
 	case exportPreempted:
-		return "", exportPreemptedError(sid)
+		return types.ExportResult{}, exportPreemptedError(sid)
 	}
 	if err := lifecycleCtx.Err(); err != nil {
-		return "", fmt.Errorf("orch: lifecycle is stopping: %w", err)
+		return types.ExportResult{}, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
 	if err := opCtx.Err(); err != nil {
-		return "", context.Cause(opCtx)
+		return types.ExportResult{}, context.Cause(opCtx)
 	}
 	if o.exports.State(attempt) == exportDetached {
-		return result, nil
+		return response, nil
 	}
 
 	// Phase two has one short linearization point against Resume. Once this lock
@@ -171,22 +192,22 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	unlock := o.lifecycle.Lock(sid)
 	defer unlock()
 	if o.exports.State(attempt) == exportPreempted {
-		return "", exportPreemptedError(sid)
+		return types.ExportResult{}, exportPreemptedError(sid)
 	}
 	if err := lifecycleCtx.Err(); err != nil {
-		return "", fmt.Errorf("orch: lifecycle is stopping: %w", err)
+		return types.ExportResult{}, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
 	if err := opCtx.Err(); err != nil {
-		return "", context.Cause(opCtx)
+		return types.ExportResult{}, context.Cause(opCtx)
 	}
 	switch o.exports.BeginFinalize(attempt) {
 	case exportPreempted:
-		return "", exportPreemptedError(sid)
+		return types.ExportResult{}, exportPreemptedError(sid)
 	case exportDetached:
-		return result, nil
+		return response, nil
 	case exportFinalizing:
 	default:
-		return "", fmt.Errorf("export-sandbox: invalid export attempt state")
+		return types.ExportResult{}, fmt.Errorf("export-sandbox: invalid export attempt state")
 	}
 
 	// Request/lifecycle cancellation may abandon export before BeginFinalize,
@@ -195,12 +216,12 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	finalizeCtx := context.WithoutCancel(opCtx)
 	current, err := o.st.Get(finalizeCtx, sid)
 	if err != nil {
-		return "", err
+		return types.ExportResult{}, err
 	}
 	if current == nil || current.State != types.StatePaused || current.ResumeSource != attempt.source ||
 		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||
 		current.StableID() != source.StableID() {
-		return "", exportPreemptedError(sid)
+		return types.ExportResult{}, exportPreemptedError(sid)
 	}
 	exportKind := "kmt"
 	if toTemplate {
@@ -214,17 +235,17 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		// ResumeSource, row, cache, or route, and does not remove its
 		// checkpoint. The source resumes from exactly where it would have
 		// resumed without the export (#336).
-		return result, nil
+		return response, nil
 	}
 	cleanupCtx, cancelCleanup := cleanupContext()
 	cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current, false)
 	cancelCleanup()
 	if cleanupErr != nil {
-		return "", fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
+		return types.ExportResult{}, fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
 	}
 	if err := o.st.Delete(finalizeCtx, sid); err != nil {
 		o.cache(current)
-		return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
+		return types.ExportResult{}, fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
 	}
 	o.runs.forget(current.RunID)
 	o.releaseDetachedPortFence(current.VswitchPort)
@@ -237,7 +258,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			o.log.Warn("export-sandbox: remove finalized local artifact", "sid", sid, "path", localArtifactDir, "err", err)
 		}
 	}
-	return result, nil
+	return response, nil
 }
 
 // ownedLocalArtifactDir returns the only directory ExportSandbox may publish
@@ -253,19 +274,35 @@ func (o *Orchestrator) ownedLocalArtifactDir(sb *types.Sandbox, source types.Res
 	if sb.BaseDir != wantBaseDir {
 		return "", fmt.Errorf("export-sandbox: sandbox BaseDir %q does not match canonical path %q", sb.BaseDir, wantBaseDir)
 	}
-	var suffix string
-	switch source.Kind {
-	case types.ResumeSourceSandbox:
-		suffix = ".sandbox"
-	case types.ResumeSourceSnapshot:
-		suffix = ".snapshot"
-	default:
-		return "", fmt.Errorf("export-sandbox: invalid local resume source kind %q", source.Kind)
-	}
 	dir := filepath.Join(wantBaseDir, "checkpoint")
-	wantRef := filepath.Join(dir, sb.ID+suffix)
-	if filepath.Clean(source.Ref) != wantRef {
-		return "", fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", source.Kind)
+	if !source.Valid() {
+		return "", fmt.Errorf("export-sandbox: incomplete local source")
+	}
+	check := func(raw string, role types.ResumeSourceKind) error {
+		if types.IsPortableRef(raw) {
+			return nil
+		}
+		if !strings.HasPrefix(raw, "file://") {
+			if filepath.Clean(raw) == filepath.Join(dir, sb.ID+"."+string(role)) {
+				return nil
+			}
+			return fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", role)
+		}
+		ref, err := manifest.ParseRef(raw)
+		if err != nil || ref.Location != "" || ref.Digest == "" ||
+			ref.Path != filepath.Base(ref.Path) || ref.Path == "." || ref.Path == ".." || strings.ContainsAny(ref.Path, `/\`) ||
+			(!strings.HasSuffix(ref.Path, ".bundle") && !strings.HasSuffix(ref.Path, "."+string(role))) {
+			return fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", role)
+		}
+		return nil
+	}
+	if err := check(source.Ref, source.Kind); err != nil {
+		return "", err
+	}
+	if source.Kind == types.ResumeSourceSnapshot {
+		if err := check(source.SandboxRef, types.ResumeSourceSandbox); err != nil {
+			return "", err
+		}
 	}
 	return dir, nil
 }
@@ -330,6 +367,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 			RuntimeDigest:          dig,
 			ResumeSourceKind:       source.Kind,
 			ResumeSourceRef:        source.Ref,
+			ResumeSandboxRef:       source.SandboxRef,
 			Env:                    sb.Env,
 			Metadata:               metadata,
 			CreatedUnix:            sb.CreatedUnix,
@@ -482,8 +520,9 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		APISecret:     pair.APISecret,
 		ManifestKey:   pair.ManifestKey,
 		ResumeSource: types.ResumeSource{
-			Kind: payload.ResumeSourceKind,
-			Ref:  payload.ResumeSourceRef,
+			Kind:       payload.ResumeSourceKind,
+			Ref:        payload.ResumeSourceRef,
+			SandboxRef: payload.ResumeSandboxRef,
 		},
 		AutoPauseMemory:    payload.AutoPauseMemory,
 		ServiceSecret:      payload.ServiceSecret,
@@ -625,4 +664,11 @@ func sha256File(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func artifactRole(kind types.ResumeSourceKind) artifactresult.LogicalRole {
+	if kind == types.ResumeSourceSnapshot {
+		return artifactresult.RoleSnapshot
+	}
+	return artifactresult.RoleSandbox
 }
