@@ -69,8 +69,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned GitHub CLI
-        run: bash scripts/install-gh-cli.sh
+      - name: Check environment GitHub CLI
+        run: |
+          gh --version
+          gh_help="$(gh api --help)"
+          [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
 
       - name: Validate release request
         id: request
@@ -121,7 +124,6 @@ jobs:
       TARGET_ARCH: x86_64
       GOPROXY: https://goproxy.cn,direct
       GOSUMDB: sum.golang.google.cn
-      GOTOOLCHAIN: local
       ACCELERATOR_VERSION: ${{ needs.preflight.outputs.accelerator_version }}
       CONNECTOR_VERSION: ${{ needs.preflight.outputs.connector_version }}
       SANDBOXER_VERSION: ${{ needs.preflight.outputs.sandboxer_version }}
@@ -313,8 +315,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned GitHub CLI
-        run: bash scripts/install-gh-cli.sh
+      - name: Check environment GitHub CLI
+        run: |
+          gh --version
+          gh_help="$(gh api --help)"
+          [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
 
       - name: Download validated release bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -352,8 +357,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned GitHub CLI
-        run: bash scripts/install-gh-cli.sh
+      - name: Check environment GitHub CLI
+        run: |
+          gh --version
+          gh_help="$(gh api --help)"
+          [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
 
       - name: Delete release workflow artifacts
         env:

@@ -42,6 +42,24 @@ class ValidatorEnvironment(unittest.TestCase):
                     self.assertFalse(marker.exists(), "ambient Go wrapper executed")
                     self.assertEqual(config.read_text(), settings)
 
+    def test_parser_does_not_load_the_callers_product_module(self):
+        with tempfile.TemporaryDirectory(prefix="archive-parser-module-") as temporary:
+            work = Path(temporary)
+            # A product can require a newer compiler than this local host helper.
+            # It must not trigger module/toolchain selection for standalone parsing.
+            (work / "go.mod").write_text("module caller.invalid\n\ngo 999.0.0\n")
+            archive = work / "empty.tar.gz"
+            with tarfile.open(archive, "w:gz"):
+                pass
+            command = 'set -euo pipefail\nROOT=$1\nfail() { echo "$*" >&2; exit 1; }\n' + FUNCTION + '\nvalidate_archive_paths "$2"\n'
+            result = subprocess.run(["bash", "-c", command, "test", str(ROOT), str(archive)],
+                                    cwd=work, env=dict(os.environ, GOPROXY="off", GOSUMDB="off"),
+                                    text=True, capture_output=True, timeout=90)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("release archive: missing member", result.stderr)
+            self.assertNotIn("go.mod requires", result.stderr)
+            self.assertNotIn("downloading", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
