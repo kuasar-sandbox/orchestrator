@@ -185,7 +185,10 @@ def main():
         # Create/Build with this guest's remaining resource ownership.
         wait_for("exact sandbox cleanup after DELETE", cleaned)
 
-    for mode in (("timeout",) if args.timeout_only else ("cancel", "query", "header")):
+    # Query/header precedence and routing are table-tested in internal/api,
+    # internal/router and internal/configsock. One real cancellation proves the
+    # shared guest interruption and resource-reclamation path end to end.
+    for mode in (("timeout",) if args.timeout_only else ("cancel",)):
         fds_before = conductor_fds()
         tid, bid = register(mode + "-hang")
         marker = "ISSUE372_HANG_" + bid

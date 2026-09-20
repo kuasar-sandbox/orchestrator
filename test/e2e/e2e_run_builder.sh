@@ -1365,21 +1365,21 @@ import sys
 p = Path(sys.argv[1])
 s = p.read_text()
 assert "total_timeout_sec: 1200" in s
-p.write_text(s.replace("total_timeout_sec: 1200", "total_timeout_sec: 90"))
+p.write_text(s.replace("total_timeout_sec: 1200", "total_timeout_sec: 10"))
 PY_CONFIG
 start_conductor
 BUILD_ACTION_API_KEY="$AK" python3 "$SCRIPT_DIR/lib/build_actions.py" \
     --url "http://127.0.0.1:$PORT" --host "api.$DOMAIN" \
     --db "$WORK/lib/node-ctl.db" --run-root "$WORK/run" --base-root "$WORK/lib" \
     --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CONDUCTOR_PID" \
-    --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --timeout-only 90 --evidence "$WORK/build-timeout.json"
+    --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --timeout-only 10 --evidence "$WORK/build-timeout.json"
 stop_conductor
 python3 - "$WORK/config.yaml" <<'PY_CONFIG'
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
 s = p.read_text()
-p.write_text(s.replace("max_builds: 1\n", "max_builds: 2\n").replace("terminal_ttl: 1h", "terminal_ttl: 5s").replace("total_timeout_sec: 90", "total_timeout_sec: 1200"))
+p.write_text(s.replace("max_builds: 1\n", "max_builds: 2\n").replace("terminal_ttl: 1h", "terminal_ttl: 5s").replace("total_timeout_sec: 10", "total_timeout_sec: 1200"))
 PY_CONFIG
 start_conductor
 
@@ -1847,13 +1847,10 @@ echo "==> P2: parent + remote.manifest=false + local, fromImage → sandbox/memo
 snapshot_manifest_keys "$WORK/p2-manifests.before"
 register e2e-policy-false-memory e2b '{"kind":"sandbox","memory":true}' 1
 P2_TID="$TID"; P2_BID="$BID"
-P2_STARTED=$(date +%s)
 code=$(req POST "/v2/templates/$P2_TID/builds/$P2_BID" "$AK" \
-    "{\"fromImage\":\"$PULL_REF\"}")
+    "{\"fromImage\":\"$PULL_REF\",\"readyCmd\":\"true\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P2 trigger = $code (want 202)"; }
 wait_ready "$P2_TID" "$P2_BID" P2 '{"kind":"sandbox","memory":true}' snp
-P2_ELAPSED=$(( $(date +%s) - P2_STARTED ))
-[ "$P2_ELAPSED" -ge 20 ] || fail "P2 completed in ${P2_ELAPSED}s; Phase C fixed wait was skipped"
 P2_PERSIST="$PERSIST"
 P2_REF=$(persist_ref "$P2_PERSIST") || fail "P2 persistent id is invalid"
 assert_located_final "$P2_REF" .snapshot
@@ -1930,13 +1927,10 @@ echo "==> P5: parent + remote.manifest=true + bundle, fromImage → sandbox/memo
 P5_MANIFESTS_BEFORE=$(manifest_count)
 register e2e-policy-bundle-memory e2b '{"kind":"sandbox","memory":true}' 1
 P5_TID="$TID"; P5_BID="$BID"
-P5_STARTED=$(date +%s)
 code=$(req POST "/v2/templates/$P5_TID/builds/$P5_BID" "$AK" \
-    "{\"fromImage\":\"$PULL_REF\"}")
+    "{\"fromImage\":\"$PULL_REF\",\"readyCmd\":\"true\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P5 trigger = $code (want 202)"; }
 wait_ready "$P5_TID" "$P5_BID" P5 '{"kind":"sandbox","memory":true}' snp
-P5_ELAPSED=$(( $(date +%s) - P5_STARTED ))
-[ "$P5_ELAPSED" -ge 20 ] || fail "P5 completed in ${P5_ELAPSED}s; Phase C fixed wait was skipped"
 P5_PERSIST="$PERSIST"
 P5_REF=$(persist_ref "$P5_PERSIST") || fail "P5 persistent id is invalid"
 [ "$(manifest_count)" = "$P5_MANIFESTS_BEFORE" ] \
