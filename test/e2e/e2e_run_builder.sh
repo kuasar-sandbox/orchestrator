@@ -1365,21 +1365,21 @@ import sys
 p = Path(sys.argv[1])
 s = p.read_text()
 assert "total_timeout_sec: 1200" in s
-p.write_text(s.replace("total_timeout_sec: 1200", "total_timeout_sec: 10"))
+p.write_text(s.replace("total_timeout_sec: 1200", "total_timeout_sec: 30"))
 PY_CONFIG
 start_conductor
 BUILD_ACTION_API_KEY="$AK" python3 "$SCRIPT_DIR/lib/build_actions.py" \
     --url "http://127.0.0.1:$PORT" --host "api.$DOMAIN" \
     --db "$WORK/lib/node-ctl.db" --run-root "$WORK/run" --base-root "$WORK/lib" \
     --socket "$WORK/node-ctl.socket" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CONDUCTOR_PID" \
-    --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --timeout-only 10 --evidence "$WORK/build-timeout.json"
+    --source "$B1_PERSIST" --cpu "$BUILDER_CPU" --timeout-only 30 --evidence "$WORK/build-timeout.json"
 stop_conductor
 python3 - "$WORK/config.yaml" <<'PY_CONFIG'
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
 s = p.read_text()
-p.write_text(s.replace("max_builds: 1\n", "max_builds: 2\n").replace("terminal_ttl: 1h", "terminal_ttl: 5s").replace("total_timeout_sec: 10", "total_timeout_sec: 1200"))
+p.write_text(s.replace("max_builds: 1\n", "max_builds: 2\n").replace("terminal_ttl: 1h", "terminal_ttl: 5s").replace("total_timeout_sec: 30", "total_timeout_sec: 1200"))
 PY_CONFIG
 start_conductor
 
