@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -156,6 +157,23 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 								return artifact.PublishReport{}, fmt.Errorf("artifact access prohibited")
 							}
 						}
+						stale := filepath.Join(sb.BaseDir, "checkpoint", "stale-local-checkpoint")
+						if err := os.MkdirAll(filepath.Dir(stale), 0700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(stale, []byte("owned checkpoint"), 0600); err != nil {
+							t.Fatal(err)
+						}
+						entered, release := make(chan struct{}), make(chan struct{})
+						unblock := sync.OnceFunc(func() { close(release) })
+						defer unblock()
+						if !keep {
+							o.removeSandboxBaseDir = func(path string) error {
+								close(entered)
+								<-release
+								return os.RemoveAll(path)
+							}
+						}
 						request := httptest.NewRequest(http.MethodPost, "/sandboxes/"+sid+"/export", strings.NewReader(fmt.Sprintf(`{"toTemplate":%t,"keepSource":%t}`, template, keep)))
 						request.Header.Set("X-API-KEY", apiKey)
 						response := httptest.NewRecorder()
@@ -188,6 +206,24 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						if len(fields) != want {
 							t.Fatalf("shape=%s", response.Body.String())
 						}
+						if !keep {
+							waitExportCleanupStep(t, entered)
+							pending, err := o.st.Get(ctx, sid)
+							if err != nil || pending == nil || pending.State != types.StateDeleting || pending.ResumeSource != sb.ResumeSource || o.lookup(sid) != nil {
+								t.Fatalf("HTTP success lost deleting ownership: %+v, %v", pending, err)
+							}
+							if _, err := os.Stat(stale); err != nil {
+								t.Fatalf("HTTP success bypassed owned cleanup: %v", err)
+							}
+							unblock()
+							waitForExportDeletion(t, o, sid)
+							for _, path := range []string{sb.RunDir, sb.BaseDir} {
+								if _, err := os.Stat(path); !os.IsNotExist(err) {
+									t.Fatalf("move retained %s: %v", path, err)
+								}
+							}
+						}
+						// Published artifacts must remain readable after source cleanup.
 						if !portable {
 							storage, _ := artifact.NewProcessStorage(nil)
 							location, err := reflocation.Resolve(o.cfg.Checkpoint.Remote.RefLocationParent, sid)
@@ -237,7 +273,10 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 							t.Fatal(err)
 						}
 						if keep {
-							if stored == nil || stored.ResumeSource != sb.ResumeSource {
+							if _, err := os.Stat(stale); err != nil {
+								t.Fatalf("keep-source removed checkpoint: %v", err)
+							}
+							if stored == nil || stored.State != types.StatePaused || stored.ResumeSource != sb.ResumeSource {
 								t.Fatal("keep-source changed source")
 							}
 						} else if stored != nil {

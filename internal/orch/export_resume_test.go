@@ -313,6 +313,7 @@ func TestTemplateExportDeletesUnkeptSource(t *testing.T) {
 	if err != nil || template.Ref != portableRef || template.Kind != types.KindSnp {
 		t.Fatalf("template result = %#v, %v", template, err)
 	}
+	waitForExportDeletion(t, fixture.o, fixture.sb.ID)
 	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
 	if err != nil || stored != nil {
 		t.Fatalf("unkept template source = %+v, %v", stored, err)
@@ -359,6 +360,7 @@ func TestTemplateExportDeletesPortableUnkeptSource(t *testing.T) {
 	if err != nil || template.Ref != portableRef {
 		t.Fatalf("portable template result = %#v, %v", template, err)
 	}
+	waitForExportDeletion(t, o, sb.ID)
 	stored, err := o.st.Get(context.Background(), sb.ID)
 	if err != nil || stored != nil || o.lookup(sb.ID) != nil {
 		t.Fatalf("portable unkept template source = %+v, %v", stored, err)
@@ -368,7 +370,7 @@ func TestTemplateExportDeletesPortableUnkeptSource(t *testing.T) {
 	}
 }
 
-func TestExportDeleteTeardownFailurePreservesSourceForRetry(t *testing.T) {
+func TestExportDeleteTeardownFailureRetriesAfterAcceptance(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	o.cfg.Units.Runner = "sandbox-runner@.service"
@@ -393,28 +395,16 @@ func TestExportDeleteTeardownFailurePreservesSourceForRetry(t *testing.T) {
 	o.cache(sb)
 
 	result, err := o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
-	if result != "" || !errors.Is(err, stopErr) {
-		t.Fatalf("export with failed source teardown = %q, %v", result, err)
-	}
-	stored, getErr := o.st.Get(context.Background(), sb.ID)
-	if getErr != nil || stored == nil || o.lookup(sb.ID) == nil {
-		t.Fatalf("failed teardown lost source row/cache = %+v, %v", stored, getErr)
-	}
-	if _, statErr := os.Stat(sb.RunDir); statErr != nil {
-		t.Fatalf("failed teardown removed source run directory: %v", statErr)
-	}
-	if vs.detachCalls.Load() != 0 {
-		t.Fatalf("failed Stop advanced to detach: %d", vs.detachCalls.Load())
-	}
-
-	result, err = o.exportSandboxTokenForTest(context.Background(), apiKey, sb.ID, true, false)
 	if err != nil {
-		t.Fatalf("retry export: %v", err)
+		t.Fatalf("export acceptance: %v", err)
 	}
+	// Cleanup failure belongs to the durable delete worker; no second Export
+	// request is needed to retry it.
+	waitForExportDeletion(t, o, sb.ID)
 	if template, parseErr := types.ParseTemplateID(result); parseErr != nil || template.Ref != sb.ResumeSource.Ref {
 		t.Fatalf("retry template result = %#v, %v", template, parseErr)
 	}
-	stored, getErr = o.st.Get(context.Background(), sb.ID)
+	stored, getErr := o.st.Get(context.Background(), sb.ID)
 	if getErr != nil || stored != nil || o.lookup(sb.ID) != nil {
 		t.Fatalf("retry retained source row/cache = %+v, %v", stored, getErr)
 	}
@@ -512,6 +502,7 @@ func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
 	if err != nil || template.Ref != portableRef || template.Kind != types.KindSnp {
 		t.Fatalf("drop result = %#v, %v", template, err)
 	}
+	waitForExportDeletion(t, fixture.o, fixture.sb.ID)
 	if stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID); err != nil || stored != nil {
 		t.Fatalf("dropped source = %+v, %v", stored, err)
 	}
@@ -623,40 +614,51 @@ func TestExportRejectsAfterLifecycleCancellation(t *testing.T) {
 	}
 }
 
-func TestExportLifecycleCancellationBeforeFinalizerPreservesSource(t *testing.T) {
-	fixture := newExportResumeFixture(t)
-	serviceCtx, stopService := context.WithCancel(context.Background())
-	fixture.o.SetLifecycleContext(serviceCtx)
-	publisher := newBlockingExportPublisher("manifest://" + strings.Repeat("8", 64))
-	t.Cleanup(publisher.Release)
-	fixture.o.artifactPublisher = publisher.Publish
-	done := startExport(fixture.o, context.Background(), fixture.apiKey, fixture.sb.ID, true, false)
-	waitPublisherStarted(t, publisher)
+func TestExportCancellationBeforeFinalizerPreservesSource(t *testing.T) {
+	for _, lifecycle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lifecycle=%t", lifecycle), func(t *testing.T) {
+			fixture := newExportResumeFixture(t)
+			serviceCtx, stopService := context.WithCancel(context.Background())
+			fixture.o.SetLifecycleContext(serviceCtx)
+			defer stopService()
+			requestCtx, stopRequest := context.WithCancel(context.Background())
+			defer stopRequest()
+			publisher := newBlockingExportPublisher("manifest://" + strings.Repeat("8", 64))
+			t.Cleanup(publisher.Release)
+			fixture.o.artifactPublisher = publisher.Publish
+			done := startExport(fixture.o, requestCtx, fixture.apiKey, fixture.sb.ID, true, false)
+			waitPublisherStarted(t, publisher)
 
-	unlock := fixture.o.lifecycle.Lock(fixture.sb.ID)
-	publisher.Release()
-	select {
-	case <-publisher.finished:
-	case <-time.After(3 * time.Second):
-		unlock()
-		t.Fatal("snapshot publisher did not finish")
-	}
-	stopService()
-	unlock()
+			unlock := fixture.o.lifecycle.Lock(fixture.sb.ID)
+			publisher.Release()
+			select {
+			case <-publisher.finished:
+			case <-time.After(3 * time.Second):
+				unlock()
+				t.Fatal("snapshot publisher did not finish")
+			}
+			if lifecycle {
+				stopService()
+			} else {
+				stopRequest()
+			}
+			unlock()
 
-	result := waitExportResult(t, done)
-	if result.result != "" || !errors.Is(result.err, context.Canceled) {
-		t.Fatalf("shutdown-fenced export = %q, %v", result.result, result.err)
-	}
-	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
-		t.Fatalf("shutdown-fenced export changed source = %+v, %v", stored, err)
-	}
-	if _, err := os.Stat(fixture.localRef); err != nil {
-		t.Fatalf("shutdown-fenced export removed local snapshot: %v", err)
-	}
-	if err := fixture.o.DrainPauses(context.Background()); err != nil {
-		t.Fatalf("drain shutdown-fenced export: %v", err)
+			result := waitExportResult(t, done)
+			if result.result != "" || !errors.Is(result.err, context.Canceled) {
+				t.Fatalf("cancellation-fenced export = %q, %v", result.result, result.err)
+			}
+			stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+			if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: fixture.localRef}) {
+				t.Fatalf("cancellation-fenced export changed source = %+v, %v", stored, err)
+			}
+			if _, err := os.Stat(fixture.localRef); err != nil {
+				t.Fatalf("cancellation-fenced export removed local snapshot: %v", err)
+			}
+			if err := fixture.o.DrainPauses(context.Background()); err != nil {
+				t.Fatalf("drain cancellation-fenced export: %v", err)
+			}
+		})
 	}
 }
 

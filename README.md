@@ -56,6 +56,11 @@ For security architecture and deployment trust boundaries, see the [project syst
 | `cluster-ctl placer` | Start the placement service |
 | `e2b-key-ctl ...` | Generate and derive tenant credentials |
 
+A successful move export accepts source deletion durably; RunDir, BaseDir and
+checkpoint cleanup may finish later. Same-ID Create/import conflicts until cleanup
+completes. `--keep-source` preserves the source. See the [node export/import
+contract](docs/node.md#27-node-ctl-export-sandbox--import-sandbox).
+
 The repository also builds `node-stub-ctl`, an E2E helper that simulates node-link participants without starting MicroVMs.
 
 ## Profiles

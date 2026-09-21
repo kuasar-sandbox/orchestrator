@@ -266,10 +266,10 @@ node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket
 node-ctl import-sandbox <token> [--socket S]
 ```
 
-- `export-sandbox <sid>` prints one opaque `kmt1.` migration token. After successfully acquiring the source finalizer, default behavior deletes the source; `--keep-source` retains it paused with its original ResumeSource and local checkpoint — the source resumes from exactly where it would have resumed without the export (#336).
-- `export-sandbox <sid> --to-template` publishes paused E or S and prints persistent `sbx`/`snp` templateID for fan-out. Source retention is identical: `--keep-source` retains it; omission deletes it.
+- `export-sandbox <sid>` prints one opaque `kmt1.` migration token. By default, success means the valid result is ready and source deletion is durably accepted; physical cleanup may finish after the response; `--keep-source` retains it paused with its original ResumeSource and local checkpoint — the source resumes from exactly where it would have resumed without the export (#336).
+- `export-sandbox <sid> --to-template` publishes paused E or S and prints persistent `sbx`/`snp` templateID for fan-out. Source retention is identical: `--keep-source` retains it; omission accepts its deletion with the same eventual cleanup semantics.
 - Resume remains allowed during local-artifact upload. If Resume wins first, KMT Export cancels upload and returns 409, whereas Template Export continues and returns templateID. Both abandon the source finalizer without updating/deleting source or local artifact.
-- `import-sandbox <token>` defaults to source NodeSandboxID, inserts a paused row without overwriting and prints SID; an existing target returns 409. API body may choose another node-local `sandboxID`, retaining logical authentication identity and service credentials. A subsequent Connect accepts asynchronous resume.
+- `import-sandbox <token>` defaults to source NodeSandboxID, inserts a paused row without overwriting and prints SID; an existing target, including a source still in `deleting`, returns 409. Reusing the same node-local ID requires cleanup to finish; import does not wait for it. API body may choose another node-local `sandboxID`, retaining logical authentication identity and service credentials. A subsequent Connect accepts asynchronous resume.
 
 `--json` prints the complete successful Export API response. Default output remains
 one `result` line (token or template ID); quiet publication progress never enters
@@ -1383,7 +1383,7 @@ comparison before projection. The caller supplies the checkpoint directory
 externally; the response contains no path/context/identifier/field-mapping
 objects. A leaving Bundle selector does not imply deleting its physical carrier.
 `keepSource` retains the original source and checkpoint despite reported removals.
-No GC, automatic deletion or remote deletion behavior is added.
+The report itself triggers no artifact deletion or GC. A move uses the sandbox-owned cleanup described below.
 
 TemplateID is `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
 
@@ -1397,7 +1397,35 @@ Paused E promotes to sbx, S to snp; E is not rejected for lacking memory. Build 
 
 KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Target expectations compare both S and E. Import performs no artifact access and atomically restores the complete pair, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
 
-Publish phase does not hold a long lifecycle lock. Finalization acquires per-SID lock against the exact original ResumeSource. Resume winning BeginResume cancels KMT export with 409; template publication can finish detached and return ID without source cleanup. If the finalizer wins, keepSource returns the export result and leaves the source untouched — same ResumeSource, row, cache, route and local checkpoint (#336); without keepSource, exact teardown precedes row/cache/route/local-artifact deletion. Teardown/Store failure retains retryable durable ownership. Local cleanup never deletes remote/located artifacts.
+Publish does not hold a long lifecycle lock. After validating the result, Export
+checks the complete original S/E pair, source instance and export attempt under
+the per-SID lifecycle lock. Resume winning `BeginResume` cancels KMT export with
+409; template publication can finish detached and return its ID without source
+cleanup. If Export wins finalization, `keepSource` leaves the source untouched:
+same ResumeSource, row, cache, route and checkpoint. A later move from that
+retained source uses the same deletion path as any other move.
+
+Without `keepSource`, Export validates local path ownership and calls the normal
+lock-held delete acceptance entry. Success means a valid token/template result
+and a durable `deleting` row; it may precede physical cleanup. The source is
+removed from cache and full route snapshots, and a live route Delete is published
+before Export returns. The existing finalizer fences the runner, releases the
+network, removes RunDir and BaseDir (including all owned checkpoint files), then
+hard-deletes the row and emits the terminal observer notification. This applies
+to local and portable S/E sources alike, including portable sources with stale
+local checkpoints. Published/shared output is outside source cleanup ownership;
+remote/located artifacts are never deleted by this finalizer.
+
+Failure to persist delete acceptance returns an error and leaves the paused
+source, its S/E pair and checkpoint intact. After acceptance, directory or
+hard-delete failure retains `deleting` ownership and the valid export result;
+it never restores paused state. The worker retries independently of the HTTP
+request. Shutdown leaves unfinished ownership in the same row for startup
+reconciliation. Request/lifecycle cancellation can stop Export before it wins
+finalization; after that point a bounded `context.WithoutCancel` critical section
+finishes acceptance. Same-ID Create/import keeps the existing 409 conflict until
+cleanup hard-deletes the source row; clients may retry after completion or import
+under a different node-local ID.
 
 Standalone import defaults to source NodeSandboxID; an explicit target changes only local ID while retaining StableID/service credentials. Atomic insert-only conflicts with 409. Connect can synchronously import a missing target from X-Kuasar-Migration-Token; existing targets ignore it. Paused routes project only kind-independent artifact_location local/remote for trusted migration consumers. Proxy does not inspect artifact kind; migration tokens are sensitive Sandbox credentials and never route-broadcast.
 
@@ -1633,7 +1661,7 @@ The same startup gate reconstructs Builder ownership under [Build recovery](node
 
 The same conductor reaper runs terminal retention every five seconds, without another timer/unit. Dead and ready/error transitions atomically write dead_unix/finished_unix. Each pass processes at most 128 rows of each type. Exact-delete only after dead_ttl/terminal_ttl and complete owner release. Sandbox must have no unit, network, RunDir/BaseDir, UDS, ResumeSource or launch owner. Build must have no execution claim, unit/cgroup, phase, network, prepare/result owner. Concurrent changes after candidate scanning fail the delete CAS and preserve the row. Restart resumes using database timestamps. No automatic VACUUM or remote-artifact mutation occurs.
 
-These local finalizers implement #132/#133's cleanup contract. Export #196 retains its publish/finalize race and source cleanup order; #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v8 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
+These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v8 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 

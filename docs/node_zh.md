@@ -390,17 +390,18 @@ node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--socket
 node-ctl import-sandbox <token> [--socket S]
 ```
 
-- `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token.成功进入 source
-  finalizer 后默认删除源沙箱;`--keep-source` 保留 paused source,且 ResumeSource 与
+- `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token。默认成功表示结果有效且源删除
+  已被持久接纳，物理清理可在响应之后完成；`--keep-source` 保留 paused source,且 ResumeSource 与
   local checkpoint 均保持原样——源沙箱仍从导出前的恢复位置恢复(#336).
 - `export-sandbox <sid> --to-template`:发布 paused Sandbox E 或 Snapshot S 并打印对应的
   持久 `sbx` / `snp` templateID(扇出用).
-  `--keep-source` 使用相同的 source retention 语义;未指定时同样删除源沙箱.
+  `--keep-source` 使用相同的 source retention 语义;未指定时同样接纳删除并最终完成物理清理。
 - local artifact 上传期间统一允许 Resume,不增加额外开关。Resume 先受理时,KMT
   Export 取消上传并返回 409;Template Export 继续上传并返回 templateID。两者都放弃
   source finalizer,不更新/删除 source,也不删除 local artifact.
 - `import-sandbox <token>`:缺省复用 token 中的 source NodeSandboxID,以 insert-only 方式
-  写入 paused 行并打印 sid;目标已存在返回 409。API body 可通过可选 `sandboxID` 指定另一
+  写入 paused 行并打印 sid；目标已存在（包括仍在 `deleting` 的源）时返回 409。复用同一
+  node-local ID 需要等待物理清理完成，import 本身不会等待。API body 可通过可选 `sandboxID` 指定另一
   个 node-local target,但不会改变逻辑认证主体或既有 service credential。随后调用
   `connect` 即可异步恢复。
 
@@ -1920,7 +1921,7 @@ S 元数据重建持久对。参见[配对 source 契约](rfc-142-pairs_zh.md)�
 `@digest`、`@hmac` 或 `@manifest` 身份；已具名 location 保留合法表示。先按完整来源
 上下文比较，再投影。调用方在外部提供 checkpoint 目录；响应不含路径、上下文、标识或
 字段映射对象。Bundle selector 退出不代表应删除物理 carrier。即使报告差集，
-`keepSource` 仍保留原源与 checkpoint。本变更不增加 GC、自动删除或远端删除行为。
+`keepSource` 仍保留原源与 checkpoint。报告本身不触发工件删除或 GC；move 按下文执行源沙箱拥有的本地资源清理。
 
 `TemplateID` 为 `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
 
@@ -1943,13 +1944,26 @@ ServiceSecret/Envd/Traffic/Forward token;目标 node 从本地 trusted key table
 ManifestKey 并校验 fingerprints、runtime digest 和 profile。token 不携 raw tenant roots、host path、
 MMDS secret value、cluster Group/RouteKey 或 generation。
 
-Export 第一阶段 publish 不持有长 lifecycle lock;第二阶段在 per-SID lock 内以 exact original
-`ResumeSource` 赢得 finalizer。Resume 先成功 `BeginResume` 时,KMT export 被取消并返回 409;
-template publish 可 detached 完成并返回 TemplateID,但不清理 source。finalizer 先获胜时,
-`keepSource=true` 只返回导出结果,source 完全不变——ResumeSource、row、cache、route 与
-local checkpoint 都保持原样(#336);`keepSource=false` 先 exact teardown ownership,再删除
-row/cache/route/local artifact。任何 teardown 或 Store 失败都保留可重试的 durable ownership。
-located/remote artifact 永不被本机 cleanup 删除。
+Export 的 publish 阶段不持有长 lifecycle lock。结果校验通过后，在 per-SID lifecycle lock
+内检查完整原始 S/E 对、源实例和导出 attempt。Resume 先成功 `BeginResume` 时，KMT
+export 被取消并返回 409；template publish 可 detached 完成并返回 TemplateID，但不清理
+source。Export 先赢得收尾权时，`keepSource=true` 保持 ResumeSource、row、cache、route
+与 checkpoint 全部不变。之后再对保留的源执行 move，仍使用同一删除流程。
+
+`keepSource=false` 校验本地路径所有权后，调用正常的锁内删除接纳入口。成功表示
+有效 token/template 结果和持久 `deleting` 行，物理清理可能尚未完成。Export 返回前
+撤销 source cache、排除后续全量 route snapshot，并发布 live route Delete。已有 finalizer
+依次 fence runner、释放 network、删除 RunDir 和 BaseDir（包括全部所属 checkpoint 文件），
+最后 hard-delete 行并通知 terminal observer。local/portable 的 S/E 源全部采用此流程，
+portable 源遗留的本地 checkpoint 也会清理。发布目录与共享输出不属于源清理所有权；
+finalizer 不删除 located/remote artifact。
+
+删除接纳无法持久化时返回错误，paused source、S/E 对和 checkpoint 完整保留。接纳后
+目录或 hard-delete 失败仍保留 `deleting` 所有权与有效导出结果，绝不恢复为 paused。
+worker 独立于 HTTP 请求持续重试；服务关闭时未完成所有权留在同一行，由启动
+reconciliation 接续。请求或 lifecycle 取消可在 Export 赢得收尾权前终止操作；获胜后
+通过有时限的 `context.WithoutCancel` 临界区完成接纳。同 ID Create/import 在源行最终
+hard-delete 前继续返回既有的 409 冲突；客户端可在清理完成后重试，或选择不同 node-local ID。
 
 standalone import 省略 target 时复用 source NodeSandboxID;显式 target 只替换 node-local ID,保留
 StableID 和 service credentials。insert 是原子的 insert-only,冲突返回 409。Connect 可携
@@ -2360,8 +2374,8 @@ RunDir/BaseDir、UDS、ResumeSource 或 launch owner；Build 不能仍有 execut
 phase、network、runtime prepare/result owner。候选扫描后的并发变化会使 delete CAS 失败并保留行，
 进程重启后按数据库时间继续。实现不自动 `VACUUM`，也不触碰任何远端 artifact。
 
-以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。#196 的 Export 仍保持
-publish/finalize 两阶段竞争与 source cleanup 顺序；#205 的 Build resources、两级准入和 cgroup
+以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。Export 保持
+publish/finalize 两阶段竞争，move 复用相同的持久删除接纳与 finalizer（#348）；#205 的 Build resources、两级准入和 cgroup
 权威不变；当前 main 仍有 post-registration Build projection，故 routesync v8 沿用 v6 引入的 Build full sync +
 live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
 节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
