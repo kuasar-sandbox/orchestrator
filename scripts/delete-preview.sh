@@ -41,8 +41,10 @@ esac
 
 if [ -n "${RELEASE_KIND:-}" ]; then
   ARCHIVE="$("$SCRIPT_DIR/release.sh" archive-name "$RELEASE_KIND" "$TAG" x86_64)"
+  ARM_ARCHIVE="$("$SCRIPT_DIR/release.sh" archive-name "$RELEASE_KIND" "$TAG" aarch64)"
 else
   ARCHIVE="$("$SCRIPT_DIR/release.sh" archive-name "$TAG" x86_64)"
+  ARM_ARCHIVE="$("$SCRIPT_DIR/release.sh" archive-name "$TAG" aarch64)"
 fi
 
 gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100"   | jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' > "$TMP/releases"
@@ -52,11 +54,12 @@ if [ "$(jq 'length' "$TMP/releases")" -eq 1 ]; then
   jq '.[0]' "$TMP/releases" > "$TMP/release"
   jq -e '.prerelease == true or .draft == true' "$TMP/release" >/dev/null     || fail "refusing to delete a non-preview release"
   complete=false
-  if jq -e --arg archive "$ARCHIVE" '
+  if jq -e --arg archive "$ARCHIVE" --arg arm "$ARM_ARCHIVE" '
       .draft == false
       and .prerelease == true
-      and (.assets | length == 2)
-      and ([.assets[].name] | sort == (["SHA256SUMS", $archive] | sort))
+      and (([.assets[].name] | sort) as $names |
+        $names == (["SHA256SUMS", $archive] | sort) or
+        $names == (["SHA256SUMS", $archive, $arm] | sort))
       and all(.assets[]; .state == "uploaded")
     ' "$TMP/release" >/dev/null; then
     complete=true

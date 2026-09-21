@@ -1,15 +1,17 @@
-"""Exercise the custom Proxy build's Go selection without running the E2E."""
+"""Exercise the custom Proxy build and prepared executable handoff without the E2E."""
 
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
-SOURCE = (Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh").read_text()
+SOURCE = (Path(__file__).resolve().parents[3] / "scripts/ci-e2e-build.sh").read_text()
 
 
 def function(name):
@@ -22,7 +24,7 @@ def function(name):
 GO = function("e2e_go")
 BUILD_CUSTOM_PROXY = function("build_custom_proxy")
 SKIP = next(line for line in SOURCE.splitlines() if line.startswith("skip() {"))
-TELEMETRY = (Path(__file__).with_name("telemetry.sh")).read_text()
+TELEMETRY = SOURCE
 
 
 class OrchestratorProxyGoSelection(unittest.TestCase):
@@ -216,76 +218,136 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         self.assertEqual(self.log.read_text().splitlines()[0], "carried-go")
 
     def test_helper_is_wired_to_runtime_callers(self):
-        self.assertEqual(SOURCE.count("\n        build_custom_proxy\n"), 1)
-        self.assertIn("run_telemetry_guest_probe", SOURCE)
+        self.assertIn("fixtures) build_custom_proxy; build_telemetry_grpc", SOURCE)
+        self.assertIn("source) build_telemetry_netns", SOURCE)
         self.assertIn('"${KUASAR_E2E_GO:-${GOROOT:+$GOROOT/bin/}go}" "$@"', GO)
         self.assertNotIn("GOTOOLCHAIN=local", GO)
 
 
-class JournalGoRegressionAdmission(unittest.TestCase):
-    def run_entry(self, *, required="0", goroot=None, path_go=False, regression_exit=0):
-        with tempfile.TemporaryDirectory(prefix="journal-go-entry-") as temporary:
+class ArtifactJournalContract(unittest.TestCase):
+    def test_required_binary_journal_does_not_invoke_go(self):
+        entry = Path(__file__).resolve().parents[1] / "e2e_journal_contract.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            tools = Path(temporary)
+            (tools / "go").write_text("#!/bin/sh\nexit 97\n")
+            (tools / "go").chmod(0o755)
+            result = subprocess.run(["bash", str(entry)], text=True, capture_output=True,
+                                    env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                         "REQUIRE_PROXY": "1", "GOROOT": "/missing-source-toolchain"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("e2e_journal_contract: OK", result.stdout)
+
+
+class PreparedCustomProxy(unittest.TestCase):
+    def test_missing_grpc_probe_is_rejected_before_heavy_prerequisites(self):
+        entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
+        source = entry.read_text()
+        preflight = source[source.index("skip() {"):source.index("for b in node-ctl ")]
+        env = {**os.environ, "REQUIRE_PROXY": "1"}
+        env.pop("TELEMETRY_GRPC_PROBE_BIN", None)
+        result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + preflight],
+                                env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("TELEMETRY_GRPC_PROBE_BIN", result.stdout)
+        self.assertIn("e2e-fixtures", result.stdout)
+
+    def test_prepared_bytes_are_installed_for_the_runtime_user(self):
+        entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
+        setup = entry.read_text().split("CUSTOM_PROXY_EXTENSION_E2E=0\n", 1)[1].split(
+            "declare -a PIDS=()", 1
+        )[0]
+        with tempfile.TemporaryDirectory(prefix="proxy-owner-") as temporary:
             root = Path(temporary)
-            entry = root / "e2e_journal_contract.sh"
-            original = Path(__file__).resolve().parents[1] / entry.name
-            entry.write_text(original.read_text())
-            tools = root / "tools"
+            prepared = root / "prepared proxy"
+            contents = b"#!/bin/sh\nprintf 'prepared-proxy\\n'\n"
+            prepared.write_bytes(contents)
+            prepared.chmod(0o555)
+            # A root run reproduces hosted CI's unprivileged prepare -> sudo E2E.
+            if os.geteuid() == 0:
+                os.chown(prepared, 65534, 65534)
+            original = prepared.stat()
+            for artifact in ("0", "1"):
+                with self.subTest(artifact=artifact):
+                    work = root / ("work-" + artifact)
+                    work.mkdir(mode=0o700)
+                    result = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\nskip() { exit 1; }\n" + setup
+                         + '\n[ "$CUSTOM_PROXY_EXTENSION_E2E" = 1 ]\nprintf "%s\\n" "$CUSTOM_PROXY_BIN"'],
+                        env={**os.environ, "WORK": str(work), "CUSTOM_PROXY_BIN": str(prepared),
+                             "KUASAR_ARTIFACT_E2E": artifact},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    installed = Path(result.stdout.strip())
+                    self.assertEqual(installed.parent, work)
+                    self.assertEqual(installed.stat().st_uid, os.geteuid())
+                    self.assertEqual(installed.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(installed.read_bytes(), contents)
+                    self.assertEqual(prepared.read_bytes(), contents)
+                    self.assertEqual(subprocess.check_output([installed], text=True), "prepared-proxy\n")
+                    current = prepared.stat()
+                    self.assertEqual(
+                        (current.st_ino, current.st_uid, current.st_gid, current.st_mode, current.st_mtime_ns),
+                        (original.st_ino, original.st_uid, original.st_gid, original.st_mode, original.st_mtime_ns),
+                    )
+
+
+class TelemetrySourceExecution(unittest.TestCase):
+    def run_probe(self, host, uid, status=0):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "scripts/ci-source-checks.sh").read_text()
+        start = source.index("bash scripts/ci-e2e-build.sh source ")
+        commands = source[start:source.index("\nTELEMETRY_SOURCE_ROOT=", start)]
+        with tempfile.TemporaryDirectory(prefix="source-netns-") as temporary:
+            work = Path(temporary)
+            tools = work / "tools"
             tools.mkdir()
-            log = root / "python.calls"
-            (tools / "dirname").symlink_to(shutil.which("dirname"))
-            python = tools / "python3"
-            python.write_text(
-                "#!/bin/sh\n"
-                'printf \'%s\\n\' "$*" >> "$CALL_LOG"\n'
-                'case "$*" in *test_orchestrator_proxy_go.py*) exit "$REGRESSION_EXIT";; esac\n'
-                "exit 0\n"
+            for name, value in (("uname", host), ("id", uid)):
+                path = tools / name
+                path.write_text("#!/bin/sh\nprintf '%s\\n' " + value + "\n")
+                path.chmod(0o755)
+            sudo_log = work / "sudo.log"
+            sudo = tools / "sudo"
+            sudo.write_text(
+                "#!" + sys.executable + "\nimport os, sys\nfrom pathlib import Path\n"
+                + f"Path({str(sudo_log)!r}).write_text('called')\n"
+                + ("sys.exit(127)\n" if uid == "0" else
+                   "assert sys.argv[1] == '-n'\nos.execvp(sys.argv[2], sys.argv[2:])\n")
             )
-            python.chmod(0o755)
-            if path_go:
-                go = tools / "go"
-                go.write_text("#!/bin/sh\nexit 1\n")
-                go.chmod(0o755)
-            env = {**os.environ, "PATH": str(tools), "REQUIRE_PROXY": required,
-                   "CALL_LOG": str(log), "REGRESSION_EXIT": str(regression_exit)}
-            if goroot is None:
-                env.pop("GOROOT", None)
-            else:
-                env["GOROOT"] = goroot
-            result = subprocess.run(["/bin/bash", str(entry)], env=env,
-                                    text=True, capture_output=True, timeout=5)
-            calls = log.read_text() if log.exists() else ""
-            return result, calls
+            sudo.chmod(0o755)
+            go = tools / "go"
+            go.write_text(
+                "#!" + sys.executable + "\nimport json, os, sys\nfrom pathlib import Path\n"
+                "assert sys.argv[1:3] == ['test', '-c']\n"
+                "output = Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                + f"probe = '#!{sys.executable}\\nimport json, os, sys\\n'\n"
+                "probe += 'print(json.dumps({\"goarch\": ' + repr(os.environ['GOARCH'])"
+                " + ', \"required\": os.environ.get(\"REQUIRE_TELEMETRY_NETNS\"), \"args\": sys.argv[1:]}))\\n'\n"
+                + f"probe += 'sys.exit({status})\\n'\n"
+                "output.write_text(probe)\noutput.chmod(0o755)\n"
+            )
+            go.chmod(0o755)
+            result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + commands],
+                cwd=root, env={**os.environ, "work": str(work), "KUASAR_E2E_GO": str(go),
+                               "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+                text=True, capture_output=True, timeout=5)
+            return result, sudo_log.exists()
 
-    def test_optional_no_go_preserves_native_journal_fallback(self):
-        for goroot in (None, ""):
-            with self.subTest(goroot=goroot):
-                result, calls = self.run_entry(goroot=goroot, regression_exit=43)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("test_journal_identity.py", calls)
-                self.assertNotIn("test_orchestrator_proxy_go.py", calls)
-                self.assertIn("native identity checks remain", result.stdout)
-                self.assertIn("e2e_journal_contract: OK", result.stdout)
+    def test_probe_uses_native_architecture_and_only_needed_sudo(self):
+        for host, arch in (("x86_64", "amd64"), ("aarch64", "arm64")):
+            for uid in ("0", "1001"):
+                with self.subTest(host=host, uid=uid):
+                    result, used_sudo = self.run_probe(host, uid)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(used_sudo, uid != "0")
+                    self.assertEqual(json.loads(result.stdout), {
+                        "goarch": arch, "required": "1",
+                        "args": ["-test.v", "-test.timeout=90s", "-test.run=^TestOTLPProxyNetNS"],
+                    })
 
-    def test_required_no_go_still_executes_and_fails_regression(self):
-        result, calls = self.run_entry(required="1", regression_exit=43)
-        self.assertEqual(result.returncode, 43, result.stderr)
-        self.assertIn("test_orchestrator_proxy_go.py", calls)
-        self.assertNotIn("e2e_journal_contract: OK", result.stdout)
-
-    def test_explicit_distribution_never_bypasses_regression(self):
-        for path_go in (False, True):
-            with self.subTest(path_go=path_go):
-                result, calls = self.run_entry(goroot="/invalid/explicit-goroot",
-                    path_go=path_go, regression_exit=43)
-                self.assertEqual(result.returncode, 43, result.stderr)
-                self.assertIn("test_orchestrator_proxy_go.py", calls)
-                self.assertNotIn("e2e_journal_contract: OK", result.stdout)
-
-    def test_optional_path_go_executes_regression(self):
-        result, calls = self.run_entry(path_go=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("test_orchestrator_proxy_go.py", calls)
-        self.assertIn("e2e_journal_contract: OK", result.stdout)
+    def test_required_probe_failure_propagates(self):
+        result, _ = self.run_probe("x86_64", "1001", 73)
+        self.assertEqual(result.returncode, 73, result.stderr)
 
 
 if __name__ == "__main__":

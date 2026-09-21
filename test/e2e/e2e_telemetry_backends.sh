@@ -4,38 +4,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ci_mode=""
-if [ -n "${KUASAR_CI_DIR:-}" ]; then
-    ci_mode="$(python3 - "$KUASAR_CI_DIR/run.tsv" <<'PY'
-import csv, sys
-rows = list(csv.DictReader(open(sys.argv[1]), delimiter='\t'))
-assert len(rows) == 1 and rows[0]['mode'] in ('source', 'exact-assets'), 'invalid CI execution mode'
-print(rows[0]['mode'])
-PY
-)"
-fi
 if [ -n "${BIN:-}" ]; then
     BIN="$(cd "$BIN" && pwd)"
     [ -x "$BIN/node-ctl" ] || { echo 'FAIL: BIN/node-ctl is required' >&2; exit 1; }
 fi
 TELEMETRY_SOURCE_ROOT="${TELEMETRY_SOURCE_ROOT:-}"
-if [ "$ci_mode" = exact-assets ]; then
-    # Release validation runs the shipped binary without rebuilding from any
-    # adjacent checkout. The binary/backend acceptance below is still required.
-    TELEMETRY_SOURCE_ROOT=""
-elif [ -z "$TELEMETRY_SOURCE_ROOT" ]; then
-    candidates=("$SCRIPT_DIR/../..")
-    # Source CI invokes the assembled owner suite and supplies platform/bin/ARCH,
-    # just as the existing custom Proxy and guest telemetry cases expect.
-    if [ -n "${BIN:-}" ]; then candidates+=("$BIN/../../../orchestrator"); fi
-    for candidate in "${candidates[@]}"; do
-        if [ -f "$candidate/internal/telemetry/deploy_integration_test.go" ]; then
-            TELEMETRY_SOURCE_ROOT="$(cd "$candidate" && pwd)"
-            break
-        fi
-    done
-fi
-if [ "$ci_mode" = source ] || [ -n "$TELEMETRY_SOURCE_ROOT" ]; then
+# Only the separate source-check stage supplies TELEMETRY_SOURCE_ROOT.
+# Artifact E2E never discovers or builds an adjacent source checkout.
+if [ -n "$TELEMETRY_SOURCE_ROOT" ]; then
     [ -f "$TELEMETRY_SOURCE_ROOT/internal/telemetry/deploy_integration_test.go" ] \
         || { echo 'FAIL: exact orchestrator sources required (TELEMETRY_SOURCE_ROOT)' >&2; exit 1; }
     command -v go >/dev/null || { echo 'FAIL: Go is required for source validation' >&2; exit 1; }
@@ -84,11 +60,13 @@ trap 'exit 143' TERM
 
 # Fixed upstream multi-platform manifests; the resolved platform image is also
 # recorded. Tests use only loopback-published, disposable service endpoints.
-prometheus_image='prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996'
-clickhouse_image='clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77'
+prometheus_image="${TELEMETRY_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996}"
+clickhouse_image="${TELEMETRY_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77}"
 prepare_image() {
     local image="$1" attempt
     if ! docker image inspect "$image" >/dev/null 2>&1; then
+        [ "${KUASAR_ARTIFACT_E2E:-0}" != 1 ] \
+            || { echo "FAIL: selected prepared backend image is missing" >&2; return 1; }
         # Reuse the public Docker Hub transport already used by platform's
         # source and exact-assets suites. Docker verifies the unchanged pinned
         # manifest digest; this does not select another tag or backend version.

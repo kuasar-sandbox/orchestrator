@@ -2466,10 +2466,24 @@ native exec 路径负责,不表示同一聚合脚本的后续 pause/resume 等�
 编排特性的 E2E 与实现一起维护在 `orchestrator/test/e2e/`。轻量 cluster stub 与需要
 vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品的真实 microVM
 用例使用同一个 `run_all.sh`。直接调用脚本时通过 `BIN` 指向项目主仓组装的二进制目录；
-`make test-e2e` 传入 `E2E_BIN`，默认 sibling 主仓 `bin/<architecture>`，没有 build prerequisite，需先组装；
+`make test-e2e` 传入 `E2E_BIN`，默认 sibling 主仓 `bin/<architecture>`；它准备测试 helper 并执行必需的源码检查，但不构建这些产品前置，需先组装；
 本地 stub 则使用 `make build` 后 `make test-e2e-cluster-stub`。
 组件 PR 的集成测试则把候选仓与其余仓源码组成统一环境后执行该入口。缺少重型前置时单脚本可
 跳过,完整门禁设置 `REQUIRE_*=1` 后硬失败。
+
+直接运行 Proxy E2E（包括其 MMDS restart wrapper）时，先准备本机架构的 helper，并传入两个可执行文件路径。以下命令从 orchestrator 仓库执行，要求产品二进制已组装且既有 KVM/Docker/zot 前置可用：
+
+```bash
+e2e_arch="$(uname -m)"
+make e2e-fixtures TARGET_ARCH="$e2e_arch"
+e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
+BIN="$PWD/../kuasar-sandbox/bin/$e2e_arch" \
+CUSTOM_PROXY_BIN="$e2e_tools/custom-proxy" \
+TELEMETRY_GRPC_PROBE_BIN="$e2e_tools/telemetry-grpc-probe" \
+REQUIRE_PROXY=1 bash test/e2e/e2e_orchestrator_proxy.sh
+```
+
+如产品组装在其它目录，请调整 `BIN`。脚本在重型环境准备前检查必需的 gRPC probe，不在 E2E 中编译 helper。完整套件的 `make test-e2e` 会自动传入这些路径。
 
 | 脚本 | 覆盖 |
 |---|---|

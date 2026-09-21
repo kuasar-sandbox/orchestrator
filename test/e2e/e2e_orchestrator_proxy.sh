@@ -57,16 +57,8 @@ PROXY_WORKERS=2
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-e2e_go() {
-    # sudo may reset PATH while preserving the explicitly selected distribution.
-    # Keep its driver/compiler paired; an invalid explicit GOROOT must fail.
-    "${KUASAR_E2E_GO:-${GOROOT:+$GOROOT/bin/}go}" "$@"
-}
-
-build_custom_proxy() {
-    (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off e2e_go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
-        || skip "failed to build examples/custom-proxy"
-}
+[ -x "${TELEMETRY_GRPC_PROBE_BIN:-}" ] \
+    || skip "prepared TELEMETRY_GRPC_PROBE_BIN is required (run make e2e-fixtures and set the probe path; see docs/node.md Tests)"
 
 for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
@@ -84,19 +76,7 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/
     || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
 
 if [ "$(id -u)" -ne 0 ]; then
-    selected_go=$(command -v "${KUASAR_E2E_GO:-${GOROOT:+$GOROOT/bin/}go}") || exit 1
-    selected_go="$(cd "$(dirname "$selected_go")" && pwd)/${selected_go##*/}"
-    # Resolve before sudo drops the PATH entries used by named/+path policies.
-    go_source="$(cd "$(dirname "$0")/../.." && pwd)"
-    selected_root=$(GOWORK=off "$selected_go" -C "$go_source" env GOROOT) || exit 1
-    bundled_root=$(GO111MODULE=off GOWORK=off GOTOOLCHAIN=local "$selected_go" env GOROOT) || exit 1
-    if [ "$selected_root" != "$bundled_root" ]; then
-        selected_version=$(GOWORK=off "$selected_go" -C "$go_source" env GOVERSION) || exit 1
-        selected_go=$(command -v "$selected_version" || printf '%s/bin/go\n' "$selected_root")
-        [ -f "$selected_go" ] && [ -x "$selected_go" ] || { echo "selected Go toolchain is unavailable" >&2; exit 1; }
-        selected_go="$(cd "$(dirname "$selected_go")" && pwd)/${selected_go##*/}"
-    fi
-    exec sudo -nE env KUASAR_E2E_GO="$selected_go" GOROOT="$selected_root" /bin/bash "$0" "$@"
+    exec sudo -nE /bin/bash "$0" "$@"
 fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
@@ -109,24 +89,13 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 CUSTOM_PROXY_EXTENSION_E2E=0
 if [ -n "${CUSTOM_PROXY_BIN:-}" ]; then
     [ -x "$CUSTOM_PROXY_BIN" ] || skip "CUSTOM_PROXY_BIN is not executable: $CUSTOM_PROXY_BIN"
+    # Keep prepared inputs intact; root dispatch requires a root-owned executable.
+    install -m 0700 "$CUSTOM_PROXY_BIN" "$WORK/custom-proxy"
+    CUSTOM_PROXY_BIN="$WORK/custom-proxy"
     CUSTOM_PROXY_EXTENSION_E2E=1
 else
-    CUSTOM_PROXY_SOURCE_ROOT="$REPO_ROOT"
-    if [ ! -f "$CUSTOM_PROXY_SOURCE_ROOT/examples/custom-proxy/main.go" ]; then
-        PROXY_PLATFORM_ROOT="$(cd "$BIN/../.." && pwd)"
-        if [ -f "$PROXY_PLATFORM_ROOT/../orchestrator/examples/custom-proxy/main.go" ]; then
-            CUSTOM_PROXY_SOURCE_ROOT="$(cd "$PROXY_PLATFORM_ROOT/../orchestrator" && pwd)"
-        fi
-    fi
-    if [ -f "$CUSTOM_PROXY_SOURCE_ROOT/examples/custom-proxy/main.go" ]; then
-        CUSTOM_PROXY_BIN="$WORK/custom-proxy"
-        build_custom_proxy
-        CUSTOM_PROXY_EXTENSION_E2E=1
-    else
-        # Exact-assets packages contain the E2E suite but no component source.
-        # Keep proxy_executable absent so node-ctl runs its built-in Proxy App.
-        CUSTOM_PROXY_BIN="-"
-    fi
+    [ "${KUASAR_ARTIFACT_E2E:-0}" != 1 ] || skip "prepared CUSTOM_PROXY_BIN is required"
+    CUSTOM_PROXY_BIN="-"
 fi
 declare -a PIDS=()
 declare -a TAGS=()
@@ -539,33 +508,14 @@ REF="127.0.0.1:$ZOT_PORT/e2e/app:v1"
 # An e2b-compliant base image: add a 'user' account + tiny ionice/nice shims (envd
 # wraps guest processes as `ionice -c.. nice -n.. cmd` and runs them as the default
 # user). Same prep as e2e_execute.sh; the orchestrator/envd are unchanged.
-cat > "$WORK/niceshim" <<'SH'
-#!/bin/sh
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -c|-n) shift 2 ;;
-    -c*|-n*) shift ;;
-    --) shift; break ;;
-    *) break ;;
-  esac
-done
-exec "$@"
-SH
-cat > "$WORK/Dockerfile.e2e" <<EOF
-FROM $E2E_IMAGE
-COPY niceshim /usr/bin/ionice
-COPY niceshim /usr/bin/nice
-RUN chmod +x /usr/bin/ionice /usr/bin/nice \
- && if ! id -u user >/dev/null 2>&1; then \
-      if command -v useradd >/dev/null 2>&1; then useradd -m -d /home/user -s /bin/sh user; \
-      elif command -v adduser >/dev/null 2>&1; then adduser -D -h /home/user -s /bin/sh user; \
-      else echo "missing useradd/adduser" >&2; exit 1; fi; \
-    fi \
- && mkdir -p /home/user \
- && chown user:user /home/user \
- && id user >/dev/null
-EOF
-docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build"; }
+if [ "${KUASAR_ARTIFACT_E2E:-0}" = 1 ]; then
+    : "${ORCHESTRATOR_BASE_IMAGE:?prepared orchestrator image is required}"
+    docker image inspect "$ORCHESTRATOR_BASE_IMAGE" >/dev/null || fail "prepared base image is missing"
+    docker tag "$ORCHESTRATOR_BASE_IMAGE" "$REF"
+else
+    bash "$SCRIPT_DIR/lib/prepare_base_image.sh" "$E2E_IMAGE" "$REF" base >"$WORK/imgbuild.log" 2>&1 \
+        || { cat "$WORK/imgbuild.log"; fail "prepare e2b base fixture"; }
+fi
 TAGS+=("$REF")
 docker push "$REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "docker push"; }
 echo "==> store-ctl + zot up; built+seeded $REF"

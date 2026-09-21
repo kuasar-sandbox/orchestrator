@@ -1174,34 +1174,14 @@ REF="127.0.0.1:$ZOT_PORT/e2e/app:v1"
 # network here — so build a minimal compliant image offline: add the user and
 # tiny ionice/nice shims (strip -c/-n opts, exec the rest). The orchestrator/envd
 # are unchanged; this only makes the test image match the e2b base contract.
-cat > "$WORK/niceshim" <<'SH'
-#!/bin/sh
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -c|-n) shift 2 ;;
-    -c*|-n*) shift ;;
-    --) shift; break ;;
-    *) break ;;
-  esac
-done
-exec "$@"
-SH
-cat > "$WORK/Dockerfile.e2e" <<EOF
-FROM $E2E_IMAGE
-COPY niceshim /usr/bin/ionice
-COPY niceshim /usr/bin/nice
-RUN chmod +x /usr/bin/ionice /usr/bin/nice \
- && if ! id -u user >/dev/null 2>&1; then \
-      if command -v useradd >/dev/null 2>&1; then useradd -m -d /home/user -s /bin/sh user; \
-      elif command -v adduser >/dev/null 2>&1; then adduser -D -h /home/user -s /bin/sh user; \
-      else echo "missing useradd/adduser" >&2; exit 1; fi; \
-    fi \
- && mkdir -p /home/user \
- && chown user:user /home/user \
- && id user >/dev/null
-CMD ["sleep", "86400"]
-EOF
-docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build (e2b-compliant image)"; }
+if [ "${KUASAR_ARTIFACT_E2E:-0}" = 1 ]; then
+    : "${ORCHESTRATOR_EXECUTE_IMAGE:?prepared orchestrator image is required}"
+    docker image inspect "$ORCHESTRATOR_EXECUTE_IMAGE" >/dev/null || fail "prepared base image is missing"
+    docker tag "$ORCHESTRATOR_EXECUTE_IMAGE" "$REF"
+else
+    bash "$SCRIPT_DIR/lib/prepare_base_image.sh" "$E2E_IMAGE" "$REF" execute >"$WORK/imgbuild.log" 2>&1 \
+        || { cat "$WORK/imgbuild.log"; fail "prepare e2b base fixture"; }
+fi
 TAGS+=("$REF")
 docker push "$REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "docker push"; }
 echo "==> store-ctl + zot up; built+seeded $REF (user + ionice/nice shims)"

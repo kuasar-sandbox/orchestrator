@@ -10,6 +10,11 @@ cat > "$TMP/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$*" == *"releases?per_page=100"* ]]; then
+  if [ -n "${FAKE_COMPLETE_ASSETS:-}" ]; then
+    jq -cn --arg tag "$FAKE_TAG" --arg target "$FAKE_TARGET" --argjson names "$FAKE_COMPLETE_ASSETS" \
+      '[[{id:17,tag_name:$tag,target_commitish:$target,draft:false,prerelease:true,assets:[$names[] | {name:.,state:"uploaded"}]}]]'
+    exit 0
+  fi
   jq -cn --arg tag "${FAKE_TAG:?}" --arg target "${FAKE_TARGET:?}"     '[[{id: 17, tag_name: $tag, target_commitish: $target,
         draft: true, prerelease: false, assets: []}]]'
   exit 0
@@ -44,5 +49,19 @@ if grep -q 'git/refs/tags' "$DELETE_LOG"; then
   echo "test-delete-preview: attempted to delete an absent tag" >&2
   exit 1
 fi
+
+# Complete old and dual releases must both survive incomplete recovery.
+for arches in x86_64 'x86_64 aarch64'; do
+  names=$(for arch in $arches; do "$SCRIPT_DIR/release.sh" archive-name "$TAG" "$arch"; done)
+  assets=$(printf '%s\n' SHA256SUMS "$names" | jq -Rsc 'split("\n")[:-1]')
+  log="$TMP/complete-${arches// /-}"
+  if PATH="$TMP/bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator \
+    FAKE_TAG="$TAG" FAKE_TARGET="$SOURCE_SHA" FAKE_COMPLETE_ASSETS="$assets" FAKE_DELETE_LOG="$log" \
+    bash "$SCRIPT_DIR/delete-preview.sh" orchestrator "$TAG" "$SOURCE_SHA" incomplete > "$TMP/refusal" 2>&1; then
+    echo 'test-delete-preview: complete release was classified as incomplete' >&2; exit 1
+  fi
+  grep -Fq 'refusing incomplete recovery for a complete preview' "$TMP/refusal"
+  [ ! -e "$log" ]
+done
 
 echo "test-delete-preview: PASS"

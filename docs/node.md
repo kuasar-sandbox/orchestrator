@@ -1757,7 +1757,21 @@ RouteSource.Range and later full snapshots therefore never mispublish abandoned 
 
 Real-microVM native-exec cases cover token issuance, service=exec CONNECT and guest execution separately for standalone and cluster. That evidence covers those native-exec paths; it does not automatically accept later pause/resume or other stages of the aggregate script.
 
-Feature E2E lives with implementation in orchestrator/test/e2e/. Lightweight cluster stubs and real-microVM cases requiring vmlinux, Cloud Hypervisor, mkfs.erofs and sandbox-runtime.bundle share run_all.sh. Direct script invocation sets BIN to the assembled project binary directory. Make test-e2e passes E2E_BIN, defaulting to the sibling project's bin/architecture directory; it does not build those prerequisites. Local stub execution uses make build followed by make test-e2e-cluster-stub. The component integration job assembles candidate sources with the other repositories and runs this entry. Individual scripts can skip missing heavy prerequisites, while full gates use REQUIRE_*=1 to fail instead.
+Feature E2E lives with implementation in orchestrator/test/e2e/. Lightweight cluster stubs and real-microVM cases requiring vmlinux, Cloud Hypervisor, mkfs.erofs and sandbox-runtime.bundle share run_all.sh. Direct script invocation sets BIN to the assembled project binary directory. Make test-e2e passes E2E_BIN, defaulting to the sibling project's bin/architecture directory; it prepares test helpers and runs required source checks, but does not build those product prerequisites. Local stub execution uses make build followed by make test-e2e-cluster-stub. The component integration job assembles candidate sources with the other repositories and runs this entry. Individual scripts can skip missing heavy prerequisites, while full gates use REQUIRE_*=1 to fail instead.
+
+For a direct Proxy E2E (including its MMDS restart wrapper), prepare the native helpers first and pass both executable paths. From the orchestrator repository, with the assembled product binaries and existing KVM/Docker/zot prerequisites available:
+
+```bash
+e2e_arch="$(uname -m)"
+make e2e-fixtures TARGET_ARCH="$e2e_arch"
+e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
+BIN="$PWD/../kuasar-sandbox/bin/$e2e_arch" \
+CUSTOM_PROXY_BIN="$e2e_tools/custom-proxy" \
+TELEMETRY_GRPC_PROBE_BIN="$e2e_tools/telemetry-grpc-probe" \
+REQUIRE_PROXY=1 bash test/e2e/e2e_orchestrator_proxy.sh
+```
+
+Adjust `BIN` if the product set is assembled elsewhere. The script checks the required prepared gRPC probe before heavy setup; it does not compile helpers during E2E. `make test-e2e` supplies these paths automatically for the complete suite.
 
 | Script | Coverage |
 |---|---|

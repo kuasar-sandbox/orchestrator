@@ -542,33 +542,14 @@ EOF
     wait_port "$ZOT_PORT" zot
 
     REF="127.0.0.1:$ZOT_PORT/e2e/cluster-real:v1"
-    cat > "$WORK/niceshim" <<'SH'
-#!/bin/sh
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -c|-n) shift 2 ;;
-    -c*|-n*) shift ;;
-    --) shift; break ;;
-    *) break ;;
-  esac
-done
-exec "$@"
-SH
-    cat > "$WORK/Dockerfile.e2e" <<EOF
-FROM $E2E_IMAGE
-COPY niceshim /usr/bin/ionice
-COPY niceshim /usr/bin/nice
-RUN chmod +x /usr/bin/ionice /usr/bin/nice \
- && if ! id -u user >/dev/null 2>&1; then \
-      if command -v useradd >/dev/null 2>&1; then useradd -m -d /home/user -s /bin/sh user; \
-      elif command -v adduser >/dev/null 2>&1; then adduser -D -h /home/user -s /bin/sh user; \
-      else echo "missing useradd/adduser" >&2; exit 1; fi; \
-    fi \
- && mkdir -p /home/user \
- && chown user:user /home/user \
- && id user >/dev/null
-EOF
-    docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" > >(tee "$WORK/imgbuild.log" >&2) 2>&1 || fail "docker build e2e image"
+    if [ "${KUASAR_ARTIFACT_E2E:-0}" = 1 ]; then
+    : "${ORCHESTRATOR_BASE_IMAGE:?prepared orchestrator image is required}"
+    docker image inspect "$ORCHESTRATOR_BASE_IMAGE" >/dev/null || fail "prepared base image is missing"
+    docker tag "$ORCHESTRATOR_BASE_IMAGE" "$REF"
+else
+    bash "$SCRIPT_DIR/lib/prepare_base_image.sh" "$E2E_IMAGE" "$REF" base >"$WORK/imgbuild.log" 2>&1 \
+        || { cat "$WORK/imgbuild.log"; fail "prepare e2b base fixture"; }
+fi
     TAGS+=("$REF")
     docker push "$REF" > >(tee "$WORK/push.log" >&2) 2>&1 || fail "docker push e2e image"
     step "store-ctl + zot up; seeded $REF"
