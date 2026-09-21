@@ -118,11 +118,15 @@ func TestCapturePairCLIToPausedDatabase(t *testing.T) {
 }
 
 func capturePairResponse(ctx context.Context, req ctl.Request, kind types.CaptureKind) (ctl.Response, error) {
+	return capturePairResponseForOwner(ctx, req, kind, "producer", [32]byte{17}, 3)
+}
+
+func capturePairResponseForOwner(ctx context.Context, req ctl.Request, kind types.CaptureKind, sid string, key [32]byte, value byte) (ctl.Response, error) {
 	var sink snapshot.ArtifactSink
 	var upload *snapshot.IngestSink
 	if req.Upload {
 		cfg := &manifest.Config{Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}}, Crypto: manifestcrypto.Config{Chunk: "aes", Manifest: "aes"}}
-		writer, err := cfg.NewIngesterWithWriter(func() ([32]byte, error) { return [32]byte{17}, nil }, nil, captureUploadWriter{})
+		writer, err := cfg.NewIngesterWithWriter(func() ([32]byte, error) { return key, nil }, nil, captureUploadWriter{})
 		if err != nil {
 			return ctl.Response{}, err
 		}
@@ -131,12 +135,12 @@ func capturePairResponse(ctx context.Context, req ctl.Request, kind types.Captur
 	} else if req.Mode == "bundle" {
 		cfg := &manifest.Config{Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}}, Crypto: manifestcrypto.Config{Chunk: "aes", Manifest: "aes"}}
 		var err error
-		sink, err = snapshot.NewBundleSink(ctx, req.OutDir, "producer", cfg, func() ([32]byte, error) { return [32]byte{17}, nil }, nil)
+		sink, err = snapshot.NewBundleSink(ctx, req.OutDir, sid, cfg, func() ([32]byte, error) { return key, nil }, nil)
 		if err != nil {
 			return ctl.Response{}, err
 		}
 	} else {
-		sink = snapshot.NewFileSink(req.OutDir, "producer", nil, false, nil)
+		sink = snapshot.NewFileSink(req.OutDir, sid, nil, false, nil)
 	}
 	defer sink.Close()
 	portable := &rtconfig.PortableSandboxConfig{Version: 1, Resources: rtconfig.PortableResourcesConfig{Capacity: rtconfig.CapacityConfig{CPU: 1, Memory: "512MiB"}, Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "512MiB"}}, Boot: rtconfig.PortableBootConfig{Kernel: "file://kernel@digest:" + strings.Repeat("1", 64), Runtime: "file://runtime@digest:" + strings.Repeat("2", 64), Root: rtconfig.PortableRootConfig{Base: "self"}}, Launch: rtconfig.PortableLaunchConfig{Workdir: "/", Restart: "never"}}
@@ -144,7 +148,7 @@ func capturePairResponse(ctx context.Context, req ctl.Request, kind types.Captur
 	if err != nil {
 		return ctl.Response{}, err
 	}
-	e, err := sandboxfile.BuildSource(sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{3}, 4096)), 4096), nil, cfg)
+	e, err := sandboxfile.BuildSource(sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{value}, 4096)), 4096), nil, cfg)
 	if err != nil {
 		return ctl.Response{}, err
 	}
@@ -158,7 +162,7 @@ func capturePairResponse(ctx context.Context, req ctl.Request, kind types.Captur
 		if err != nil {
 			return ctl.Response{}, err
 		}
-		source, err := snapshotfile.BuildSource(sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{4}, 4096)), 4096), []byte("{}"), []byte("{}"), scfg)
+		source, err := snapshotfile.BuildSource(sparse.Dense(bytes.NewReader(bytes.Repeat([]byte{value + 1}, 4096)), 4096), []byte("{}"), []byte("{}"), scfg)
 		if err != nil {
 			return ctl.Response{}, err
 		}

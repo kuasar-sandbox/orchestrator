@@ -718,6 +718,8 @@ registration usage 只统计 status IN (registered, waiting, building) 且两个
 
 按现有版本协调一起升级 node/router/Registry writer. 回退到不理解意图的旧 writer 前,停止接受新的取消/删除,由当前版本收敛全部待处理操作. 有未完成意图时,加法 schema 本身不能保证安全回退. 不增加长期双 writer、新任务表或兼容服务. 记录删除后已发布 canonical img/sbx/snp 引用、已有 Sandbox、下游 fromTemplate 和共享产物的其他 Build 仍可用;绝不删除远端内容.
 
+托管沙箱的 checkpoint 选择性清理不在 Build 阶段之间执行。后续 phase 可能仍读取前一阶段的 S/E，因此阶段输入与任意 FileSink 输出继续由原 owner 持有。Build 终态收尾先 fence exact runner 并释放阶段资源，再由既有 BuildBaseDir finalizer 删除所属 checkpoint 目录。失败、取消和重启仍保留该 finalizer 的持久责任，不删除共享发布 ref。
+
 ### Checkpoint 发布报告
 
 Builder 对 checkpoint S 调用 `sandbox-ctl publish --json --quiet`，接受 checkpoint

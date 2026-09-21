@@ -70,6 +70,8 @@ func main() {
 		err = runBuilder(os.Args[2:], log)
 	case "config":
 		err = configCmd(os.Args[2:], log)
+	case "checkpoint-cleanup":
+		err = checkpointCleanupCmd(os.Args[2:])
 	case "manifest-key":
 		err = manifestKeyCmd(os.Args[2:], log)
 	case "export-sandbox":
@@ -92,7 +94,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|builder|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder|version} [args]")
 	os.Exit(2)
 }
 

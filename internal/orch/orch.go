@@ -1399,7 +1399,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 // cleanupPausedOwnership releases ownership in the canonical dependency order.
 // Each exact RunID, port, and RunDir remains durable until its cleanup succeeds;
 // clearing RunDir also clears the UDS paths it owns. BaseDir remains the paused
-// artifact owner and is never touched here.
+// artifact owner; only obsolete checkpoint entries are selectively retired here.
 func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.Sandbox) error {
 	if sb == nil || sb.State != types.StatePaused {
 		return errors.New("orch: paused ownership cleanup requires a paused sandbox")
@@ -1450,6 +1450,9 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		removeRunDir = os.RemoveAll
 	}
 	if runDir := sb.RunDir; runDir != "" {
+		if err := o.cleanupCheckpoint(ctx, sb); err != nil {
+			return err
+		}
 		if err := removeRunDir(runDir); err != nil {
 			return fmt.Errorf("remove paused sandbox RunDir %s: %w", runDir, err)
 		}

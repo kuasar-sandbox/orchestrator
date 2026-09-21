@@ -1223,7 +1223,7 @@ Create/Connect/Wake/route activation/native exec/exec-session/migration import s
 
 After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation, without another route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans locally, then exactly creates owner-free dead history and withdraws route.
 
-CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains only BaseDir/checkpoint and source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
+CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains only BaseDir/checkpoint and source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
 ### 8.1 Artifact capture, templates and migration
 
@@ -1261,7 +1261,81 @@ CaptureSandbox:
   -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
 
-Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. RunDir removal failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
+Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
+
+##### Managed checkpoint history and selective cleanup
+
+`merge_ref=false` records the current resident working set separately. Starting with
+`S1 -> S0`, the next capture streams a new immutable historical Snapshot
+`S1′ = S1(memory) over S0(memory)` and writes `S2(current working set) -> S1′`.
+Further local captures repeat this composition: at most one owned local memory
+lower remains beneath the newest S. `merge_ref=true` absorbs the current resident
+memory and the entire eligible local prefix; switching false → true → false has
+the same bound. Restore still accepts old multi-layer inputs. Only the newest S
+supplies execution state and `sandbox_ref`; historical S contributes memory only.
+
+The prefix belongs to the current sandbox's canonical `BaseDir/checkpoint`.
+Selection uses complete source bindings and physical Bundle membership before
+comparing paths. A named location or external template is a boundary even if its
+files are on this host, including a mapping to the same pathname. The boundary
+and remaining lower refs preserve their order. Local tarstream, Bundle, and mixed
+carriers follow the same rules. Writable disk chains always absorb their eligible
+same-device local prefix, independently of the memory flag; immutable EROFS bases
+remain separate from ext4 uppers. Data and opaque Zero override lower layers;
+Hole falls through. Historical reads use host artifact streams, never the guest
+memfd, and therefore do not enlarge the captured working set.
+
+History is composed before guest freeze and streamed into the final sink. It
+uses `fetch.NewLayered` and sparse runs without a full-image buffer or intermediate
+image copy. Local output reuses dependencies already owned by that checkpoint through their
+physical selectors. Bundle output keeps its existing member-copy publication path. New history has a new content
+identity; the old source remains valid through sink commit/close and database
+commit. Failed capture or database commit cannot authorize old-file deletion.
+
+After a managed Pause commits its exact S/E pair (or E-only root), the lifecycle
+owner fences the old runner and all readers/writers, then invokes selective
+cleanup. Generic FileSink output, arbitrary `--output`, independent
+`snapshot --resume`, and shared build inputs confer no cleanup rights. The
+sandboxer artifact library interprets the keep set; conductor supplies ownership,
+paths, the committed pair, and the existing lifecycle fences through the
+short-lived `node-ctl checkpoint-cleanup` tool. Portable Export continues to use
+its stored pair without reading artifacts. No token, public result, base format,
+or persistent cleanup schema changes.
+
+The keep set contains current S/E, memory-history carriers, and current disk,
+upper and immutable-base carriers, including reused files. A historical S's old
+E is not a disk dependency. Any needed Bundle member retains its whole physical
+carrier. Source/location binding precedes basename comparison. Selection reads
+only bounded current metadata and Bundle indexes, not old candidate payloads or
+full-image digests; Snapshot CPU/state bodies are not needed by this operation.
+Any keep-plan or reader-close error prevents all deletions. Kernel/runtime basename
+identities bind host-supplied boot files and are not checkpoint payload edges.
+
+Only direct entries in the verified exclusive checkpoint directory are eligible:
+64 lowercase hexadecimal digest/key names with `.snapshot`, `.sandbox`,
+`.overlay`, `.image`, or `.bundle` must be regular files; capture partials must
+exactly match `<producer-SandboxID>.<kind>.<uint32-decimal>.partial` (including
+`bundle`, no leading zeros except `0`); fixed `<sid>.snapshot`/`<sid>.sandbox`
+aliases and `.<sid>.<role>.<32-lowercase-hex>.tmp` must be symlinks with the
+producer's basename target convention. SandboxID is not PathID or StableID.
+Unknown names, other SIDs, prefix collisions, malformed lookalikes, directories,
+and unexpected symlinks remain untouched. Incomplete partial contents need no
+validation. A fixed alias is current only when it names the corresponding committed
+S or E carrier. An E-only root retires its old S alias even when E retains the
+same Bundle. Snapshot capture commits the S alias only; its E identity comes from
+the stored pair, without requiring an E alias. Cleanup unlinks recognized aliases themselves and never follows
+symlinks or recursively removes the directory; directory-fd operations keep
+unlink confined if paths race.
+
+A committed Pause remains successful if cleanup fails. The last durable RunDir
+ownership marker remains until checkpoint cleanup and ordinary paused cleanup
+succeed. The existing worker retries with a freshly loaded current source under
+the SID lifecycle lock, including after restart. Active or detached exports keep
+their read fence; cleanup never waits for an export while holding the lock it
+needs. Resume/Wake/Exec obey the existing pending-cleanup admission contract.
+Missing candidates count as finished; permission, I/O, and identity errors retain
+retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
+existing finalizers. Shared/external artifacts are never reclaimed by this step.
 
 #### 8.1.2 Resume admission, Connect and Wake
 
@@ -1655,7 +1729,7 @@ configured runner unit set:
 - **Running with active/activating unit:** adopt, restore in-memory route, preserve TTL, resend the snapshot to Proxy and report through node-link in clusters.
 - **Running without live unit:** fence unit, detach, remove both directories, then atomically exact-owner-CAS clear paths/runtime/network/artifact and mark dead. Dead is resource-free history.
 - **Runner units without running rows:** old-pool idle/orphan run IDs are stopped/reset; the new pool replenishes configured idle capacity.
-- **Paused:** retry complete stop/reset/inactive fencing, detach, exact CAS and RunDir removal even if RunID/port already cleared. Preserve source and BaseDir/checkpoint. Resume/Wake/Exec use the same admission gate and cannot enter starting before old cleanup completes. Run_root is tmpfs: host reboot makes lost running instances dead, while paused E/S and sbx/snp templates survive and can Connect/Wake from persistent BaseDir/checkpoint.
+- **Paused:** retry complete stop/reset/inactive fencing, detach, exact CAS, selective checkpoint cleanup and RunDir removal even if RunID/port already cleared. Preserve source and BaseDir/checkpoint. Resume/Wake/Exec use the same admission gate and cannot enter starting before old cleanup completes. Run_root is tmpfs: host reboot makes lost running instances dead, while paused E/S and sbx/snp templates survive and can Connect/Wake from persistent BaseDir/checkpoint.
 
 The same startup gate reconstructs Builder ownership under [Build recovery](node-build.md#6-persistence-recovery-and-retention) before allowing bootstrap/results. Builds remain subject to the shared reaper and failure-domain rules below.
 

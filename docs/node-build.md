@@ -357,6 +357,8 @@ The two intent columns migrate additively as INTEGER NOT NULL DEFAULT 0; existin
 
 Upgrade node/router/Registry writers together under the existing version coordination. Before reverting to a writer that does not understand intent, stop new cancellation/deletion acceptance and converge all pending operations using the current version. An additive schema alone does not make rollback safe while intent remains. No long-term dual writer, new task table or compatibility service is required. Published canonical img/sbx/snp references, existing Sandboxes, downstream fromTemplate and other Builds sharing an artifact remain usable after record deletion; remote content is never removed.
 
+Managed sandbox checkpoint cleanup does not run between Build phases. A phase may still read an earlier stage's S/E, so stage inputs and arbitrary FileSink outputs retain their existing owner. Terminal Build cleanup fences the exact runner and releases stage resources before the existing BuildBaseDir finalizer removes the owned checkpoint directory. Failure, cancellation and restart retain that finalizer's durable ownership; no shared publication ref is deleted.
+
 ### Checkpoint publication reports
 
 The builder invokes `sandbox-ctl publish --json --quiet` for a checkpoint S and

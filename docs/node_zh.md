@@ -1695,7 +1695,7 @@ route-applied barrier;失败在完成本地 cleanup 后以 exact owner CAS 收�
 并发布 Delete 撤销 route。
 
 Pause 的 `CommitRunningPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别只在
-Stop/Reset fence、Detach、RemoveAll 成功后 exact-clear；RunDir CAS 同时清除该目录拥有的 envd/ci
+Stop/Reset fence、Detach、checkpoint 选择性清理及 RemoveAll 成功后 exact-clear；RunDir CAS 同时清除该目录拥有的 envd/ci
 UDS path。任一步失败都保留尚未完成的字段供当前进程或 startup Reconcile 重试。fully-cleaned paused
 row 只保留 BaseDir/checkpoint 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
 并在 `paused -> starting` acceptance 中原子恢复 canonical RunDir/UDS。这样 paused BaseDir 永不被
@@ -1747,12 +1747,64 @@ CaptureSandbox:
 
 Pause 的顺序固定为 resolve request -> accepted operation -> runtime capture ->
 `CommitRunningPaused(id, exactRunID, ResumeSource)` -> stop/reset exact runner -> detach exact network ->
-RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
+selective checkpoint cleanup -> RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
 RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
-exact-CAS 清 network；任一步失败保留尚需重试的字段。RunDir 删除失败不允许新的 Resume/Wake/Exec
-取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 及其中
-checkpoint 始终保留。capture 失败保持 state=running、旧 source、runner 和 network 不变,不创建
+exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 或 RunDir 清理失败不允许新的 Resume/Wake/Exec
+取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败保持 state=running、旧 source、runner 和 network 不变,不创建
 成功 alias,也不从 S 降级为 E。
+
+##### 托管 checkpoint 历史合并与选择性清理
+
+`merge_ref=false` 独立记录本轮驻留工作集。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
+不可变历史 Snapshot `S1′ = S1(memory) 覆盖 S0(memory)`，再写出
+`S2(当前工作集) -> S1′`。后续本地捕获重复该组合，最新 S 下最多保留一个本沙箱拥有的本地
+内存 lower。`merge_ref=true` 将当前驻留内存与整个可合并本地前缀合并；false → true → false
+切换同样收敛。reader 仍支持旧的多层输入。恢复执行状态和 `sandbox_ref` 只来自最新 S，
+历史 S 只提供 memory。
+
+前缀必须属于当前沙箱的规范 `BaseDir/checkpoint`。先按完整来源绑定和 Bundle 实际成员选择
+物理载体，再比较路径。named location 或外部模板是边界，即使文件可在本机读取、甚至映射
+到同一路径也不能越界合并。该边界及其后的 lower refs 保持原顺序。local tarstream、Bundle
+和混合载体使用相同规则。可写磁盘链始终吸收同设备的连续本地前缀，不受内存开关影响；
+不可变 EROFS base 与 ext4 upper 保持分离。Data 和不透明 Zero 覆盖下层，Hole 向下穿透。
+历史读取走宿主制品 stream，不读 guest memfd，因此不会扩大本轮工作集。
+
+历史组合在 guest freeze 前准备并直接流入最终 sink，复用 `fetch.NewLayered` 和 sparse run，
+不缓存整镜像，也不生成多余整镜像中间副本。local 输出对 checkpoint 已拥有的复用依赖保留物理
+selector；Bundle 输出继续使用既有成员复制发布路径。历史合并生成新内容身份；sink commit/close 和数据库提交之前，
+旧来源始终有效。捕获或数据库提交失败都不能授权删除旧文件。
+
+托管 Pause 提交精确 S/E 对（或 E-only 根）后，生命周期 owner 先 fence 旧 runner 及全部
+读写使用者，再执行选择性清理。通用 FileSink、任意 `--output`、独立 `snapshot --resume`
+和共享 build 阶段输入都不因此取得清理权。sandboxer 制品库解释保留集合；conductor 只通过
+短生命周期 `node-ctl checkpoint-cleanup` 工具提供目录归属、路径、已提交的来源对及既有
+lifecycle fence。portable Export 继续只使用已存储的来源对，不读取制品。token、公开结果、
+base 格式和持久化 cleanup schema 均不改变。
+
+保留集合包含当前 S/E、历史内存载体、当前磁盘/upper/不可变 base 载体及复用文件。历史 S
+的旧 E 不是磁盘依赖。Bundle 任一成员仍被使用就保留整个物理载体。比较 basename 前先解析
+source/location 绑定。选择只读取有界的当前小型元数据与 Bundle 索引，不读取旧候选 payload，
+不计算整镜像摘要；此操作无需 Snapshot 的 CPU/state body。kernel/runtime 的
+basename identity 绑定宿主提供的启动文件，不是 checkpoint payload 依赖。keep plan 或 reader Close 出错时
+不删除任何文件。
+
+只处理已验证专属 checkpoint 的直接目录项：64 位小写十六进制 digest/key 加 `.snapshot`、
+`.sandbox`、`.overlay`、`.image`、`.bundle` 的成品必须是普通文件；捕获 partial 必须完整匹配
+`<producer-SandboxID>.<kind>.<uint32十进制>.partial`（包括 bundle，除 `0` 外不得有前导零）；
+固定 `<sid>.snapshot`/`<sid>.sandbox` 别名和 `.<sid>.<role>.<32位小写hex>.tmp` 必须是符合生产端
+basename target 约定的符号链接。SandboxID 不等于 PathID 或 StableID。未知名字、其他 SID、
+前缀碰撞、格式近似但非法的名字、目录和异常链接一律保留。未完成 partial 无需内容校验。
+固定别名只有指向对应当前 S/E root 的载体时才保留；即使 E 成员仍使用同一 Bundle，
+E-only 也会删除旧 S 别名。Snapshot 捕获只提交 S 别名，E 身份取自持久 S/E 对，不要求
+存在 E 别名。清理只 unlink 可识别别名本身，不跟随链接，不递归删除目录；dirfd 操作保证路径发生竞态时
+unlink 仍被限制在原目录内。
+
+新来源已提交后，即使清理失败，Pause 仍成功。最后一个持久 RunDir ownership 标记保留到
+checkpoint 清理和既有 paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前
+来源重试，重启后也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
+不会持锁等待需要同一锁完成的 export。Resume/Wake/Exec 遵守既有 pending-cleanup admission
+合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。普通 Kill 和 BuildBaseDir
+终态删除仍由原 finalizer 负责；此步骤不回收任何共享或外部制品。
 
 #### 8.1.2 Resume admission、Connect 与 Wake
 
@@ -2359,7 +2411,7 @@ conductor 在开放 API、config-socket routesync 和 node-link 前按配置 run
 - 无 running 行对应的 runner 单元属于上一个 pool 的 idle/orphan run-id ⇒
   `StopUnit` + `ResetFailedUnit`,随后由新 pool 按配置补足;
 - paused 行无论 RunID/port 是否已清空都重试完整 cleanup：Stop/Reset + inactive fence、Detach、
-  exact CAS 和 RunDir RemoveAll；source 与 BaseDir/checkpoint 不变。Resume/Wake/Exec 使用相同
+  exact CAS、checkpoint 选择性清理和 RunDir RemoveAll；source 与当前 checkpoint 依赖保留。Resume/Wake/Exec 使用相同
   admission gate，旧 ownership 未完成时不得进入 `starting`。`run_root` 为 tmpfs ⇒ 整机重启后失联 running
   判 dead;paused E/S 与 sbx/snp template 保留,可被 Connect/Wake 重新拉起(本机制品位于
   持久 `BaseDir/checkpoint`)。
