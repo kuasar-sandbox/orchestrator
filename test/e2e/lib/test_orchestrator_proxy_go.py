@@ -1,4 +1,4 @@
-"""Exercise the custom Proxy build's Go selection without running the E2E."""
+"""Exercise the custom Proxy build and prepared executable handoff without the E2E."""
 
 import os
 from pathlib import Path
@@ -234,6 +234,48 @@ class ArtifactJournalContract(unittest.TestCase):
                                          "REQUIRE_PROXY": "1", "GOROOT": "/missing-source-toolchain"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("e2e_journal_contract: OK", result.stdout)
+
+
+class PreparedCustomProxy(unittest.TestCase):
+    def test_prepared_bytes_are_installed_for_the_runtime_user(self):
+        entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
+        setup = entry.read_text().split("CUSTOM_PROXY_EXTENSION_E2E=0\n", 1)[1].split(
+            "declare -a PIDS=()", 1
+        )[0]
+        with tempfile.TemporaryDirectory(prefix="proxy-owner-") as temporary:
+            root = Path(temporary)
+            prepared = root / "prepared proxy"
+            contents = b"#!/bin/sh\nprintf 'prepared-proxy\\n'\n"
+            prepared.write_bytes(contents)
+            prepared.chmod(0o555)
+            # A root run reproduces hosted CI's unprivileged prepare -> sudo E2E.
+            if os.geteuid() == 0:
+                os.chown(prepared, 65534, 65534)
+            original = prepared.stat()
+            for artifact in ("0", "1"):
+                with self.subTest(artifact=artifact):
+                    work = root / ("work-" + artifact)
+                    work.mkdir(mode=0o700)
+                    result = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\nskip() { exit 1; }\n" + setup
+                         + '\n[ "$CUSTOM_PROXY_EXTENSION_E2E" = 1 ]\nprintf "%s\\n" "$CUSTOM_PROXY_BIN"'],
+                        env={**os.environ, "WORK": str(work), "CUSTOM_PROXY_BIN": str(prepared),
+                             "KUASAR_ARTIFACT_E2E": artifact},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    installed = Path(result.stdout.strip())
+                    self.assertEqual(installed.parent, work)
+                    self.assertEqual(installed.stat().st_uid, os.geteuid())
+                    self.assertEqual(installed.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(installed.read_bytes(), contents)
+                    self.assertEqual(prepared.read_bytes(), contents)
+                    self.assertEqual(subprocess.check_output([installed], text=True), "prepared-proxy\n")
+                    current = prepared.stat()
+                    self.assertEqual(
+                        (current.st_ino, current.st_uid, current.st_gid, current.st_mode, current.st_mtime_ns),
+                        (original.st_ino, original.st_uid, original.st_gid, original.st_mode, original.st_mtime_ns),
+                    )
 
 
 if __name__ == "__main__":

@@ -87,6 +87,9 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 CUSTOM_PROXY_EXTENSION_E2E=0
 if [ -n "${CUSTOM_PROXY_BIN:-}" ]; then
     [ -x "$CUSTOM_PROXY_BIN" ] || skip "CUSTOM_PROXY_BIN is not executable: $CUSTOM_PROXY_BIN"
+    # Keep prepared inputs intact; root dispatch requires a root-owned executable.
+    install -m 0700 "$CUSTOM_PROXY_BIN" "$WORK/custom-proxy"
+    CUSTOM_PROXY_BIN="$WORK/custom-proxy"
     CUSTOM_PROXY_EXTENSION_E2E=1
 else
     [ "${KUASAR_ARTIFACT_E2E:-0}" != 1 ] || skip "prepared CUSTOM_PROXY_BIN is required"
