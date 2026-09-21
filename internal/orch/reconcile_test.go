@@ -882,6 +882,13 @@ func TestReconcileRetriesBuildDirectoryCleanupAfterRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	checkpoint := filepath.Join(baseDir, "checkpoint", "phase.snapshot.123.partial")
+	if err := os.MkdirAll(filepath.Dir(checkpoint), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checkpoint, []byte("failed phase"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
@@ -911,6 +918,9 @@ func TestReconcileRetriesBuildDirectoryCleanupAfterRestart(t *testing.T) {
 		t.Fatalf("failed BuildBaseDir cleanup lost retry owner: %v", err)
 	}
 
+	if _, err := os.Stat(checkpoint); err != nil {
+		t.Fatal("failed cleanup lost Build checkpoint retry owner", err)
+	}
 	// A new controller has no process-local cleanup state. It must recover the
 	// exact directories from BuildID plus the configured roots.
 	restarted := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))

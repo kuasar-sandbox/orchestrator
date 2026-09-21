@@ -272,6 +272,13 @@ func TestBuildBaseDirFailureRetainsExecutionClaimUntilRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	checkpoint := filepath.Join(baseDir, "checkpoint", strings.Repeat("a", 64)+".snapshot")
+	if err := os.MkdirAll(filepath.Dir(checkpoint), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checkpoint, []byte("stage input survives until terminal cleanup"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	baseErr := errors.New("injected BuildBaseDir removal failure")
 	var calls atomic.Int32
 	o.removeBuildBaseDir = func(path string) error {
@@ -299,6 +306,9 @@ func TestBuildBaseDirFailureRetainsExecutionClaimUntilRetry(t *testing.T) {
 		t.Fatalf("failed BuildBaseDir cleanup lost retry owner: %v", err)
 	}
 
+	if _, err := os.Stat(checkpoint); err != nil {
+		t.Fatal("failed BuildBaseDir cleanup removed stage input", err)
+	}
 	_, retryErr := o.retryBuildCleanup(context.Background(), build, &buildCleanupPendingError{
 		cleanup: err, port: progress.port, persisted: progress.persisted,
 	})

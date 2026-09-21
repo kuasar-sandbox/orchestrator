@@ -75,6 +75,15 @@ func TestBuildActionRecoveryPrioritizesIntentAndAcceptedResult(t *testing.T) {
 						}
 					}
 				}
+				if phase != "terminal" {
+					checkpoint := filepath.Join(baseDir, "checkpoint", strings.Repeat("a", 64)+".bundle")
+					if err := os.MkdirAll(filepath.Dir(checkpoint), 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(checkpoint, []byte("retained stage input"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
 				unit := "sandbox-builder@br-372-recovery.service"
 				lc := &reconcileLauncher{}
 				if phase != "exited" && phase != "terminal" {

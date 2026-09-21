@@ -608,6 +608,9 @@ fi
 	if err := os.WriteFile(filepath.Join(dir, config.BinSandboxCtl), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "node-ctl"), []byte("#!/bin/sh\n[ \"$1\" = checkpoint-cleanup ] || exit 2\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CHECKPOINT_ARGS_FILE", argsPath)
 	t.Setenv("CHECKPOINT_FAIL", "")
