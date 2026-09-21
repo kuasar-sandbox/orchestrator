@@ -2928,8 +2928,23 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-e-read.out" \
     || { sed 's/^/  guest| /' "$WORK/bundle-e-read.out"; fail "retained Bundle Sandbox E lost disk state"; }
-code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
-wait_sandbox_state "$SID" missing 120 || fail "Bundle E delete finalizer retained durable row"
+# Re-capture after the retained-local Wake, then move through the real CLI.
+# Success accepts deletion; wait for the durable completion condition before
+# reusing this node-local ID for KMT import.
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "Bundle E pause before move=$code"; }
+E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --json \
+    --socket "$WORK/node-ctl.socket" >"$WORK/bundle-e-move.json" \
+    || fail "Bundle E move export failed"
+E_BUNDLE_TOKEN=$(json_field "$WORK/bundle-e-move.json" result)
+E_BUNDLE_REMOTE_REF=$(json_field "$WORK/bundle-e-move.json" sandboxRef)
+case "$E_BUNDLE_TOKEN" in kmt1.*) ;; *) fail "Bundle E move returned a non-KMT result" ;; esac
+wait_sandbox_state "$SID" missing 120 || fail "Bundle E move finalizer retained durable row"
+[ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Bundle E move retained RunDir"
+[ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Bundle E move retained BaseDir/checkpoint"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$E_BUNDLE_REMOTE_REF" >"$WORK/bundle-e-moved-remote.json" \
+    || fail "Bundle E move removed its published artifact"
 unset EXEC_TOKEN
 echo "==> KMT import of published Bundle E -> cold restore from the manifest Store"
 E_KMT_RUN_CALL=$(run_argv_count)
@@ -2955,6 +2970,25 @@ grep -q "$BUNDLE_PERSIST" "$WORK/bundle-e-kmt-read.out" \
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill imported Bundle E=$code"
 wait_sandbox_state "$SID" missing 120 || fail "imported Bundle E delete finalizer retained durable row"
 unset E_KMT_EXEC_TOKEN
+
+# Import leaves a portable paused source. Even an older local checkpoint under
+# its owned BaseDir must be removed by a later template move.
+PORTABLE_MOVE_SID=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" import-sandbox "$E_BUNDLE_TOKEN" \
+    --socket "$WORK/node-ctl.socket") || fail "portable move fixture import failed"
+[ "$PORTABLE_MOVE_SID" = "$SID" ] || fail "portable move import changed the node-local ID"
+mkdir -p "$CHECKPOINT_ROOT/$SID/checkpoint"
+printf '%s\n' 'isolated stale checkpoint fixture' >"$CHECKPOINT_ROOT/$SID/checkpoint/stale"
+E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --to-template --json \
+    --socket "$WORK/node-ctl.socket" >"$WORK/portable-e-move.json" \
+    || fail "portable E template move failed"
+[ "$(json_field "$WORK/portable-e-move.json" sandboxRef)" = "$E_BUNDLE_REMOTE_REF" ] \
+    || fail "portable E move changed the published root"
+wait_sandbox_state "$SID" missing 120 || fail "portable E move finalizer retained durable row"
+[ ! -e "$WORK/run/sandboxes/$SID" ] || fail "portable E move retained RunDir"
+[ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "portable E move retained stale BaseDir/checkpoint"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$E_BUNDLE_REMOTE_REF" >"$WORK/portable-e-moved-remote.json" \
+    || fail "portable E move removed shared published output"
 echo "==> PASS: Bundle drove self-contained S chain plus E capture, exact publish, retained-local Wake, and cold Store restore via KMT"
 
 echo

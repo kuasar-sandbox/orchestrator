@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 
@@ -107,10 +108,8 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	if artifact.Kind == types.ResumeSourceSnapshot {
 		report.SnapshotRef, report.SandboxRef = artifact.Ref, artifact.SandboxRef
 	}
-	localArtifactDir := ""
 	if !types.IsPortableRef(artifact.Ref) {
-		localArtifactDir, err = o.ownedLocalArtifactDir(source, artifact)
-		if err != nil {
+		if _, err := o.ownedLocalArtifactDir(source, artifact); err != nil {
 			return types.ExportResult{}, err
 		}
 		publish := o.promote
@@ -188,7 +187,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 
 	// Phase two has one short linearization point against Resume. Once this lock
 	// is held and BeginFinalize succeeds, Resume waits for the durable source
-	// mutation and local cleanup attempt to finish.
+	// mutation. Physical deletion belongs to the common asynchronous finalizer.
 	unlock := o.lifecycle.Lock(sid)
 	defer unlock()
 	if o.exports.State(attempt) == exportPreempted {
@@ -213,7 +212,8 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	// Request/lifecycle cancellation may abandon export before BeginFinalize,
 	// but it cannot split an already-won durable source commit. Preserve context
 	// values while finishing this bounded local critical section.
-	finalizeCtx := context.WithoutCancel(opCtx)
+	finalizeCtx, cancelFinalize := context.WithTimeout(context.WithoutCancel(opCtx), 30*time.Second)
+	defer cancelFinalize()
 	current, err := o.st.Get(finalizeCtx, sid)
 	if err != nil {
 		return types.ExportResult{}, err
@@ -237,35 +237,22 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		// resumed without the export (#336).
 		return response, nil
 	}
-	cleanupCtx, cancelCleanup := cleanupContext()
-	cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current, false)
-	cancelCleanup()
-	if cleanupErr != nil {
-		return types.ExportResult{}, fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
+	if err := o.validateSandboxCleanupPaths(current); err != nil {
+		return types.ExportResult{}, err
 	}
-	if err := o.st.Delete(finalizeCtx, sid); err != nil {
-		o.cache(current)
+	// Use the lock-held acceptance entry: the outer Delete path would wait on
+	// this export's own completion fence. Once deleting is durable, its worker
+	// owns all local cleanup and retries independently of the HTTP request.
+	if _, err := o.acceptSandboxDeleteLocked(finalizeCtx, current); err != nil {
 		return types.ExportResult{}, fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
-	}
-	o.runs.forget(current.RunID)
-	o.releaseDetachedPortFence(current.VswitchPort)
-	o.uncache(sid)
-	o.clearDeadlineIntent(sid)
-	o.publishDelete(sid)
-	o.observeSandboxDelete(current)
-	if localArtifactDir != "" {
-		if err := os.RemoveAll(localArtifactDir); err != nil {
-			o.log.Warn("export-sandbox: remove finalized local artifact", "sid", sid, "path", localArtifactDir, "err", err)
-		}
 	}
 	return response, nil
 }
 
-// ownedLocalArtifactDir returns the only directory ExportSandbox may publish
-// and recursively remove for a node-local pause artifact. The exact path is a
-// capture invariant, not a value trusted merely because it was persisted in a
-// row: malformed state must fail closed before sandbox-ctl reads it or cleanup
-// derives a broader deletion target from it.
+// ownedLocalArtifactDir returns the trusted publication directory for a
+// node-local pause artifact. The exact path is a capture invariant, not a value
+// trusted merely because it was persisted in a row: malformed state must fail
+// closed before sandbox-ctl reads it.
 func (o *Orchestrator) ownedLocalArtifactDir(sb *types.Sandbox, source types.ResumeSource) (string, error) {
 	if sb == nil || sb.ID == "" || sb.BaseDir == "" {
 		return "", fmt.Errorf("export-sandbox: local artifact owner is incomplete")

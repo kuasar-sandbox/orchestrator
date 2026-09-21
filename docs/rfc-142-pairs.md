@@ -1,6 +1,6 @@
 # RFC-142 paired checkpoint identity
 
-[中文](rfc-142-pairs_zh.md)
+[English](rfc-142-pairs.md) | [简体中文](rfc-142-pairs_zh.md)
 
 `ResumeSource` keeps `Kind` and `Ref`. A Snapshot additionally requires
 `SandboxRef`, the exact E selected by that S. An E-only source holds E in `Ref`
@@ -30,6 +30,14 @@ local S0/E0. Portable Export uses only the stored pair, even with inaccessible
 artifacts or storage; it performs no artifact reads or metadata subprocesses.
 Import authenticates and atomically inserts the complete pair without opening
 artifacts. Exact target expectations reject S1/E2 when they require S1/E1.
+
+Move Export returns after accepting source deletion durably, with cleanup owned
+by the normal retrying finalizer. Both local and portable sources lose their
+owned BaseDir/checkpoint eventually; shared published artifacts remain. A failed
+acceptance preserves paused S0/E0, while a later cleanup failure retains the
+`deleting` row and valid S1/E1 result. Same-ID Create/import conflicts until the
+row is finalized. See the [node lifecycle contract](node.md#81-artifact-capture-templates-and-migration)
+for cancellation, restart and observer ordering.
 
 Before upgrading, stop the old conductor and drain or retire managed sandboxes.
 Preserve needed records and artifacts, then have the operator explicitly clear

@@ -1,6 +1,6 @@
 # RFC-142 配对 checkpoint 身份
 
-[English](rfc-142-pairs.md)
+[English](rfc-142-pairs.md) | [简体中文](rfc-142-pairs_zh.md)
 
 `ResumeSource` 保留 `Kind` 和 `Ref`。Snapshot 还必须包含 `SandboxRef`，即 S 实际选择
 的 E。E-only source 将 E 存在 `Ref` 中，`SandboxRef` 为空。此对作为一个持久值参与
@@ -23,6 +23,12 @@ preparation 记录中冻结已受理的对，每次 replay 都比较完整对。
 发布在报告和 token 中返回最终 S1/E1；keep-source 保留本地 S0/E0。portable Export
 仅使用已保存的对，即使工件或存储不可访问也不读取工件、不启动元数据子进程。Import
 认证后原子插入完整对，不打开工件。目标精确要求 S1/E1 时，Expectations 拒绝 S1/E2。
+
+move Export 在源删除被持久接纳后返回，由正常的可重试 finalizer 负责清理。local 与
+portable 源拥有的 BaseDir/checkpoint 最终都会删除，共享发布工件保持不变。接纳失败
+保留 paused S0/E0；接纳后的清理失败保留 `deleting` 行与有效 S1/E1 结果。同 ID
+Create/import 在源行最终删除前继续冲突。取消、重启与 observer 时序见[节点生命周期
+契约](node_zh.md)。
 
 升级前停止旧 conductor，排空或退役其管理的 sandbox。保留需要的记录和工件，再由
 操作员明确清空旧本地数据库，使用匹配版本的 sandboxer 与 orchestrator 重新创建记录。

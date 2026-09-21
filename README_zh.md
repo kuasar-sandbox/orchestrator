@@ -58,6 +58,10 @@
 | `cluster-ctl placer` | 启动放置服务 |
 | `e2b-key-ctl ...` | 生成和派生租户凭据 |
 
+move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkpoint 的物理清理可能
+稍后完成。同 ID Create/import 在清理完成前仍冲突。`--keep-source` 保留原源。详见
+[节点文档](docs/node_zh.md)的 export/import 契约。
+
 仓库还构建 `node-stub-ctl`,用于模拟 node-link 参与方而不启动 microVM 的 E2E helper。
 
 ## Profiles

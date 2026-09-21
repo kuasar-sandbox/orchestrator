@@ -82,6 +82,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	}
 	assertMigrationCredentialsEqual(t, payloadCredentials(payload), sandboxCredentials(sb))
 
+	waitForExportDeletion(t, o, sid)
 	if s, _ := o.st.Get(ctx, sid); s != nil {
 		t.Fatal("move export should delete the source row")
 	}
@@ -1050,7 +1051,7 @@ func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
 	}
 }
 
-func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
+func TestExportMoveDeleteAcceptanceFailurePreservesSource(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
 	runtimePath := filepath.Join(dir, "rt-e2b.erofs")
@@ -1073,7 +1074,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_delete BEFORE DELETE ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END`)
+	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_begin_delete BEFORE UPDATE OF state ON sandboxes WHEN NEW.state='deleting' BEGIN SELECT RAISE(ABORT, 'forced delete acceptance failure'); END`)
 	events, cancel := o.Subscribe()
 	defer cancel()
 
@@ -1082,7 +1083,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 		t.Fatalf("move export returned the wrong token/error state: %v", err)
 	}
 	stored, getErr := o.st.Get(ctx, sid)
-	if getErr != nil || stored == nil || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
+	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
 		t.Fatalf("source row lost after failed delete: %v", getErr)
 	}
 	if cached := o.lookup(sid); cached == nil {

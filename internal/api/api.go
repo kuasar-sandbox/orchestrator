@@ -401,7 +401,8 @@ type Core interface {
 	// Sandbox export/import (orchestrator extension to the e2b surface). Export
 	// publishes a paused Sandbox E or Snapshot S as a same-kind reusable template
 	// (toTemplate) or an opaque kmt1 migration token; keepSource independently
-	// controls source finalization.
+	// controls source finalization. A move succeeds once deletion is durably
+	// accepted; physical cleanup may finish after the response.
 	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error)
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
 }
