@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SOURCE = (Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh").read_text()
+SOURCE = (Path(__file__).resolve().parents[3] / "scripts/ci-e2e-build.sh").read_text()
 
 
 def function(name):
@@ -22,7 +22,7 @@ def function(name):
 GO = function("e2e_go")
 BUILD_CUSTOM_PROXY = function("build_custom_proxy")
 SKIP = next(line for line in SOURCE.splitlines() if line.startswith("skip() {"))
-TELEMETRY = (Path(__file__).with_name("telemetry.sh")).read_text()
+TELEMETRY = SOURCE
 
 
 class OrchestratorProxyGoSelection(unittest.TestCase):
@@ -216,76 +216,24 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         self.assertEqual(self.log.read_text().splitlines()[0], "carried-go")
 
     def test_helper_is_wired_to_runtime_callers(self):
-        self.assertEqual(SOURCE.count("\n        build_custom_proxy\n"), 1)
-        self.assertIn("run_telemetry_guest_probe", SOURCE)
+        self.assertIn("fixtures) build_custom_proxy; build_telemetry_grpc", SOURCE)
+        self.assertIn("source) build_telemetry_netns", SOURCE)
         self.assertIn('"${KUASAR_E2E_GO:-${GOROOT:+$GOROOT/bin/}go}" "$@"', GO)
         self.assertNotIn("GOTOOLCHAIN=local", GO)
 
 
-class JournalGoRegressionAdmission(unittest.TestCase):
-    def run_entry(self, *, required="0", goroot=None, path_go=False, regression_exit=0):
-        with tempfile.TemporaryDirectory(prefix="journal-go-entry-") as temporary:
-            root = Path(temporary)
-            entry = root / "e2e_journal_contract.sh"
-            original = Path(__file__).resolve().parents[1] / entry.name
-            entry.write_text(original.read_text())
-            tools = root / "tools"
-            tools.mkdir()
-            log = root / "python.calls"
-            (tools / "dirname").symlink_to(shutil.which("dirname"))
-            python = tools / "python3"
-            python.write_text(
-                "#!/bin/sh\n"
-                'printf \'%s\\n\' "$*" >> "$CALL_LOG"\n'
-                'case "$*" in *test_orchestrator_proxy_go.py*) exit "$REGRESSION_EXIT";; esac\n'
-                "exit 0\n"
-            )
-            python.chmod(0o755)
-            if path_go:
-                go = tools / "go"
-                go.write_text("#!/bin/sh\nexit 1\n")
-                go.chmod(0o755)
-            env = {**os.environ, "PATH": str(tools), "REQUIRE_PROXY": required,
-                   "CALL_LOG": str(log), "REGRESSION_EXIT": str(regression_exit)}
-            if goroot is None:
-                env.pop("GOROOT", None)
-            else:
-                env["GOROOT"] = goroot
-            result = subprocess.run(["/bin/bash", str(entry)], env=env,
-                                    text=True, capture_output=True, timeout=5)
-            calls = log.read_text() if log.exists() else ""
-            return result, calls
-
-    def test_optional_no_go_preserves_native_journal_fallback(self):
-        for goroot in (None, ""):
-            with self.subTest(goroot=goroot):
-                result, calls = self.run_entry(goroot=goroot, regression_exit=43)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("test_journal_identity.py", calls)
-                self.assertNotIn("test_orchestrator_proxy_go.py", calls)
-                self.assertIn("native identity checks remain", result.stdout)
-                self.assertIn("e2e_journal_contract: OK", result.stdout)
-
-    def test_required_no_go_still_executes_and_fails_regression(self):
-        result, calls = self.run_entry(required="1", regression_exit=43)
-        self.assertEqual(result.returncode, 43, result.stderr)
-        self.assertIn("test_orchestrator_proxy_go.py", calls)
-        self.assertNotIn("e2e_journal_contract: OK", result.stdout)
-
-    def test_explicit_distribution_never_bypasses_regression(self):
-        for path_go in (False, True):
-            with self.subTest(path_go=path_go):
-                result, calls = self.run_entry(goroot="/invalid/explicit-goroot",
-                    path_go=path_go, regression_exit=43)
-                self.assertEqual(result.returncode, 43, result.stderr)
-                self.assertIn("test_orchestrator_proxy_go.py", calls)
-                self.assertNotIn("e2e_journal_contract: OK", result.stdout)
-
-    def test_optional_path_go_executes_regression(self):
-        result, calls = self.run_entry(path_go=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("test_orchestrator_proxy_go.py", calls)
-        self.assertIn("e2e_journal_contract: OK", result.stdout)
+class ArtifactJournalContract(unittest.TestCase):
+    def test_required_binary_journal_does_not_invoke_go(self):
+        entry = Path(__file__).resolve().parents[1] / "e2e_journal_contract.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            tools = Path(temporary)
+            (tools / "go").write_text("#!/bin/sh\nexit 97\n")
+            (tools / "go").chmod(0o755)
+            result = subprocess.run(["bash", str(entry)], text=True, capture_output=True,
+                                    env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                         "REQUIRE_PROXY": "1", "GOROOT": "/missing-source-toolchain"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("e2e_journal_contract: OK", result.stdout)
 
 
 if __name__ == "__main__":

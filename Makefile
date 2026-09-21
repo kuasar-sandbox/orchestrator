@@ -8,7 +8,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
-	        test vet bench test-e2e test-e2e-cluster-stub release test-release clean help
+	        test vet bench e2e-fixtures test-e2e test-e2e-cluster-stub release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -100,8 +100,14 @@ clean:
 # Orchestrator owns both its self-contained cluster stub and the full node,
 # proxy, builder, and cluster integration cases. The latter use the assembled
 # platform binary set supplied by Integration E2E.
-test-e2e:
-	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" bash test/e2e/run_all.sh
+e2e-fixtures:
+	bash scripts/ci-e2e-build.sh fixtures "$(TARGET_ARCH)" "$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)"
+
+test-e2e: e2e-fixtures
+	bash scripts/ci-source-checks.sh
+	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" \
+		CUSTOM_PROXY_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/custom-proxy" \
+		TELEMETRY_GRPC_PROBE_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/telemetry-grpc-probe" bash test/e2e/run_all.sh
 
 test-e2e-cluster-stub:
 	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
