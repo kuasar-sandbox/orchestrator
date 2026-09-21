@@ -1,25 +1,22 @@
 name: Reconcile Latest
 run-name: Reconcile main Stable Latest
-
-on:
+'on':
   workflow_run:
     workflows:
-      - "Component Release"
-    types: [completed]
+      - Component Release
+    types:
+      - completed
   schedule:
-    - cron: "41 1 * * *"
-  workflow_dispatch:
-
+    - cron: 41 1 * * *
+  workflow_dispatch: null
 permissions:
   contents: read
-
 concurrency:
   group: component-latest-reconciliation-${{ github.repository }}
   cancel-in-progress: false
-
 jobs:
   reconcile:
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -37,21 +34,19 @@ jobs:
             [ "$TRIGGER_REPOSITORY" = "$GITHUB_REPOSITORY" ]
             [ "$TRIGGER_BRANCH" = main ]
           fi
-
       - name: Check out trusted reconciliation tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: main
           persist-credentials: false
-
       - name: Check environment GitHub CLI
         run: |
           gh --version
           gh_help="$(gh api --help)"
           [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
-
       - name: Reconcile source-ordered main Stable Latest
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: bash scripts/publish-release.sh reconcile
+    if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository

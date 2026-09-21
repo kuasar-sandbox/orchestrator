@@ -1,7 +1,6 @@
 name: Component Release
 run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}]
-
-on:
+'on':
   workflow_dispatch:
     inputs:
       version:
@@ -36,17 +35,14 @@ on:
         description: Platform commit selecting aggregate_version; required for a Preview
         required: false
         type: string
-
 permissions:
   contents: read
-
 concurrency:
   group: component-mutation-${{ github.repository }}-${{ inputs.version }}
   cancel-in-progress: false
-
 jobs:
   preflight:
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
@@ -57,24 +53,39 @@ jobs:
       source_ref: ${{ steps.request.outputs.source_ref }}
       source_sha: ${{ steps.request.outputs.source_sha }}
       version: ${{ steps.request.outputs.version }}
+      framework_sha: ${{ steps.framework.outputs.sha }}
+      accelerator_sha: ${{ steps.dependencies.outputs.accelerator_sha }}
+      connector_sha: ${{ steps.dependencies.outputs.connector_sha }}
+      sandboxer_sha: ${{ steps.dependencies.outputs.sandboxer_sha }}
     steps:
       - name: Require trusted release controller
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] \
             || { echo "Component Release must run from main" >&2; exit 1; }
-
       - name: Check out trusted release tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-
+      - name: Check out trusted platform tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: main
+          path: trusted/platform
+          persist-credentials: false
+      - name: Bootstrap standard runner
+        run: |
+          bash trusted/platform/ci/hosted/bootstrap.sh --profile release-control
+      - name: Record exact framework revision
+        id: framework
+        run: |
+          echo "sha=$(git -C trusted/platform rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Check environment GitHub CLI
         run: |
           gh --version
           gh_help="$(gh api --help)"
           [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
-
       - name: Validate release request
         id: request
         env:
@@ -87,7 +98,7 @@ jobs:
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
           VERSION: ${{ inputs.version }}
-          TARGET_ARCH: x86_64
+          TARGET_ARCH: all
         run: |
           set -euo pipefail
           [[ "$ACCELERATOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
@@ -109,39 +120,67 @@ jobs:
             echo "source_sha=$SOURCE_SHA"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
-
+      - name: Resolve exact public dependency releases
+        id: dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCELERATOR_VERSION: ${{ steps.request.outputs.accelerator_version }}
+          CONNECTOR_VERSION: ${{ steps.request.outputs.connector_version }}
+          SANDBOXER_VERSION: ${{ steps.request.outputs.sandboxer_version }}
+        run: |
+          set -euo pipefail
+          repository=kuasar-sandbox/accelerator
+          version=$ACCELERATOR_VERSION
+          gh api "repos/$repository" --jq 'select(.visibility == "public" and .private == false) | .full_name' | grep -Fx "$repository"
+          sha=$(gh api "repos/$repository/git/ref/tags/$version" --jq 'select(.object.type == "commit") | .object.sha')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          release=$(gh api "repos/$repository/releases/tags/$version")
+          jq -e --arg tag "$version" --arg sha "$sha" '.tag_name == $tag and .target_commitish == $sha and .draft == false' <<< "$release" >/dev/null
+          echo "accelerator_sha=$sha" >> "$GITHUB_OUTPUT"
+          repository=kuasar-sandbox/connector
+          version=$CONNECTOR_VERSION
+          gh api "repos/$repository" --jq 'select(.visibility == "public" and .private == false) | .full_name' | grep -Fx "$repository"
+          sha=$(gh api "repos/$repository/git/ref/tags/$version" --jq 'select(.object.type == "commit") | .object.sha')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          release=$(gh api "repos/$repository/releases/tags/$version")
+          jq -e --arg tag "$version" --arg sha "$sha" '.tag_name == $tag and .target_commitish == $sha and .draft == false' <<< "$release" >/dev/null
+          echo "connector_sha=$sha" >> "$GITHUB_OUTPUT"
+          repository=kuasar-sandbox/sandboxer
+          version=$SANDBOXER_VERSION
+          gh api "repos/$repository" --jq 'select(.visibility == "public" and .private == false) | .full_name' | grep -Fx "$repository"
+          sha=$(gh api "repos/$repository/git/ref/tags/$version" --jq 'select(.object.type == "commit") | .object.sha')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          release=$(gh api "repos/$repository/releases/tags/$version")
+          jq -e --arg tag "$version" --arg sha "$sha" '.tag_name == $tag and .target_commitish == $sha and .draft == false' <<< "$release" >/dev/null
+          echo "sandboxer_sha=$sha" >> "$GITHUB_OUTPUT"
+    if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
   build:
     needs: preflight
-    runs-on:
-      - self-hosted
-      - Linux
-      - X64
-      - kuasar-e2e
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     permissions:
       contents: read
     env:
-      TARGET_ARCH: x86_64
-      GOPROXY: https://goproxy.cn,direct
-      GOSUMDB: sum.golang.google.cn
+      TARGET_ARCH: ${{ matrix.arch }}
       ACCELERATOR_VERSION: ${{ needs.preflight.outputs.accelerator_version }}
       CONNECTOR_VERSION: ${{ needs.preflight.outputs.connector_version }}
       SANDBOXER_VERSION: ${{ needs.preflight.outputs.sandboxer_version }}
     steps:
-      - name: Create read-only source token
-        id: source-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - name: Check out trusted platform tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          client-id: ${{ vars.KUASAR_CI_APP_CLIENT_ID }}
-          private-key: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
-          owner: kuasar-sandbox
-          repositories: accelerator,connector,orchestrator,sandboxer
-          permission-contents: read
-          skip-token-revoke: true
-
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: ${{ needs.preflight.outputs.framework_sha }}
+          path: trusted/platform
+          persist-credentials: false
+      - name: Bootstrap native or cross build
+        run: |
+          profile=artifact-build
+          if [ "$TARGET_ARCH" = aarch64 ]; then profile=artifact-cross; fi
+          bash trusted/platform/ci/hosted/bootstrap.sh --profile "$profile"
       - name: Verify dependency releases
         env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           for dependency in \
@@ -163,125 +202,86 @@ jobs:
               '.tag_name == $version and .draft == false and .prerelease == $prerelease' \
               "$repository-release.json" >/dev/null
           done
-
       - name: Check out exact orchestrator source
         id: checkout-orchestrator
         continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/orchestrator
           ref: ${{ needs.preflight.outputs.source_sha }}
           path: src/orchestrator
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Retry exact orchestrator source checkout
         if: steps.checkout-orchestrator.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/orchestrator
           ref: ${{ needs.preflight.outputs.source_sha }}
           path: src/orchestrator
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Check out accelerator dependency
         id: checkout-accelerator
         continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/accelerator
-          ref: ${{ needs.preflight.outputs.accelerator_version }}
+          ref: ${{ needs.preflight.outputs.accelerator_sha }}
           path: src/accelerator
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Retry accelerator dependency checkout
         if: steps.checkout-accelerator.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/accelerator
-          ref: ${{ needs.preflight.outputs.accelerator_version }}
+          ref: ${{ needs.preflight.outputs.accelerator_sha }}
           path: src/accelerator
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Check out connector dependency
         id: checkout-connector
         continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/connector
-          ref: ${{ needs.preflight.outputs.connector_version }}
+          ref: ${{ needs.preflight.outputs.connector_sha }}
           path: src/connector
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Retry connector dependency checkout
         if: steps.checkout-connector.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/connector
-          ref: ${{ needs.preflight.outputs.connector_version }}
+          ref: ${{ needs.preflight.outputs.connector_sha }}
           path: src/connector
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Check out sandboxer dependency
         id: checkout-sandboxer
         continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/sandboxer
-          ref: ${{ needs.preflight.outputs.sandboxer_version }}
+          ref: ${{ needs.preflight.outputs.sandboxer_sha }}
           path: src/sandboxer
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
       - name: Retry sandboxer dependency checkout
         if: steps.checkout-sandboxer.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kuasar-sandbox/sandboxer
-          ref: ${{ needs.preflight.outputs.sandboxer_version }}
+          ref: ${{ needs.preflight.outputs.sandboxer_sha }}
           path: src/sandboxer
-          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
-
-      - name: Revoke source token before code execution
-        if: ${{ always() && steps.source-token.outputs.token != '' }}
-        env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          status=$(curl --show-error --silent \
-            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
-            --request DELETE \
-            --output /dev/null \
-            --write-out '%{http_code}' \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/installation/token)
-          case "$status" in
-            204|401) ;;
-            *) echo "failed to revoke source token: HTTP $status" >&2; exit 1 ;;
-          esac
-
       - name: Assemble source workspace
         run: |
           set -euo pipefail
           rm -f go.work go.work.sum
           go work init ./src/accelerator ./src/connector ./src/orchestrator ./src/sandboxer
-
       - name: Build and test orchestrator
         working-directory: src/orchestrator
         run: |
+          taskset -pc "$KUASAR_BUILD_CPUS" "$$" >/dev/null
           set -euo pipefail
-          make test
-          make vet
+          if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
           make build
-
       - name: Package the component release
         working-directory: src/orchestrator
         env:
@@ -292,41 +292,65 @@ jobs:
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
           bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
-
       - name: Upload validated release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: orchestrator-release-${{ needs.preflight.outputs.version }}-${{ github.run_id }}
+          name: component-release-${{ needs.preflight.outputs.version }}-${{ matrix.arch }}-${{ github.run_id }}
           path: src/orchestrator/release-bundle
           if-no-files-found: error
           retention-days: 1
-
+    if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
   publish:
     needs:
       - preflight
       - build
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: write
     steps:
       - name: Check out trusted publish tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-
+      - name: Check out trusted platform tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: ${{ needs.preflight.outputs.framework_sha }}
+          path: trusted/platform
+          persist-credentials: false
+      - name: Bootstrap standard runner
+        run: |
+          bash trusted/platform/ci/hosted/bootstrap.sh --profile release-control
       - name: Check environment GitHub CLI
         run: |
           gh --version
           gh_help="$(gh api --help)"
           [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
-
-      - name: Download validated release bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Download validated x86_64 bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: orchestrator-release-${{ needs.preflight.outputs.version }}-${{ github.run_id }}
-          path: release-bundle
-
+          name: component-release-${{ needs.preflight.outputs.version }}-x86_64-${{ github.run_id }}
+          path: staged/x86_64
+      - name: Download validated aarch64 bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: component-release-${{ needs.preflight.outputs.version }}-aarch64-${{ github.run_id }}
+          path: staged/aarch64
+      - name: Assemble the two validated architecture archives
+        env:
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: |
+          bash scripts/publish-release.sh assemble "$VERSION" staged/x86_64 staged/aarch64 release-bundle
       - name: Publish orchestrator release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -336,33 +360,33 @@ jobs:
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
           RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}
-          TARGET_ARCH: x86_64
+          TARGET_ARCH: all
         run: |
           set -euo pipefail
           bash scripts/validate-preview-line.sh \
             orchestrator "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh publish \
             "$VERSION" "$TARGET_ARCH" "$SOURCE_SHA" release-bundle "$SOURCE_REF"
-
+    if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
   cleanup:
-    needs: publish
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    needs:
+      - preflight
+      - publish
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       actions: write
       contents: read
     steps:
       - name: Check out trusted cleanup tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-
       - name: Check environment GitHub CLI
         run: |
           gh --version
           gh_help="$(gh api --help)"
           [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
-
       - name: Delete release workflow artifacts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -382,3 +406,4 @@ jobs:
               --silent
           done
           echo "deleted ${#artifact_ids[@]} release workflow artifact(s)"
+    if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository

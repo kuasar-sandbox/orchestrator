@@ -15,11 +15,55 @@ fail() {
 release_cli() {
   local command="$1"
   shift
+  if [ "${2:-}" = all ]; then
+    local tag=$1 arch bundle=${3:-} name view expected actual
+    case "$command" in
+      archive-name)
+        for arch in x86_64 aarch64; do release_cli archive-name "$tag" "$arch"; done
+        return ;;
+      validate)
+        expected=$(printf '%s\n' SHA256SUMS "$(release_cli archive-name "$tag" all)" | LC_ALL=C sort)
+        actual=$(find "$bundle/assets" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+        [ "$actual" = "$expected" ] || fail 'dual bundle must contain exactly both archives and SHA256SUMS'
+        [ "$(grep -cve '^[[:space:]]*$' "$bundle/assets/SHA256SUMS")" = 2 ] || fail 'dual checksum set must contain exactly two entries'
+        for arch in x86_64 aarch64; do
+          name=$(release_cli archive-name "$tag" "$arch")
+          view=$(mktemp -d "$TMP/validate-$arch.XXXXXX")
+          mkdir "$view/assets"
+          cp "$bundle/assets/$name" "$view/assets/$name"
+          cp "$bundle/release-notes.md" "$view/release-notes.md"
+          awk -v name="$name" '$2 == name || $2 == "*" name {print}' "$bundle/assets/SHA256SUMS" > "$view/assets/SHA256SUMS"
+          # Each existing target validator keeps its source/material/license,
+          # path/type/mode, Go/ELF and embedded-runtime identity checks.
+          release_cli validate "$tag" "$arch" "$view"
+        done
+        return ;;
+      *) fail 'all architectures are valid only for names/validation' ;;
+    esac
+  fi
   if [ -n "${RELEASE_KIND:-}" ]; then
     "$SCRIPT_DIR/release.sh" "$command" "$RELEASE_KIND" "$@"
   else
     "$SCRIPT_DIR/release.sh" "$command" "$@"
   fi
+}
+
+assemble_architectures() {
+  [ "$#" = 4 ] || fail 'usage: publish-release.sh assemble <tag> <x86-bundle> <arm-bundle> <output>'
+  local tag=$1 x86=$2 arm=$3 output=$4 arch directory name
+  [ -n "$output" ] && [ ! -e "$output" ] || fail 'dual output must be fresh'
+  mkdir -p "$output/assets"
+  for arch in x86_64 aarch64; do
+    directory=$x86
+    [ "$arch" != aarch64 ] || directory=$arm
+    release_cli validate "$tag" "$arch" "$directory"
+    name=$(release_cli archive-name "$tag" "$arch")
+    cp "$directory/assets/$name" "$output/assets/$name"
+  done
+  cp "$x86/release-notes.md" "$output/release-notes.md"
+  printf '\nArchitectures: x86_64 and aarch64 (ARM cross-build; native validation scope is declared by the aggregate).\n' >> "$output/release-notes.md"
+  (cd "$output/assets" && sha256sum ./*.tar.gz | sed 's@  ./@  @') > "$output/assets/SHA256SUMS"
+  release_cli validate "$tag" all "$output"
 }
 
 api_optional() {
@@ -273,6 +317,7 @@ publish_bundle() {
 command -v gh >/dev/null || fail "gh is required"
 command -v jq >/dev/null || fail "jq is required"
 case "${1:-}" in
+  assemble) shift; assemble_architectures "$@" ;;
   check) shift; check_release "$@" ;;
   publish) shift; publish_bundle "$@" ;;
   reconcile)
@@ -280,5 +325,5 @@ case "${1:-}" in
     [ "$#" -eq 0 ] || fail "usage: publish-release.sh reconcile"
     reconcile_main_latest
     ;;
-  *) fail "usage: publish-release.sh <check|publish|reconcile> ..." ;;
+  *) fail "usage: publish-release.sh <assemble|check|publish|reconcile> ..." ;;
 esac
