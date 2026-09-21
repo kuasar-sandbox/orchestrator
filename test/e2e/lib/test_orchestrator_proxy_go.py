@@ -1,10 +1,12 @@
 """Exercise the custom Proxy build and prepared executable handoff without the E2E."""
 
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -237,6 +239,18 @@ class ArtifactJournalContract(unittest.TestCase):
 
 
 class PreparedCustomProxy(unittest.TestCase):
+    def test_missing_grpc_probe_is_rejected_before_heavy_prerequisites(self):
+        entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
+        source = entry.read_text()
+        preflight = source[source.index("skip() {"):source.index("for b in node-ctl ")]
+        env = {**os.environ, "REQUIRE_PROXY": "1"}
+        env.pop("TELEMETRY_GRPC_PROBE_BIN", None)
+        result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + preflight],
+                                env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("TELEMETRY_GRPC_PROBE_BIN", result.stdout)
+        self.assertIn("e2e-fixtures", result.stdout)
+
     def test_prepared_bytes_are_installed_for_the_runtime_user(self):
         entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
         setup = entry.read_text().split("CUSTOM_PROXY_EXTENSION_E2E=0\n", 1)[1].split(
@@ -276,6 +290,64 @@ class PreparedCustomProxy(unittest.TestCase):
                         (current.st_ino, current.st_uid, current.st_gid, current.st_mode, current.st_mtime_ns),
                         (original.st_ino, original.st_uid, original.st_gid, original.st_mode, original.st_mtime_ns),
                     )
+
+
+class TelemetrySourceExecution(unittest.TestCase):
+    def run_probe(self, host, uid, status=0):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "scripts/ci-source-checks.sh").read_text()
+        start = source.index("bash scripts/ci-e2e-build.sh source ")
+        commands = source[start:source.index("\nTELEMETRY_SOURCE_ROOT=", start)]
+        with tempfile.TemporaryDirectory(prefix="source-netns-") as temporary:
+            work = Path(temporary)
+            tools = work / "tools"
+            tools.mkdir()
+            for name, value in (("uname", host), ("id", uid)):
+                path = tools / name
+                path.write_text("#!/bin/sh\nprintf '%s\\n' " + value + "\n")
+                path.chmod(0o755)
+            sudo_log = work / "sudo.log"
+            sudo = tools / "sudo"
+            sudo.write_text(
+                "#!" + sys.executable + "\nimport os, sys\nfrom pathlib import Path\n"
+                + f"Path({str(sudo_log)!r}).write_text('called')\n"
+                + ("sys.exit(127)\n" if uid == "0" else
+                   "assert sys.argv[1] == '-n'\nos.execvp(sys.argv[2], sys.argv[2:])\n")
+            )
+            sudo.chmod(0o755)
+            go = tools / "go"
+            go.write_text(
+                "#!" + sys.executable + "\nimport json, os, sys\nfrom pathlib import Path\n"
+                "assert sys.argv[1:3] == ['test', '-c']\n"
+                "output = Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                + f"probe = '#!{sys.executable}\\nimport json, os, sys\\n'\n"
+                "probe += 'print(json.dumps({\"goarch\": ' + repr(os.environ['GOARCH'])"
+                " + ', \"required\": os.environ.get(\"REQUIRE_TELEMETRY_NETNS\"), \"args\": sys.argv[1:]}))\\n'\n"
+                + f"probe += 'sys.exit({status})\\n'\n"
+                "output.write_text(probe)\noutput.chmod(0o755)\n"
+            )
+            go.chmod(0o755)
+            result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + commands],
+                cwd=root, env={**os.environ, "work": str(work), "KUASAR_E2E_GO": str(go),
+                               "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+                text=True, capture_output=True, timeout=5)
+            return result, sudo_log.exists()
+
+    def test_probe_uses_native_architecture_and_only_needed_sudo(self):
+        for host, arch in (("x86_64", "amd64"), ("aarch64", "arm64")):
+            for uid in ("0", "1001"):
+                with self.subTest(host=host, uid=uid):
+                    result, used_sudo = self.run_probe(host, uid)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(used_sudo, uid != "0")
+                    self.assertEqual(json.loads(result.stdout), {
+                        "goarch": arch, "required": "1",
+                        "args": ["-test.v", "-test.timeout=90s", "-test.run=^TestOTLPProxyNetNS"],
+                    })
+
+    def test_required_probe_failure_propagates(self):
+        result, _ = self.run_probe("x86_64", "1001", 73)
+        self.assertEqual(result.returncode, 73, result.stderr)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,8 @@ PROXY_WORKERS=2
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+[ -x "${TELEMETRY_GRPC_PROBE_BIN:-}" ] \
+    || skip "prepared TELEMETRY_GRPC_PROBE_BIN is required (run make e2e-fixtures and set the probe path; see docs/node.md Tests)"
 
 for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
