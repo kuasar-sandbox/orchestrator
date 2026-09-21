@@ -102,7 +102,8 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 		APISecret:    apiSecret,
 		ManifestKey:  manifestKey,
 		ResumeSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: localRef},
-		RunDir:       nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sid),
+		// Initial source is already fully paused; runtime ownership was released.
+		RunDir:       "",
 		BaseDir:      nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sid),
 		CreatedUnix:  1,
 		DeadlineUnix: time.Now().Add(time.Hour).Unix(),
@@ -295,6 +296,11 @@ func TestAcceptedResumePreemptsExportBeforeAsyncSnapshotFailure(t *testing.T) {
 
 func TestTemplateExportDeletesUnkeptSource(t *testing.T) {
 	fixture := newExportResumeFixture(t)
+	fixture.sb.RunDir = nodepath.SandboxRunDir(fixture.o.cfg.Paths.RunRoot, fixture.sb.ID)
+	if err := fixture.o.st.Put(fixture.ctx, fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	fixture.o.cache(fixture.sb)
 	if err := os.MkdirAll(fixture.sb.RunDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -468,6 +474,11 @@ func TestExportKeepSourcePreservesLocalResumeSource(t *testing.T) {
 // drop deletes the durable row and removes the retained local checkpoint.
 func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
 	fixture := newExportResumeFixture(t)
+	fixture.sb.RunDir = nodepath.SandboxRunDir(fixture.o.cfg.Paths.RunRoot, fixture.sb.ID)
+	if err := fixture.o.st.Put(fixture.ctx, fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	fixture.o.cache(fixture.sb)
 	if err := os.MkdirAll(fixture.sb.RunDir, 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -2263,9 +2263,9 @@ print(relative)
 PY
 ) || fail "local B/W graph validation failed"
 B_ROOT_TOP_PATH="$CHECKPOINT_ROOT/$SID/checkpoint/$B_ROOT_TOP_BASENAME"
-[ -f "$B_ROOT_TOP_PATH" ] || fail "B root disk top is missing before minimal-set test: $B_ROOT_TOP_PATH"
-rm -f -- "$B_ROOT_TOP_PATH"
-echo "==> PASS: W -> local B is separate; B root disk top was merged and removed"
+wait_paused_cleanup "$SID" || fail "W checkpoint cleanup did not finish"
+[ ! -e "$B_ROOT_TOP_PATH" ] || fail "unused B root disk top remains after managed checkpoint cleanup: $B_ROOT_TOP_PATH"
+echo "==> PASS: W -> local B is separate; managed cleanup retired B's merged disk top"
 
 W_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$W_PORTABLE_LOCAL") || fail "invalid W capture pair"
 W_RUNTIME_REF=$(checkpoint_runtime_ref "$W_LOCAL_PAIR" "$CHECKPOINT_ROOT/$SID/checkpoint")
@@ -2528,6 +2528,69 @@ if "kuasar-sandbox.checkpoint" in (info.get("Metadata") or {}):
     raise SystemExit("host-only checkpoint policy leaked into snapshot.cfg metadata")
 PY
 echo "==> PASS: Pause header null inherited body, explicit false flags reached local capture, W self remains separate from its memory lower"
+
+# Reuse this managed sandbox to exercise repeated working-set capture and
+# false -> true -> false, restoring only after old files have disappeared.
+CHECKPOINT_DIR="$CHECKPOINT_ROOT/$SID/checkpoint"
+python3 - "$CHECKPOINT_DIR" "$SID" <<'PY_PROTECT'
+import os, sys
+root, sid = sys.argv[1:]
+for name in ("user.snapshot", "user.tmp", sid+"2.snapshot.12.partial", sid+".snapshot.01.partial"):
+    open(os.path.join(root, name), "w").write("protected fixture")
+os.mkdir(os.path.join(root, "unfamiliar"))
+os.symlink("../outside-user-file", os.path.join(root, "f"*64+".image"))
+PY_PROTECT
+for merge in false false false true false; do
+    previous_pair=$(checkpoint_pair "$SID" snapshot "$CHECKPOINT_DIR/$SID.snapshot") || fail "invalid previous history S/E pair"
+    code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
+    [ "$code" = 200 ] || fail "history restore=$code"
+    wait_sandbox_state "$SID" running 1200 || fail "history restore did not reach running"
+    python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+        "grep -qx $POLICY_PERSIST /home/user/policy-persist.txt; echo history-$merge >> /home/user/history-rounds" \
+        >"$WORK/history-restore.out" 2>&1 || true
+    grep -q 'EXIT_CODE 0' "$WORK/history-restore.out" || fail "restored checkpoint lost disk state"
+    # Both interrupted partials and complete failed-attempt garbage are found
+    # by enumeration, without needing successful response bookkeeping.
+    printf incomplete >"$CHECKPOINT_DIR/$SID.snapshot.4294967295.partial"
+    printf garbage >"$CHECKPOINT_DIR/$(printf '%064d' 8).snapshot"
+    code=$(req POST "/sandboxes/$SID/pause" "$AK" \
+        "{\"memory\":true,\"checkpoint_merge_ref\":$merge,\"checkpoint_drop_caches\":false}")
+    [ "$code" = 204 ] || fail "history capture=$code"
+    wait_paused_cleanup "$SID" || fail "history checkpoint cleanup did not finish"
+    "$BIN/sandbox-ctl" info --json "$CHECKPOINT_DIR/$SID.snapshot" >"$WORK/history-current.json"
+    current_pair=$(checkpoint_pair "$SID" snapshot "$CHECKPOINT_DIR/$SID.snapshot") || fail "invalid current history S/E pair"
+    python3 - "$WORK/history-current.json" "$WORK/w-policy.json" "$merge" "$CHECKPOINT_DIR" "$SID" "$previous_pair" "$current_pair" <<'PY_HISTORY'
+import json, os, sys
+current, original = (json.load(open(path)) for path in sys.argv[1:3])
+refs, external = current.get("FromRefs") or [], original.get("FromRefs") or []
+count = 0 if sys.argv[3] == "true" else 1
+if len(refs) != count+len(external) or refs[count:] != external:
+    raise SystemExit(f"unbounded/local boundary changed: {refs!r}, suffix={external!r}")
+root, sid, before, after = sys.argv[4:]
+# checkpoint_pair validated actual stored S/E identities and both physical files
+# while each source was current. Snapshot capture creates only the S alias.
+old_e, current_e = (json.loads(pair)[3] for pair in (before, after))
+def checkpoint_path(ref):
+    return os.path.join(root, ref.removeprefix("file://").split("@", 1)[0])
+old_path, current_path = checkpoint_path(old_e), checkpoint_path(current_e)
+if old_path != current_path and os.path.lexists(old_path):
+    raise SystemExit(f"unused previous E remains after source commit: {old_e!r}")
+for name in ("user.snapshot", "user.tmp", sid+"2.snapshot.12.partial", sid+".snapshot.01.partial", "unfamiliar", "f"*64+".image"):
+    if not os.path.lexists(os.path.join(root, name)):
+        raise SystemExit(f"protected entry deleted: {name}")
+for name in (sid+".snapshot.4294967295.partial", "8".zfill(64)+".snapshot"):
+    if os.path.lexists(os.path.join(root, name)):
+        raise SystemExit(f"owned failed-attempt garbage remains: {name}")
+# Runtime disk lower lists may retain external/image layers, but local writable
+# E/overlay ancestry must not grow with memory working-set capture.
+for node in [current["Boot"]["Root"], *(current["Boot"]["Disks"] or [])]:
+    writable = node["Overlay"] if node["Overlay"] is not None else node
+    for raw in writable["BaseFromRefs"] or []:
+        if raw.startswith("file://") and "@location:" not in raw and (".sandbox@" in raw or ".overlay@" in raw):
+            raise SystemExit(f"local writable disk lower was not absorbed: {raw}")
+PY_HISTORY
+done
+echo "==> PASS: repeated managed false/true/false restores preserved state, bounded history, and directory protection"
 
 S_COLD_RUN_CALL=$(run_argv_count)
 code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113,"memory":false}')
@@ -2812,42 +2875,29 @@ BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_ROOT_KEY=$(basename "$BUNDLE_PROMOTE_TARGET" .bundle)
 [[ "$BUNDLE_PROMOTE_TARGET" == *.bundle && "$BUNDLE_ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "bundle C target does not encode its root ManifestKey: $BUNDLE_PROMOTE_TARGET"
-python3 - "$BUNDLE_PROMOTE_TARGET" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY' \
-    || fail "bundle C retained external refs or omitted embedded B/A manifests"
-import sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    names = set(archive.namelist())
-if "bundle/refs" in names:
-    raise SystemExit("bundle C unexpectedly retained external refs")
-want = {"manifest/" + key for key in sys.argv[2:]}
-missing = sorted(want - names)
-if missing:
-    raise SystemExit(f"bundle C entries omit embedded manifests {missing!r}")
-PY
+wait_paused_cleanup "$SID" || fail "Bundle C checkpoint cleanup remained pending"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_PROMOTE_TARGET" >"$WORK/bundle-c.json" || fail "bundle C snapshot.cfg is unreadable"
-python3 - "$WORK/bundle-c.json" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY' \
-    || fail "bundle C snapshot.cfg is not the flattened manifest-only graph"
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as stream:
-    cfg = json.load(stream)
-want = ["manifest://" + sys.argv[2], "manifest://" + sys.argv[3]]
-got = (cfg.get("FromRefs") or [])[:2]
-if got != want:
-    raise SystemExit(f"bundle C FromRefs prefix={got!r}, want={want!r}")
-def strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for nested in value.values():
-            yield from strings(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            yield from strings(nested)
-bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value]
-if bad:
-    raise SystemExit(f"physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
-PY
+python3 - "$WORK/bundle-c.json" "$WORK/bundle-local.json" "$BUNDLE_PROMOTE_TARGET" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY_BUNDLE' \
+    || fail "Bundle C failed bounded historical memory composition"
+import json, sys, zipfile
+current, first = (json.load(open(path)) for path in sys.argv[1:3])
+refs, suffix = current.get("FromRefs") or [], first.get("FromRefs") or []
+if len(refs) != 1 + len(suffix) or refs[1:] != suffix:
+    raise SystemExit(f"C memory refs={refs!r}, want one new history plus {suffix!r}")
+history = refs[0].removeprefix("manifest://")
+if len(history) != 64 or history in sys.argv[4:]:
+    raise SystemExit(f"history did not receive a new immutable identity: {refs[0]}")
+with zipfile.ZipFile(sys.argv[3]) as archive:
+    names = set(archive.namelist())
+if "bundle/refs" in names or "manifest/" + history not in names:
+    raise SystemExit("C does not own its historical memory member")
+for old in sys.argv[4:]:
+    if "manifest/" + old in names:
+        raise SystemExit(f"C copied retired full Snapshot {old} instead of composing memory")
+PY_BUNDLE
+[ ! -e "$BUNDLE_B_TARGET" ] && [ ! -e "$BUNDLE_TARGET" ] \
+    || fail "Bundle C cleanup retained obsolete A/B carriers"
 BUNDLE_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle capture pair"
 BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
