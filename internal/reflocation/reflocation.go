@@ -34,9 +34,9 @@ func PublicationName(entityID string) string {
 // pure function of the name: the name travels inside the portable ref, so
 // restore/import/inheritance resolve the identical path on any node without
 // extra state. The SHA256 fan-out bounds directory size. The per-entity
-// directory accumulates content-addressed versions; whether and how anything
-// is deleted is owned by the future management-plane GC and is deliberately
-// not this package's contract.
+// directory accumulates content-addressed versions. Callers are responsible
+// for retaining and deleting published artifacts; this package only derives
+// their locations.
 // parentURI must be an absolute hostless file URI and name must be a valid
 // portable ref-location name.
 func Resolve(parentURI, name string) (Location, error) {
