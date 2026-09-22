@@ -460,6 +460,13 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 	if running.DeadlineUnix != explicitDeadline {
 		t.Fatalf("running deadline = %d, want %d", running.DeadlineUnix, explicitDeadline)
 	}
+	// The running commit precedes consumption of the in-memory deadline intent.
+	// Join terminal publication before checking that postcondition.
+	if attempt, found := o.launches.Lookup(sb.ID); found {
+		if err := attempt.wait(ctx); err != nil {
+			t.Fatalf("resume launch failed after running commit: %v", err)
+		}
+	}
 	if o.hasDeadlineIntent(sb.ID) {
 		t.Fatal("successful resume retained the consumed deadline intent")
 	}
