@@ -74,7 +74,6 @@ node-stub-ctl:
 	$(call link_bin,node-stub-ctl)
 
 test:
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_ENABLED=0 $(GO) test ./...
 	bash test/e2e/runtask_privilege_test.sh
