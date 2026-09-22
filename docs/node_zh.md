@@ -1915,10 +1915,11 @@ StableID、build 发布用 BuildID(见 `reflocation.PublicationName`),URI 为
 name 本身即目录键:同一逻辑 sandbox 的全部 publication——重试、跨进程重启、import 换 target id 后的
 再导出、cluster 各 generation——收敛到同一个 StableID 目录;同一 Build 的 image/checkpoint 等
 named publication 收敛到同一个 BuildID 目录。目录内内容寻址的 `<digest>.<role>` 文件累积成多个
-版本,相同内容由 publisher 去重复用。SHA-256 两级扇出限制单目录条目。GC 不按 publication 年龄或
-日期分区清理,而是基于引用可达性(portable ref / TemplateID / migration token 指向的目录与文件),
-属于未来 management plane 职责。conductor 与 task reader 共用 `internal/reflocation` 的
-deterministic 解析,location name 自足,恢复不依赖额外 side table。
+版本，相同内容由 publisher 去重复用。SHA-256 两级扇出限制单目录条目。使用方跟踪 portable ref、
+TemplateID 和 migration token，并负责发布制品的保留与删除策略。仅凭发布时间不能判断制品
+是否已不再被引用。本项目提供引用及其变化信息，外部制品的保留与删除不属于节点生命周期。
+conductor 与 task reader 共用 `internal/reflocation` 的 deterministic 解析，location name 自足，
+恢复不依赖额外 side table。
 
 需属主鉴权的 `POST /sandboxes/{id}/export` 请求仍为
 `{"toTemplate":false,"keepSource":true}`。成功响应保留既有 `result`，恰好增加对应的
