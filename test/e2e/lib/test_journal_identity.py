@@ -1,5 +1,10 @@
 import contextlib
 import io
+import json
+from pathlib import Path
+import re
+import subprocess
+import tempfile
 import unittest
 
 from journal_identity import validate
@@ -101,6 +106,35 @@ class JournalIdentityTest(unittest.TestCase):
             row["_TRANSPORT"] = "stdout"
         self.reject("sandbox", rows)
         self.reject("sandbox", [])
+
+
+class BuilderJournalLookupTest(unittest.TestCase):
+    def lookup(self, entries):
+        source = (Path(__file__).resolve().parents[1] / "e2e_run_builder.sh").read_text()
+        function = re.search(r"(?ms)^build_journal_unit\(\).*?^\}", source).group()
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = Path(temporary) / "journal.jsonl"
+            journal.write_text(entries)
+            # cat is a real finite pipe producer, with journalctl's SIGPIPE
+            # behavior when the consumer exits before draining its output.
+            script = 'set -euo pipefail\nJOURNAL=$1\njournalctl() { cat "$JOURNAL"; }\n'
+            script += function + '\nbuild_journal_unit fixture\n'
+            return subprocess.run(["bash", "-c", script, "_", str(journal)],
+                                  text=True, capture_output=True, timeout=10)
+
+    def test_match_with_trailing_output_keeps_unit_and_success(self):
+        unit = "sandbox-builder@fixture.service"
+        entries = json.dumps({"_SYSTEMD_UNIT": unit}) + "\n"
+        entries += json.dumps({"_SYSTEMD_UNIT": "sandbox-builder@later.service"}) + "\n"
+        entries += "{}\n" * (1 << 20)  # More than a pipe buffer, without sleeps.
+        result = self.lookup(entries)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, unit + "\n")
+
+    def test_missing_builder_unit_still_fails(self):
+        result = self.lookup('invalid JSON\n{"_SYSTEMD_UNIT":"other.service"}\n{}\n')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":
