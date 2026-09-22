@@ -174,4 +174,4 @@ deltas; it does not represent guest sampling or remote export throughput.
 - [Node resources](node-resource.md)
 - [Telemetry](telemetry.md)
 - [Conductor extensions](extensions.md)
-- [Native sandboxer usage](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/usage.md)
+- [Native sandboxer usage](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md#usage-query)

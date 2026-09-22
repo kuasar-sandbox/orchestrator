@@ -3,7 +3,7 @@
 # 沙箱与 Build 的 journal 身份
 
 本文补充[节点参考文档](node_zh.md)的日志章节。
-运行时目标语法见 [sandboxer journal 指南](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/journald_zh.md)。
+运行时目标语法见 [sandboxer journal 指南](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#journal-output-targets)。
 
 ## 职责与输出目标
 

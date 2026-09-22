@@ -3,7 +3,7 @@
 # Journal identities for sandboxes and Builds
 
 This guide supplements the logging section of [the node reference](node.md).
-The runtime target syntax is specified by [sandboxer's journal guide](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/journald.md).
+The runtime target syntax is specified by [sandboxer's journal guide](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md#journal-output-targets).
 
 ## Ownership and output targets
 

@@ -1306,7 +1306,7 @@ Conductor 为 runtime component、app stdio 与 guest console 显式构造独立
 Build phase target 携 `KUASAR_BUILD_ID`、`KUASAR_RUN_ID`。字段不从环境、unit 或制品推导,
 也不在输出之间继承。完整身份规则、target 编码、查询与发送边界由
 [journal 身份指南](node-journald_zh.md) 维护;运行时参数由
-[sandboxer journal 指南](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/journald_zh.md) 维护。
+[sandboxer journal 指南](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#journal-output-targets) 维护。
 
 | 标签 | 写者 | 内容 | 去向 |
 |---|---|---|---|
