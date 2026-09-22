@@ -546,6 +546,9 @@ for line in sys.stdin:
     except json.JSONDecodeError:
         continue
     if unit.startswith("sandbox-builder@") and unit.endswith(".service"):
+        # Drain journalctl so pipefail cannot turn a match into SIGPIPE.
+        for _ in sys.stdin:
+            pass
         print(unit)
         raise SystemExit(0)
 raise SystemExit(1)'
