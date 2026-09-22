@@ -41,9 +41,10 @@
 #       publishes IMG to Manifest and checkpoint E/S as located tarstreams
 #   P3  parent + manifest=true, fromImage → image Bundle
 #   P4  parent + manifest=true, fromImage → top-level Sandbox E Bundle
-#   bundle-memory publication routing is covered deterministically by
-#       internal/builder publication tests; B8 retains real Phase-C memory capture
-#   create from B8, B1, B5, B7 and P3 after their Build rows expire
+#   P5  parent + manifest=true + bundle, fromImage → sandbox/memory
+#       boots Phase C from a located IMG Bundle and keeps that dependency external
+#       to the Snapshot Bundle; restore remains valid after the Build row expires
+#   create from B8, B1, B5, B7, P3 and P5 after their Build rows expire
 #       → running → kill
 #
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
@@ -1923,13 +1924,46 @@ assert_phase_history "$P4_BID" - c P4
 assert_build_finalized "$P4_BID" P4
 echo "==> PASS: P4 directly assembled and published a sandbox-root Bundle, with no IMG Manifest or complete E staging"
 
-# Memory+Bundle publication selection and same-directory role routing are
-# exhaustively covered by internal/builder/publication*_test.go. P3/P4 keep
-# real Bundle publication, while B8 keeps the real no-readyCmd memory capture.
+echo "==> P5: parent + remote.manifest=true + bundle, fromImage → sandbox/memory"
+P5_MANIFESTS_BEFORE=$(manifest_count)
+register e2e-policy-bundle-memory e2b '{"kind":"sandbox","memory":true}' 1
+P5_TID="$TID"; P5_BID="$BID"
+code=$(req POST "/v2/templates/$P5_TID/builds/$P5_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P5 trigger = $code (want 202)"; }
+wait_ready "$P5_TID" "$P5_BID" P5 '{"kind":"sandbox","memory":true}' snp
+P5_PERSIST="$PERSIST"
+P5_REF=$(persist_ref "$P5_PERSIST") || fail "P5 persistent id is invalid"
+[ "$(manifest_count)" = "$P5_MANIFESTS_BEFORE" ] \
+    || fail "P5 wrote image/checkpoint roots to the Manifest store"
+assert_located_final "$P5_REF" .bundle
+artifact_info "$P5_REF" "$WORK/p5-snapshot.json" "$WORK/p5-snapshot.err" \
+    || { cat "$WORK/p5-snapshot.err"; fail "sandbox-ctl info P5 Snapshot Bundle"; }
+P5_IMAGE_REF=$(python3 - "$WORK/p5-snapshot.json" <<'PY_REF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+print(config["Boot"]["Root"]["BaseRef"])
+PY_REF
+)
+assert_located_final "$P5_IMAGE_REF" .bundle
+P5_SNAPSHOT_DIR=$(dirname "$(located_file_path "$P5_REF")")
+P5_IMAGE_DIR=$(dirname "$(located_file_path "$P5_IMAGE_REF")")
+[ "$P5_SNAPSHOT_DIR" = "$P5_IMAGE_DIR" ] \
+    || fail "P5 image and checkpoint publications split across directories: $P5_IMAGE_DIR != $P5_SNAPSHOT_DIR"
+assert_bundle_directory_only "$P5_REF" 2
+assert_phase_history "$P5_BID" a - P5
+assert_phase_history "$P5_BID" - b P5
+assert_phase_history "$P5_BID" c - P5
+assert_build_finalized "$P5_BID" P5
+echo "==> PASS: P5 graph is Bundle S → EΔ → located IMG Bundle; Phase C reopened the portable image and Store count stayed fixed"
+
+# The deterministic publication tests retain matrix-level coverage. P5 keeps one
+# bounded real memory+Bundle path across capture, publication and restore.
 
 # The opaque TemplateIDs, not terminal Build rows, remain the authority. P3
-# proves a located image-root Bundle can cold boot.
-for terminal_bid in "$P3_BID" "$P4_BID"; do
+# proves a located image-root Bundle can cold boot; P5 proves Snapshot Bundle
+# restore follows its external located image dependency.
+for terminal_bid in "$P3_BID" "$P4_BID" "$P5_BID"; do
     wait_build_row_deleted "$terminal_bid" \
         || fail "policy Build row $terminal_bid survived builder.terminal_ttl"
 done
@@ -1940,7 +1974,15 @@ P3_SID=$(json_field "$WORK/resp.body" sandboxID)
 wait_running "$P3_SID" || { diag "$P3_BID"; fail "P3 located image sandbox did not reach running"; }
 code=$(req DELETE "/sandboxes/$P3_SID" "$AK"); [ "$code" = "204" ] || fail "P3 kill = $code (want 204)"
 
-echo "==> PASS: located IMG Bundle TemplateID created a real sandbox after Build-row TTL"
+echo "==> restore sandbox from $P5_PERSIST (Snapshot Bundle + external IMG Bundle)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$P5_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$P5_BID"; fail "P5 Create = $code (want 201)"; }
+P5_SID=$(json_field "$WORK/resp.body" sandboxID)
+wait_running "$P5_SID" || { diag "$P5_BID"; fail "P5 Snapshot Bundle sandbox did not reach running"; }
+wait_resource_capacity "$P5_SID" "$((3 << 30))" \
+    || fail "P5 Snapshot Bundle Create did not preserve target capacity"
+code=$(req DELETE "/sandboxes/$P5_SID" "$AK"); [ "$code" = "204" ] || fail "P5 kill = $code (want 204)"
+echo "==> PASS: located IMG and Snapshot Bundle TemplateIDs created real sandboxes after Build-row TTL"
 
 # store actually holds the uploaded chunks/manifests
 objs=$(find "$WORK/store" -type f | wc -l)
@@ -1948,4 +1990,4 @@ objs=$(find "$WORK/store" -type f | wc -l)
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST B9=$B9_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST)"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST B9=$B9_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST P5=$P5_PERSIST)"
