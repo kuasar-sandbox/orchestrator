@@ -958,7 +958,7 @@ KillMode=control-group covers ctl/vmm recursively. systemd reclaims the delegate
 
 ### 5.2 Journald and log labels
 
-Conductor constructs independent journald targets for runtime component diagnostics, app stdio and guest console. Every managed Sandbox target explicitly carries `KUASAR_STABLE_ID`, `KUASAR_SANDBOX_ID` and `KUASAR_RUN_ID`; Build phase targets carry `KUASAR_BUILD_ID` and `KUASAR_RUN_ID`. Fields are not inferred from environment, units or artifacts and do not inherit across outputs. Complete identity, encoding, query and delivery rules live in the [journal identity guide](node-journald.md); runtime argument syntax belongs to [sandboxer's journal guide](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/journald.md).
+Conductor constructs independent journald targets for runtime component diagnostics, app stdio and guest console. Every managed Sandbox target explicitly carries `KUASAR_STABLE_ID`, `KUASAR_SANDBOX_ID` and `KUASAR_RUN_ID`; Build phase targets carry `KUASAR_BUILD_ID` and `KUASAR_RUN_ID`. Fields are not inferred from environment, units or artifacts and do not inherit across outputs. Complete identity, encoding, query and delivery rules live in the [journal identity guide](node-journald.md); runtime argument syntax belongs to [sandboxer's journal guide](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md#journal-output-targets).
 
 | Label | Writer | Content | Audience |
 |---|---|---|---|
