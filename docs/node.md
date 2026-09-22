@@ -1327,6 +1327,13 @@ the stored pair, without requiring an E alias. Cleanup unlinks recognized aliase
 symlinks or recursively removes the directory; directory-fd operations keep
 unlink confined if paths race.
 
+Managed checkpoint cleanup requires a canonical physical `paths.base_root`:
+its checkpoint path and all ancestors must contain no symbolic links. Configure
+the resolved directory itself rather than a symlink alias. This is an existing
+cleanup precondition; a successful Pause does not imply path validation happened
+at node startup. Published artifact retention and deletion remain the caller's
+responsibility, separate from owned checkpoint cleanup.
+
 A committed Pause remains successful if cleanup fails. The last durable RunDir
 ownership marker remains until checkpoint cleanup and ordinary paused cleanup
 succeed. The existing worker retries with a freshly loaded current source under
