@@ -146,4 +146,4 @@ go test ./internal/orch -run '^$' -bench '^BenchmarkNativeUsageBatch$' -benchmem
 - [节点资源](node-resource_zh.md)
 - [Telemetry](telemetry_zh.md)
 - [Conductor extension](extensions_zh.md)
-- [Sandboxer 原生 usage](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/usage_zh.md)
+- [Sandboxer 原生 usage](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#usage-query)
