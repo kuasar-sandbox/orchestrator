@@ -17,32 +17,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
-func TestAttachReadinessPipeUsesNextExtraFilesFD(t *testing.T) {
-	firstR, firstW, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer firstR.Close()
-	defer firstW.Close()
-	cmd := exec.Command("/bin/true")
-	cmd.ExtraFiles = []*os.File{firstW}
-	readyR, readyW, childFD, err := attachReadinessPipe(cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer readyR.Close()
-	defer readyW.Close()
-	if childFD != 4 {
-		t.Fatalf("child fd = %d, want 4", childFD)
-	}
-	if got := cmd.Args[len(cmd.Args)-1]; got != "--ready-fd=4" {
-		t.Fatalf("ready arg = %q", got)
-	}
-	if len(cmd.ExtraFiles) != 2 || cmd.ExtraFiles[1] != readyW {
-		t.Fatalf("ExtraFiles = %#v", cmd.ExtraFiles)
-	}
-}
-
 func TestPhaseSandboxRuntimeReadiness(t *testing.T) {
 	tests := []struct {
 		name    string

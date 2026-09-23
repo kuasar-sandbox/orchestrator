@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
@@ -61,13 +62,7 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 
 	args := phaseSandboxRunArgs(s, phase, sid, yamlPath, connect, from, replaceBoot)
 	cmd := exec.Command(s.Paths.SandboxCtl, args...)
-	if p.vmmCgroup == nil || p.vmmCgroup.Fd() < 3 {
-		return nil, fmt.Errorf("phase %s has no trusted VMM cgroup descriptor", phase)
-	}
-	cgroupChildFD := 3 + len(cmd.ExtraFiles)
-	cmd.ExtraFiles = append(cmd.ExtraFiles, p.vmmCgroup)
-	cmd.Args = append(cmd.Args, fmt.Sprintf("--cgroup-path=fd=%d", cgroupChildFD))
-	readyR, readyW, _, err := attachReadinessPipe(cmd)
+	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("create readiness pipe: %w", err)
 	}
@@ -77,14 +72,10 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 	// Component/app/console logs use explicit targets. Original process stderr
 	// remains available for early CLI errors, CH stderr and journal fallback.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := cmd.Start(); err != nil {
+	if err := sandboxproc.Start(cmd, p.vmmCgroup, readyW); err != nil {
 		_ = readyR.Close()
-		_ = readyW.Close()
 		return nil, fmt.Errorf("spawn sandbox-ctl: %w", err)
 	}
-	// os/exec has duplicated ExtraFiles into the child. Drop the parent's writer
-	// immediately so every pre-ready child exit is observable as EOF by readyR.
-	_ = readyW.Close()
 	sb := &phaseSandbox{
 		p: p, sid: sid, pathID: phase, runRoot: s.RunDir, cmd: cmd,
 		done: make(chan struct{}), readyR: readyR,
@@ -136,19 +127,6 @@ func phaseSandboxID(phase, buildID string) string {
 	sum := sha256.Sum256([]byte(buildID))
 	digest := phaseSandboxIDEncoding.EncodeToString(sum[:phaseSandboxDigestBytes])
 	return fmt.Sprintf("bp-%s-%s", phase, strings.ToLower(digest))
-}
-
-// attachReadinessPipe gives the writer the next os/exec child descriptor. The
-// number is derived from the pre-existing ExtraFiles rather than assuming fd 3.
-func attachReadinessPipe(cmd *exec.Cmd) (reader, writer *os.File, childFD int, err error) {
-	reader, writer, err = os.Pipe()
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	childFD = 3 + len(cmd.ExtraFiles)
-	cmd.ExtraFiles = append(cmd.ExtraFiles, writer)
-	cmd.Args = append(cmd.Args, fmt.Sprintf("--ready-fd=%d", childFD))
-	return reader, writer, childFD, nil
 }
 
 func appendRefLocationArgs(args []string, locations map[string]string) []string {
