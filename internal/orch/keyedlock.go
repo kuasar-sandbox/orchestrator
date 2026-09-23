@@ -40,6 +40,40 @@ func (g *keyedLockGroup) Lock(key string) func() {
 	}
 }
 
+// TryLock lets background scans skip a busy lifecycle without delaying other
+// sandboxes or the reaper's TTL pass.
+func (g *keyedLockGroup) TryLock(key string) (func(), bool) {
+	g.mu.Lock()
+	if g.locks == nil {
+		g.locks = make(map[string]*keyedLock)
+	}
+	lock := g.locks[key]
+	if lock == nil {
+		lock = &keyedLock{}
+		g.locks[key] = lock
+	}
+	lock.refs++
+	g.mu.Unlock()
+	if !lock.mu.TryLock() {
+		g.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 && g.locks[key] == lock {
+			delete(g.locks, key)
+		}
+		g.mu.Unlock()
+		return nil, false
+	}
+	return func() {
+		lock.mu.Unlock()
+		g.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 && g.locks[key] == lock {
+			delete(g.locks, key)
+		}
+		g.mu.Unlock()
+	}, true
+}
+
 func (o *Orchestrator) markDeadlineIntent(sid string) {
 	o.deadlineIntentMu.Lock()
 	o.deadlineIntents[sid] = struct{}{}

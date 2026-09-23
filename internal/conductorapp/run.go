@@ -94,6 +94,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		if err := core.DrainPauses(context.Background()); err != nil {
 			logger.Error("drain accepted sandbox operations", "err", err)
 		}
+		if err := core.DrainRunnerReaps(context.Background()); err != nil {
+			logger.Error("drain exited-runner cleanup", "err", err)
+		}
 	}()
 	startedExtension, err := startExtension(ctx, runtime, storage, core)
 	if err != nil {

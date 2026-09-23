@@ -2549,6 +2549,32 @@ conductor 在开放 API、config-socket routesync 和 node-link 前按配置 run
 
 同一次 startup gate 也按 [Build 恢复契约](node-build_zh.md#6-持久化恢复与保留) 重建 Builder ownership，完成前不得处理 bootstrap/result。Build 仍受下述共享 reaper 与故障域规则约束。
 
+conductor 持续运行时, 独立的低频 runner 扫描发现 live-unit 列表中缺少 runner
+的 running 行. 发现过程有时间预算, 每轮限制候选处理量, 游标使后续行不会持续
+被失败候选阻塞. ListUnits 缺席只产生候选, 不证明死亡. Sandbox 生命周期锁忙时
+推迟处理; 取得锁后重读持久行, 比较完整 ownership 身份: state, SID, RunID,
+创建身份, launch mode, network tuple, RunDir/BaseDir, runtime UDS 和 ResumeSource.
+并发替换、Pause 或 Delete 因而会在资源释放前使旧候选失效.
+
+清理必须使用已记录的精确 RunID-to-unit 关联. 扫描重读该 unit, 保留可能仍存活
+的单元, 对非活动候选执行 Stop 后再次检查. launcher 还必须证明 systemd 状态为
+inactive/failed, 且 ControlGroup 为空或 cgroup v2 报告 `populated 0`.
+关联缺失、枚举/proof 错误、单元仍活跃或 cgroup 非空时, 保留 durable running 行
+及后续轮次的清理重试责任. 列表缺席或单个子进程退出都不充分.
+
+证明成立后复用既有 ownership teardown: Stop/Reset 并 fence exact runner,
+在 allocation fence 内 detach 其 network ownership, 删除 canonical RunDir/BaseDir.
+只有 teardown 成功后才允许条件 dead commit 清空全部持久 ownership 并写入终态
+历史; 完整 ownership 比较是防止并发替换或删除的最后一道检查. teardown/commit
+失败时保留 durable running owner 供重试, 不能发布成功的 dead 转移. commit 后才
+忘记该 run、释放 detached-port fence, 并经既有 route stream 发布 Delete,
+使 Proxy 与 cluster node-link 撤销该投影.
+
+proof 前取消会保留清理重试责任. 一旦已证明为空, 接纳后的 teardown 和 commit
+使用独立且有界的 cleanup context, 不继承已到期的 proof 或 conductor context.
+shutdown 关闭新扫描接纳并 drain 已接纳的 runner 检查、清理和发布, 然后才关闭
+launcher/store. 扫描周期、候选数量和内部预算是实现限制, 不是公开的清理完成时限.
+
 同一个 conductor reaper 每 5 秒执行一次终态保留清理，不增加 systemd timer/unit。Sandbox
 进入 `dead` 与 Build 进入 `ready/error` 的 store transition 分别原子写 `dead_unix` 与
 `finished_unix`；每轮每类最多处理 128 条。只有到达 `sandbox.dead_ttl` /
@@ -2574,7 +2600,7 @@ cleanup stage 或第二份路径权威。
 | conductor 崩溃/重启 | 控制面中断;沙箱(microVM/单元)与 running 数据流不受影响 | systemd 重启 → 重启对账收养;Proxy master 仍可用共享路由视图服务 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报；MMDS confidential authority 仍按 routesync loss 清空 |
 | Proxy worker 崩溃 | 该 worker 上的连接断;其共享 admission 绝对计数 stale-high,其余 worker 可继续接新连接或保守拒绝 | stats stream fault 先终止该 worker;仅 `cmd.Wait` 确认旧进程退出后 master 才清空该 index,再以同一 index、新 epoch 启动 replacement;不改 route/Sandbox state,不影响 Create |
 | Proxy master 崩溃 | 数据面中断,plugin 租约断开,Create fail closed | systemd 重启 master → 重新注册,重建共享表,启动 worker |
-| runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
+| runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 在线 runner 扫描与启动对账先释放 exact ownership 再记录 dead(§14.2);proof/cleanup 不确定时保留 running 供重试. 客户重新 create 或从单独保留的 paused 制品 resume |
 | routesync 断流 | Proxy 数据面视图停更;MMDS route/value/service 立即不可用 | Proxy master 清空 confidential heap 并指数退避重连重注册,完整同步 bookmark 后才重开 MMDS；fixed routes 保持原 retention/convergence 行为（node-proxy.md §4） |
 | node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md);本节点沙箱不受影响 |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |

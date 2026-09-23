@@ -1894,6 +1894,41 @@ configured runner unit set:
 
 The same startup gate reconstructs Builder ownership under [Build recovery](node-build.md#6-persistence-recovery-and-retention) before allowing bootstrap/results. Builds remain subject to the shared reaper and failure-domain rules below.
 
+While conductor remains live, a separate low-frequency runner scan discovers
+running rows whose runner unit is absent from the live-unit list. Discovery has a
+bounded budget and each pass limits candidate work; its cursor lets later rows
+progress past failed candidates. ListUnits absence only nominates a candidate,
+never proves death. A busy Sandbox lifecycle lock defers that candidate. Under
+that lock the scan rereads the durable row and compares its complete ownership
+identity: state, SID, RunID, creation identity, launch mode, network tuple,
+RunDir/BaseDir, runtime UDS and ResumeSource. A concurrent replacement, Pause or
+Delete therefore invalidates a stale candidate before it can release resources.
+
+Cleanup requires the exact recorded RunID-to-unit association. The scan rereads
+that unit, leaves a possibly live unit alone, then stops an inactive candidate
+and checks it again. The launcher must additionally prove that systemd reports
+inactive/failed and either no ControlGroup or a cgroup v2 `populated 0` result.
+Missing association, enumeration/proof errors, an active unit or a nonempty
+cgroup retain the durable running row and cleanup responsibility for a later
+pass. Neither a missing list entry nor one child process exiting is sufficient.
+
+After that proof, the existing ownership teardown stops/resets and fences the
+exact runner, detaches its network ownership under the allocation fence, and
+removes the canonical RunDir/BaseDir. Only successful teardown permits the
+conditional dead commit to clear all persisted ownership and record terminal
+history. Its full ownership comparison is the last guard against replacement or
+concurrent deletion. Teardown/commit failure retains the durable running owner
+for retry; it cannot publish a successful dead transition. After commit the scan
+forgets that run, releases its detached-port fence, and publishes Delete through
+the existing route stream so Proxy and cluster node-link withdraw the projection.
+
+Cancellation before proof leaves cleanup for retry. Once emptiness is proved,
+accepted teardown and commit use their own bounded cleanup context instead of
+inheriting the expired proof or conductor context. Shutdown closes new scan
+admission and drains accepted runner checks, cleanup and publication before
+closing the launcher/store. Scan cadence, candidate count and internal budgets
+are implementation limits, not a public cleanup-completion deadline.
+
 The same conductor reaper runs terminal retention every five seconds, without another timer/unit. Dead and ready/error transitions atomically write dead_unix/finished_unix. Each pass processes at most 128 rows of each type. Exact-delete only after dead_ttl/terminal_ttl and complete owner release. Sandbox must have no unit, network, RunDir/BaseDir, UDS, ResumeSource or launch owner. Build must have no execution claim, unit/cgroup, phase, network, prepare/result owner. Concurrent changes after candidate scanning fail the delete CAS and preserve the row. Restart resumes using database timestamps. No automatic VACUUM or remote-artifact mutation occurs.
 
 These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v8 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
@@ -1907,7 +1942,7 @@ RouteSource.Range and later full snapshots therefore never mispublish abandoned 
 | Conductor crash/restart | Control interrupted; microVM units and established running data streams survive. | Systemd restarts and reconciliation adopts units. Proxy retains fixed routes for running traffic; paused Wake has no responder and can time out. Cluster node-link reconnects/reports. MMDS confidential authority still clears on routesync loss as below. |
 | Proxy worker crash | Its connections close; absolute shared admission counts remain conservatively high. Other workers accept or conservatively reject. | Stats-stream fault first terminates worker. Only after cmd.Wait proves process exit does master clear its index and launch a new epoch there. Route/Sandbox state and Create are unchanged. |
 | Proxy master crash | Data unavailable, plugin lease lost and new Create fails closed. | Systemd restarts master, registers, rebuilds shared tables and starts workers. |
-| Runner unit/Cloud Hypervisor crash | That Sandbox dies; Restart=no avoids stateful retries. | Reconciliation marks dead; client creates again or resumes a separately preserved paused artifact. |
+| Runner unit/Cloud Hypervisor crash | That Sandbox dies; Restart=no avoids stateful retries. | Live runner scanning and startup reconciliation release exact ownership before recording dead (§14.2); uncertain proof/cleanup retains running for retry. Clients create again or resume a separately preserved paused artifact. |
 | Routesync disconnect | Fixed route view stops updating; MMDS routes/values/services immediately unavailable. | Master clears confidential heap, reconnects/registers with exponential backoff and reopens MMDS only after full-sync bookmark (node-proxy.md §4). Fixed routes retain existing retention/convergence behavior. |
 | Cluster node-link disconnect | Registry temporarily loses fresh node view. | Node reconnects/registers/reports with exponential backoff (§10/cluster.md); local Sandboxes continue. |
 | SQLite corruption | Control unavailable. | File-level backup/rebuild; operators can still discover Sandbox units through ListUnits. |
