@@ -389,6 +389,8 @@ microVM(`sandbox-ctl run` 直接子进程)。父进程为每个 phase 建匿名 
 即表现为 EOF。A 阶段只等待这条 runtime wire(60s),不再用 guest exec 轮询;B/C
 在 runtime wire 后继续等 envd `/health`,两者共用一次 90s boot deadline:
 
+共用的子进程启动边界只注入可信 VMM/readiness 描述符、推导子进程 FD 编号并启动命令。无论启动成功或失败，都关闭父进程的 readiness 副本；VMM 描述符仅借用，唯一一次 Wait 仍由调用方负责。命令构造、环境、阶段取消、readiness 消费和 phase teardown 保持为 Build 职责；复用启动边界不改变构建生命周期。
+
 每个 phase 的逻辑 SandboxID 保持现有全局唯一值；目录 PathID 固定为 `a`、`b`、`c`。
 run-builder 对每阶段调用
 `sandbox-ctl run --run-root <BuildRunDir> --base-root <BuildBaseDir>
