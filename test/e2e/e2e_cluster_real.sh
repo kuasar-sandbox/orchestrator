@@ -10,7 +10,9 @@
 #   Phase 2 / registry-redirect:
 #     three registries, node_link owner_count=1. The node first connects to the
 #     bootstrap registry, gets a node-link redirect to its owner, reconnects, and
-#     then runs the same real sandbox flow.
+#     restarts that actual Registry owner and Router, proves node-link recovery
+#     and placer convergence, then creates one real sandbox, sends one routed
+#     guest request and deletes the sandbox.
 #
 # This orchestrator-owned case uses the platform-provided binary set because a
 # real cluster sandbox spans all component artifacts. Missing heavy
@@ -120,6 +122,7 @@ for u in "${UNIT_NAMES[@]}"; do
 done
 mkdir -p "$WORK/r" "$WORK/l" "$WORK/s" "$WORK/z/d" "$WORK/g" "$WORK/br" "$WORK/bl" "$WORK/cr" "$WORK/cl"
 declare -a PIDS=()
+declare -a REGISTRY_PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
 NETNS_CREATED=""
@@ -766,7 +769,7 @@ start_cluster_control_plane() {
         step "starting registry-$i (:${port})"
         "$BIN/cluster-ctl" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
         PIDS+=("$!")
-        [ "$i" != 1 ] || REGISTRY_ONE_PID=$!
+        REGISTRY_PIDS+=("$!")
         wait_port "$port" "registry-$i"
     done
     step "checking registry membership endpoint"
@@ -797,9 +800,11 @@ PY
 }
 
 choose_redirect_node_id() {
-    python3 - "http://127.0.0.1:$CONTROL_PORT/node-link/session" <<'PY'
+    python3 - "http://127.0.0.1:$CONTROL_PORT/node-link/session" "${CONTROL_PORTS[@]}" <<'PY'
 import json, struct, sys, urllib.request
 url = sys.argv[1]
+members = {"registry-%d" % idx: "127.0.0.1:" + port
+           for idx, port in enumerate(sys.argv[2:], 1)}
 for idx in range(1, 80):
     node_id = "real-node-redirect-%02d" % idx
     msg = {
@@ -828,7 +833,10 @@ for idx in range(1, 80):
         continue
     redir = (((hello.get("hello") or {}).get("redirect") or {}).get("targets") or [])
     if redir:
-        print(node_id)
+        if (len(redir) != 1 or redir[0].get("member_id") not in members
+                or members[redir[0]["member_id"]] != redir[0].get("endpoint")):
+            raise SystemExit("redirect did not identify one fixture Registry owner")
+        print(node_id, redir[0]["member_id"], redir[0]["endpoint"], sep="\t")
         raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -883,8 +891,8 @@ EOF
     step "cluster Proxy data endpoint ready (:${NODE_DATA_PORT})"
     if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
         for _ in $(seq 1 80); do
-            if grep -q "redirecting to node owner" "$WORK/cluster-node.log"; then
-                step "observed node-link redirect to node owner"
+            if grep -F "redirecting to node owner" "$WORK/cluster-node.log" | grep -Fq "node=$node_id member=$REDIRECT_OWNER endpoint=$REDIRECT_ENDPOINT"; then
+                step "observed node-link redirect node=$node_id owner=$REDIRECT_OWNER endpoint=$REDIRECT_ENDPOINT"
                 return 0
             fi
             sleep 0.25
@@ -1030,10 +1038,73 @@ PY
     fail "deleted sandbox still appears in list"
 }
 
+wait_redirect_placer() {
+    python3 "$SCRIPT_DIR/lib/placer_readiness.py" \
+        --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID"
+}
+
+stop_redirect_process() {
+    local pid="$1" name="$2" deadline=$((SECONDS + 20))
+    kill "$pid" || fail "$name exited before the restart"
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            fail "$name did not stop for restart"
+        fi
+        sleep 0.05
+    done
+    wait "$pid" 2>/dev/null || true
+    for i in "${!PIDS[@]}"; do
+        [ "${PIDS[$i]}" != "$pid" ] || PIDS[$i]=""
+    done
+}
+
+restart_redirect_owner() {
+    local index=$(( ${REDIRECT_OWNER#registry-} - 1 ))
+    REDIRECT_CONNECTIONS="$(grep -c "node-link: node connected.*node=$NODE_ID " "$WORK/$REDIRECT_OWNER.log" || true)"
+    [ "$REDIRECT_CONNECTIONS" -gt 0 ] || fail "redirected node never connected to $REDIRECT_OWNER"
+    step "restarting actual redirect owner=$REDIRECT_OWNER pid=${REGISTRY_PIDS[$index]} endpoint=$REDIRECT_ENDPOINT"
+    stop_redirect_process "${REGISTRY_PIDS[$index]}" "$REDIRECT_OWNER"
+    "$BIN/cluster-ctl" registry --config "$WORK/$REDIRECT_OWNER.yaml" > >(tee -a "$WORK/$REDIRECT_OWNER.log" >&2) 2>&1 &
+    REGISTRY_PIDS[$index]=$!
+    PIDS+=("$!")
+    wait_port "${CONTROL_PORTS[$index]}" "$REDIRECT_OWNER-restarted"
+
+    stop_redirect_process "$ROUTER_PID" router
+    "$BIN/cluster-ctl" router --config "$WORK/router.yaml" > >(tee -a "$WORK/router.log" >&2) 2>&1 &
+    ROUTER_PID=$!
+    PIDS+=("$!")
+    wait_port "$ROUTER_PORT" router-restarted
+    step "restarted redirect Registry owner and Router with empty Router cache"
+}
+
+wait_redirect_node_link() {
+    local connections index=$(( ${REDIRECT_OWNER#registry-} - 1 )) deadline=$((SECONDS + 20))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        kill -0 "${REGISTRY_PIDS[$index]}" 2>/dev/null || fail "restarted Registry owner exited"
+        kill -0 "$ROUTER_PID" 2>/dev/null || fail "restarted Router exited"
+        connections="$(grep -c "node-link: node connected.*node=$NODE_ID " "$WORK/$REDIRECT_OWNER.log" || true)"
+        if [ "$connections" -gt "$REDIRECT_CONNECTIONS" ]; then
+            step "PASS: $REDIRECT_OWNER accepted a new node-link after owner restart"
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "redirected node-link did not reconnect"
+}
+
+run_redirect_recovery() {
+    restart_redirect_owner || fail "redirect owner restart failed"
+    wait_redirect_node_link || fail "redirected node-link recovery failed"
+    wait_redirect_placer || fail "placer did not converge to the redirected node"
+}
+
 run_redirect_flow() {
     local code sid envd_token forward_token create_response="$WORK/create.credentials"
-    step "creating one sandbox through the redirected registry topology"
-    code="$(retry_create_sandbox "$create_response" || true)"
+    run_redirect_recovery
+    step "creating one sandbox through the recovered redirected registry topology"
+    code="$(create_sandbox "$create_response")"
     [ "$code" = "201" ] || { [ -s "$create_response" ] && cat "$create_response" >&2; fail "redirect create returned $code"; }
     assert_no_default_exec_token "$create_response" || fail "redirect create exposed a default exec token"
     IFS=$'\t' read -r sid envd_token forward_token < <(sandbox_route "$create_response") \
@@ -1041,9 +1112,10 @@ run_redirect_flow() {
     rm -f "$create_response"
 
     code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
-    [ "$code" = "204" ] || [ "$code" = "200" ] || fail "redirect data-plane /health returned $code"
+    [ "$code" = "204" ] || [ "$code" = "200" ] || fail "post-restart redirect data-plane /health returned $code"
     wait_cluster_traffic_stats "$sid" idle || fail "redirect traffic did not publish/converge to idle"
-    step "PASS: redirected topology routed a real create and envd request ($code)"
+    step "PASS: post-restart redirected topology placed a real sandbox and routed envd health ($code)"
+    unset envd_token
 
     code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "redirect delete returned $code"; }
@@ -1091,8 +1163,9 @@ start_cluster_control_plane
 NODE_ID="real-node-1"
 if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
     step "probing node ids until bootstrap registry returns a node-link redirect"
-    NODE_ID="$(choose_redirect_node_id)" || fail "could not find a node_id redirected away from bootstrap registry"
-    step "selected redirected node_id=$NODE_ID"
+    REDIRECT_SELECTION="$(choose_redirect_node_id)" || fail "could not find a node_id redirected away from bootstrap registry"
+    IFS=$'\t' read -r NODE_ID REDIRECT_OWNER REDIRECT_ENDPOINT <<< "$REDIRECT_SELECTION"
+    step "selected redirected node_id=$NODE_ID owner=$REDIRECT_OWNER endpoint=$REDIRECT_ENDPOINT"
 fi
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair

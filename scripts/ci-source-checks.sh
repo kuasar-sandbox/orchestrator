@@ -8,6 +8,8 @@ CGO_ENABLED=1 go test -race -count=1 -timeout=5m ./...
 go vet ./...
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_orchestrator_proxy_go.py -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_capture_cli.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_placer_readiness.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_registry_redirect.py -v
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 bash scripts/ci-e2e-build.sh source "$(uname -m)" "$work"
