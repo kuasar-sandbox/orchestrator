@@ -324,6 +324,49 @@ func TestSandboxDeleteFinalizerRetainsOnlyPendingOwnershipAtEveryFailure(t *test
 	}
 }
 
+func TestSandboxResultCleanupDurablyClearsNetworkBeforeDirectoryCleanup(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "result-cleanup-order")
+	code := 137
+	result := types.SandboxExecutionResult{SID: fixture.sb.ID, RunID: fixture.sb.RunID, Stage: types.SandboxResultRun, ExitCode: &code}
+	if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), fixture.sb.ID, fixture.sb.RunID, result); err != nil || !inserted {
+		t.Fatalf("AcceptSandboxExecutionResult = %t, %v", inserted, err)
+	}
+	runErr := errors.New("injected RunDir failure after network clear")
+	fixture.o.removeSandboxRunDir = func(string) error { return runErr }
+	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); !errors.Is(err, runErr) {
+		t.Fatalf("result cleanup error = %v, want RunDir failure", err)
+	}
+	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || got == nil {
+		t.Fatalf("running owner after result cleanup failure = %+v, %v", got, err)
+	}
+	if got.State != types.StateRunning || got.RunID != fixture.sb.RunID || got.VswitchPort != "" || got.FloatingIP != "" || got.InnerIP != "" || got.PortMAC != "" || got.RunDir != fixture.sb.RunDir || got.BaseDir != fixture.sb.BaseDir || got.ExecutionResult == nil {
+		t.Fatalf("result cleanup failure did not retain only pending ownership: %+v", got)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if fenced {
+		t.Fatal("durably cleared result port remained allocation-fenced")
+	}
+	if _, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err != nil {
+		t.Fatalf("new allocation after result network clear: %v", err)
+	}
+	fixture.o.removeSandboxRunDir = os.RemoveAll
+	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err != nil {
+		t.Fatalf("retry result cleanup: %v", err)
+	}
+	dead, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != fixture.sb.RunID {
+		t.Fatalf("dead result row = %+v, %v", dead, err)
+	}
+	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("result cleanup retained %s: %v", path, err)
+		}
+	}
+}
+
 func TestSandboxDeleteDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "delete-allocation-fence")
 	vs := &serializedSandboxDeleteVS{
