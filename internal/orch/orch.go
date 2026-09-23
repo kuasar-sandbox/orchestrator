@@ -2460,9 +2460,9 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		}
 	}
 	// Adopt live sandboxes in-memory inline (o.cache is not a store write);
-	// collect the dead ones and tear them down after the scan, since teardown +
-	// SetState write the store and must not run while the read cursor is open.
-	var deleting, paused, interrupted, dead, deadHistory []*types.Sandbox
+	// collect the dead/result-owned ones and tear them down after the scan, since
+	// teardown + terminal writes must not run while the read cursor is open.
+	var deleting, paused, acceptedStarting, interrupted, acceptedRunning, dead, deadHistory []*types.Sandbox
 	knownRuns := make(map[string]bool)
 	if err := o.st.RangeByState(ctx, types.StateDeleting, func(sb *types.Sandbox) error {
 		if sb.RunID != "" {
@@ -2486,7 +2486,11 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
 		}
-		interrupted = append(interrupted, sb)
+		if sb.ExecutionResult != nil {
+			acceptedStarting = append(acceptedStarting, sb)
+		} else {
+			interrupted = append(interrupted, sb)
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -2495,7 +2499,9 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
 		}
-		if sb.RunID != "" && alive[sb.RunID] {
+		if sb.ExecutionResult != nil {
+			acceptedRunning = append(acceptedRunning, sb)
+		} else if sb.RunID != "" && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
 			o.observeSandboxUpsert(sb)
 		} else {
@@ -2527,6 +2533,12 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		}
 		o.cache(sb)
 		o.observeSandboxUpsert(sb)
+	}
+	for _, sb := range acceptedStarting {
+		o.log.Info("reconcile: accepted result for starting sandbox", "sid", sb.ID, "run_id", sb.RunID, "launch_mode", sb.LaunchMode)
+		if err := o.recoverAcceptedStartingResult(ctx, sb); err != nil {
+			return fmt.Errorf("reconcile: recover accepted starting result %s: %w", sb.ID, err)
+		}
 	}
 	for _, sb := range interrupted {
 		resume := sb.ResumeSource.Valid()
@@ -2579,6 +2591,12 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			}
 		}
 	}
+	for _, sb := range acceptedRunning {
+		o.log.Info("reconcile: accepted result for running sandbox", "sid", sb.ID, "run_id", sb.RunID)
+		if err := o.finalizeSandboxResultOnce(ctx, sb.ID, sb.RunID); err != nil {
+			return fmt.Errorf("reconcile: cleanup accepted result sandbox %s: %w", sb.ID, err)
+		}
+	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		if err := o.teardownPersistedOwnership(ctx, sb, true); err != nil {
@@ -2617,6 +2635,55 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		_ = o.lc.ResetFailed(ctx, u.Name)
 		o.runs.forget(runID)
 	}
+	return nil
+}
+
+func (o *Orchestrator) recoverAcceptedStartingResult(ctx context.Context, observed *types.Sandbox) error {
+	if observed == nil || observed.RunID == "" || observed.ExecutionResult == nil {
+		return nil
+	}
+	unlock := o.lifecycle.Lock(observed.ID)
+	defer unlock()
+
+	current, err := o.st.Get(ctx, observed.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.State != types.StateStarting || current.RunID != observed.RunID ||
+		current.ExecutionResult == nil || current.ExecutionResult.RunID != observed.RunID {
+		return nil
+	}
+	resume := current.ResumeSource.Valid()
+	if err := o.teardownPersistedOwnership(ctx, current, !resume); err != nil {
+		return err
+	}
+	var changed bool
+	if resume {
+		changed, err = o.st.RollbackStartingPaused(ctx, current)
+	} else {
+		changed, err = o.st.RollbackStartingDead(ctx, current)
+	}
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return fmt.Errorf("orch: accepted starting result ownership changed for %s", current.ID)
+	}
+	o.runs.forget(current.RunID)
+	o.releaseDetachedPortFence(current.VswitchPort)
+	updated, err := o.st.Get(ctx, current.ID)
+	if err != nil {
+		return err
+	}
+	if updated == nil {
+		return nil
+	}
+	if resume {
+		o.cache(updated)
+	} else {
+		o.uncache(updated.ID)
+	}
+	o.observeSandboxUpsert(updated)
 	return nil
 }
 
