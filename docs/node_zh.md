@@ -2597,9 +2597,13 @@ migrate,node-link(注册/事件/命令往返)等).
 最后重新导出. capture 用例在返回结构化结果前删除载体, 并要求撕裂响应保留 running
 行和原有对.
 
-三组 CLI 集成用例当前需要显式启用; 普通 `go test` 未设置
-`KUASAR_TEST_SANDBOX_CTL` 时会跳过. 将 `BIN` 指向所选且已构建的产品目录,
-从本仓库执行:
+必需的 owner 入口 [e2e_capture_cli.sh](../test/e2e/e2e_capture_cli.sh) 使用所选
+真实产品执行三组 CLI 集成用例及全部当前子用例. 缺少 `BIN` 产品或已准备的
+`ORCH_CLI_TEST_BIN`、空选择、未完成的子用例或任何 Skip 都使该入口失败.
+既有 build/helper 阶段按独立 test pin 编译测试执行文件; hosted artifact E2E
+只消费该文件和 `BIN`, 不检出源码或编译. 本地可选 `go test` 未设置
+`KUASAR_TEST_SANDBOX_CTL` 时仍可跳过这些组. 将 `BIN` 指向所选且已构建的
+产品目录, 从本仓库执行:
 
 ```bash
 KUASAR_TEST_SANDBOX_CTL="$BIN/sandbox-ctl" go test ./internal/orch \

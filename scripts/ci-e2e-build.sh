@@ -23,8 +23,12 @@ build_telemetry_grpc() {
     GOWORK=off CGO_ENABLED=0 e2e_go build -trimpath -o "$WORK/telemetry-grpc-probe" "$SCRIPT_DIR/telemetryprobe/main.go"
 }
 
+build_capture_cli() {
+    (cd "$ROOT" && GOWORK=off CGO_ENABLED=0 e2e_go test -c -trimpath -o "$WORK/orch-cli.test" ./internal/orch)
+}
+
 main() {
-    [ "$#" = 3 ] || { echo "usage: ci-e2e-build.sh fixtures|source <x86_64|aarch64> <output>" >&2; exit 2; }
+    [ "$#" = 3 ] || { echo "usage: ci-e2e-build.sh fixtures|source|cli <x86_64|aarch64> <output>" >&2; exit 2; }
     local mode="$1" ROOT
     ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     case "$2" in x86_64) export GOARCH=amd64 ;; aarch64) export GOARCH=arm64 ;; *) exit 2 ;; esac
@@ -38,6 +42,7 @@ main() {
     case "$mode" in
         fixtures) build_custom_proxy; build_telemetry_grpc ;;
         source) build_telemetry_netns ;;
+        cli) build_capture_cli ;;
         *) exit 2 ;;
     esac
 }
