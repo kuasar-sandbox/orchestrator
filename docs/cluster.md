@@ -836,13 +836,12 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 The companion real `e2e_cluster_real.sh` case keeps the common lifecycle and
 Build/cancellation/reclamation matrix in `registry-n1`. `registry-redirect`
 derives the exact Registry owner from the actual node-link redirect and confirms
-that the node used it. After one real Create and guest health check, it restarts
-that owner and Router, requires a new node-link connection and the same running
-SandboxID through the empty Router cache, then uses the existing bounded placer
-probe to require the expected node. Only then does one guest data request run,
-followed by normal Delete and node-local finalization. This proves retained-route
-recovery; it does not claim a new post-restart placement. Failed readiness blocks
-the request, and failed Create/post-restart data requests are not retried. Syntax,
+that the node used it. It restarts that owner and Router, requires a new node-link
+connection, then uses the existing bounded placer probe to require the expected
+node. The recovered topology and empty Router cache must then serve one real
+Create, one guest data request, and normal Delete with node-local finalization.
+This exercises actual post-restart placement after node-link recovery. Failed
+readiness blocks Create, and failed Create/data requests are not retried. Syntax,
 ShellCheck and the placer/recovery gate regressions precede the required real KVM
 owner run; stub or helper results do not replace that run.
 

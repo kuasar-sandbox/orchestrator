@@ -49,42 +49,64 @@ class RegistryRedirectTest(unittest.TestCase):
             log = Path(directory) / "sequence"
             script = r'''
 set -euo pipefail
-WORK=fixture
+WORK="$FIXTURE_WORK"
+CLUSTER_API_KEY=test-key
+ROUTE_KEY=test-route
 step() { :; }
 fail() { exit 19; }
 record() { echo "$1" >> "$SEQUENCE"; [ "$1" != "$FAILURE" ]; }
 restart_redirect_owner() { record restart; }
-wait_redirect_retained_route() { [ "$1" = exact-sid ]; record retained; }
+wait_redirect_node_link() { record node-link; }
 wait_redirect_placer() { record placer; }
+create_sandbox() {
+    record create
+    if [ "$FAILURE" = create-http ]; then echo 503; else echo 201; fi
+}
+assert_no_default_exec_token() { :; }
+sandbox_route() { printf 'exact-sid\ttest-token\ttest-forward\n'; }
 data_by_sid_code() {
     [ "$2" = exact-sid ] && [ "$3" = test-token ] || exit 18
     record request
     if [ "$FAILURE" = http ]; then echo 503; else echo 204; fi
 }
 wait_cluster_traffic_stats() { record traffic; }
-''' + (source or function("run_redirect_recovery")) + '\nrun_redirect_recovery exact-sid test-token\n'
+router_req() {
+    if [ "$1" = DELETE ]; then
+        record delete; echo 204
+    else
+        record list; echo '[]' > "$WORK/router-resp.body"; echo 200
+    fi
+}
+wait_node_sandbox_finalized() { record finalized; }
+''' + (source or function("run_redirect_recovery")) + '\n' + function("run_redirect_flow") + '\nrun_redirect_flow\n'
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                                    timeout=5, env={**os.environ, "SEQUENCE": str(log), "FAILURE": failure})
+                                    timeout=5, env={**os.environ, "SEQUENCE": str(log), "FAILURE": failure,
+                                                   "FIXTURE_WORK": directory})
             return result.returncode, log.read_text().splitlines() if log.exists() else []
 
-    def test_restart_retained_route_and_placer_precede_one_real_request(self):
+    def test_restart_node_link_and_placer_precede_real_create_data_delete(self):
         status, calls = self.recovery()
         self.assertEqual(status, 0)
-        self.assertEqual(calls, ["restart", "retained", "placer", "request", "traffic"])
+        self.assertEqual(calls, ["restart", "node-link", "placer", "create", "request", "traffic",
+                                 "delete", "list", "finalized"])
 
     def test_each_failed_gate_blocks_the_post_restart_request(self):
-        for gate in ("restart", "retained", "placer"):
+        for gate in ("restart", "node-link", "placer"):
             with self.subTest(gate=gate):
                 status, calls = self.recovery(gate)
                 self.assertNotEqual(status, 0)
                 self.assertEqual(calls[-1], gate)
+                self.assertNotIn("create", calls)
                 self.assertNotIn("request", calls)
 
-    def test_failed_data_request_is_never_retried(self):
-        status, calls = self.recovery("http")
-        self.assertNotEqual(status, 0)
-        self.assertEqual(calls.count("request"), 1)
-        self.assertNotIn("traffic", calls)
+    def test_failed_create_or_data_request_is_never_retried(self):
+        for failure, request in (("create-http", "create"), ("http", "request")):
+            with self.subTest(failure=failure):
+                status, calls = self.recovery(failure)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(calls.count(request), 1)
+                self.assertNotIn("traffic", calls)
+                self.assertNotIn("delete", calls)
 
     def test_missing_readiness_gate_mutant_is_detected(self):
         source = function("run_redirect_recovery")
@@ -92,7 +114,7 @@ wait_cluster_traffic_stats() { record traffic; }
         self.assertNotEqual(source, mutant)
         status, calls = self.recovery("placer", mutant)
         self.assertEqual(status, 0)
-        self.assertIn("request", calls)  # A ports-only restart would wrongly reach the guest.
+        self.assertIn("create", calls)  # A ports-only restart would wrongly start placement.
         status, calls = self.recovery("placer", source)
         self.assertNotEqual(status, 0)
         self.assertNotIn("request", calls)
@@ -100,7 +122,8 @@ wait_cluster_traffic_stats() { record traffic; }
     def test_actual_flow_invokes_recovery_before_delete_and_creates_once(self):
         source = function("run_redirect_flow")
         self.assertNotIn("retry_create_sandbox", source)
-        self.assertLess(source.index("wait_redirect_placer"), source.index('code="$(create_sandbox'))
+        self.assertNotIn("retry_data_by_sid", source)
+        self.assertLess(source.index("run_redirect_recovery"), source.index('code="$(create_sandbox'))
         self.assertLess(source.index("run_redirect_recovery"), source.index("router_req DELETE"))
         gate = function("wait_redirect_placer")
         self.assertIn("lib/placer_readiness.py", gate)

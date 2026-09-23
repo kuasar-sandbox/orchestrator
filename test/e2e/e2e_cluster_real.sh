@@ -10,9 +10,9 @@
 #   Phase 2 / registry-redirect:
 #     three registries, node_link owner_count=1. The node first connects to the
 #     bootstrap registry, gets a node-link redirect to its owner, reconnects, and
-#     creates one real sandbox, restarts that actual Registry owner and Router,
-#     proves node-link/retained-route recovery and placer convergence, then
-#     sends one routed guest request before deleting the sandbox.
+#     restarts that actual Registry owner and Router, proves node-link recovery
+#     and placer convergence, then creates one real sandbox, sends one routed
+#     guest request and deletes the sandbox.
 #
 # This orchestrator-owned case uses the platform-provided binary set because a
 # real cluster sandbox spans all component artifacts. Missing heavy
@@ -1076,49 +1076,34 @@ restart_redirect_owner() {
     ROUTER_PID=$!
     PIDS+=("$!")
     wait_port "$ROUTER_PORT" router-restarted
-    step "restarted redirect Registry owner and Router; checking retained route through empty Router cache"
+    step "restarted redirect Registry owner and Router with empty Router cache"
 }
 
-wait_redirect_retained_route() {
-    local sid="$1" code connections deadline=$((SECONDS + 20))
+wait_redirect_node_link() {
+    local connections index=$(( ${REDIRECT_OWNER#registry-} - 1 )) deadline=$((SECONDS + 20))
     while [ "$SECONDS" -lt "$deadline" ]; do
+        kill -0 "${REGISTRY_PIDS[$index]}" 2>/dev/null || fail "restarted Registry owner exited"
         kill -0 "$ROUTER_PID" 2>/dev/null || fail "restarted Router exited"
         connections="$(grep -c "node-link: node connected.*node=$NODE_ID " "$WORK/$REDIRECT_OWNER.log" || true)"
         if [ "$connections" -gt "$REDIRECT_CONNECTIONS" ]; then
-            code="$(curl -sS --noproxy '*' --max-time 1 -o "$WORK/retained-route.body" -w '%{http_code}' \
-                -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" \
-                -H "X-Kuasar-Route-Key: $ROUTE_KEY" -H "X-API-KEY: $CLUSTER_API_KEY" \
-                "http://127.0.0.1:$ROUTER_PORT/sandboxes/$sid" || true)"
-            if [ "$code" = 200 ] && python3 - "$WORK/retained-route.body" "$sid" <<'PY_RETAINED'
-import json, sys
-value = json.load(open(sys.argv[1]))
-assert value.get("sandboxID") == sys.argv[2] and value.get("state") == "running"
-PY_RETAINED
-            then
-                step "PASS: $REDIRECT_OWNER accepted a new node-link and empty Router cache resolved retained sandbox=$sid"
-                return 0
-            fi
+            step "PASS: $REDIRECT_OWNER accepted a new node-link after owner restart"
+            return 0
         fi
         sleep 0.25
     done
-    fail "redirected node-link/retained route did not recover"
+    fail "redirected node-link did not reconnect"
 }
 
 run_redirect_recovery() {
-    local sid="$1" envd_token="$2" code
     restart_redirect_owner || fail "redirect owner restart failed"
-    wait_redirect_retained_route "$sid" || fail "retained route recovery failed"
+    wait_redirect_node_link || fail "redirected node-link recovery failed"
     wait_redirect_placer || fail "placer did not converge to the redirected node"
-    code="$(data_by_sid_code "$WORK/data-health.body" "$sid" "$envd_token")"
-    [ "$code" = 204 ] || [ "$code" = 200 ] || fail "post-restart redirected /health returned $code"
-    wait_cluster_traffic_stats "$sid" idle || fail "post-restart redirected traffic did not converge to idle"
-    step "PASS: post-restart redirected envd request succeeded once ($code); existing route retained"
 }
 
 run_redirect_flow() {
     local code sid envd_token forward_token create_response="$WORK/create.credentials"
-    wait_redirect_placer || fail "initial placer view did not select the redirected node"
-    step "creating one sandbox through the redirected registry topology"
+    run_redirect_recovery
+    step "creating one sandbox through the recovered redirected registry topology"
     code="$(create_sandbox "$create_response")"
     [ "$code" = "201" ] || { [ -s "$create_response" ] && cat "$create_response" >&2; fail "redirect create returned $code"; }
     assert_no_default_exec_token "$create_response" || fail "redirect create exposed a default exec token"
@@ -1126,12 +1111,10 @@ run_redirect_flow() {
         || fail "redirect create returned an invalid e2b response"
     rm -f "$create_response"
 
-    code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
-    [ "$code" = "204" ] || [ "$code" = "200" ] || fail "redirect data-plane /health returned $code"
+    code="$(data_by_sid_code "$WORK/data-health.body" "$sid" "$envd_token")"
+    [ "$code" = "204" ] || [ "$code" = "200" ] || fail "post-restart redirect data-plane /health returned $code"
     wait_cluster_traffic_stats "$sid" idle || fail "redirect traffic did not publish/converge to idle"
-    step "PASS: redirected topology routed a real create and envd request ($code)"
-
-    run_redirect_recovery "$sid" "$envd_token"
+    step "PASS: post-restart redirected topology placed a real sandbox and routed one envd request ($code)"
     unset envd_token
 
     code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
