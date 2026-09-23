@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -146,6 +148,95 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 	}
 	if _, err := readyW.Write([]byte("x")); err == nil {
 		t.Fatal("ready fd remained open after exec failure")
+	}
+}
+
+func TestRunAssignedSandboxSessionCoversAssignmentAndLaunch(t *testing.T) {
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "config.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionAcked := make(chan struct{})
+	sessionClosed := make(chan struct{})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != configsock.PathRunSession || r.Method != http.MethodPut {
+			t.Fatalf("unexpected session request %s %s", r.Method, r.URL.Path)
+		}
+		var req configsock.RunSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode session request: %v", err)
+			return
+		}
+		if req.Kind != "sandbox" || req.RunID != "run-1" {
+			t.Errorf("session identity = %+v", req)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(configsock.RunSessionResponse{Kind: req.Kind, RunID: req.RunID}); err != nil {
+			t.Errorf("write session ack: %v", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(sessionAcked)
+		<-r.Context().Done()
+		close(sessionClosed)
+	})}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	defer func() {
+		_ = server.Close()
+		<-done
+	}()
+
+	vmmCgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmmCgroup.Close()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyR.Close()
+	launchErr := errors.New("launch returned")
+	err = runAssignedSandbox(nodepath.RunnerPID(filepath.Join(dir, "run"), "run-1"), socket, "run-1", runSandboxOps{
+		lockPidfile:   func(string) error { return nil },
+		prepareCgroup: func() (*os.File, error) { return vmmCgroup, nil },
+		openSession:   configsock.OpenRunSession,
+		waitAssignment: func(context.Context, string, string, string) (string, error) {
+			select {
+			case <-sessionAcked:
+			default:
+				t.Fatal("assignment started before run session was acknowledged")
+			}
+			select {
+			case <-sessionClosed:
+				t.Fatal("session closed before assignment")
+			default:
+			}
+			return "sid", nil
+		},
+		connectReady: func(string) (*os.File, error) { return readyW, nil },
+		launchTask: func(string, string, string, *os.File, *os.File) error {
+			select {
+			case <-sessionClosed:
+				t.Fatal("session closed before launch returned")
+			default:
+			}
+			return launchErr
+		},
+	})
+	if !errors.Is(err, launchErr) {
+		t.Fatalf("runAssignedSandbox error = %v, want %v", err, launchErr)
+	}
+	select {
+	case <-sessionClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run session was not closed after launch returned")
 	}
 }
 

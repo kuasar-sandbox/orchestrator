@@ -1,8 +1,8 @@
 package main
 
-// Shared scaffold for the in-unit sandbox launcher: lock the task pidfile
-// (double-start guard), fetch a LaunchSpec over the config-socket, then exec-replace
-// into the target so it inherits this PID (the unit's main pid + cgroup).
+// Shared scaffold for the in-unit sandbox launcher: lock the run pidfile
+// (double-start guard), fetch a LaunchSpec over the config-socket, then start
+// sandbox-ctl as the unit parent's direct child.
 
 import (
 	"context"
@@ -26,8 +26,8 @@ import (
 )
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
-// optional task-local artifact preparation, and exec-replaces into the target.
-// runAssignedSandbox has locked the task pidfile before this function is called.
+// optional task-local artifact preparation, and starts the sandbox-ctl child.
+// runAssignedSandbox has locked the run pidfile before this function is called.
 func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
 	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
@@ -166,8 +166,8 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
-	// These are the last fallible operations before exec/start. If exec itself
-	// fails, runAssignedSandbox's defers close the now-inheritable descriptors.
+	// These are the last fallible operations before exec/start. If the legacy exec
+	// seam fails, runAssignedSandbox's defers close the now-inheritable descriptors.
 	cancelDeadline()
 	stopContext()
 	if ops.startChild != nil {

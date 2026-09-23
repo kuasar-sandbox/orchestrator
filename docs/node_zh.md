@@ -141,8 +141,8 @@ task 取得 assignment 后立即连接 readiness、锁 task pidfile并取 bootst
 ManifestKey 覆盖进程环境,task 按 E/S kind 与 LaunchMode 打开 root、选择 PreparedSource 并提交
 capacity/network/ref closure 的非秘密 summary。唯一 launch worker随后 resolve resource/network→attach→以
 `starting AND run_id=<exact>` CAS 持久化 ownership→写非密 YAML→返回最终 LaunchSpec。
-runner追加本地保留的 ref-location并以同一 PID `execve sandbox-ctl run`→起 microVM→
-严格完成 runtime readiness wire→(e2b)直接
+runner追加本地保留的 ref-location并以直接子进程启动 `sandbox-ctl run`→起 microVM→
+父进程等待一次并上报有界执行结果, runtime 严格完成 readiness wire→(e2b)直接
 `POST /init` 置 env/默认用户→以 exact run-id CAS 为 `running`并开放数据面。集群下,该
 create 由 node-link 的
 `create` 命令触发;profile、group、route-key
@@ -307,20 +307,21 @@ conductor/Proxy 并列部署，不作为它们的 required dependency。
 
 systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--run-id` 是 systemd 实例名,
 `--pidfile` 指向 `<RunRoot>/runners/<RunID>.pid`,以 `fcntl(F_SETLK)` 排他锁防重入并写本
-PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者分道:
+PID → 在 `--config-socket` 上打开一个经认证的长生命周期 run session → WaitAssignment 取得业务 id(§6)。之后两者分道:
 
-- **run-sandbox**:取得 sid 后立即连接固定的
-  `<RunRoot>/sandboxes/<SandboxID>/ready.sock`(此时 readiness fd 保持 `FD_CLOEXEC`)→ 锁
-  `<RunRoot>/sandboxes/<SandboxID>/<SandboxID>.pid`→以 sid + exact run-id 取 bootstrap。cold image bootstrap
+- **run-sandbox**:保持为单元父进程。取得 sid 后立即连接固定的
+  `<RunRoot>/sandboxes/<SandboxID>/ready.sock`(此时 readiness fd 保持 `FD_CLOEXEC`)并以 sid + exact run-id 取 bootstrap；runtime 拥有的
+  `<RunRoot>/sandboxes/<SandboxID>/<SandboxID>.pid` 由后续 `sandbox-ctl` 锁定,父进程不持有。cold image bootstrap
   直接带最终 LaunchSpec,只需一次 RPC。E/S artifact bootstrap 带 task-local
   `ArtifactPrepareSpec` 与 authoritative `MANIFEST_KEY`;runner 覆盖继承环境,在本进程按
   source kind 与 durable LaunchMode 打开 E/S,提交同一 completion并等待最终 LaunchSpec。
   它保留 task-local `PreparedSource`、carrier binding 和 sorted ref-location,
-  显式关闭 reader/fetcher后才 `chdir(LaunchSpec.Workdir)`、剥除 `TASK_*`、合入 task/spec env。
-  仅在最后一次 `execve` 前清 readiness fd 的 `FD_CLOEXEC`,向 argv 追加其实际编号
-  `--ready-fd=<fd>`并替换为 `sandbox-ctl run`。目标继承本 PID、单元 cgroup、pidfile
-  锁 fd 和 readiness fd;任一 pre-exec/prepare 失败都会关闭 readiness连接,serve立即读到 EOF。
-- **run-builder**:完整任务准备、驻留执行、deadline 与结果交接见 [Build §4](node-build_zh.md#4-任务交接).
+  显式关闭 reader/fetcher后才启动直接子进程 `sandbox-ctl run`,并传入受信 VMM cgroup fd 与 readiness fd。
+  父进程在 `Start` 成功后关闭自己的 readiness 副本,对该子进程只 `Wait` 一次,然后通过 config socket
+  上报一个有界 `{sid, run_id, stage, exit_code|signal|error}` 执行结果再退出。长生命周期 session fd
+  只归父进程所有,不会继承给子进程。任一 prepare/start 失败都会关闭 readiness 连接,serve 立即读到 EOF；
+  子进程启动后的退出则经 durable result 路径上报。
+- **run-builder**:完整任务准备、驻留执行、deadline、共享 run-session 注册与 Build 结果交接见 [Build §4](node-build_zh.md#4-任务交接).
 
 ```
 node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
@@ -1312,11 +1313,11 @@ Delegate=yes
 
 完整 Builder unit 生命周期与资源责任边界见 [Build §4.1](node-build_zh.md#41-builder-unit-与进程生命周期).
 
-两单元的 ExecStart 都先锁 run-id pidfile,再经 config-socket WaitAssignment 等待
-业务 id。runner 取得 sid 后立即连接 readiness,再锁 `<RunDir>/<SandboxID>.pid`,以
-exact run-id取 bootstrap;artifact task在进程内完成 E/S prepare 和第二阶段后才取最终 LaunchSpec,
-随后 `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,`Type=exec` 故无需
-sd_notify)。Builder 的进程/子 VM 与结果回传见 [Build §4](node-build_zh.md#4-任务交接)。
+两单元的 ExecStart 都先锁 run-id pidfile,打开经认证的 run session,再经 config-socket WaitAssignment 等待
+业务 id。runner 取得 sid 后立即连接 readiness,以 exact run-id 取 bootstrap；runtime
+`<RunDir>/<SandboxID>.pid` 由 `sandbox-ctl` 拥有。artifact task 在进程内完成 E/S prepare 和第二阶段后才取最终 LaunchSpec。
+runner 父进程随后在同一单元 cgroup 内启动直接子进程 `sandbox-ctl run`,Start 后关闭自己的 readiness 副本,
+只 Wait 一次并上报有界执行结果；`Type=exec` 故无需 sd_notify。Builder 的进程/子 VM 与结果回传见 [Build §4](node-build_zh.md#4-任务交接)。
 
 serve 分别维护 runner/builder 的目标 idle 数量。分配会消费一个已进入 WaitAssignment
 的单元并立即登记异步补池;无 idle 时也生成 run-id、按同一路径启动单元并等待其

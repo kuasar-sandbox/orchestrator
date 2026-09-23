@@ -17,7 +17,8 @@ import (
 
 // runSandbox is the ExecStart of sandbox-runner@<run-id>.service: it waits until
 // the run-id is assigned a sandbox id, fetches that sandbox's LaunchSpec over the
-// config-socket, and exec-replaces into sandbox-ctl.
+// config-socket, starts sandbox-ctl as its direct child, waits once, and reports
+// the bounded child result before exiting.
 //
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 func runSandbox(args []string, log *slog.Logger) error {

@@ -208,10 +208,10 @@ a required dependency of, conductor/Proxy.
 
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
-These are systemd ExecStart launchers. Their common entry uses `--run-id` as the unit instance name and `--pidfile=<RunRoot>/runners/<RunID>.pid`. An exclusive `fcntl(F_SETLK)` lock prevents duplicate execution; the launcher writes its PID, then calls WaitAssignment over `--config-socket` to obtain its business ID (§6). They then diverge:
+These are systemd ExecStart launchers. Their common entry uses `--run-id` as the unit instance name and `--pidfile=<RunRoot>/runners/<RunID>.pid`. An exclusive `fcntl(F_SETLK)` lock prevents duplicate execution; the launcher writes its PID, opens one authenticated long-lived run session on `--config-socket`, then calls WaitAssignment to obtain its business ID (§6). They then diverge:
 
-- **run-sandbox:** immediately connect `<RunRoot>/sandboxes/<SandboxID>/ready.sock` with `FD_CLOEXEC` still set, lock `<RunDir>/<SandboxID>.pid`, and request bootstrap using SID plus exact RunID. Cold-image bootstrap returns final LaunchSpec in one RPC. E/S bootstrap returns task-local ArtifactPrepareSpec and authoritative `MANIFEST_KEY`; the runner overrides inherited environment, opens E/S according to kind and durable LaunchMode, submits the completion and waits for final LaunchSpec. It retains PreparedSource, carrier bindings and sorted ref-locations locally, explicitly closes readers/fetchers, then changes to LaunchSpec.Workdir, strips `TASK_*` and merges task/spec environment. Only immediately before final `execve` does it clear readiness FD's `FD_CLOEXEC`, append actual `--ready-fd=<fd>` and replace itself with `sandbox-ctl run`. The new program inherits PID, unit cgroup, pidfile lock FD and readiness FD. Any pre-exec/prepare failure closes readiness and conductor immediately observes EOF.
-- **run-builder:** complete task preparation, resident execution, deadlines and result handoff are in [Build §4](node-build.md#4-task-handoff).
+- **run-sandbox:** remains the unit parent. It immediately connects `<RunRoot>/sandboxes/<SandboxID>/ready.sock` with `FD_CLOEXEC` still set and requests bootstrap using SID plus exact RunID; the runtime-owned `<RunDir>/<SandboxID>.pid` is locked later by `sandbox-ctl`, not by the parent. Cold-image bootstrap returns final LaunchSpec in one RPC. E/S bootstrap returns task-local ArtifactPrepareSpec and authoritative `MANIFEST_KEY`; the runner overrides inherited environment, opens E/S according to kind and durable LaunchMode, submits the completion and waits for final LaunchSpec. It retains PreparedSource, carrier bindings and sorted ref-locations locally, explicitly closes readers/fetchers, then starts `sandbox-ctl run` as its direct child with the trusted VMM cgroup FD and readiness FD. The parent closes its readiness copy after `Start`, waits exactly once for that child, and reports one bounded `{sid, run_id, stage, exit_code|signal|error}` execution result over the config socket before exiting. The long-lived session FD stays parent-owned and is never inherited by the child. Any prepare/start failure closes readiness and conductor observes EOF; a post-start child exit is reported through the durable result path.
+- **run-builder:** complete task preparation, resident execution, deadlines, shared run-session registration and Build result handoff are in [Build §4](node-build.md#4-task-handoff).
 
 ```
 node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
@@ -1015,7 +1015,7 @@ Delegate=yes
 
 The complete Builder unit lifecycle and resource ownership rules are in [Build §4.1](node-build.md#41-builder-unit-and-process-lifecycle).
 
-Both ExecStart programs lock the RunID pidfile, then wait for business-ID assignment over config-socket. Runner connects readiness immediately after obtaining SID, locks `<RunDir>/<SandboxID>.pid` and requests exact-run bootstrap. Artifact tasks prepare E/S locally and complete the second stage before obtaining final LaunchSpec, then execve sandbox-ctl run with the same unit PID/cgroup. Type=exec requires no sd_notify. Builder process/child-VM and result behavior is defined in [Build §4](node-build.md#4-task-handoff).
+Both ExecStart programs lock the RunID pidfile, open the authenticated run session, then wait for business-ID assignment over config-socket. Runner connects readiness immediately after obtaining SID and requests exact-run bootstrap; the runtime `<RunDir>/<SandboxID>.pid` is owned by `sandbox-ctl`. Artifact tasks prepare E/S locally and complete the second stage before obtaining final LaunchSpec. The runner parent then starts `sandbox-ctl run` as a direct child in the same unit cgroup, closes its readiness copy after Start, waits once, and reports the bounded execution result. Type=exec requires no sd_notify. Builder process/child-VM and result behavior is defined in [Build §4](node-build.md#4-task-handoff).
 
 Runner and Builder each select the next list position at the existing Assign
 boundary and advance an independent cursor. Only selection holds the cursor
@@ -1175,7 +1175,7 @@ anything in that mode.
 
 Runner assignments alternate between the two runner pools; Builder assignments
 independently alternate between the two Builder pools. A prewarmed process is
-already placed before assignment. Runner exec-replacement and Builder child
+already placed before assignment. Runner children and Builder child
 processes remain under the selected unit; the Builder's A/B/C phases that actually
 run use that same Builder, not fresh pool selections. In-guest work runs through
 those phase VMMs. Do not bind only the Conductor daemon: systemd starts the units,
