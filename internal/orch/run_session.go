@@ -230,23 +230,45 @@ func (o *Orchestrator) checkDisconnectedRunningSandbox(ctx context.Context, sb *
 }
 
 func (o *Orchestrator) retireUnassignedRun(kind, runID string) bool {
-	unit, waiting := o.runs.owner(runID)
-	if !waiting || unit == "" {
+	unit, pool, waiting := o.runs.ownerPool(runID)
+	if !waiting || unit == "" || pool == nil {
 		return false
 	}
-	o.runs.forget(runID)
-	go func() {
-		ctx, cancel := cleanupContext()
-		defer cancel()
-		if err := o.lc.Stop(ctx, unit); err != nil {
-			o.log.Warn("retire disconnected unassigned run", "kind", kind, "run_id", runID, "unit", unit, "err", err)
-			return
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	unit, retired, err := pool.RetireUnassigned(ctx, runID, func(checkCtx context.Context) (bool, error) {
+		assigned, err := o.runSessionDurableAssigned(checkCtx, kind, runID)
+		if err != nil || assigned {
+			return false, err
 		}
-		if err := o.lc.ResetFailed(ctx, unit); err != nil {
-			o.log.Warn("reset disconnected unassigned run", "kind", kind, "run_id", runID, "unit", unit, "err", err)
-		}
-	}()
+		return true, nil
+	})
+	if err != nil {
+		o.log.Warn("retire disconnected unassigned run", "kind", kind, "run_id", runID, "unit", unit, "err", err)
+		return false
+	}
+	if !retired {
+		return false
+	}
+	o.log.Info("retired disconnected unassigned run", "kind", kind, "run_id", runID, "unit", unit)
 	return true
+}
+
+func (o *Orchestrator) runSessionDurableAssigned(ctx context.Context, kind, runID string) (bool, error) {
+	switch kind {
+	case runKindSandbox:
+		_, found, err := o.st.GetSandboxIDByCurrentRunID(ctx, runID)
+		return found, err
+	case runKindBuild:
+		buildID, found, err := o.st.GetClaimedBuildIDByRunID(ctx, runID)
+		if err != nil || !found {
+			return found, err
+		}
+		allowed, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
+		return allowed, err
+	default:
+		return false, nil
+	}
 }
 
 func (o *Orchestrator) runSessionActive(kind, runID string) bool {

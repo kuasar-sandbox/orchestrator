@@ -8,10 +8,10 @@
 //     Authed by SO_PEERCRED peer pid == the run-id pidfile
 //     (/run/sandbox/runners/<run-id>.pid).
 //   - task   (POST /internal/task/{sandbox,build}/{bootstrap,prepare}):
-//     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
-//     SO_PEERCRED peer pid == the task pidfile
-//     (/run/sandbox/sandboxes/<sid>/<sid>.pid or
-//     /run/sandbox/builds/<build-id>/builder.pid).
+//     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Sandbox
+//     bootstrap/prepare auth uses the parent run-id pidfile
+//     (/run/sandbox/runners/<run-id>.pid), while Build uses
+//     /run/sandbox/builds/<build-id>/builder.pid after assignment.
 //   - admin  (/internal/admin/manifest-keys and sandbox MMDS route-value paths):
 //     manifest-key allowlist management plus bounded secret PUT/DELETE. Authed by
 //     SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the socket's

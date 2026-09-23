@@ -42,16 +42,22 @@ func TestRunSessionRejectsFormattedButUnknownRunID(t *testing.T) {
 
 func TestRunSessionDisconnectRetiresOnlyUnassignedPoolWorker(t *testing.T) {
 	o := testOrch(t)
-	lc := newRunPoolTestLauncher()
+	p, lc, baseCtx, _ := startRunPoolTestWithIndex(t, 1, &o.runs)
 	o.lc = lc
-	runID := "sr-00000000-0000-7000-8000-000000000428"
-	pool := &runPool{unitName: testRunUnit}
-	o.runs.register(runID, pool)
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
 	session, ok, err := o.RegisterRunSession(context.Background(), runKindSandbox, runID)
 	if err != nil || !ok {
 		t.Fatalf("RegisterRunSession = ok %v err %v", ok, err)
 	}
 	session.Close(false)
+	select {
+	case got := <-waiter.resp:
+		if got.err == nil || got.ok || got.taskID != "" {
+			t.Fatalf("retired waiter = %+v, want error", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unassigned disconnected waiter was not released")
+	}
 	select {
 	case unit := <-lc.stopped:
 		if unit != testRunUnit(runID) {
@@ -70,6 +76,88 @@ func TestRunSessionDisconnectRetiresOnlyUnassignedPoolWorker(t *testing.T) {
 	}
 	if unit := o.runs.unit(runID); unit != "" {
 		t.Fatalf("retired unassigned run remained indexed as %q", unit)
+	}
+}
+
+func TestRunSessionDisconnectRetirementLosesToSandboxAssignmentCommit(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-assign-race")
+	fixture.sb.State = types.StateStarting
+	fixture.sb.RunID = ""
+	fixture.sb.LaunchMode = types.LaunchImage
+	fixture.sb.ExecutionResult = nil
+	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	p, lc, baseCtx, _ := startRunPoolTestWithIndex(t, 1, &fixture.o.runs)
+	fixture.o.lc = lc
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
+	session, ok, err := fixture.o.RegisterRunSession(context.Background(), runKindSandbox, runID)
+	if err != nil || !ok {
+		t.Fatalf("RegisterRunSession = ok %v err %v", ok, err)
+	}
+	commitStarted := make(chan struct{})
+	commitGate := make(chan struct{})
+	assignDone := make(chan error, 1)
+	go func() {
+		_, err := p.Assign(baseCtx, fixture.sb.ID, func(gotRunID string) error {
+			if gotRunID != runID {
+				t.Errorf("commit runID = %q, want %q", gotRunID, runID)
+			}
+			changed, err := fixture.o.st.BindStartingRunner(context.Background(), fixture.sb.ID, gotRunID)
+			if err != nil || !changed {
+				return errors.New("BindStartingRunner did not commit")
+			}
+			close(commitStarted)
+			<-commitGate
+			return nil
+		})
+		assignDone <- err
+	}()
+	select {
+	case <-commitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("assignment commit did not start")
+	}
+	disconnectDone := make(chan struct{})
+	go func() {
+		session.Close(false)
+		close(disconnectDone)
+	}()
+	select {
+	case <-disconnectDone:
+		t.Fatal("disconnect retirement completed while assignment commit was in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(commitGate)
+	select {
+	case err := <-assignDone:
+		if err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("assignment did not finish")
+	}
+	select {
+	case got := <-waiter.resp:
+		if !got.ok || got.taskID != fixture.sb.ID || got.err != nil {
+			t.Fatalf("waiter assignment = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not receive assignment")
+	}
+	select {
+	case <-disconnectDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("disconnect did not finish after assignment")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		t.Fatalf("disconnect retirement stopped assigned unit %s", stopped)
+	case <-time.After(50 * time.Millisecond):
+	}
+	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || got == nil || got.RunID != runID || got.State != types.StateStarting {
+		t.Fatalf("durable assignment after disconnect race = %+v, %v", got, err)
 	}
 }
 

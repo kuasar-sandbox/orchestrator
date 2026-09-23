@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,7 +207,7 @@ func TestRunAssignedSandboxSessionCoversAssignmentAndLaunch(t *testing.T) {
 	err = runAssignedSandbox(nodepath.RunnerPID(filepath.Join(dir, "run"), "run-1"), socket, "run-1", runSandboxOps{
 		lockPidfile:   func(string) error { return nil },
 		prepareCgroup: func() (*os.File, error) { return vmmCgroup, nil },
-		openSession:   configsock.OpenRunSession,
+		openSession:   openRunSessionKeeper,
 		waitAssignment: func(context.Context, string, string, string) (string, error) {
 			select {
 			case <-sessionAcked:
@@ -237,6 +238,144 @@ func TestRunAssignedSandboxSessionCoversAssignmentAndLaunch(t *testing.T) {
 	case <-sessionClosed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("run session was not closed after launch returned")
+	}
+}
+
+func startRunSessionOnlyServer(t *testing.T, socket string, sessionAck chan<- int, sessionClosed chan<- int, sessionCount *atomic.Int32) (*http.Server, <-chan error) {
+	t.Helper()
+	_ = os.Remove(socket)
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != configsock.PathRunSession || r.Method != http.MethodPut {
+			t.Errorf("unexpected session request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		var req configsock.RunSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode session request: %v", err)
+			return
+		}
+		if req.Kind != "sandbox" || req.RunID != "run-1" {
+			t.Errorf("session identity = %+v", req)
+			return
+		}
+		n := int(sessionCount.Add(1))
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(configsock.RunSessionResponse{Kind: req.Kind, RunID: req.RunID}); err != nil {
+			t.Errorf("write session ack: %v", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case sessionAck <- n:
+		default:
+		}
+		<-r.Context().Done()
+		select {
+		case sessionClosed <- n:
+		default:
+		}
+	})}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	return server, done
+}
+
+func TestRunAssignedSandboxSessionReconnectDoesNotDuplicateAssignmentOrLaunch(t *testing.T) {
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "config.sock")
+	sessionAck := make(chan int, 8)
+	sessionClosed := make(chan int, 8)
+	var sessionCount atomic.Int32
+	server1, done1 := startRunSessionOnlyServer(t, socket, sessionAck, sessionClosed, &sessionCount)
+	var server2 *http.Server
+	var done2 <-chan error
+	defer func() {
+		if server2 != nil {
+			_ = server2.Close()
+			<-done2
+		}
+	}()
+
+	vmmCgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmmCgroup.Close()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyR.Close()
+	var assignments atomic.Int32
+	var launches atomic.Int32
+	launchErr := errors.New("launch returned")
+	err = runAssignedSandbox(nodepath.RunnerPID(filepath.Join(dir, "run"), "run-1"), socket, "run-1", runSandboxOps{
+		lockPidfile:   func(string) error { return nil },
+		prepareCgroup: func() (*os.File, error) { return vmmCgroup, nil },
+		openSession:   openRunSessionKeeper,
+		waitAssignment: func(context.Context, string, string, string) (string, error) {
+			if assignments.Add(1) != 1 {
+				t.Fatal("assignment called more than once")
+			}
+			select {
+			case got := <-sessionAck:
+				if got != 1 {
+					t.Fatalf("first session ack = %d", got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("first session was not acknowledged before assignment")
+			}
+			_ = server1.Close()
+			select {
+			case err := <-done1:
+				if err != http.ErrServerClosed {
+					t.Fatalf("first server returned %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("first server did not stop")
+			}
+			server2, done2 = startRunSessionOnlyServer(t, socket, sessionAck, sessionClosed, &sessionCount)
+			select {
+			case got := <-sessionAck:
+				if got != 2 {
+					t.Fatalf("reconnected session ack = %d", got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("run session did not reconnect after server restart")
+			}
+			return "sid", nil
+		},
+		connectReady: func(string) (*os.File, error) { return readyW, nil },
+		launchTask: func(string, string, string, *os.File, *os.File) error {
+			if launches.Add(1) != 1 {
+				t.Fatal("launch called more than once")
+			}
+			return launchErr
+		},
+	})
+	if !errors.Is(err, launchErr) {
+		t.Fatalf("runAssignedSandbox error = %v, want %v", err, launchErr)
+	}
+	if got := assignments.Load(); got != 1 {
+		t.Fatalf("assignments = %d, want 1", got)
+	}
+	if got := launches.Load(); got != 1 {
+		t.Fatalf("launches = %d, want 1", got)
+	}
+	select {
+	case got := <-sessionClosed:
+		if got != 1 && got != 2 {
+			t.Fatalf("closed session = %d", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no session close observed")
 	}
 }
 

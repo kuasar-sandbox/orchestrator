@@ -62,6 +62,71 @@ func (s *RunSession) Done() <-chan error {
 	return s.done
 }
 
+type RunSessionKeeper struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func OpenRunSessionKeeper(ctx context.Context, socket, kind, runID string) (*RunSessionKeeper, error) {
+	first, err := OpenRunSession(ctx, socket, kind, runID)
+	if err != nil {
+		return nil, err
+	}
+	keeperCtx, cancel := context.WithCancel(ctx)
+	k := &RunSessionKeeper{cancel: cancel, done: make(chan struct{})}
+	go k.keep(keeperCtx, socket, kind, runID, first)
+	return k, nil
+}
+
+func (k *RunSessionKeeper) Close() error {
+	if k == nil {
+		return nil
+	}
+	k.cancel()
+	<-k.done
+	return nil
+}
+
+func (k *RunSessionKeeper) keep(ctx context.Context, socket, kind, runID string, session *RunSession) {
+	defer close(k.done)
+	defer session.Close()
+	delay := 20 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-session.Done():
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			next, err := OpenRunSession(ctx, socket, kind, runID)
+			if err == nil {
+				_ = session.Close()
+				session = next
+				delay = 20 * time.Millisecond
+				break
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if delay < time.Second {
+				delay *= 2
+				if delay > time.Second {
+					delay = time.Second
+				}
+			}
+		}
+	}
+}
+
 func OpenRunSession(ctx context.Context, socket, kind, runID string) (*RunSession, error) {
 	body, _ := json.Marshal(RunSessionRequest{Kind: kind, RunID: runID})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost"+PathRunSession, bytes.NewReader(body))

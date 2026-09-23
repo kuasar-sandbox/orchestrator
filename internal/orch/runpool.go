@@ -28,6 +28,7 @@ type runPool struct {
 	controlCh       chan runControlReq
 	consumeCancelCh chan *runConsumeReq
 	waitCancelCh    chan *runWaitReq
+	retireCh        chan *runRetireReq
 	done            chan struct{}
 }
 
@@ -73,6 +74,19 @@ type runControlReq struct {
 	runID string
 }
 
+type runRetireReq struct {
+	runID string
+	ctx   context.Context
+	fence func(context.Context) (bool, error)
+	resp  chan runRetireResp
+}
+
+type runRetireResp struct {
+	unit    string
+	retired bool
+	err     error
+}
+
 type idleRun struct {
 	runID string
 	req   *runWaitReq
@@ -87,6 +101,7 @@ func newRunPool(kind string, size int, waitTimeout time.Duration, runRoot string
 		controlCh:       make(chan runControlReq),
 		consumeCancelCh: make(chan *runConsumeReq, 128),
 		waitCancelCh:    make(chan *runWaitReq, 128),
+		retireCh:        make(chan *runRetireReq),
 		done:            make(chan struct{}),
 	}
 }
@@ -138,6 +153,22 @@ func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, boo
 	return res.taskID, res.ok, res.err
 }
 
+func (p *runPool) RetireUnassigned(ctx context.Context, runID string, fence func(context.Context) (bool, error)) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	req := &runRetireReq{runID: runID, ctx: ctx, fence: fence, resp: make(chan runRetireResp, 1)}
+	select {
+	case p.retireCh <- req:
+	case <-ctx.Done():
+		return "", false, ctx.Err()
+	case <-p.done:
+		return "", false, fmt.Errorf("run pool: stopped")
+	}
+	res := <-req.resp
+	return res.unit, res.retired, res.err
+}
+
 func (p *runPool) loop(ctx context.Context) {
 	defer close(p.done)
 	defer p.runs.forgetWaiting(p)
@@ -170,6 +201,9 @@ func (p *runPool) loop(ctx context.Context) {
 		if req.stopCancel != nil {
 			req.stopCancel()
 		}
+		req.resp <- resp
+	}
+	replyRetire := func(req *runRetireReq, resp runRetireResp) {
 		req.resp <- resp
 	}
 
@@ -417,6 +451,35 @@ func (p *runPool) loop(ctx context.Context) {
 			removeStartAttempt(req.runID, nil)
 			failExhausted()
 			trimIdle()
+			ensure()
+		case req := <-p.retireCh:
+			if err := req.ctx.Err(); err != nil {
+				replyRetire(req, runRetireResp{err: err})
+				continue
+			}
+			idx := -1
+			for i, waiting := range idle {
+				if waiting.runID == req.runID {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				replyRetire(req, runRetireResp{})
+				continue
+			}
+			if req.fence != nil {
+				ok, err := req.fence(req.ctx)
+				if err != nil || !ok {
+					replyRetire(req, runRetireResp{err: err})
+					continue
+				}
+			}
+			w := idle[idx]
+			idle = slices.Delete(idle, idx, idx+1)
+			replyWait(w.req, runWaitResp{err: fmt.Errorf("run pool: idle session disconnected")})
+			queueControl(runControlReq{op: "stop", runID: w.runID})
+			replyRetire(req, runRetireResp{unit: p.unitName(w.runID), retired: true})
 			ensure()
 		case req := <-p.consumeCancelCh:
 			for i, pendingReq := range pending {

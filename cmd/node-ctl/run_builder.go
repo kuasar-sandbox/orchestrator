@@ -78,7 +78,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 		return fmt.Errorf("prepare builder cgroup: %w", err)
 	}
 	defer vmmCgroup.Close()
-	session, err := configsock.OpenRunSession(ctx, *socket, "build", *runID)
+	session, err := configsock.OpenRunSessionKeeper(ctx, *socket, "build", *runID)
 	if err != nil {
 		return fmt.Errorf("open run session: %w", err)
 	}

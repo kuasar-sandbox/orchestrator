@@ -80,13 +80,18 @@ func (r *runIndex) assigned(runID string) {
 }
 
 func (r *runIndex) owner(runID string) (unit string, waiting bool) {
+	unit, _, waiting = r.ownerPool(runID)
+	return unit, waiting
+}
+
+func (r *runIndex) ownerPool(runID string) (unit string, pool *runPool, waiting bool) {
 	if r == nil {
-		return "", false
+		return "", nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, waiting = r.waiting[runID]
-	return r.units[runID], waiting
+	pool, waiting = r.waiting[runID]
+	return r.units[runID], pool, waiting
 }
 
 func (r *runIndex) forget(runID string) {

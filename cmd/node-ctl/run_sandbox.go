@@ -36,6 +36,7 @@ func runSandbox(args []string, log *slog.Logger) error {
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
 		lockPidfile:    lockPidfile,
 		prepareCgroup:  func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
+		openSession:    openRunSessionKeeper,
 		waitAssignment: configsock.WaitAssignment,
 		connectReady:   connectReadinessSocket,
 		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
@@ -46,10 +47,16 @@ func runSandbox(args []string, log *slog.Logger) error {
 	})
 }
 
+type runSessionCloser interface{ Close() error }
+
+func openRunSessionKeeper(ctx context.Context, socket, kind, runID string) (runSessionCloser, error) {
+	return configsock.OpenRunSessionKeeper(ctx, socket, kind, runID)
+}
+
 type runSandboxOps struct {
 	lockPidfile    func(string) error
 	prepareCgroup  func() (*os.File, error)
-	openSession    func(context.Context, string, string, string) (*configsock.RunSession, error)
+	openSession    func(context.Context, string, string, string) (runSessionCloser, error)
 	waitAssignment func(context.Context, string, string, string) (string, error)
 	connectReady   func(string) (*os.File, error)
 	launchTask     func(string, string, string, *os.File, *os.File) error

@@ -72,11 +72,16 @@ func runIDFromTestUnit(unit string) string {
 }
 
 func startRunPoolTest(t *testing.T, size int) (*runPool, *runPoolTestLauncher, context.Context, context.CancelFunc) {
+	return startRunPoolTestWithIndex(t, size, nil)
+}
+
+func startRunPoolTestWithIndex(t *testing.T, size int, runs *runIndex) (*runPool, *runPoolTestLauncher, context.Context, context.CancelFunc) {
 	t.Helper()
 	lc := newRunPoolTestLauncher()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	p := newRunPool(runKindSandbox, size, time.Second, t.TempDir(), lc, testRunUnit, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p.runs = runs
 	if err := p.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -707,5 +712,112 @@ func TestRunPoolStartReportsPidDirectoryFailure(t *testing.T) {
 	p := newRunPool(runKindSandbox, 1, time.Second, blocked, newRunPoolTestLauncher(), testRunUnit, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := p.Start(context.Background()); err == nil {
 		t.Fatal("Start succeeded with an unusable run root")
+	}
+}
+
+func TestRunPoolRetireLosesToAssignmentCommit(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
+	commitStarted := make(chan struct{})
+	commitGate := make(chan struct{})
+	assignDone := make(chan struct {
+		runID string
+		err   error
+	}, 1)
+	go func() {
+		got, err := p.Assign(baseCtx, "assigned-task", func(gotRunID string) error {
+			if gotRunID != runID {
+				t.Errorf("commit runID = %q, want %q", gotRunID, runID)
+			}
+			close(commitStarted)
+			<-commitGate
+			return nil
+		})
+		assignDone <- struct {
+			runID string
+			err   error
+		}{got, err}
+	}()
+	select {
+	case <-commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("assignment commit did not start")
+	}
+
+	retireDone := make(chan runRetireResp, 1)
+	go func() {
+		unit, retired, err := p.RetireUnassigned(baseCtx, runID, func(context.Context) (bool, error) { return true, nil })
+		retireDone <- runRetireResp{unit: unit, retired: retired, err: err}
+	}()
+	select {
+	case res := <-retireDone:
+		t.Fatalf("retire completed while assignment commit was in progress: %+v", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(commitGate)
+
+	select {
+	case res := <-assignDone:
+		if res.err != nil || res.runID != runID {
+			t.Fatalf("Assign = %q, %v", res.runID, res.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("assignment did not complete")
+	}
+	select {
+	case got := <-waiter.resp:
+		if !got.ok || got.taskID != "assigned-task" || got.err != nil {
+			t.Fatalf("waiter assignment = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not receive assignment")
+	}
+	select {
+	case res := <-retireDone:
+		if res.retired || res.unit != "" || res.err != nil {
+			t.Fatalf("retire after assignment = %+v, want no-op", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retire did not complete after assignment")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		t.Fatalf("retire stopped assigned unit %s", stopped)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestRunPoolRetireWinsBeforeAssignmentAndFenceCanVeto(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
+	unit, retired, err := p.RetireUnassigned(baseCtx, runID, func(context.Context) (bool, error) { return false, nil })
+	if err != nil || retired || unit != "" {
+		t.Fatalf("fenced retire = unit %q retired %t err %v, want no-op", unit, retired, err)
+	}
+	select {
+	case stopped := <-lc.stopped:
+		t.Fatalf("fenced retire stopped unit %s", stopped)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unit, retired, err = p.RetireUnassigned(baseCtx, runID, func(context.Context) (bool, error) { return true, nil })
+	if err != nil || !retired || unit != testRunUnit(runID) {
+		t.Fatalf("retire = unit %q retired %t err %v", unit, retired, err)
+	}
+	select {
+	case got := <-waiter.resp:
+		if got.err == nil || got.ok || got.taskID != "" {
+			t.Fatalf("retired waiter = %+v, want error", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired waiter did not receive error")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		if stopped != testRunUnit(runID) {
+			t.Fatalf("stopped unit = %q, want %q", stopped, testRunUnit(runID))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired unit was not stopped")
 	}
 }
