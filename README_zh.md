@@ -109,6 +109,23 @@ make test                       # 单元测试
 make test-e2e                   # 组件 owner suite,需要项目组装的完整 BIN
 ```
 
+Owner suite 包含 `e2e_capture_cli.sh`,使用所选真实 `sandbox-ctl` 和 `node-ctl`
+执行 `TestCapturePairCLIToPausedDatabase`、`TestUploadCaptureCLIToPausedDatabase`
+和 `TestExportPublicationCLIAPI`. 全部当前子用例都必须完成且不得 Skip,包括
+结构化结果提交前删除载体、拒绝撕裂的 capture 响应,以及制品不可读后的 portable
+CLI/API 矩阵. 缺产品、缺 helper、空选择或只有父测试结果均失败.
+本地可选 `go test` 未设置 `KUASAR_TEST_SANDBOX_CTL` 时仍可跳过这些组,
+但不能作为必需入口的执行证据.
+
+`make test-e2e` 在既有 fixture 阶段编译测试 helper. Hosted artifact 验证在
+prepare 前按独立固定的 owner test revision 构建 `orch-cli.test`;runner 只消费
+该执行文件与 `BIN`,不获取源码或编译. 针对性入口为:
+
+```bash
+BIN=/path/to/selected/bin ORCH_CLI_TEST_BIN=/path/to/prepared/orch-cli.test \
+  bash test/e2e/e2e_capture_cli.sh
+```
+
 真实沙箱要求 Linux、systemd、root 权限、KVM、sandboxer、connector 及 guest-runtime 产生的 Runtime/VMLinux 制品。
 变更范围可以限定在本仓，构建仍需上述依赖闭包；跨仓契约变更必须关联 companion PR 并使用精确源码组合的集成测试验证，
 见 [Organization 贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。

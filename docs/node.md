@@ -1925,9 +1925,15 @@ unavailable, then re-export. Capture cases delete the carrier before returning
 the structured result and require torn responses to leave the running row and
 old pair unchanged.
 
-The three CLI integration groups currently require explicit opt-in; an ordinary
-`go test` without `KUASAR_TEST_SANDBOX_CTL` skips them. With `BIN` pointing to the
-selected, already built product directory, run from this repository:
+The required owner entry [e2e_capture_cli.sh](../test/e2e/e2e_capture_cli.sh) runs
+all three CLI integration groups and every current subcase against the selected
+real products. Missing `BIN` products or the prepared `ORCH_CLI_TEST_BIN`, an
+empty selection, an unfinished subcase or any Skip fails this entry. The existing
+build/helper stage compiles the test executable from its independent test pin;
+hosted artifact E2E consumes that executable and `BIN` without source checkout
+or compilation. Optional local `go test` still skips these groups without
+`KUASAR_TEST_SANDBOX_CTL`. With `BIN` pointing to the selected, already built
+product directory, run from this repository:
 
 ```bash
 KUASAR_TEST_SANDBOX_CTL="$BIN/sandbox-ctl" go test ./internal/orch \

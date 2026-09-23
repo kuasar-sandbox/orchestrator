@@ -106,6 +106,26 @@ make test                       # unit tests
 make test-e2e                   # component owner suite; requires the assembled project BIN
 ```
 
+The owner suite includes `e2e_capture_cli.sh`, which runs
+`TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase` and
+`TestExportPublicationCLIAPI` against the selected real `sandbox-ctl` and
+`node-ctl`. It requires every current subcase to finish without Skip, including
+carrier deletion before structured-result commit, rejection of torn capture
+responses and the portable CLI/API matrix after artifact access is removed.
+Missing products, missing helpers, empty selections and parent-only results fail.
+An optional local `go test` without `KUASAR_TEST_SANDBOX_CTL` may still skip these
+groups; that is not evidence for the required entry.
+
+`make test-e2e` compiles the test helper in its existing fixture stage. Hosted
+artifact validation builds `orch-cli.test` from the independently pinned owner
+test revision before preparation; the runner consumes only that executable and
+`BIN`, without fetching sources or compiling. The focused entry is:
+
+```bash
+BIN=/path/to/selected/bin ORCH_CLI_TEST_BIN=/path/to/prepared/orch-cli.test \
+  bash test/e2e/e2e_capture_cli.sh
+```
+
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
 Source builds require Go 1.26.1 or newer and sibling checkouts of `accelerator`,

@@ -85,6 +85,7 @@ test:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_density_*.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_orchestrator_proxy_go.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_placer_readiness.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_capture_cli.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-telemetry-image-pull.py
 
 vet:
@@ -101,11 +102,13 @@ clean:
 # platform binary set supplied by Integration E2E.
 e2e-fixtures:
 	bash scripts/ci-e2e-build.sh fixtures "$(TARGET_ARCH)" "$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)"
+	bash scripts/ci-e2e-build.sh cli "$(TARGET_ARCH)" "$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)"
 
 test-e2e: e2e-fixtures
 	bash scripts/ci-source-checks.sh
 	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" \
 		CUSTOM_PROXY_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/custom-proxy" \
+		ORCH_CLI_TEST_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/orch-cli.test" \
 		TELEMETRY_GRPC_PROBE_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/telemetry-grpc-probe" bash test/e2e/run_all.sh
 
 test-e2e-cluster-stub:
