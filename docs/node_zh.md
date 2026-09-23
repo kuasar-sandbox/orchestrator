@@ -83,7 +83,7 @@ profile 编码在 templateID 前缀里（[Build §2](node-build_zh.md#2-模板-i
 - 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.2)。
 - 独立 Telemetry 实现 envd/OTLP 采集与 E2B `/sandboxes/{SandboxID}/metrics` 历史；
   Conductor 只鉴权、检查 ownership 并转发到 live query UDS，完整契约见
-  [Telemetry](telemetry_zh.md)。`/stats/resource`、`/stats/traffic` 和 `/stats/usage` 均保持独立; 参见 §4.1.1 和[原生 usage](node-usage_zh.md).
+  [Telemetry](telemetry_zh.md)。`/stats/resource`、`/stats/traffic` 和 `/stats/usage` 均保持独立; 参见 §4.1.1 和[原生 usage](node_zh.md#原生-usage).
 - 服务端不解析 Dockerfile；客户端展开的结构化 steps 会在构建 guest 内执行，支持镜像拉取、
   展平与最多三阶段流水线（[Build §5](node-build_zh.md#5-按目标执行与发布)）。
 - 节点本地:路由、存储、单元管理都是节点本地的;跨机快照/模板使用 canonical
@@ -473,7 +473,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
-| `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | image cold、`run --from`、`run --restore` 共用的原生生命周期计量策略; 严格校验, 不进入 portable artifact, 独立于 telemetry. 参见[原生 usage](node-usage_zh.md) |
+| `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | image cold、`run --from`、`run --restore` 共用的原生生命周期计量策略; 严格校验, 不进入 portable artifact, 独立于 telemetry. 参见[原生 usage 策略](#33-原生-usage-策略) |
 | `sandbox.dead_ttl` | `24h` | 已完成全部本地 cleanup、无任何 owner 的 `dead` Sandbox 诊断记录保留期；必须为正 Go duration |
 | `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 Capacity。img 冷启可由 create/group 覆盖;restore Capacity 由 snapshot 固定 |
 | `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / 省略时继承 `256MiB` | CPU 是相对调度权重，不是硬性小数核保证；memory 是 settled guest headroom,不是 total Budget。conductor 配置省略 memory 时可随最终 Capacity 收敛；operator/custom 显式值（即使等于 `256MiB`）不得静默收敛，越界直接拒绝。request patch 的 pointer schema 与规则不变 |
@@ -562,6 +562,27 @@ Proxy 是唯一数据面闸门);`mmds.routes.enabled=true` 还要求 `mmds.enabl
 identity并自动写入每个 dynamic sandbox YAML;没有第二个
 `sandbox.resources.control_socket` 配置源。startup 对 static/dynamic 使用同一 headroom
 语义,不依赖 controller 是否启用。
+
+### 3.3 原生 usage 策略
+
+```yaml
+sandbox:
+  usage:
+    enabled: true
+    sample_interval: 1s
+    flush_interval: 5m
+```
+
+默认值分别为 false、`1s` 和 `5m`. 周期必须是正的 Go duration, flush 不小于
+sample, sample 的两倍不得超出原生有符号 duration 范围. 关闭时也执行校验.
+显式 null、错误类型、未知/重复字段和 YAML merge key 均拒绝. Clone、配置输出、
+外部 conductor bootstrap 和 Configure hook 后的最终校验保留同一策略.
+
+Conductor 将节点策略下发到 image cold start、`run --from` 和 `run --restore`.
+Usage 是宿主策略, 不进入 portable E/S artifact; 恢复使用当前节点策略. 启用
+telemetry 不会启用 usage, 停止 telemetry 不会停止原生计量. `flush_interval`
+调度原生 append, 不触发 fsync 或设备缓存 flush. 参见经实际解析器校验的
+[conductor 部署示例](../deploy/conductor.example.yaml).
 
 ## 4. e2b API 契约
 
@@ -769,7 +790,75 @@ admission算法、误差证明、worker-local状态机、绝对快照 stream 和
 
 Conductor 每个 switch 最多批量读取 64 个当前端口,调用 connector Go `Stats(ports)`,不逐沙箱启动 CLI,不维护第二套生命周期权威. 它复用原有 allocation/detach fence;connector 复用 pin 目录共享锁、当前 pinned-map ID 和清零确认标记. 既有 Proxy stats socket 也支持有界批量. 已配置来源读取失败、清零未确认、控制锁占用、结果不完整或绑定变化时,整个读取返回 503,不会用 0 或旧样本伪装完整响应. 公开 API、可信本机 batch 与 conductor extension 共用相同领域读取. Stats 独立于 telemetry,不参与 Create/Resume readiness.
 
-原生生命周期计量通过 `/sandboxes/{id}/stats/usage` 发布, paused 对象也可读取. 它独立选择 current/saved/history, 完整保留原生无损记录, 不用 resource counter 替代. 参见[原生 usage 与可信 batch 读取](node-usage_zh.md).
+##### 原生 usage
+
+Conductor 在 `/stats/resource` 和 `/stats/traffic` 之外发布
+`GET /sandboxes/{SandboxID}/stats/usage`. Usage 读取 sandboxer 已有的原生生命周期
+计量. Resource stats 描述当前生效规格和 VMM 观测; traffic stats 描述既有 Proxy
+ingress 观测. 这些接口独立于 telemetry 及其
+`/sandboxes/{SandboxID}/metrics` 历史查询. 原生账本格式和 runtime 查询合同由
+[sandboxer usage](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#usage-query)维护.
+
+每次公开读取均认证 API key 并核对精确 SandboxID 的归属. StableID 只是关联标签,
+不能作为查询别名. Conductor 定位当前对象, 调用与 `sandbox-ctl usage` 共用的
+sandboxer [`pkg/usagereader.Read`](https://github.com/kuasar-sandbox/sandboxer/blob/main/pkg/usagereader/read.go).
+它不复制原生 codec、恢复、锁或历史读取算法. Telemetry 只经 conductor 获取原生
+section, 不打开沙箱 `ctl.sock` 或 `.usage` 文件.
+
+```sh
+curl -H "X-API-Key: $API_KEY" "$NODE_API/sandboxes/$SANDBOX_ID/stats/usage"
+curl -H "X-API-Key: $API_KEY" "$NODE_API/sandboxes/$SANDBOX_ID/stats/usage?view=saved"
+curl -H "X-API-Key: $API_KEY" "$NODE_API/sandboxes/$SANDBOX_ID/stats/usage?view=history&cursor=0&limit=10"
+```
+
+| 参数 | 合同 |
+|---|---|
+| `view` | `current` (默认)、`saved` 或 `history` |
+| `cursor` | 仅 history; 非负十进制字节位置, 默认 `0`. 原样保留返回的 `next_cursor` 字符串, 不经过浮点转换 |
+| `limit` | 仅 history; 整数 `1`–`100`, 默认 `10`. 超出原生 1 MiB 页面上限时应减小 |
+
+未知、重复、空值或格式错误的参数返回 400. 不提供 `/usage` 别名. 响应包含
+`Cache-Control: no-store`. 普通认证错误保持不变; 对象不存在或 SandboxID 不属于
+调用方时返回 404. 文件缺失、活动 writer 锁冲突、owner 不可用、owner 身份无效、
+读取失败、超时和并发 runtime 替换返回 503. 合法 View 中的原生
+`read_error`/`save_error` 仍完整保留, 不丢弃或转换为零.
+
+`current` 返回原生 View; `saved` 返回省略 `live` 的同一 View. 例如 usage 关闭且
+没有 saved record 的 owner 可以返回:
+
+```json
+{"enabled":false,"saved_end":"0","saving":false,"unknown_tail":false}
+```
+
+这不是测得零用量的记录, 也不能证明其他位置不存在历史用量. `history` 返回原生
+Record 和 `next_cursor`; 验证为空的文件返回
+`{"records":[],"next_cursor":"0"}`. 原生 counter、大小、时间戳、位置和 128-bit
+积分保持十进制字符串表达. Coverage、completeness、status、`live`、`saved`、
+`saving`、`unknown_tail`、错误和原生 `run_epoch` 元数据均保留. 不向 stats 模型
+加入 orchestrator RunID.
+
+运行中的 owner 对 live 状态、自己接纳的 saved 基线和已确认 history 具有权威.
+仅 owner socket 不存在或拒绝连接时允许离线回退. 成功连接之后, 协议错误、EOF、
+owner 错误、取消或超时均不能回退到看似可读的文件. 每个响应都证明精确 owner
+SandboxID, 包括空/关闭的 View 和空 history. Reader 与 sandboxer owner 必须使用
+该 ctl envelope 的兼容版本.
+
+Paused 对象可以在不唤醒的情况下读取. 离线读取取得原生非阻塞共享锁、验证普通
+文件, 然后使用 Recover 和 ReadHistory. 活动 writer 阻止调用方绕过其接纳的
+saved 边界. 离线 recovery 找到完整存活记录, 不证明前一 writer 已确认该 append,
+也不证明数据经历掉电后仍可靠保存.
+
+读取不采样、不积分、不 append、不 flush、不通过写入进行 recovery、不 resize,
+也不调用 guest. 它不会将尚未保存的 live 值保存, 或消除不确定尾部. 原生 memory
+积分 coverage 与 CPU 来源 reset 保持原有语义. 重复读取同一累计记录得到的是同一
+总量, 不是新增区间消耗. 浮点 telemetry 投影不能恢复无损原生账本, 也不能证明
+不完整尾部的完整性. 不新增 usage 持久化、sync、ACK、finalizer、删除后保留或
+生命周期行为.
+
+这些值按需读取, 不进入 RouteEntry 订阅流. 公开读取、本机 batch 和进程内
+extension 共用 conductor 领域实现及最终当前绑定校验, 包括 paused SandboxID
+被复用时既有的插入绑定凭据和系统身份校验. Stats 和 telemetry 均不
+创建 Create/Resume barrier.
 
 #### 4.1.2 Create 身份
 
@@ -1436,8 +1525,6 @@ Conductor 重写的基础文件。
 
 ## 6. 本机控制 socket(run / task / admin / plugin / api 平面)
 
-同一 plugin 平面通过 `POST /internal/plugin/telemetry/stats` 提供有界原生读取. 只有当前 ready telemetry 注册的真实 PID 可调用, 并受既有 plugin 白名单约束; 能连接 UDS 不自动获得普通 API 或 native batch 权限. Lease 撤销取消正在执行的读取. 参见[原生读取上限与 ownership](node-usage_zh.md#5-可信-conductor-读取面).
-
 serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600**)
 跑一个 h2c HTTP 服务(兼容 HTTP/1.1):单 socket 复用五个平面、各自鉴权。连接建立时
 经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
@@ -1521,6 +1608,37 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
 `export-sandbox`/`import-sandbox` CLI 即此平面客户端(§8.1)。
 
 **信任模型**:host root / daemon uid 可信;租户代码在 guest 内,够不到 host UDS。
+
+### 原生 stats batch
+
+对应的内部 `POST /internal/plugin/telemetry/stats` 复用现有
+`paths.config_socket`, 对完整 RouteEntry 流已发现的 SandboxID 显式选择原生
+section:
+
+```json
+{"sandboxIDs":["exact-sid"],"sections":["usage"],"usage":{"view":"saved"}}
+```
+
+按请求顺序返回的结果包含 `sandboxID`、可选 `stableID` 和每个已选 section 的原生
+body. 不返回凭据、路径或 RunID. 任一已选 section 缺失或读取失败都会使整批失败,
+不会以旧样本或零补齐. Paused 对象无需 active guest 即可提供 usage; 若同批还请求
+不可用的 resource section, 则该批可能失败.
+
+能够连接 UDS 不自动获得此操作权限. 服务端验证真实 SO_PEERCRED PID、既有可选
+`plugin_pidfile` 白名单, 以及固定 Plugin ID `telemetry` 当前已 ready 的有效注册.
+Stats 连接必须属于已注册进程. Lease 替换或断开会取消正在执行的读取. 注册不要求
+暴露 query UDS, 因而 write-only telemetry 仍能消费原生 stats. 未配置白名单时,
+mode 0600 保持既有可信本机 plugin 边界; 普通 API 请求仍需要 API 认证和归属校验.
+不收集租户 API key, 不引入新的权限模型或 socket.
+
+每批包含 1–64 个不重复的非空 SandboxID, 并从 `resource`、`traffic`、`usage` 选择
+1–3 个不重复 section. 仅选中 usage 时接受 usage 参数. 请求 body 上限 64 KiB,
+响应上限 4 MiB, 来源读取超时 5 秒; config socket 响应另有一秒写入上限,
+包括读取超时后的 503 响应. 本机 client 为两段操作保留时间; 调用方更早的截止
+时间仍会取消请求. 底层原生 Reader 保留各自更小的上限. 所有 batch
+调用之间最多并发读取八个对象. 父 context 取消和 lease 撤销会传递到底层读取,
+并释放槽位和连接. 无效请求返回 400, 对象不存在返回 404, 生命周期状态冲突返回
+409, 读取不可用返回 503, 与公开 API 共用同一领域错误体系.
 
 ## 7. 密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)
 
@@ -2535,6 +2653,18 @@ REQUIRE_PROXY=1 bash test/e2e/e2e_orchestrator_proxy.sh
 
 `make test-e2e` 即执行 `test/e2e/run_all.sh`;项目主仓只提供统一环境、聚合入口及真正跨组件
 组合本身的用例,不复制上述脚本。
+
+### 原生 usage 读取验证
+
+密度 benchmark 测量有界读取及 FD/goroutine 行为,
+不设置机器相关门槛; 原生采样和 history append 算法保持不变.
+
+```sh
+go test ./internal/orch -run '^$' -bench '^BenchmarkNativeUsageBatch$' -benchmem -count=3
+```
+
+此 benchmark 在每批 1/16/64 个对象下读取真实 SQLite 对象和原生 saved 文件,
+报告分配量及保留 FD/goroutine 的变化; 不代表 guest 采样或远端导出吞吐.
 
 ## 16. See Also
 

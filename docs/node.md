@@ -41,7 +41,7 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 - Northbound clients use e2b SDK/CLI directly. In a cluster, cluster-ctl Router forwards traffic and node-link carries control commands. Platform administration can also use the e2b API.
 - Standalone and cluster modes keep create/pause/kill/template execution on the node. Joining adds node-link (§10) without replacing the e2b contract.
 - The data plane forwards upstream guest envd protocols rather than implementing envd (§4.2).
-- The independent Telemetry component implements envd/OTLP collection and E2B `/sandboxes/{SandboxID}/metrics` history; Conductor only authenticates, checks ownership and forwards to a live registered query UDS. See [Telemetry](telemetry.md). Native `/stats/resource`, `/stats/traffic` and `/stats/usage` remain independent; see §4.1.1 and [Native usage](node-usage.md).
+- The independent Telemetry component implements envd/OTLP collection and E2B `/sandboxes/{SandboxID}/metrics` history; Conductor only authenticates, checks ownership and forwards to a live registered query UDS. See [Telemetry](telemetry.md). Native `/stats/resource`, `/stats/traffic` and `/stats/usage` remain independent; see §4.1.1 and [Native usage](node.md#native-usage).
 - The server does not parse Dockerfiles. It pulls/flattens existing images and executes the supported structured Build steps supplied by clients inside phase microVMs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 - Routing, storage and units are node-local. Cross-node snapshots/templates use canonical portable refs in Manifest Store or uniformly mounted named locations (§8.1); cluster-ctl orchestrates through node-link (§10).
 - Dependencies include the standard library, pure-Go `modernc.org/sqlite`, `golang.org/x/net/http2` for config-socket/node-link h2c, `golang.org/x/sys` for pidfile locks/SO_PEERCRED/mmap, `coreos/go-systemd`, `google/uuid` v7 and `gopkg.in/yaml.v3`. The module also includes CEL/protobuf, AWS SDK and sibling public packages; see [go.mod](../go.mod). The hand-written envd client and node-link use JSON rather than a gRPC wire protocol.
@@ -321,7 +321,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `units.pool_wait_timeout` | `5s` | Positive budget from StartUnit through entry into WaitAssignment; timeout cleans that RunID and replenishes the pool |
 | `units.install` | `true` | False delegates unit installation to operations |
 | `sandbox.timeout_sec` | `300` | Default sandbox TTL in seconds |
-| `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | Native lifecycle accounting policy for image cold, `run --from` and `run --restore`; strict validation, excluded from portable artifacts and independent of telemetry. See [Native usage](node-usage.md) |
+| `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | Native lifecycle accounting policy for image cold, `run --from` and `run --restore`; strict validation, excluded from portable artifacts and independent of telemetry. See [Native usage policy](#33-native-usage-policy) |
 | `sandbox.dead_ttl` | `24h` | Positive Go duration retaining completely cleaned, owner-free dead diagnostic rows |
 | `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | Guest-visible VM ceiling/SKU; E2B cpuCount/memoryMB still mean capacity. img cold starts accept create/group overrides; artifact capacity constrains restore |
 | `sandbox.resources.allocatable.cpu` / `.memory` | Final capacity CPU / inherited `256MiB` when absent | CPU is relative scheduling weight, not a hard fractional-core guarantee; memory is settled guest headroom, not total Budget. Omitted node memory can clamp to final capacity, but explicit operator/custom values, even `256MiB`, must not silently clamp. Out-of-range values fail; request pointer semantics are unchanged |
@@ -406,6 +406,30 @@ Build configuration and its legacy-schema boundary are defined in [Build configu
 There is no node-global remote-memory prefetch switch. Each Sandbox's kuasar-sandbox.restore namespace selects it (§4.4).
 
 Configuration consistency requires proxy.auth=enforce when mmds.enabled=false, since nonsecure envd relies on Proxy's data gate. mmds.routes.enabled requires mmds.enabled; service endpoints must be absolute Unix socket URIs. Only proxy.yaml configures proxy_netns and worker count. Cluster endpoint requires node_id plus separate api_endpoint/data_endpoint. With resource_listen.enabled, startup resolves one canonical controller identity and writes it into every dynamic Sandbox YAML; there is no second sandbox.resources.control_socket source. Startup headroom has identical static/dynamic semantics, independent of controller enablement.
+
+### 3.3 Native usage policy
+
+```yaml
+sandbox:
+  usage:
+    enabled: true
+    sample_interval: 1s
+    flush_interval: 5m
+```
+
+Defaults are false, `1s` and `5m`. Durations must be positive Go durations,
+flush must be at least sample, and twice sample must fit the native signed
+duration range. Validation also applies when disabled. Explicit null, wrong
+types, unknown/duplicate keys and YAML merge keys are rejected. Clone,
+diagnostic output, external conductor bootstrap and final Configure-hook
+validation preserve the same policy.
+
+Conductor passes this node policy to image cold start, `run --from` and
+`run --restore`. Usage is host policy and is absent from portable E/S
+artifacts; restore uses the current node's policy. Enabling telemetry does
+not enable usage, and stopping telemetry does not stop native accounting.
+`flush_interval` schedules native appends, not fsync or device-cache flushes.
+See the parsed [conductor deployment example](../deploy/conductor.example.yaml).
 
 ## 4. e2b API contract
 
@@ -555,7 +579,88 @@ The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services
 
 Conductor batches at most 64 current ports per switch through connector's Go `Stats(ports)` API, with no per-sandbox CLI processes or second lifecycle authority. It reuses its allocation/detach fence; connector reuses the pin-directory shared lock, current pinned-map ID and reset-confirmation flag. The existing Proxy stats socket also accepts a bounded batch. Configured-source read errors, unconfirmed reset, control contention, incomplete results or changed bindings return 503 for the whole read, never zero or an older complete-looking response. The same domain reads serve the public API, trusted local batch and conductor extension. Stats remains available independently of telemetry and does not participate in Create/Resume readiness.
 
-Native lifecycle accounting is available at `/sandboxes/{id}/stats/usage`, including paused objects. It has its own current/saved/history selection and preserves the native lossless record rather than replacing it with resource counters. See [Native usage and trusted batch reads](node-usage.md).
+##### Native usage
+
+Conductor publishes `GET /sandboxes/{SandboxID}/stats/usage` alongside
+`/stats/resource` and `/stats/traffic`. Usage reads sandboxer's existing native
+lifecycle accounting. Resource stats describe current effective specification
+and VMM observations; traffic stats describe the existing Proxy ingress
+observations. These are independent of telemetry and its history query
+at `/sandboxes/{SandboxID}/metrics`. The native ledger format and runtime
+query contract belong to [sandboxer usage](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md#usage-query).
+
+Every public read authenticates the API key and checks the exact SandboxID's
+ownership. StableID is a correlation label, never a lookup alias. Conductor
+resolves the current object and calls sandboxer's shared
+[`pkg/usagereader.Read`](https://github.com/kuasar-sandbox/sandboxer/blob/main/pkg/usagereader/read.go),
+also used by `sandbox-ctl usage`. It does not duplicate the native codec,
+recovery, locks or history algorithm. Telemetry obtains native sections only
+through conductor, without opening sandbox `ctl.sock` or `.usage` files.
+
+```sh
+curl -H "X-API-Key: $API_KEY" "$NODE_API/sandboxes/$SANDBOX_ID/stats/usage"
+curl -H "X-API-Key: $API_KEY" "$NODE_API/sandboxes/$SANDBOX_ID/stats/usage?view=saved"
+curl -H "X-API-Key: $API_KEY" "$NODE_API/sandboxes/$SANDBOX_ID/stats/usage?view=history&cursor=0&limit=10"
+```
+
+| Parameter | Contract |
+|---|---|
+| `view` | `current` (default), `saved`, or `history` |
+| `cursor` | History only; nonnegative decimal byte position, default `0`. Preserve the returned `next_cursor` string without floating-point conversion |
+| `limit` | History only; integer `1`–`100`, default `10`. Reduce it if the native 1 MiB page bound is exceeded |
+
+Unknown, repeated, empty or malformed parameters are rejected with 400.
+There is no `/usage` alias. The response has `Cache-Control: no-store`.
+Normal authentication errors remain unchanged; a missing or non-owned
+SandboxID returns 404. Missing files, live-writer lock conflicts, unavailable
+owners, invalid owner identity, failed reads, timeouts and concurrent runtime
+replacement return 503. Native `read_error`/`save_error` fields in a valid view
+remain part of that view, rather than being discarded or converted to zeros.
+
+`current` returns the native View; `saved` returns that View with `live`
+omitted. For example, a disabled owner with no saved record can return:
+
+```json
+{"enabled":false,"saved_end":"0","saving":false,"unknown_tail":false}
+```
+
+This is neither a measured zero-usage record nor proof that historical usage
+does not exist elsewhere. `history` returns native Records and `next_cursor`;
+an empty validated file returns `{"records":[],"next_cursor":"0"}`.
+Native counters, sizes, timestamps, positions and 128-bit integrals retain
+their decimal-string representations. Coverage, completeness, status,
+`live`, `saved`, `saving`, `unknown_tail`, errors and native `run_epoch`
+metadata are preserved. No orchestrator RunID is added to the stats model.
+
+The running owner is authoritative for live state, its adopted saved baseline
+and confirmed history. Only an absent/refused owner socket permits offline
+fallback. After a connection succeeds, protocol errors, EOF, owner errors,
+cancellation and timeout do not fall back to an apparently readable file.
+Every response proves the exact owner SandboxID, including empty/disabled
+views and empty history. Reader and sandboxer owner must use compatible
+revisions of that ctl envelope.
+
+A paused object can be read without waking it. Offline reads take the native
+nonblocking shared lock, validate a regular file, then use Recover and
+ReadHistory. An active writer prevents bypassing its adopted saved boundary.
+Offline recovery finds complete surviving records; it does not prove that
+the former writer confirmed an append or that data survived a power failure.
+
+Reads do not sample, integrate, append, flush, recover by writing, resize or
+call the guest. They neither save unsaved live values nor resolve an uncertain
+tail. Native memory integral coverage and CPU source resets retain their
+existing semantics. Repeated reads of a cumulative record are the same
+total, not new interval consumption. A floating-point telemetry projection
+cannot reconstruct the lossless native ledger or certify an incomplete tail.
+There is no new usage persistence, sync, ACK, finalizer, retention-after-delete
+or lifecycle behavior.
+
+These values are fetched on demand, outside the RouteEntry subscription.
+Public reads, local batches and in-process extensions share conductor's
+domain implementation and final current-binding checks, including the existing
+insert-bound credentials and system identity when a paused SandboxID is reused.
+Neither stats nor
+telemetry creates a Create/Resume barrier.
 
 #### 4.1.2 Create identity
 
@@ -1127,8 +1232,6 @@ Name must be referenced by a current secret route. PUT replaces opaque bytes wit
 
 **③ Plugin plane:** PUT /internal/plugin/{id}/register registers Proxy master or an observer and holds the h2c connection as both lease and routesync stream ([node-proxy.md](node-proxy.md) §4). First body frame is register{caps}; route_wake subscriptions can later send wake/route_barrier_ack. Response is hello(policy) → initial upserts → bookmark → live upsert/delete/barrier. Wake/ACK share a serialized upstream writer.
 
-The same plugin plane exposes bounded native stats at `POST /internal/plugin/telemetry/stats`. Only the actual PID of the current ready telemetry registration may read it, subject to the existing plugin allowlist; UDS access alone does not grant ordinary API or native-batch rights. Lease revocation cancels active reads. See [Native reading bounds and ownership](node-usage.md#5-trusted-conductor-reading-surface).
-
 Capabilities are independent: subscribe route/route_wake, proxy marker with optional stats_socket, and mmds. Barrier participation requires exact proxy ID, route_wake subscription and proxy marker, not stats_socket. Disconnect unregisters; a new same-ID registration unregisters/disconnects its predecessor. Optional plugin_pidfile checks peer PID, otherwise socket 0600 applies. Proxy and agents subscribe locally, independently of cross-network node-link mTLS.
 
 Confidential MMDS projection cannot be self-granted by arbitrary plugins. Only exact ID proxy with route_wake, non-nil proxy and mmds=true receives service registry, mmds_routes and mmds_route_secret_values. Ordinary observers and cluster/node-link do not receive route values; other IDs claiming mmds=true are rejected. Master fails closed before full Bookmark and clears mutable route/value/service views on disconnect rather than indefinitely serving stale secrets.
@@ -1136,6 +1239,46 @@ Confidential MMDS projection cannot be self-granted by arbitrary plugins. Only e
 **④ API plane:** remaining paths use the same wrapped e2b control http.Handler as api.listen, including export/import, over local plaintext h2c with API-key authentication. Export/import CLI uses it (§8.1).
 
 Host root/daemon UID are trusted; tenant code runs inside guests and cannot reach host UDS.
+
+### Native stats batches
+
+The existing `paths.config_socket` carries the corresponding
+internal `POST /internal/plugin/telemetry/stats`, selecting explicit native
+sections for SandboxIDs already discovered from the full RouteEntry stream:
+
+```json
+{"sandboxIDs":["exact-sid"],"sections":["usage"],"usage":{"view":"saved"}}
+```
+
+The ordered response contains `sandboxID`, optional `stableID` and each
+selected section's unchanged native body. No credentials, paths or RunID are
+returned. Missing or failed selected sections fail the entire batch; no old
+sample or zero completes a failed read. A paused object may supply usage
+without an active guest; requesting an unavailable resource section can
+instead fail that batch.
+
+UDS connectivity alone does not grant this operation. The server verifies
+actual SO_PEERCRED PID, the existing optional `plugin_pidfile` allowlist and
+the ready, current, live registration with fixed Plugin ID `telemetry`.
+The stats connection must belong to that registered process. Replacing or
+disconnecting the lease cancels in-flight reads. Registration need not expose
+a query UDS, so write-only telemetry can consume native stats. With no
+allowlist, mode 0600 retains the established trusted local plugin boundary;
+ordinary API requests still require their API authentication and ownership.
+No tenant API-key collection, new permission model or socket is introduced.
+
+Each batch contains 1–64 distinct nonempty SandboxIDs and 1–3 distinct
+sections from `resource`, `traffic`, `usage`. Usage options are accepted only
+when usage is selected. Request bodies are limited to 64 KiB, responses to
+4 MiB and source work to 5 seconds; the config-socket response has a separate
+one-second write budget, including the 503 response after a read timeout.
+The local client allows both budgets; an earlier caller deadline still cancels
+the call. Underlying native readers retain their smaller limits.
+At most eight batch objects are read concurrently across
+batch calls. Parent cancellation and lease revocation reach source reads;
+slots and connections are released. Invalid requests return 400, missing
+objects 404, conflicting lifecycle states 409 and unavailable reads 503,
+using the same domain errors as the public APIs.
 
 ## 7. Credentials and ownership: encrypted APISecret/ManifestKey pairs
 
@@ -1830,6 +1973,20 @@ Adjust `BIN` if the product set is assembled elsewhere. The script checks the re
 | e2e_sandbox_cold_target.sh | Production-shaped cold Sandbox target driven by node-ctl resource controller. |
 
 Make test-e2e executes test/e2e/run_all.sh. The project repository supplies the common environment, aggregate entry and genuinely cross-component combinations without copying these scripts.
+
+### Native usage read validation
+
+The density benchmark measures
+bounded reads and FD/goroutine behavior without a machine-specific gate;
+native sampling and history append algorithms remain unchanged.
+
+```sh
+go test ./internal/orch -run '^$' -bench '^BenchmarkNativeUsageBatch$' -benchmem -count=3
+```
+
+This benchmark uses real SQLite object reads and native saved files at
+1/16/64 objects per batch. It reports allocations and retained FD/goroutine
+deltas; it does not represent guest sampling or remote export throughput.
 
 ## 16. See also
 

@@ -165,6 +165,8 @@ ordinary tenant API permissions. It needs no tenant API-key collection and has
 no sandbox ctl client, usage-file access or second port binding map. Conductor
 organizes native sources and retains ownership/binding checks and failure rules.
 
+The internal request is `POST /internal/plugin/telemetry/stats`, authorized by the ready, current, live registration with fixed Plugin ID `telemetry`, the actual `SO_PEERCRED` PID and the existing `plugin_pidfile` allowlist. Replacement or disconnection cancels in-flight reads; a write-only registration needs no query UDS to consume native stats. [Node local stats](node.md#native-stats-batches) owns the full request/response example, whole-batch failure, parameters, size/concurrency bounds and read/write budgets.
+
 Configure `resource_interval` (default 5s), `traffic_interval` (10s),
 `usage_interval` (1m), `timeout` (5s maximum), and `concurrency` (default 4, 1..8).
 An interval of zero disables that section; enabled intervals are 1s..1h and at
@@ -203,7 +205,7 @@ can be ahead of saved; crash/failed save can lose that unsaved tail. The receive
 does not force a sample, save, fsync or export acknowledgement and does not change
 native usage policy. Current/live/history, precise integers, raw counters,
 128-bit integrals, coverage and detailed errors remain available through
-[`stats/usage`](node-usage.md). Enabling telemetry does not enable usage.
+[`stats/usage`](node.md#native-usage). Enabling telemetry does not enable usage.
 
 ## 4. Direct sandbox-facing OTLP
 
@@ -546,7 +548,7 @@ The nine required fields match the
 The platform's instantaneous `/stats/resource` and `/stats/traffic` remain
 separate read-only interfaces, not substitutes for this guest-metric history.
 
-Native resource, traffic and usage reads are owned by conductor and remain available when telemetry stops. The trusted telemetry lease can consume selected sections through the existing config socket; it does not access sandbox ctl sockets or usage files. Paused saved usage does not require an active guest. See [Native usage and local reads](node-usage.md).
+Native resource, traffic and usage reads are owned by conductor and remain available when telemetry stops. The trusted telemetry lease can consume selected sections through the existing config socket; it does not access sandbox ctl sockets or usage files. Paused saved usage does not require an active guest. See [Native usage and local reads](node.md#native-usage).
 
 Native traffic uses the flat `state`, `maxInflight`, `inflight:{parking,connected}`, `idleSince`, `services`, `platform`, `transit` and `egress` shape. Platform and transit retain connector Mgmt/Transit counters from the sandbox viewpoint; `egress:{}` means no publishable statistics. They do not alter Proxy ingress idle or turn management monitoring packets into admitted application flows. The conductor batches current bindings per switch through connector's native Go API. See [native traffic](node-proxy.md#83-traffic-stats-and-the-unified-worker-stream).
 

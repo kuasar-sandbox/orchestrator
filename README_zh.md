@@ -237,7 +237,7 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 - [Journal 身份](docs/node-journald_zh.md):独立 Sandbox/Build 输出身份、StableID、查询与验证。
 - [Node Proxy](docs/node-proxy_zh.md):独立数据面、路由、鉴权、MMDS 与 native exec。
 - [Node resource](docs/node-resource_zh.md):节点准入、reservation、水位、inventory 恢复与统计。
-- [原生 usage](docs/node-usage_zh.md): 无损 usage API、节点策略、在线/离线 ownership 与可信本机 stats 读取.
+- [原生 usage](docs/node_zh.md#原生-usage): 无损 usage API、节点策略、在线/离线 ownership 与可信本机 stats 读取.
 - [Cluster](docs/cluster_zh.md):Registry membership、复制状态、node link、Reserve 与集群 E2E。
 - [Cluster Router](docs/cluster-router_zh.md):控制/数据统一入口、路由与 stable/node-local 身份转换。
 - [Cluster Placer](docs/cluster-placer_zh.md):provider/importer、WATCH_LIST、source lease、selector patch 与放置建议。

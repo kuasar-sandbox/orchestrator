@@ -76,6 +76,6 @@ trusted telemetry plugin. The fixed request/concurrency/time/size limits and
 whole-batch errors also apply in process. StableID cannot replace SandboxID.
 Keep the raw JSON or decode the native integer types; do not round through a
 generic float64 map or expose this trusted reader through an unauthenticated
-wrapper. See [native usage](../../docs/node-usage.md).
+wrapper. See [native usage](../../docs/node.md#native-usage).
 
 The same `StatsRequest` accepts `Sections: []string{"traffic"}`. Each result has `Traffic.Inflight.Connected`, logical per-service connected counts, flat `Traffic.Platform`/`Traffic.Transit` counters and empty `Traffic.Egress`. A missing port yields empty planes; a configured read failure fails the batch. Submit up to 64 exact SandboxIDs together: conductor performs one native switch read and, for the built-in Proxy provider, one stats UDS batch. Resource, traffic and usage are domain reads, independent of telemetry lifetime.
