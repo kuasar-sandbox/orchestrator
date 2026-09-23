@@ -1191,6 +1191,13 @@ CaptureKind, ResumeSource, ResumeMode, LaunchMode and ResumeTrigger are separate
 | LaunchMode | image / memory / cold | Resolved mode actually executed by starting |
 | ResumeTrigger | connect / wake / route / exec / exec-session | Low-cardinality observation source, not mode or permission |
 
+`ResumeSource` retains `Kind` and `Ref`. A Snapshot also requires `SandboxRef`,
+the exact E selected by S; an E-only source holds E in `Ref` and leaves
+`SandboxRef` empty. The complete pair is one atomic durable identity in SQLite,
+cache, lifecycle CAS comparisons, restart recovery and encrypted migration tokens,
+not a best-effort cache. `removedRefs` belongs only to operation reports and is
+never persisted in SQLite or tokens.
+
 An image is a read-only filesystem root. E contains portable sandbox.runtime.cfg and disk state, without guest memory. S holds memory and references authoritative E through snapshot.cfg.sandbox_ref. S always has real memory state; its config does not represent E with a memory toggle. Template mapping is:
 
 ```text
@@ -1260,6 +1267,16 @@ CaptureSandbox:
     --run-root <run-root>
   -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
+
+Capture returns the producer's actual identities: `snapshot --json` returns
+`{snapshotRef,sandboxRef,removedRefs}` and `export --json` returns
+`{sandboxRef,removedRefs}`. Capture removals are `[]`. A Snapshot Bundle carries
+the S and E selectors in the same physical file. Local refs retain their identity
+qualifiers but expose only basenames; the checkpoint directory is execution
+context. Default human output and upload-key stdout are unchanged. The adapter
+validates the complete structured result before committing running→paused;
+Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
+and its association. Capture failure never commits a partial pair.
 
 Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
 
@@ -1422,16 +1439,11 @@ The Core method returns one `types.ExportResult`; the HTTP `result` field remain
 compatible with existing clients. Deploy sandboxer and orchestrator from the
 matching source set when adopting the new internal CLI contract.
 
-Capture uses `sandbox-ctl snapshot --json` or `export --json` and validates the
-complete result before the atomic running→paused commit. Snapshot stores the
-producer's S and E, including both selectors for a single-root Bundle. E-only
-capture clears the old Snapshot and association. Local refs remain basenames
-with their identity qualifiers; execution resolves them using the sandbox's
-checkpoint directory. Capture failure never commits a partial pair. Local
-publication returns S1/E1 in both report and token; keep-source retains S0/E0 in
-SQLite and the cache. `removedRefs` is never stored in SQLite or tokens.
+Local publication returns S1/E1 in both report and token; keep-source retains
+S0/E0 in SQLite and the cache. Capture and its producer result are specified in
+[§8.1.1](#811-capture-and-pause).
 
-**RFC-142 upgrade:** stop the old conductor and drain or retire its managed
+**Upgrading the paired-source schema:** stop the old conductor and drain or retire its managed
 sandboxes, preserving any artifacts and records you need before proceeding.
 The operator must explicitly clear the old local sandbox database before
 starting this version; there is no ALTER, migration, backfill or dual-read path
@@ -1441,7 +1453,6 @@ recreate local records. Old migration tokens without the required `resumeSandbox
 Snapshot tokens missing E, are invalid; discard stale tokens and re-export from a
 complete paired record.
 Do not use an old token or an S metadata read to reconstruct a durable pair.
-See [paired source contract](rfc-142-pairs.md).
 
 An already portable source is not republished and has `removedRefs:[]`. A
 portable Snapshot returns the exact S/E pair already stored in SQLite. Export
@@ -1761,6 +1772,28 @@ RouteSource.Range and later full snapshots therefore never mispublish abandoned 
 ## 15. Tests
 
 `make test` covers strict MMDS parsing/top-level merge/minimal persistence; encrypted owner values, AAD/CAS/cleanup; admin UDS/service relay/confidential projection; master/worker resync/rotation; HTTP routing; apikey/secretbox/regcreds; routesync registration/bookmarks; proxyshm route sharing/park/wake/generation sweep; proxyadmission multiworker bounded error, generation reuse and crash cleanup after Wait; same-ID plugin replacement; CONNECT tunnels; Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gates and buffered half-close; deterministic MMDS keys; launch ownership; namespace parsing/capacity folding/network merge; migration; and node-link registration/event/command round trips.
+
+Paired-source validation covers real capture producers and CLI responses, atomic
+SQL rollback/reopen and lifecycle CAS, preparation identity/digest replay, Builder
+recovery of the accepted pair, and strict authenticated tokens. The real CLI/API
+publication matrix covers all 16 combinations of S/E × token/template × keep/move
+× local/portable. Portable cases import the token, make source artifacts
+unavailable, then re-export. Capture cases delete the carrier before returning
+the structured result and require torn responses to leave the running row and
+old pair unchanged.
+
+The three CLI integration groups currently require explicit opt-in; an ordinary
+`go test` without `KUASAR_TEST_SANDBOX_CTL` skips them. With `BIN` pointing to the
+selected, already built product directory, run from this repository:
+
+```bash
+KUASAR_TEST_SANDBOX_CTL="$BIN/sandbox-ctl" go test ./internal/orch \
+  -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$' \
+  -count=1 -v
+```
+
+Inspect each group and its current subcases for actual execution; a successful
+test process containing skipped groups does not validate this CLI contract.
 
 Real-microVM native-exec cases cover token issuance, service=exec CONNECT and guest execution separately for standalone and cluster. That evidence covers those native-exec paths; it does not automatically accept later pause/resume or other stages of the aggregate script.
 

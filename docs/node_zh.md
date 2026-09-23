@@ -1640,10 +1640,15 @@ LaunchMode records what will actually run.
 | 概念 | 值 | 职责 |
 |---|---|---|
 | `CaptureKind` | `snapshot` / `sandbox` | 本次 Pause 保存 Snapshot S 还是 Sandbox E |
-| `ResumeSource` | `{kind:snapshot\|sandbox, ref}` | paused 行持有的可恢复根制品 |
+| `ResumeSource` | `kind/ref`, Snapshot 还包含 `SandboxRef` | 行持有的精确 S/E 对或 E-only 根 |
 | `ResumeMode` | `auto` / `memory` / `cold` | 调用方对本次 Resume 的选择 |
 | `LaunchMode` | `image` / `memory` / `cold` | 解析完成并将在本次 starting 中实际执行的模式 |
 | `ResumeTrigger` | `connect` / `wake` / `route` / `exec` / `exec-session` | 低基数日志与指标来源,不参与模式或权限判断 |
+
+`ResumeSource` 保留 `Kind` 和 `Ref`. Snapshot 还必须包含 `SandboxRef`, 即 S 实际选择
+的 E; E-only source 将 E 存在 `Ref` 中, `SandboxRef` 为空. 完整对作为一个原子持久
+身份参与 SQLite, cache, 生命周期 CAS 比较, 重启恢复及加密迁移 token, 不是尽力填充
+的缓存. `removedRefs` 仅属于操作报告, 不进入 SQLite 或 token.
 
 Image 是只读镜像根;Sandbox E 是不含 guest 内存、但包含 portable `sandbox.runtime.cfg` 和磁盘
 状态的执行制品;Snapshot S 是内存制品,其 `snapshot.cfg.sandbox_ref` 指向权威 Sandbox E。
@@ -1744,6 +1749,14 @@ CaptureSandbox:
     --run-root <run-root>
   -> ResumeSource{kind:sandbox, ref:<actual E basename + identity>, sandboxRef:""}
 ```
+
+capture 返回生产者的实际身份: `snapshot --json` 返回
+`{snapshotRef,sandboxRef,removedRefs}`, `export --json` 返回
+`{sandboxRef,removedRefs}`. capture 的差集为 `[]`. Snapshot Bundle 在同一物理文件
+中携带 S 和 E 两个 selector. 本地引用保留身份限定符, 只公开 basename; checkpoint
+目录属于执行上下文. 默认人类可读输出及 upload-key stdout 不变. 适配器先验证完整
+结构化结果, 再原子提交 running→paused; Snapshot 保存实际 S/E 对, E-only capture
+清除旧 Snapshot 及其关联. capture 失败绝不提交半对.
 
 Pause 的顺序固定为 resolve request -> accepted operation -> runtime capture ->
 `CommitRunningPaused(id, exactRunID, ResumeSource)` -> stop/reset exact runner -> detach exact network ->
@@ -1873,6 +1886,12 @@ task 进程。task 在本地严格解析 artifact network metadata,拒绝 duplic
 digest 覆盖 RunID、完整根对、launch mode、selected source、
 closure、locations、carrier binding、capacity/network summary。相同 runID + digest replay 返回同一结果;
 冲突 replay fail closed。
+外部 S-only 模板仅是初次 starting 阶段的 preparation 输入, 此时持久 source 为空,
+不是有效的 paused source. 现有 tenant task 解析 S 时取得 E, bounded summary 只携
+根 S/E 身份及上述摘要, 不把完整配置或 MANIFEST_KEY 相关解析移入 conductor.
+相同摘要重试幂等, E 不同的重试冲突; 只有匹配根, RunID 和 starting 状态的 worker
+能够把完整对与 running 一起提交. 失败保持初始 source 未受理; 重启不恢复缺失 E 的对.
+preparation 不得替换已导入或已持久保存的 E.
 最终 `taskrun` 只根据 task-local `PreparedSource` 追加 `--from <E>` 或 `--restore <S>`。
 
 运行配置使用三种明确 DTO,不以一份完整 `SandboxConfig` YAML 服务所有模式:
@@ -1943,28 +1962,16 @@ portable 最终根、必需的最终 E、有序唯一差集和安全文件 basen
 `types.ExportResult`，HTTP 的 `result` 字段继续兼容既有客户端。采用新内部 CLI 契约时，
 sandboxer 与 orchestrator 应部署来自相匹配来源集的版本。
 
-Capture 使用 `sandbox-ctl snapshot --json` 或 `export --json`，验证完整结果后才原子
-提交 running→paused。Snapshot 保存生产者返回的 S 与 E，包括单根 Bundle 中的两个
-Manifest selector。E-only capture 会清除旧 Snapshot 及其关联。公开本地引用仅有
-basename，并保留身份限定符；执行时使用该 sandbox 的 checkpoint 目录解析。capture
-失败绝不提交半对。本地发布的报告和 token 同时使用 S1/E1；keep-source 的 SQLite 与
-cache 继续保存 S0/E0。`removedRefs` 不进入 SQLite 或 token。
+本地发布的报告和 token 同时使用 S1/E1; keep-source 的 SQLite 与 cache 继续保存
+S0/E0. capture 及其生产者结果由 [§8.1.1](#811-capture-与-pause) 维护.
 
-外部 S-only 模板仅是初次 starting 阶段的 preparation 输入，此时持久 source 为空，
-不是有效的 paused source。现有 tenant task 解析 S 时取得 E，bounded summary 只增加
-根 S/E 身份，不把完整配置或 MANIFEST_KEY 相关解析移入 conductor。resolution_digest
-绑定 RunID、完整根对、launch mode、所选 source、闭包、location、carrier 及原有摘要。
-相同摘要重试幂等，E 不同的重试冲突；只有匹配根、RunID 和 starting 状态的 worker
-能够把完整对与 running 一起提交。失败保持初始 source 未受理；重启不恢复缺失 E 的对。
-preparation 不得替换已导入或已持久保存的 E。
-
-**RFC-142 升级：**先停止旧 conductor，排空或退役其管理的 sandbox，并预先保留需要的
+**配对 source schema 升级:** 先停止旧 conductor，排空或退役其管理的 sandbox，并预先保留需要的
 工件和记录。启动本版本前，操作员必须明确清空旧本地 sandbox 数据库；此配对 schema
 不提供 ALTER、迁移、回填或双读兼容。进程拒绝旧 schema，绝不为升级自动删除用户数据。
 部署匹配版本的 sandboxer/orchestrator 后重新创建本地记录。缺少必填 `resumeSandboxRef`
 字段的旧迁移 token（包括缺少 E 的 Snapshot token）无效；废弃过期 token，从具有完整
 对的记录重新导出。不得用旧 token 或读取
-S 元数据重建持久对。参见[配对 source 契约](rfc-142-pairs_zh.md)。
+S 元数据重建持久对。
 
 已 portable 的源不再发布，返回 `removedRefs:[]`；portable Snapshot 直接返回 SQLite
 中保存的精确 S/E 对。即使两份工件都离线，Export 也不打开工件、不配置存储、不检查
@@ -2464,6 +2471,25 @@ Proxy master/worker resync/rotation;handler 路由,apikey/secretbox/regcreds,rou
 Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).
+
+配对 source 验证覆盖真实 capture 生产者与 CLI 响应, SQL 原子回滚及重开,
+生命周期 CAS, preparation 身份/digest 重放, Builder 对已受理配对的恢复,
+以及严格认证的 token. 真实 CLI/API 发布矩阵覆盖 S/E × token/template × keep/move
+× local/portable 全部 16 种组合. portable 用例先导入 token, 再使源工件不可用,
+最后重新导出. capture 用例在返回结构化结果前删除载体, 并要求撕裂响应保留 running
+行和原有对.
+
+三组 CLI 集成用例当前需要显式启用; 普通 `go test` 未设置
+`KUASAR_TEST_SANDBOX_CTL` 时会跳过. 将 `BIN` 指向所选且已构建的产品目录,
+从本仓库执行:
+
+```bash
+KUASAR_TEST_SANDBOX_CTL="$BIN/sandbox-ctl" go test ./internal/orch \
+  -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$' \
+  -count=1 -v
+```
+
+逐组核对当前子用例是否实际执行; 包含 Skip 的进程退出成功不构成 CLI 合同验证.
 
 Native exec 的真实 microVM 特性用例分别覆盖 standalone 和 cluster 路径的
 ExecAccessToken 签发,`service=exec` CONNECT 以及 guest 命令执行.该结论只对上述
