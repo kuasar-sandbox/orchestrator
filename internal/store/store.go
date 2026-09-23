@@ -808,8 +808,40 @@ func (s *Store) StartingTaskIdentity(ctx context.Context, id, runID string) (run
 	return runDir, true, nil
 }
 
-// BindStartingRunner is the runner-pool commit fence. It succeeds exactly once
-// while the accepted launch still owns an unassigned starting row.
+// GetSandboxIDByCurrentRunID resolves any current durable sandbox owner for
+// reconnect/disconnect handling. Unlike assignment replay, this includes rows
+// after starting has committed to running and cleanup states that still own the
+// exact runner. Dead rows retain only diagnostic result data and intentionally do
+// not count as current ownership.
+func (s *Store) GetSandboxIDByCurrentRunID(ctx context.Context, runID string) (string, bool, error) {
+	if runID == "" {
+		return "", false, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM sandboxes
+		 WHERE run_id=? AND state IN (?,?,?,?)`,
+		runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePaused), string(types.StateDeleting))
+	if err != nil {
+		return "", false, fmt.Errorf("store: find current sandbox by run id %s: %w", runID, err)
+	}
+	defer rows.Close()
+	var found string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", false, fmt.Errorf("store: scan current sandbox by run id %s: %w", runID, err)
+		}
+		if found != "" {
+			return "", false, fmt.Errorf("store: multiple current sandboxes claim run id %s", runID)
+		}
+		found = id
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("store: scan current sandbox by run id %s: %w", runID, err)
+	}
+	return found, found != "", nil
+}
+
 // GetClaimedSandboxIDByRunID resolves an already-published sandbox assignment
 // after the assignment response was lost. It returns only live starting rows
 // that have not accepted an execution result for that exact run.
@@ -841,6 +873,8 @@ func (s *Store) GetClaimedSandboxIDByRunID(ctx context.Context, runID string) (s
 	return found, found != "", nil
 }
 
+// BindStartingRunner is the runner-pool commit fence. It succeeds exactly once
+// while the accepted launch still owns an unassigned starting row.
 func (s *Store) BindStartingRunner(ctx context.Context, id, runID string) (bool, error) {
 	if runID == "" {
 		return false, fmt.Errorf("store: bind starting runner sandbox %s: empty run id", id)

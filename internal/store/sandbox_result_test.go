@@ -142,3 +142,41 @@ func TestGetClaimedSandboxIDByRunIDReplaysOnlyLiveStartingAssignment(t *testing.
 		t.Fatalf("replay after result = %q, %t, %v; want absent", got, found, err)
 	}
 }
+
+func TestGetSandboxIDByCurrentRunIDIncludesOnlyCurrentOwners(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	states := []types.State{types.StateStarting, types.StateRunning, types.StatePaused, types.StateDeleting}
+	for i, state := range states {
+		sb := sandboxInsertFixture("current-run-"+string(state), i)
+		sb.State = state
+		sb.RunID = "run-current-" + string(state)
+		sb.LaunchMode = ""
+		sb.ResumeSource = types.ResumeSource{}
+		switch state {
+		case types.StateStarting:
+			sb.LaunchMode = types.LaunchImage
+		case types.StatePaused:
+			sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("4", 64)}
+		}
+		if err := st.InsertSandbox(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+		got, found, err := st.GetSandboxIDByCurrentRunID(ctx, sb.RunID)
+		if err != nil || !found || got != sb.ID {
+			t.Fatalf("%s current run lookup = %q, %t, %v", state, got, found, err)
+		}
+	}
+
+	dead := sandboxInsertFixture("current-run-dead", 4)
+	dead.RunID = "run-current-dead"
+	if err := st.InsertSandbox(ctx, dead); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.CommitSandboxDead(ctx, dead); err != nil || !changed {
+		t.Fatalf("CommitSandboxDead = %t, %v", changed, err)
+	}
+	if got, found, err := st.GetSandboxIDByCurrentRunID(ctx, dead.RunID); err != nil || found || got != "" {
+		t.Fatalf("dead current run lookup = %q, %t, %v", got, found, err)
+	}
+}
