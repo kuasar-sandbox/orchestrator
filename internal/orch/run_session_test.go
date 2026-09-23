@@ -310,3 +310,89 @@ func TestRunSessionDisconnectDelegatesPausedAndDeletingCleanupOwners(t *testing.
 	session.Close(false)
 	waitForSandboxAbsent(t, deleting.o, context.Background(), deleting.sb.ID, "delete finalizer after disconnect")
 }
+
+func setSandboxFinalizerUnitState(t *testing.T, fixture sandboxFinalizerFixture, state string) {
+	t.Helper()
+	fixture.lc.mu.Lock()
+	fixture.lc.state = state
+	fixture.lc.mu.Unlock()
+}
+
+func TestRunSessionMaintenanceConvergesAfterHealthyDisconnectThenUnitExit(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-maint-late-exit")
+	session, ok, err := fixture.o.RegisterRunSession(context.Background(), runKindSandbox, fixture.sb.RunID)
+	if err != nil || !ok {
+		t.Fatalf("RegisterRunSession = ok %v err %v", ok, err)
+	}
+	session.Close(false)
+	waitRunDisconnectIdle(t, fixture.o, runKindSandbox, fixture.sb.RunID)
+	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || got == nil || got.State != types.StateRunning || got.ExecutionResult != nil {
+		t.Fatalf("immediate active disconnect changed sandbox = %+v, %v", got, err)
+	}
+
+	setSandboxFinalizerUnitState(t, fixture, "inactive")
+	if err := fixture.o.queueMissingRunSessionChecks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dead := waitForSandbox(t, fixture.o, context.Background(), fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateDead && sb.ExecutionResult != nil
+	}, "maintenance cleanup after later unit exit")
+	if dead.ExecutionResult.RunID != fixture.sb.RunID || dead.ExecutionResult.Stage != types.SandboxResultRun {
+		t.Fatalf("maintenance result = %+v", dead.ExecutionResult)
+	}
+}
+
+func TestRunSessionMaintenanceSkipsReconnectedRunningOwner(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-maint-reconnected")
+	session, ok, err := fixture.o.RegisterRunSession(context.Background(), runKindSandbox, fixture.sb.RunID)
+	if err != nil || !ok {
+		t.Fatalf("RegisterRunSession = ok %v err %v", ok, err)
+	}
+	defer session.Close(true)
+	setSandboxFinalizerUnitState(t, fixture, "inactive")
+	if err := fixture.o.queueMissingRunSessionChecks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-time.After(50 * time.Millisecond):
+	}
+	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || got == nil {
+		t.Fatalf("reconnected owner row = %+v, %v", got, err)
+	}
+	if got.State != types.StateRunning || got.ExecutionResult != nil || got.RunID != fixture.sb.RunID {
+		t.Fatalf("maintenance touched reconnected owner: %+v", got)
+	}
+	if _, stops := fixture.lc.stopSnapshot(); stops != 0 {
+		t.Fatalf("maintenance stopped reconnected owner %d times", stops)
+	}
+}
+
+func TestRunSessionMaintenanceConvergesLegacyNoSessionRunningOwner(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-maint-legacy")
+	setSandboxFinalizerUnitState(t, fixture, "inactive")
+	if err := fixture.o.queueMissingRunSessionChecks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dead := waitForSandbox(t, fixture.o, context.Background(), fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateDead && sb.ExecutionResult != nil
+	}, "legacy no-session maintenance cleanup")
+	if dead.ExecutionResult.RunID != fixture.sb.RunID || dead.ExecutionResult.Stage != types.SandboxResultRun {
+		t.Fatalf("legacy maintenance result = %+v", dead.ExecutionResult)
+	}
+}
+
+func TestReaperQueuesMissingRunSessionMaintenance(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-maint-reaper")
+	setSandboxFinalizerUnitState(t, fixture, "inactive")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go fixture.o.Reaper(ctx, 10*time.Millisecond)
+	dead := waitForSandbox(t, fixture.o, context.Background(), fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateDead && sb.ExecutionResult != nil
+	}, "reaper missing-session maintenance cleanup")
+	if dead.ExecutionResult.RunID != fixture.sb.RunID || dead.ExecutionResult.Stage != types.SandboxResultRun {
+		t.Fatalf("reaper maintenance result = %+v", dead.ExecutionResult)
+	}
+}

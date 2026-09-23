@@ -2417,6 +2417,9 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
+			if err := o.queueMissingRunSessionChecks(ctx); err != nil {
+				o.log.Warn("reaper run-session maintenance", "err", err)
+			}
 			if n, err := o.st.PruneExpiredKeyPairs(ctx); err != nil {
 				o.log.Warn("reaper prune key pairs", "err", err)
 			} else if n > 0 {
@@ -2427,6 +2430,26 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+func (o *Orchestrator) queueMissingRunSessionChecks(ctx context.Context) error {
+	var runIDs []string
+	if err := o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
+		if sb.RunID == "" || sb.ExecutionResult != nil {
+			return nil
+		}
+		if o.runSessionActive(runKindSandbox, sb.RunID) {
+			return nil
+		}
+		runIDs = append(runIDs, sb.RunID)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, runID := range runIDs {
+		o.startRunDisconnectCheck(runKindSandbox, runID)
+	}
+	return nil
 }
 
 // Reconcile is the complete restart path used by tests and embedded callers.

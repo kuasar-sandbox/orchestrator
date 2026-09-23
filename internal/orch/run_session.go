@@ -153,6 +153,9 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 	if kind != runKindSandbox {
 		return nil
 	}
+	if o.runSessionActive(kind, runID) {
+		return nil
+	}
 	checkCtx, cancel := cleanupContext()
 	defer cancel()
 	sid, found, err := o.st.GetSandboxIDByCurrentRunID(checkCtx, runID)
