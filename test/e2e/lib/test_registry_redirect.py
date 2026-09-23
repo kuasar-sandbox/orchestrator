@@ -53,6 +53,7 @@ WORK="$FIXTURE_WORK"
 CLUSTER_API_KEY=test-key
 ROUTE_KEY=test-route
 step() { :; }
+sleep() { :; }
 fail() { exit 19; }
 record() { echo "$1" >> "$SEQUENCE"; [ "$1" != "$FAILURE" ]; }
 restart_redirect_owner() { record restart; }
@@ -67,7 +68,11 @@ sandbox_route() { printf 'exact-sid\ttest-token\ttest-forward\n'; }
 data_by_sid_code() {
     [ "$2" = exact-sid ] && [ "$3" = test-token ] || exit 18
     record request
-    if [ "$FAILURE" = http ]; then echo 503; else echo 204; fi
+    if [ "$FAILURE" = http ] || { [ "$FAILURE" = slow-boot ] && [ "$(grep -c '^request$' "$SEQUENCE")" -lt 3 ]; }; then
+        echo 503
+    else
+        echo 204
+    fi
 }
 wait_cluster_traffic_stats() { record traffic; }
 router_req() {
@@ -78,7 +83,7 @@ router_req() {
     fi
 }
 wait_node_sandbox_finalized() { record finalized; }
-''' + (source or function("run_redirect_recovery")) + '\n' + function("run_redirect_flow") + '\nrun_redirect_flow\n'
+''' + function("retry_data_by_sid") + '\n' + (source or function("run_redirect_recovery")) + '\n' + function("run_redirect_flow") + '\nrun_redirect_flow\n'
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                                     timeout=5, env={**os.environ, "SEQUENCE": str(log), "FAILURE": failure,
                                                    "FIXTURE_WORK": directory})
@@ -99,14 +104,27 @@ wait_node_sandbox_finalized() { record finalized; }
                 self.assertNotIn("create", calls)
                 self.assertNotIn("request", calls)
 
-    def test_failed_create_or_data_request_is_never_retried(self):
-        for failure, request in (("create-http", "create"), ("http", "request")):
-            with self.subTest(failure=failure):
-                status, calls = self.recovery(failure)
-                self.assertNotEqual(status, 0)
-                self.assertEqual(calls.count(request), 1)
-                self.assertNotIn("traffic", calls)
-                self.assertNotIn("delete", calls)
+    def test_failed_create_is_never_retried(self):
+        status, calls = self.recovery("create-http")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(calls.count("create"), 1)
+        self.assertNotIn("request", calls)
+        self.assertNotIn("delete", calls)
+
+    def test_read_only_data_readiness_converges_without_repeating_create(self):
+        status, calls = self.recovery("slow-boot")
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, ["restart", "node-link", "placer", "create",
+                                 "request", "request", "request", "traffic",
+                                 "delete", "list", "finalized"])
+
+    def test_data_readiness_exhausts_existing_bound_without_repeating_create(self):
+        status, calls = self.recovery("http")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(calls.count("create"), 1)
+        self.assertEqual(calls.count("request"), 12)
+        self.assertNotIn("traffic", calls)
+        self.assertNotIn("delete", calls)
 
     def test_missing_readiness_gate_mutant_is_detected(self):
         source = function("run_redirect_recovery")
@@ -122,7 +140,7 @@ wait_node_sandbox_finalized() { record finalized; }
     def test_actual_flow_invokes_recovery_before_delete_and_creates_once(self):
         source = function("run_redirect_flow")
         self.assertNotIn("retry_create_sandbox", source)
-        self.assertNotIn("retry_data_by_sid", source)
+        self.assertIn('retry_data_by_sid "$sid" "$envd_token"', source)
         self.assertLess(source.index("run_redirect_recovery"), source.index('code="$(create_sandbox'))
         self.assertLess(source.index("run_redirect_recovery"), source.index("router_req DELETE"))
         gate = function("wait_redirect_placer")

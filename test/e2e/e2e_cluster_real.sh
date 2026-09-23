@@ -1111,10 +1111,10 @@ run_redirect_flow() {
         || fail "redirect create returned an invalid e2b response"
     rm -f "$create_response"
 
-    code="$(data_by_sid_code "$WORK/data-health.body" "$sid" "$envd_token")"
+    code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
     [ "$code" = "204" ] || [ "$code" = "200" ] || fail "post-restart redirect data-plane /health returned $code"
     wait_cluster_traffic_stats "$sid" idle || fail "redirect traffic did not publish/converge to idle"
-    step "PASS: post-restart redirected topology placed a real sandbox and routed one envd request ($code)"
+    step "PASS: post-restart redirected topology placed a real sandbox and routed envd health ($code)"
     unset envd_token
 
     code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"

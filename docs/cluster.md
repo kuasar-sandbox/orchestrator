@@ -839,9 +839,11 @@ derives the exact Registry owner from the actual node-link redirect and confirms
 that the node used it. It restarts that owner and Router, requires a new node-link
 connection, then uses the existing bounded placer probe to require the expected
 node. The recovered topology and empty Router cache must then serve one real
-Create, one guest data request, and normal Delete with node-local finalization.
-This exercises actual post-restart placement after node-link recovery. Failed
-readiness blocks Create, and failed Create/data requests are not retried. Syntax,
+Create, pass the existing bounded read-only guest `/health` readiness probe, and
+complete normal Delete with node-local finalization. This exercises actual
+post-restart placement after node-link recovery. Failed recovery readiness blocks
+Create; failed Create is not retried. Guest readiness retains its existing bound
+and permits no repeated mutating operation. Syntax,
 ShellCheck and the placer/recovery gate regressions precede the required real KVM
 owner run; stub or helper results do not replace that run.
 
