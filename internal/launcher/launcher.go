@@ -6,6 +6,9 @@ package launcher
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/coreos/go-systemd/v22/dbus"
 )
@@ -28,6 +31,9 @@ type Launcher interface {
 	ResetFailed(ctx context.Context, unit string) error
 	// List returns units matching the glob pattern (the liveness authority).
 	List(ctx context.Context, pattern string) ([]Unit, error)
+	// UnitEmpty proves the exact stopped unit has no processes left. Implementations
+	// must return an error when that cannot be established reliably.
+	UnitEmpty(ctx context.Context, unit string) (bool, error)
 	// Reload re-reads unit files after node-ctl installs/updates them.
 	Reload(ctx context.Context) error
 	Close() error
@@ -90,6 +96,54 @@ func (s *Systemd) List(ctx context.Context, pattern string) ([]Unit, error) {
 		out = append(out, Unit{Name: u.Name, ActiveState: u.ActiveState, SubState: u.SubState})
 	}
 	return out, nil
+}
+
+// UnitEmpty verifies the exact unit's delegated cgroup has no processes after
+// Stop has settled. An empty ControlGroup is authoritative only when systemd
+// also reports the unit inactive or failed. A nonempty group requires cgroup v2.
+func (s *Systemd) UnitEmpty(ctx context.Context, unit string) (bool, error) {
+	state, err := s.conn.GetUnitPropertyContext(ctx, unit, "ActiveState")
+	if err != nil {
+		return false, fmt.Errorf("launcher: state %s: %w", unit, err)
+	}
+	active, ok := state.Value.Value().(string)
+	if !ok {
+		return false, fmt.Errorf("launcher: invalid state for %s", unit)
+	}
+	if active != "inactive" && active != "failed" {
+		return false, nil
+	}
+	group, err := s.conn.GetServicePropertyContext(ctx, unit, "ControlGroup")
+	if err != nil {
+		return false, fmt.Errorf("launcher: cgroup %s: %w", unit, err)
+	}
+	name, ok := group.Value.Value().(string)
+	if !ok {
+		return false, fmt.Errorf("launcher: invalid cgroup for %s", unit)
+	}
+	if name == "" {
+		return true, nil
+	}
+	if !strings.HasPrefix(name, "/") || filepath.Clean(name) != name || strings.Contains(name, "..") {
+		return false, fmt.Errorf("launcher: invalid cgroup path for %s", unit)
+	}
+	data, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", name, "cgroup.events"))
+	if err != nil {
+		return false, fmt.Errorf("launcher: read cgroup events %s: %w", unit, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "populated" {
+			if fields[1] == "0" {
+				return true, nil
+			}
+			if fields[1] == "1" {
+				return false, nil
+			}
+			break
+		}
+	}
+	return false, fmt.Errorf("launcher: invalid cgroup events for %s", unit)
 }
 
 func waitJob(ctx context.Context, unit, op string, ch <-chan string) error {

@@ -66,14 +66,17 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
-	launches       launchGroup            // sole process-local owner of create and resume attempts
-	acceptedOps    acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
-	buildWake      chan struct{}
-	buildUsageWake chan struct{}
-	buildOps       acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
-	deleteOps      acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
-	exports        exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
-	lifecycle      keyedLockGroup         // serialize lifecycle mutations for one sid
+	launches         launchGroup            // sole process-local owner of create and resume attempts
+	acceptedOps      acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+	buildWake        chan struct{}
+	buildUsageWake   chan struct{}
+	buildOps         acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
+	deleteOps        acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
+	runnerReapOps    acceptedOperationGroup // runner scans and cleanup drain before store/launcher close
+	exports          exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
+	lifecycle        keyedLockGroup         // serialize lifecycle mutations for one sid
+	reaperScanMu     sync.Mutex             // serialize scans and protect cursor
+	reaperScanCursor string                 // last running SID checked for runner exit
 
 	deleteMu            sync.Mutex
 	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
@@ -2382,12 +2385,12 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 
 // --- reaper / reconcile ---
 
-// Reaper enforces active idle TTLs and bounded terminal-history retention:
-// idle past deadline -> auto-suspend, then owner-free dead/ready/error rows
-// past their configured diagnostic window -> exact durable delete.
+// Reaper enforces idle TTLs and terminal-history retention, and starts the
+// independent running-runner liveness scan. Call it once per Orchestrator.
 func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	go o.runnerExitReaper(ctx, runnerScanIntervalMultiplier*interval)
 	for {
 		select {
 		case <-ctx.Done():
@@ -2419,6 +2422,180 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+const (
+	runnerScanIntervalMultiplier = 3 // 5s conductor reaper -> 15s runner scan
+	runnerScanTimeout            = 5 * time.Second
+	runnerProofTimeout           = 4 * time.Second
+	runnerCleanupTimeout         = 30 * time.Second
+	runnerPostCommitTimeout      = 2 * time.Second
+	runnerScanBatchSize          = 16
+)
+
+// Runner checks have their own cadence so slow external cleanup cannot delay
+// TTL enforcement or terminal-history pruning.
+func (o *Orchestrator) runnerExitReaper(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := o.reapExitedRunners(ctx); err != nil {
+				o.log.Warn("reaper runner scan", "err", err)
+			}
+		}
+	}
+}
+
+// reapExitedRunners uses the unit list only to find candidates. Each candidate
+// is checked again under its lifecycle fence before any ownership is released.
+// The cursor bounds cleanup per tick without starving later SIDs on failures.
+func (o *Orchestrator) reapExitedRunners(ctx context.Context) error {
+	if !o.reaperScanMu.TryLock() {
+		return nil // another scan already owns the cursor and candidates
+	}
+	defer o.reaperScanMu.Unlock()
+	finish, err := o.runnerReapOps.Begin(o.launchContext())
+	if err != nil {
+		return err
+	}
+	defer finish()
+	scanCtx, cancel := context.WithTimeout(ctx, runnerScanTimeout)
+	defer cancel()
+	units, err := o.listRunUnits(scanCtx, runKindSandbox)
+	if err != nil {
+		return err
+	}
+	alive := make(map[string]bool, len(units))
+	for _, unit := range units {
+		if builderUnitMayHaveProcesses(unit.ActiveState) {
+			alive[o.unitToRunID(unit.Name)] = true
+		}
+	}
+	var rows []*types.Sandbox
+	if err := o.st.RangeByState(scanCtx, types.StateRunning, func(sb *types.Sandbox) error {
+		if sb.RunID != "" && !alive[sb.RunID] {
+			rows = append(rows, sb)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		o.reaperScanCursor = ""
+		return nil
+	}
+	start := 0
+	for start < len(rows) && rows[start].ID <= o.reaperScanCursor {
+		start++
+	}
+	if start == len(rows) {
+		start = 0
+	}
+	for i := 0; i < len(rows) && i < runnerScanBatchSize; i++ {
+		sb := rows[(start+i)%len(rows)]
+		o.reaperScanCursor = sb.ID
+		candidateCtx, done := context.WithTimeout(ctx, runnerProofTimeout)
+		if err := o.reapExitedRunner(candidateCtx, sb); err != nil {
+			o.log.Warn("reaper exited runner cleanup", "sid", sb.ID, "run_id", sb.RunID, "err", err)
+		}
+		done()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func sameRunningOwnership(a, b *types.Sandbox) bool {
+	// Keep this identity tuple aligned with Store.CommitSandboxDead's conditional
+	// update. The CAS remains the final guard before publishing a dead state.
+	return a != nil && b != nil && a.State == types.StateRunning && b.State == types.StateRunning &&
+		a.ID == b.ID && a.RunID == b.RunID && a.CreatedUnix == b.CreatedUnix &&
+		a.LaunchMode == b.LaunchMode && a.FloatingIP == b.FloatingIP &&
+		a.VswitchPort == b.VswitchPort && a.InnerIP == b.InnerIP && a.PortMAC == b.PortMAC &&
+		a.RunDir == b.RunDir && a.BaseDir == b.BaseDir && a.EnvdUDS == b.EnvdUDS &&
+		a.CiUDS == b.CiUDS && a.ResumeSource == b.ResumeSource
+}
+
+func (o *Orchestrator) reapExitedRunner(ctx context.Context, candidate *types.Sandbox) error {
+	unlock, locked := o.lifecycle.TryLock(candidate.ID)
+	if !locked {
+		return nil
+	}
+	defer unlock()
+	current, err := o.st.Get(ctx, candidate.ID)
+	if err != nil {
+		return err
+	}
+	if !sameRunningOwnership(candidate, current) {
+		return nil
+	}
+	unit := o.runnerUnit(current.RunID)
+	if unit == "" {
+		return fmt.Errorf("runner %s has no exact unit association", current.RunID)
+	}
+	active, err := o.sandboxUnitActive(ctx, unit)
+	if err != nil {
+		return err
+	}
+	if active {
+		return nil
+	}
+	stopErr := o.lc.Stop(ctx, unit)
+	active, err = o.sandboxUnitActive(ctx, unit)
+	if err != nil {
+		return errors.Join(stopErr, err)
+	}
+	if active {
+		if stopErr != nil {
+			return fmt.Errorf("runner %s remained active after stop: %w", unit, stopErr)
+		}
+		return fmt.Errorf("runner %s remained active after stop", unit)
+	}
+	empty, err := o.lc.UnitEmpty(ctx, unit)
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return fmt.Errorf("runner %s was not verified empty after stop", unit)
+	}
+	// A checkpoint tree can take longer than the systemd proof budget to remove.
+	// Keep its durable owner until cleanup and the terminal commit both succeed.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), runnerCleanupTimeout)
+	defer cleanupCancel()
+	if err := o.teardownPersistedOwnership(cleanupCtx, current, true); err != nil {
+		return err
+	}
+	changed, err := o.st.CommitSandboxDead(cleanupCtx, current)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return fmt.Errorf("running sandbox %s changed before dead commit", current.ID)
+	}
+	o.runs.forget(current.RunID)
+	o.releaseDetachedPortFence(current.VswitchPort)
+	o.publishDelete(current.ID)
+	readCtx, readCancel := context.WithTimeout(context.Background(), runnerPostCommitTimeout)
+	defer readCancel()
+	updated, err := o.st.Get(readCtx, current.ID)
+	if err != nil {
+		return err
+	}
+	if updated != nil {
+		o.observeSandboxUpsert(updated)
+	}
+	return nil
+}
+
+// DrainRunnerReaps closes scan admission and waits for in-flight runner checks,
+// cleanup, and publication before the launcher and store are closed.
+func (o *Orchestrator) DrainRunnerReaps(ctx context.Context) error {
+	return o.runnerReapOps.Drain(ctx)
 }
 
 // Reconcile is the complete restart path used by tests and embedded callers.
