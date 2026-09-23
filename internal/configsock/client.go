@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -34,6 +36,67 @@ func HTTPClientWithTimeout(socket string, timeout time.Duration) *http.Client {
 			},
 		},
 	}
+}
+
+type RunSession struct {
+	body io.ReadCloser
+	once sync.Once
+	done chan error
+}
+
+func (s *RunSession) Close() error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	s.once.Do(func() { err = s.body.Close() })
+	return err
+}
+
+func (s *RunSession) Done() <-chan error {
+	if s == nil {
+		ch := make(chan error)
+		close(ch)
+		return ch
+	}
+	return s.done
+}
+
+func OpenRunSession(ctx context.Context, socket, kind, runID string) (*RunSession, error) {
+	body, _ := json.Marshal(RunSessionRequest{Kind: kind, RunID: runID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost"+PathRunSession, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
+	if err != nil {
+		return nil, &transportError{err: err}
+	}
+	var out RunSessionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		_ = resp.Body.Close()
+		return nil, &transportError{err: fmt.Errorf("configsock: decode run session: %w", err)}
+	}
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		_ = resp.Body.Close()
+		return nil, buildResponseError(resp.StatusCode, out.Error)
+	}
+	if out.Kind != kind || out.RunID != runID {
+		_ = resp.Body.Close()
+		return nil, errors.New("configsock: run session identity mismatch")
+	}
+	session := &RunSession{body: resp.Body, done: make(chan error, 1)}
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			session.done <- &transportError{err: err}
+			return
+		}
+		session.done <- nil
+	}()
+	return session, nil
 }
 
 func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, error) {

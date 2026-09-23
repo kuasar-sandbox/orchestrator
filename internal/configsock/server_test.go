@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +39,34 @@ type stubProvider struct {
 	buildAuthHits   *atomic.Int32
 	buildSpecHits   *atomic.Int32
 	buildPrepHits   *atomic.Int32
+	sessions        *stubRunSessionRegistry
+}
+
+type stubRunSessionRegistry struct {
+	mu         sync.Mutex
+	registered []RunSessionRequest
+	closed     []bool
+	closeCh    chan bool
+}
+
+type stubRunSession struct {
+	registry *stubRunSessionRegistry
+}
+
+func (s *stubRunSession) Close(shutdown bool) {
+	if s == nil || s.registry == nil {
+		return
+	}
+	s.registry.mu.Lock()
+	s.registry.closed = append(s.registry.closed, shutdown)
+	ch := s.registry.closeCh
+	s.registry.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- shutdown:
+		default:
+		}
+	}
 }
 
 func (s stubProvider) SandboxTaskAuth(_ context.Context, sandboxID, runID string) (SandboxTaskAuth, bool, error) {
@@ -127,6 +156,21 @@ func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
 		return s.pidFile, true
 	}
 	return "", false
+}
+
+func (s stubProvider) RegisterRunSession(_ context.Context, kind, runID string) (RunSessionRegistration, bool, error) {
+	if kind != "sandbox" && kind != "build" {
+		return nil, false, nil
+	}
+	if (kind == "sandbox" && runID != "sr-test") || (kind == "build" && runID != "br-test") {
+		return nil, false, nil
+	}
+	if s.sessions != nil {
+		s.sessions.mu.Lock()
+		s.sessions.registered = append(s.sessions.registered, RunSessionRequest{Kind: kind, RunID: runID})
+		s.sessions.mu.Unlock()
+	}
+	return &stubRunSession{registry: s.sessions}, true, nil
 }
 
 func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (string, bool, error) {
@@ -235,18 +279,25 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 
 func startTestServer(t *testing.T, deps Deps) (string, *http.Client) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "ctl.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = New(sock, deps, discardLogger()).Serve(ctx) }()
+	sock, client, _ := startTestServerWithContext(t, ctx, deps)
+	return sock, client
+}
+
+func startTestServerWithContext(t *testing.T, ctx context.Context, deps Deps) (string, *http.Client, <-chan error) {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	done := make(chan error, 1)
+	go func() { done <- New(sock, deps, discardLogger()).Serve(ctx) }()
 	for range 400 { // wait for ListenUnix + chmod to publish the socket
 		if _, err := os.Stat(sock); err == nil {
-			return sock, HTTPClient(sock)
+			return sock, HTTPClient(sock), done
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("server did not bind")
-	return "", nil
+	return "", nil, done
 }
 
 func mustWrite(t *testing.T, path, content string) {
@@ -690,6 +741,83 @@ func TestBuildRetryClassification(t *testing.T) {
 				t.Fatalf("definitive error = %v, retryable=%t", err, IsRetryableError(err))
 			}
 		})
+	}
+}
+
+func TestRunSessionFlushesAckAndClosesOnClientDisconnect(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	registry := &stubRunSessionRegistry{closeCh: make(chan bool, 1)}
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, sessions: registry}})
+	session, err := OpenRunSession(context.Background(), sock, "sandbox", "sr-test")
+	if err != nil {
+		t.Fatalf("OpenRunSession: %v", err)
+	}
+	registry.mu.Lock()
+	registered := append([]RunSessionRequest(nil), registry.registered...)
+	registry.mu.Unlock()
+	if len(registered) != 1 || registered[0].Kind != "sandbox" || registered[0].RunID != "sr-test" {
+		t.Fatalf("registered sessions = %+v", registered)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	select {
+	case shutdown := <-registry.closeCh:
+		if shutdown {
+			t.Fatal("client disconnect was reported as shutdown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session close did not reach provider")
+	}
+}
+
+func TestRunSessionAuthenticatesBeforeRegistration(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	registry := &stubRunSessionRegistry{}
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, sessions: registry}})
+	if _, err := OpenRunSession(context.Background(), sock, "sandbox", "sr-test"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("unauthorized session error = %v", err)
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.registered) != 0 {
+		t.Fatalf("unauthorized session reached provider: %+v", registry.registered)
+	}
+}
+
+func TestRunSessionShutdownCloseIsSuppressed(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	registry := &stubRunSessionRegistry{closeCh: make(chan bool, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	sock, _, done := startTestServerWithContext(t, ctx, Deps{Provider: stubProvider{pidFile: pf, sessions: registry}})
+	session, err := OpenRunSession(context.Background(), sock, "sandbox", "sr-test")
+	if err != nil {
+		t.Fatalf("OpenRunSession: %v", err)
+	}
+	cancel()
+	select {
+	case shutdown := <-registry.closeCh:
+		if !shutdown {
+			t.Fatal("server shutdown was reported as ordinary disconnect")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not close long run session")
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client session did not observe shutdown")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after cancel")
 	}
 }
 

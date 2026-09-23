@@ -48,6 +48,7 @@ func runSandbox(args []string, log *slog.Logger) error {
 type runSandboxOps struct {
 	lockPidfile    func(string) error
 	prepareCgroup  func() (*os.File, error)
+	openSession    func(context.Context, string, string, string) (*configsock.RunSession, error)
 	waitAssignment func(context.Context, string, string, string) (string, error)
 	connectReady   func(string) (*os.File, error)
 	launchTask     func(string, string, string, *os.File, *os.File) error
@@ -62,6 +63,13 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 		return fmt.Errorf("prepare runner cgroup: %w", err)
 	}
 	defer vmmCgroup.Close()
+	if ops.openSession != nil {
+		session, err := ops.openSession(context.Background(), socket, "sandbox", runID)
+		if err != nil {
+			return fmt.Errorf("open run session: %w", err)
+		}
+		defer session.Close()
+	}
 	sid, err := ops.waitAssignment(context.Background(), socket, "sandbox", runID)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)

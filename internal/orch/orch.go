@@ -82,6 +82,10 @@ type Orchestrator struct {
 	resultCleanupMu     sync.Mutex
 	resultCleanupActive map[string]struct{} // sid/run_id -> live retrying result cleanup
 
+	runSessionsMu   sync.Mutex
+	runSessionsNext uint64
+	runSessions     map[runSessionKey]*runSessionGeneration
+
 	lifecycleCtxMu sync.RWMutex
 	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
 

@@ -79,6 +79,16 @@ func (r *runIndex) assigned(runID string) {
 	delete(r.waiting, runID)
 }
 
+func (r *runIndex) owner(runID string) (unit string, waiting bool) {
+	if r == nil {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, waiting = r.waiting[runID]
+	return r.units[runID], waiting
+}
+
 func (r *runIndex) forget(runID string) {
 	if r == nil {
 		return

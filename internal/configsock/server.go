@@ -2,10 +2,11 @@
 // UDS that multiplexes several planes over HTTP (h2c, with HTTP/1.1 fallback), each
 // with its own authentication:
 //
-//   - run    (POST /internal/run/assignment, /internal/run/build-result):
-//     prestarted run-id units wait for their sandbox/build assignment; run-builder
-//     posts its result back here. Authed by SO_PEERCRED peer pid == the run-id
-//     pidfile (/run/sandbox/runners/<run-id>.pid).
+//   - run    (PUT /internal/run/session, POST /internal/run/assignment,
+//     /internal/run/build-result): prestarted run-id units register one long-lived
+//     parent session, wait for sandbox/build assignment, and post bounded results.
+//     Authed by SO_PEERCRED peer pid == the run-id pidfile
+//     (/run/sandbox/runners/<run-id>.pid).
 //   - task   (POST /internal/task/{sandbox,build}/{bootstrap,prepare}):
 //     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
 //     SO_PEERCRED peer pid == the task pidfile
@@ -42,6 +43,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -64,6 +66,7 @@ const (
 	PathTaskBuildBootstrap         = "/internal/task/build/bootstrap"
 	PathTaskBuildPrepare           = "/internal/task/build/prepare"
 	PathRunAssignment              = "/internal/run/assignment"
+	PathRunSession                 = "/internal/run/session"
 	PathRunBuildResult             = "/internal/run/build-result"
 	PathRunSandboxResult           = "/internal/run/sandbox-result"
 	PathRunBuildPhase              = "/internal/run/build-phase"
@@ -110,6 +113,25 @@ type AssignmentResponse struct {
 	RunID  string `json:"run_id,omitempty"`
 	TaskID string `json:"task_id,omitempty"`
 	Error  string `json:"error,omitempty"`
+}
+
+type RunSessionRequest struct {
+	Kind  string `json:"kind"`
+	RunID string `json:"run_id"`
+}
+
+type RunSessionResponse struct {
+	Kind  string `json:"kind,omitempty"`
+	RunID string `json:"run_id,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// RunSessionRegistration is the provider-owned generation for one long-lived
+// runner parent connection. Close is called exactly once when the HTTP stream
+// ends; shutdown is true only for config-socket server shutdown, which must not
+// be treated as runner death.
+type RunSessionRegistration interface {
+	Close(shutdown bool)
 }
 
 // SandboxExecutionResult is the config-socket wire representation of the
@@ -219,6 +241,7 @@ type Provider interface {
 	BuildTaskSpecFor(ctx context.Context, buildID, runID string) (resp *BuildTaskSpec, ok bool, err error)
 	CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary ArtifactPrepareSummary) (*BuildSpec, error)
 	RunPidFile(kind, runID string) (pidFile string, ok bool)
+	RegisterRunSession(ctx context.Context, kind, runID string) (session RunSessionRegistration, ok bool, err error)
 	WaitAssignment(ctx context.Context, kind, runID string) (taskID string, ok bool, err error)
 	PostSandboxResult(ctx context.Context, runID, sandboxID string, result SandboxExecutionResult) error
 	PostBuildResult(ctx context.Context, runID, buildID string, result BuildResult) error
@@ -464,6 +487,8 @@ type Server struct {
 	path string
 	deps Deps
 	log  *slog.Logger
+
+	shuttingDown atomic.Bool
 }
 
 func New(path string, deps Deps, log *slog.Logger) *Server {
@@ -484,6 +509,9 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
+	s.shuttingDown.Store(false)
+	serverCtx, cancelServerCtx := context.WithCancel(context.Background())
+	defer cancelServerCtx()
 	_ = os.Remove(s.path)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.path, Net: "unix"})
 	if err != nil {
@@ -499,6 +527,9 @@ func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
 	srv := &http.Server{
 		Handler:           h2c.NewHandler(s.router(), &http2.Server{}),
 		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return serverCtx
+		},
 		// Capture the connecting process's pid via SO_PEERCRED at accept time so
 		// every request on the connection can be authorized by peer pid.
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
@@ -512,6 +543,8 @@ func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
 	}
 	go func() {
 		<-ctx.Done()
+		s.shuttingDown.Store(true)
+		cancelServerCtx()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
@@ -529,6 +562,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskSandboxPrepare, s.handleSandboxPrepare)
 	mux.HandleFunc("POST "+PathTaskBuildBootstrap, s.handleBuildBootstrap)
 	mux.HandleFunc("POST "+PathTaskBuildPrepare, s.handleBuildPrepare)
+	mux.HandleFunc("PUT "+PathRunSession, s.handleRunSession)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunSandboxResult, s.handleSandboxResult)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
@@ -741,6 +775,50 @@ func decodeTaskRequest(w http.ResponseWriter, r *http.Request, maxBytes int64, o
 		return http.StatusBadRequest
 	}
 	return 0
+}
+
+func (s *Server) handleRunSession(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &RunSessionResponse{Error: "no peer credentials"})
+		return
+	}
+	var req RunSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Kind == "" || req.RunID == "" {
+		writeJSON(w, http.StatusBadRequest, &RunSessionResponse{Error: "bad request"})
+		return
+	}
+	pidFile, ok := s.deps.Provider.RunPidFile(req.Kind, req.RunID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &RunSessionResponse{Error: "unknown run"})
+		return
+	}
+	if !s.taskAuthed("run-session:"+req.Kind+":"+req.RunID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &RunSessionResponse{Error: "not authorized"})
+		return
+	}
+	session, ok, err := s.deps.Provider.RegisterRunSession(r.Context(), req.Kind, req.RunID)
+	if err != nil {
+		s.log.Warn("configsock run session", "kind", req.Kind, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &RunSessionResponse{Error: err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &RunSessionResponse{Error: "unknown run"})
+		return
+	}
+	defer func() { session.Close(s.shuttingDown.Load()) }()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(&RunSessionResponse{Kind: req.Kind, RunID: req.RunID}); err != nil {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	flusher.Flush()
+	<-r.Context().Done()
 }
 
 func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {
