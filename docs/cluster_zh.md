@@ -1123,6 +1123,16 @@ import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、
 孤儿 route 清理、Build Delete 丢失后的 reconnect full-sync 收敛和节点清空收敛。
 桩的 `reboot-empty` 故意清空模拟状态，不是实际 conductor 启动删除 durable SQLite row 的证明。
 
+配套的真实 `e2e_cluster_real.sh` 将通用生命周期和 Build/取消/回收矩阵保留在
+`registry-n1`. `registry-redirect` 从实际 node-link redirect 得到精确 Registry
+owner, 并确认 node 使用了该 owner. 一次真实 Create 和 guest health 检查之后,
+重启该 owner 与 Router, 要求出现新的 node-link 连接, 并经空 Router cache 读回
+同一个 running SandboxID, 然后复用既有有界 placer probe 确认预期节点. 门禁全部
+通过后才执行一次 guest 数据请求, 最后正常 Delete 并等待 node-local finalization.
+它证明存量 route 恢复, 不声称重启后完成新放置. Readiness 失败阻止后续请求,
+Create 或重启后数据请求失败时不重试. 语法、ShellCheck 和 placer/恢复门禁回归
+先于必需的真实 KVM owner run; stub 或 helper 结果不能替代该运行.
+
 ## 17. See Also
 
 - [cluster-router_zh.md](cluster-router_zh.md) — router 入口、route cache 和数据面转发。

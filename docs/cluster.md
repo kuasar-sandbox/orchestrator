@@ -833,6 +833,19 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 
 `make test-e2e` does not build binaries: it passes `E2E_BIN` (defaulting to the sibling project repository’s assembled binary directory) to `test/e2e/run_all.sh` and requires that multi-repository artifact set beforehand. For the local stub-only flow, run `make build` followed by `make test-e2e-cluster-stub`; this target uses the local `BINDIR` to start real `cluster-ctl registry/router/placer` and `node-stub-ctl`. See [Makefile](../Makefile). `test/e2e/e2e_cluster_stub.sh` covers N=1 and multi-member Registry, joint/old_grace membership cutover, group import, key distribution, explicit create/Reserve, stable-SandboxID CmdConnect, SandboxID↔NodeSandboxID translation, control/build reaching the API listener, data/exec reaching the Data listener, ExecSession Reserve/CmdExecSession issuance, `service=exec` KAT rejection/two-hop validation and the second-hop buffered tunnel, route cache, BuildRegister, orphan-route cleanup, reconnect full-sync convergence after a lost Build Delete, and emptied-node convergence. The stub's `reboot-empty` deliberately empties simulated state; it is not proof that real conductor startup deletes durable SQLite rows.
 
+The companion real `e2e_cluster_real.sh` case keeps the common lifecycle and
+Build/cancellation/reclamation matrix in `registry-n1`. `registry-redirect`
+derives the exact Registry owner from the actual node-link redirect and confirms
+that the node used it. After one real Create and guest health check, it restarts
+that owner and Router, requires a new node-link connection and the same running
+SandboxID through the empty Router cache, then uses the existing bounded placer
+probe to require the expected node. Only then does one guest data request run,
+followed by normal Delete and node-local finalization. This proves retained-route
+recovery; it does not claim a new post-restart placement. Failed readiness blocks
+the request, and failed Create/post-restart data requests are not retried. Syntax,
+ShellCheck and the placer/recovery gate regressions precede the required real KVM
+owner run; stub or helper results do not replace that run.
+
 ## 17. See also
 
 - [Cluster router](cluster-router.md) — Router ingress, route cache and data forwarding.
