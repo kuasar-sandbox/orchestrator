@@ -409,7 +409,7 @@ pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure even
 这些指标不能混成一个“内存使用量”:reservation、host VMM charge 和 guest demand
 分别属于不同口径。
 
-生命周期累计用量通过[原生 stats/usage](node-usage_zh.md)读取, 节点策略下发到全部三条启动路径. 当前 VMM counter、生命周期累计量与历史 E2B Gauge 保持各自语义.
+生命周期累计用量通过[原生 stats/usage](node_zh.md#原生-usage)读取, 节点策略下发到全部三条启动路径. 当前 VMM counter、生命周期累计量与历史 E2B Gauge 保持各自语义.
 
 ## 10. See Also
 

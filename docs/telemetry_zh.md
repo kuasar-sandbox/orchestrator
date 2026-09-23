@@ -143,6 +143,8 @@ pipeline; 只有沙箱业务 receiver 专门处理 metrics. 不增加 logs/trace
 client、不读取 usage 文件、不维护第二套 port 绑定. Conductor 组织原生来源, 保留
 ownership/binding 校验及失败规则.
 
+内部请求为 `POST /internal/plugin/telemetry/stats`,使用固定 Plugin ID `telemetry` 的 ready、current、live 注册及实际 `SO_PEERCRED` PID,并遵守既有 `plugin_pidfile` 白名单. 注册替换或断开会取消 inflight 读取;write-only 注册无需 query UDS 也可消费原生 stats. 完整请求/响应示例、整批失败、参数与大小/并发/读取/写入时间上限由 [Node 本机 stats 合同](node_zh.md#原生-stats-batch)维护.
+
 配置项包括 `resource_interval` (默认 5s)、`traffic_interval` (10s)、`usage_interval`
 (1m)、`timeout` (上限 5s)、`concurrency` (默认 4, 范围 1..8). 周期零表示关闭对应
 section; 启用周期为 1s..1h, 至少启用一项. 每实例每次请求最多 64 个 SandboxID,
@@ -173,7 +175,7 @@ Usage 采集请求 `view=saved`. 累计数量保留 Record 的 `saved_utc_ns`; �
 区分保存的贡献和当前来源观测.
 Live 可以领先 saved; crash 或保存失败可能丢失未保存尾部. Receiver 不强制 sample、
 save、fsync 或 export ACK, 不改变原生 usage 策略. Current/live/history、精确整数、
-raw counter、128-bit 积分、coverage 和详细错误仍由 [`stats/usage`](node-usage_zh.md)
+raw counter、128-bit 积分、coverage 和详细错误仍由 [`stats/usage`](node_zh.md#原生-usage)
 提供. 启用 telemetry 不会启用 usage.
 
 ## 4. 直接面向沙箱的 OTLP
@@ -461,7 +463,7 @@ Reader 失败返回脱敏 503。不插值、不填零、
 平台已有 `/stats/resource` 与 `/stats/traffic` 保持独立只读即时接口，不替代 guest
 metric history。
 
-原生 resource、traffic 和 usage 读取由 conductor 负责, telemetry 停止时仍可使用. 可信 telemetry lease 经现有 config socket 消费选定 section, 不访问沙箱 ctl socket 或 usage 文件. Paused saved usage 不要求 active guest. 参见[原生 usage 与本机读取](node-usage_zh.md).
+原生 resource、traffic 和 usage 读取由 conductor 负责, telemetry 停止时仍可使用. 可信 telemetry lease 经现有 config socket 消费选定 section, 不访问沙箱 ctl socket 或 usage 文件. Paused saved usage 不要求 active guest. 参见[原生 usage 与本机读取](node_zh.md#原生-usage).
 
 原生 traffic 使用平铺的 `state`、`maxInflight`、`inflight:{parking,connected}`、`idleSince`、`services`、`platform`、`transit` 和 `egress` 结构. Platform/transit 以沙箱视角保留 connector Mgmt/Transit 计数; `egress:{}` 表示尚无可发布统计. 它们不改变 Proxy ingress idle,也不把 management 监控包视为已接纳的应用流. Conductor 按当前交换机绑定经 connector 原生 Go API 批量读取. 参见[原生 traffic](node-proxy_zh.md#83-traffic-stats-与统一-worker-stream).
 

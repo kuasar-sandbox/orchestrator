@@ -407,7 +407,7 @@ Core 先订阅，再查询 SQLite 快照，避免修改永久落入 snapshot/liv
 
 对路由消费者而言，live delete 和重新连接后的完整快照中缺席，都会撤销旧投影。持久本地清理独立于这两条路由收敛路径，从保留的行继续执行。
 
-`Host.Stats()` 提供与公开 stats API 和 telemetry plugin 共用的有界原生 section Reader. `StatsRequest` 选择精确 SandboxID、resource/traffic/usage section 及可选原生 usage view/cursor/limit; `SandboxStats` 包含各 section 原样 body 和仅作关联的 StableID. 此可信进程内入口不收集 API key、不唤醒 guest、不采样. 它执行同样的 64 对象、八个并发读取、五秒和 4 MiB 上限. 不要在 Watch callback 内执行慢读取; 应保留 Host, 在独立可取消任务中读取. 参见[原生 usage 与本机 stats](node-usage_zh.md)及[公共类型](../app/conductor/extension/stats.go). Start 期间及 core reconciliation/provider 装配完成之前, 读取立即返回 unavailable, 不阻塞 extension 启动.
+`Host.Stats()` 提供与公开 stats API 和 telemetry plugin 共用的有界原生 section Reader. 静态链接的 conductor extension 调用它的 `ReadStats(ctx, StatsRequest)` 方法. `StatsRequest` 选择精确 SandboxID、resource/traffic/usage section 及可选原生 usage view/cursor/limit; `SandboxStats` 包含各 section 原样 body 和仅作关联的 StableID. 此可信进程内入口不收集 API key、不唤醒 guest、不采样. 它执行同样的 64 对象、八个并发读取、五秒和 4 MiB 上限. 不要在 Watch callback 内执行慢读取; 应保留 Host, 在独立可取消任务中读取. 参见[Node 原生 usage](node_zh.md#原生-usage)和[原生 batch 合同](node_zh.md#原生-stats-batch)及[公共类型](../app/conductor/extension/stats.go). Start 期间及 core reconciliation/provider 装配完成之前, 读取立即返回 unavailable, 不阻塞 extension 启动, 也不暴露尚未配置完成的来源. 启动后使用同一领域 Reader.
 
 ## Conductor 生命周期 Hook
 

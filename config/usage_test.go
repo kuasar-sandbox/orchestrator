@@ -19,12 +19,16 @@ func TestConductorUsageDeploymentAndDocumentation(t *testing.T) {
 	if err != nil || config.Sandbox.Usage.Enabled || config.Sandbox.Usage.SampleInterval != "1s" || config.Sandbox.Usage.FlushInterval != "5m" {
 		t.Fatal("deployment policy", config, err)
 	}
-	for _, path := range []string{"../docs/node-usage.md", "../docs/node-usage_zh.md"} {
+	for _, path := range []string{"../docs/node.md", "../docs/node_zh.md"} {
 		body, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		blocks := regexp.MustCompile("(?s)```yaml\\n(.*?)\\n```").FindAllSubmatch(body, -1)
+		section := regexp.MustCompile("(?s)### 3\\.3 [^\\n]+\\n(.*?)(?:\\n## |\\z)").FindSubmatch(body)
+		if len(section) != 2 {
+			t.Fatalf("%s: native usage policy section missing", path)
+		}
+		blocks := regexp.MustCompile("(?s)```yaml\\n(.*?)\\n```").FindAllSubmatch(section[1], -1)
 		if len(blocks) != 1 {
 			t.Fatalf("%s: expected one complete node policy", path)
 		}
