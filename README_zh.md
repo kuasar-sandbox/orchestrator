@@ -106,7 +106,10 @@ Go 二进制使用 `CGO_ENABLED=0` 构建。
 make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
 make build TARGET_ARCH=aarch64  # 交叉编译;也接受 amd64/arm64 别名
 make test                       # 单元测试
-make test-e2e                   # 组件 owner suite,需要项目组装的完整 BIN
+e2e_arch="$(uname -m)"
+e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
+bash scripts/ci-e2e-build.sh cli "$e2e_arch" "$e2e_tools"
+ORCH_CLI_TEST_BIN="$e2e_tools/orch-cli.test" make test-e2e  # 需要项目组装的完整 BIN
 ```
 
 Owner suite 包含 `e2e_capture_cli.sh`,使用所选真实 `sandbox-ctl` 和 `node-ctl`
@@ -117,9 +120,11 @@ CLI/API 矩阵. 缺产品、缺 helper、空选择或只有父测试结果均失
 本地可选 `go test` 未设置 `KUASAR_TEST_SANDBOX_CTL` 时仍可跳过这些组,
 但不能作为必需入口的执行证据.
 
-`make test-e2e` 在既有 fixture 阶段编译测试 helper. Hosted artifact 验证在
+本地命令通过既有 fixture 脚本准备 CLI helper, 然后传给 `make test-e2e`.
+Hosted artifact 验证在
 prepare 前按独立固定的 owner test revision 构建 `orch-cli.test`;runner 只消费
-该执行文件与 `BIN`,不获取源码或编译. 针对性入口为:
+该执行文件与 `BIN`,不获取源码或编译. 既有必需 source 检查同时执行 runner 的
+输入、选择与 Skip 门禁回归. 针对性入口为:
 
 ```bash
 BIN=/path/to/selected/bin ORCH_CLI_TEST_BIN=/path/to/prepared/orch-cli.test \
