@@ -367,6 +367,124 @@ func TestSandboxResultCleanupDurablyClearsNetworkBeforeDirectoryCleanup(t *testi
 	}
 }
 
+func TestSandboxResultCleanupRetainsRetryOwnershipAtEarlyFailures(t *testing.T) {
+	fault := errors.New("injected result cleanup failure")
+	for _, test := range []struct {
+		name   string
+		inject func(*sandboxFinalizerFixture)
+		clear  func(*sandboxFinalizerFixture)
+	}{
+		{
+			name:   "stop",
+			inject: func(f *sandboxFinalizerFixture) { f.lc.stopErr = fault },
+			clear:  func(f *sandboxFinalizerFixture) { f.lc.clearFaults() },
+		},
+		{
+			name:   "reset",
+			inject: func(f *sandboxFinalizerFixture) { f.lc.resetErr = fault },
+			clear:  func(f *sandboxFinalizerFixture) { f.lc.clearFaults() },
+		},
+		{
+			name:   "detach",
+			inject: func(f *sandboxFinalizerFixture) { f.vs.detachErr = fault },
+			clear:  func(f *sandboxFinalizerFixture) { f.vs.clearFault() },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSandboxFinalizerFixture(t, "result-fault-"+test.name)
+			result := types.SandboxExecutionResult{SID: fixture.sb.ID, RunID: fixture.sb.RunID, Stage: types.SandboxResultRun, Error: test.name}
+			if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), fixture.sb.ID, fixture.sb.RunID, result); err != nil || !inserted {
+				t.Fatalf("AcceptSandboxExecutionResult = %t, %v", inserted, err)
+			}
+			test.inject(&fixture)
+			if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); !errors.Is(err, fault) {
+				t.Fatalf("first result cleanup error = %v", err)
+			}
+			got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+			if err != nil || got == nil || got.State != types.StateRunning || got.RunID != fixture.sb.RunID || got.VswitchPort != fixture.sb.VswitchPort || got.ExecutionResult == nil {
+				t.Fatalf("early result cleanup failure lost durable ownership: %+v, %v", got, err)
+			}
+			for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("early result cleanup failure removed %s: %v", path, err)
+				}
+			}
+			test.clear(&fixture)
+			if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err != nil {
+				t.Fatalf("retry result cleanup: %v", err)
+			}
+			dead, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+			if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != fixture.sb.RunID {
+				t.Fatalf("result retry did not finish dead history: %+v, %v", dead, err)
+			}
+		})
+	}
+}
+
+func TestSandboxResultCleanupNetworkClearFailureKeepsAllocationFenced(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "result-network-clear-failure")
+	result := types.SandboxExecutionResult{SID: fixture.sb.ID, RunID: fixture.sb.RunID, Stage: types.SandboxResultRun, Error: "network clear"}
+	if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), fixture.sb.ID, fixture.sb.RunID, result); err != nil || !inserted {
+		t.Fatalf("AcceptSandboxExecutionResult = %t, %v", inserted, err)
+	}
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_result_network_clear BEFORE UPDATE OF vswitch_port ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced result network clear failure'); END`)
+	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err == nil || !strings.Contains(err.Error(), "forced result network clear failure") {
+		t.Fatalf("network clear failure = %v", err)
+	}
+	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || got == nil || got.State != types.StateRunning || got.VswitchPort != fixture.sb.VswitchPort || got.RunDir != fixture.sb.RunDir || got.ExecutionResult == nil {
+		t.Fatalf("network clear failure lost running owner: %+v, %v", got, err)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if !fenced {
+		t.Fatal("failed result network clear did not retain allocation fence")
+	}
+	if _, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err == nil || !strings.Contains(err.Error(), "network allocation blocked") {
+		t.Fatalf("allocation while result port fence pending = %v", err)
+	}
+	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_result_network_clear`)
+	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err != nil {
+		t.Fatalf("retry result cleanup after network clear: %v", err)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced = fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if fenced {
+		t.Fatal("successful result retry retained allocation fence")
+	}
+}
+
+func TestSandboxResultCleanupDeadCommitFailureKeepsRetryOwner(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "result-dead-cas-failure")
+	result := types.SandboxExecutionResult{SID: fixture.sb.ID, RunID: fixture.sb.RunID, Stage: types.SandboxResultRun, Error: "dead cas"}
+	if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), fixture.sb.ID, fixture.sb.RunID, result); err != nil || !inserted {
+		t.Fatalf("AcceptSandboxExecutionResult = %t, %v", inserted, err)
+	}
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_result_dead_commit BEFORE UPDATE OF state ON sandboxes WHEN NEW.state='dead' BEGIN SELECT RAISE(ABORT, 'forced result dead commit failure'); END`)
+	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err == nil || !strings.Contains(err.Error(), "forced result dead commit failure") {
+		t.Fatalf("dead commit failure = %v", err)
+	}
+	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || got == nil || got.State != types.StateRunning || got.RunID != fixture.sb.RunID || got.VswitchPort != "" || got.RunDir != fixture.sb.RunDir || got.BaseDir != fixture.sb.BaseDir || got.ExecutionResult == nil {
+		t.Fatalf("dead commit failure lost retry row: %+v, %v", got, err)
+	}
+	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dead commit failure retained completed directory %s: %v", path, err)
+		}
+	}
+	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_result_dead_commit`)
+	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err != nil {
+		t.Fatalf("retry result cleanup after dead commit: %v", err)
+	}
+	dead, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != fixture.sb.RunID {
+		t.Fatalf("result dead retry = %+v, %v", dead, err)
+	}
+}
+
 func TestSandboxDeleteDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "delete-allocation-fence")
 	vs := &serializedSandboxDeleteVS{
