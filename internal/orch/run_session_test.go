@@ -91,6 +91,30 @@ func waitRunDisconnectIdle(t *testing.T, o *Orchestrator, kind, runID string) {
 	}
 }
 
+func TestWaitAssignmentReplaysDurableSandboxRunBinding(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "assignment-replay")
+	fixture.sb.State = types.StateStarting
+	fixture.sb.LaunchMode = types.LaunchImage
+	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+
+	sandboxID, ok, err := fixture.o.WaitAssignment(context.Background(), runKindSandbox, fixture.sb.RunID)
+	if err != nil || !ok || sandboxID != fixture.sb.ID {
+		t.Fatalf("durable sandbox assignment replay = %q, %t, %v", sandboxID, ok, err)
+	}
+
+	result := types.SandboxExecutionResult{SID: fixture.sb.ID, RunID: fixture.sb.RunID, Stage: types.SandboxResultStart, Error: "lost assignment response result"}
+	if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), fixture.sb.ID, fixture.sb.RunID, result); err != nil || !inserted {
+		t.Fatalf("AcceptSandboxExecutionResult = %t, %v", inserted, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if replay, ok, err := fixture.o.WaitAssignment(ctx, runKindSandbox, fixture.sb.RunID); err == nil || ok || replay != "" {
+		t.Fatalf("assignment replay after accepted result = %q, %t, %v; want no replay", replay, ok, err)
+	}
+}
+
 func TestRunSessionAdmitsCurrentRunningSandboxOwner(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "session-running-owner")
 	session, ok, err := fixture.o.RegisterRunSession(context.Background(), runKindSandbox, fixture.sb.RunID)
