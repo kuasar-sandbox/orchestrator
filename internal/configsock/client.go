@@ -104,6 +104,32 @@ func buildResponseError(status int, message string) error {
 	return err
 }
 
+func PostSandboxResult(socket, runID, sandboxID string, result SandboxExecutionResult) error {
+	return PostSandboxResultContext(context.Background(), socket, runID, sandboxID, result)
+}
+
+func PostSandboxResultContext(ctx context.Context, socket, runID, sandboxID string, result SandboxExecutionResult) error {
+	body, _ := json.Marshal(SandboxResultRequest{RunID: runID, SandboxID: sandboxID, Result: result})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathRunSandboxResult, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClient(socket).Do(req)
+	if err != nil {
+		return &transportError{err: err}
+	}
+	defer resp.Body.Close()
+	var out SandboxResultResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return &transportError{err: fmt.Errorf("configsock: decode sandbox result: %w", err)}
+	}
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return buildResponseError(resp.StatusCode, out.Error)
+	}
+	return nil
+}
+
 func PostBuildResult(socket, runID, buildID string, result BuildResult) error {
 	return PostBuildResultContext(context.Background(), socket, runID, buildID, result)
 }

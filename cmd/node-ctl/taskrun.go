@@ -6,9 +6,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -26,15 +29,26 @@ import (
 // optional task-local artifact preparation, and exec-replaces into the target.
 // runAssignedSandbox has locked the task pidfile before this function is called.
 func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
-	return launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
+	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
 		prepareArtifact: taskartifact.Prepare,
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
 		chdir:           os.Chdir,
 		exec:            syscall.Exec,
-		log:             log,
+		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
+			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready)
+		},
+		log: log,
 	})
+	var reported sandboxRunReportedError
+	if err != nil && !errors.As(err, &reported) {
+		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultPrepare, err)
+		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+			return errors.Join(err, reportErr)
+		}
+	}
+	return err
 }
 
 type taskLaunchOps struct {
@@ -44,6 +58,7 @@ type taskLaunchOps struct {
 	setenv          func(string, string) error
 	chdir           func(string) error
 	exec            func(string, []string, []string) error
+	startChild      func(string, []string, []string, *os.File, *os.File) error
 	log             *slog.Logger
 }
 
@@ -136,14 +151,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 			return fmt.Errorf("chdir %s: %w", workdir, err)
 		}
 	}
-	argv := []string{spec.Exec, "run", fmt.Sprintf("--cgroup-path=fd=%d", vmmCgroup.Fd())}
-	if ready != nil {
-		fd := int(ready.Fd())
-		if fd < 3 {
-			return fmt.Errorf("readiness fd %d is not inheritable", fd)
-		}
-		argv = append(argv, fmt.Sprintf("--ready-fd=%d", fd))
-	}
+	argv := []string{spec.Exec, "run"}
 	argv = append(argv, spec.Args[1:]...)
 	if !preparedSource.Empty() {
 		switch preparedSource.Kind {
@@ -158,10 +166,22 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
-	// These are the last fallible operations before exec. If exec itself fails,
-	// runAssignedSandbox's defers close the now-inheritable descriptors.
+	// These are the last fallible operations before exec/start. If exec itself
+	// fails, runAssignedSandbox's defers close the now-inheritable descriptors.
 	cancelDeadline()
 	stopContext()
+	if ops.startChild != nil {
+		return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
+	}
+	execArgv := []string{spec.Exec, "run", fmt.Sprintf("--cgroup-path=fd=%d", vmmCgroup.Fd())}
+	if ready != nil {
+		fd := int(ready.Fd())
+		if fd < 3 {
+			return fmt.Errorf("readiness fd %d is not inheritable", fd)
+		}
+		execArgv = append(execArgv, fmt.Sprintf("--ready-fd=%d", fd))
+	}
+	execArgv = append(execArgv, argv[2:]...)
 	if err := clearCloseOnExec(vmmCgroup); err != nil {
 		return fmt.Errorf("make vmm cgroup descriptor inheritable: %w", err)
 	}
@@ -170,7 +190,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 			return err
 		}
 	}
-	return ops.exec(spec.Exec, argv, env)
+	return ops.exec(spec.Exec, execArgv, env)
 }
 
 func completeSandboxPrepareWithRetry(
@@ -345,4 +365,105 @@ func taskEnv(add map[string]string) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+type sandboxRunReportedError struct{ err error }
+
+func (e sandboxRunReportedError) Error() string { return e.err.Error() }
+func (e sandboxRunReportedError) Unwrap() error { return e.err }
+
+func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File) error {
+	cmd := exec.Command(path)
+	cmd.Args = argv
+	cmd.Env = env
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := sandboxproc.Start(cmd, vmmCgroup, ready); err != nil {
+		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultStart, err)
+		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+			return errors.Join(err, reportErr)
+		}
+		return sandboxRunReportedError{err: err}
+	}
+	err := cmd.Wait()
+	result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultRun, err)
+	if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+		return errors.Join(err, reportErr)
+	}
+	if err != nil {
+		return sandboxRunReportedError{err: err}
+	}
+	return nil
+}
+
+func sandboxExecutionResult(sandboxID, runID string, stage types.SandboxExecutionStage, err error) configsock.SandboxExecutionResult {
+	result := configsock.SandboxExecutionResult{SID: sandboxID, RunID: runID, Stage: stage}
+	if err == nil {
+		code := 0
+		result.ExitCode = &code
+		return result
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if status.Exited() {
+				code := status.ExitStatus()
+				result.ExitCode = &code
+			} else if status.Signaled() {
+				result.Signal = status.Signal().String()
+			}
+		}
+	}
+	result.Error = sanitizeSandboxResultError(err.Error())
+	return result
+}
+
+func sanitizeSandboxResultError(message string) string {
+	message = strings.Map(func(r rune) rune {
+		if r == 0 || r == '\r' || r == '\n' || r == '\t' {
+			return ' '
+		}
+		if r < 0x20 {
+			return -1
+		}
+		return r
+	}, message)
+	message = strings.TrimSpace(message)
+	if len(message) > 1024 {
+		message = message[:1024]
+	}
+	return message
+}
+
+func postSandboxResultWithRetry(socket, sandboxID, runID string, result configsock.SandboxExecutionResult) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	delay := 100 * time.Millisecond
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+		err := configsock.PostSandboxResultContext(callCtx, socket, runID, sandboxID, result)
+		callCancel()
+		if err == nil || !configsock.IsRetryableError(err) {
+			return err
+		}
+		last = err
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(ctx.Err(), last)
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
+	return last
 }

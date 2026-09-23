@@ -206,6 +206,110 @@ func (o *Orchestrator) startPausedCleanupRetry(sid string) {
 	}()
 }
 
+func resultCleanupKey(sid, runID string) string { return sid + "\x00" + runID }
+
+// startSandboxResultCleanup coalesces cleanup for an accepted exact-run result.
+// The result row is durable before this is called; losing process-local
+// admission leaves startup reconciliation with enough state to retry.
+func (o *Orchestrator) startSandboxResultCleanup(sid, runID string) {
+	lifecycleCtx := o.launchContext()
+	finish, err := o.acceptedOps.Begin(lifecycleCtx)
+	if err != nil {
+		return
+	}
+
+	key := resultCleanupKey(sid, runID)
+	o.resultCleanupMu.Lock()
+	if o.resultCleanupActive == nil {
+		o.resultCleanupActive = make(map[string]struct{})
+	}
+	if _, exists := o.resultCleanupActive[key]; exists {
+		o.resultCleanupMu.Unlock()
+		finish()
+		return
+	}
+	o.resultCleanupActive[key] = struct{}{}
+	o.resultCleanupMu.Unlock()
+
+	go func() {
+		defer finish()
+		delay := launchCleanupRetryMin
+		for {
+			if lifecycleCtx.Err() != nil {
+				o.abandonSandboxResultCleanup(key)
+				return
+			}
+			if err := o.finalizeSandboxResultOnce(lifecycleCtx, sid, runID); err != nil {
+				o.log.Error("sandbox result cleanup incomplete; retrying",
+					"sid", sid, "run_id", runID, "retry_in", delay, "err", err)
+				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
+					o.abandonSandboxResultCleanup(key)
+					return
+				}
+				delay = nextLaunchCleanupRetry(delay)
+				continue
+			}
+			o.resultCleanupMu.Lock()
+			delete(o.resultCleanupActive, key)
+			o.resultCleanupMu.Unlock()
+			return
+		}
+	}()
+}
+
+func (o *Orchestrator) abandonSandboxResultCleanup(key string) {
+	o.resultCleanupMu.Lock()
+	delete(o.resultCleanupActive, key)
+	o.resultCleanupMu.Unlock()
+}
+
+func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID string) error {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
+	cleanupCtx, cancel := cleanupContext()
+	defer cancel()
+	sb, err := o.st.Get(cleanupCtx, sid)
+	if err != nil {
+		return err
+	}
+	if sb == nil || sb.RunID != runID || sb.ExecutionResult == nil || sb.ExecutionResult.RunID != runID {
+		return nil
+	}
+	switch sb.State {
+	case types.StateRunning:
+		if err := o.teardownPersistedOwnership(cleanupCtx, sb, true); err != nil {
+			return err
+		}
+		changed, err := o.st.CommitSandboxDead(cleanupCtx, sb)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("orch: sandbox %s changed before result dead commit", sid)
+		}
+		o.runs.forget(runID)
+		o.releaseDetachedPortFence(sb.VswitchPort)
+		o.uncache(sid)
+		o.publishDelete(sid)
+		updated, err := o.st.Get(cleanupCtx, sid)
+		if err != nil {
+			return err
+		}
+		if updated != nil {
+			o.observeSandboxUpsert(updated)
+		}
+		return nil
+	case types.StateStarting:
+		o.launches.Cancel(sid)
+		return nil
+	case types.StatePaused, types.StateDeleting, types.StateDead:
+		return nil
+	default:
+		return nil
+	}
+}
+
 func waitSandboxCleanupRetry(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()

@@ -142,6 +142,16 @@ func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (str
 	return "", false, nil
 }
 
+func (s stubProvider) PostSandboxResult(_ context.Context, runID, sandboxID string, _ SandboxExecutionResult) error {
+	if s.resultErr != nil {
+		return s.resultErr
+	}
+	if runID == "sr-test" && sandboxID == "x" {
+		return nil
+	}
+	return os.ErrNotExist
+}
+
 func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, _ BuildResult) error {
 	if s.resultErr != nil {
 		return s.resultErr

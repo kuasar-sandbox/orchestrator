@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -486,8 +487,9 @@ func TestSandboxTaskBootstrapUsesExactRunAndDoesNoArtifactIO(t *testing.T) {
 		t.Fatalf("stale auth = %t, %v", found, err)
 	}
 	auth, found, err := o.SandboxTaskAuth(context.Background(), sb.ID, sb.RunID)
-	if err != nil || !found || auth.PidFile != sb.PidFile() {
-		t.Fatalf("exact auth = %+v, %t, %v", auth, found, err)
+	wantPidfile := nodepath.RunnerPID(o.cfg.Paths.RunRoot, sb.RunID)
+	if err != nil || !found || auth.PidFile != wantPidfile {
+		t.Fatalf("exact auth = %+v, %t, %v; want pidfile %s", auth, found, err, wantPidfile)
 	}
 	task, found, err := o.SandboxTaskSpecFor(context.Background(), sb.ID, sb.RunID)
 	if err != nil || !found || task.Prepare == nil || task.Final != nil {

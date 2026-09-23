@@ -24,6 +24,16 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 	}
 	switch kind {
 	case runKindSandbox:
+		// BindStartingRunner commits before runPool publishes its response. A retry
+		// after response loss resolves the same exact starting assignment without
+		// consuming another pool worker.
+		sandboxID, found, err := o.st.GetClaimedSandboxIDByRunID(ctx, runID)
+		if err != nil {
+			return "", false, err
+		}
+		if found {
+			return sandboxID, true, nil
+		}
 		return o.runs.wait(ctx, runID)
 	case runKindBuild:
 		// BindBuildRun commits before runPool publishes its response. A retry after
@@ -46,6 +56,21 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 	default:
 		return "", false, nil
 	}
+}
+
+func (o *Orchestrator) PostSandboxResult(ctx context.Context, runID, sandboxID string, result configsock.SandboxExecutionResult) error {
+	inserted, err := o.st.AcceptSandboxExecutionResult(ctx, sandboxID, runID, result)
+	if err != nil {
+		if errors.Is(err, store.ErrSandboxExecutionOwnership) || errors.Is(err, store.ErrSandboxResultConflict) {
+			return configsock.RejectSandboxReport(err)
+		}
+		return err
+	}
+	if inserted {
+		o.log.Info("sandbox execution result accepted", "sid", sandboxID, "run_id", runID, "stage", result.Stage)
+	}
+	o.startSandboxResultCleanup(sandboxID, runID)
+	return nil
 }
 
 func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID string, result configsock.BuildResult) error {

@@ -326,6 +326,36 @@ func IsPortableRef(raw string) bool {
 	return err == nil
 }
 
+// SandboxExecutionStage identifies the parent-observed stage where a sandbox
+// runner stopped. It is internal diagnostic state, not a public lifecycle state.
+type SandboxExecutionStage string
+
+const (
+	SandboxResultPrepare SandboxExecutionStage = "prepare"
+	SandboxResultStart   SandboxExecutionStage = "start"
+	SandboxResultRun     SandboxExecutionStage = "run"
+)
+
+func (s SandboxExecutionStage) Valid() bool {
+	switch s {
+	case SandboxResultPrepare, SandboxResultStart, SandboxResultRun:
+		return true
+	default:
+		return false
+	}
+}
+
+// SandboxExecutionResult is the bounded internal result accepted from the
+// run-sandbox parent after its direct sandbox-ctl child exits.
+type SandboxExecutionResult struct {
+	SID      string                `json:"sid"`
+	RunID    string                `json:"run_id"`
+	Stage    SandboxExecutionStage `json:"stage"`
+	ExitCode *int                  `json:"exit_code,omitempty"`
+	Signal   string                `json:"signal,omitempty"`
+	Error    string                `json:"error,omitempty"`
+}
+
 // Sandbox is one managed sandbox instance.
 type Sandbox struct {
 	ID                 string
@@ -357,6 +387,7 @@ type Sandbox struct {
 	Env                map[string]string
 	CreatedUnix        int64
 	DeadUnix           int64 // diagnostic dead commit time; 0 for every non-dead state
+	ExecutionResult    *SandboxExecutionResult
 }
 
 // ClusterSandboxContext is trusted node-local ownership state supplied by the

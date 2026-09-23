@@ -71,14 +71,6 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 			}
 			return nil
 		},
-		lockTaskPidfile: func(path string) error {
-			order = append(order, "sandbox pidfile")
-			if path != filepath.Join(nodepath.SandboxRunDir(runRoot, "sid-1"), "sid-1.pid") {
-				t.Fatalf("sandbox pidfile = %q", path)
-			}
-			assertCloseOnExec("sandbox pidfile", true)
-			return nil
-		},
 		prepareCgroup: func() (*os.File, error) {
 			order = append(order, "prepare cgroup")
 			assertCgroupCloseOnExec("prepare cgroup", true)
@@ -146,7 +138,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 		t.Fatalf("runAssignedSandbox error = %v", err)
 	}
 	wantOrder := []string{
-		"run pidfile", "prepare cgroup", "assignment", "connect ready", "sandbox pidfile",
+		"run pidfile", "prepare cgroup", "assignment", "connect ready",
 		"launch task", "fetch spec", "chdir", "stop context", "exec",
 	}
 	if !reflect.DeepEqual(order, wantOrder) {
@@ -293,9 +285,8 @@ func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
 	}
 	wantErr := errors.New("fetch failed")
 	err = runAssignedSandbox("/run/sandbox/runners/run.pid", "/config.sock", "run", runSandboxOps{
-		lockPidfile:     func(string) error { return nil },
-		lockTaskPidfile: func(string) error { return nil },
-		prepareCgroup:   func() (*os.File, error) { return vmmCgroup, nil },
+		lockPidfile:   func(string) error { return nil },
+		prepareCgroup: func() (*os.File, error) { return vmmCgroup, nil },
 		waitAssignment: func(context.Context, string, string, string) (string, error) {
 			return "sid", nil
 		},

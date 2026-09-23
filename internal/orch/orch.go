@@ -79,6 +79,8 @@ type Orchestrator struct {
 	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
 	pausedCleanupMu     sync.Mutex
 	pausedCleanupActive map[string]struct{} // paused sandbox id -> live retrying ownership cleanup
+	resultCleanupMu     sync.Mutex
+	resultCleanupActive map[string]struct{} // sid/run_id -> live retrying result cleanup
 
 	lifecycleCtxMu sync.RWMutex
 	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
@@ -211,6 +213,7 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		detachedPortsPending: map[string]struct{}{},
 		deleteActive:         map[string]struct{}{},
 		pausedCleanupActive:  map[string]struct{}{},
+		resultCleanupActive:  map[string]struct{}{},
 		clusterBuilds:        map[string]*clusterBuild{},
 		buildSubs:            map[int]chan routesync.BuildEvent{},
 		mmdsBuildOwners:      map[string]string{},
@@ -2199,11 +2202,10 @@ func (o *Orchestrator) SandboxTaskAuth(ctx context.Context, sandboxID, runID str
 	if !ok || attempt.RunID() != runID {
 		return configsock.SandboxTaskAuth{}, false, nil
 	}
-	runDir, found, err := o.st.StartingTaskIdentity(ctx, sandboxID, runID)
-	if err != nil || !found {
+	if _, found, err := o.st.StartingTaskIdentity(ctx, sandboxID, runID); err != nil || !found {
 		return configsock.SandboxTaskAuth{}, found, err
 	}
-	return configsock.SandboxTaskAuth{PidFile: filepath.Join(runDir, sandboxID+".pid")}, true, nil
+	return configsock.SandboxTaskAuth{PidFile: nodepath.RunnerPID(o.cfg.Paths.RunRoot, runID)}, true, nil
 }
 
 // SandboxTaskSpecFor is called by configsock only after exact-run peer

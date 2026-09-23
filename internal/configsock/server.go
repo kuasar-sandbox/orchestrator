@@ -65,6 +65,7 @@ const (
 	PathTaskBuildPrepare           = "/internal/task/build/prepare"
 	PathRunAssignment              = "/internal/run/assignment"
 	PathRunBuildResult             = "/internal/run/build-result"
+	PathRunSandboxResult           = "/internal/run/sandbox-result"
 	PathRunBuildPhase              = "/internal/run/build-phase"
 	PathAdminManifestKey           = "/internal/admin/manifest-keys"
 	PathAdminBuilderAdmission      = "/internal/admin/builder-admission"
@@ -111,6 +112,20 @@ type AssignmentResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// SandboxExecutionResult is the config-socket wire representation of the
+// bounded parent-observed sandbox runner result.
+type SandboxExecutionResult = types.SandboxExecutionResult
+
+type SandboxResultRequest struct {
+	RunID     string                 `json:"run_id"`
+	SandboxID string                 `json:"sandbox_id"`
+	Result    SandboxExecutionResult `json:"result"`
+}
+
+type SandboxResultResponse struct {
+	Error string `json:"error,omitempty"`
+}
+
 // BuildResult is the config-socket wire representation of the durable core
 // result. Keeping this an alias prevents the report and recovery paths from
 // acquiring subtly different schemas.
@@ -136,6 +151,26 @@ type BuildPhaseRequest struct {
 
 type BuildPhaseResponse struct {
 	Error string `json:"error,omitempty"`
+}
+
+// SandboxReportRejection marks a definitive sandbox result rejection. The
+// server maps it to 409 so run-sandbox does not retry stale or conflicting
+// reports; unmarked provider failures remain retryable 5xx responses.
+type SandboxReportRejection struct{ Err error }
+
+func (e *SandboxReportRejection) Error() string { return e.Err.Error() }
+func (e *SandboxReportRejection) Unwrap() error { return e.Err }
+
+func RejectSandboxReport(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &SandboxReportRejection{Err: err}
+}
+
+func IsSandboxReportRejection(err error) bool {
+	var rejection *SandboxReportRejection
+	return errors.As(err, &rejection)
 }
 
 // BuildReportRejection marks a worker report that the provider definitively
@@ -185,6 +220,7 @@ type Provider interface {
 	CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary ArtifactPrepareSummary) (*BuildSpec, error)
 	RunPidFile(kind, runID string) (pidFile string, ok bool)
 	WaitAssignment(ctx context.Context, kind, runID string) (taskID string, ok bool, err error)
+	PostSandboxResult(ctx context.Context, runID, sandboxID string, result SandboxExecutionResult) error
 	PostBuildResult(ctx context.Context, runID, buildID string, result BuildResult) error
 	PostBuildPhase(ctx context.Context, runID, buildID, phase, sandboxID, state string) error
 }
@@ -494,6 +530,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskBuildBootstrap, s.handleBuildBootstrap)
 	mux.HandleFunc("POST "+PathTaskBuildPrepare, s.handleBuildPrepare)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
+	mux.HandleFunc("POST "+PathRunSandboxResult, s.handleSandboxResult)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc("POST "+PathRunBuildPhase, s.handleBuildPhase)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
@@ -737,6 +774,42 @@ func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, &AssignmentResponse{Kind: req.Kind, RunID: req.RunID, TaskID: taskID})
+}
+
+func (s *Server) handleSandboxResult(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &SandboxResultResponse{Error: "no peer credentials"})
+		return
+	}
+	var req SandboxResultRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RunID == "" || req.SandboxID == "" {
+		writeJSON(w, http.StatusBadRequest, &SandboxResultResponse{Error: "bad request"})
+		return
+	}
+	if req.Result.SID != req.SandboxID || req.Result.RunID != req.RunID {
+		writeJSON(w, http.StatusBadRequest, &SandboxResultResponse{Error: "result identity mismatch"})
+		return
+	}
+	pidFile, ok := s.deps.Provider.RunPidFile("sandbox", req.RunID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &SandboxResultResponse{Error: "unknown run"})
+		return
+	}
+	if !s.taskAuthed("sandbox-result:"+req.RunID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &SandboxResultResponse{Error: "not authorized"})
+		return
+	}
+	if err := s.deps.Provider.PostSandboxResult(r.Context(), req.RunID, req.SandboxID, req.Result); err != nil {
+		s.log.Warn("configsock sandbox result", "run_id", req.RunID, "sid", req.SandboxID, "err", err)
+		status := http.StatusInternalServerError
+		if IsSandboxReportRejection(err) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, &SandboxResultResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &SandboxResultResponse{})
 }
 
 func (s *Server) handleBuildResult(w http.ResponseWriter, r *http.Request) {
