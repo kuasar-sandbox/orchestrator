@@ -1,0 +1,16 @@
+name: Open Source Audit
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/open-source-audit.yml
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  audit:
+    uses: kuasar-sandbox/.github/.github/workflows/open-source-audit.yml@f83580df574930b1b39731fa4547d32cfdf62da2
