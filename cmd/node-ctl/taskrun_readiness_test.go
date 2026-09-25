@@ -25,7 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
+func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 
 	runRoot := filepath.Join(t.TempDir(), "run")
 	runPidfile := nodepath.RunnerPID(runRoot, "run-1")
-	execErr := errors.New("exec failed")
+	startErr := errors.New("child start failed")
 	err = runAssignedSandbox(runPidfile, "/config.sock", "run-1", runSandboxOps{
 		lockPidfile: func(path string) error {
 			order = append(order, "run pidfile")
@@ -125,32 +125,30 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 					}
 					return nil
 				},
-				exec: func(path string, argv, _ []string) error {
-					order = append(order, "exec")
-					assertCloseOnExec("exec", false)
-					assertCgroupCloseOnExec("exec", false)
-					wantArg := "--ready-fd=" + strconv.Itoa(int(readyW.Fd()))
-					wantCgroup := "--cgroup-path=fd=" + strconv.Itoa(int(vmmCgroup.Fd()))
-					if path != "/bin/sandbox-ctl" || len(argv) != 4 || argv[2] != wantCgroup || argv[3] != wantArg {
-						t.Fatalf("exec path=%q argv=%q, want injected %q, %q", path, argv, wantCgroup, wantArg)
+				startChild: func(path string, argv, _ []string, vmm, ready *os.File) error {
+					order = append(order, "start child")
+					assertCloseOnExec("start child", true)
+					assertCgroupCloseOnExec("start child", true)
+					if path != "/bin/sandbox-ctl" || !reflect.DeepEqual(argv, []string{path, "run"}) || vmm != vmmCgroup || ready != readyW {
+						t.Fatalf("child path=%q argv=%q vmm=%v ready=%v", path, argv, vmm, ready)
 					}
-					return execErr
+					return startErr
 				},
 			})
 		},
 	})
-	if !errors.Is(err, execErr) {
+	if !errors.Is(err, startErr) {
 		t.Fatalf("runAssignedSandbox error = %v", err)
 	}
 	wantOrder := []string{
 		"run pidfile", "prepare cgroup", "assignment", "connect ready",
-		"launch task", "fetch spec", "chdir", "stop context", "exec",
+		"launch task", "fetch spec", "chdir", "stop context", "start child",
 	}
 	if !reflect.DeepEqual(order, wantOrder) {
 		t.Fatalf("order = %q, want %q", order, wantOrder)
 	}
 	if _, err := readyW.Write([]byte("x")); err == nil {
-		t.Fatal("ready fd remained open after exec failure")
+		t.Fatal("ready fd remained open after child Start failure")
 	}
 }
 
@@ -390,7 +388,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer vmm.Close()
-	execErr := errors.New("exec intercepted")
+	startErr := errors.New("child start intercepted")
 	var fetches, reads, completions int
 	stopped := false
 	err = launchTaskWith(context.Background(), func() { stopped = true }, "/config.sock", "sid", "run-1", nil, vmm, taskLaunchOps{
@@ -435,9 +433,9 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			}
 			return nil
 		},
-		exec: func(path string, argv, env []string) error {
+		startChild: func(path string, argv, env []string, _, _ *os.File) error {
 			if !stopped {
-				t.Fatal("task cancellation resources were not stopped before exec")
+				t.Fatal("task cancellation resources were not stopped before child Start")
 			}
 			wantSuffix := []string{
 				"--restore", "manifest://root",
@@ -445,7 +443,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 				"--ref-location", "z-location=file:///z",
 			}
 			if path != "/bin/sandbox-ctl" || len(argv) < len(wantSuffix) || !reflect.DeepEqual(argv[len(argv)-len(wantSuffix):], wantSuffix) {
-				t.Fatalf("exec path/argv = %q, %q", path, argv)
+				t.Fatalf("child path/argv = %q, %q", path, argv)
 			}
 			manifestEntries := 0
 			for _, entry := range env {
@@ -453,18 +451,18 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 				case entry == "MANIFEST_KEY=authoritative-key":
 					manifestEntries++
 				case strings.HasPrefix(entry, "MANIFEST_KEY="):
-					t.Fatalf("non-authoritative manifest key in exec env: %q", entry)
+					t.Fatalf("non-authoritative manifest key in child env: %q", entry)
 				case strings.HasPrefix(entry, "TASK_"):
-					t.Fatalf("bootstrap variable leaked into exec env: %q", entry)
+					t.Fatalf("bootstrap variable leaked into child env: %q", entry)
 				}
 			}
 			if manifestEntries != 1 {
 				t.Fatalf("authoritative MANIFEST_KEY entries = %d", manifestEntries)
 			}
-			return execErr
+			return startErr
 		},
 	})
-	if !errors.Is(err, execErr) {
+	if !errors.Is(err, startErr) {
 		t.Fatalf("launchTaskWith error = %v", err)
 	}
 	if fetches != 1 || reads != 1 || completions != 1 {
@@ -478,7 +476,7 @@ func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer vmm.Close()
-	execErr := errors.New("exec intercepted")
+	startErr := errors.New("child start intercepted")
 	var fetches int
 	err = launchTaskWith(context.Background(), func() {}, "/config.sock", "sid", "run", nil, vmm, taskLaunchOps{
 		fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
@@ -496,16 +494,16 @@ func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
 			t.Fatal("cold path used a second RPC")
 			return nil, nil
 		},
-		setenv: func(string, string) error { return nil },
-		chdir:  func(string) error { return nil },
-		exec:   func(string, []string, []string) error { return execErr },
+		setenv:     func(string, string) error { return nil },
+		chdir:      func(string) error { return nil },
+		startChild: func(string, []string, []string, *os.File, *os.File) error { return startErr },
 	})
-	if !errors.Is(err, execErr) || fetches != 1 {
+	if !errors.Is(err, startErr) || fetches != 1 {
 		t.Fatalf("cold launch = %v, fetches=%d", err, fetches)
 	}
 }
 
-func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
+func TestRunAssignedSandboxPrepareFailureClosesReadinessFD(t *testing.T) {
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -528,9 +526,9 @@ func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
 				fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
 					return nil, wantErr
 				},
-				setenv: func(string, string) error { return nil },
-				chdir:  func(string) error { return nil },
-				exec:   func(string, []string, []string) error { t.Fatal("exec called"); return nil },
+				setenv:     func(string, string) error { return nil },
+				chdir:      func(string) error { return nil },
+				startChild: func(string, []string, []string, *os.File, *os.File) error { t.Fatal("child Start called"); return nil },
 			})
 		},
 	})
@@ -539,7 +537,7 @@ func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
 	}
 	buf := make([]byte, 1)
 	if n, err := readyR.Read(buf); n != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("read after pre-exec failure = %d, %v; want EOF", n, err)
+		t.Fatalf("read after prepare failure = %d, %v; want EOF", n, err)
 	}
 }
 
@@ -590,8 +588,8 @@ func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
 				},
 				setenv: func(string, string) error { return nil },
 				chdir:  func(string) error { return nil },
-				exec: func(string, []string, []string) error {
-					t.Fatal("exec called")
+				startChild: func(string, []string, []string, *os.File, *os.File) error {
+					t.Fatal("child Start called")
 					return nil
 				},
 			})

@@ -423,7 +423,7 @@ func TestRunSessionMaintenanceAcceptedResultOverridesActiveSession(t *testing.T)
 
 func TestSandboxRunEndWorkersAreBoundedAndRetainPendingRetry(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "session-bounded-first")
-	fixture.o.runEndSlots = make(chan struct{}, 1)
+	fixture.o.runEndWorkerLimit = 1
 	second := *fixture.sb
 	second.ID = "session-bounded-second"
 	second.RunID = "sr-00000000-0000-7000-8000-000000000288"

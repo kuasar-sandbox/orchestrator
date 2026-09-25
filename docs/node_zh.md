@@ -137,13 +137,14 @@ RunDir/BaseDir，再以 exact owner CAS 将 `starting,run_id=""` 收敛为零 ow
 并发布 route Delete。cold image 后台路径保持原有单阶段 fast path:先完成
 resource/network/YAML,再从 runner pool 分配 run-id。artifact launch 路径先建目录和绑定
 `ready.sock`,再由 pool commit callback 以 `starting AND run_id=''` CAS 绑定 exact run-id;
-task 取得 assignment 后立即连接 readiness、锁 task pidfile并取 bootstrap。认证通过后
+task 取得 assignment 后立即连接 readiness,使用父进程已锁定的 RunID pidfile 鉴权并取 bootstrap。认证通过后
 ManifestKey 覆盖进程环境,task 按 E/S kind 与 LaunchMode 打开 root、选择 PreparedSource 并提交
 capacity/network/ref closure 的非秘密 summary。唯一 launch worker随后 resolve resource/network→attach→以
 `starting AND run_id=<exact>` CAS 持久化 ownership→写非密 YAML→返回最终 LaunchSpec。
-runner追加本地保留的 ref-location并以直接子进程启动 `sandbox-ctl run`→起 microVM→
-父进程等待一次并上报有界执行结果, runtime 严格完成 readiness wire→(e2b)直接
-`POST /init` 置 env/默认用户→以 exact run-id CAS 为 `running`并开放数据面。集群下,该
+runner 追加本地保留的 ref-location并以直接子进程启动 `sandbox-ctl run`。父进程的唯一 Wait
+与 conductor 消费 runtime readiness、执行 e2b `POST /init` 及提交 running 并行；
+runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用户→以 exact run-id CAS
+为 `running`并开放数据面。只有子进程后来退出，父进程的 Wait 才返回并开始有界结果上报。集群下,该
 create 由 node-link 的
 `create` 命令触发;profile、group、route-key
 和可选认证主体通过结构化系统上下文下发并独立持久化。事件回报 profile、node-owned
@@ -1301,7 +1302,7 @@ WorkingDirectory=/run/sandbox
 ExecStart=<node-ctl> run-sandbox --pidfile=/run/sandbox/runners/%i.pid \
           --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
 ExecStopPost=/bin/rm -f /run/sandbox/runners/%i.pid
-# 一进程一沙箱：有状态崩溃不重试
+# 每个 RunID 一个常驻父进程；有状态崩溃不自动重试
 Restart=no
 # 默认先 SIGTERM，TimeoutStopSec 后 SIGKILL；递归包含 CH（§5.1）
 KillMode=control-group
@@ -1346,7 +1347,7 @@ pool loop 唯一回复,每个请求恰有一次结果。
   `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后把 `POST /init` 作为首个 envd
   请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。restore
   launch的单一绝对 budget从 Assign成功时开始,覆盖 task根读取、completion RPC、host
-  resource/network准备、final wait、exec/startup、runtime wire与mandatory `/init`,最终 spec
+  resource/network准备、final wait、子进程 Start、runtime wire与mandatory `/init`,最终 spec
   生成后不重置。cold path仍在runner handoff后使用现有runtime budget。首个 `/init`立即发出;仅连接/传输
   错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
   非 204 只返回状态码,不记录可能回显 access token/用户 env 的响应体;协议错误、提前
@@ -1365,7 +1366,7 @@ runner unit 的 cgroup 根只作为委托边界,不放进程:
 
 ```text
 sandbox-runner@<run-id>.service/
-├── ctl/   node-ctl,exec 后为 sandbox-ctl
+├── ctl/   node-ctl 父进程及其直接 sandbox-ctl 子进程
 └── vmm/   cloud-hypervisor
 ```
 
@@ -1374,8 +1375,9 @@ unit 根或其 `ctl/`。前者创建 `ctl/` 并通过 `cgroup.procs` 将自身�
 `/proc/self/cgroup` 验证身份;后者用于运维带外安装的已预置单元。两条路径统一验证 unit
 根无进程及 cpu/memory 委派,再于 unit 根启用 controller,幂等创建 `vmm/` 并以 CLOEXEC
 打开目录 FD。该方式只依赖 `Delegate=yes`,不要求 systemd v254 才提供的
-`DelegateSubgroup=`。取得 LaunchSpec 后,启动器在最终 exec 前才使该 FD 可继承,本地
-追加 `--cgroup-path=fd=N`;LaunchSpec 自身不携带任何主机 cgroup 路径或 FD。
+`DelegateSubgroup=`。取得 LaunchSpec 后,启动器只把可信 VMM/readiness 描述符放入子进程
+ExtraFiles，按实际子进程 FD 编号追加参数。父进程副本保持 CLOEXEC；RunID 锁与 Run session
+不进入 ExtraFiles。LaunchSpec 自身不携带任何主机 cgroup 路径或 FD。
 
 sandbox-ctl 接收 FD 后立即恢复 CLOEXEC,写入资源上限,并以
 `clone3(CLONE_INTO_CGROUP)` 把 CH 原子创建到 `vmm/`。因此 `memory.high` 只限制
@@ -1498,7 +1500,7 @@ Conductor 重写的基础文件。
 该模式下 Conductor 不执行任何模板安装或 reload。
 
 普通 runner 在两个 runner pool 间轮询；Builder 在两个 builder pool 间独立轮询。
-预热进程在分配业务前已处于对应放置策略下。Runner 的 exec 替换及 Builder 的子进程
+预热进程在分配业务前已处于对应放置策略下。Runner 父进程及其直接子进程、Builder 的各阶段子进程
 留在选定 unit 下；一个 Build 实际执行的 A/B/C 阶段仍由同一个 Builder 驱动，
 不按阶段重新取池；guest 内的工作通过这些阶段 VMM 执行。
 不要只给 Conductor daemon 绑核：unit 由 systemd 启动，放置策略必须配置到任务模板上。
@@ -1531,10 +1533,34 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
 各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用,与 api 路径不冲突。
 
-**Run 平面**提供 `POST /internal/run/assignment`、`/internal/run/build-result` 与
-`/internal/run/build-phase`，用于预启动单元等待任务及 Builder 回报 phase/result。
-`SO_PEERCRED` 的 peer PID 必须与 `runners/` 下已锁定 RunID pidfile 一致，report 还校验 exact task owner；
-它不同于 task 平面的业务 ID pidfile 鉴权，见 [configsock/server.go](../internal/configsock/server.go)。
+**Run 平面**在既有 socket 提供 `PUT /internal/run/session` 以及
+`POST /internal/run/assignment`、`/internal/run/sandbox-result`、`/internal/run/build-result`
+和 `/internal/run/build-phase`。SO_PEERCRED 必须匹配父进程持锁的 `runners/<RunID>.pid`；
+session 准入还必须存在真实 pool 或 durable task owner，不能只校验 RunID 格式。
+首响应标识 kind+RunID 并在 assignment 前 flush。父进程持续消费此响应流；同一 Run 重连只重新注册，
+不重复 assignment 或子进程执行。旧连接关闭不能移除替代它的新 generation。
+Idle 退役和 assignment handoff 共用 pool 串行边界；先 durable bind 再返回响应，丢响应可以重放同一 starting assignment。
+
+Session 断连只是存活通知，不等于进程死亡。Conductor 核对精确的实际 unit 并保留健康执行；
+旧 Run 的检查不能取消同 SID 的后继运行或已重连的 starting attempt。Shutdown 先将 session 关闭标为
+非死亡、取消流，再 drain HTTP handlers。资源控制器 lease 与 StateSync 责任不变。
+见 [configsock/server.go](../internal/configsock/server.go)。
+
+`POST /internal/run/sandbox-result` 携精确 SandboxID/RunID 和有界 prepare/start/run 结果。
+短 store 事务先持久接受再 ACK；相同重试幂等，stale/冲突报告拒绝。ACK 表示接受，
+不表示完成清理；report 不等待跨 StopUnit 或 Hook 的 SID 长生命周期锁。
+两条 starting→running CAS 都拒绝已接受结束结果。父进程使用独立有限预算上报，
+不直接操作节点数据库或网络，不在 start/run 上报失败后伪造 prepare 结果。
+
+结果、session 断连与既有低频 Reaper 共用每 exact RunID 一个进程内 pending 项。
+最多四个 run-end worker 执行；等待中的 Run 不各自创建 goroutine 或 timer。
+失败尝试按有界退避轮转到其它工作之后。Shutdown 必须等待已开始的同步删除完成，
+不能假称 context 能中断 RemoveAll；durable pending ownership 保留供恢复。
+Starting 只通知原 rollback attempt；running 结果先 fence exact unit，再在 allocation fence 内
+物理 detach 并 durable clear 网络，在慢目录删除前释放端口 fence，最后 commit dead 并撤销在线 route/observation。
+Paused 保留 checkpoint，deleting 继续使用既有 finalizer。Reaper 还补偿内存唤醒丢失的 accepted result，
+即使父 session 仍在线；缺 session 的运行在首次检查仍健康、后来 unit 退出时也能收敛。
+不周期执行完整启动 reconciliation。
 
 **① task 平面** — 启动器取工作规约。sandbox 与 artifact-backed builder 都使用 exact-run
 两阶段端点，cold/image 路径保持单次 bootstrap fast path:
@@ -1551,12 +1577,12 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   --run-root <RunRoot>/sandboxes --base-root <BaseRoot>/sandboxes
   (--from <E>|--restore <S>) (--connect <uds:ip:port>)…]`。`--path-id` 与两个调用级 root
   把 sandbox-ctl 的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到持久化的 RunDir/BaseDir；
-  pause/snapshot/exec 客户端用同一 PathID 才能拨到 `ctl.sock`。node-ctl 在最终 exec
-  时另行强制追加本机 `--cgroup-path=fd=N`,不允许 LaunchSpec 覆盖。
+  pause/snapshot/exec 客户端用同一 PathID 才能拨到 `ctl.sock`。node-ctl 在启动直接子进程
+  时注入本机 cgroup/readiness FD,不允许 LaunchSpec 覆盖。
 - Build bootstrap/prepare 的完整版本、payload 与恢复约束见 [Build 任务交接](node-build_zh.md#4-任务交接)；下述身份和消息平面规则同时约束 Sandbox 与 Build。
 - **鉴权**:sandbox/build端点先以业务 id + exact run-id 查不含秘密的 task identity，再校验
-  peer pid ⟷ 已锁定 task pidfile；认证通过后才调用可解密 `MANIFEST_KEY`/registry credential
-  的 provider。builder 使用 `BuildRunDir/builder.pid`，stale run 或未授权 peer
+  peer pid ⟷ 对应父进程已锁定的 pidfile；认证通过后才调用可解密 `MANIFEST_KEY`/registry credential
+  的 provider。Sandbox 使用 `<RunRoot>/runners/<RunID>.pid`，builder 使用 `BuildRunDir/builder.pid`；stale run 或未授权 peer
   均不能触达 secret-bearing provider。
 - 设计意图:**根凭据不进入配置文件**(`<sid>.yaml` 为 0600;构建 phase YAML 为 0600,
   由 run-builder 写进 0700 的 phase RunDir)、**根凭据与 pull credential 走 spec env**，加密存储并仅在受信运行期使用；
@@ -2463,7 +2489,7 @@ plugin 平面,机群路由经 registry 聚合。
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | run-sandbox(单元)最终 `execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`;run-builder 以直接子进程启动 A/B/C，source E 的 C 使用 `run --from E --replace-boot`，经 `exec --env/--stdin-from/--stdout-to` 做平台接力，memory 收尾 `snapshot`/`publish`;顶层 E 则直接调用 sandboxer package assembly/publication API，不启动 sandbox-ctl;serve 的 Capture 调用 `snapshot` 或 `export` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,[Build §5](node-build_zh.md#5-按目标执行与发布)) |
+| `sandbox-ctl`(runtime) | run-sandbox 保持为单元父进程，以直接子进程启动 `run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`;run-builder 以直接子进程启动 A/B/C，source E 的 C 使用 `run --from E --replace-boot`，经 `exec --env/--stdin-from/--stdout-to` 做平台接力，memory 收尾 `snapshot`/`publish`;顶层 E 则直接调用 sandboxer package assembly/publication API，不启动 sandbox-ctl;serve 的 Capture 调用 `snapshot` 或 `export` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,[Build §5](node-build_zh.md#5-按目标执行与发布)) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);dynamic sandbox 自动使用同一 canonical `SocketIdentity` 拨号(`pkg/resource` 协议) | `resource_listen` 是唯一 endpoint 来源;每个 runner 的 `vmm/` 是沙箱资源 cgroup,FD 由 run-sandbox 注入;controller disabled = static cgroup |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/Sandbox route 与 Build full-sync/upsert/delete，受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;Build projection 无 Registry-side TTL;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
@@ -2489,13 +2515,13 @@ advanced Collector binding 隔离在 `app/telemetry/otel`；
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                profile, cluster_group, cluster_route_key, stable_id,
                template_id, state(starting|running|paused|deleting|dead), deadline_unix, dead_unix,
-               run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
+               run_id, run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
                resume_source_kind, resume_source_ref, resume_sandbox_ref, auto_pause_memory, launch_mode,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
-               created_unix
+               created_unix, sandbox_result_run_id, sandbox_result_json
 sandbox_mmds_route_secret_values
                sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
@@ -2507,6 +2533,8 @@ Build schema、准入与记录权威见 [Build §6](node-build_zh.md#6-持久化
 `resume_source_kind/ref` 是 paused E/S 的 typed root，`resume_sandbox_ref` 保存 Snapshot 的精确关联 E；`auto_pause_memory` 只决定 TTL CaptureKind;
 `launch_mode` 是 starting 中已接受的实际 image/cold/memory 模式。生命周期
 schema 直接替换旧单字符串 lifecycle 模型,不保留双读/双写或迁移 shim;已有开发数据库须重建。
+
+新增 `sandbox_result_run_id`/`sandbox_result_json` 两列，以 additive migration 保存原执行身份和有界结果；dead history 和数据库重开保留它，新运行开始时重置。结果随既有 Sandbox row 的 dead-history retention 删除，不另建结果表或任务历史。
 
 `*_enc` 根凭据及 Sandbox service credential 均
 AES-256-GCM、两项 `*_hash` 均为
@@ -2521,6 +2549,9 @@ MMDS value 表每 owner 最多一行 secretbox ciphertext;AAD/事务/CAS/cleanup
 仍有执行或待清理归属的模板必须保留配置，不提供已删除模板自动发现、迁移、热删除或 drain。
 
 conductor 在开放 API、config-socket routesync 和 node-link 前按配置 runner unit 集合对账:
+
+已接受的 execution result 优先于表面 unit 存活：running owner 进入结果收尾而不被重新接管；
+已接受失败结果的 starting，fresh Create 回到 dead，resume 回到 paused 并保留 checkpoint。
 
 - 库内 `deleting` 是已经接纳、尚未完成的显式删除.Reconcile 先取消同 SID 的 launch owner,
   fence exact unit;network tuple 非空时在 allocation fence 内 detach exact port 并 full-owner
@@ -2643,7 +2674,7 @@ REQUIRE_PROXY=1 bash test/e2e/e2e_orchestrator_proxy.sh
 | 脚本 | 覆盖 |
 |---|---|
 | `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill |
-| `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、exact-run bootstrap、cold单阶段/restore两阶段、execve、`TASK_*`和重复MANIFEST_KEY剥除;`config` CLI 往返 |
+| `e2e_runtask.sh` | 先做 config/参数 CLI smokes，再用真实 delegated systemd、无需 KVM：常驻父/直接子进程身份、session 先于 assignment、同 Run 重连不重复启动、父 PID/session FD 隔离、子进程退出前 readiness EOF、唯一结果及 ACK 后父进程退出、重复父进程锁拒绝、cgroup 清理。required suite 缺前置条件时报错而非跳过。 |
 | `e2e_builder_unit_upgrade.sh` | 隔离真实 systemd:生成 slice 更新, live runtime properties 保留, 按 exact source 一次性移除;reload 后检查实际 cgroup 值.  |
 | `e2e_run_builder.sh` | target-aware 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):真实 IMG/SBX/SNP、fromImage/fromTemplate(img/sbx/snp)、image/checkpoint publication matrix、Manifest 与 named-location Bundle、顶层 E 无完整 staging/零 Phase C、portable Phase-C image ref、local/Bundle checkpoint mode、S→E cold selection、memory C 固定等待、source-ref closure 与 Build-row TTL 后 canonical Create;另覆盖 COPY/bare,父级/ctl 隔离与有限 VMM 控制,conductor 崩溃后保持 exact claim/run-id/进程的 live Build 接管,真实总超时 fencing 与 claim/reservation 释放,终态 cleanup,日志/DB/artifact secrecy |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、持久 RunDir/BaseDir、BaseDir writable diff/checkpoint、RunRoot 无大工件、PathID native exec、local Pause→resume 与恢复策略、failed Create 的 dead 零 ownership、显式 delete finalizer 删除 row/RunDir/BaseDir 且不伤 node-level 文件 |

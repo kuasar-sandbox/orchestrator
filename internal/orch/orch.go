@@ -83,8 +83,11 @@ type Orchestrator struct {
 	runSessionsNext     uint64
 	runSessions         map[runSessionKey]*runSessionGeneration
 	runEndMu            sync.Mutex
-	runEndActive        map[string]struct{} // sandbox RunID -> live retrying exact-run end/cleanup worker
-	runEndSlots         chan struct{}
+	runEndActive        map[string]*sandboxRunEndWork // one pending/running entry per exact RunID
+	runEndQueue         []string
+	runEndWake          chan struct{}
+	runEndWorkers       int
+	runEndWorkerLimit   int
 
 	allowLegacyAssignmentWithoutRunSession bool // test-only compatibility for in-process runner fixtures
 
@@ -219,8 +222,8 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		detachedPortsPending: map[string]struct{}{},
 		deleteActive:         map[string]struct{}{},
 		pausedCleanupActive:  map[string]struct{}{},
-		runEndActive:         map[string]struct{}{},
-		runEndSlots:          make(chan struct{}, 4),
+		runEndActive:         map[string]*sandboxRunEndWork{},
+		runEndWorkerLimit:    sandboxRunEndConcurrency,
 		clusterBuilds:        map[string]*clusterBuild{},
 		buildSubs:            map[int]chan routesync.BuildEvent{},
 		mmdsBuildOwners:      map[string]string{},

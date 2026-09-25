@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -104,54 +105,152 @@ func (o *Orchestrator) startRunDisconnectCheck(kind, runID string) {
 	}
 }
 
+const sandboxRunEndConcurrency = 4
+
+// Pending work is only an in-memory wakeup for a durable exact-run owner.
+// Workers and timers, unlike entries, never scale with the number of RunIDs.
+// Failed attempts rejoin the FIFO after their backoff rather than occupying a
+// worker while sleeping, so a failed owner cannot starve unrelated cleanup.
+type sandboxRunEndWork struct {
+	running bool
+	again   bool
+	due     time.Time
+	delay   time.Duration
+}
+
 func (o *Orchestrator) startSandboxRunEndCheck(runID string) {
-	lifecycleCtx := o.launchContext()
-	finish, err := o.acceptedOps.Begin(lifecycleCtx)
+	if runID == "" {
+		return
+	}
+	ctx := o.launchContext()
+	finishAdmission, err := o.acceptedOps.Begin(ctx)
 	if err != nil {
 		return
 	}
+	defer finishAdmission()
+
 	o.runEndMu.Lock()
+	defer o.runEndMu.Unlock()
 	if o.runEndActive == nil {
-		o.runEndActive = make(map[string]struct{})
+		o.runEndActive = make(map[string]*sandboxRunEndWork)
 	}
-	if _, exists := o.runEndActive[runID]; exists {
-		o.runEndMu.Unlock()
-		finish()
+	if work := o.runEndActive[runID]; work != nil {
+		// A notification arriving after a worker's last durable read must not
+		// disappear when that worker retires. Queued duplicates already have
+		// a future read and do not need another queue entry.
+		if work.running {
+			work.again = true
+		}
 		return
 	}
-	o.runEndActive[runID] = struct{}{}
-	o.runEndMu.Unlock()
+	o.runEndActive[runID] = &sandboxRunEndWork{}
+	o.runEndQueue = append(o.runEndQueue, runID)
+	o.wakeSandboxRunEndLocked()
+	limit := o.runEndWorkerLimit
+	if limit <= 0 {
+		limit = sandboxRunEndConcurrency
+	}
+	wanted := min(limit, o.runEndWorkers+len(o.runEndQueue))
+	for o.runEndWorkers < wanted {
+		finish, err := o.acceptedOps.Begin(ctx)
+		if err != nil {
+			// Shutdown closed admission. The durable row and existing Reaper
+			// or startup recovery retain responsibility for pending work.
+			if o.runEndWorkers == 0 {
+				clear(o.runEndActive)
+				o.runEndQueue = nil
+			}
+			return
+		}
+		o.runEndWorkers++
+		go o.sandboxRunEndWorker(ctx, finish)
+	}
+}
 
-	go func() {
-		defer finish()
-		defer func() {
-			o.runEndMu.Lock()
-			delete(o.runEndActive, runID)
+// Caller holds runEndMu. Closing the generation wakes at most the fixed number
+// of workers; there is no per-RunID goroutine, timer or channel.
+func (o *Orchestrator) wakeSandboxRunEndLocked() {
+	if o.runEndWake != nil {
+		close(o.runEndWake)
+	}
+	o.runEndWake = make(chan struct{})
+}
+
+func (o *Orchestrator) sandboxRunEndWorker(ctx context.Context, finish func()) {
+	defer finish()
+	for {
+		o.runEndMu.Lock()
+		if ctx.Err() != nil || len(o.runEndQueue) == 0 {
+			o.runEndWorkers--
+			if o.runEndWorkers == 0 {
+				clear(o.runEndActive)
+				o.runEndQueue = nil
+			}
 			o.runEndMu.Unlock()
-		}()
-		select {
-		case o.runEndSlots <- struct{}{}:
-			defer func() { <-o.runEndSlots }()
-		case <-lifecycleCtx.Done():
 			return
 		}
-		delay := launchCleanupRetryMin
-		for {
-			if lifecycleCtx.Err() != nil {
-				return
+
+		now := time.Now()
+		var runID string
+		var work *sandboxRunEndWork
+		var next time.Time
+		// Rotate delayed retries behind new work. The usual ready FIFO path
+		// is O(1); only a queue consisting of delayed retries needs a scan.
+		for remaining := len(o.runEndQueue); remaining > 0; remaining-- {
+			id := o.runEndQueue[0]
+			o.runEndQueue[0] = ""
+			o.runEndQueue = o.runEndQueue[1:]
+			candidate := o.runEndActive[id]
+			if !candidate.due.After(now) {
+				runID, work = id, candidate
+				work.running, work.again = true, false
+				break
 			}
-			if err := o.checkDisconnectedRunOnce(lifecycleCtx, runKindSandbox, runID); err != nil {
-				o.log.Warn("sandbox run end check incomplete; retrying",
-					"run_id", runID, "retry_in", delay, "err", err)
-				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
-					return
-				}
-				delay = nextLaunchCleanupRetry(delay)
-				continue
+			o.runEndQueue = append(o.runEndQueue, id)
+			if next.IsZero() || candidate.due.Before(next) {
+				next = candidate.due
 			}
-			return
 		}
-	}()
+		if work == nil {
+			wake := o.runEndWake
+			o.runEndMu.Unlock()
+			timer := time.NewTimer(time.Until(next))
+			select {
+			case <-ctx.Done():
+			case <-wake:
+			case <-timer.C:
+			}
+			timer.Stop()
+			continue
+		}
+		o.runEndMu.Unlock()
+
+		err := o.checkDisconnectedRunOnce(ctx, runKindSandbox, runID)
+		o.runEndMu.Lock()
+		work.running = false
+		switch {
+		case ctx.Err() != nil:
+			delete(o.runEndActive, runID)
+		case err != nil:
+			if work.delay == 0 {
+				work.delay = launchCleanupRetryMin
+			} else {
+				work.delay = nextLaunchCleanupRetry(work.delay)
+			}
+			work.due = time.Now().Add(work.delay)
+			o.runEndQueue = append(o.runEndQueue, runID)
+		case work.again:
+			work.due, work.delay = time.Time{}, 0
+			o.runEndQueue = append(o.runEndQueue, runID)
+		default:
+			delete(o.runEndActive, runID)
+		}
+		o.wakeSandboxRunEndLocked()
+		o.runEndMu.Unlock()
+		if err != nil {
+			o.log.Warn("sandbox run end check incomplete; retaining retry ownership", "run_id", runID, "err", err)
+		}
+	}
 }
 
 func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID string) error {
@@ -201,6 +300,10 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 }
 
 func (o *Orchestrator) checkDisconnectedStartingSandbox(ctx context.Context, sb *types.Sandbox) error {
+	expected, ok := o.launches.Lookup(sb.ID)
+	if !ok || expected.RunID() != sb.RunID {
+		return nil
+	}
 	unit, err := o.resolveRunUnit(ctx, runKindSandbox, sb.RunID)
 	if err != nil {
 		return err
@@ -214,7 +317,24 @@ func (o *Orchestrator) checkDisconnectedStartingSandbox(ctx context.Context, sb 
 			return nil
 		}
 	}
-	o.launches.Cancel(sb.ID)
+
+	// Unit I/O runs without the SID lock. A finished old attempt, a new run,
+	// a running commit or a session reconnect may have won during that I/O.
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	current, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.State != types.StateStarting || current.RunID != sb.RunID {
+		return nil
+	}
+	o.runSessionsMu.Lock()
+	defer o.runSessionsMu.Unlock()
+	if current.ExecutionResult == nil && o.runSessions[runSessionKey{kind: runKindSandbox, runID: sb.RunID}] != nil {
+		return nil
+	}
+	o.launches.CancelExact(expected)
 	return nil
 }
 

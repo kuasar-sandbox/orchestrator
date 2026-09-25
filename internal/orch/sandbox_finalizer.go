@@ -276,8 +276,6 @@ func (o *Orchestrator) clearRunningSandboxNetwork(ctx context.Context, sb *types
 	return nil
 }
 
-func (o *Orchestrator) abandonSandboxResultCleanup(key string) {}
-
 func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID string) error {
 	unlock := o.lifecycle.Lock(sid)
 	defer unlock()
@@ -316,9 +314,19 @@ func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID
 		}
 		return nil
 	case types.StateStarting:
-		o.launches.Cancel(sid)
+		if attempt, ok := o.launches.Lookup(sid); ok && attempt.RunID() == runID {
+			o.launches.CancelExact(attempt)
+		}
 		return nil
-	case types.StatePaused, types.StateDeleting, types.StateDead:
+	case types.StatePaused:
+		if pausedCleanupPending(sb) {
+			o.startPausedCleanupRetry(sid)
+		}
+		return nil
+	case types.StateDeleting:
+		o.startSandboxDeleteFinalizer(sid)
+		return nil
+	case types.StateDead:
 		return nil
 	default:
 		return nil

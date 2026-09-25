@@ -87,8 +87,8 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	if err != nil {
 		return fmt.Errorf("connect readiness socket: %w", err)
 	}
-	// The connection owns the bridge until exec succeeds. Any pidfile, config,
-	// chdir, argv, or exec failure returns through this defer and turns into EOF
+	// The connection owns the bridge until child Start consumes it. Any config,
+	// chdir, argv, or Start failure returns through this defer and turns into EOF
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
 	return ops.launchTask(socket, sid, runID, ready, vmmCgroup)
@@ -105,7 +105,8 @@ func connectReadinessSocket(path string) (*os.File, error) {
 		return nil, err
 	}
 	// File returns a duplicate. Keep it close-on-exec throughout every fallible
-	// pre-exec step; launchTask clears the bit only for the final sandbox-ctl exec.
+	// preparation step. sandboxproc.Start explicitly passes the child copy;
+	// the parent descriptor never needs to become inheritable.
 	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
 	if err != nil {
 		_ = f.Close()

@@ -35,7 +35,6 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
 		chdir:           os.Chdir,
-		exec:            syscall.Exec,
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
 			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready)
 		},
@@ -60,7 +59,6 @@ type taskLaunchOps struct {
 	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
 	setenv          func(string, string) error
 	chdir           func(string) error
-	exec            func(string, []string, []string) error
 	startChild      func(string, []string, []string, *os.File, *os.File) error
 	log             *slog.Logger
 }
@@ -169,31 +167,14 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
-	// These are the last fallible operations before exec/start. If the legacy exec
-	// seam fails, runAssignedSandbox's defers close the now-inheritable descriptors.
+	// Preparation cancellation must not become the runtime lifetime. The
+	// sole spawn boundary derives child FD numbers and owns readiness Close.
 	cancelDeadline()
 	stopContext()
-	if ops.startChild != nil {
-		return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
+	if ops.startChild == nil {
+		return errors.New("sandbox child starter is not configured")
 	}
-	execArgv := []string{spec.Exec, "run", fmt.Sprintf("--cgroup-path=fd=%d", vmmCgroup.Fd())}
-	if ready != nil {
-		fd := int(ready.Fd())
-		if fd < 3 {
-			return fmt.Errorf("readiness fd %d is not inheritable", fd)
-		}
-		execArgv = append(execArgv, fmt.Sprintf("--ready-fd=%d", fd))
-	}
-	execArgv = append(execArgv, argv[2:]...)
-	if err := clearCloseOnExec(vmmCgroup); err != nil {
-		return fmt.Errorf("make vmm cgroup descriptor inheritable: %w", err)
-	}
-	if ready != nil {
-		if err := clearCloseOnExec(ready); err != nil {
-			return err
-		}
-	}
-	return ops.exec(spec.Exec, execArgv, env)
+	return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
 }
 
 func completeSandboxPrepareWithRetry(
@@ -290,17 +271,6 @@ func launchSpecArtifactArg(args []string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func clearCloseOnExec(f *os.File) error {
-	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
-	if err != nil {
-		return fmt.Errorf("get descriptor flags: %w", err)
-	}
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
-		return fmt.Errorf("clear descriptor close-on-exec: %w", err)
-	}
-	return nil
 }
 
 func envDefault(p *string, key string) {
