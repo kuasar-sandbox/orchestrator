@@ -89,7 +89,7 @@ func (o *Orchestrator) handleRunSessionDisconnect(kind, runID string) {
 	}
 	switch kind {
 	case runKindSandbox:
-		o.startRunDisconnectCheck(kind, runID)
+		o.startSandboxRunEndCheck(runID)
 	case runKindBuild:
 		// Build result recovery remains owned by the existing build monitor/reconcile
 		// path. The shared session is only an exact-run wakeup and must not create a
@@ -99,61 +99,63 @@ func (o *Orchestrator) handleRunSessionDisconnect(kind, runID string) {
 }
 
 func (o *Orchestrator) startRunDisconnectCheck(kind, runID string) {
+	if kind == runKindSandbox {
+		o.startSandboxRunEndCheck(runID)
+	}
+}
+
+func (o *Orchestrator) startSandboxRunEndCheck(runID string) {
 	lifecycleCtx := o.launchContext()
 	finish, err := o.acceptedOps.Begin(lifecycleCtx)
 	if err != nil {
 		return
 	}
-	key := runSessionKey{kind: kind, runID: runID}
-	o.runDisconnectMu.Lock()
-	if o.runDisconnectActive == nil {
-		o.runDisconnectActive = make(map[runSessionKey]struct{})
+	o.runEndMu.Lock()
+	if o.runEndActive == nil {
+		o.runEndActive = make(map[string]struct{})
 	}
-	if _, exists := o.runDisconnectActive[key]; exists {
-		o.runDisconnectMu.Unlock()
+	if _, exists := o.runEndActive[runID]; exists {
+		o.runEndMu.Unlock()
 		finish()
 		return
 	}
-	o.runDisconnectActive[key] = struct{}{}
-	o.runDisconnectMu.Unlock()
+	o.runEndActive[runID] = struct{}{}
+	o.runEndMu.Unlock()
 
 	go func() {
 		defer finish()
+		defer func() {
+			o.runEndMu.Lock()
+			delete(o.runEndActive, runID)
+			o.runEndMu.Unlock()
+		}()
+		select {
+		case o.runEndSlots <- struct{}{}:
+			defer func() { <-o.runEndSlots }()
+		case <-lifecycleCtx.Done():
+			return
+		}
 		delay := launchCleanupRetryMin
 		for {
 			if lifecycleCtx.Err() != nil {
-				o.abandonRunDisconnectCheck(key)
 				return
 			}
-			if err := o.checkDisconnectedRunOnce(lifecycleCtx, kind, runID); err != nil {
-				o.log.Warn("run session disconnect check incomplete; retrying",
-					"kind", kind, "run_id", runID, "retry_in", delay, "err", err)
+			if err := o.checkDisconnectedRunOnce(lifecycleCtx, runKindSandbox, runID); err != nil {
+				o.log.Warn("sandbox run end check incomplete; retrying",
+					"run_id", runID, "retry_in", delay, "err", err)
 				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
-					o.abandonRunDisconnectCheck(key)
 					return
 				}
 				delay = nextLaunchCleanupRetry(delay)
 				continue
 			}
-			o.runDisconnectMu.Lock()
-			delete(o.runDisconnectActive, key)
-			o.runDisconnectMu.Unlock()
 			return
 		}
 	}()
 }
 
-func (o *Orchestrator) abandonRunDisconnectCheck(key runSessionKey) {
-	o.runDisconnectMu.Lock()
-	delete(o.runDisconnectActive, key)
-	o.runDisconnectMu.Unlock()
-}
-
 func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID string) error {
 	if kind != runKindSandbox {
-		return nil
-	}
-	if o.runSessionActive(kind, runID) {
 		return nil
 	}
 	checkCtx, cancel := cleanupContext()
@@ -164,9 +166,8 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 	}
 
 	unlock := o.lifecycle.Lock(sid)
-	defer unlock()
-
 	sb, err := o.st.Get(checkCtx, sid)
+	unlock()
 	if err != nil {
 		return err
 	}
@@ -174,13 +175,14 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 		return nil
 	}
 	if sb.ExecutionResult != nil {
-		o.startSandboxResultCleanup(sid, runID)
+		return o.finalizeSandboxResultOnce(ctx, sid, runID)
+	}
+	if o.runSessionActive(kind, runID) {
 		return nil
 	}
 	switch sb.State {
 	case types.StateStarting:
-		o.launches.Cancel(sid)
-		return nil
+		return o.checkDisconnectedStartingSandbox(checkCtx, sb)
 	case types.StateRunning:
 		return o.checkDisconnectedRunningSandbox(checkCtx, sb)
 	case types.StatePaused:
@@ -196,6 +198,24 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 	default:
 		return nil
 	}
+}
+
+func (o *Orchestrator) checkDisconnectedStartingSandbox(ctx context.Context, sb *types.Sandbox) error {
+	unit, err := o.resolveRunUnit(ctx, runKindSandbox, sb.RunID)
+	if err != nil {
+		return err
+	}
+	if unit != "" {
+		active, err := o.sandboxUnitActive(ctx, unit)
+		if err != nil {
+			return err
+		}
+		if active {
+			return nil
+		}
+	}
+	o.launches.Cancel(sb.ID)
+	return nil
 }
 
 func (o *Orchestrator) checkDisconnectedRunningSandbox(ctx context.Context, sb *types.Sandbox) error {
@@ -228,8 +248,7 @@ func (o *Orchestrator) checkDisconnectedRunningSandbox(ctx context.Context, sb *
 	if inserted {
 		o.log.Info("sandbox execution result accepted from disconnected run", "sid", sb.ID, "run_id", sb.RunID)
 	}
-	o.startSandboxResultCleanup(sb.ID, sb.RunID)
-	return nil
+	return o.finalizeSandboxResultOnce(ctx, sb.ID, sb.RunID)
 }
 
 func (o *Orchestrator) retireUnassignedRun(kind, runID string) bool {
@@ -274,6 +293,13 @@ func (o *Orchestrator) runSessionDurableAssigned(ctx context.Context, kind, runI
 	}
 }
 
+func (o *Orchestrator) runSessionAssignmentActive(kind, runID string) bool {
+	if o.runSessionActive(kind, runID) {
+		return true
+	}
+	return o.allowLegacyAssignmentWithoutRunSession
+}
+
 func (o *Orchestrator) runSessionActive(kind, runID string) bool {
 	o.runSessionsMu.Lock()
 	defer o.runSessionsMu.Unlock()
@@ -281,9 +307,12 @@ func (o *Orchestrator) runSessionActive(kind, runID string) bool {
 }
 
 func (o *Orchestrator) runDisconnectCheckActive(kind, runID string) bool {
-	o.runDisconnectMu.Lock()
-	defer o.runDisconnectMu.Unlock()
-	_, active := o.runDisconnectActive[runSessionKey{kind: kind, runID: runID}]
+	if kind != runKindSandbox {
+		return false
+	}
+	o.runEndMu.Lock()
+	defer o.runEndMu.Unlock()
+	_, active := o.runEndActive[runID]
 	return active
 }
 

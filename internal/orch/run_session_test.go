@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,8 +257,8 @@ func TestRunSessionDisconnectInactiveRunningAcceptsResultAndCleansDead(t *testin
 	}
 }
 
-func TestRunSessionDisconnectStartingWakesLaunchRollbackOwner(t *testing.T) {
-	fixture := newSandboxFinalizerFixture(t, "session-starting")
+func TestRunSessionDisconnectStartingPreservesHealthyActiveUnit(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-starting-active")
 	fixture.sb.State = types.StateStarting
 	fixture.sb.LaunchMode = types.LaunchImage
 	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
@@ -275,8 +277,35 @@ func TestRunSessionDisconnectStartingWakesLaunchRollbackOwner(t *testing.T) {
 	waitRunDisconnectIdle(t, fixture.o, runKindSandbox, fixture.sb.RunID)
 	select {
 	case <-attempt.Context().Done():
+		t.Fatal("active starting unit was canceled after session disconnect")
+	case <-time.After(50 * time.Millisecond):
+	}
+	fixture.o.launches.Finish(attempt, nil)
+}
+
+func TestRunSessionDisconnectStartingWakesRollbackAfterUnitEnded(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-starting-ended")
+	fixture.sb.State = types.StateStarting
+	fixture.sb.LaunchMode = types.LaunchImage
+	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	setSandboxFinalizerUnitState(t, fixture, "inactive")
+	attempt, err := fixture.o.launches.Claim(context.Background(), fixture.sb.ID, launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt.SetRunID(fixture.sb.RunID)
+	session, ok, err := fixture.o.RegisterRunSession(context.Background(), runKindSandbox, fixture.sb.RunID)
+	if err != nil || !ok {
+		t.Fatalf("RegisterRunSession = ok %v err %v", ok, err)
+	}
+	session.Close(false)
+	waitRunDisconnectIdle(t, fixture.o, runKindSandbox, fixture.sb.RunID)
+	select {
+	case <-attempt.Context().Done():
 	case <-time.After(2 * time.Second):
-		t.Fatal("starting disconnect did not cancel launch attempt")
+		t.Fatal("ended starting unit did not cancel launch attempt")
 	}
 	fixture.o.launches.Finish(attempt, nil)
 }
@@ -367,6 +396,89 @@ func TestRunSessionMaintenanceSkipsReconnectedRunningOwner(t *testing.T) {
 	if _, stops := fixture.lc.stopSnapshot(); stops != 0 {
 		t.Fatalf("maintenance stopped reconnected owner %d times", stops)
 	}
+}
+
+func TestRunSessionMaintenanceAcceptedResultOverridesActiveSession(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-maint-result-active")
+	session, ok, err := fixture.o.RegisterRunSession(context.Background(), runKindSandbox, fixture.sb.RunID)
+	if err != nil || !ok {
+		t.Fatalf("RegisterRunSession = ok %v err %v", ok, err)
+	}
+	defer session.Close(true)
+	code := 0
+	result := types.SandboxExecutionResult{SID: fixture.sb.ID, RunID: fixture.sb.RunID, Stage: types.SandboxResultRun, ExitCode: &code}
+	if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), fixture.sb.ID, fixture.sb.RunID, result); err != nil || !inserted {
+		t.Fatalf("AcceptSandboxExecutionResult = %t, %v", inserted, err)
+	}
+	if err := fixture.o.queueMissingRunSessionChecks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dead := waitForSandbox(t, fixture.o, context.Background(), fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateDead && sb.ExecutionResult != nil
+	}, "accepted result maintenance with active session")
+	if dead.ExecutionResult.RunID != fixture.sb.RunID || dead.ExecutionResult.Stage != types.SandboxResultRun {
+		t.Fatalf("accepted-result maintenance result = %+v", dead.ExecutionResult)
+	}
+}
+
+func TestSandboxRunEndWorkersAreBoundedAndRetainPendingRetry(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "session-bounded-first")
+	fixture.o.runEndSlots = make(chan struct{}, 1)
+	second := *fixture.sb
+	second.ID = "session-bounded-second"
+	second.RunID = "sr-00000000-0000-7000-8000-000000000288"
+	second.RunDir = filepath.Join(filepath.Dir(fixture.sb.RunDir), second.ID)
+	second.BaseDir = filepath.Join(filepath.Dir(fixture.sb.BaseDir), second.ID)
+	second.VswitchPort = "port-288"
+	second.FloatingIP = "192.0.2.88"
+	second.ExecutionResult = nil
+	materializeTestSandboxCredentials(t, &second)
+	if err := fixture.o.st.Put(context.Background(), &second); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{second.RunDir, second.BaseDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code := 0
+	for _, sb := range []*types.Sandbox{fixture.sb, &second} {
+		result := types.SandboxExecutionResult{SID: sb.ID, RunID: sb.RunID, Stage: types.SandboxResultRun, ExitCode: &code}
+		if inserted, err := fixture.o.st.AcceptSandboxExecutionResult(context.Background(), sb.ID, sb.RunID, result); err != nil || !inserted {
+			t.Fatalf("AcceptSandboxExecutionResult(%s) = %t, %v", sb.ID, inserted, err)
+		}
+	}
+	removeStarted := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	var once sync.Once
+	fixture.o.removeSandboxRunDir = func(path string) error {
+		if path == fixture.sb.RunDir {
+			once.Do(func() { close(removeStarted) })
+			<-releaseRemove
+		}
+		return os.RemoveAll(path)
+	}
+	fixture.o.startSandboxRunEndCheck(fixture.sb.RunID)
+	select {
+	case <-removeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first cleanup did not acquire the single run-end slot")
+	}
+	fixture.o.startSandboxRunEndCheck(second.RunID)
+	select {
+	case <-time.After(50 * time.Millisecond):
+	}
+	gotSecond, err := fixture.o.st.Get(context.Background(), second.ID)
+	if err != nil || gotSecond == nil || gotSecond.State != types.StateRunning || gotSecond.ExecutionResult == nil {
+		t.Fatalf("second cleanup ran while single slot was blocked: %+v, %v", gotSecond, err)
+	}
+	close(releaseRemove)
+	waitForSandbox(t, fixture.o, context.Background(), fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateDead && sb.ExecutionResult != nil
+	}, "first bounded cleanup")
+	waitForSandbox(t, fixture.o, context.Background(), second.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateDead && sb.ExecutionResult != nil
+	}, "second pending bounded cleanup")
 }
 
 func TestRunSessionMaintenanceConvergesLegacyNoSessionRunningOwner(t *testing.T) {

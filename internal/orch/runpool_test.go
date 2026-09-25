@@ -715,6 +715,106 @@ func TestRunPoolStartReportsPidDirectoryFailure(t *testing.T) {
 	}
 }
 
+func TestRunPoolAssignWithFenceRejectsIdleDisconnectedRun(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
+	committed := false
+	gotRunID, err := p.AssignWithFence(baseCtx, "task-without-session", func(got string) bool {
+		if got != runID {
+			t.Fatalf("fence runID = %q, want %q", got, runID)
+		}
+		return false
+	}, func(string) error {
+		committed = true
+		return nil
+	})
+	if err == nil || gotRunID != "" || !strings.Contains(err.Error(), "no active run session") {
+		t.Fatalf("AssignWithFence = %q, %v; want session fence error", gotRunID, err)
+	}
+	if committed {
+		t.Fatal("commit ran after failed session fence")
+	}
+	select {
+	case got := <-waiter.resp:
+		if got.err == nil || got.ok || got.taskID != "" || !strings.Contains(got.err.Error(), "no active run session") {
+			t.Fatalf("waiter after failed fence = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not receive failed fence response")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		if stopped != testRunUnit(runID) {
+			t.Fatalf("stopped unit = %q, want %q", stopped, testRunUnit(runID))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed-fence run was not stopped")
+	}
+}
+
+func TestRunPoolAssignWithFenceRejectsPreWaitDisconnectedRun(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	var runID string
+	select {
+	case unit := <-lc.started:
+		runID = runIDFromTestUnit(unit)
+	case <-time.After(time.Second):
+		t.Fatal("runner unit was not started")
+	}
+	assignDone := make(chan struct {
+		runID string
+		err   error
+	}, 1)
+	committed := false
+	go func() {
+		got, err := p.AssignWithFence(baseCtx, "pre-wait-task", func(got string) bool {
+			if got != runID {
+				t.Errorf("fence runID = %q, want %q", got, runID)
+			}
+			return false
+		}, func(string) error {
+			committed = true
+			return nil
+		})
+		assignDone <- struct {
+			runID string
+			err   error
+		}{got, err}
+	}()
+	waitDone := make(chan runWaitResp, 1)
+	go func() {
+		taskID, ok, err := p.WaitAssignment(baseCtx, runID)
+		waitDone <- runWaitResp{taskID: taskID, ok: ok, err: err}
+	}()
+	select {
+	case res := <-assignDone:
+		if res.err == nil || res.runID != "" || !strings.Contains(res.err.Error(), "no active run session") {
+			t.Fatalf("AssignWithFence pre-wait = %+v, want session fence error", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("assignment did not fail at pre-wait fence")
+	}
+	if committed {
+		t.Fatal("commit ran after pre-wait failed session fence")
+	}
+	select {
+	case got := <-waitDone:
+		if got.err == nil || got.ok || got.taskID != "" || !strings.Contains(got.err.Error(), "no active run session") {
+			t.Fatalf("WaitAssignment after pre-wait failed fence = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitAssignment did not receive failed fence response")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		if stopped != testRunUnit(runID) {
+			t.Fatalf("stopped unit = %q, want %q", stopped, testRunUnit(runID))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pre-wait failed-fence run was not stopped")
+	}
+}
+
 func TestRunPoolRetireLosesToAssignmentCommit(t *testing.T) {
 	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
 	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)

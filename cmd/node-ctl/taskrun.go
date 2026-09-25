@@ -43,9 +43,12 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 	})
 	var reported sandboxRunReportedError
 	if err != nil && !errors.As(err, &reported) {
+		if ready != nil {
+			_ = ready.Close()
+		}
 		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultPrepare, err)
 		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
-			return errors.Join(err, reportErr)
+			return sandboxRunReportedError{err: errors.Join(err, reportErr)}
 		}
 	}
 	return err
@@ -307,12 +310,12 @@ func envDefault(p *string, key string) {
 }
 
 // lockPidfile opens path, takes a non-blocking exclusive POSIX lock (fails if another
-// instance already holds it — the double-start guard), writes our pid, and clears
-// FD_CLOEXEC so the lock survives execve into the target (the fd stays open in the
-// same-PID process; the lock releases on process exit). It is never closed and never
-// unlinked — the launcher does not clean up the pidfile.
+// instance already holds it — the double-start guard), and writes our pid. The
+// descriptor stays open in the parent to retain the lock, but is close-on-exec so
+// sandbox-ctl children cannot inherit the parent-owned RunID/Build pidfile. It is
+// never closed and never unlinked — the launcher does not clean up the pidfile.
 func lockPidfile(path string) error {
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT, 0o600)
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return fmt.Errorf("open pidfile %s: %w", path, err)
 	}
@@ -328,9 +331,6 @@ func lockPidfile(path string) error {
 	if _, err := unix.Pwrite(fd, []byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
 		unix.Close(fd)
 		return fmt.Errorf("write pidfile: %w", err)
-	}
-	if flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
-		_, _ = unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags&^unix.FD_CLOEXEC)
 	}
 	return nil
 }
@@ -382,14 +382,14 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 	if err := sandboxproc.Start(cmd, vmmCgroup, ready); err != nil {
 		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultStart, err)
 		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
-			return errors.Join(err, reportErr)
+			return sandboxRunReportedError{err: errors.Join(err, reportErr)}
 		}
 		return sandboxRunReportedError{err: err}
 	}
 	err := cmd.Wait()
 	result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultRun, err)
 	if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
-		return errors.Join(err, reportErr)
+		return sandboxRunReportedError{err: errors.Join(err, reportErr)}
 	}
 	if err != nil {
 		return sandboxRunReportedError{err: err}

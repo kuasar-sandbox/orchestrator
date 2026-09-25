@@ -33,11 +33,12 @@ type runPool struct {
 }
 
 type runConsumeReq struct {
-	taskID     string
-	ctx        context.Context
-	commit     func(runID string) error
-	resp       chan runConsumeResp
-	stopCancel func() bool
+	taskID       string
+	ctx          context.Context
+	commit       func(runID string) error
+	sessionFence func(runID string) bool
+	resp         chan runConsumeResp
+	stopCancel   func() bool
 	// startAttempts is the finite wave of already in-flight or demand-created
 	// units that may satisfy this request. Replacements created after a failed
 	// wave can still win the race and become idle, but they do not extend the
@@ -120,10 +121,14 @@ func (p *runPool) Start(ctx context.Context) error {
 }
 
 func (p *runPool) Assign(ctx context.Context, taskID string, commit func(runID string) error) (string, error) {
+	return p.AssignWithFence(ctx, taskID, nil, commit)
+}
+
+func (p *runPool) AssignWithFence(ctx context.Context, taskID string, sessionFence func(runID string) bool, commit func(runID string) error) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, resp: make(chan runConsumeResp, 1)}
+	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, sessionFence: sessionFence, resp: make(chan runConsumeResp, 1)}
 	select {
 	case p.consumeCh <- req:
 	case <-ctx.Done():
@@ -326,6 +331,13 @@ func (p *runPool) loop(ctx context.Context) {
 			if err := req.ctx.Err(); err != nil {
 				replyConsume(req, runConsumeResp{err: err})
 				idle = append([]idleRun{w}, idle...)
+				continue
+			}
+			if req.sessionFence != nil && !req.sessionFence(w.runID) {
+				err := fmt.Errorf("run pool: run %s has no active run session", w.runID)
+				replyWait(w.req, runWaitResp{err: err})
+				queueControl(runControlReq{op: "stop", runID: w.runID})
+				replyConsume(req, runConsumeResp{err: err})
 				continue
 			}
 			if err := req.commit(w.runID); err != nil {

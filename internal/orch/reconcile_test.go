@@ -412,6 +412,7 @@ func TestReconcileRetriesSnapshotColdResumeWithDurableLaunchMode(t *testing.T) {
 	}
 	vs := &checkpointVS{}
 	o := New(cfg, st, launcher, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o.allowLegacyAssignmentWithoutRunSession = true
 	launcher.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

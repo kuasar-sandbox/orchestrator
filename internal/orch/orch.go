@@ -79,14 +79,14 @@ type Orchestrator struct {
 	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
 	pausedCleanupMu     sync.Mutex
 	pausedCleanupActive map[string]struct{} // paused sandbox id -> live retrying ownership cleanup
-	resultCleanupMu     sync.Mutex
-	resultCleanupActive map[string]struct{} // sid/run_id -> live retrying result cleanup
-
 	runSessionsMu       sync.Mutex
 	runSessionsNext     uint64
 	runSessions         map[runSessionKey]*runSessionGeneration
-	runDisconnectMu     sync.Mutex
-	runDisconnectActive map[runSessionKey]struct{}
+	runEndMu            sync.Mutex
+	runEndActive        map[string]struct{} // sandbox RunID -> live retrying exact-run end/cleanup worker
+	runEndSlots         chan struct{}
+
+	allowLegacyAssignmentWithoutRunSession bool // test-only compatibility for in-process runner fixtures
 
 	lifecycleCtxMu sync.RWMutex
 	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
@@ -219,7 +219,8 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		detachedPortsPending: map[string]struct{}{},
 		deleteActive:         map[string]struct{}{},
 		pausedCleanupActive:  map[string]struct{}{},
-		resultCleanupActive:  map[string]struct{}{},
+		runEndActive:         map[string]struct{}{},
+		runEndSlots:          make(chan struct{}, 4),
 		clusterBuilds:        map[string]*clusterBuild{},
 		buildSubs:            map[int]chan routesync.BuildEvent{},
 		mmdsBuildOwners:      map[string]string{},
@@ -598,7 +599,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	assignStarted := time.Now()
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
-	runID, err := o.runnerPool.Assign(assignmentCtx, sb.ID, func(runID string) error {
+	runID, err := o.runnerPool.AssignWithFence(assignmentCtx, sb.ID, func(runID string) bool { return o.runSessionAssignmentActive(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
 		// Serialize the runner-binding linearization point with Kill/Delete and
 		// other lifecycle mutations. If deletion wins, the exact CAS below misses
@@ -2434,20 +2435,22 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 
 func (o *Orchestrator) queueMissingRunSessionChecks(ctx context.Context) error {
 	var runIDs []string
-	if err := o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
-		if sb.RunID == "" || sb.ExecutionResult != nil {
+	collect := func(sb *types.Sandbox) error {
+		if sb.RunID == "" {
 			return nil
 		}
-		if o.runSessionActive(runKindSandbox, sb.RunID) {
-			return nil
+		if sb.ExecutionResult != nil || !o.runSessionActive(runKindSandbox, sb.RunID) {
+			runIDs = append(runIDs, sb.RunID)
 		}
-		runIDs = append(runIDs, sb.RunID)
 		return nil
-	}); err != nil {
-		return err
+	}
+	for _, state := range []types.State{types.StateStarting, types.StateRunning, types.StatePaused, types.StateDeleting} {
+		if err := o.st.RangeByState(ctx, state, collect); err != nil {
+			return err
+		}
 	}
 	for _, runID := range runIDs {
-		o.startRunDisconnectCheck(runKindSandbox, runID)
+		o.startSandboxRunEndCheck(runID)
 	}
 	return nil
 }

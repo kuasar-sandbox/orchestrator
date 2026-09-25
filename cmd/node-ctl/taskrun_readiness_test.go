@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"golang.org/x/sys/unix"
@@ -599,3 +601,295 @@ func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestLaunchTaskReportFailureKeepsObservedChildResult(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		execPath  string
+		wantStage types.SandboxExecutionStage
+		wantExit  *int
+	}{
+		{name: "start", execPath: filepath.Join(t.TempDir(), "missing-sandbox-ctl"), wantStage: types.SandboxResultStart},
+		{name: "run", wantStage: types.SandboxResultRun, wantExit: intPtr(7)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			execPath := tc.execPath
+			if execPath == "" {
+				execPath = filepath.Join(dir, "sandbox-ctl-test")
+				if err := os.WriteFile(execPath, []byte("#!/bin/sh\nexit 7\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			socket := filepath.Join(dir, "config.sock")
+			var results []configsock.SandboxExecutionResult
+			server, done := startSandboxLaunchResultServer(t, socket, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case configsock.PathTaskSandboxBootstrap:
+					_ = json.NewEncoder(w).Encode(configsock.SandboxTaskSpec{
+						SandboxID: "sid", RunID: "run-1", Env: map[string]string{"MANIFEST_KEY": "key"},
+						Final: &configsock.LaunchSpec{Exec: execPath, Args: []string{"run"}},
+					})
+				case configsock.PathRunSandboxResult:
+					var req configsock.SandboxResultRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Errorf("decode result: %v", err)
+						return
+					}
+					results = append(results, req.Result)
+					w.WriteHeader(http.StatusConflict)
+					_ = json.NewEncoder(w).Encode(configsock.SandboxResultResponse{Error: "report rejected"})
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			})
+			defer closeTestHTTPServer(t, server, done)
+
+			vmm, err := os.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vmm.Close()
+			readyR, readyW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer readyR.Close()
+
+			err = launchTask(context.Background(), func() {}, socket, "sid", "run-1", readyW, vmm, nil)
+			var reported sandboxRunReportedError
+			if !errors.As(err, &reported) || !strings.Contains(err.Error(), "report rejected") {
+				t.Fatalf("launchTask error = %v, want marked rejected report", err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("reported results = %d, want exactly one: %+v", len(results), results)
+			}
+			got := results[0]
+			if got.Stage != tc.wantStage || got.SID != "sid" || got.RunID != "run-1" {
+				t.Fatalf("result identity/stage = %+v, want %s sid/run-1", got, tc.wantStage)
+			}
+			if tc.wantExit != nil {
+				if got.ExitCode == nil || *got.ExitCode != *tc.wantExit {
+					t.Fatalf("exit code = %v, want %d", got.ExitCode, *tc.wantExit)
+				}
+			}
+		})
+	}
+}
+
+func TestLaunchTaskPrepareFailureClosesReadinessBeforeReportACK(t *testing.T) {
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "config.sock")
+	resultReceived := make(chan struct{})
+	releaseResult := make(chan struct{})
+	server, done := startSandboxLaunchResultServer(t, socket, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case configsock.PathTaskSandboxBootstrap:
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(configsock.SandboxTaskSpec{Error: "bootstrap failed"})
+		case configsock.PathRunSandboxResult:
+			var req configsock.SandboxResultRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode result: %v", err)
+				return
+			}
+			if req.Result.Stage != types.SandboxResultPrepare {
+				t.Errorf("prepare failure report stage = %s", req.Result.Stage)
+			}
+			close(resultReceived)
+			<-releaseResult
+			_ = json.NewEncoder(w).Encode(configsock.SandboxResultResponse{})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	defer closeTestHTTPServer(t, server, done)
+
+	vmm, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmm.Close()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyR.Close()
+	errCh := make(chan error, 1)
+	go func() { errCh <- launchTask(context.Background(), func() {}, socket, "sid", "run-1", readyW, vmm, nil) }()
+	select {
+	case <-resultReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prepare result was not posted")
+	}
+	if err := readyR.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if n, err := readyR.Read(buf); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("readiness before report ACK = %d, %v; want EOF", n, err)
+	}
+	close(releaseResult)
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "bootstrap failed") {
+			t.Fatalf("launchTask error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("launchTask did not return after report ACK")
+	}
+}
+
+func TestParentRunPidfilesAndSessionFDsAreNotInheritedBySandboxprocChild(t *testing.T) {
+	dir := t.TempDir()
+	runPidfile := filepath.Join(dir, "runners", "sr-test.pid")
+	buildPidfile := filepath.Join(dir, "builds", "bid", "builder.pid")
+	for _, path := range []string{runPidfile, buildPidfile} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := lockPidfile(path); err != nil {
+			t.Fatalf("lockPidfile(%s): %v", path, err)
+		}
+	}
+
+	socket := filepath.Join(dir, "config.sock")
+	sessionAck := make(chan struct{})
+	sessionRelease := make(chan struct{})
+	server, done := startSandboxLaunchResultServer(t, socket, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != configsock.PathRunSession {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(configsock.RunSessionResponse{Kind: "sandbox", RunID: "sr-test"})
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(sessionAck)
+		<-sessionRelease
+	})
+	defer close(sessionRelease)
+	defer closeTestHTTPServer(t, server, done)
+	keeper, err := configsock.OpenRunSessionKeeper(context.Background(), socket, "sandbox", "sr-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keeper.Close()
+	select {
+	case <-sessionAck:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session was not established")
+	}
+
+	vmm, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmm.Close()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyR.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestNodeCtlFDInspectionChild$", "--")
+	cmd.Env = append(os.Environ(),
+		"NODE_CTL_FD_INSPECTION_CHILD=1",
+		"NODE_CTL_FORBIDDEN_FD_PATHS="+runPidfile+string(os.PathListSeparator)+buildPidfile,
+		"NODE_CTL_FORBID_SOCKET_FDS=1",
+	)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := sandboxproc.Start(cmd, vmm, readyW); err != nil {
+		t.Fatal(err)
+	}
+	if err := readyR.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	wire, err := io.ReadAll(readyR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wire) != "ready\n" {
+		t.Fatalf("child readiness = %q", wire)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNodeCtlFDInspectionChild(t *testing.T) {
+	if os.Getenv("NODE_CTL_FD_INSPECTION_CHILD") != "1" {
+		return
+	}
+	forbidden := map[string]bool{}
+	for _, path := range filepath.SplitList(os.Getenv("NODE_CTL_FORBIDDEN_FD_PATHS")) {
+		if path != "" {
+			forbidden[path] = true
+		}
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		fdPath := filepath.Join("/proc/self/fd", entry.Name())
+		target, err := os.Readlink(fdPath)
+		if err != nil {
+			continue
+		}
+		if forbidden[target] {
+			t.Fatalf("inherited forbidden parent pidfile fd %s -> %s", entry.Name(), target)
+		}
+		if os.Getenv("NODE_CTL_FORBID_SOCKET_FDS") == "1" && strings.HasPrefix(target, "socket:[") {
+			t.Fatalf("inherited parent socket fd %s -> %s", entry.Name(), target)
+		}
+	}
+	readyFD := -1
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "--ready-fd=") {
+			readyFD, _ = strconv.Atoi(strings.TrimPrefix(arg, "--ready-fd="))
+		}
+	}
+	if readyFD < 0 {
+		t.Fatal("missing ready fd")
+	}
+	ready := os.NewFile(uintptr(readyFD), "ready")
+	if _, err := io.WriteString(ready, "ready\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ready.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func startSandboxLaunchResultServer(t *testing.T, socket string, handler http.HandlerFunc) (*http.Server, <-chan error) {
+	t.Helper()
+	_ = os.Remove(socket)
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: handler}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	return server, done
+}
+
+func closeTestHTTPServer(t *testing.T, server *http.Server, done <-chan error) {
+	t.Helper()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+func intPtr(v int) *int { return &v }

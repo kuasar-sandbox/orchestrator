@@ -212,49 +212,7 @@ func resultCleanupKey(sid, runID string) string { return sid + "\x00" + runID }
 // The result row is durable before this is called; losing process-local
 // admission leaves startup reconciliation with enough state to retry.
 func (o *Orchestrator) startSandboxResultCleanup(sid, runID string) {
-	lifecycleCtx := o.launchContext()
-	finish, err := o.acceptedOps.Begin(lifecycleCtx)
-	if err != nil {
-		return
-	}
-
-	key := resultCleanupKey(sid, runID)
-	o.resultCleanupMu.Lock()
-	if o.resultCleanupActive == nil {
-		o.resultCleanupActive = make(map[string]struct{})
-	}
-	if _, exists := o.resultCleanupActive[key]; exists {
-		o.resultCleanupMu.Unlock()
-		finish()
-		return
-	}
-	o.resultCleanupActive[key] = struct{}{}
-	o.resultCleanupMu.Unlock()
-
-	go func() {
-		defer finish()
-		delay := launchCleanupRetryMin
-		for {
-			if lifecycleCtx.Err() != nil {
-				o.abandonSandboxResultCleanup(key)
-				return
-			}
-			if err := o.finalizeSandboxResultOnce(lifecycleCtx, sid, runID); err != nil {
-				o.log.Error("sandbox result cleanup incomplete; retrying",
-					"sid", sid, "run_id", runID, "retry_in", delay, "err", err)
-				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
-					o.abandonSandboxResultCleanup(key)
-					return
-				}
-				delay = nextLaunchCleanupRetry(delay)
-				continue
-			}
-			o.resultCleanupMu.Lock()
-			delete(o.resultCleanupActive, key)
-			o.resultCleanupMu.Unlock()
-			return
-		}
-	}()
+	o.startSandboxRunEndCheck(runID)
 }
 
 func (o *Orchestrator) cleanupResultRunningOwnership(ctx context.Context, sb *types.Sandbox) error {
@@ -318,11 +276,7 @@ func (o *Orchestrator) clearRunningSandboxNetwork(ctx context.Context, sb *types
 	return nil
 }
 
-func (o *Orchestrator) abandonSandboxResultCleanup(key string) {
-	o.resultCleanupMu.Lock()
-	delete(o.resultCleanupActive, key)
-	o.resultCleanupMu.Unlock()
-}
+func (o *Orchestrator) abandonSandboxResultCleanup(key string) {}
 
 func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID string) error {
 	unlock := o.lifecycle.Lock(sid)

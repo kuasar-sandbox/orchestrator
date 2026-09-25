@@ -278,6 +278,7 @@ func TestResumeRace_ConnectAndConcurrentAdmissionSingleLaunch(t *testing.T) {
 	startGate := make(chan struct{})
 	lc := &countingLauncher{started: started, startGate: startGate}
 	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o.allowLegacyAssignmentWithoutRunSession = true
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
