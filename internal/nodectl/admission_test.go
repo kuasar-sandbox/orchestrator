@@ -367,6 +367,198 @@ func TestAdmission_QueuedBuildFailureLogsDiagnostic(t *testing.T) {
 	}
 }
 
+// TestAdmission_QueueFullLogsDiagnostic verifies that an enqueue rejected at
+// queue_max_depth emits an explicit admit_queue_full diagnostic, after the
+// queue critical section is released. Regression for the silently-vanishing
+// admits observed at N>queue_max_depth (issue #265): the client received a
+// queue_full rejection but the server-side trail had no trace of the drop.
+func TestAdmission_QueueFullLogsDiagnostic(t *testing.T) {
+	state := newTestState(t, 1<<30)
+	a := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Hour, QueueMaxDepth: 1,
+	})
+	logs := &queueLockCheckingWriter{queueMu: &a.queueMu}
+	a.SetWiring(state, slog.New(slog.NewJSONHandler(logs, nil)), func(*PendingAdmit) (*Message, error) {
+		return nil, nil
+	})
+	req := &Message{
+		SandboxID:           "sb-overflow",
+		CapacityMemoryBytes: 256 << 20,
+		FloorMemoryBytes:    64 << 20,
+		StartupBudgetMemory: 64 << 20,
+	}
+	c1Client, c1Server := net.Pipe()
+	defer c1Client.Close()
+	defer c1Server.Close()
+	c2Client, c2Server := net.Pipe()
+	defer c2Client.Close()
+	defer c2Server.Close()
+
+	entry1, ok := a.Enqueue(req, c1Server, 0)
+	if !ok {
+		t.Fatal("enqueue 1 failed")
+	}
+	defer entry1.ttlTimer.Stop()
+
+	if _, ok := a.Enqueue(req, c2Server, 0); ok {
+		t.Fatal("enqueue 2 should have failed (queue at cap)")
+	}
+	if logs.wroteWhileLocked {
+		t.Fatal("queue diagnostic was written while queueMu was held")
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.buf.Bytes()), &record); err != nil {
+		t.Fatalf("decode queue diagnostic: %v: %s", err, logs.buf.String())
+	}
+	if record["event"] != "admit_queue_full" || record["sandbox_id"] != "sb-overflow" ||
+		record["queue_max_depth"] != float64(1) {
+		t.Fatalf("queue diagnostic = %v", record)
+	}
+	if a.QueueDepth() != 1 {
+		t.Fatalf("queue depth = %d, want 1", a.QueueDepth())
+	}
+}
+
+// TestAdmission_QueueCanceledLogsDiagnostic verifies that a TTL-expired
+// queued admit emits an admit_queue_canceled diagnostic with reason
+// ttl_expired and delivers the queue_canceled rejection to a connected client.
+func TestAdmission_QueueCanceledLogsDiagnostic(t *testing.T) {
+	state := newTestState(t, 1<<30)
+	a := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: 10 * time.Millisecond, QueueMaxDepth: 4,
+	})
+	logs := &queueLockCheckingWriter{queueMu: &a.queueMu}
+	builderCalled := false
+	a.SetWiring(state, slog.New(slog.NewJSONHandler(logs, nil)), func(*PendingAdmit) (*Message, error) {
+		builderCalled = true
+		return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted}, nil
+	})
+	req := &Message{
+		SandboxID:           "sb-ttl",
+		CapacityMemoryBytes: 256 << 20,
+		FloorMemoryBytes:    64 << 20,
+		StartupBudgetMemory: 64 << 20,
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	respCh := make(chan *Message, 1)
+	go func() {
+		msg, err := ReadMessage(client)
+		if err != nil {
+			t.Errorf("read rejection: %v", err)
+			return
+		}
+		respCh <- msg
+	}()
+	entry, ok := a.Enqueue(req, server, 4242)
+	if !ok {
+		t.Fatal("enqueue failed")
+	}
+	defer entry.ttlTimer.Stop()
+
+	// Wait deterministically for the TTL timer to close cancelCh.
+	select {
+	case <-entry.cancelCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for TTL cancelCh to close")
+	}
+
+	a.processQueue()
+
+	if builderCalled {
+		t.Fatal("builder was called for canceled admit")
+	}
+	if logs.wroteWhileLocked {
+		t.Fatal("queue diagnostic was written while queueMu was held")
+	}
+	select {
+	case msg := <-respCh:
+		if msg.Status != StatusRejected || msg.Reason != "queue_canceled" {
+			t.Fatalf("rejection = %+v", msg)
+		}
+		if msg.Msg != "queued admit canceled (TTL expiry)" {
+			t.Fatalf("rejection Msg = %q, want %q", msg.Msg, "queued admit canceled (TTL expiry)")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for queue_canceled rejection")
+	}
+	if a.QueueDepth() != 0 {
+		t.Fatalf("queue depth = %d, want 0 after TTL cancel", a.QueueDepth())
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.buf.Bytes()), &record); err != nil {
+		t.Fatalf("decode queue diagnostic: %v: %s", err, logs.buf.String())
+	}
+	if record["event"] != "admit_queue_canceled" || record["reason"] != "ttl_expired" ||
+		record["sandbox_id"] != "sb-ttl" {
+		t.Fatalf("queue diagnostic = %v", record)
+	}
+}
+
+// TestAdmission_QueueCanceledLogsDiagnostic_ClientDisconnected verifies that
+// when a queued admit's TTL expires after the client has already disconnected,
+// the server safely removes the entry from the queue and emits an
+// admit_queue_canceled diagnostic (with reason=ttl_expired) outside queueMu,
+// without panicking on the dead socket or expecting response delivery.
+func TestAdmission_QueueCanceledLogsDiagnostic_ClientDisconnected(t *testing.T) {
+	state := newTestState(t, 1<<30)
+	a := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: 10 * time.Millisecond, QueueMaxDepth: 4,
+	})
+	logs := &queueLockCheckingWriter{queueMu: &a.queueMu}
+	builderCalled := false
+	a.SetWiring(state, slog.New(slog.NewJSONHandler(logs, nil)), func(*PendingAdmit) (*Message, error) {
+		builderCalled = true
+		return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted}, nil
+	})
+	req := &Message{
+		SandboxID:           "sb-ttl-disconnected",
+		CapacityMemoryBytes: 256 << 20,
+		FloorMemoryBytes:    64 << 20,
+		StartupBudgetMemory: 64 << 20,
+	}
+	client, server := net.Pipe()
+	defer server.Close()
+
+	entry, ok := a.Enqueue(req, server, 4242)
+	if !ok {
+		t.Fatal("enqueue failed")
+	}
+	defer entry.ttlTimer.Stop()
+
+	// Client closes the socket before the TTL fires and before processQueue runs.
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-entry.cancelCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for TTL cancelCh to close")
+	}
+
+	a.processQueue()
+
+	if builderCalled {
+		t.Fatal("builder was called for canceled admit")
+	}
+	if logs.wroteWhileLocked {
+		t.Fatal("queue diagnostic was written while queueMu was held")
+	}
+	if a.QueueDepth() != 0 {
+		t.Fatalf("queue depth = %d, want 0 after TTL cleanup", a.QueueDepth())
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.buf.Bytes()), &record); err != nil {
+		t.Fatalf("decode queue diagnostic: %v: %s", err, logs.buf.String())
+	}
+	if record["event"] != "admit_queue_canceled" || record["reason"] != "ttl_expired" ||
+		record["sandbox_id"] != "sb-ttl-disconnected" {
+		t.Fatalf("queue diagnostic = %v", record)
+	}
+}
+
 func TestAdmission_QueuedWriteFailureClearsReservationConnection(t *testing.T) {
 	state := newTestState(t, 8<<30)
 	a := NewAdmissionController(AdmissionPolicy{
