@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 
@@ -401,7 +402,14 @@ func sanitizeSandboxResultError(message string) string {
 	}, message)
 	message = strings.TrimSpace(message)
 	if len(message) > 1024 {
-		message = message[:1024]
+		end := 1024
+		// strings.Map produced valid UTF-8. Do not split its last rune: JSON
+		// replaces invalid bytes with U+FFFD and could expand the wire value
+		// past the store's 1024-byte result bound, losing durable acceptance.
+		for !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end]
 	}
 	return message
 }
