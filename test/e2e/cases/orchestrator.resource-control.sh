@@ -24,11 +24,18 @@ s=s.replace('launch:\n  exec: /bin/sleep\n  args: ["300"]\n',
     - |
       import time
       blocks=[]
+      import os
+      start="/tmp/resource-static.start"
+      delivery="/tmp/resource-static.delivery"
       print("control-workload-ready", flush=True)
-      time.sleep(3)
-      for _ in range(6):
+      while not os.path.exists(start): time.sleep(.05)
+      blocks.append(bytearray(48*1024*1024))
+      blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
+      print("pressure-probe-ready", flush=True)
+      while not os.path.exists(delivery): time.sleep(.05)
+      for _ in range(5):
           blocks.append(bytearray(48*1024*1024))
-          for b in blocks[-1:]: b[::4096]=b"\\1"*(len(b)//4096)
+          blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
           print("pressure", len(blocks), flush=True)
           time.sleep(1)
       print("workload done", flush=True)
@@ -58,6 +65,14 @@ if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ]; then
     grow_phase=prepressure
     target_reference=$initial_target
 fi
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-static.start'
+deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    grep -q pressure-probe-ready "$WORK/$sid.log" && break
+    kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
+    sleep 0.1
+done
+grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
 if [ "$grow_phase" = pressure ]; then resource_wait_local_grow "$sid" "$pid" "$grows" 30; fi
 
 deadline=$((SECONDS+30))
@@ -69,6 +84,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.25
 done
 [ "$target_after" -lt "$target_reference" ] || resource_fail "static grow did not reduce CH balloon target below $target_reference"
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-static.delivery'
 deadline=$((SECONDS+45))
 while [ "$SECONDS" -lt "$deadline" ]; do
     grep -q 'workload done' "$WORK/$sid.log" && break
