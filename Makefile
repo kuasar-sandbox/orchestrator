@@ -8,7 +8,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
-	        test vet bench e2e-fixtures test-e2e release test-release clean help
+	        test vet bench test-e2e release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
