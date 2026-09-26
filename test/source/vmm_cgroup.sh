@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$SCRIPT_DIR/lib/vmm_cgroup.sh"
+. "$SCRIPT_DIR/../e2e/lib/vmm_cgroup.sh"
 
 WORK="$(mktemp -d /tmp/vmm-cgroup-test-XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
