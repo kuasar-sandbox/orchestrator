@@ -58,7 +58,17 @@ code="$(curl -sS --noproxy '*' -o "$WORK/data.body" -w '%{http_code}'     -H 'Ho
 deadline=$((SECONDS + 20))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if curl -fsS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" >"$WORK/metrics.out" 2>/dev/null &&
-       grep -q 'data_requests_total' "$WORK/metrics.out"; then
+       grep -Eq 'data_requests_total\\{[^}]*result="notfound"[^}]*\\}[[:space:]]+[1-9][0-9]*(\\.[0-9]+)?; then
+        echo "PASS telemetry.proxy.sh"
+        exit 0
+    fi
+    kill -0 "$PROXY" 2>/dev/null || { cat "$WORK/proxy.log" >&2; exit 1; }
+    sleep 0.2
+done
+cat "$WORK/proxy.log" >&2
+echo "proxy master metrics omitted aggregated notfound data_requests_total" >&2
+exit 1
+ "$WORK/metrics.out"; then
         echo "PASS telemetry.proxy.sh"
         exit 0
     fi
