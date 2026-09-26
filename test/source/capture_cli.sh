@@ -20,11 +20,6 @@ trap 'rm -rf "$WORK"' EXIT
     cd "$SANDBOXER_SOURCE_ROOT"
     GOOS=linux CGO_ENABLED=0 go build -trimpath -o "$WORK/sandbox-ctl" ./cmd/sandbox-ctl
 )
-(
-    cd "$ROOT"
-    GOOS=linux CGO_ENABLED=0 go build -trimpath -o "$WORK/node-ctl" ./cmd/node-ctl
-)
-
 RESULTS="$WORK/results.jsonl"
 KUASAR_TEST_SANDBOX_CTL="$WORK/sandbox-ctl"     go test -json -count=1 -timeout=5m ./internal/orch     -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$'     >"$RESULTS"
 
