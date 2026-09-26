@@ -20,30 +20,18 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/lib/proxy.sh"
 . "$SCRIPT_DIR/lib/build_fixture_units.sh"
-BIN="${BIN:-$REPO_ROOT/bin}"
+ : "${BIN:?BIN must point to prepared products}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-c${BASHPID}}"
-E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
-if [ -z "${ZOT_BIN:-}" ]; then
-    ZOT_BIN="$(command -v zot || true)"
-fi
+: "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
+E2E_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
+ : "${ZOT_BIN:?ZOT_BIN must point to the prepared registry binary}"
 SW_NETNS="${SW_NETNS:-e2ec_${BASHPID}}"
 
 step() { echo "==> $*" >&2; }
-
-skip() {
-    echo >&2
-    echo "==> e2e_cluster_real: skipping ($*)" >&2
-    if [ "${REQUIRE_CLUSTER_REAL:-0}" = "1" ]; then
-        echo "REQUIRE_CLUSTER_REAL=1; failing" >&2
-        exit 1
-    fi
-    exit 0
-}
 
 fail() {
     echo "==> FAIL: $*" >&2
@@ -84,20 +72,19 @@ case "$CLUSTER_REAL_CASE" in
 esac
 
 for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl cloud-hypervisor; do
-    [ -x "$BIN/$b" ] || skip "missing $BIN/$b"
+    [ -x "$BIN/$b" ] || fail "missing $BIN/$b"
 done
-[ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
-[ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
-command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
-command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
-[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
-command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
-command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
-[ -d /run/systemd/system ] || skip "systemd not PID1"
-[ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
-docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
-    || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
+[ -f "$BIN/vmlinux" ] || fail "missing $BIN/vmlinux"
+[ -f "$BIN/sandbox-runtime.bundle" ] || fail "missing $BIN/sandbox-runtime.bundle"
+command -v python3 >/dev/null 2>&1 || fail "python3 not on PATH"
+command -v curl >/dev/null 2>&1 || fail "curl not on PATH"
+command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || fail "docker not usable"
+[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || fail "zot not found (set ZOT_BIN or install zot on PATH)"
+command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || fail "mkfs.erofs not found"
+command -v ip >/dev/null 2>&1 || fail "iproute2 (ip) not found"
+[ -d /run/systemd/system ] || fail "systemd not PID1"
+[ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm not available (rw)"
+docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || fail "prepared base image is missing: $E2E_IMAGE"
 
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
@@ -581,7 +568,7 @@ EOF
 
 make_ext4_templates() {
     MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
-    [ -x "$MKFS_EXT4" ] || skip "mkfs.ext4 not found"
+    [ -x "$MKFS_EXT4" ] || fail "mkfs.ext4 not found"
     OVL="$WORK/overlay-1G.ext4"
     truncate -s 1G "$OVL"
     "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs-overlay.log" 2>&1 || { cat "$WORK/mkfs-overlay.log"; fail "mkfs overlay"; }
