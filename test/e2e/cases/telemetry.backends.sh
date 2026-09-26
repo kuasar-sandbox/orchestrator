@@ -12,8 +12,10 @@ for tool in docker curl python3; do command -v "$tool" >/dev/null || { echo "mis
 docker info >/dev/null
 OUT="$WORK/backends"
 mkdir -p "$OUT"
-PROM="${TELEMETRY_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996}"
-CLICK="${TELEMETRY_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77}"
+: "${TELEMETRY_PROMETHEUS_IMAGE:?prepared Prometheus image is required}"
+: "${TELEMETRY_CLICKHOUSE_IMAGE:?prepared ClickHouse image is required}"
+PROM="$TELEMETRY_PROMETHEUS_IMAGE"
+CLICK="$TELEMETRY_CLICKHOUSE_IMAGE"
 docker image inspect "$PROM" "$CLICK" >"$OUT/images.json" || { echo "prepared telemetry backend images are required" >&2; exit 1; }
 PROM_ID=""; CLICK_ID=""; NET=""
 cleanup() {
