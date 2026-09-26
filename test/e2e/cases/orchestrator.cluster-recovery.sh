@@ -523,14 +523,8 @@ EOF
     wait_port "$ZOT_PORT" zot
 
     REF="127.0.0.1:$ZOT_PORT/e2e/cluster-real:v1"
-    if [ "${KUASAR_ARTIFACT_E2E:-0}" = 1 ]; then
-    : "${ORCHESTRATOR_BASE_IMAGE:?prepared orchestrator image is required}"
     docker image inspect "$ORCHESTRATOR_BASE_IMAGE" >/dev/null || fail "prepared base image is missing"
     docker tag "$ORCHESTRATOR_BASE_IMAGE" "$REF"
-else
-    bash "$SCRIPT_DIR/prepare_base_image.sh" "$E2E_IMAGE" "$REF" base >"$WORK/imgbuild.log" 2>&1 \
-        || { cat "$WORK/imgbuild.log"; fail "prepare e2b base fixture"; }
-fi
     TAGS+=("$REF")
     docker push "$REF" > >(tee "$WORK/push.log" >&2) 2>&1 || fail "docker push e2e image"
     step "store-ctl + zot up; seeded $REF"
