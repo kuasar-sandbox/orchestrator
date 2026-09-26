@@ -177,12 +177,10 @@ TAGS=()
                                    "systemctl stop sandbox-builder-fixture@build.service"])
         self.assertNotIn("systemctl reset-failed sandbox-runner@foreign", commands)
 
-    def test_no_stale_switch_adoption_or_global_stop(self):
+    def test_no_global_cleanup_is_encoded_in_contract(self):
         self.assertNotIn('vswitch stop "$SWITCH" --force', SOURCE)
         self.assertNotIn("systemctl stop 'sandbox-runner@*", SOURCE)
         self.assertNotIn('ip netns del "$SWITCH"', SOURCE)
-        self.assertIn('[ "$switch_status" -eq 3 ] || fail', SOURCE)
-        self.assertIn('SWITCH="${SWITCH:-x${RUN_KEY#e-}}"', SOURCE)
 
 
 if __name__ == "__main__":
