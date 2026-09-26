@@ -715,103 +715,165 @@ func TestRunPoolStartReportsPidDirectoryFailure(t *testing.T) {
 	}
 }
 
-func TestRunPoolAssignWithFenceRejectsIdleDisconnectedRun(t *testing.T) {
+func TestRunPoolAssignWithFenceRetiresIdleDisconnectedRunAndUsesReplacement(t *testing.T) {
 	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
-	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
-	committed := false
-	gotRunID, err := p.AssignWithFence(baseCtx, "task-without-session", func(got string) bool {
-		if got != runID {
-			t.Fatalf("fence runID = %q, want %q", got, runID)
-		}
-		return false
-	}, func(string) error {
-		committed = true
-		return nil
-	})
-	if err == nil || gotRunID != "" || !strings.Contains(err.Error(), "no active run session") {
-		t.Fatalf("AssignWithFence = %q, %v; want session fence error", gotRunID, err)
-	}
-	if committed {
-		t.Fatal("commit ran after failed session fence")
-	}
+	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Second)
+	defer cancel()
+	stale, waiter := addIdleRunForTest(t, p, lc, ctx)
+	assigned := make(chan runConsumeResp, 1)
+	var committed string
+	go func() {
+		id, err := p.AssignWithFence(ctx, "replacement-task", func(id string) bool { return id != stale }, func(id string) error { committed = id; return nil })
+		assigned <- runConsumeResp{runID: id, err: err}
+	}()
 	select {
 	case got := <-waiter.resp:
 		if got.err == nil || got.ok || got.taskID != "" || !strings.Contains(got.err.Error(), "no active run session") {
-			t.Fatalf("waiter after failed fence = %+v", got)
+			t.Fatalf("stale waiter = %+v", got)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("waiter did not receive failed fence response")
+	case <-ctx.Done():
+		t.Fatal("stale waiter was not retired")
 	}
 	select {
-	case stopped := <-lc.stopped:
-		if stopped != testRunUnit(runID) {
-			t.Fatalf("stopped unit = %q, want %q", stopped, testRunUnit(runID))
+	case unit := <-lc.stopped:
+		if unit != testRunUnit(stale) {
+			t.Fatalf("stopped %s, want stale %s", unit, stale)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("failed-fence run was not stopped")
+	case <-ctx.Done():
+		t.Fatal("disconnected idle unit was not stopped")
+	}
+	healthy, ready := addIdleRunForTest(t, p, lc, ctx)
+	select {
+	case got := <-assigned:
+		if got.err != nil || got.runID != healthy || committed != healthy {
+			t.Fatalf("replacement assignment = %+v, commit=%s, want %s", got, committed, healthy)
+		}
+	case <-ctx.Done():
+		t.Fatal("task did not receive replacement capacity")
+	}
+	select {
+	case got := <-ready.resp:
+		if !got.ok || got.err != nil || got.taskID != "replacement-task" {
+			t.Fatalf("replacement waiter = %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("replacement did not receive task")
 	}
 }
 
-func TestRunPoolAssignWithFenceRejectsPreWaitDisconnectedRun(t *testing.T) {
+func TestRunPoolAssignWithFenceRetiresPreWaitDisconnectedRunAndUsesLiveStart(t *testing.T) {
 	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
-	var runID string
+	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Second)
+	defer cancel()
+	var stale string
 	select {
 	case unit := <-lc.started:
-		runID = runIDFromTestUnit(unit)
-	case <-time.After(time.Second):
-		t.Fatal("runner unit was not started")
+		stale = runIDFromTestUnit(unit)
+	case <-ctx.Done():
+		t.Fatal("initial runner did not start")
 	}
-	assignDone := make(chan struct {
-		runID string
-		err   error
-	}, 1)
+	assigned := make(chan runConsumeResp, 1)
+	var committed string
+	go func() {
+		id, err := p.AssignWithFence(ctx, "pre-wait-task", func(id string) bool { return id != stale }, func(id string) error { committed = id; return nil })
+		assigned <- runConsumeResp{runID: id, err: err}
+	}()
+	// A demand start proves the consumer is pending before the stale runner
+	// sends its first WaitAssignment request.
+	var healthy string
+	select {
+	case unit := <-lc.started:
+		healthy = runIDFromTestUnit(unit)
+	case <-ctx.Done():
+		t.Fatal("demand start missing")
+	}
+	task, ok, err := p.WaitAssignment(ctx, stale)
+	if err == nil || ok || task != "" || !strings.Contains(err.Error(), "no active run session") {
+		t.Fatalf("stale first WaitAssignment = %q, %t, %v", task, ok, err)
+	}
+	task, ok, err = p.WaitAssignment(ctx, healthy)
+	if err != nil || !ok || task != "pre-wait-task" {
+		t.Fatalf("healthy first WaitAssignment = %q, %t, %v", task, ok, err)
+	}
+	select {
+	case got := <-assigned:
+		if got.err != nil || got.runID != healthy || committed != healthy {
+			t.Fatalf("pre-wait assignment = %+v, commit=%s, want %s", got, committed, healthy)
+		}
+	case <-ctx.Done():
+		t.Fatal("pre-wait task was not assigned to live capacity")
+	}
+}
+
+func TestRunPoolAssignWithFenceCancellationAfterIdleSessionLoss(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+	stale, waiter := addIdleRunForTest(t, p, lc, ctx)
+	assigned := make(chan runConsumeResp, 1)
 	committed := false
 	go func() {
-		got, err := p.AssignWithFence(baseCtx, "pre-wait-task", func(got string) bool {
-			if got != runID {
-				t.Errorf("fence runID = %q, want %q", got, runID)
-			}
-			return false
-		}, func(string) error {
-			committed = true
+		id, err := p.AssignWithFence(ctx, "cancel-after-session-loss", func(id string) bool { return id != stale }, func(string) error { committed = true; return nil })
+		assigned <- runConsumeResp{runID: id, err: err}
+	}()
+	select {
+	case got := <-waiter.resp:
+		if got.err == nil || got.ok || got.taskID != "" {
+			t.Fatalf("stale waiter = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale waiter was not retired")
+	}
+	cancel()
+	select {
+	case got := <-assigned:
+		if !errors.Is(got.err, context.Canceled) || got.runID != "" || committed {
+			t.Fatalf("assignment after cancellation = %+v, committed=%t", got, committed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not complete the preserved request")
+	}
+}
+
+func TestRunPoolAssignWithFencePreservesFiniteReplacementStartFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lc := newRunPoolTestLauncher()
+	starts := 0 // Only the pool's serialized unit-control worker calls Start.
+	lc.startFn = func(ctx context.Context, unit string) error {
+		starts++
+		if starts == 1 {
+			lc.started <- unit
 			return nil
-		})
-		assignDone <- struct {
-			runID string
-			err   error
-		}{got, err}
-	}()
-	waitDone := make(chan runWaitResp, 1)
-	go func() {
-		taskID, ok, err := p.WaitAssignment(baseCtx, runID)
-		waitDone <- runWaitResp{taskID: taskID, ok: ok, err: err}
-	}()
-	select {
-	case res := <-assignDone:
-		if res.err == nil || res.runID != "" || !strings.Contains(res.err.Error(), "no active run session") {
-			t.Fatalf("AssignWithFence pre-wait = %+v, want session fence error", res)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("assignment did not fail at pre-wait fence")
-	}
-	if committed {
-		t.Fatal("commit ran after pre-wait failed session fence")
-	}
-	select {
-	case got := <-waitDone:
-		if got.err == nil || got.ok || got.taskID != "" || !strings.Contains(got.err.Error(), "no active run session") {
-			t.Fatalf("WaitAssignment after pre-wait failed fence = %+v", got)
+		if starts <= 3 {
+			return errors.New("replacement-start-failed")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("WaitAssignment did not receive failed fence response")
+		// Stop background refill from spinning while the original finite wave's
+		// error is delivered. These later starts must not prolong that consumer.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	p := newRunPool(runKindSandbox, 1, time.Second, t.TempDir(), lc, testRunUnit, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stale, waiter := addIdleRunForTest(t, p, lc, ctx)
+	committed := false
+	got, err := p.AssignWithFence(ctx, "finite-replacement-wave", func(id string) bool { return id != stale }, func(string) error { committed = true; return nil })
+	if err == nil || !strings.Contains(err.Error(), "replacement-start-failed") || got != "" || committed {
+		t.Fatalf("replacement wave = %q, %v, committed=%t", got, err, committed)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("replacement start failure was delayed until caller deadline")
 	}
 	select {
-	case stopped := <-lc.stopped:
-		if stopped != testRunUnit(runID) {
-			t.Fatalf("stopped unit = %q, want %q", stopped, testRunUnit(runID))
+	case result := <-waiter.resp:
+		if result.ok || result.err == nil || result.taskID != "" {
+			t.Fatalf("stale waiter = %+v", result)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("pre-wait failed-fence run was not stopped")
+	case <-ctx.Done():
+		t.Fatal("stale waiter was not rejected")
 	}
 }
 
@@ -919,5 +981,47 @@ func TestRunPoolRetireWinsBeforeAssignmentAndFenceCanVeto(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("retired unit was not stopped")
+	}
+}
+
+func TestRunPoolAssignWithFenceSkipsDisconnectedIdleBeforeHealthyCapacity(t *testing.T) {
+	for _, kind := range []string{runKindSandbox, runKindBuild} {
+		t.Run(kind, func(t *testing.T) {
+			lc := newRunPoolTestLauncher()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			p := newRunPool(kind, 2, time.Second, t.TempDir(), lc, testRunUnit, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err := p.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			stale, staleWait := addIdleRunForTest(t, p, lc, ctx)
+			healthy, healthyWait := addIdleRunForTest(t, p, lc, ctx)
+			var commits []string
+			// Model the real fence between session removal and the queued idle-retire
+			// event: the first waiter still exists, but only the next runner has a session.
+			got, err := p.AssignWithFence(ctx, "healthy-request", func(id string) bool { return id == healthy }, func(id string) error { commits = append(commits, id); return nil })
+			if err != nil || got != healthy {
+				t.Fatalf("stale idle %s rejected an unrelated request despite live idle %s: got %q, err %v; commits %v", stale, healthy, got, err, commits)
+			}
+			if len(commits) != 1 || commits[0] != healthy {
+				t.Fatalf("wrong durable handoff: %v", commits)
+			}
+			select {
+			case r := <-staleWait.resp:
+				if r.ok || r.taskID != "" || r.err == nil {
+					t.Fatalf("stale runner received work: %+v", r)
+				}
+			case <-ctx.Done():
+				t.Fatal("stale waiter was not retired")
+			}
+			select {
+			case r := <-healthyWait.resp:
+				if !r.ok || r.taskID != "healthy-request" || r.err != nil {
+					t.Fatalf("healthy handoff: %+v", r)
+				}
+			case <-ctx.Done():
+				t.Fatal("healthy waiter did not receive task")
+			}
+		})
 	}
 }

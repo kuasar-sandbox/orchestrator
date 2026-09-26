@@ -337,7 +337,12 @@ func (p *runPool) loop(ctx context.Context) {
 				err := fmt.Errorf("run pool: run %s has no active run session", w.runID)
 				replyWait(w.req, runWaitResp{err: err})
 				queueControl(runControlReq{op: "stop", runID: w.runID})
-				replyConsume(req, runConsumeResp{err: err})
+				// Losing an idle session retires that runner, not the task
+				// waiting for capacity. Preserve FIFO order and replenish the
+				// waiting requests' start wave; subsequent unit-start failures
+				// still use the existing finite-wave/cancellation handling.
+				pending = append([]*runConsumeReq{req}, pending...)
+				addStartAttempts(pending, ensure())
 				continue
 			}
 			if err := req.commit(w.runID); err != nil {
