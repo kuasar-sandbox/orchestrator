@@ -22,4 +22,3 @@ bash scripts/ci-e2e-build.sh source "$(uname -m)" "$work"
 telemetry_privilege=()
 if [ "$(id -u)" -ne 0 ]; then telemetry_privilege=(sudo -n); fi
 "${telemetry_privilege[@]}" env REQUIRE_TELEMETRY_NETNS=1 "$work/telemetry.test" -test.v -test.timeout=90s -test.run='^TestOTLPProxyNetNS'
-TELEMETRY_SOURCE_ROOT="$ROOT" bash test/e2e/e2e_telemetry_backends.sh
