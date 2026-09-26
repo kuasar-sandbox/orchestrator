@@ -28,15 +28,17 @@ type runPool struct {
 	controlCh       chan runControlReq
 	consumeCancelCh chan *runConsumeReq
 	waitCancelCh    chan *runWaitReq
+	retireCh        chan *runRetireReq
 	done            chan struct{}
 }
 
 type runConsumeReq struct {
-	taskID     string
-	ctx        context.Context
-	commit     func(runID string) error
-	resp       chan runConsumeResp
-	stopCancel func() bool
+	taskID       string
+	ctx          context.Context
+	commit       func(runID string) error
+	sessionFence func(runID string) bool
+	resp         chan runConsumeResp
+	stopCancel   func() bool
 	// startAttempts is the finite wave of already in-flight or demand-created
 	// units that may satisfy this request. Replacements created after a failed
 	// wave can still win the race and become idle, but they do not extend the
@@ -73,6 +75,19 @@ type runControlReq struct {
 	runID string
 }
 
+type runRetireReq struct {
+	runID string
+	ctx   context.Context
+	fence func(context.Context) (bool, error)
+	resp  chan runRetireResp
+}
+
+type runRetireResp struct {
+	unit    string
+	retired bool
+	err     error
+}
+
 type idleRun struct {
 	runID string
 	req   *runWaitReq
@@ -87,6 +102,7 @@ func newRunPool(kind string, size int, waitTimeout time.Duration, runRoot string
 		controlCh:       make(chan runControlReq),
 		consumeCancelCh: make(chan *runConsumeReq, 128),
 		waitCancelCh:    make(chan *runWaitReq, 128),
+		retireCh:        make(chan *runRetireReq),
 		done:            make(chan struct{}),
 	}
 }
@@ -105,10 +121,14 @@ func (p *runPool) Start(ctx context.Context) error {
 }
 
 func (p *runPool) Assign(ctx context.Context, taskID string, commit func(runID string) error) (string, error) {
+	return p.AssignWithFence(ctx, taskID, nil, commit)
+}
+
+func (p *runPool) AssignWithFence(ctx context.Context, taskID string, sessionFence func(runID string) bool, commit func(runID string) error) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, resp: make(chan runConsumeResp, 1)}
+	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, sessionFence: sessionFence, resp: make(chan runConsumeResp, 1)}
 	select {
 	case p.consumeCh <- req:
 	case <-ctx.Done():
@@ -136,6 +156,22 @@ func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, boo
 	}
 	res := <-req.resp
 	return res.taskID, res.ok, res.err
+}
+
+func (p *runPool) RetireUnassigned(ctx context.Context, runID string, fence func(context.Context) (bool, error)) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	req := &runRetireReq{runID: runID, ctx: ctx, fence: fence, resp: make(chan runRetireResp, 1)}
+	select {
+	case p.retireCh <- req:
+	case <-ctx.Done():
+		return "", false, ctx.Err()
+	case <-p.done:
+		return "", false, fmt.Errorf("run pool: stopped")
+	}
+	res := <-req.resp
+	return res.unit, res.retired, res.err
 }
 
 func (p *runPool) loop(ctx context.Context) {
@@ -170,6 +206,9 @@ func (p *runPool) loop(ctx context.Context) {
 		if req.stopCancel != nil {
 			req.stopCancel()
 		}
+		req.resp <- resp
+	}
+	replyRetire := func(req *runRetireReq, resp runRetireResp) {
 		req.resp <- resp
 	}
 
@@ -292,6 +331,18 @@ func (p *runPool) loop(ctx context.Context) {
 			if err := req.ctx.Err(); err != nil {
 				replyConsume(req, runConsumeResp{err: err})
 				idle = append([]idleRun{w}, idle...)
+				continue
+			}
+			if req.sessionFence != nil && !req.sessionFence(w.runID) {
+				err := fmt.Errorf("run pool: run %s has no active run session", w.runID)
+				replyWait(w.req, runWaitResp{err: err})
+				queueControl(runControlReq{op: "stop", runID: w.runID})
+				// Losing an idle session retires that runner, not the task
+				// waiting for capacity. Preserve FIFO order and replenish the
+				// waiting requests' start wave; subsequent unit-start failures
+				// still use the existing finite-wave/cancellation handling.
+				pending = append([]*runConsumeReq{req}, pending...)
+				addStartAttempts(pending, ensure())
 				continue
 			}
 			if err := req.commit(w.runID); err != nil {
@@ -417,6 +468,35 @@ func (p *runPool) loop(ctx context.Context) {
 			removeStartAttempt(req.runID, nil)
 			failExhausted()
 			trimIdle()
+			ensure()
+		case req := <-p.retireCh:
+			if err := req.ctx.Err(); err != nil {
+				replyRetire(req, runRetireResp{err: err})
+				continue
+			}
+			idx := -1
+			for i, waiting := range idle {
+				if waiting.runID == req.runID {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				replyRetire(req, runRetireResp{})
+				continue
+			}
+			if req.fence != nil {
+				ok, err := req.fence(req.ctx)
+				if err != nil || !ok {
+					replyRetire(req, runRetireResp{err: err})
+					continue
+				}
+			}
+			w := idle[idx]
+			idle = slices.Delete(idle, idx, idx+1)
+			replyWait(w.req, runWaitResp{err: fmt.Errorf("run pool: idle session disconnected")})
+			queueControl(runControlReq{op: "stop", runID: w.runID})
+			replyRetire(req, runRetireResp{unit: p.unitName(w.runID), retired: true})
 			ensure()
 		case req := <-p.consumeCancelCh:
 			for i, pendingReq := range pending {

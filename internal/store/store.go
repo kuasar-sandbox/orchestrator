@@ -67,7 +67,9 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   metadata_json        TEXT NOT NULL DEFAULT '{}',
   env_json             TEXT NOT NULL DEFAULT '{}',
   created_unix         INTEGER NOT NULL,
-  dead_unix            INTEGER NOT NULL DEFAULT 0
+  dead_unix            INTEGER NOT NULL DEFAULT 0,
+  sandbox_result_run_id TEXT NOT NULL DEFAULT '',
+  sandbox_result_json   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_ashash ON sandboxes(api_secret_hash);
@@ -227,6 +229,14 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureColumn(ctx, db, "sandboxes", "sandbox_result_run_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "sandboxes", "sandbox_result_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	for _, column := range []string{"cancel_requested_unix", "delete_requested_unix"} {
 		if err := ensureColumn(ctx, db, "builds", column, "INTEGER NOT NULL DEFAULT 0"); err != nil {
 			db.Close()
@@ -319,6 +329,14 @@ var (
 	// ErrSandboxExists means an insert-only sandbox write found an existing
 	// record with the same ID. The existing row is retained unchanged.
 	ErrSandboxExists = errors.New("store: sandbox already exists")
+
+	// ErrSandboxExecutionOwnership means a sandbox result or replay does not match
+	// the row's current exact RunID owner.
+	ErrSandboxExecutionOwnership = errors.New("store: sandbox execution ownership changed")
+
+	// ErrSandboxResultConflict means a different result was already accepted for
+	// the same sandbox row. The existing result is retained.
+	ErrSandboxResultConflict = errors.New("store: sandbox result conflicts with accepted result")
 
 	// ErrKeyPairConflict means an API-secret fingerprint is already bound to
 	// different API-secret or manifest-key material. The existing row is retained.
@@ -416,6 +434,56 @@ func ujs(s string) []string {
 	return v
 }
 
+func sandboxExecutionResultJSON(result *types.SandboxExecutionResult) (string, error) {
+	if result == nil {
+		return "", nil
+	}
+	if err := validateSandboxExecutionResult(result); err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("store: encode sandbox execution result: %w", err)
+	}
+	return string(b), nil
+}
+
+func parseSandboxExecutionResult(raw string) (*types.SandboxExecutionResult, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var result types.SandboxExecutionResult
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, fmt.Errorf("store: decode sandbox execution result: %w", err)
+	}
+	if err := validateSandboxExecutionResult(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func validateSandboxExecutionResult(result *types.SandboxExecutionResult) error {
+	if result == nil {
+		return nil
+	}
+	if result.SID == "" || result.RunID == "" {
+		return errors.New("store: sandbox execution result requires sid and run id")
+	}
+	if !result.Stage.Valid() {
+		return fmt.Errorf("store: sandbox execution result has invalid stage %q", result.Stage)
+	}
+	if result.ExitCode != nil && (*result.ExitCode < 0 || *result.ExitCode > 255) {
+		return fmt.Errorf("store: sandbox execution result has invalid exit code %d", *result.ExitCode)
+	}
+	if len(result.Signal) > 32 {
+		return errors.New("store: sandbox execution result signal is too long")
+	}
+	if len(result.Error) > 1024 {
+		return errors.New("store: sandbox execution result error is too long")
+	}
+	return nil
+}
+
 func mb(o types.BuildOptions) string {
 	b, _ := json.Marshal(o)
 	if len(b) == 0 || string(b) == "null" {
@@ -444,8 +512,9 @@ const sandboxInsertSQL = `
 	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
 	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,launch_mode,
-	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,
+	  sandbox_result_run_id,sandbox_result_json)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -456,7 +525,8 @@ ON CONFLICT(id) DO UPDATE SET
   resume_source_kind=excluded.resume_source_kind, resume_source_ref=excluded.resume_source_ref, resume_sandbox_ref=excluded.resume_sandbox_ref,
   auto_pause_memory=excluded.auto_pause_memory, launch_mode=excluded.launch_mode,
   metadata_json=excluded.metadata_json, env_json=excluded.env_json,
-  dead_unix=excluded.dead_unix`
+  dead_unix=excluded.dead_unix, sandbox_result_run_id=excluded.sandbox_result_run_id,
+  sandbox_result_json=excluded.sandbox_result_json`
 
 const sandboxInsertOnlySQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO NOTHING`
@@ -505,13 +575,21 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encrypt forward access token: %w", err)
 	}
+	resultJSON, err := sandboxExecutionResultJSON(sb.ExecutionResult)
+	if err != nil {
+		return nil, err
+	}
+	resultRunID := ""
+	if sb.ExecutionResult != nil {
+		resultRunID = sb.ExecutionResult.RunID
+	}
 	return []any{
 		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.StableIDValue,
 		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc,
 		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.AutoPauseMemory, string(sb.LaunchMode),
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
-		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix,
+		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix, resultRunID, resultJSON,
 	}, nil
 }
 
@@ -656,7 +734,8 @@ func (s *Store) BeginResume(
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
-		   SET state=?, deadline_unix=?, launch_mode=?, run_dir=?, envd_uds=?, ci_uds=?
+		   SET state=?, deadline_unix=?, launch_mode=?, run_dir=?, envd_uds=?, ci_uds=?,
+		       sandbox_result_run_id='', sandbox_result_json=''
 		 WHERE id=? AND state=?
 		   AND run_id='' AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
 		   AND run_dir='' AND envd_uds='' AND ci_uds=''
@@ -729,6 +808,71 @@ func (s *Store) StartingTaskIdentity(ctx context.Context, id, runID string) (run
 	return runDir, true, nil
 }
 
+// GetSandboxIDByCurrentRunID resolves any current durable sandbox owner for
+// reconnect/disconnect handling. Unlike assignment replay, this includes rows
+// after starting has committed to running and cleanup states that still own the
+// exact runner. Dead rows retain only diagnostic result data and intentionally do
+// not count as current ownership.
+func (s *Store) GetSandboxIDByCurrentRunID(ctx context.Context, runID string) (string, bool, error) {
+	if runID == "" {
+		return "", false, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM sandboxes
+		 WHERE run_id=? AND state IN (?,?,?,?)`,
+		runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePaused), string(types.StateDeleting))
+	if err != nil {
+		return "", false, fmt.Errorf("store: find current sandbox by run id %s: %w", runID, err)
+	}
+	defer rows.Close()
+	var found string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", false, fmt.Errorf("store: scan current sandbox by run id %s: %w", runID, err)
+		}
+		if found != "" {
+			return "", false, fmt.Errorf("store: multiple current sandboxes claim run id %s", runID)
+		}
+		found = id
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("store: scan current sandbox by run id %s: %w", runID, err)
+	}
+	return found, found != "", nil
+}
+
+// GetClaimedSandboxIDByRunID resolves an already-published sandbox assignment
+// after the assignment response was lost. It returns only live starting rows
+// that have not accepted an execution result for that exact run.
+func (s *Store) GetClaimedSandboxIDByRunID(ctx context.Context, runID string) (string, bool, error) {
+	if runID == "" {
+		return "", false, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM sandboxes
+		 WHERE run_id=? AND state=? AND sandbox_result_run_id=''`, runID, string(types.StateStarting))
+	if err != nil {
+		return "", false, fmt.Errorf("store: find sandbox by run id %s: %w", runID, err)
+	}
+	defer rows.Close()
+	var found string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", false, fmt.Errorf("store: scan sandbox by run id %s: %w", runID, err)
+		}
+		if found != "" {
+			return "", false, fmt.Errorf("store: multiple sandboxes claim run id %s", runID)
+		}
+		found = id
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("store: scan sandbox by run id %s: %w", runID, err)
+	}
+	return found, found != "", nil
+}
+
 // BindStartingRunner is the runner-pool commit fence. It succeeds exactly once
 // while the accepted launch still owns an unassigned starting row.
 func (s *Store) BindStartingRunner(ctx context.Context, id, runID string) (bool, error) {
@@ -774,7 +918,7 @@ func (s *Store) CommitStartingRunning(ctx context.Context, id, runID string) (bo
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes SET state=?, launch_mode=''
-		 WHERE id=? AND state=? AND run_id=?
+		 WHERE id=? AND state=? AND run_id=? AND sandbox_result_run_id=''
 		   AND ((launch_mode='image' AND resume_source_kind='' AND resume_source_ref='' AND resume_sandbox_ref='') OR
 		        (resume_source_ref<>'' AND ((resume_source_kind='snapshot' AND resume_sandbox_ref<>'') OR
 		                                   (resume_source_kind='sandbox' AND resume_sandbox_ref=''))))`,
@@ -806,6 +950,7 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes SET state=?, launch_mode='', resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?
 		 WHERE id=? AND state=? AND run_id=? AND launch_mode=? AND template_id=? AND created_unix=?
+		   AND sandbox_result_run_id=''
 		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=?`,
 		string(types.StateRunning), string(source.Kind), source.Ref, source.SandboxRef,
 		expected.ID, string(types.StateStarting), expected.RunID, string(expected.LaunchMode), expected.TemplateID, expected.CreatedUnix,
@@ -819,6 +964,66 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 // CommitRunningPaused publishes a completed artifact only while the exact
 // runner that produced it still owns a running row. State and resume source are
 // one atomic update so readers can never observe a partially committed pause.
+// AcceptSandboxExecutionResult durably records the exact runner result before
+// lifecycle cleanup. Identical replays are idempotent, including after a later
+// dead commit clears current run ownership but retains diagnostic result data.
+func (s *Store) AcceptSandboxExecutionResult(ctx context.Context, id, runID string, result types.SandboxExecutionResult) (bool, error) {
+	if id == "" || runID == "" || result.SID != id || result.RunID != runID {
+		return false, ErrSandboxExecutionOwnership
+	}
+	encoded, err := sandboxExecutionResultJSON(&result)
+	if err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: accept sandbox result %s: %w", id, err)
+	}
+	defer tx.Rollback()
+
+	var state, currentRunID, acceptedRunID, acceptedJSON string
+	err = tx.QueryRowContext(ctx, `
+		SELECT state, run_id, sandbox_result_run_id, sandbox_result_json
+		  FROM sandboxes WHERE id=?`, id).Scan(&state, &currentRunID, &acceptedRunID, &acceptedJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrSandboxExecutionOwnership
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: accept sandbox result %s: %w", id, err)
+	}
+	if acceptedRunID != "" {
+		if acceptedRunID == runID && acceptedJSON == encoded {
+			if err := tx.Commit(); err != nil {
+				return false, fmt.Errorf("store: replay sandbox result %s: %w", id, err)
+			}
+			return false, nil
+		}
+		return false, ErrSandboxResultConflict
+	}
+	if currentRunID != runID || (state != string(types.StateStarting) && state != string(types.StateRunning)) {
+		return false, ErrSandboxExecutionOwnership
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET sandbox_result_run_id=?, sandbox_result_json=?
+		 WHERE id=? AND run_id=? AND sandbox_result_run_id=''
+		   AND state IN (?,?)`, runID, encoded, id, runID, string(types.StateStarting), string(types.StateRunning))
+	if err != nil {
+		return false, fmt.Errorf("store: accept sandbox result %s: %w", id, err)
+	}
+	changed, err := sandboxUpdateChanged("accept sandbox result", id, res)
+	if err != nil || !changed {
+		if err != nil {
+			return false, err
+		}
+		return false, ErrSandboxExecutionOwnership
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: accept sandbox result %s: %w", id, err)
+	}
+	return true, nil
+}
+
 func (s *Store) CommitRunningPaused(ctx context.Context, id, runID string, source types.ResumeSource) (bool, error) {
 	if !source.Valid() {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: invalid resume source", id)
@@ -913,6 +1118,31 @@ func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool
 		return false, fmt.Errorf("store: begin sandbox delete %s: %w", sb.ID, err)
 	}
 	return sandboxUpdateChanged("begin delete", sb.ID, result)
+}
+
+// ClearRunningNetwork records that the exact running Sandbox incarnation no
+// longer owns its connector port after physical detach. Every derived network
+// field is cleared in the same full-owner CAS so a stale result finalizer cannot
+// clear a successor's port.
+func (s *Store) ClearRunningNetwork(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.ID == "" || sb.State != types.StateRunning || sb.VswitchPort == "" {
+		return false, errors.New("store: clear running network requires a running sandbox with a port")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET floatingip='', vswitch_port='', inner_ip='', port_mac=''
+		 WHERE id=? AND state=? AND launch_mode=?
+		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
+		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
+		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=?`,
+		sb.ID, string(types.StateRunning), string(sb.LaunchMode),
+		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
+		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix)
+	if err != nil {
+		return false, fmt.Errorf("store: clear running network sandbox %s: %w", sb.ID, err)
+	}
+	return sandboxUpdateChanged("clear running network", sb.ID, result)
 }
 
 // ClearDeletingNetwork records that the exact deleting Sandbox incarnation no
@@ -1032,12 +1262,12 @@ func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (
 var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,launch_mode,
-  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix`
+  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
 	var profile, clusterGroup, clusterRouteKey, st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
-	var resumeSourceKind, launchMode string
+	var resumeSourceKind, launchMode, sandboxResultRunID, sandboxResultJSON string
 	var autoPauseMemory bool
 	var serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc string
 	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.StableIDValue,
@@ -1046,7 +1276,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc,
 		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
-		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix); err != nil {
+		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON); err != nil {
 		return nil, err
 	}
 	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
@@ -1092,6 +1322,14 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		return nil, fmt.Errorf("store: sandbox %s has invalid lifecycle state: %w", sb.ID, err)
 	}
 	sb.Metadata, sb.Env = uj(meta), uj(env)
+	result, err := parseSandboxExecutionResult(sandboxResultJSON)
+	if err != nil {
+		return nil, fmt.Errorf("store: sandbox %s has corrupt execution result: %w", sb.ID, err)
+	}
+	if result != nil && result.RunID != sandboxResultRunID {
+		return nil, fmt.Errorf("store: sandbox %s execution result run id mismatch", sb.ID)
+	}
+	sb.ExecutionResult = result
 	return &sb, nil
 }
 

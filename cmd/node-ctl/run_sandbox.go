@@ -12,13 +12,13 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"golang.org/x/sys/unix"
 )
 
 // runSandbox is the ExecStart of sandbox-runner@<run-id>.service: it waits until
 // the run-id is assigned a sandbox id, fetches that sandbox's LaunchSpec over the
-// config-socket, and exec-replaces into sandbox-ctl.
+// config-socket, starts sandbox-ctl as its direct child, waits once, and reports
+// the bounded child result before exiting.
 //
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 func runSandbox(args []string, log *slog.Logger) error {
@@ -34,11 +34,11 @@ func runSandbox(args []string, log *slog.Logger) error {
 		return fmt.Errorf("run-sandbox: --pidfile, --config-socket, and --run-id required")
 	}
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
-		lockPidfile:     lockPidfile,
-		lockTaskPidfile: lockPidfile,
-		prepareCgroup:   func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
-		waitAssignment:  configsock.WaitAssignment,
-		connectReady:    connectReadinessSocket,
+		lockPidfile:    lockPidfile,
+		prepareCgroup:  func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
+		openSession:    openRunSessionKeeper,
+		waitAssignment: configsock.WaitAssignment,
+		connectReady:   connectReadinessSocket,
 		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
@@ -47,13 +47,19 @@ func runSandbox(args []string, log *slog.Logger) error {
 	})
 }
 
+type runSessionCloser interface{ Close() error }
+
+func openRunSessionKeeper(ctx context.Context, socket, kind, runID string) (runSessionCloser, error) {
+	return configsock.OpenRunSessionKeeper(ctx, socket, kind, runID)
+}
+
 type runSandboxOps struct {
-	lockPidfile     func(string) error
-	lockTaskPidfile func(string) error
-	prepareCgroup   func() (*os.File, error)
-	waitAssignment  func(context.Context, string, string, string) (string, error)
-	connectReady    func(string) (*os.File, error)
-	launchTask      func(string, string, string, *os.File, *os.File) error
+	lockPidfile    func(string) error
+	prepareCgroup  func() (*os.File, error)
+	openSession    func(context.Context, string, string, string) (runSessionCloser, error)
+	waitAssignment func(context.Context, string, string, string) (string, error)
+	connectReady   func(string) (*os.File, error)
+	launchTask     func(string, string, string, *os.File, *os.File) error
 }
 
 func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error {
@@ -65,6 +71,13 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 		return fmt.Errorf("prepare runner cgroup: %w", err)
 	}
 	defer vmmCgroup.Close()
+	if ops.openSession != nil {
+		session, err := ops.openSession(context.Background(), socket, "sandbox", runID)
+		if err != nil {
+			return fmt.Errorf("open run session: %w", err)
+		}
+		defer session.Close()
+	}
 	sid, err := ops.waitAssignment(context.Background(), socket, "sandbox", runID)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
@@ -74,17 +87,10 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	if err != nil {
 		return fmt.Errorf("connect readiness socket: %w", err)
 	}
-	// The connection owns the bridge until exec succeeds. Any pidfile, config,
-	// chdir, argv, or exec failure returns through this defer and turns into EOF
+	// The connection owns the bridge until child Start consumes it. Any config,
+	// chdir, argv, or Start failure returns through this defer and turns into EOF
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
-	taskPidfile := filepath.Join(nodepath.SandboxRunDir(runRoot, sid), sid+".pid")
-	if ops.lockTaskPidfile == nil {
-		return fmt.Errorf("sandbox task pidfile locker is not configured")
-	}
-	if err := ops.lockTaskPidfile(taskPidfile); err != nil {
-		return fmt.Errorf("lock sandbox task pidfile: %w", err)
-	}
 	return ops.launchTask(socket, sid, runID, ready, vmmCgroup)
 }
 
@@ -99,7 +105,8 @@ func connectReadinessSocket(path string) (*os.File, error) {
 		return nil, err
 	}
 	// File returns a duplicate. Keep it close-on-exec throughout every fallible
-	// pre-exec step; launchTask clears the bit only for the final sandbox-ctl exec.
+	// preparation step. sandboxproc.Start explicitly passes the child copy;
+	// the parent descriptor never needs to become inheritable.
 	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
 	if err != nil {
 		_ = f.Close()

@@ -314,6 +314,19 @@ func (g *launchGroup) Cancel(sid string) {
 	}
 }
 
+// CancelExact never redirects a delayed cancellation to a same-SID successor.
+// Callers establish the durable RunID boundary separately under lifecycle.
+func (g *launchGroup) CancelExact(expected *launchAttempt) {
+	if expected == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.m[expected.sid] == expected {
+		expected.cancel()
+	}
+}
+
 // Drain waits until every claimed launch has completed terminal publication
 // and cleanup. Callers must first cancel the lifecycle root so no new attempt
 // can be admitted while shutdown is draining the current set.

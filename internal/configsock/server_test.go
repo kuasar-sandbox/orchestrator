@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +39,34 @@ type stubProvider struct {
 	buildAuthHits   *atomic.Int32
 	buildSpecHits   *atomic.Int32
 	buildPrepHits   *atomic.Int32
+	sessions        *stubRunSessionRegistry
+}
+
+type stubRunSessionRegistry struct {
+	mu         sync.Mutex
+	registered []RunSessionRequest
+	closed     []bool
+	closeCh    chan bool
+}
+
+type stubRunSession struct {
+	registry *stubRunSessionRegistry
+}
+
+func (s *stubRunSession) Close(shutdown bool) {
+	if s == nil || s.registry == nil {
+		return
+	}
+	s.registry.mu.Lock()
+	s.registry.closed = append(s.registry.closed, shutdown)
+	ch := s.registry.closeCh
+	s.registry.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- shutdown:
+		default:
+		}
+	}
 }
 
 func (s stubProvider) SandboxTaskAuth(_ context.Context, sandboxID, runID string) (SandboxTaskAuth, bool, error) {
@@ -129,6 +158,21 @@ func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
 	return "", false
 }
 
+func (s stubProvider) RegisterRunSession(_ context.Context, kind, runID string) (RunSessionRegistration, bool, error) {
+	if kind != "sandbox" && kind != "build" {
+		return nil, false, nil
+	}
+	if (kind == "sandbox" && runID != "sr-test") || (kind == "build" && runID != "br-test") {
+		return nil, false, nil
+	}
+	if s.sessions != nil {
+		s.sessions.mu.Lock()
+		s.sessions.registered = append(s.sessions.registered, RunSessionRequest{Kind: kind, RunID: runID})
+		s.sessions.mu.Unlock()
+	}
+	return &stubRunSession{registry: s.sessions}, true, nil
+}
+
 func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (string, bool, error) {
 	if s.assignmentErr != nil {
 		return "", false, s.assignmentErr
@@ -140,6 +184,16 @@ func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (str
 		return "x", true, nil
 	}
 	return "", false, nil
+}
+
+func (s stubProvider) PostSandboxResult(_ context.Context, runID, sandboxID string, _ SandboxExecutionResult) error {
+	if s.resultErr != nil {
+		return s.resultErr
+	}
+	if runID == "sr-test" && sandboxID == "x" {
+		return nil
+	}
+	return os.ErrNotExist
 }
 
 func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, _ BuildResult) error {
@@ -225,18 +279,25 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 
 func startTestServer(t *testing.T, deps Deps) (string, *http.Client) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "ctl.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = New(sock, deps, discardLogger()).Serve(ctx) }()
+	sock, client, _ := startTestServerWithContext(t, ctx, deps)
+	return sock, client
+}
+
+func startTestServerWithContext(t *testing.T, ctx context.Context, deps Deps) (string, *http.Client, <-chan error) {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "ctl.sock")
+	done := make(chan error, 1)
+	go func() { done <- New(sock, deps, discardLogger()).Serve(ctx) }()
 	for range 400 { // wait for ListenUnix + chmod to publish the socket
 		if _, err := os.Stat(sock); err == nil {
-			return sock, HTTPClient(sock)
+			return sock, HTTPClient(sock), done
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("server did not bind")
-	return "", nil
+	return "", nil, done
 }
 
 func mustWrite(t *testing.T, path, content string) {
@@ -683,6 +744,83 @@ func TestBuildRetryClassification(t *testing.T) {
 	}
 }
 
+func TestRunSessionFlushesAckAndClosesOnClientDisconnect(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	registry := &stubRunSessionRegistry{closeCh: make(chan bool, 1)}
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, sessions: registry}})
+	session, err := OpenRunSession(context.Background(), sock, "sandbox", "sr-test")
+	if err != nil {
+		t.Fatalf("OpenRunSession: %v", err)
+	}
+	registry.mu.Lock()
+	registered := append([]RunSessionRequest(nil), registry.registered...)
+	registry.mu.Unlock()
+	if len(registered) != 1 || registered[0].Kind != "sandbox" || registered[0].RunID != "sr-test" {
+		t.Fatalf("registered sessions = %+v", registered)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	select {
+	case shutdown := <-registry.closeCh:
+		if shutdown {
+			t.Fatal("client disconnect was reported as shutdown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session close did not reach provider")
+	}
+}
+
+func TestRunSessionAuthenticatesBeforeRegistration(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	registry := &stubRunSessionRegistry{}
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, sessions: registry}})
+	if _, err := OpenRunSession(context.Background(), sock, "sandbox", "sr-test"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("unauthorized session error = %v", err)
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.registered) != 0 {
+		t.Fatalf("unauthorized session reached provider: %+v", registry.registered)
+	}
+}
+
+func TestRunSessionShutdownCloseIsSuppressed(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	registry := &stubRunSessionRegistry{closeCh: make(chan bool, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	sock, _, done := startTestServerWithContext(t, ctx, Deps{Provider: stubProvider{pidFile: pf, sessions: registry}})
+	session, err := OpenRunSession(context.Background(), sock, "sandbox", "sr-test")
+	if err != nil {
+		t.Fatalf("OpenRunSession: %v", err)
+	}
+	cancel()
+	select {
+	case shutdown := <-registry.closeCh:
+		if !shutdown {
+			t.Fatal("server shutdown was reported as ordinary disconnect")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not close long run session")
+	}
+	select {
+	case <-session.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client session did not observe shutdown")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after cancel")
+	}
+}
+
 func TestRunPlane(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "run.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
@@ -800,4 +938,103 @@ func rawGet(t *testing.T, client *http.Client, path string) (int, []byte) {
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, rb
+}
+
+func startTestServerAt(t *testing.T, ctx context.Context, sock string, deps Deps) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- New(sock, deps, discardLogger()).Serve(ctx) }()
+	for range 400 {
+		if _, err := os.Stat(sock); err == nil {
+			return done
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("server did not bind")
+	return done
+}
+
+func waitRunSessionRegistrations(t *testing.T, registry *stubRunSessionRegistry, n int) []RunSessionRequest {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		registry.mu.Lock()
+		registered := append([]RunSessionRequest(nil), registry.registered...)
+		registry.mu.Unlock()
+		if len(registered) >= n {
+			return registered
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	t.Fatalf("session registrations = %+v, want at least %d", registry.registered, n)
+	return nil
+}
+
+func TestRunSessionKeeperReconnectsAfterServerRestart(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "ctl.sock")
+	pf := filepath.Join(dir, "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	registry := &stubRunSessionRegistry{closeCh: make(chan bool, 4)}
+	deps := Deps{Provider: stubProvider{pidFile: pf, sessions: registry}}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := startTestServerAt(t, ctx1, sock, deps)
+	keeper, err := OpenRunSessionKeeper(context.Background(), sock, "sandbox", "sr-test")
+	if err != nil {
+		t.Fatalf("OpenRunSessionKeeper: %v", err)
+	}
+	defer keeper.Close()
+	registered := waitRunSessionRegistrations(t, registry, 1)
+	if registered[0].Kind != "sandbox" || registered[0].RunID != "sr-test" {
+		t.Fatalf("first registration = %+v", registered[0])
+	}
+
+	cancel1()
+	select {
+	case shutdown := <-registry.closeCh:
+		if !shutdown {
+			t.Fatal("first server shutdown was reported as ordinary disconnect")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first server did not close session on shutdown")
+	}
+	select {
+	case err := <-done1:
+		if err != nil {
+			t.Fatalf("first Serve returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first server did not stop")
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done2 := startTestServerAt(t, ctx2, sock, deps)
+	registered = waitRunSessionRegistrations(t, registry, 2)
+	if registered[1].Kind != "sandbox" || registered[1].RunID != "sr-test" {
+		t.Fatalf("reconnect registration = %+v", registered[1])
+	}
+	if err := keeper.Close(); err != nil {
+		t.Fatalf("Close keeper: %v", err)
+	}
+	select {
+	case shutdown := <-registry.closeCh:
+		if shutdown {
+			t.Fatal("keeper close was reported as server shutdown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("keeper close did not close second server session")
+	}
+	cancel2()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("second Serve returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second server did not stop")
+	}
 }

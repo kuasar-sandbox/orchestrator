@@ -1385,6 +1385,80 @@ stop_orchestrator() {
     ORCH_PID=""
 }
 
+# Reuse the existing templates, process owners and policy for real exit
+# acceptance. No new build/workspace/CI path or host resource setting is added.
+runner_lifecycle_check() {
+    python3 "$SCRIPT_DIR/lib/runner_lifecycle.py" "$1" "$WORK" "$2" "$RUNNER_PREFIX" "$3" "${@:4}"
+}
+run_runner_exit_case() { # $1=static|controller, $2=ch|runtime|parent, $3=template
+    local mode="$1" role="$2" template="$3" body code sid token before started ready_ms killed cleanup_ms runtime_pid
+    body=$(python3 - "$template" <<'PY'
+import json,sys
+print(json.dumps({"templateID":sys.argv[1],"timeout":180}))
+PY
+    )
+    started=$(date +%s%3N)
+    code=$(req POST /sandboxes "$AK" "$body")
+    [ "$code" = 201 ] || fail "runner-exit $mode/$role Create=$code"
+    sid=$(json_field "$WORK/resp.body" sandboxID)
+    token=$(json_field "$WORK/resp.body" envdAccessToken)
+    code=$(DP_MAX_TIME=120 dp "49983-$sid" /health "$token" || true)
+    { [ "$code" = 200 ] || [ "$code" = 204 ]; } || fail "runner-exit $mode/$role guest health=$code"
+    wait_sandbox_state "$sid" running 60 || fail "runner-exit did not reach running"
+    ready_ms=$(( $(date +%s%3N) - started ))
+    before="$WORK/runner-lifecycle-$mode-$role.json"
+    runner_lifecycle_check snapshot "$sid" "$before" || fail "runner-exit process identities"
+    if [ "$mode" = controller ]; then
+        wait_resource_stats "$sid" || fail "runner-exit reservation unavailable"
+        runner_lifecycle_check lease "$sid" "$before" || fail "runner-exit runtime-owned lease"
+    fi
+    if [ "$mode/$role" = controller/parent ]; then
+        # Controller and conductor share this process. Restart with a live
+        # guest and require StateSync/session recovery without re-execution.
+        stop_orchestrator
+        start_orchestrator "$WORK/orch-runner-lifecycle-restart.log"
+        wait_mmds_listener
+        wait_resource_stats "$sid" || fail "live StateSync did not restore reservation"
+        runner_lifecycle_check same-run "$sid" "$before" || fail "conductor restart replaced a live run"
+        runner_lifecycle_check lease "$sid" "$before" || fail "StateSync did not preserve runtime PID"
+        runtime_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processes"]["runtime"]["pid"])' "$before")
+        for _ in $(seq 1 100); do
+            grep -Fq "state sync sid=$sid pid=$runtime_pid " "$WORK/orch-runner-lifecycle-restart.log" && break
+            sleep 0.1
+        done
+        grep -Fq "state sync sid=$sid pid=$runtime_pid " "$WORK/orch-runner-lifecycle-restart.log" || fail "no successful runtime StateSync after restart"
+        code=$(DP_MAX_TIME=30 dp "49983-$sid" /health "$token" || true)
+        { [ "$code" = 200 ] || [ "$code" = 204 ]; } || fail "guest lost connectivity across conductor restart"
+        echo "==> PASS: live conductor/controller restart preserved parent/runtime/CH and StateSync identity"
+    fi
+    killed=$(date +%s%3N)
+    runner_lifecycle_check signal "$sid" "$before" --role "$role" || fail "runner-exit guarded signal"
+    # No DELETE, explicit StopUnit or restart can help this cleanup path.
+    wait_sandbox_state "$sid" dead 600 || fail "runner-exit $mode/$role did not automatically reach dead"
+    assert_dead_no_ownership "$sid" || fail "runner-exit retained durable ownership"
+    for _ in $(seq 1 100); do
+        runner_lifecycle_check dead "$sid" "$before" 2>/dev/null && break
+        sleep 0.1
+    done
+    runner_lifecycle_check dead "$sid" "$before" || fail "runner-exit retained processes/paths or lost result"
+    cleanup_ms=$(( $(date +%s%3N) - killed ))
+    for _ in $(seq 1 50); do
+        code=$(DP_MAX_TIME=2 dp "49983-$sid" /health "$token" || true)
+        [ "$code" = 404 ] && break
+        sleep 0.1
+    done
+    [ "$code" = 404 ] || fail "dead runner route still reachable: $code"
+    python3 - "$before" "$mode" "$role" "$ready_ms" "$cleanup_ms" <<'PY'
+import json,sys
+path,mode,role,ready,cleanup=sys.argv[1:]
+record=json.load(open(path))
+record.update(resource_mode=mode,killed_role=role,ready_ms=int(ready),cleanup_ms=int(cleanup))
+with open(path,"w") as stream: json.dump(record,stream,indent=2)
+print("runner-lifecycle measurement",json.dumps({k:record[k] for k in ("resource_mode","killed_role","ready_ms","cleanup_ms","parent_measurement")}))
+PY
+    echo "==> PASS: $mode $role SIGKILL auto-cleaned without DELETE or conductor restart"
+}
+
 write_orchestrator_config unset static
 start_orchestrator "$WORK/orch.log"
 echo "==> node-ctl up (:$PORT)"
@@ -1588,6 +1662,11 @@ for LOW_ALLOC_ITERATION in $(seq 1 "$LOW_ALLOC_REPEATS"); do
     run_low_allocatable_case "$LOW_ALLOC_ITERATION"
 done
 echo "==> PASS: repeated 8GiB/256MiB startup $LOW_ALLOC_REPEATS times"
+
+# Cold images and restored Snapshots share the runtime identity boundary.
+run_runner_exit_case static ch "$LOW_TEMPLATE"
+run_runner_exit_case static runtime "$TEMPLATE"
+run_runner_exit_case static parent "$LOW_TEMPLATE"
 
 # Keep the low-headroom cgroup check in static mode so its high/balloon state is
 # driven only by the sandbox-local loop. With no sandbox left from that check,
@@ -3020,6 +3099,10 @@ MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manif
     "$E_BUNDLE_REMOTE_REF" >"$WORK/portable-e-moved-remote.json" \
     || fail "portable E move removed shared published output"
 echo "==> PASS: Bundle drove self-contained S chain plus E capture, exact publish, retained-local Wake, and cold Store restore via KMT"
+
+run_runner_exit_case controller ch "$LOW_TEMPLATE"
+run_runner_exit_case controller runtime "$TEMPLATE"
+run_runner_exit_case controller parent "$LOW_TEMPLATE"
 
 echo
 echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle-S $BUNDLE_REMOTE_REF, bundle-E $E_BUNDLE_REMOTE_REF)"

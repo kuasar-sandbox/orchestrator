@@ -6,6 +6,12 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+import copy
+import signal
+import sys
+
+import runner_lifecycle
 
 SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()
 
@@ -185,6 +191,94 @@ TAGS=()
         self.assertIn('[ "$switch_status" -eq 3 ] || fail', SOURCE)
         self.assertIn('SWITCH="${SWITCH:-x${RUN_KEY#e-}}"', SOURCE)
 
+
+
+class RunnerLifecycleIdentity(unittest.TestCase):
+    def observed(self, pid=101):
+        return {"sid":"test-run", "run_id":"sr-old", "unit":"test@sr-old.service", "cgroup":"/test@sr-old.service",
+                "processes":{role:dict(pid=pid,ppid=1,start_ticks=1,cgroup="/unit/"+role,executable=role)
+                             for role in ("parent","runtime","ch")}}
+
+    def test_exact_identity_survives_only_measurement_changes(self):
+        before=self.observed()
+        after=copy.deepcopy(before)
+        after["parent_measurement"]={"Pss_bytes":123}
+        runner_lifecycle.assert_same_run(before,after)
+        for key in ("run_id","unit","cgroup"):
+            changed=copy.deepcopy(before)
+            changed[key]+="-new"
+            with self.assertRaises(ValueError): runner_lifecycle.assert_same_run(before,changed)
+        for role in ("parent","runtime","ch"):
+            for key in ("pid","ppid","start_ticks"):
+                changed=copy.deepcopy(before)
+                changed["processes"][role][key]+=1
+                with self.assertRaises(ValueError): runner_lifecycle.assert_same_run(before,changed)
+
+    def test_stale_identity_closes_pidfd_without_sending_signal(self):
+        before=self.observed()
+        after=copy.deepcopy(before)
+        after["run_id"]="sr-successor"
+        with mock.patch.object(runner_lifecycle.os,"pidfd_open",return_value=123) as opened, \
+             mock.patch.object(runner_lifecycle.os,"close") as closed, \
+             mock.patch.object(runner_lifecycle.signal,"pidfd_send_signal") as sent, \
+             mock.patch.object(runner_lifecycle,"snapshot",return_value=after):
+            with self.assertRaises(ValueError):
+                runner_lifecycle.kill_exact(Path("/test"),before,"test@","runtime")
+            opened.assert_called_once_with(101)
+            closed.assert_called_once_with(123)
+            sent.assert_not_called()
+
+    def test_pidfd_signal_targets_only_the_pinned_test_child(self):
+        child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(20)"])
+        try:
+            before=self.observed(child.pid)
+            # Mock only the test inventory, not the actual process
+            # or kernel signal. Real KVM/unit inventory is verified by execute.
+            with mock.patch.object(runner_lifecycle,"snapshot",return_value=before):
+                runner_lifecycle.kill_exact(Path("/test"),before,"test@","runtime")
+            self.assertEqual(child.wait(timeout=5),-signal.SIGKILL)
+        finally:
+            if child.poll() is None: child.kill()
+            child.wait(timeout=5)
+
+    def test_real_process_identity_has_start_time_and_parent(self):
+        child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(20)"])
+        try:
+            actual=runner_lifecycle.process(child.pid)
+            self.assertEqual(actual["ppid"],os.getpid())
+            self.assertEqual(actual["pid"],child.pid)
+            self.assertGreater(actual["start_ticks"],0)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+
+    def test_lease_requires_runtime_pid_not_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work=Path(directory)
+            observed=self.observed()
+            observed["processes"]["runtime"]["pid"]=102
+            leases=work/"sandbox-resource.sock.leases"
+            leases.mkdir()
+            path=leases/(runner_lifecycle.hashlib.sha256(observed["sid"].encode()).hexdigest()+".json")
+            lease={"sandbox_id":observed["sid"],"pid":101,"client_features":["state_sync_v1"]}
+            path.write_text(json.dumps(lease))
+            with self.assertRaises(ValueError):runner_lifecycle.verify_lease(work,observed)
+            lease["pid"]=102
+            path.write_text(json.dumps(lease))
+            runner_lifecycle.verify_lease(work,observed)
+
+    def test_exit_matrix_is_wired_without_delete_or_manual_stop(self):
+        run=function("run_runner_exit_case")
+        after_signal=run.split('runner_lifecycle_check signal',1)[1]
+        self.assertNotIn('req DELETE',after_signal)
+        self.assertNotIn('systemctl stop',after_signal)
+        self.assertNotIn('stop_orchestrator',after_signal)
+        self.assertIn('wait_sandbox_state "$sid" dead',after_signal)
+        self.assertIn('runner_lifecycle_check same-run',run)
+        self.assertIn('runner_lifecycle_check lease',run)
+        for mode in ('static','controller'):
+            for role in ('ch','runtime','parent'):
+                self.assertIn('run_runner_exit_case '+mode+' '+role+' ',SOURCE)
 
 if __name__ == "__main__":
     unittest.main()

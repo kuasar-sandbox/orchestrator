@@ -17,9 +17,9 @@ import (
 // units.install=false, the operator manages unit files out of band and this
 // method performs no file or systemd operations.
 //
-//   - <runner>  (sandbox-runner@.service): one run-id unit that waits for a sandbox
-//     assignment, then exec-replaces into sandbox-ctl run with config pulled over
-//     the config-socket.
+//   - <runner>  (sandbox-runner@.service): one run-id unit whose parent waits
+//     for a sandbox assignment, starts sandbox-ctl run as its direct child with
+//     config pulled over the config-socket, reports the child result, then exits.
 //   - <builder> (sandbox-builder@.service): one run-id unit that waits for a build
 //     assignment, authenticates an exact-run bootstrap, prepares an artifact root
 //     task-locally when required, then drives the target-selected pipeline and posts
@@ -75,7 +75,7 @@ Description=kuasar sandbox runner %%i
 CollectMode=inactive-or-failed
 # %%i is a run-id, not a sandbox id. node-ctl run-sandbox waits on the config
 # socket until this run-id is assigned a sandbox id, then fetches the sandbox's
-# LaunchSpec and exec-replaces into sandbox-ctl.
+# LaunchSpec, starts sandbox-ctl as a direct child and reports its result.
 
 [Service]
 Type=exec

@@ -206,6 +206,133 @@ func (o *Orchestrator) startPausedCleanupRetry(sid string) {
 	}()
 }
 
+func resultCleanupKey(sid, runID string) string { return sid + "\x00" + runID }
+
+// startSandboxResultCleanup coalesces cleanup for an accepted exact-run result.
+// The result row is durable before this is called; losing process-local
+// admission leaves startup reconciliation with enough state to retry.
+func (o *Orchestrator) startSandboxResultCleanup(sid, runID string) {
+	o.startSandboxRunEndCheck(runID)
+}
+
+func (o *Orchestrator) cleanupResultRunningOwnership(ctx context.Context, sb *types.Sandbox) error {
+	if err := o.validateSandboxCleanupPaths(sb); err != nil {
+		return err
+	}
+	if sb.RunID != "" {
+		if err := o.fenceSandboxRunner(ctx, sb.RunID); err != nil {
+			return err
+		}
+	}
+	if sb.VswitchPort != "" {
+		if err := o.clearRunningSandboxNetwork(ctx, sb); err != nil {
+			return err
+		}
+	}
+	removeRunDir := o.removeSandboxRunDir
+	if removeRunDir == nil {
+		removeRunDir = os.RemoveAll
+	}
+	if sb.RunDir != "" {
+		if err := removeRunDir(sb.RunDir); err != nil {
+			return fmt.Errorf("remove sandbox RunDir %s: %w", sb.RunDir, err)
+		}
+	}
+	removeBaseDir := o.removeSandboxBaseDir
+	if removeBaseDir == nil {
+		removeBaseDir = os.RemoveAll
+	}
+	if sb.BaseDir != "" {
+		if err := removeBaseDir(sb.BaseDir); err != nil {
+			return fmt.Errorf("remove sandbox BaseDir %s: %w", sb.BaseDir, err)
+		}
+	}
+	return nil
+}
+
+func (o *Orchestrator) clearRunningSandboxNetwork(ctx context.Context, sb *types.Sandbox) error {
+	port := sb.VswitchPort
+	o.networkAllocationMu.Lock()
+	defer o.networkAllocationMu.Unlock()
+
+	if err := o.vs.Detach(ctx, port); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
+		return fmt.Errorf("detach sandbox port %s: %w", port, err)
+	}
+	if o.detachedPortsPending == nil {
+		o.detachedPortsPending = make(map[string]struct{})
+	}
+	o.detachedPortsPending[port] = struct{}{}
+
+	cleared, err := o.st.ClearRunningNetwork(ctx, sb)
+	if err != nil {
+		return err
+	}
+	if !cleared {
+		return fmt.Errorf("orch: sandbox %s running network ownership changed before durable clear", sb.ID)
+	}
+
+	delete(o.detachedPortsPending, port)
+	sb.VswitchPort, sb.FloatingIP, sb.InnerIP, sb.PortMAC = "", "", "", ""
+	return nil
+}
+
+func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID string) error {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
+	cleanupCtx, cancel := cleanupContext()
+	defer cancel()
+	sb, err := o.st.Get(cleanupCtx, sid)
+	if err != nil {
+		return err
+	}
+	if sb == nil || sb.RunID != runID || sb.ExecutionResult == nil || sb.ExecutionResult.RunID != runID {
+		return nil
+	}
+	switch sb.State {
+	case types.StateRunning:
+		if err := o.cleanupResultRunningOwnership(cleanupCtx, sb); err != nil {
+			return err
+		}
+		changed, err := o.st.CommitSandboxDead(cleanupCtx, sb)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("orch: sandbox %s changed before result dead commit", sid)
+		}
+		o.runs.forget(runID)
+		o.releaseDetachedPortFence(sb.VswitchPort)
+		o.uncache(sid)
+		o.publishDelete(sid)
+		updated, err := o.st.Get(cleanupCtx, sid)
+		if err != nil {
+			return err
+		}
+		if updated != nil {
+			o.observeSandboxUpsert(updated)
+		}
+		return nil
+	case types.StateStarting:
+		if attempt, ok := o.launches.Lookup(sid); ok && attempt.RunID() == runID {
+			o.launches.CancelExact(attempt)
+		}
+		return nil
+	case types.StatePaused:
+		if pausedCleanupPending(sb) {
+			o.startPausedCleanupRetry(sid)
+		}
+		return nil
+	case types.StateDeleting:
+		o.startSandboxDeleteFinalizer(sid)
+		return nil
+	case types.StateDead:
+		return nil
+	default:
+		return nil
+	}
+}
+
 func waitSandboxCleanupRetry(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()

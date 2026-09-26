@@ -39,11 +39,15 @@ func (p *runPools) Start(ctx context.Context) error {
 }
 
 func (p *runPools) Assign(ctx context.Context, taskID string, commit func(string) error) (string, error) {
+	return p.AssignWithFence(ctx, taskID, nil, commit)
+}
+
+func (p *runPools) AssignWithFence(ctx context.Context, taskID string, sessionFence func(string) bool, commit func(string) error) (string, error) {
 	p.mu.Lock()
 	pool := p.pools[p.next]
 	p.next = (p.next + 1) % len(p.pools)
 	p.mu.Unlock()
-	return pool.Assign(ctx, taskID, commit)
+	return pool.AssignWithFence(ctx, taskID, sessionFence, commit)
 }
 
 // runIndex has two different lifetimes: waiting ends at handoff/retirement;
@@ -77,6 +81,21 @@ func (r *runIndex) assigned(runID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.waiting, runID)
+}
+
+func (r *runIndex) owner(runID string) (unit string, waiting bool) {
+	unit, _, waiting = r.ownerPool(runID)
+	return unit, waiting
+}
+
+func (r *runIndex) ownerPool(runID string) (unit string, pool *runPool, waiting bool) {
+	if r == nil {
+		return "", nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pool, waiting = r.waiting[runID]
+	return r.units[runID], pool, waiting
 }
 
 func (r *runIndex) forget(runID string) {

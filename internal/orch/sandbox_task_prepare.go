@@ -75,7 +75,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	assignStarted := time.Now()
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
-	runID, err := o.runnerPool.Assign(assignmentCtx, sb.ID, func(runID string) error {
+	runID, err := o.runnerPool.AssignWithFence(assignmentCtx, sb.ID, func(runID string) bool { return o.runSessionAssignmentActive(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
 		unlock := o.lifecycle.Lock(sb.ID)
 		defer unlock()

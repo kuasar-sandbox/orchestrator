@@ -1,40 +1,57 @@
 package main
 
-// Shared scaffold for the in-unit sandbox launcher: lock the task pidfile
-// (double-start guard), fetch a LaunchSpec over the config-socket, then exec-replace
-// into the target so it inherits this PID (the unit's main pid + cgroup).
+// Shared scaffold for the in-unit sandbox launcher: lock the run pidfile
+// (double-start guard), fetch a LaunchSpec over the config-socket, then start
+// sandbox-ctl as the unit parent's direct child.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
-// optional task-local artifact preparation, and exec-replaces into the target.
-// runAssignedSandbox has locked the task pidfile before this function is called.
+// optional task-local artifact preparation, and starts the sandbox-ctl child.
+// runAssignedSandbox has locked the run pidfile before this function is called.
 func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
-	return launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
+	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
 		prepareArtifact: taskartifact.Prepare,
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
 		chdir:           os.Chdir,
-		exec:            syscall.Exec,
-		log:             log,
+		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
+			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready)
+		},
+		log: log,
 	})
+	var reported sandboxRunReportedError
+	if err != nil && !errors.As(err, &reported) {
+		if ready != nil {
+			_ = ready.Close()
+		}
+		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultPrepare, err)
+		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+			return sandboxRunReportedError{err: errors.Join(err, reportErr)}
+		}
+	}
+	return err
 }
 
 type taskLaunchOps struct {
@@ -43,7 +60,7 @@ type taskLaunchOps struct {
 	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
 	setenv          func(string, string) error
 	chdir           func(string) error
-	exec            func(string, []string, []string) error
+	startChild      func(string, []string, []string, *os.File, *os.File) error
 	log             *slog.Logger
 }
 
@@ -136,14 +153,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 			return fmt.Errorf("chdir %s: %w", workdir, err)
 		}
 	}
-	argv := []string{spec.Exec, "run", fmt.Sprintf("--cgroup-path=fd=%d", vmmCgroup.Fd())}
-	if ready != nil {
-		fd := int(ready.Fd())
-		if fd < 3 {
-			return fmt.Errorf("readiness fd %d is not inheritable", fd)
-		}
-		argv = append(argv, fmt.Sprintf("--ready-fd=%d", fd))
-	}
+	argv := []string{spec.Exec, "run"}
 	argv = append(argv, spec.Args[1:]...)
 	if !preparedSource.Empty() {
 		switch preparedSource.Kind {
@@ -158,19 +168,14 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
-	// These are the last fallible operations before exec. If exec itself fails,
-	// runAssignedSandbox's defers close the now-inheritable descriptors.
+	// Preparation cancellation must not become the runtime lifetime. The
+	// sole spawn boundary derives child FD numbers and owns readiness Close.
 	cancelDeadline()
 	stopContext()
-	if err := clearCloseOnExec(vmmCgroup); err != nil {
-		return fmt.Errorf("make vmm cgroup descriptor inheritable: %w", err)
+	if ops.startChild == nil {
+		return errors.New("sandbox child starter is not configured")
 	}
-	if ready != nil {
-		if err := clearCloseOnExec(ready); err != nil {
-			return err
-		}
-	}
-	return ops.exec(spec.Exec, argv, env)
+	return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
 }
 
 func completeSandboxPrepareWithRetry(
@@ -269,17 +274,6 @@ func launchSpecArtifactArg(args []string) (string, bool) {
 	return "", false
 }
 
-func clearCloseOnExec(f *os.File) error {
-	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
-	if err != nil {
-		return fmt.Errorf("get descriptor flags: %w", err)
-	}
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
-		return fmt.Errorf("clear descriptor close-on-exec: %w", err)
-	}
-	return nil
-}
-
 func envDefault(p *string, key string) {
 	if *p == "" {
 		*p = os.Getenv(key)
@@ -287,12 +281,12 @@ func envDefault(p *string, key string) {
 }
 
 // lockPidfile opens path, takes a non-blocking exclusive POSIX lock (fails if another
-// instance already holds it — the double-start guard), writes our pid, and clears
-// FD_CLOEXEC so the lock survives execve into the target (the fd stays open in the
-// same-PID process; the lock releases on process exit). It is never closed and never
-// unlinked — the launcher does not clean up the pidfile.
+// instance already holds it — the double-start guard), and writes our pid. The
+// descriptor stays open in the parent to retain the lock, but is close-on-exec so
+// sandbox-ctl children cannot inherit the parent-owned RunID/Build pidfile. It is
+// never closed and never unlinked — the launcher does not clean up the pidfile.
 func lockPidfile(path string) error {
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT, 0o600)
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return fmt.Errorf("open pidfile %s: %w", path, err)
 	}
@@ -308,9 +302,6 @@ func lockPidfile(path string) error {
 	if _, err := unix.Pwrite(fd, []byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
 		unix.Close(fd)
 		return fmt.Errorf("write pidfile: %w", err)
-	}
-	if flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
-		_, _ = unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags&^unix.FD_CLOEXEC)
 	}
 	return nil
 }
@@ -345,4 +336,112 @@ func taskEnv(add map[string]string) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+type sandboxRunReportedError struct{ err error }
+
+func (e sandboxRunReportedError) Error() string { return e.err.Error() }
+func (e sandboxRunReportedError) Unwrap() error { return e.err }
+
+func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File) error {
+	cmd := exec.Command(path)
+	cmd.Args = argv
+	cmd.Env = env
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := sandboxproc.Start(cmd, vmmCgroup, ready); err != nil {
+		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultStart, err)
+		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+			return sandboxRunReportedError{err: errors.Join(err, reportErr)}
+		}
+		return sandboxRunReportedError{err: err}
+	}
+	err := cmd.Wait()
+	result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultRun, err)
+	if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+		return sandboxRunReportedError{err: errors.Join(err, reportErr)}
+	}
+	if err != nil {
+		return sandboxRunReportedError{err: err}
+	}
+	return nil
+}
+
+func sandboxExecutionResult(sandboxID, runID string, stage types.SandboxExecutionStage, err error) configsock.SandboxExecutionResult {
+	result := configsock.SandboxExecutionResult{SID: sandboxID, RunID: runID, Stage: stage}
+	if err == nil {
+		code := 0
+		result.ExitCode = &code
+		return result
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if status.Exited() {
+				code := status.ExitStatus()
+				result.ExitCode = &code
+			} else if status.Signaled() {
+				result.Signal = status.Signal().String()
+			}
+		}
+	}
+	result.Error = sanitizeSandboxResultError(err.Error())
+	return result
+}
+
+func sanitizeSandboxResultError(message string) string {
+	message = strings.Map(func(r rune) rune {
+		if r == 0 || r == '\r' || r == '\n' || r == '\t' {
+			return ' '
+		}
+		if r < 0x20 {
+			return -1
+		}
+		return r
+	}, message)
+	message = strings.TrimSpace(message)
+	if len(message) > 1024 {
+		end := 1024
+		// strings.Map produced valid UTF-8. Do not split its last rune: JSON
+		// replaces invalid bytes with U+FFFD and could expand the wire value
+		// past the store's 1024-byte result bound, losing durable acceptance.
+		for !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end]
+	}
+	return message
+}
+
+func postSandboxResultWithRetry(socket, sandboxID, runID string, result configsock.SandboxExecutionResult) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	delay := 100 * time.Millisecond
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+		err := configsock.PostSandboxResultContext(callCtx, socket, runID, sandboxID, result)
+		callCancel()
+		if err == nil || !configsock.IsRetryableError(err) {
+			return err
+		}
+		last = err
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(ctx.Err(), last)
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
+	return last
 }

@@ -103,6 +103,7 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 	}
 	t.Cleanup(func() { st.Close() })
 	o := New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o.allowLegacyAssignmentWithoutRunSession = true
 	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
 	// General unit fixtures model a controller after startup reconciliation.
 	// Recovery-boundary tests construct Orchestrator directly and control this
