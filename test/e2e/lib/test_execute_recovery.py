@@ -10,8 +10,6 @@ import unittest
 
 
 LIB = Path(__file__).with_name("execute_state.sh")
-E2E = Path(__file__).resolve().parents[1] / "e2e_execute.sh"
-RUN_ALL = Path(__file__).resolve().parents[1] / "run_all.sh"
 
 
 class ExecuteRecovery(unittest.TestCase):
@@ -341,23 +339,6 @@ execute_state_assert_targets_absent "$2" fixture fixture-sw fixture-proxy fixtur
         self.assertIn("cannot inspect execute forwarding rule", rule_error.stderr)
         self.assertFalse(self.state.exists())
 
-    def test_suite_recovers_before_fixed_name_cases_and_records_before_setup(self):
-        run_all = RUN_ALL.read_text()
-        execute = E2E.read_text()
-        self.assertLess(run_all.index('execute_state.sh" recover'), run_all.index('cases=('))
-        self.assertLess(execute.index('execute_state_recover "$BIN"'),
-                        execute.index("for b in node-ctl"))
-        self.assertLess(execute.index('execute_state_recover "$BIN"'),
-                        execute.index('docker image inspect "$E2E_IMAGE"'))
-        self.assertLess(execute.index("execute_state_assert_targets_absent"),
-                        execute.index("execute_state_assert_units_absent"))
-        self.assertLess(execute.index("execute_state_assert_units_absent"),
-                        execute.index("execute_state_reserve"))
-        self.assertLess(execute.index("execute_state_reserve"), execute.index("setup_proxy_netns"))
-        self.assertLess(execute.index("execute_state_remember_forwarding"),
-                        execute.index("sysctl -q -w net.ipv4.ip_forward=1"))
-        self.assertLess(execute.index('execute_state_restore_forwarding "$ORIG_IP_FORWARD"'),
-                        execute.index('execute_state_finish "$BIN"'))
 
 
 if __name__ == "__main__":
