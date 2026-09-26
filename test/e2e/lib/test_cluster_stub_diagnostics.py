@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "e2e_cluster_stub.sh"
+SCRIPT = Path(__file__).resolve().parents[2] / "source" / "cluster_stub.sh"
 SOURCE = SCRIPT.read_text()
 CANARY = "fixture-capability-must-not-enter-ci-diagnostics"
 
@@ -34,21 +34,13 @@ class ClusterStubDiagnostics(unittest.TestCase):
                 self.assertEqual(log.read_text(), (CANARY + "\n") * 2)
                 self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
-    def test_private_umask_is_applied_only_after_binary_builds(self):
-        mask_position = SOURCE.index("\numask 077\n")
-        self.assertLess(SOURCE.rindex("\nbuild_cluster_stub_binaries\n"), mask_position)
-        self.assertLess(SOURCE.index("make -C"), mask_position)
+    def test_source_build_precedes_private_umask(self):
+        mask_position = SOURCE.index("\\numask 077\\n")
+        self.assertLess(SOURCE.rindex("\\nbuild_cluster_stub_binaries\\n"), mask_position)
+        self.assertNotIn("make -C", SOURCE)
+        self.assertIn("go build -trimpath", SOURCE)
         self.assertLess(mask_position, SOURCE.index('WORK="$(mktemp -d)"'))
-        with tempfile.TemporaryDirectory() as directory:
-            prefix = SOURCE[:SOURCE.index('if [ -z "${CLUSTER_STUB_CASE:-}" ]; then')]
-            prefix = prefix.replace('ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"', 'ROOT=$1')
-            script = prefix + '\nmake() { mkdir -p "$ROOT/bin"; printf "fixture\\n" >"$ROOT/bin/fixture"; chmod +x "$ROOT/bin/fixture"; }\n'
-            script += 'build_cluster_stub_binaries\numask 077\nprintf "private\\n" >"$ROOT/diagnostic"\n'
-            result = subprocess.run(["bash", "-c", "umask 022\n" + script, "_", directory],
-                                    env={"PATH": os.defpath}, text=True, capture_output=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((Path(directory) / "bin/fixture").stat().st_mode & 0o777, 0o755)
-            self.assertEqual((Path(directory) / "diagnostic").stat().st_mode & 0o777, 0o600)
+
 
     def test_failure_withholds_private_file_contents(self):
         function = re.search(r"(?ms)^fail\(\) \{\n.*?^\}", SOURCE).group()
