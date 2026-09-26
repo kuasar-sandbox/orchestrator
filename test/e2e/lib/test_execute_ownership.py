@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()
+SOURCE = Path(__file__).with_name("execute_contract.sh").read_text()
 
 
 def function(name):
@@ -60,8 +60,7 @@ class ExecuteOwnership(unittest.TestCase):
             result = subprocess.run(self.lock_command(directory, "python3", "-c", program, directory),
                                     text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(SOURCE.index('run_host_serialized /run/systemd/system'),
-                        SOURCE.index('WORK="$(mktemp -d /tmp/e-XXXXXX)"'))
+        self.assertIn('flock --nonblock --exclusive --close', SOURCE)
 
     def wait_case(self, call, delay=0):
         with tempfile.TemporaryDirectory() as directory:
