@@ -10,10 +10,10 @@ bash test/source/runtask_privilege.sh
 bash test/source/vmm_cgroup.sh
 REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
 bash test/source/journal_contract.sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_orchestrator_proxy_go.py -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_capture_cli.py -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_placer_readiness.py -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_registry_redirect.py -v
+# Helper/source regressions stay in this compiler-capable gate, not in the
+# prepared product E2E runner. Discover the maintained helper tests as one set so
+# execute/density/cluster/capture regressions cannot disappear during cutover.
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_*.py' -v
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 bash scripts/ci-e2e-build.sh source "$(uname -m)" "$work"
