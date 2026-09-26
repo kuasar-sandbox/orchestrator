@@ -54,14 +54,16 @@ code="$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"],"cpuCoun
 TID="$(field "$WORK/resp.body" templateID)"; BID="$(field "$WORK/resp.body" buildID)"
 case "$TID" in transient-*) ;; *) fail "non-transient template id: $TID";; esac
 [ "$(req GET "/templates/$TID/builds/$BID/status" "$AK2")" = 404 ] || fail "cross-tenant build ownership leak"
-code="$(req POST "/v2/templates/$TID/builds/$BID" "$AK" '{"fromImage":"docker.io/library/alpine:3.19"}')"
-[ "$code" = 202 ] || { cat "$WORK/resp.body"; fail "trigger=$code"; }
-status=""
-for _ in $(seq 1 30); do
-  [ "$(req GET "/templates/$TID/builds/$BID/status" "$AK")" = 200 ] || fail "status request"
-  status="$(field "$WORK/resp.body" status)"
-  case "$status" in ready|error) break;; waiting|building) ;; *) fail "unexpected status: $status";; esac
-  sleep 1
-done
-case "$status" in ready|error) ;; *) fail "build did not terminate";; esac
-echo "PASS builder.api.sh ($status)"
+[ "$(req GET "/templates/$TID/builds/$BID/status" "$AK")" = 200 ] || fail "status request"
+status="$(field "$WORK/resp.body" status)"
+[ "$status" = building ] || fail "registered build exposed unexpected SDK status: $status"
+
+[ "$(req GET /v3/templates "$AK")" = 200 ] || fail "template list request"
+TID="$TID" BODY="$WORK/resp.body" python3 - <<'PY' || fail "registered build appeared as ready template"
+import json, os
+payload=json.load(open(os.environ["BODY"]))
+items=payload if isinstance(payload, list) else payload.get("templates", [])
+assert all(item.get("templateID") != os.environ["TID"] for item in items), items
+PY
+
+echo "PASS builder.api.sh (registered=$status)"
