@@ -216,8 +216,8 @@ func IsBuildReportRejection(err error) bool {
 	return errors.As(err, &rejection)
 }
 
-// LaunchSpec is the generic launch config the launcher applies and then exec-replaces
-// into: the absolute target binary, its args (after argv0), the working dir, and
+// LaunchSpec describes the target process started by the runner: its absolute
+// binary path, args (after argv0), working directory, and
 // env added to the inherited environment (secrets — e.g. MANIFEST_KEY — ride here,
 // never on disk).
 type LaunchSpec struct {
