@@ -14,15 +14,12 @@
 #     and placer convergence, then creates one real sandbox, sends one routed
 #     guest request and deletes the sandbox.
 #
-# This orchestrator-owned case uses the platform-provided binary set because a
-# real cluster sandbox spans all component artifacts. Missing heavy
-# prerequisites exits 0 ("skipped") unless REQUIRE_CLUSTER_REAL=1.
-
+# Prepared-product cluster case; missing required inputs fail closed.\n
 set -euo pipefail
 
 SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
-. "$SCRIPT_DIR/lib/proxy.sh"
-. "$SCRIPT_DIR/lib/build_fixture_units.sh"
+. "$SCRIPT_DIR/proxy.sh"
+. "$SCRIPT_DIR/build_fixture_units.sh"
  : "${BIN:?BIN must point to prepared products}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-c${BASHPID}}"
@@ -531,7 +528,7 @@ EOF
     docker image inspect "$ORCHESTRATOR_BASE_IMAGE" >/dev/null || fail "prepared base image is missing"
     docker tag "$ORCHESTRATOR_BASE_IMAGE" "$REF"
 else
-    bash "$SCRIPT_DIR/lib/prepare_base_image.sh" "$E2E_IMAGE" "$REF" base >"$WORK/imgbuild.log" 2>&1 \
+    bash "$SCRIPT_DIR/prepare_base_image.sh" "$E2E_IMAGE" "$REF" base >"$WORK/imgbuild.log" 2>&1 \
         || { cat "$WORK/imgbuild.log"; fail "prepare e2b base fixture"; }
 fi
     TAGS+=("$REF")
@@ -947,7 +944,7 @@ run_cluster_flow() {
     assert_cluster_resource_yaml "$node_yaml" || fail "cluster restore resource policy differs from cold create"
 
     local websocket_command
-    websocket_command=$(python3 "$SCRIPT_DIR/lib/websocket_probe.py" guest-command)
+    websocket_command=$(python3 "$SCRIPT_DIR/websocket_probe.py" guest-command)
     timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
         --proxy "http://127.0.0.1:$ROUTER_PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
@@ -957,7 +954,7 @@ run_cluster_flow() {
         --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
         -- /bin/sh -c "$websocket_command" >"$WORK/start-websocket.out" 2>&1 \
         || fail "start cluster guest WebSocket fixture"
-    python3 "$SCRIPT_DIR/lib/websocket_probe.py" probe --port "$ROUTER_PORT" \
+    python3 "$SCRIPT_DIR/websocket_probe.py" probe --port "$ROUTER_PORT" \
         --authority "8001-$sid.$DOMAIN" --token "$forward_token" \
         --header "X-Kuasar-Sandbox-Group: $GROUP" \
         --header "X-Kuasar-Route-Key: $ROUTE_KEY" \
@@ -1020,7 +1017,7 @@ PY
 }
 
 wait_redirect_placer() {
-    python3 "$SCRIPT_DIR/lib/placer_readiness.py" \
+    python3 "$SCRIPT_DIR/placer_readiness.py" \
         --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID"
 }
 
@@ -1154,7 +1151,7 @@ if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
     run_redirect_flow
 else
     run_cluster_flow
-    BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/lib/build_actions.py" \
+    BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/build_actions.py" \
         --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
         --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
         --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
