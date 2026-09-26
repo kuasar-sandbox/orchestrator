@@ -11,6 +11,7 @@ bash test/source/vmm_cgroup.sh
 REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
 bash test/source/journal_contract.sh
 bash test/source/capture_cli.sh
+REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
 # Helper/source regressions stay in this compiler-capable gate, not in the
 # prepared product E2E runner. Discover the maintained helper tests as one set so
 # execute/density/cluster/capture regressions cannot disappear during cutover.
