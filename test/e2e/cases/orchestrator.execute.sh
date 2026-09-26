@@ -68,9 +68,7 @@ FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
 LOW_ALLOC_REPEATS="${LOW_ALLOC_REPEATS:-2}"
 
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
-# legacy skip removed for prepared product execution
 skip() { fail "$*"; }
-fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
 RECOVERY_PENDING=0
 execute_state_path_absent "$(execute_state_path)" || RECOVERY_PENDING=1
