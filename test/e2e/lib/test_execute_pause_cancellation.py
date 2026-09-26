@@ -13,7 +13,7 @@ import time
 import unittest
 
 
-SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()
+SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()  # temporary until pause fixture extraction completes
 
 
 def snippet(start, end):
