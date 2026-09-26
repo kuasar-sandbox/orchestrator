@@ -8,7 +8,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
-	        test vet bench e2e-fixtures test-e2e test-e2e-cluster-stub release test-release clean help
+	        test vet bench e2e-fixtures test-e2e release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -96,20 +96,10 @@ bench:
 clean:
 	rm -rf bin build
 
-# Orchestrator owns both its self-contained cluster stub and the full node,
-# proxy, builder, and cluster integration cases. The latter use the assembled
-# platform binary set supplied by Integration E2E.
-e2e-fixtures:
-	bash scripts/ci-e2e-build.sh fixtures "$(TARGET_ARCH)" "$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)"
-
-test-e2e: e2e-fixtures
+# Product E2E is executed by the shared project framework from prepared artifacts.
+# Local source checks remain available through the compiler-capable source gate.
+test-e2e:
 	bash scripts/ci-source-checks.sh
-	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" \
-		CUSTOM_PROXY_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/custom-proxy" \
-		TELEMETRY_GRPC_PROBE_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/telemetry-grpc-probe" bash test/e2e/run_all.sh
-
-test-e2e-cluster-stub:
-	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
 
 VERSION ?= v0.1.0
 ACCELERATOR_VERSION ?= v0.1.3
@@ -136,7 +126,7 @@ help:
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e                   run the orchestrator-owned E2E suite with E2E_BIN"
+	@echo "  test-e2e                   run compiler-capable orchestrator source integration checks"
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
