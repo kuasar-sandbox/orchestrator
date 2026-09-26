@@ -208,3 +208,49 @@ resource_cleanup() {
         rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null || true
     done
 }
+
+resource_read_balloon() {
+    local sid="$1" json
+    json=$(curl --silent --show-error --fail --max-time 2         --unix-socket "$WORK/run/$sid/ch.sock" http://localhost/api/v1/vm.info) || return 1
+    python3 -c 'import json,sys
+info=json.load(sys.stdin); balloon=info.get("config",{}).get("balloon") or {}
+print(balloon.get("size",-1), info.get("memory_actual_size",-1))' <<<"$json"
+}
+
+resource_memory_control_observed() {
+    local sid="$1" high maximum
+    grep -qE 'memory: initial CH observation accepted epoch=[1-9][0-9]* seq=[1-9][0-9]*($|[[:space:]])' "$WORK/$sid.log" || return 1
+    high=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.high") || return 1
+    maximum=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.max") || return 1
+    [[ "$high" =~ ^[1-9][0-9]*$ && "$maximum" =~ ^[1-9][0-9]*$ ]] && [ "$high" -le "$maximum" ]
+}
+
+resource_reservation_memory() {
+    local sid="$1" rows
+    rows=$("$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock") || return 1
+    SID="$sid" ROWS="$rows" python3 -c 'import json,os
+m=[r for r in json.loads(os.environ["ROWS"]) if r.get("sandbox_id")==os.environ["SID"]]
+assert len(m)==1 and m[0].get("connected") is True and not m[0].get("provisional",False), m
+print(m[0]["allocatable_memory"])'
+}
+
+resource_wait_local_grow() {
+    local sid="$1" pid="$2" baseline="$3" timeout="$4" count=0 deadline=$((SECONDS+timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        count=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || count=0
+        [ "$count" -gt "$baseline" ] && return 0
+        kill -0 "$pid" || resource_fail "$sid exited before local grow"
+        sleep 0.1
+    done
+    resource_fail "$sid did not apply local grow"
+}
+
+resource_assert_no_oom() {
+    local sid="$1" oom=0
+    if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
+        oom=$(awk '$1=="oom"{print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local")
+        [ -z "$oom" ] && oom=0
+    fi
+    [ "$oom" -eq 0 ] || resource_fail "$sid cgroup oom_count=$oom"
+    ! grep -qiE 'oom-kill:|Out of memory: Killed process|app exited code=137|app_exited code=137' "$WORK/$sid.log"         || resource_fail "$sid guest OOM/SIGKILL observed"
+}
