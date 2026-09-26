@@ -19,7 +19,8 @@ resource_init() {
     done
     [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || resource_fail "/dev/kvm is required"
     [ "$(id -u)" -eq 0 ] || resource_fail "root is required"
-    RESOURCE_IMAGE="${ORCHESTRATOR_BASE_IMAGE:-${E2E_IMAGE:-python:3.12-slim}}"
+    : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
+    RESOURCE_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
     docker image inspect "$RESOURCE_IMAGE" >/dev/null 2>&1         || resource_fail "prepared base image is missing: $RESOURCE_IMAGE"
     mkdir -p "$WORK/run" "$WORK/lib" "$WORK/units"
     RESOURCE_DAEMON_PID=""
@@ -152,7 +153,8 @@ resource_reservation_count() {
 }
 
 resource_wait_reservations() {
-    local want="$1" timeout="$2" count=0 deadline=$((SECONDS + timeout))
+    local want="$1" timeout="$2" count=0 deadline
+    deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         count="$(resource_reservation_count 2>/dev/null || echo 0)"
         [ "$count" -ge "$want" ] && return 0
@@ -162,7 +164,8 @@ resource_wait_reservations() {
 }
 
 resource_wait_state() {
-    local sid="$1" pid="$2" mode="$3" timeout="$4" deadline=$((SECONDS + timeout))
+    local sid="$1" pid="$2" mode="$3" timeout="$4" deadline
+    deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         local rows
         rows="$("$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" 2>/dev/null || true)"
@@ -235,7 +238,8 @@ print(m[0]["allocatable_memory"])'
 }
 
 resource_wait_local_grow() {
-    local sid="$1" pid="$2" baseline="$3" timeout="$4" count=0 deadline=$((SECONDS+timeout))
+    local sid="$1" pid="$2" baseline="$3" timeout="$4" count=0 deadline
+    deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
         count=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || count=0
         [ "$count" -gt "$baseline" ] && return 0
