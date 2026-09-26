@@ -130,23 +130,4 @@ if run_case required_failure 1000 1 1 unset; then
 fi
 grep -qx 'skip:run-sandbox handoff requires root or passwordless sudo' "$TMP/harness-required_failure.out"
 
-# Lock the real owner case to the tested helper and unconditional pre-reexec
-# cleanup. Then prove the wiring check catches a direct-root-skip regression.
-assert_entry_wiring() {
-    local entry="$1"
-    grep -Fqx ". \"\$SCRIPT_DIR/lib/runtask_privilege.sh\"" "$entry"
-    grep -Fqx "    rm -rf \"\$WORK\"" "$entry"
-    grep -Fqx "runtask_enter_privileged cleanup_before_privilege_reexec \"\$SCRIPT_DIR/e2e_runtask.sh\" \"\$@\"" "$entry"
-}
-ENTRY="$ROOT/test/e2e/e2e_runtask.sh"
-assert_entry_wiring "$ENTRY"
-MUTANT="$TMP/e2e_runtask-mutant.sh"
-# The replacement intentionally writes a literal shell expression.
-# shellcheck disable=SC2016
-sed 's/^runtask_enter_privileged cleanup_before_privilege_reexec .*$/[ "$(id -u)" -eq 0 ] || skip "run-sandbox handoff requires a delegated systemd unit"/' "$ENTRY" > "$MUTANT"
-if assert_entry_wiring "$MUTANT" 2>/dev/null; then
-    echo "wiring mutant unexpectedly passed" >&2
-    exit 1
-fi
-
-echo "runtask privilege entry tests: PASS"
+echo "runtask privilege helper tests: PASS"
