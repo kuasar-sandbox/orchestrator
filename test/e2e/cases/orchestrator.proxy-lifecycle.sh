@@ -34,7 +34,7 @@ SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/telemetry.sh"
 . "$SCRIPT_DIR/native_traffic.sh"
 : "${BIN:?BIN must point to prepared products}"
-MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
+MMDS_ROUTES_E2E=1
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 PROXY_PORT="${PROXY_PORT:-3443}"
@@ -96,6 +96,9 @@ else
     [ "${KUASAR_ARTIFACT_E2E:-0}" != 1 ] || fail "prepared CUSTOM_PROXY_BIN is required"
     CUSTOM_PROXY_BIN="-"
 fi
+MMDS_SECRET_INITIAL_VALUE=MMDS_SECRET_INITIAL_GUEST_E2E
+REQ_MMDS_HEADER='{"secrets":{"e2e_secret":"MMDS_SECRET_INITIAL_GUEST_E2E"},"routes":[{"path":"/e2e/static","data":"MMDS_STATIC_GUEST_E2E"},{"path":"/e2e/secret","type":"secret","secret":"e2e_secret","content_type":"application/x-kuasar-e2e-secret"},{"path":"/e2e/unresolved","type":"secret","secret":"e2e_unresolved"},{"path":"/e2e/service","type":"service","service":"e2e_service"}]}'
+export MMDS_SECRET_INITIAL_VALUE REQ_MMDS_HEADER
 declare -a PIDS=()
 declare -a TAGS=()
 MMDS_ROUTES_CONFIG=""
