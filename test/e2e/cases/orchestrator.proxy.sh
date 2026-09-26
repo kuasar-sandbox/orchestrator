@@ -52,4 +52,9 @@ grep -Eqi '^X-Kuasar-Proxy-Error:[[:space:]]*not_found[[:space:]]*$' "$WORK/data
 code="$(curl -sS --noproxy '*' -o "$WORK/api-data.body" -w '%{http_code}' -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$API_PORT/health")"
 [ "$code" = 404 ] || { cat "$WORK/api-data.body"; echo "conductor incorrectly served data host: $code" >&2; exit 1; }
 
+code="$(curl -sS --noproxy '*' -o "$WORK/api-connect.body" -w '%{http_code}' -X CONNECT -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$API_PORT/")"
+case "$code" in 404|405) ;; *) cat "$WORK/api-connect.body"; echo "conductor API accepted data CONNECT: $code" >&2; exit 1;; esac
+! grep -qi 'X-Kuasar-Proxy-Error' "$WORK/api-connect.body" ||
+    { cat "$WORK/api-connect.body"; echo "conductor API CONNECT leaked proxy response" >&2; exit 1; }
+
 echo "PASS orchestrator.proxy.sh"
