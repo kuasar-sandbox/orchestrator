@@ -76,8 +76,8 @@ node-stub-ctl:
 test:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_ENABLED=0 $(GO) test ./...
-	bash test/e2e/runtask_privilege_test.sh
-	bash test/e2e/vmm_cgroup_test.sh
+	bash test/source/runtask_privilege.sh
+	bash test/source/vmm_cgroup.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_cluster_stub_diagnostics.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_ownership.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_pause_cancellation.py'
