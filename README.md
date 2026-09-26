@@ -103,32 +103,19 @@ The Go binaries are built with `CGO_ENABLED=0`.
 make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make test                       # unit tests
-e2e_arch="$(uname -m)"
-e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
-bash scripts/ci-e2e-build.sh cli "$e2e_arch" "$e2e_tools"
-ORCH_CLI_TEST_BIN="$e2e_tools/orch-cli.test" make test-e2e  # requires the assembled project BIN
+make test                       # unit + source integration gates
 ```
 
-The owner suite includes `e2e_capture_cli.sh`, which runs
-`TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase` and
-`TestExportPublicationCLIAPI` against the selected real `sandbox-ctl` and
-`node-ctl`. It requires every current subcase to finish without Skip, including
-carrier deletion before structured-result commit, rejection of torn capture
-responses and the portable CLI/API matrix after artifact access is removed.
-Missing products, missing helpers, empty selections and parent-only results fail.
-An optional local `go test` without `KUASAR_TEST_SANDBOX_CTL` may still skip these
-groups; that is not evidence for the required entry.
+Capture CLI/DB fixture contracts are source integration, not product E2E. The
+required source gate builds the exact sibling sandboxer's `sandbox-ctl` and runs
+`TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase`
+and `TestExportPublicationCLIAPI` from this exact orchestrator source. Every
+selected group must run at least one subcase and every started subcase must pass;
+Skip, failure, parent-only output, or missing exact sibling source fails the gate.
 
-The local command prepares the CLI helper with the existing fixture script and
-passes it to `make test-e2e`. Hosted artifact validation builds `orch-cli.test` from the independently pinned owner
-test revision before preparation; the runner consumes only that executable and
-`BIN`, without fetching sources or compiling. The existing required source checks
-also execute the runner's input/selection/Skip regressions. The focused entry is:
-
-```bash
-BIN=/path/to/selected/bin ORCH_CLI_TEST_BIN=/path/to/prepared/orch-cli.test \
-  bash test/e2e/e2e_capture_cli.sh
-```
+Product E2E consumes only prepared release products and helpers through the
+project framework. It does not build products or helpers, discover sibling
+source trees, or download fallback images at runtime.
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
