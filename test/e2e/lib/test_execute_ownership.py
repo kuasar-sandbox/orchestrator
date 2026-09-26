@@ -68,7 +68,7 @@ class ExecuteOwnership(unittest.TestCase):
             log.write_text("")
             script = "set -euo pipefail\nRUN_ARGV_LOG=$1\n"
             script += function("argv_log_count") + "\n"
-            script += re.search(r"(?m)^run_argv_count\(\).*", SOURCE).group() + "\n"
+            script += function("run_argv_count") + "\n"
             script += function("wait_run_argv") + "\n" + function("assert_run_source_mode") + "\n"
             if call is not None:
                 # Real delayed file observation, not a timer-only success stub.
