@@ -47,9 +47,16 @@ s=s.replace('launch:\n  exec: /bin/sleep\n  args: ["300"]\n',
     - |
       import time
       blocks=[]
+      import os
+      start="/tmp/resource-dynamic.start"
+      delivery="/tmp/resource-dynamic.delivery"
       print("control-workload-ready", flush=True)
-      time.sleep(3)
-      for _ in range(6):
+      while not os.path.exists(start): time.sleep(.05)
+      blocks.append(bytearray(48*1024*1024))
+      blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
+      print("pressure-probe-ready", flush=True)
+      while not os.path.exists(delivery): time.sleep(.05)
+      for _ in range(5):
           blocks.append(bytearray(48*1024*1024))
           blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
           print("pressure", len(blocks), flush=True)
@@ -91,6 +98,14 @@ if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ] && [ "$reser
     grow_phase=prepressure
     target_reference=$initial_target
 else
+    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
+    deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -q pressure-probe-ready "$WORK/$sid.log" && break
+        kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
+        sleep 0.1
+    done
+    grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
     deadline=$((SECONDS+45))
     while [ "$SECONDS" -lt "$deadline" ]; do
         reservation_after="$(resource_reservation_memory "$sid" 2>/dev/null || echo 0)"
@@ -121,6 +136,17 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.25
 done
 [ "$covered" = 1 ] || resource_fail "CH grow was not covered by live node reservation"
+if [ "$grow_phase" = prepressure ]; then
+    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
+    deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -q pressure-probe-ready "$WORK/$sid.log" && break
+        kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
+        sleep 0.1
+    done
+    grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
+fi
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.delivery'
 
 deadline=$((SECONDS+45))
 while [ "$SECONDS" -lt "$deadline" ]; do
