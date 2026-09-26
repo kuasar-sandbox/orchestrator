@@ -32,8 +32,9 @@ required = {
     "TestUploadCaptureCLIToPausedDatabase",
     "TestExportPublicationCLIAPI",
 }
-passed = set()
 started = set()
+passed = set()
+children = {root: set() for root in required}
 for raw in open(sys.argv[1], encoding="utf-8"):
     event = json.loads(raw)
     name = event.get("Test")
@@ -44,18 +45,23 @@ for raw in open(sys.argv[1], encoding="utf-8"):
     if root not in required:
         continue
     if action == "run":
-        started.add(root)
-    elif action == "pass" and name == root:
-        passed.add(root)
+        started.add(name)
+        if name != root:
+            children[root].add(name)
+    elif action == "pass":
+        passed.add(name)
     elif action in {"fail", "skip"}:
         raise SystemExit(f"capture source integration {action}: {name}")
 
-missing = required - started
-if missing:
-    raise SystemExit(f"capture source integration did not run: {sorted(missing)}")
-missing = required - passed
-if missing:
-    raise SystemExit(f"capture source integration did not pass: {sorted(missing)}")
+missing_roots = required - started
+if missing_roots:
+    raise SystemExit(f"capture source integration did not run: {sorted(missing_roots)}")
+empty_groups = sorted(root for root in required if not children[root])
+if empty_groups:
+    raise SystemExit(f"capture source integration ran no subcases: {empty_groups}")
+unfinished = sorted(started - passed)
+if unfinished:
+    raise SystemExit(f"capture source integration did not pass: {unfinished}")
 PY
 
 echo "PASS source/capture-cli"
