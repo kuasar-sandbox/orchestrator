@@ -13,7 +13,7 @@ import time
 import unittest
 
 
-SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()
+SOURCE = Path(__file__).with_name("execute_pause_contract.sh").read_text()
 
 
 def snippet(start, end):
