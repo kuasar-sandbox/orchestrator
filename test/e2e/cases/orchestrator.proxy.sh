@@ -17,7 +17,7 @@ LOG="$WORK/proxy.log"
 
 # A proxy cannot register without a conductor plugin endpoint. This focused case
 # uses the real conductor with no sandbox creation; it validates the independent
-# data listener/WorkerExtension boundary without KVM or a template build.
+# data listener and API endpoint boundary without KVM or a template build.
 API_PORT="$(proxy_case_free_port)"
 mkdir -p "$WORK/lib" "$WORK/units"
 cat >"$WORK/conductor.yaml" <<EOF
@@ -43,8 +43,11 @@ start_proxy "$NODE" "$WORK/proxy.yaml" "$LOG"
 PROXY=$PROXY_HELPER_PID
 proxy_case_wait_data "$PROXY" 127.0.0.1 "$PORT" "$STATS" "$LOG" || exit 1
 
-code="$(curl -sS --noproxy '*' -o "$WORK/data.body" -w '%{http_code}' -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$PORT/health")"
-[ "$code" = 401 ] || { cat "$WORK/data.body"; echo "data listener did not enforce WorkerExtension auth: $code" >&2; exit 1; }
+# No sandbox route exists here. Canonical route lookup returns typed not_found
+# before token authorization; existing-route authentication is a separate case.
+code="$(curl -sS --noproxy '*' -D "$WORK/data.headers" -o "$WORK/data.body" -w '%{http_code}' -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$PORT/health")"
+[ "$code" = 404 ] || { cat "$WORK/data.body"; echo "missing proxy route returned $code (want 404)" >&2; exit 1; }
+grep -Eqi '^X-Kuasar-Proxy-Error:[[:space:]]*not_found[[:space:]]*$' "$WORK/data.headers" || { cat "$WORK/data.headers"; echo "missing proxy route omitted typed not_found error" >&2; exit 1; }
 
 code="$(curl -sS --noproxy '*' -o "$WORK/api-data.body" -w '%{http_code}' -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$API_PORT/health")"
 [ "$code" = 404 ] || { cat "$WORK/api-data.body"; echo "conductor incorrectly served data host: $code" >&2; exit 1; }
