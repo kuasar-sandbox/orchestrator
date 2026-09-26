@@ -236,6 +236,7 @@ for entrypoint in \
   test/e2e/cases/basic.orchestrator-cli.sh \
   test/e2e/cases/orchestrator.api.sh \
   test/e2e/cases/orchestrator.cold-target.sh \
+  test/e2e/cases/orchestrator.execute.sh \
   test/e2e/cases/orchestrator.cluster-lifecycle.sh \
   test/e2e/cases/orchestrator.cluster-recovery.sh \
   test/e2e/cases/orchestrator.proxy.sh \
@@ -258,7 +259,7 @@ for legacy in test/e2e/e2e_capture_cli.sh test/e2e/e2e_cluster_stub.sh \
   test/e2e/e2e_sandbox_cold_target.sh test/e2e/e2e_cluster_real.sh \
   test/e2e/e2e_density.sh test/e2e/e2e_orchestrator_proxy.sh \
   test/e2e/e2e_mmds_routes.sh test/e2e/e2e_mmds_routes_proxy_restart.sh \
-  test/e2e/run_all.sh; do
+  test/e2e/run_all.sh test/e2e/e2e_execute.sh; do
   if git -C "$ROOT" ls-files --error-unmatch "$legacy" >/dev/null 2>&1; then
     fail "migrated legacy E2E entrypoint remains tracked: $legacy"
   fi
