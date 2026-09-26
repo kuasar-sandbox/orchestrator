@@ -235,6 +235,7 @@ grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW"
 for entrypoint in \
   test/e2e/cases/basic.orchestrator-cli.sh \
   test/e2e/cases/orchestrator.api.sh \
+  test/e2e/cases/orchestrator.cold-target.sh \
   test/e2e/cases/orchestrator.proxy.sh \
   test/e2e/cases/orchestrator.resource-admission.sh \
   test/e2e/cases/orchestrator.resource-control.sh \
@@ -250,7 +251,8 @@ done
 
 for legacy in test/e2e/e2e_capture_cli.sh test/e2e/e2e_cluster_stub.sh \
   test/e2e/e2e_builder_unit_upgrade.sh test/e2e/e2e_journal_contract.sh \
-  test/e2e/runtask_privilege_test.sh test/e2e/vmm_cgroup_test.sh; do
+  test/e2e/runtask_privilege_test.sh test/e2e/vmm_cgroup_test.sh \
+  test/e2e/e2e_sandbox_cold_target.sh; do
   if git -C "$ROOT" ls-files --error-unmatch "$legacy" >/dev/null 2>&1; then
     fail "migrated legacy E2E entrypoint remains tracked: $legacy"
   fi
