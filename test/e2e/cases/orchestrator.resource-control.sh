@@ -48,18 +48,27 @@ done
 resource_memory_control_observed "$sid" || resource_fail "memory control did not initialize"
 read -r target_before actual_before <<<"$(resource_read_balloon "$sid")"
 [[ "$target_before" =~ ^[0-9]+$ && "$actual_before" =~ ^[0-9]+$ ]] || resource_fail "invalid initial CH balloon state"
+capacity=$((1024 * 1024 * 1024))
+initial_target=$((512 * 1024 * 1024))
+[ "$target_before" -le "$capacity" ] && [ "$actual_before" -le "$capacity" ] || resource_fail "initial CH balloon state exceeds capacity"
 grows=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grows=0
-if [ "$grows" -eq 0 ]; then resource_wait_local_grow "$sid" "$pid" "$grows" 30; fi
+grow_phase=pressure
+target_reference=$target_before
+if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ]; then
+    grow_phase=prepressure
+    target_reference=$initial_target
+fi
+if [ "$grow_phase" = pressure ]; then resource_wait_local_grow "$sid" "$pid" "$grows" 30; fi
 
 deadline=$((SECONDS+30))
 target_after=$target_before
 while [ "$SECONDS" -lt "$deadline" ]; do
     read -r target_after actual_after <<<"$(resource_read_balloon "$sid")" || true
-    [ "$target_after" -lt "$target_before" ] && break
+    if [[ "$target_after" =~ ^[0-9]+$ && "$actual_after" =~ ^[0-9]+$ ]] && [ "$target_after" -lt "$target_reference" ]; then break; fi
     kill -0 "$pid" || resource_fail "$sid exited before CH accepted grow"
     sleep 0.25
 done
-[ "$target_after" -lt "$target_before" ] || resource_fail "static grow did not reduce CH balloon target"
+[ "$target_after" -lt "$target_reference" ] || resource_fail "static grow did not reduce CH balloon target below $target_reference"
 deadline=$((SECONDS+45))
 while [ "$SECONDS" -lt "$deadline" ]; do
     grep -q 'workload done' "$WORK/$sid.log" && break
