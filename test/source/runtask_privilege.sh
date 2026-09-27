@@ -24,12 +24,14 @@ shift
 shift
 [ "\${1:-}" = -i ] || exit 62
 shift
-root_path="" bin="" require="" keep_set=0 keep=""
+root_path="" bin="" lib="" work="" out_set=0 out="" keep_set=0 keep=""
 while [ \$# -gt 0 ] && [[ "\$1" == *=* ]]; do
     case "\$1" in
         PATH=*) root_path="\${1#PATH=}" ;;
         BIN=*) bin="\${1#BIN=}" ;;
-        REQUIRE_RUNTASK=*) require="\${1#REQUIRE_RUNTASK=}" ;;
+        E2E_LIB=*) lib="\${1#E2E_LIB=}" ;;
+        WORK=*) work="\${1#WORK=}" ;;
+        OUT=*) out_set=1; out="\${1#OUT=}" ;;
         E2E_KEEP=*) keep_set=1; keep="\${1#E2E_KEEP=}" ;;
         SENTINEL=*) exit 63 ;;
         *) exit 64 ;;
@@ -38,19 +40,22 @@ while [ \$# -gt 0 ] && [[ "\$1" == *=* ]]; do
 done
 cmd="\${1:?missing sudo command}"
 shift
-printf 'sudo:path=%s:bin=%s:require=%s:keep_set=%s:keep=%s:cmd=%s\n' \
-    "\$root_path" "\$bin" "\$require" "\$keep_set" "\$keep" "\$cmd" >> "$TMP/sudo.log"
+printf 'sudo:path=%s:bin=%s:lib=%s:work=%s:out_set=%s:out=%s:keep_set=%s:keep=%s:cmd=%s\n' \
+    "\$root_path" "\$bin" "\$lib" "\$work" "\$out_set" "\$out" "\$keep_set" "\$keep" "\$cmd" >> "$TMP/sudo.log"
 if [ "\$cmd" = /usr/bin/true ]; then
     exit "\${SUDO_PROBE_STATUS:-0}"
 fi
-name="\$(basename "\$cmd")"
+[ "\$cmd" = /bin/bash ] || exit 66
+name="\$(basename "\${1:?missing case script}")"
 [ ! -e "$TMP/\$name.workspace" ] || { echo "pre-sudo workspace leaked" >&2; exit 65; }
 env_args=(
     "PATH=$TMP:\$root_path"
     "BIN=\$bin"
-    "REQUIRE_RUNTASK=\$require"
+    "E2E_LIB=\$lib"
+    "WORK=\$work"
     "TEST_UID=0"
 )
+[ "\$out_set" -eq 0 ] || env_args+=("OUT=\$out")
 [ "\$keep_set" -eq 0 ] || env_args+=("E2E_KEEP=\$keep")
 exec /usr/bin/env -i "\${env_args[@]}" "\$cmd" "\$@"
 EOF
@@ -63,10 +68,9 @@ make_harness() {
 #!/usr/bin/env bash
 set -euo pipefail
 out="$TMP/harness-$name.out"
-skip() {
-    printf 'skip:%s\\n' "\$*" >> "\$out"
-    [ "\${REQUIRE_RUNTASK:-0}" = 1 ] && exit 1
-    exit 0
+fail() {
+    printf 'fail:%s\\n' "\$*" >> "\$out"
+    exit 1
 }
 before_exec() {
     rm -rf "$TMP/harness-$name.workspace"
@@ -75,59 +79,61 @@ before_exec() {
 . "$ROOT/test/e2e/lib/runtask_privilege.sh"
 touch "$TMP/harness-$name.workspace"
 runtask_enter_privileged before_exec "\$0" "\$@"
-printf 'direct:uid=%s:bin=%s:require=%s:keep=%s:sentinel=%s\\n' \
-    "\$(id -u)" "\${BIN:-missing}" "\${REQUIRE_RUNTASK:-missing}" \
-    "\${E2E_KEEP-unset}" "\${SENTINEL-unset}" >> "\$out"
+printf 'direct:uid=%s:bin=%s:lib=%s:work=%s:out=%s:keep=%s:sentinel=%s:arg=%s\\n' \
+    "\$(id -u)" "\${BIN:-missing}" "\${E2E_LIB:-missing}" "\${WORK:-missing}" \
+    "\${OUT-unset}" "\${E2E_KEEP-unset}" "\${SENTINEL-unset}" "\${1:-missing}" >> "\$out"
 EOF
-    chmod +x "$harness"
+    chmod 0644 "$harness"
     printf '%s\n' "$harness"
 }
 
 run_case() {
-    local name="$1" uid="$2" probe="$3" required="$4" keep_mode="$5"
+    local name="$1" uid="$2" probe="$3" out_mode="$4" keep_mode="$5"
     local harness
     harness="$(make_harness "$name")"
     local -a env_args=(
         "TEST_UID=$uid"
         "SUDO_PROBE_STATUS=$probe"
-        "REQUIRE_RUNTASK=$required"
-        "BIN=/owner/selected/bin"
+        "BIN=/prepared products/bin"
+        "E2E_LIB=/prepared helpers/lib"
+        "WORK=/runner workspace/case"
         "SENTINEL=must-not-cross-sudo"
         "PATH=$TMP:$PATH"
     )
+    [ "$out_mode" = unset ] || env_args+=("OUT=$out_mode")
     [ "$keep_mode" = unset ] || env_args+=("E2E_KEEP=$keep_mode")
-    /usr/bin/env "${env_args[@]}" "$harness"
+    /usr/bin/env -u OUT -u E2E_KEEP "${env_args[@]}" /bin/bash "$harness" "argument with spaces"
 }
 
 : > "$TMP/sudo.log"
-run_case nonroot_keep 1000 0 1 1
+run_case nonroot_keep 1000 0 '/runner output/case' 1
 cat "$TMP/harness-nonroot_keep.out"
 grep -qx 'before-exec' "$TMP/harness-nonroot_keep.out"
-grep -qx 'direct:uid=0:bin=/owner/selected/bin:require=1:keep=1:sentinel=unset' "$TMP/harness-nonroot_keep.out"
+grep -qx 'direct:uid=0:bin=/prepared products/bin:lib=/prepared helpers/lib:work=/runner workspace/case:out=/runner output/case:keep=1:sentinel=unset:arg=argument with spaces' "$TMP/harness-nonroot_keep.out"
 [ -e "$TMP/harness-nonroot_keep.workspace" ]
-grep -q 'sudo:path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:bin=/owner/selected/bin:require=1:keep_set=1:keep=1:cmd=/usr/bin/true' "$TMP/sudo.log"
-grep -q 'cmd=.*/harness-nonroot_keep$' "$TMP/sudo.log"
+grep -q 'sudo:path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:bin=/prepared products/bin:lib=/prepared helpers/lib:work=/runner workspace/case:out_set=1:out=/runner output/case:keep_set=1:keep=1:cmd=/usr/bin/true' "$TMP/sudo.log"
+grep -q 'cmd=/bin/bash$' "$TMP/sudo.log"
 
 : > "$TMP/sudo.log"
-run_case nonroot_unset 1000 0 1 unset
-grep -qx 'direct:uid=0:bin=/owner/selected/bin:require=1:keep=unset:sentinel=unset' "$TMP/harness-nonroot_unset.out"
-grep -q 'keep_set=0:keep=:cmd=/usr/bin/true' "$TMP/sudo.log"
+run_case nonroot_unset 1000 0 unset unset
+grep -qx 'direct:uid=0:bin=/prepared products/bin:lib=/prepared helpers/lib:work=/runner workspace/case:out=unset:keep=unset:sentinel=unset:arg=argument with spaces' "$TMP/harness-nonroot_unset.out"
+grep -q 'out_set=0:out=:keep_set=0:keep=:cmd=/usr/bin/true' "$TMP/sudo.log"
 
 : > "$TMP/sudo.log"
-run_case root 0 64 1 1
-grep -qx 'direct:uid=0:bin=/owner/selected/bin:require=1:keep=1:sentinel=must-not-cross-sudo' "$TMP/harness-root.out"
+run_case root 0 64 '/runner output/case' 1
+grep -qx 'direct:uid=0:bin=/prepared products/bin:lib=/prepared helpers/lib:work=/runner workspace/case:out=/runner output/case:keep=1:sentinel=must-not-cross-sudo:arg=argument with spaces' "$TMP/harness-root.out"
 [ ! -s "$TMP/sudo.log" ]
 
-: > "$TMP/sudo.log"
-run_case optional_failure 1000 1 0 unset
-grep -qx 'skip:run-sandbox handoff requires root or passwordless sudo' "$TMP/harness-optional_failure.out"
-[ -e "$TMP/harness-optional_failure.workspace" ]
-
-: > "$TMP/sudo.log"
-if run_case required_failure 1000 1 1 unset; then
-    echo "required sudo failure unexpectedly succeeded" >&2
-    exit 1
-fi
-grep -qx 'skip:run-sandbox handoff requires root or passwordless sudo' "$TMP/harness-required_failure.out"
+# The removed optional legacy entrypoint cannot make a selected case pass by
+# setting REQUIRE_RUNTASK=0. Both inherited values must fail without privilege.
+for required in 0 1; do
+    : > "$TMP/sudo.log"
+    if REQUIRE_RUNTASK="$required" run_case "failure_$required" 1000 1 unset unset; then
+        echo "sudo failure unexpectedly succeeded (legacy flag=$required)" >&2
+        exit 1
+    fi
+    grep -qx 'fail:run-sandbox handoff requires root or passwordless sudo' "$TMP/harness-failure_$required.out"
+    [ -e "$TMP/harness-failure_$required.workspace" ]
+done
 
 echo "runtask privilege helper tests: PASS"

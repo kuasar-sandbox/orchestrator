@@ -14,8 +14,11 @@ dump_template_build_failure() {
 }
 
 build_ready_template() {
+# The template Build uses the same 6GiB input as the focused Builder cases so
+# its initial reservation fits the public runner's default startup pool.
+# The resulting Sandbox still has the separately asserted 2560MiB capacity.
 REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"2560MiB"}}'
-code=$(req POST /v3/templates "$AK" "{\"name\":\"exec-tmpl\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":8192}")
+code=$(req POST /v3/templates "$AK" "{\"name\":\"exec-tmpl\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}")
 unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)

@@ -3,6 +3,8 @@ set -euo pipefail
 
 : "${BIN:?BIN must point to the prepared platform binary directory}"
 : "${WORK:?WORK must be provided by the platform E2E runner}"
+. "${E2E_LIB:?}/orchestrator/case_workspace.sh"
+. "$E2E_LIB/orchestrator/runtask_privilege.sh"
 ORCH="$BIN/node-ctl"
 [ -x "$ORCH" ] || { echo "missing prepared product: $ORCH" >&2; exit 1; }
 
@@ -15,7 +17,11 @@ cleanup() {
     [ -n "$UNIT" ] && systemctl reset-failed "$UNIT.service" >/dev/null 2>&1
     [ -n "$DUP_UNIT" ] && systemctl stop "$DUP_UNIT.service" >/dev/null 2>&1
     [ -n "$DUP_UNIT" ] && systemctl reset-failed "$DUP_UNIT.service" >/dev/null 2>&1
-    [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
+    if [ -n "$SRV_PID" ]; then
+        kill "$SRV_PID" 2>/dev/null
+        wait "$SRV_PID" 2>/dev/null || true
+    fi
+    case_workspace_cleanup
 }
 trap cleanup EXIT
 fail() { echo "FAIL orchestrator.runtask.sh: $*" >&2; exit 1; }
@@ -23,8 +29,9 @@ fail() { echo "FAIL orchestrator.runtask.sh: $*" >&2; exit 1; }
 command -v python3 >/dev/null
 command -v systemd-run >/dev/null
 [ -d /run/systemd/system ] || { echo "systemd manager is required" >&2; exit 1; }
-[ "$(id -u)" -eq 0 ] || { echo "root is required" >&2; exit 1; }
+runtask_enter_privileged case_workspace_cleanup "$0" "$@"
 systemctl show-environment >/dev/null 2>&1 || { echo "systemd manager is unavailable" >&2; exit 1; }
+case_workspace_init
 
 SOCK="$WORK/node-ctl.socket"
 RUN_ID="sr-00000000-0000-7000-8000-000000000001"
@@ -127,7 +134,7 @@ SRV_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { cat "$WORK/server.log"; fail "fake config socket did not come up"; }
 
-UNIT="e2e-runtask@$RUN_ID"
+UNIT="e2e-runtask-${WORK##*/}@$RUN_ID"
 echo "==> run-sandbox: launch in delegated transient unit $UNIT"
 systemd-run --quiet --unit="$UNIT" --service-type=exec \
     --slice=sandbox-runner.slice \
@@ -174,7 +181,7 @@ RUNNER_CGROUP="$(awk -F: '$1 == "0" { print $3 }' "/proc/$RT_PID/cgroup")"
 kill -0 "$RT_PID" 2>/dev/null || fail "exec-replaced target is not alive"
 echo "==> PASS: portable root-to-ctl placement, delegated ctl/vmm handoff, exact readiness wire, and PID inheritance"
 
-DUP_UNIT="e2e-runtask-duplicate@$RUN_ID"
+DUP_UNIT="e2e-runtask-duplicate-${WORK##*/}@$RUN_ID"
 set +e
 systemd-run --quiet --wait --pipe --unit="$DUP_UNIT" --service-type=exec \
     --slice=sandbox-runner.slice \
