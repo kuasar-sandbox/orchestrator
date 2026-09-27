@@ -25,7 +25,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-
 func TestWaitSandboxAssignmentRetriesInterruptedResponse(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.sock")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

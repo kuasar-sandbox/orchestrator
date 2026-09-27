@@ -1026,7 +1026,6 @@ func TestRunPoolAssignWithFenceSkipsDisconnectedIdleBeforeHealthyCapacity(t *tes
 	}
 }
 
-
 func TestRunPoolAssignmentFenceReleasesAfterRetiredRunIsForgotten(t *testing.T) {
 	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
 	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Second)

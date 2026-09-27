@@ -95,7 +95,6 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	return ops.launchTask(socket, sid, runID, ready, vmmCgroup)
 }
 
-
 func waitSandboxAssignmentWithRetry(ctx context.Context, socket, runID string, wait func(context.Context, string, string, string) (string, error)) (string, error) {
 	delay := 20 * time.Millisecond
 	for {
