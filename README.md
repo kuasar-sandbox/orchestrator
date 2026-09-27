@@ -102,33 +102,43 @@ The Go binaries are built with `CGO_ENABLED=0`.
 ```bash
 make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
-make test                       # unit tests
-e2e_arch="$(uname -m)"
-e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
-bash scripts/ci-e2e-build.sh cli "$e2e_arch" "$e2e_tools"
-ORCH_CLI_TEST_BIN="$e2e_tools/orch-cli.test" make test-e2e  # requires the assembled project BIN
+make test                       # unit and helper tests
+ORG=/path/to/exact/sources make test-source  # source/race/vet/integration gates
 ```
 
-The owner suite includes `e2e_capture_cli.sh`, which runs
-`TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase` and
-`TestExportPublicationCLIAPI` against the selected real `sandbox-ctl` and
-`node-ctl`. It requires every current subcase to finish without Skip, including
-carrier deletion before structured-result commit, rejection of torn capture
-responses and the portable CLI/API matrix after artifact access is removed.
-Missing products, missing helpers, empty selections and parent-only results fail.
-An optional local `go test` without `KUASAR_TEST_SANDBOX_CTL` may still skip these
-groups; that is not evidence for the required entry.
+Capture CLI/DB fixture contracts are source integration, not product E2E. The
+required source gate builds the exact sibling sandboxer's `sandbox-ctl` and runs
+`TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase`
+and `TestExportPublicationCLIAPI` from this exact orchestrator source. Every
+selected group must run at least one subcase and every started subcase must pass;
+Skip, failure, parent-only output, or missing exact sibling source fails the gate.
 
-The local command prepares the CLI helper with the existing fixture script and
-passes it to `make test-e2e`. Hosted artifact validation builds `orch-cli.test` from the independently pinned owner
-test revision before preparation; the runner consumes only that executable and
-`BIN`, without fetching sources or compiling. The existing required source checks
-also execute the runner's input/selection/Skip regressions. The focused entry is:
+Product E2E follows **prebuilt products → prepare → `<suite>.<case>.sh` → the
+shared public runner**. The full filename is the case ID; its first segment is
+the suite. The project owns the nine suites `basic`, `storage`, `image`,
+`network`, `sandbox`, `snapshot`, `orchestrator`, `builder`, and `telemetry`.
+Cases consume `BIN`, `WORK`, `OUT`, `E2E_LIB`, prepared helper paths and prepared
+images. They do not compile, search sibling source trees, pull fallback images,
+or select a host product in place of a missing prepared input. Real guest builds,
+flattening, snapshots and publication are operations under test and stay real.
 
-```bash
-BIN=/path/to/selected/bin ORCH_CLI_TEST_BIN=/path/to/prepared/orch-cli.test \
-  bash test/e2e/e2e_capture_cli.sh
+From the assembled project platform directory, use its sole public entrypoint:
+
+```sh
+python3 test/e2e/e2e prepare --release-dir /path/to/platform --workdir /path/to/prepared
+python3 /path/to/prepared/test/e2e/e2e list --suite orchestrator
+python3 /path/to/prepared/test/e2e/e2e run --workdir /path/to/prepared --include orchestrator.lifecycle.sh
 ```
+
+Preparation must supply the selected products, helper executables and local
+images required by the selection. KVM cases require Linux, root, systemd and
+the prepared Kernel/Runtime. Missing inputs fail the case. Helpers own fixture,
+process, network, HTTP and observation primitives; each case owns its scenario.
+See the project [E2E contract](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/172)
+for aggregation and release acceptance.
+
+The [owner coverage table](docs/node.md#15-tests) maps each substantive contract
+to its maintained focused case.
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
@@ -142,7 +152,7 @@ Do not infer which source revision was tested from the version label: record the
 exact sibling SHAs. Runtime/Kernel artifacts are additional prerequisites for
 real sandbox tests, not Go-only compilation.
 
-The local `make test-e2e-cluster-stub` flow starts real control-plane processes
+The source `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh` flow starts real control-plane processes
 but no MicroVMs. Its run directory is private. Failure output reports diagnostic
 filenames and sizes, not raw responses, logs or capability-bearing objects.
 Daemon output is written directly to private files, not streamed to CI; the
@@ -161,7 +171,7 @@ concurrent execute/MMDS invocation is refused before resource creation. The lock
 descriptor is not inherited by daemons. Async launch assertions wait for the
 actual runner observation without relaxing sandbox identity or launch-mode
 checks. `make test` includes isolated cleanup/concurrency regressions; those
-checks do not substitute for running both real execute and MMDS cases.
+checks do not substitute for running the corresponding real lifecycle, exec, pause/wake, snapshot and MMDS cases.
 
 Cross-repository contract changes require linked companion PRs and exact-source
 integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).

@@ -2629,66 +2629,58 @@ migrate,node-link(注册/事件/命令往返)等).
 最后重新导出. capture 用例在返回结构化结果前删除载体, 并要求撕裂响应保留 running
 行和原有对.
 
-必需的 owner 入口 [e2e_capture_cli.sh](../test/e2e/e2e_capture_cli.sh) 使用所选
-真实产品执行三组 CLI 集成用例及全部当前子用例. 缺少 `BIN` 产品或已准备的
-`ORCH_CLI_TEST_BIN`、空选择、未完成的子用例或任何 Skip 都使该入口失败.
-既有 build/helper 阶段按独立 test pin 编译测试执行文件; hosted artifact E2E
-只消费该文件和 `BIN`, 不检出源码或编译. 本地可选 `go test` 未设置
-`KUASAR_TEST_SANDBOX_CTL` 时仍可跳过这些组. 将 `BIN` 指向所选且已构建的
-产品目录, 从本仓库执行:
+必需源码集成使用 `make test-source`，要求 Go 1.26.1+，并以 `ORG` 指定
+所选集成源码工作区。它编译 exact sibling sandboxer CLI 来执行上述三组 capture/发布
+测试；缺组、未完成子用例或任何 Skip 均失败。`test/source/builder_state.sh` 实际执行
+必需的状态、并发、策略及发布规划 Go 合同，并拒绝缺失/跳过测试。单元/race/vet、helper
+回归、特权 UFFD/Collector 检查、unit upgrade、journal 身份、cluster stub 集成和性能
+门禁属于独立源码检查。
+Helper 回归直接执行资源用例使用的就绪、grow 事件和实时 reservation 判定，覆盖
+延迟、非法及被后续状态替代的观察值；同时验证 capture 结果完整性和先恢复再准备的顺序。
 
-```bash
-KUASAR_TEST_SANDBOX_CTL="$BIN/sandbox-ctl" go test ./internal/orch \
-  -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$' \
-  -count=1 -v
+产品 E2E 遵循 **预构建产品 → prepare → `<suite>.<case>.sh` → 统一公开 runner**。
+完整文件名是 case ID，第一段是 suite。项目只使用 `basic`、`storage`、`image`、
+`network`、`sandbox`、`snapshot`、`orchestrator`、`builder`、`telemetry` 九个 suite。
+用例消费 `BIN`、`WORK`、`OUT`、`E2E_LIB`、已准备的 helper 路径与本地镜像；
+不编译、不发现兄弟源码仓、不自动拉取后备镜像、不以主机产品替代缺失的准备输入。
+真实 guest build、flatten、snapshot 与 publish 是被测操作，继续真实执行。
+
+在已组装的项目平台目录中，使用唯一公开入口：
+
+```sh
+python3 test/e2e/e2e prepare --release-dir /path/to/platform --workdir /path/to/prepared
+python3 /path/to/prepared/test/e2e/e2e list --suite orchestrator
+python3 /path/to/prepared/test/e2e/e2e run --workdir /path/to/prepared --include orchestrator.lifecycle.sh
 ```
 
-逐组核对当前子用例是否实际执行; 包含 Skip 的进程退出成功不构成 CLI 合同验证.
+准备阶段必须提供所选产品、helper 可执行文件和本地镜像。KVM 用例还要求 Linux、
+root、systemd 与已准备的 Kernel/Runtime；缺少输入直接失败。共享 helper 只负责
+fixture、进程、网络、HTTP 和观测原语，每个 case 自己拥有测试场景。
+聚合与发布验收见项目 [E2E 合同](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/172)。
 
-Native exec 的真实 microVM 特性用例分别覆盖 standalone 和 cluster 路径的
-ExecAccessToken 签发,`service=exec` CONNECT 以及 guest 命令执行.该结论只对上述
-native exec 路径负责,不表示同一聚合脚本的后续 pause/resume 等其它阶段已一并验收.
-
-编排特性的 E2E 与实现一起维护在 `orchestrator/test/e2e/`。轻量 cluster stub 与需要
-vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品的真实 microVM
-用例使用同一个 `run_all.sh`。直接调用脚本时通过 `BIN` 指向项目主仓组装的二进制目录；
-`make test-e2e` 传入 `E2E_BIN`，默认 sibling 主仓 `bin/<architecture>`；它准备测试 helper 并执行必需的源码检查，但不构建这些产品前置，需先组装；
-本地 stub 则使用 `make build` 后 `make test-e2e-cluster-stub`。
-组件 PR 的集成测试则把候选仓与其余仓源码组成统一环境后执行该入口。缺少重型前置时单脚本可
-跳过,完整门禁设置 `REQUIRE_*=1` 后硬失败。
-
-直接运行 Proxy E2E（包括其 MMDS restart wrapper）时，先准备本机架构的 helper，并传入两个可执行文件路径。以下命令从 orchestrator 仓库执行，要求产品二进制已组装且既有 KVM/Docker/zot 前置可用：
-
-```bash
-e2e_arch="$(uname -m)"
-make e2e-fixtures TARGET_ARCH="$e2e_arch"
-e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
-BIN="$PWD/../kuasar-sandbox/bin/$e2e_arch" \
-CUSTOM_PROXY_BIN="$e2e_tools/custom-proxy" \
-TELEMETRY_GRPC_PROBE_BIN="$e2e_tools/telemetry-grpc-probe" \
-REQUIRE_PROXY=1 bash test/e2e/e2e_orchestrator_proxy.sh
-```
-
-如产品组装在其它目录，请调整 `BIN`。脚本在重型环境准备前检查必需的 gRPC probe，不在 E2E 中编译 helper。完整套件的 `make test-e2e` 会自动传入这些路径。
-
-| 脚本 | 覆盖 |
+| 维护的用例 | 必需断言 |
 |---|---|
-| `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill |
-| `e2e_runtask.sh` | 先做 config/参数 CLI smokes，再用真实 delegated systemd、无需 KVM：常驻父/直接子进程身份、session 先于 assignment、同 Run 重连不重复启动、父 PID/session FD 隔离、子进程退出前 readiness EOF、唯一结果及 ACK 后父进程退出、重复父进程锁拒绝、cgroup 清理。required suite 缺前置条件时报错而非跳过。 |
-| `e2e_builder_unit_upgrade.sh` | 隔离真实 systemd:生成 slice 更新, live runtime properties 保留, 按 exact source 一次性移除;reload 后检查实际 cgroup 值.  |
-| `e2e_run_builder.sh` | target-aware 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):真实 IMG/SBX/SNP、fromImage/fromTemplate(img/sbx/snp)、image/checkpoint publication matrix、Manifest 与 named-location Bundle、顶层 E 无完整 staging/零 Phase C、portable Phase-C image ref、local/Bundle checkpoint mode、S→E cold selection、memory C 固定等待、source-ref closure 与 Build-row TTL 后 canonical Create;另覆盖 COPY/bare,父级/ctl 隔离与有限 VMM 控制,conductor 崩溃后保持 exact claim/run-id/进程的 live Build 接管,真实总超时 fencing 与 claim/reservation 释放,终态 cleanup,日志/DB/artifact secrecy |
-| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、持久 RunDir/BaseDir、BaseDir writable diff/checkpoint、RunRoot 无大工件、PathID native exec、local Pause→resume 与恢复策略、failed Create 的 dead 零 ownership、显式 delete finalizer 删除 row/RunDir/BaseDir 且不伤 node-level 文件；静态/动态模式 CH/runtime/parent SIGKILL 不依靠 DELETE/restart 自动达到零 ownership dead；存活中重启 conductor/资源控制器保留精确进程链和 runtime StateSync 身份。记录父进程 PSS/private memory/FD 与 ready/cleanup 时延，不设机器相关性能硬阈值。 |
-| `e2e_mmds_routes.sh` | 复用 execute 的 Proxy 拓扑覆盖 static,secret 生命周期与 local UDS service |
-| `e2e_mmds_routes_proxy_restart.sh` | 复用 Proxy 拓扑覆盖 MMDS full resync/fail-closed 恢复 |
-| `e2e_orchestrator_proxy.sh` | Proxy master/worker,唯一 data ingress,路由同步,数据面鉴权,auto-resume 与 CONNECT relay |
-| `e2e_cluster_stub.sh` | 真实 registry/router/placer + node-stub-ctl,以不同 API/Data listener 覆盖 node-link,Reserve,control/data/exec/build 路由,稳定 SandboxID 与成员变更 |
-| `go test ./test/e2e/cluster_stub` | 可执行的 h2c node-link/Registry/Router/Placer 集成；覆盖 Build live projection、连接中丢失 Delete 后以空 Build full snapshot 删除 projection 与 exact owner ref |
-| `e2e_cluster_real.sh` | 真实 cluster 控制面、node-ctl 与 microVM,覆盖单 registry、node-link redirect，以及 cluster Delete 后 Registry route 与节点 row/RunDir/BaseDir 的共同收敛 |
-| `e2e_density.sh` | 节点资源准入、回收与密度行为 |
-| `e2e_sandbox_cold_target.sh` | node-ctl 资源控制器驱动 production-shaped sandbox target 冷启动 |
-
-`make test-e2e` 即执行 `test/e2e/run_all.sh`;项目主仓只提供统一环境、聚合入口及真正跨组件
-组合本身的用例,不复制上述脚本。
+| [`basic.orchestrator-cli.sh`](../test/e2e/cases/basic.orchestrator-cli.sh); [`orchestrator.api.sh`](../test/e2e/cases/orchestrator.api.sh); [`builder.api.sh`](../test/e2e/cases/builder.api.sh) | CLI help/config、unit 安装、health/鉴权、注册/触发/状态、跨 key 归属和无效请求。 |
+| [`orchestrator.runtask.sh`](../test/e2e/cases/orchestrator.runtask.sh) | 常驻 unit 父进程/直接子进程身份；Run session 先于 assignment；同 Run 重连不重复 assignment/launch；父进程专属描述符不传给子进程；子进程退出前 readiness EOF；唯一 reap/result report；重复父进程拒绝；delegated ctl/vmm 清理；exact-run bootstrap 及 TASK_* /重复 MANIFEST_KEY 清理。 |
+| [`orchestrator.lifecycle.sh`](../test/e2e/cases/orchestrator.lifecycle.sh) | WaitAssignment/readiness/init 失败、starting 状态 SetTimeout/Pause/Kill、Create parking、RunDir/BaseDir 归属、资源/lease、list/detail，以及保留节点文件的最终清理；真实 runner/runtime/VMM 退出自动收敛，存活中控制器重启保持 exact run 与 StateSync 身份。 |
+| [`orchestrator.exec.sh`](../test/e2e/cases/orchestrator.exec.sh) | 显式 KAT 及条件（空、exact、OR、cwd/user/TTY）、PTY resize/stdin/stdout/stderr/退出码、envd 初始化/hostname、marker 和真实 FloatingIP HTTP。 |
+| [`orchestrator.pause-wake.sh`](../test/e2e/cases/orchestrator.pause-wake.sh) | Guest /app 委派和冻结的进程/listener/counter；已受理 Pause 的 SIGTERM/143 取消屏障；同一 token 唤醒请求；memory 策略 node/body/header false/null 优先级、cold E、重复清理、native usage 和 TTL/reaper。 |
+| [`orchestrator.snapshot.sh`](../test/e2e/cases/orchestrator.snapshot.sh) | 本地 baseline/delta 内存恢复、磁盘层分离、portable keep/move 导出、noWake 拒绝、self-only prefetch 与清理；真实 Bundle A/B/C 闭包保持历史内存，Store 发布、本地恢复及 E-only 导出/导入保持 canonical 引用。 |
+| [`orchestrator.resource-startup.sh`](../test/e2e/cases/orchestrator.resource-startup.sh); [`orchestrator.resource-admission.sh`](../test/e2e/cases/orchestrator.resource-admission.sh) | 重复 8GiB/低分配启动、有限 VMM 与无限制 parent/ctl；默认和小容量在 exec/pause/resume 后的 headroom、有界关闭；硬件容量、显式 512MiB 冷启动 reservation/balloon、Python 执行与 connected/settled 准入，随后验证红区拒绝。 |
+| [`orchestrator.resource-control.sh`](../test/e2e/cases/orchestrator.resource-control.sh); [`orchestrator.resource-recovery.sh`](../test/e2e/cases/orchestrator.resource-recovery.sh); [`orchestrator.resource-reservation.sh`](../test/e2e/cases/orchestrator.resource-reservation.sh) | 真实 sandbox-local 压力/grow、CH balloon 生效且无 OOM，控制器重启/inventory 收敛以及 reservation 生命周期。 |
+| [`orchestrator.proxy.sh`](../test/e2e/cases/orchestrator.proxy.sh); [`orchestrator.proxy-auth.sh`](../test/e2e/cases/orchestrator.proxy-auth.sh) | 唯一数据入口；显式 local/stable 身份、重复 ID 拒绝、parking、静态 stats/native traffic、正确/缺失/错误 token 且不刷新 idle、canonical WebSocket、signed files、被动 noWake、raw CONNECT 和 native exec。 |
+| [`orchestrator.proxy-wake.sh`](../test/e2e/cases/orchestrator.proxy-wake.sh) | 条件拒绝的 exec 不改变 paused guest；同一合法 KAT 冷恢复并使 health/traffic 收敛。 |
+| [`orchestrator.proxy-restart.sh`](../test/e2e/cases/orchestrator.proxy-restart.sh) | 已准备的自定义扩展入口/private WebSocket；master 缺失时准入 503 且不占资源；master 路由 resync、worker 故障/替换就绪、metrics 和 worker 回收。 |
+| [`orchestrator.mmds.sh`](../test/e2e/cases/orchestrator.mmds.sh); [`orchestrator.mmds-recovery.sh`](../test/e2e/cases/orchestrator.mmds-recovery.sh) | 独立 guest 覆盖 static、initial/unresolved secret、更新/轮换/删除、未声明 route 拒绝及 UDS service；恢复用例在更新和 full resync 之间重启 Proxy；两者检查 DB/log/route-table 明文不泄露。 |
+| [`orchestrator.cluster-lifecycle.sh`](../test/e2e/cases/orchestrator.cluster-lifecycle.sh) | node-link/placer 就绪后单次 Create；group/stable-ID exec、E pause/wake、WebSocket、data/stats/list 及 route/node/目录最终收敛；路由 Build 取消释放容量；Router 重启后首先读取保留状态；canonical peer/reuse 在 transient 删除后仍可用，且无目录 FD 残留。 |
+| [`orchestrator.cluster-recovery.sh`](../test/e2e/cases/orchestrator.cluster-recovery.sh) | 三个 Registry 观测真实 node-link redirect、重启实际 owner、等待 node-link 和 placer 收敛，随后单次 Create、data 就绪及 Registry/node DELETE 最终清理。 |
+| [`builder.image.sh`](../test/e2e/cases/builder.image.sh) | 重复 pool 独立预热、请求所选 DNS 的真实 image pull/flatten 和 Phase-A reservation、终态冲突/list、e2b/bare image 结果与 Build-row TTL 后 canonical cold Create。 |
+| [`builder.steps.sh`](../test/e2e/cases/builder.steps.sh) | 真实 RUN/ENV/WORKDIR、guest cgroup 委派、start/ready 继承、conductor SIGKILL 后原 worker/claim/进程接管、限定 phase 清理和 A/B/C 资源归属；snapshot/image metadata、单次 task-local source 准备、SNP-to-image 实体化及 Build MMDS 不可变/终态保密。 |
+| [`builder.context.sh`](../test/e2e/cases/builder.context.sh) | 未配置 COPY/files 的 501、格式错误或缺失 context 的 400、presigned 直接上传与 present false→true 幂等、真实 COPY 默认/chown 归属及 A/B 请求 DNS。 |
+| [`builder.sandbox.sh`](../test/e2e/cases/builder.sandbox.sh) | 不启动 A/B/C 的顶层 E、目标 capacity/env 和 source 闭包；E-to-image auto 解析；memory-C 无 ready 的固定等待、新 S→E 身份且不继承命令；row TTL 后 canonical E/snapshot Create。 |
+| [`builder.failure.sh`](../test/e2e/cases/builder.failure.sh) | 重复无 assignment 的常驻 runner/Builder unit 在 run-session 准入失败后被回收且保留 journal；真实挂起 RUN 取消与自动总超时、队列容量恢复、claim/进程/cgroup/port/目录回收、canonical peer 和存活 guest 保留、FD 关闭及确定业务错误诊断。 |
+| [`builder.publish.sh`](../test/e2e/cases/builder.publish.sh) | 保持 DB/key 的五个真实 local/Bundle、Manifest/named-location 发布操作：顶层 E 无中间 image、S→E delta 的 portable image 引用、精确 Store 对象变化、Bundle 目录闭包和 row TTL 后 canonical image/snapshot Create。 |
+| [`telemetry.proxy.sh`](../test/e2e/cases/telemetry.proxy.sh); [`telemetry.backends.sh`](../test/e2e/cases/telemetry.backends.sh); [`telemetry.guest.sh`](../test/e2e/cases/telemetry.guest.sh) | 真实 404 前后的 Prometheus counter 基线/增加与独立 backend 合同；真实 guest OTLP HTTP/gRPC/native traffic、local/stable 身份、pause/restart history/noWake、Collector 缺失/断连及 namespace 归属。 |
 
 ### 原生 usage 读取验证
 

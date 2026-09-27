@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "test/e2e/e2e_telemetry_backends.sh"
+SCRIPT = ROOT / "test/source/telemetry_backends.sh"
 IMAGE = "example/backend:1@sha256:" + "a" * 64
 MIRROR = "m.daocloud.io/docker.io/" + IMAGE
 

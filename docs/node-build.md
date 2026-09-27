@@ -190,7 +190,7 @@ Build.Resources remains immutable and supplies both admission/accounting and res
 
 The removed outer systemd enforcement contract is not replaced by a parent quota, weight, memory.high, overhead budget or background cleaner. New unit instances receive no orchestrator resource properties. Updating a project-generated sandbox-builder.slice removes its CPUQuota/MemoryMax lines and reloads systemd. Existing live services can still retain runtime properties installed by the old process; daemon-reload alone does not remove their source files.
 
-The isolated `test/e2e/e2e_builder_unit_upgrade.sh` regression checks actual cgroup files before and after reload: a generated slice loses its old policy, while the same live service keeps its runtime limits and PID. After that exact fixture execution stops and only its two known property files are removed, a new execution has `cpu.max` beginning with `max` and `memory.max=max`. The real Builder suite separately checks the same parent values while retaining finite sandbox-ctl VMM limits.
+The isolated `test/source/builder_unit_upgrade.sh` regression checks actual cgroup files before and after reload: a generated slice loses its old policy, while the same live service keeps its runtime limits and PID. After that exact fixture execution stops and only its two known property files are removed, a new execution has `cpu.max` beginning with `max` and `memory.max=max`. The real Builder suite separately checks the same parent values while retaining finite sandbox-ctl VMM limits.
 
 For a one-time deployment upgrade:
 

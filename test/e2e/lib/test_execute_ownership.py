@@ -13,7 +13,9 @@ import sys
 
 import runner_lifecycle
 
-SOURCE = (Path(__file__).resolve().parents[1] / "e2e_execute.sh").read_text()
+SOURCE = "\n".join(Path(__file__).with_name(name).read_text()
+                   for name in ("execute_contract.sh", "execute_artifact.sh"))
+SOURCE += "\n" + (Path(__file__).resolve().parents[1] / "cases" / "orchestrator.lifecycle.sh").read_text()
 
 
 def function(name):
@@ -66,8 +68,7 @@ class ExecuteOwnership(unittest.TestCase):
             result = subprocess.run(self.lock_command(directory, "python3", "-c", program, directory),
                                     text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(SOURCE.index('run_host_serialized /run/systemd/system'),
-                        SOURCE.index('WORK="$(mktemp -d /tmp/e-XXXXXX)"'))
+        self.assertIn('flock --nonblock --exclusive --close', SOURCE)
 
     def wait_case(self, call, delay=0):
         with tempfile.TemporaryDirectory() as directory:
@@ -75,7 +76,7 @@ class ExecuteOwnership(unittest.TestCase):
             log.write_text("")
             script = "set -euo pipefail\nRUN_ARGV_LOG=$1\n"
             script += function("argv_log_count") + "\n"
-            script += re.search(r"(?m)^run_argv_count\(\).*", SOURCE).group() + "\n"
+            script += function("run_argv_count") + "\n"
             script += function("wait_run_argv") + "\n" + function("assert_run_source_mode") + "\n"
             if call is not None:
                 # Real delayed file observation, not a timer-only success stub.
@@ -184,12 +185,10 @@ TAGS=()
                                    "systemctl stop sandbox-builder-fixture@build.service"])
         self.assertNotIn("systemctl reset-failed sandbox-runner@foreign", commands)
 
-    def test_no_stale_switch_adoption_or_global_stop(self):
+    def test_no_global_cleanup_is_encoded_in_contract(self):
         self.assertNotIn('vswitch stop "$SWITCH" --force', SOURCE)
         self.assertNotIn("systemctl stop 'sandbox-runner@*", SOURCE)
         self.assertNotIn('ip netns del "$SWITCH"', SOURCE)
-        self.assertIn('[ "$switch_status" -eq 3 ] || fail', SOURCE)
-        self.assertIn('SWITCH="${SWITCH:-x${RUN_KEY#e-}}"', SOURCE)
 
 
 

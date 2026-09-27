@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# Shared process/setup helpers for focused orchestrator resource product cases.
+# Product cases consume prepared binaries and a locally prepared base image; this
+# helper never downloads inputs or compiles products/helpers.
+set -euo pipefail
+
+resource_fail() { echo "FAIL: $*" >&2; exit 1; }
+
+resource_init() {
+    . "${E2E_LIB:?}/orchestrator/resource_observation.sh"
+    : "${BIN:?BIN must point to prepared products}"
+    : "${WORK:?WORK must be provided by the E2E runner}"
+    : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
+    . "$E2E_LIB/orchestrator/tarstream.sh"
+    export PATH="$BIN:$PATH"
+    for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl cloud-hypervisor vmlinux mkfs.erofs; do
+        [ -e "$BIN/$b" ] || resource_fail "missing prepared product $BIN/$b"
+    done
+    for tool in docker mkfs.ext4 python3 ip; do
+        command -v "$tool" >/dev/null || resource_fail "missing prerequisite $tool"
+    done
+    [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || resource_fail "/dev/kvm is required"
+    [ "$(id -u)" -eq 0 ] || resource_fail "root is required"
+    : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
+    RESOURCE_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
+    docker image inspect "$RESOURCE_IMAGE" >/dev/null 2>&1         || resource_fail "prepared base image is missing: $RESOURCE_IMAGE"
+    . "$E2E_LIB/orchestrator/case_workspace.sh"
+    case_workspace_init
+    mkdir -p "$WORK/run" "$WORK/lib" "$WORK/units"
+    RESOURCE_DAEMON_PID=""
+    RESOURCE_SANDBOX_PIDS=()
+    RESOURCE_SANDBOX_IDS=()
+    declare -gA RESOURCE_TAPS=()
+    trap resource_cleanup EXIT
+    [ -d /sys/fs/cgroup/sandboxes ] || mkdir /sys/fs/cgroup/sandboxes
+    echo "+memory +cpu" >/sys/fs/cgroup/sandboxes/cgroup.subtree_control 2>/dev/null || true
+    local blk="$WORK/base.img"
+    docker save "$RESOURCE_IMAGE" | "$BIN/flatten-ctl" export --output "$blk" --no-progress
+    RESOURCE_BASE_REF="$(plaintext_tarstream_ref "$blk")"
+}
+
+resource_setup_sandbox() {
+    local sid="$1"
+    local tap="r${BASHPID}n${#RESOURCE_SANDBOX_IDS[@]}"
+    [ ! -e "/sys/fs/cgroup/sandboxes/$sid" ] || resource_fail "foreign cgroup exists: $sid"
+    ip link show "$tap" >/dev/null 2>&1 && resource_fail "foreign TAP exists: $tap"
+    mkdir "/sys/fs/cgroup/sandboxes/$sid"
+    RESOURCE_SANDBOX_IDS+=("$sid")
+    RESOURCE_TAPS["$sid"]="$tap"
+    ip tuntap add "$tap" mode tap
+    ip link set "$tap" up
+    truncate -s 1G "$WORK/${sid}.diff"
+    mkfs.ext4 -q -F -O ^has_journal "$WORK/${sid}.diff"
+}
+
+resource_write_sandbox() {
+    local sid="$1" headroom="$2" capacity="$3" startup="$4" placeholder="${5:-false}"
+    cat >"$WORK/$sid.yaml" <<EOF
+resources:
+  capacity: { cpu: 1, memory: ${capacity}MiB }
+  allocatable: { cpu: 1, memory: ${headroom}MiB, deflate_on_oom: true }
+  control:
+    cgroup_path: /sys/fs/cgroup/sandboxes/$sid
+    controller: $WORK/sandbox-resource.sock
+  startup: { memory: ${startup}MiB }
+network: { tap: ${RESOURCE_TAPS[$sid]} }
+boot:
+  kernel: file://$BIN/vmlinux
+  runtime: file://$BIN/sandbox-runtime.bundle
+  cmdline: "console=hvc0"
+  root:
+    base: $RESOURCE_BASE_REF
+    overlay: { diff: file://$WORK/${sid}.diff }
+EOF
+    if [ "$placeholder" = true ]; then
+        printf 'launch:\n  placeholder: true\n' >>"$WORK/$sid.yaml"
+    else
+        printf 'launch:\n  exec: /bin/sleep\n  args: ["300"]\n' >>"$WORK/$sid.yaml"
+    fi
+}
+
+resource_write_pressure_workload() {
+    local sid="$1" mode="$2" start_gate="$3" delivery_gate="$4"
+    python3 - "$WORK/$sid.yaml" "$mode" "$WORK/sandbox-resource.sock" \
+        "$E2E_LIB/orchestrator/workload.py" "$start_gate" "$delivery_gate" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path, mode, controller, workload, start, delivery = sys.argv[1:]
+assert mode in {"static", "dynamic"}, mode
+config = Path(path).read_text()
+controller_line = f"    controller: {controller}\n"
+assert config.count(controller_line) == 1, "missing controller fixture input"
+if mode == "static":
+    config = config.replace(controller_line, "", 1)
+# Keep the original density comparison's deterministic 256-384MiB, two-cycle
+# workload. Its first complete allocation remains held until delivery is seen.
+program = 'print("control-workload-ready", flush=True)\n' + Path(workload).read_text()
+program += '\n# Keep the guest alive for the host post-workload observations.\ntime.sleep(30)\n'
+launch = {"exec": "/usr/local/bin/python3", "restart": "never", "env": {
+    "PYTHONUNBUFFERED": "1", "WL_MODE": "cycles", "WL_SEED": "42",
+    "WL_DURATION": "15", "WL_CYCLES": "2", "WL_RMIN_MIB": "256", "WL_RMAX_MIB": "384",
+    "WL_START_GATE": start, "WL_START_GATE_TIMEOUT": "60",
+    "WL_DELIVERY_GATE": delivery, "WL_DELIVERY_GATE_TIMEOUT": "60",
+}, "args": ["-c", program]}
+original = 'launch:\n  exec: /bin/sleep\n  args: ["300"]\n'
+assert config.count(original) == 1, "missing launch fixture input"
+Path(path).write_text(config.replace(original, "launch: " + json.dumps(launch) + "\n", 1))
+PY
+}
+
+resource_write_controller() {
+    local output="$1" compact="${2:-false}"
+    local physical_memory=4GiB host_memory=512MiB host_cpu=1 startup_factor=0.50 ttl=120s
+    if [ "$compact" = true ]; then
+        physical_memory=400MiB; host_memory=80MiB; host_cpu=0.5; startup_factor=1.00; ttl=60s
+    fi
+    cat >"$output" <<EOF
+api: { domain: resource.e2e.local, listen: "127.0.0.1:0" }
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
+proxy: { auth: enforce }
+sandbox:
+  boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle }
+paths:
+  run_root: $WORK/run
+  base_root: $WORK/lib
+  config_socket: $WORK/node-ctl.socket
+  db_path: $WORK/node-ctl.db
+units: { dir: $WORK/units, install: false }
+resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/state.json
+  cgroup_scan_paths: [/sys/fs/cgroup/sandboxes]
+  resources:
+    physical_memory: $physical_memory
+    physical_cpu: 4
+    host_reserved: { memory: $host_memory, cpu: $host_cpu }
+  watermarks:
+    operational_margin_factor: 0.10
+    high_factor: 0.85
+    low_factor: 0.70
+    emergency_factor: 0.05
+    startup_factor: $startup_factor
+  rate_limits: { memory_grant_per_sec_factor: 0.20 }
+  admission:
+    rate: 50
+    burst: 50
+    startup_ttl: $ttl
+    queue_ttl: 10s
+    queue_max_depth: 256
+  log_level: info
+EOF
+}
+
+resource_start_controller() {
+    local config="$1"
+    "$BIN/node-ctl" conductor serve --config "$config" >"$WORK/resource-controller.log" 2>&1 &
+    RESOURCE_DAEMON_PID=$!
+    for _ in $(seq 1 80); do
+        if [ -S "$WORK/sandbox-resource.sock" ] &&
+           "$BIN/node-ctl" resource status --socket "$WORK/sandbox-resource.sock" >/dev/null 2>&1; then
+            return 0
+        fi
+        kill -0 "$RESOURCE_DAEMON_PID" 2>/dev/null || {
+            cat "$WORK/resource-controller.log" >&2
+            resource_fail "resource controller exited before readiness"
+        }
+        sleep 0.25
+    done
+    resource_fail "resource controller did not become ready"
+}
+
+resource_stop_controller() {
+    local result=0
+    if [ -n "${RESOURCE_DAEMON_PID:-}" ]; then
+        resource_stop_process "$RESOURCE_DAEMON_PID" controller || result=1
+    fi
+    RESOURCE_DAEMON_PID=""
+    rm -f "$WORK/sandbox-resource.sock"
+    return "$result"
+}
+
+resource_run_sandbox() {
+    local sid="$1"
+    "$BIN/sandbox-ctl" run --config "$WORK/$sid.yaml" --sandbox-id "$sid"         --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/run"         >"$WORK/$sid.log" 2>&1 &
+    RESOURCE_LAST_PID=$!
+    RESOURCE_SANDBOX_PIDS+=("$RESOURCE_LAST_PID")
+}
+
+resource_reservation_count() {
+    local reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    RESERVATIONS_JSON="$reservations" python3 - <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+# The CLI marshals an empty AdminList result as null.
+if rows is None:
+    rows = []
+if not isinstance(rows, list):
+    raise SystemExit("resource list must return an array or null")
+print(len(rows))
+PY
+}
+
+resource_wait_reservations() {
+    local want="$1" timeout="$2" count=0 deadline
+    deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        count="$(resource_reservation_count 2>/dev/null || echo 0)"
+        [ "$count" -ge "$want" ] && return 0
+        sleep 0.25
+    done
+    resource_fail "only $count reservations after ${timeout}s; want $want"
+}
+
+resource_wait_state() {
+    local sid="$1" pid="$2" mode="$3" timeout="$4" deadline
+    deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if resource_reservation_matches "$sid" "$mode"; then return 0; fi
+        kill -0 "$pid" 2>/dev/null || resource_fail "$sid exited before reservation state $mode"
+        sleep 0.25
+    done
+    resource_fail "$sid did not reach reservation state $mode"
+}
+
+resource_shutdown_pid() {
+    local pid="$1" index
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 120); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            for index in "${!RESOURCE_SANDBOX_PIDS[@]}"; do
+                [ "${RESOURCE_SANDBOX_PIDS[$index]}" != "$pid" ] || RESOURCE_SANDBOX_PIDS[index]=""
+            done
+            return 0
+        fi
+        sleep 1
+    done
+    resource_fail "sandbox-ctl pid $pid did not stop after SIGTERM"
+}
+
+resource_wait_process_exit() {
+    local pid="$1" deadline=$((SECONDS + $2))
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$SECONDS" -lt "$deadline" ] || return 1
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
+resource_stop_process() {
+    local pid="$1" name="$2" grace="${3:-20}"
+    [ -n "$pid" ] || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    resource_wait_process_exit "$pid" "$grace" && return 0
+    echo "FAIL: $name pid $pid did not stop after ${grace}s; sending SIGKILL" >&2
+    kill -KILL "$pid" 2>/dev/null || true
+    resource_wait_process_exit "$pid" 5 \
+        || echo "FAIL: $name pid $pid remained alive after SIGKILL" >&2
+    return 1
+}
+
+resource_cleanup() {
+    local result=$?
+    trap - EXIT
+    set +e
+    if [ "$result" -ne 0 ]; then
+        local log sid
+        local -a logs=("$WORK/resource-controller.log")
+        for sid in "${RESOURCE_SANDBOX_IDS[@]}"; do logs+=("$WORK/$sid.log"); done
+        for log in "${logs[@]}"; do
+            [ -f "$log" ] || continue
+            echo "==> failure: ${log##*/} (last 80 lines)" >&2
+            tail -n 80 "$log" >&2
+        done
+    fi
+    for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do
+        [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do
+        resource_stop_process "$pid" sandbox-ctl || result=1
+    done
+    resource_stop_controller || result=1
+    for sid in "${RESOURCE_SANDBOX_IDS[@]:-}"; do
+        [ -n "$sid" ] || continue
+        ip link delete "${RESOURCE_TAPS[$sid]}" 2>/dev/null || true
+        rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null || true
+    done
+    case_workspace_cleanup || result=1
+    exit "$result"
+}
+
+resource_read_balloon() {
+    local sid="$1" json
+    json=$(curl --silent --show-error --fail --max-time 2         --unix-socket "$WORK/run/$sid/ch.sock" http://localhost/api/v1/vm.info) || return 1
+    python3 -c 'import json,sys
+info=json.load(sys.stdin); balloon=info.get("config",{}).get("balloon") or {}
+print(balloon.get("size",-1), info.get("memory_actual_size",-1))' <<<"$json"
+}
+
+resource_memory_control_observed() {
+    local sid="$1" high maximum
+    grep -qE 'memory: initial CH observation accepted epoch=[1-9][0-9]* seq=[1-9][0-9]*($|[[:space:]])' "$WORK/$sid.log" || return 1
+    high=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.high") || return 1
+    maximum=$(cat "/sys/fs/cgroup/sandboxes/$sid/memory.max") || return 1
+    [[ "$high" =~ ^[1-9][0-9]*$ && "$maximum" =~ ^[1-9][0-9]*$ ]] && [ "$high" -le "$maximum" ]
+}
+
+resource_reservation_memory() {
+    local sid="$1" reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    SID="$sid" RESERVATIONS_JSON="$reservations" python3 - 2>/dev/null <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+matches = [row for row in rows if row.get("sandbox_id") == os.environ["SID"]]
+assert len(matches) == 1, rows
+row = matches[0]
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+print(row["allocatable_memory"])
+PY
+}
+
+resource_wait_local_grow() {
+    local sid="$1" pid="$2" baseline="$3" timeout="$4" count=0 deadline
+    deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        count=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || count=0
+        [ "$count" -gt "$baseline" ] && return 0
+        kill -0 "$pid" || resource_fail "$sid exited before local grow"
+        sleep 0.1
+    done
+    resource_fail "$sid did not apply local grow"
+}
+
+resource_assert_no_oom() {
+    local sid="$1" oom=0
+    if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
+        oom=$(awk '$1=="oom"{print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local")
+        [ -z "$oom" ] && oom=0
+    fi
+    [ "$oom" -eq 0 ] || resource_fail "$sid cgroup oom_count=$oom"
+    ! grep -qiE 'oom-kill:|Out of memory: Killed process|app exited code=137|app_exited code=137' "$WORK/$sid.log"         || resource_fail "$sid guest OOM/SIGKILL observed"
+}

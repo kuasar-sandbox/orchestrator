@@ -8,7 +8,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
-	        test vet bench e2e-fixtures test-e2e test-e2e-cluster-stub release test-release clean help
+	        test test-source vet bench release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -32,9 +32,6 @@ endif
 GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
-E2E_BIN        ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
-ZOT_BIN        ?= zot
-VGW_BIN        ?= versitygw
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -76,15 +73,9 @@ node-stub-ctl:
 test:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_ENABLED=0 $(GO) test ./...
-	bash test/e2e/runtask_privilege_test.sh
-	bash test/e2e/vmm_cgroup_test.sh
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_cluster_stub_diagnostics.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_ownership.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_pause_cancellation.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_recovery.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_density_*.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_orchestrator_proxy_go.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_placer_readiness.py'
+	bash test/source/runtask_privilege.sh
+	bash test/source/vmm_cgroup.sh
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_*.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-telemetry-image-pull.py
 
 vet:
@@ -96,20 +87,10 @@ bench:
 clean:
 	rm -rf bin build
 
-# Orchestrator owns both its self-contained cluster stub and the full node,
-# proxy, builder, and cluster integration cases. The latter use the assembled
-# platform binary set supplied by Integration E2E.
-e2e-fixtures:
-	bash scripts/ci-e2e-build.sh fixtures "$(TARGET_ARCH)" "$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)"
-
-test-e2e: e2e-fixtures
+# Product E2E is executed by the shared project framework from prepared artifacts.
+# Local source checks remain available through the compiler-capable source gate.
+test-source:
 	bash scripts/ci-source-checks.sh
-	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" \
-		CUSTOM_PROXY_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/custom-proxy" \
-		TELEMETRY_GRPC_PROBE_BIN="$(CURDIR)/build/e2e-tools/$(TARGET_ARCH)/telemetry-grpc-probe" bash test/e2e/run_all.sh
-
-test-e2e-cluster-stub:
-	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
 
 VERSION ?= v0.1.0
 ACCELERATOR_VERSION ?= v0.1.3
@@ -136,7 +117,7 @@ help:
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e                   run the orchestrator-owned E2E suite with E2E_BIN"
+	@echo "  test-source                run compiler-capable orchestrator source integration checks"
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"

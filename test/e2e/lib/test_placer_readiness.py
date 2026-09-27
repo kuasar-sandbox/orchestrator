@@ -89,21 +89,19 @@ class PlacerReadinessTest(unittest.TestCase):
                             sleep=clock.sleep)
 
     def test_wiring_preserves_retained_status_before_placer_gate(self):
-        source = (Path(__file__).with_name("build_actions.py")).read_text()
+        source = (Path(__file__).resolve().parents[1] / "cases/orchestrator.cluster-lifecycle.sh").read_text()
         restart = source.index('wait_for("fixture Router/Registry restart"')
         retained = source.index('require("GET", status_path(wt, wb), 200)', restart)
-        enabled = source.index("post_restart = True", retained)
+        enabled = source.index("args.post_restart = True", retained)
         self.assertLess(restart, retained)
         self.assertLess(retained, enabled)
 
     def registration(self, opener, *, post_restart=True, placer_url="http://placer"):
-        # Execute the fixture's actual nested registration function without
+        # Execute the maintained registration primitive without
         # starting a VM. The readiness loop itself is not mocked.
-        path = Path(__file__).with_name("build_actions.py")
+        path = Path(__file__).with_name("build_client.py")
         module = ast.parse(path.read_text(), filename=str(path))
-        main = next(node for node in module.body
-                    if isinstance(node, ast.FunctionDef) and node.name == "main")
-        register = next(node for node in main.body
+        register = next(node for node in module.body
                         if isinstance(node, ast.FunctionDef) and node.name == "register")
         clock = Clock()
         gate = Mock(wraps=functools.partial(
@@ -111,8 +109,7 @@ class PlacerReadinessTest(unittest.TestCase):
             monotonic=clock.monotonic, sleep=clock.sleep))
         write = Mock(return_value=({"templateID": "transient-test", "buildID": "build-test"}, {}))
         scope = {"args": SimpleNamespace(placer_url=placer_url, group="/group",
-                                        expected_node="expected", cpu=2),
-                 "post_restart": post_restart, "wait_for_placer": gate,
+                                        expected_node="expected", cpu=2, post_restart=post_restart), "wait_for_placer": gate,
                  "require": write, "json": json}
         exec(compile(ast.Module(body=[register], type_ignores=[]), str(path), "exec"), scope)
         return scope["register"], write, gate

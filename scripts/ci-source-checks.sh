@@ -6,14 +6,23 @@ cd "$ROOT"
 go test -count=1 -timeout=5m ./...
 CGO_ENABLED=1 go test -race -count=1 -timeout=5m ./...
 go vet ./...
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_orchestrator_proxy_go.py -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_capture_cli.py -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_placer_readiness.py -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p test_registry_redirect.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-telemetry-image-pull.py
+bash test/source/runtask_privilege.sh
+bash test/source/vmm_cgroup.sh
+REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
+bash test/source/journal_contract.sh
+bash test/source/capture_cli.sh
+REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+bash test/source/builder_state.sh
+bash test/source/telemetry_backends.sh
+# Helper/source regressions stay in this compiler-capable gate, not in the
+# prepared product E2E runner. Discover the maintained helper tests as one set so
+# execute/resource/cluster/capture regressions cannot disappear during cutover.
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_*.py' -v
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 bash scripts/ci-e2e-build.sh source "$(uname -m)" "$work"
 telemetry_privilege=()
 if [ "$(id -u)" -ne 0 ]; then telemetry_privilege=(sudo -n); fi
 "${telemetry_privilege[@]}" env REQUIRE_TELEMETRY_NETNS=1 "$work/telemetry.test" -test.v -test.timeout=90s -test.run='^TestOTLPProxyNetNS'
-TELEMETRY_SOURCE_ROOT="$ROOT" bash test/e2e/e2e_telemetry_backends.sh

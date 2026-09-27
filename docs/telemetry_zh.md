@@ -490,26 +490,22 @@ GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/confi
 GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
-bash test/e2e/e2e_telemetry_backends.sh # source: Go + Docker; installed package: BIN + Docker
+bash test/source/telemetry_backends.sh # compiler-capable source contracts
 make test vet build
-make test-e2e # 要求组装的项目 BIN 与真实 KVM host
+ORG=/path/to/exact/sources make test-source
 ```
 
 组件自有 backend case 从固定 manifest digest 创建临时 Prometheus 3.5.0 和
 ClickHouse 25.8 容器, 只向 loopback 发布端口, 记录实际版本与镜像身份, 并独占一个
 私有 Docker network. 退出时删除自己创建的容器、volume 和 network, 包括部分启动
-失败的情况; 不依赖或修改共享的默认网桥. 两个引擎与所有具名 case 均必须执行; 缺少前提条件、
-skip 和失败均报错. 未缓存的镜像使用 platform 现有的公共 Docker Hub mirror,
-在有界时间内拉取相同的固定 manifest digest, 不替换 tag 或 backend 版本.
-Source CI 从组装的 `BIN` 目录定位精确 sibling checkout;
-源码缺失仍报错. 仅在其他源码布局中设置 `TELEMETRY_SOURCE_ROOT`. Source 与
-exact-assets 验证均通过 `test/e2e/run_all.sh` 执行同一 case. Exact-assets 使用
-发布的 `BIN/node-ctl`, 不要求 Go, 不重新构建组件源码.
-`TELEMETRY_BACKEND_OUT_DIR` 可指定保留配置、JSON test event、可执行文件 hash
-和引擎日志的位置; CI 默认写入会上传的 metadata 目录. Fixture 表与 Prometheus
-sample 只存在于临时容器内, 退出时删除其 volume.
+失败的情况; 不依赖或修改共享的默认网桥. 两个引擎与所有具名合同均必须执行。产品用例 `telemetry.backends.sh` 通过
+[统一 runner](node_zh.md#15-测试) 消费已准备的 node-ctl 和 backend 镜像，
+不发现源码、不编译、不自动拉取后备输入。每个 case 的输出保留版本、镜像/可执行文件
+身份、查询结果和日志。独立源码门禁 `test/source/telemetry_backends.sh` 准备临时固定
+backend，运行 Go exporter/Reader 集成测试，并编译 exact node-ctl/custom-telemetry
+验证 sealed-bootstrap/query-only 扩展；缺少或跳过 source group 均失败。
 
-两种布局均运行实际 node-ctl, 由可信基础设施 OTLP fixture 经原生 batch/queue、
+产品用例运行已准备的 node-ctl, 由可信基础设施 OTLP fixture 经原生 batch/queue、
 标准远端 exporter 和匹配 Reader, 通过私有 E2B query UDS 验证读取. 断言覆盖
 精确 SID/source 隔离、StableID 仅作 label、独立 MAX、包含端点的时间边界、
 不完整 bucket、不延长 Gauge、不创建本地 DB 和正常退出清理. 此 backend case

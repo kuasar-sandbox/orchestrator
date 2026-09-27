@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+# Archive fixtures prescribe 0755 directories regardless of the caller's umask.
+# mktemp still creates the enclosing workspace with mode 0700.
+umask 022
 
 # Keep this offline fixture's checksum routing and local-only Go isolation.
 export GOSUMDB=sum.golang.google.cn GOTOOLCHAIN=local
@@ -232,21 +235,58 @@ done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
   || fail "release workflow does not verify dependency releases"
 
-for entrypoint in test/e2e/e2e_cluster_real.sh test/e2e/e2e_cluster_stub.sh \
-  test/e2e/e2e_density.sh test/e2e/e2e_execute.sh \
-  test/e2e/e2e_orchestrator.sh test/e2e/e2e_orchestrator_proxy.sh \
-  test/e2e/e2e_run_builder.sh test/e2e/e2e_runtask.sh \
-  test/e2e/e2e_sandbox_cold_target.sh test/e2e/run_all.sh; do
-  [ "$(git -C "$ROOT" ls-files -s -- "$entrypoint" | awk '{print $1}')" = 100755 ] \
-    || fail "$entrypoint is not executable in the Git index"
+for entrypoint in \
+  test/e2e/cases/basic.orchestrator-cli.sh \
+  test/e2e/cases/builder.api.sh \
+  test/e2e/cases/builder.context.sh \
+  test/e2e/cases/builder.failure.sh \
+  test/e2e/cases/builder.image.sh \
+  test/e2e/cases/builder.publish.sh \
+  test/e2e/cases/builder.sandbox.sh \
+  test/e2e/cases/builder.steps.sh \
+  test/e2e/cases/orchestrator.api.sh \
+  test/e2e/cases/orchestrator.cluster-lifecycle.sh \
+  test/e2e/cases/orchestrator.cluster-recovery.sh \
+  test/e2e/cases/orchestrator.exec.sh \
+  test/e2e/cases/orchestrator.lifecycle.sh \
+  test/e2e/cases/orchestrator.mmds-recovery.sh \
+  test/e2e/cases/orchestrator.mmds.sh \
+  test/e2e/cases/orchestrator.pause-wake.sh \
+  test/e2e/cases/orchestrator.proxy-auth.sh \
+  test/e2e/cases/orchestrator.proxy-restart.sh \
+  test/e2e/cases/orchestrator.proxy-wake.sh \
+  test/e2e/cases/orchestrator.proxy.sh \
+  test/e2e/cases/orchestrator.resource-admission.sh \
+  test/e2e/cases/orchestrator.resource-control.sh \
+  test/e2e/cases/orchestrator.resource-recovery.sh \
+  test/e2e/cases/orchestrator.resource-reservation.sh \
+  test/e2e/cases/orchestrator.resource-startup.sh \
+  test/e2e/cases/orchestrator.runtask.sh \
+  test/e2e/cases/orchestrator.snapshot.sh \
+  test/e2e/cases/telemetry.backends.sh \
+  test/e2e/cases/telemetry.guest.sh \
+  test/e2e/cases/telemetry.proxy.sh; do
+  git -C "$ROOT" ls-files --error-unmatch "$entrypoint" >/dev/null 2>&1 \
+    || fail "rewritten product case is not tracked: $entrypoint"
 done
 
-PROXY_E2E="$ROOT/test/e2e/e2e_orchestrator_proxy.sh"
-grep -Fq 'CUSTOM_PROXY_BIN="-"' "$PROXY_E2E" \
-  || fail "exact-assets Proxy E2E does not select the built-in App"
-if grep -Fq 'CUSTOM_PROXY_BIN="$BIN/node-ctl"' "$PROXY_E2E"; then
-  fail "exact-assets Proxy E2E configures node-ctl as its own custom executable"
-fi
+for legacy in test/e2e/e2e_capture_cli.sh test/e2e/e2e_cluster_stub.sh \
+  test/e2e/e2e_builder_unit_upgrade.sh test/e2e/e2e_journal_contract.sh \
+  test/e2e/runtask_privilege_test.sh test/e2e/vmm_cgroup_test.sh \
+  test/e2e/e2e_sandbox_cold_target.sh test/e2e/e2e_cluster_real.sh \
+  test/e2e/e2e_density.sh test/e2e/e2e_orchestrator_proxy.sh \
+  test/e2e/e2e_mmds_routes.sh test/e2e/e2e_mmds_routes_proxy_restart.sh \
+  test/e2e/run_all.sh test/e2e/e2e_execute.sh test/e2e/e2e_run_builder.sh \
+  test/e2e/lib/build_actions.py test/e2e/lib/execute_pause_contract.sh \
+  test/e2e/cases/builder.pipeline.sh \
+  test/e2e/cases/orchestrator.cold-target.sh \
+  test/e2e/cases/orchestrator.execute.sh \
+  test/e2e/cases/orchestrator.proxy-lifecycle.sh; do
+  if git -C "$ROOT" ls-files --error-unmatch "$legacy" >/dev/null 2>&1; then
+    fail "migrated legacy E2E entrypoint remains tracked: $legacy"
+  fi
+done
+
 # shellcheck source=test/e2e/lib/proxy.sh
 . "$ROOT/test/e2e/lib/proxy.sh"
 write_proxy_config "$TMP/built-in-proxy.yaml" \

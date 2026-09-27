@@ -578,9 +578,9 @@ GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/confi
 GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
 GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
 GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
-bash test/e2e/e2e_telemetry_backends.sh # source: Go + Docker; installed package: BIN + Docker
+bash test/source/telemetry_backends.sh # compiler-capable source contracts
 make test vet build
-make test-e2e # assembled project BIN and real KVM host required
+ORG=/path/to/exact/sources make test-source
 ```
 
 The component-owned backend case creates disposable Prometheus 3.5.0 and
@@ -588,20 +588,16 @@ ClickHouse 25.8 containers from pinned manifest digests, publishes loopback-only
 ports, records actual versions and image identities, and owns a private Docker
 network. Containers, volumes and that network are removed on exit, including
 partial startup failure; the shared default bridge is not required or modified.
-Both engines and every named case are required; missing
-prerequisites, skips and failures are errors. Uncached images use platform's
-existing public Docker Hub mirror with a bounded pull and the same pinned
-manifest digest; no tag or backend version is substituted. Source CI locates the exact sibling
-checkout from the assembled `BIN` directory; missing sources remain an error.
-Set `TELEMETRY_SOURCE_ROOT` only for another source layout. The same case runs
-from `test/e2e/run_all.sh` in source and exact-assets validation. Exact-assets uses
-the shipped `BIN/node-ctl`, without Go or rebuilding component sources.
-`TELEMETRY_BACKEND_OUT_DIR` optionally selects retained configurations, JSON test
-events, executable hashes and engine logs; CI defaults to its uploaded metadata
-directory. Fixture tables and Prometheus samples exist only in disposable
-containers, whose volumes are removed on exit.
+Both engines and every named contract are required. Product case
+`telemetry.backends.sh` consumes the prepared node-ctl and backend images through
+the [shared runner](node.md#15-tests), without source discovery, compilation or
+fallback pulls. Its per-case output retains versions, image/executable identities,
+query results and logs. The independent `test/source/telemetry_backends.sh` source
+gate prepares disposable pinned backends, runs the Go exporter/Reader integration
+tests and builds exact node-ctl/custom-telemetry for sealed-bootstrap/query-only
+extension validation. Missing or skipped source groups fail that gate.
 
-Both layouts run the installed node-ctl with a trusted infrastructure OTLP
+The product case runs the prepared node-ctl with a trusted infrastructure OTLP
 fixture, native batch/queue, the standard remote exporter and the matching Reader
 through the private E2B query UDS. Assertions cover exact SID/source isolation,
 StableID as a label only, independent MAX, inclusive boundaries, incomplete
@@ -628,6 +624,6 @@ sandbox exports its actual saved usage through the same lease-authorized reader;
 assertions compare CPU/memory cumulative values and the original saved timestamp
 with the public native API and confirm the sandbox stays paused.
 
-The existing real Proxy E2E fixture also exercises envd → Collector → local DB,
+The independent `telemetry.guest.sh` case exercises envd → Collector → local DB,
 guest OTLP through connector mgmt-extract, auth, paused queries, unavailable
-telemetry, lease revocation and TSDB restart, without a second VM lifecycle.
+telemetry, lease revocation and TSDB restart, using its own real guest lifecycle.
