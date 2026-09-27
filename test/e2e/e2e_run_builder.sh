@@ -1165,9 +1165,10 @@ assert_phase_history() { # bid required-phase-or-dash forbidden-phase-or-dash la
 }
 
 # Exercise the installed templates without going through orchestrator cleanup:
-# an unknown run id reaches the real launcher, fails WaitAssignment, and exits
-# non-zero. CollectMode must unload each failed instance while journald retains
-# its diagnostics. Repetition proves the failed-unit set does not accumulate.
+# an unknown run id reaches the resident parent, fails run-session admission,
+# and exits non-zero before assignment. CollectMode must unload each failed
+# instance while journald retains its diagnostics. Repetition proves the failed
+# unit set does not accumulate.
 RUNNER_FAILED_BASE=$(failed_unit_count 'sandbox-runner@*.service')
 BUILDER_FAILED_BASE=$(failed_unit_count 'sandbox-builder@*.service')
 for kind in runner builder; do
@@ -1179,7 +1180,7 @@ for kind in runner builder; do
         run_id="issue178-$kind-$RANDOM-$attempt"
         unit="sandbox-$kind@$run_id.service"
         systemctl start "$unit" >"$WORK/$run_id.start" 2>&1 || true
-        wait_unit_journal_contains "$unit" "wait assignment" "$WORK/$run_id.journal" \
+        wait_unit_journal_contains "$unit" "open run session: unknown run" "$WORK/$run_id.journal" \
             || { cat "$WORK/$run_id.start" "$WORK/$run_id.journal" >&2; fail "$unit journal was not retained"; }
         wait_unit_collected "$unit" || fail "$unit remained loaded and failed"
     done

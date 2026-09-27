@@ -163,6 +163,109 @@ func TestRunSessionDisconnectRetirementLosesToSandboxAssignmentCommit(t *testing
 	}
 }
 
+
+func TestRunSessionDisconnectRetirementLosesToReconnectedIdleGeneration(t *testing.T) {
+	o := testOrch(t)
+	p, lc, baseCtx, _ := startRunPoolTestWithIndex(t, 2, &o.runs)
+	o.lc = lc
+	blockerRunID, blockerWaiter := addIdleRunForTest(t, p, lc, baseCtx)
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
+
+	first, ok, err := o.RegisterRunSession(context.Background(), runKindSandbox, runID)
+	if err != nil || !ok {
+		t.Fatalf("first RegisterRunSession = ok %v err %v", ok, err)
+	}
+	firstGeneration, ok := first.(*runSessionGeneration)
+	if !ok {
+		t.Fatalf("first session type = %T", first)
+	}
+
+	commitStarted := make(chan struct{})
+	commitGate := make(chan struct{})
+	assignDone := make(chan error, 1)
+	go func() {
+		_, err := p.Assign(baseCtx, "block-pool-retirement", func(gotRunID string) error {
+			if gotRunID != blockerRunID {
+				return fmt.Errorf("blocker runID = %q, want %q", gotRunID, blockerRunID)
+			}
+			close(commitStarted)
+			<-commitGate
+			return nil
+		})
+		assignDone <- err
+	}()
+	select {
+	case <-commitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking assignment did not enter its commit")
+	}
+
+	key := runSessionKey{kind: runKindSandbox, runID: runID}
+	o.runSessionsMu.Lock()
+	if current := o.runSessions[key]; current == nil || current.gen != firstGeneration.gen {
+		o.runSessionsMu.Unlock()
+		t.Fatalf("current session before disconnect = %+v, want generation %d", current, firstGeneration.gen)
+	}
+	delete(o.runSessions, key)
+	o.runSessionsMu.Unlock()
+
+	disconnectDone := make(chan struct{})
+	go func() {
+		o.handleRunSessionDisconnect(runKindSandbox, runID, firstGeneration.gen)
+		close(disconnectDone)
+	}()
+
+	second, ok, err := o.RegisterRunSession(context.Background(), runKindSandbox, runID)
+	if err != nil || !ok {
+		t.Fatalf("replacement RegisterRunSession = ok %v err %v", ok, err)
+	}
+	secondGeneration, ok := second.(*runSessionGeneration)
+	if !ok || secondGeneration.gen <= firstGeneration.gen {
+		t.Fatalf("replacement session = %T generation %d, first %d", second, secondGeneration.gen, firstGeneration.gen)
+	}
+
+	close(commitGate)
+	select {
+	case err := <-assignDone:
+		if err != nil {
+			t.Fatalf("blocking Assign: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking assignment did not finish")
+	}
+	select {
+	case got := <-blockerWaiter.resp:
+		if !got.ok || got.taskID != "block-pool-retirement" || got.err != nil {
+			t.Fatalf("blocker waiter = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocker waiter did not receive assignment")
+	}
+	select {
+	case <-disconnectDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("disconnect retirement did not finish after pool unblocked")
+	}
+
+	if !o.runSessionActive(runKindSandbox, runID) {
+		t.Fatal("old disconnect retired the replacement run session")
+	}
+	select {
+	case got := <-waiter.resp:
+		t.Fatalf("reconnected idle waiter was retired: %+v", got)
+	default:
+	}
+	select {
+	case stopped := <-lc.stopped:
+		t.Fatalf("old disconnect stopped reconnected idle unit %s", stopped)
+	default:
+	}
+	if unit := o.runs.unit(runID); unit != testRunUnit(runID) {
+		t.Fatalf("reconnected idle run unit = %q, want %q", unit, testRunUnit(runID))
+	}
+	second.Close(true)
+}
+
 func waitRunDisconnectIdle(t *testing.T, o *Orchestrator, kind, runID string) {
 	t.Helper()
 	ticker := time.NewTicker(5 * time.Millisecond)

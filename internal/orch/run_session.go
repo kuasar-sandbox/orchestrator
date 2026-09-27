@@ -81,11 +81,11 @@ func (o *Orchestrator) closeRunSession(key runSessionKey, gen uint64, shutdown b
 	if shutdown {
 		return
 	}
-	o.handleRunSessionDisconnect(key.kind, key.runID)
+	o.handleRunSessionDisconnect(key.kind, key.runID, gen)
 }
 
-func (o *Orchestrator) handleRunSessionDisconnect(kind, runID string) {
-	if o.retireUnassignedRun(kind, runID) {
+func (o *Orchestrator) handleRunSessionDisconnect(kind, runID string, disconnectedGen uint64) {
+	if o.retireUnassignedRun(kind, runID, disconnectedGen) {
 		return
 	}
 	switch kind {
@@ -371,7 +371,7 @@ func (o *Orchestrator) checkDisconnectedRunningSandbox(ctx context.Context, sb *
 	return o.finalizeSandboxResultOnce(ctx, sb.ID, sb.RunID)
 }
 
-func (o *Orchestrator) retireUnassignedRun(kind, runID string) bool {
+func (o *Orchestrator) retireUnassignedRun(kind, runID string, disconnectedGen uint64) bool {
 	unit, pool, waiting := o.runs.ownerPool(runID)
 	if !waiting || unit == "" || pool == nil {
 		return false
@@ -379,6 +379,16 @@ func (o *Orchestrator) retireUnassignedRun(kind, runID string) bool {
 	ctx, cancel := cleanupContext()
 	defer cancel()
 	unit, retired, err := pool.RetireUnassigned(ctx, runID, func(checkCtx context.Context) (bool, error) {
+		// A reconnect can register a successor after the old stream closes but
+		// before this queued retirement reaches the pool. This fence is the
+		// retirement linearization point: an already-active successor keeps the
+		// idle worker alive instead of letting an old disconnect stop it.
+		o.runSessionsMu.Lock()
+		current := o.runSessions[runSessionKey{kind: kind, runID: runID}]
+		o.runSessionsMu.Unlock()
+		if current != nil && current.gen > disconnectedGen {
+			return false, nil
+		}
 		assigned, err := o.runSessionDurableAssigned(checkCtx, kind, runID)
 		if err != nil || assigned {
 			return false, err
