@@ -82,13 +82,13 @@ Type=exec
 WorkingDirectory=%s
 ExecStart=%s run-sandbox --pidfile=%s --config-socket=%s --run-id=%%i
 ExecStopPost=/bin/rm -f %s
-# One process per sandbox, stateful: a crash means the sandbox is gone, not retryable.
+# One resident node-ctl parent owns one direct sandbox-ctl child per assignment; runtime child exit is terminal for that exact run.
 Restart=no
 KillMode=control-group
 TimeoutStopSec=20
 Slice=sandbox-runner.slice
 # node-ctl moves itself into ctl/ before enabling cgroup-v2 domain controllers;
-# after exec, sandbox-ctl stays there while node-ctl creates vmm/ for CH.
+# node-ctl remains the resident ctl/ parent; its direct sandbox-ctl child uses the handed-off vmm/ descriptor for Cloud Hypervisor.
 Delegate=yes
 # KillMode=control-group recursively covers both delegated subgroups.
 `, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
