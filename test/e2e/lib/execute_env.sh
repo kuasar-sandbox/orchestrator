@@ -61,19 +61,18 @@ if [ "$RECOVERY_PENDING" = 1 ]; then
 fi
 execute_state_recover "$BIN"
 
-for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor mkfs.erofs; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN to the prepared registry)"
-command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 command -v iptables >/dev/null 2>&1 || skip "iptables not found"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || fail "prepared execute image is missing: $E2E_IMAGE"
-if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
+export PATH="$BIN:$PATH"
 
 # Preserve the existing Build admission vector and its derived A/B CPU.
 # Target Sandbox CPU resolves independently from the configuration below;

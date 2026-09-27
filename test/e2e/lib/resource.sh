@@ -11,7 +11,8 @@ resource_init() {
     : "${WORK:?WORK must be provided by the E2E runner}"
     : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
     . "$E2E_LIB/orchestrator/tarstream.sh"
-    for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl cloud-hypervisor vmlinux; do
+    export PATH="$BIN:$PATH"
+    for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl cloud-hypervisor vmlinux mkfs.erofs; do
         [ -e "$BIN/$b" ] || resource_fail "missing prepared product $BIN/$b"
     done
     for tool in docker mkfs.ext4 python3 ip; do

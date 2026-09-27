@@ -45,7 +45,7 @@ fail() {
 }
 
 
-for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl cloud-hypervisor; do
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl cloud-hypervisor mkfs.erofs; do
     [ -x "$BIN/$b" ] || fail "missing $BIN/$b"
 done
 [ -f "$BIN/vmlinux" ] || fail "missing $BIN/vmlinux"
@@ -54,7 +54,6 @@ command -v python3 >/dev/null 2>&1 || fail "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || fail "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || fail "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || fail "prepared registry is missing: $ZOT_BIN"
-command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || fail "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || fail "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || fail "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm not available (rw)"
@@ -63,9 +62,7 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || fail "prepared base image i
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
-if ! command -v mkfs.erofs >/dev/null 2>&1; then
-    export PATH="$BIN:$PATH"
-fi
+export PATH="$BIN:$PATH"
 
 : "${WORK:?WORK must be supplied by the common runner}"
 UNIT_DIR="/run/systemd/system"

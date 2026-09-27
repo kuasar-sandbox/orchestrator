@@ -6,6 +6,7 @@ SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/vmm_cgroup.sh"
 : "${BIN:?BIN must point to prepared products}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
+export PATH="$BIN:$PATH"
 # Builds with steps/startCmd carry the e2b contract: envd runs them as
 # `/bin/bash -l -c` — the image must have bash (python:3.12-slim does).
 : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared builder image}"
@@ -17,7 +18,7 @@ MGMT_VIP="169.254.169.254"                   # host-side mgmt NIC IP; guests rou
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
 # ---- prerequisite checks --------------------------------------------------
-for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
+for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl mkfs.erofs; do
     [ -x "$BIN/$b" ] || fail "missing $BIN/$b; prepare the required products"
 done
 for f in vmlinux sandbox-runtime.bundle; do
