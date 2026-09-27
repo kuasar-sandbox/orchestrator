@@ -115,6 +115,11 @@ grep -Fq 'kuasar-sandbox.mmds' "$WORK/bm-snapshot.json" \
 echo "==> PASS: BM real guest MMDS, Trigger immutability, terminal cleanup, and artifact/log secrecy"
 
 # ---- B2: fromTemplate(img) + steps + startCmd/readyCmd → e2b-snp ------------
+# One registration deliberately never executes. Together with B2 it proves
+# registration admission and execution admission retain distinct charges,
+# including across the conductor crash below.
+register registration-only-peer
+REGISTRATION_ONLY_TID="$TID"; REGISTRATION_ONLY_BID="$BID"
 echo "==> B2: fromTemplate=$SOURCE_IMAGE + steps + startCmd/readyCmd"
 register e2e-tpl e2b '' 1
 B2_TID="$TID"; B2_BID="$BID"
@@ -211,6 +216,17 @@ grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image conf
 echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + published manifest base + manifest:// overlay + merged ENV/WORKDIR"
 wait_resource_reservations_empty || fail "phase sandbox reservation remained after B2 completion"
 echo "==> PASS: phases A/B/C used precise nodectl reservations and left no reservation"
+code=$(req GET "/templates/$REGISTRATION_ONLY_TID/builds/$REGISTRATION_ONLY_BID/status" "$AK")
+[ "$code" = 200 ] || fail "registration-only peer disappeared across recovery"
+python3 - "$WORK/resp.body" <<'PY_REGISTRATION'
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert status["status"] == "building" and not status["executionClaimed"], status
+assert not status.get("runID") and not status.get("phase"), status
+PY_REGISTRATION
+code=$(req DELETE "/templates/$REGISTRATION_ONLY_TID" "$AK")
+[ "$code" = 204 ] || fail "registration-only peer delete=$code"
+wait_build_row_deleted "$REGISTRATION_ONLY_BID" || fail "registration-only peer retained admission after delete"
 
 # ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
 echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"

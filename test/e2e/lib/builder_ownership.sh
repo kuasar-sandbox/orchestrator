@@ -243,7 +243,7 @@ assert status["execution"]["configured"] == {
     "max_builds": 2,
     "resources": {"cpu": execution_cpu, "memory": 12 << 30, "storage": 16 << 30},
 }, status
-# The deliberately untriggered negative-test registration and this active
+# The deliberately untriggered peer registration and this active
 # Build both consume registration admission. Only this Build consumes execution.
 assert status["registration"]["used_builds"] == 2, status
 assert status["registration"]["used_resources"] == {
