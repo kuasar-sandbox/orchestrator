@@ -191,6 +191,12 @@ func TestRunAssignedSandboxSessionCoversAssignmentAndLaunch(t *testing.T) {
 			t.Errorf("session identity = %+v", req)
 			return
 		}
+		// Mark the server-side admission decision before emitting the response.
+		// OpenRunSession still cannot return until it has decoded that response,
+		// so WaitAssignment is ordered after both admission and the protocol ACK.
+		// Closing this after Flush is scheduler-racy: the client may decode the
+		// bytes and enter WaitAssignment before this handler runs its next line.
+		close(sessionAcked)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(configsock.RunSessionResponse{Kind: req.Kind, RunID: req.RunID}); err != nil {
 			t.Errorf("write session ack: %v", err)
@@ -199,7 +205,6 @@ func TestRunAssignedSandboxSessionCoversAssignmentAndLaunch(t *testing.T) {
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
-		close(sessionAcked)
 		<-r.Context().Done()
 		close(sessionClosed)
 	})}
