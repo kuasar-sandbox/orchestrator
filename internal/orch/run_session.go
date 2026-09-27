@@ -26,13 +26,16 @@ func (o *Orchestrator) RegisterRunSession(ctx context.Context, kind, runID strin
 	if !validRunID(kind, runID) {
 		return nil, false, nil
 	}
+	key := runSessionKey{kind: kind, runID: runID}
+	o.runSessionsMu.Lock()
+	defer o.runSessionsMu.Unlock()
+	// Admission and idle retirement share this lock. Revalidate ownership while
+	// holding it so a reconnect that raced with retirement cannot register from
+	// a stale pre-retirement run-index observation.
 	known, err := o.runSessionKnownOwner(ctx, kind, runID)
 	if err != nil || !known {
 		return nil, known, err
 	}
-	key := runSessionKey{kind: kind, runID: runID}
-	o.runSessionsMu.Lock()
-	defer o.runSessionsMu.Unlock()
 	o.runSessionsNext++
 	session := &runSessionGeneration{owner: o, key: key, gen: o.runSessionsNext}
 	if o.runSessions == nil {
@@ -378,23 +381,30 @@ func (o *Orchestrator) retireUnassignedRun(kind, runID string, disconnectedGen u
 	}
 	ctx, cancel := cleanupContext()
 	defer cancel()
+	var releaseSessionFence func()
 	unit, retired, err := pool.RetireUnassigned(ctx, runID, func(checkCtx context.Context) (bool, error) {
 		// A reconnect can register a successor after the old stream closes but
-		// before this queued retirement reaches the pool. This fence is the
-		// retirement linearization point: an already-active successor keeps the
-		// idle worker alive instead of letting an old disconnect stop it.
+		// before this queued retirement reaches the pool. Serialize registration
+		// through the pool's retirement linearization point: an already-active
+		// successor vetoes retirement; otherwise keep registration fenced until
+		// the idle waiter has been removed and its run index forgotten.
 		o.runSessionsMu.Lock()
 		current := o.runSessions[runSessionKey{kind: kind, runID: runID}]
-		o.runSessionsMu.Unlock()
 		if current != nil && current.gen > disconnectedGen {
+			o.runSessionsMu.Unlock()
 			return false, nil
 		}
 		assigned, err := o.runSessionDurableAssigned(checkCtx, kind, runID)
 		if err != nil || assigned {
+			o.runSessionsMu.Unlock()
 			return false, err
 		}
+		releaseSessionFence = o.runSessionsMu.Unlock
 		return true, nil
 	})
+	if releaseSessionFence != nil {
+		releaseSessionFence()
+	}
 	if err != nil {
 		o.log.Warn("retire disconnected unassigned run", "kind", kind, "run_id", runID, "unit", unit, "err", err)
 		return false
