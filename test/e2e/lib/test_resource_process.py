@@ -56,9 +56,15 @@ set -euo pipefail
 WORK="$3"
 case_workspace_init
 printf evidence > "$WORK/node.log"
+printf controller-diagnostic > "$WORK/resource-controller.log"
+printf guest-diagnostic > "$WORK/fixture.log"
 RESOURCE_SANDBOX_PIDS=()
-RESOURCE_SANDBOX_IDS=()
+RESOURCE_SANDBOX_IDS=(fixture)
+declare -A RESOURCE_TAPS=([fixture]=fixture-tap)
 RESOURCE_DAEMON_PID=""
+# No host network/cgroup ownership in this source-only cleanup fixture.
+ip() { :; }
+rmdir() { :; }
 if [ "$4" = fail ]; then resource_stop_controller() { return 1; }; fi
 trap resource_cleanup EXIT
 exit "$5"
@@ -76,6 +82,8 @@ exit "$5"
     def test_cleanup_preserves_the_original_case_failure(self):
         result = self.run_cleanup(False, 23)
         self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertIn("controller-diagnostic", result.stderr)
+        self.assertIn("guest-diagnostic", result.stderr)
 
 
 if __name__ == "__main__":

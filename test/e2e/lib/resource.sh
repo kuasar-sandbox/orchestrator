@@ -79,6 +79,37 @@ EOF
     fi
 }
 
+resource_write_pressure_workload() {
+    local sid="$1" mode="$2" start_gate="$3" delivery_gate="$4"
+    python3 - "$WORK/$sid.yaml" "$mode" "$WORK/sandbox-resource.sock" \
+        "$E2E_LIB/orchestrator/workload.py" "$start_gate" "$delivery_gate" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path, mode, controller, workload, start, delivery = sys.argv[1:]
+assert mode in {"static", "dynamic"}, mode
+config = Path(path).read_text()
+controller_line = f"    controller: {controller}\n"
+assert config.count(controller_line) == 1, "missing controller fixture input"
+if mode == "static":
+    config = config.replace(controller_line, "", 1)
+# Keep the original density comparison's deterministic 256-384MiB, two-cycle
+# workload. Its first complete allocation remains held until delivery is seen.
+program = 'print("control-workload-ready", flush=True)\n' + Path(workload).read_text()
+program += '\n# Keep the guest alive for the host post-workload observations.\ntime.sleep(30)\n'
+launch = {"exec": "/usr/local/bin/python3", "restart": "never", "env": {
+    "PYTHONUNBUFFERED": "1", "WL_MODE": "cycles", "WL_SEED": "42",
+    "WL_DURATION": "15", "WL_CYCLES": "2", "WL_RMIN_MIB": "256", "WL_RMAX_MIB": "384",
+    "WL_START_GATE": start, "WL_START_GATE_TIMEOUT": "60",
+    "WL_DELIVERY_GATE": delivery, "WL_DELIVERY_GATE_TIMEOUT": "60",
+}, "args": ["-c", program]}
+original = 'launch:\n  exec: /bin/sleep\n  args: ["300"]\n'
+assert config.count(original) == 1, "missing launch fixture input"
+Path(path).write_text(config.replace(original, "launch: " + json.dumps(launch) + "\n", 1))
+PY
+}
+
 resource_write_controller() {
     local output="$1" compact="${2:-false}"
     local physical_memory=4GiB host_memory=512MiB host_cpu=1 startup_factor=0.50 ttl=120s
@@ -239,6 +270,16 @@ resource_cleanup() {
     local result=$?
     trap - EXIT
     set +e
+    if [ "$result" -ne 0 ]; then
+        local log sid
+        local -a logs=("$WORK/resource-controller.log")
+        for sid in "${RESOURCE_SANDBOX_IDS[@]}"; do logs+=("$WORK/$sid.log"); done
+        for log in "${logs[@]}"; do
+            [ -f "$log" ] || continue
+            echo "==> failure: ${log##*/} (last 80 lines)" >&2
+            tail -n 80 "$log" >&2
+        done
+    fi
     for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do
         [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
     done

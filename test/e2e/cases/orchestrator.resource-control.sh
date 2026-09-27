@@ -9,43 +9,12 @@ resource_setup_sandbox "$sid"
 # Static mode deliberately omits the node controller: this proves the
 # sandbox-local memory control path can deliver a real CH grow by itself.
 resource_write_sandbox "$sid" 320 1024 512 false
-python3 - "$WORK/$sid.yaml" <<'PY'
-import sys
-p=sys.argv[1]
-s=open(p).read()
-s=s.replace("    controller: "+__import__("os").environ["WORK"]+"/sandbox-resource.sock\n","")
-s=s.replace('launch:\n  exec: /bin/sleep\n  args: ["300"]\n',
-'''launch:
-  exec: /usr/local/bin/python3
-  env: { PYTHONUNBUFFERED: "1" }
-  args:
-    - "-c"
-    - |
-      import time
-      blocks=[]
-      import os
-      start="/tmp/resource-static.start"
-      delivery="/tmp/resource-static.delivery"
-      print("control-workload-ready", flush=True)
-      while not os.path.exists(start): time.sleep(.05)
-      blocks.append(bytearray(48*1024*1024))
-      blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
-      print("pressure-probe-ready", flush=True)
-      while not os.path.exists(delivery): time.sleep(.05)
-      for _ in range(5):
-          blocks.append(bytearray(48*1024*1024))
-          blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
-          print("pressure", len(blocks), flush=True)
-          time.sleep(1)
-      print("workload done", flush=True)
-      time.sleep(30)
-''')
-open(p,"w").write(s)
-PY
+resource_write_pressure_workload "$sid" static \
+    /tmp/resource-static.start /tmp/resource-static.delivery
 
 resource_run_sandbox "$sid"
 pid=$RESOURCE_LAST_PID
-resource_wait_static_control_ready "$sid" "$pid" 30
+resource_wait_static_control_ready "$sid" "$pid" 20
 read -r target_before actual_before <<<"$(resource_read_balloon "$sid")"
 [[ "$target_before" =~ ^[0-9]+$ && "$actual_before" =~ ^[0-9]+$ ]] || resource_fail "invalid initial CH balloon state"
 capacity=$((1024 * 1024 * 1024))
@@ -59,23 +28,29 @@ if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ]; then
     target_reference=$initial_target
 fi
 "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-static.start'
-deadline=$((SECONDS + 30))
+deadline=$((SECONDS + 20))
 while [ "$SECONDS" -lt "$deadline" ]; do
-    grep -q pressure-probe-ready "$WORK/$sid.log" && break
+    grep -q 'workload pressure probe ready rss=' "$WORK/$sid.log" && break
     kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
     sleep 0.1
 done
-grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
-if [ "$grow_phase" = pressure ]; then resource_wait_local_grow "$sid" "$pid" "$grows" 30; fi
+grep -q 'workload pressure probe ready rss=' "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
+if [ "$grow_phase" = pressure ]; then resource_wait_local_grow "$sid" "$pid" "$grows" 20; fi
 
-deadline=$((SECONDS+30))
+deadline=$((SECONDS+15))
 target_after=$target_before
 while [ "$SECONDS" -lt "$deadline" ]; do
+    target_after=-1 actual_after=-1
     read -r target_after actual_after <<<"$(resource_read_balloon "$sid")" || true
-    if [[ "$target_after" =~ ^[0-9]+$ && "$actual_after" =~ ^[0-9]+$ ]] && [ "$target_after" -lt "$target_reference" ]; then break; fi
     kill -0 "$pid" || resource_fail "$sid exited before CH accepted grow"
+    if [[ "$target_after" =~ ^[0-9]+$ && "$actual_after" =~ ^[0-9]+$ ]]; then
+        [ "$target_after" -le "$capacity" ] && [ "$actual_after" -le "$capacity" ] ||
+            resource_fail "post-grow CH balloon state exceeds capacity"
+        [ "$target_after" -ge "$target_reference" ] || break
+    fi
     sleep 0.25
 done
+[[ "$target_after" =~ ^[0-9]+$ && "$actual_after" =~ ^[0-9]+$ ]] || resource_fail "invalid post-grow CH balloon state"
 [ "$target_after" -lt "$target_reference" ] || resource_fail "static grow did not reduce CH balloon target below $target_reference"
 "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-static.delivery'
 deadline=$((SECONDS+45))

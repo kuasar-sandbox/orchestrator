@@ -9,41 +9,12 @@ resource_start_controller "$WORK/controller.yaml"
 sid=resource-dynamic
 resource_setup_sandbox "$sid"
 resource_write_sandbox "$sid" 320 1024 512 false
-python3 - "$WORK/$sid.yaml" <<'PY'
-import sys
-p=sys.argv[1]; s=open(p).read()
-s=s.replace('launch:\n  exec: /bin/sleep\n  args: ["300"]\n',
-'''launch:
-  exec: /usr/local/bin/python3
-  env: { PYTHONUNBUFFERED: "1" }
-  args:
-    - "-c"
-    - |
-      import time
-      blocks=[]
-      import os
-      start="/tmp/resource-dynamic.start"
-      delivery="/tmp/resource-dynamic.delivery"
-      print("control-workload-ready", flush=True)
-      while not os.path.exists(start): time.sleep(.05)
-      blocks.append(bytearray(48*1024*1024))
-      blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
-      print("pressure-probe-ready", flush=True)
-      while not os.path.exists(delivery): time.sleep(.05)
-      for _ in range(5):
-          blocks.append(bytearray(48*1024*1024))
-          blocks[-1][::4096]=b"\\1"*(len(blocks[-1])//4096)
-          print("pressure", len(blocks), flush=True)
-          time.sleep(1)
-      print("workload done", flush=True)
-      time.sleep(30)
-''')
-open(p,"w").write(s)
-PY
+resource_write_pressure_workload "$sid" dynamic \
+    /tmp/resource-dynamic.start /tmp/resource-dynamic.delivery
 
 resource_run_sandbox "$sid"
 pid=$RESOURCE_LAST_PID
-resource_wait_dynamic_control_ready "$sid" "$pid" 30
+resource_wait_dynamic_control_ready "$sid" "$pid" 20
 capacity=$((1024 * 1024 * 1024))
 startup_budget=$((512 * 1024 * 1024))
 settled_headroom=$((320 * 1024 * 1024))
@@ -64,16 +35,17 @@ if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ] && [ "$reser
     # requiring an artificial second grant.
     grow_phase=prepressure
     target_reference=$initial_target
-else
-    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
-    deadline=$((SECONDS + 30))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        grep -q pressure-probe-ready "$WORK/$sid.log" && break
-        kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
-        sleep 0.1
-    done
-    grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
-    deadline=$((SECONDS+45))
+fi
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
+deadline=$((SECONDS + 20))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    grep -q 'workload pressure probe ready rss=' "$WORK/$sid.log" && break
+    kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
+    sleep 0.1
+done
+grep -q 'workload pressure probe ready rss=' "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
+if [ "$grow_phase" = pressure ]; then
+    deadline=$((SECONDS+20))
     while [ "$SECONDS" -lt "$deadline" ]; do
         reservation_after="$(resource_reservation_memory "$sid" 2>/dev/null || echo 0)"
         if [[ "$reservation_after" =~ ^[0-9]+$ ]] && [ "$reservation_after" -gt "$reservation_before" ]; then break; fi
@@ -81,25 +53,19 @@ else
         sleep 0.25
     done
     [ "$reservation_after" -gt "$reservation_before" ] || resource_fail "node reservation did not grow"
-    resource_wait_local_grow "$sid" "$pid" "$grows" 30
+    resource_wait_local_grow "$sid" "$pid" "$grows" 20
 fi
 
-reservation_after="$(resource_wait_reserved_grow "$sid" "$pid" 30 "$startup_budget" "$capacity")"
-reservation_after="$(resource_wait_covered_grow "$sid" "$pid" 30 "$target_reference" "$capacity")"
-if [ "$grow_phase" = prepressure ]; then
-    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
-    deadline=$((SECONDS + 30))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        grep -q pressure-probe-ready "$WORK/$sid.log" && break
-        kill -0 "$pid" || resource_fail "$sid exited before pressure probe"
-        sleep 0.1
-    done
-    grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
-fi
+# Both authorization and its current CH target must be observed within the
+# original 15-second delivery budget while the first allocation is held.
+deadline=$((SECONDS+15))
+reservation_after="$(resource_wait_reserved_grow "$sid" "$pid" 15 "$startup_budget" "$capacity")"
+reservation_after="$(resource_wait_covered_grow "$sid" "$pid" "$((deadline-SECONDS))" "$target_reference" "$capacity")"
 "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.delivery'
 
 deadline=$((SECONDS+45))
 while [ "$SECONDS" -lt "$deadline" ]; do
+    ! resource_self_cap_observed "$sid" || resource_fail "guest self-cap fired during workload"
     grep -q 'workload done' "$WORK/$sid.log" && break
     kill -0 "$pid" || resource_fail "$sid exited before workload completion"
     sleep 0.25
