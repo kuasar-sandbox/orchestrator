@@ -280,7 +280,7 @@ memory.max, memory.high, CPU capacity ceiling 和 weight;ctl 保留独立的同�
 sandbox-builder.slice 会删除 CPUQuota/MemoryMax 行并 reload systemd;既有 live service
 仍可能保留旧进程写入的 runtime properties,daemon-reload 不会删除这些属性的来源文件.
 
-隔离用例 `test/e2e/e2e_builder_unit_upgrade.sh` 实际检查 reload 前后的 cgroup 文件:
+隔离用例 `test/source/builder_unit_upgrade.sh` 实际检查 reload 前后的 cgroup 文件:
 项目生成的 slice 解除旧策略,同一 live service 的 runtime 限额和 PID 保持. 该 exact fixture
 执行结束, 仅删除其两份已知属性文件后,新执行的 cpu.max 首字段为 max, memory.max=max.
 真实 Builder 套件另行检查相同父级值,同时保持 sandbox-ctl 的有限 VMM 叶子控制.

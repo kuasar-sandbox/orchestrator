@@ -159,8 +159,21 @@ resource_run_sandbox() {
 }
 
 resource_reservation_count() {
-    "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" 2>/dev/null |
-        python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'
+    local reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    RESERVATIONS_JSON="$reservations" python3 - <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+# The CLI marshals an empty AdminList result as null.
+if rows is None:
+    rows = []
+if not isinstance(rows, list):
+    raise SystemExit("resource list must return an array or null")
+print(len(rows))
+PY
 }
 
 resource_wait_reservations() {
