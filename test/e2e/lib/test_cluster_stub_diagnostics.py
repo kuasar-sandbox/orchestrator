@@ -35,8 +35,8 @@ class ClusterStubDiagnostics(unittest.TestCase):
                 self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
     def test_source_build_precedes_private_umask(self):
-        mask_position = SOURCE.index("\\numask 077\\n")
-        self.assertLess(SOURCE.rindex("\\nbuild_cluster_stub_binaries\\n"), mask_position)
+        mask_position = SOURCE.index("\numask 077\n")
+        self.assertLess(SOURCE.rindex("\nbuild_cluster_stub_binaries\n"), mask_position)
         self.assertNotIn("make -C", SOURCE)
         self.assertIn("go build -trimpath", SOURCE)
         self.assertLess(mask_position, SOURCE.index('WORK="$(mktemp -d)"'))
