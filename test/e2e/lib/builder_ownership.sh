@@ -138,6 +138,20 @@ PY
         sleep 0.25
     done
     printf '%s\n' "$reservations" >&2
+    # Terminal rows expire independently of this observation. Preserve the
+    # current ownership/reason and retained Build journal before fixture cleanup
+    # so a failed step is distinguishable from a missed phase reservation.
+    python3 - "$WORK/lib/node-ctl.db" "$bid" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        "select status, reason, run_id, execution_claimed, phase, phase_sandbox_id "
+        "from builds where build_id=?", (sys.argv[2],)
+    ).fetchone()
+print("Build at reservation timeout:", json.dumps(dict(row) if row else None))
+PY
+    diag "$bid"
     return 1
 }
 wait_resource_reservations_empty() {
