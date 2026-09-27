@@ -66,7 +66,8 @@ case "$TID" in transient-*) ;; *) fail "non-transient template id: $TID";; esac
 status="$(field "$WORK/resp.body" status)"
 [ "$status" = building ] || fail "registered build exposed unexpected SDK status: $status"
 
-[ "$(req GET /v3/templates "$AK")" = 200 ] || fail "template list request"
+code="$(req GET /templates "$AK")"
+[ "$code" = 200 ] || fail "template list returned $code"
 TID="$TID" BODY="$WORK/resp.body" python3 - <<'PY' || fail "registered build appeared as ready template"
 import json, os
 payload=json.load(open(os.environ["BODY"]))

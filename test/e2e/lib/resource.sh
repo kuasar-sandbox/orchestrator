@@ -141,12 +141,13 @@ resource_start_controller() {
 }
 
 resource_stop_controller() {
+    local result=0
     if [ -n "${RESOURCE_DAEMON_PID:-}" ]; then
-        kill -TERM "$RESOURCE_DAEMON_PID" 2>/dev/null || true
-        wait "$RESOURCE_DAEMON_PID" 2>/dev/null || true
+        resource_stop_process "$RESOURCE_DAEMON_PID" controller || result=1
     fi
     RESOURCE_DAEMON_PID=""
     rm -f "$WORK/sandbox-resource.sock"
+    return "$result"
 }
 
 resource_run_sandbox() {
@@ -199,28 +200,60 @@ PY
 }
 
 resource_shutdown_pid() {
-    local pid="$1"
+    local pid="$1" index
     kill -TERM "$pid" 2>/dev/null || true
     for _ in $(seq 1 120); do
-        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            for index in "${!RESOURCE_SANDBOX_PIDS[@]}"; do
+                [ "${RESOURCE_SANDBOX_PIDS[$index]}" != "$pid" ] || RESOURCE_SANDBOX_PIDS[index]=""
+            done
+            return 0
+        fi
         sleep 1
     done
     resource_fail "sandbox-ctl pid $pid did not stop after SIGTERM"
 }
 
+resource_wait_process_exit() {
+    local pid="$1" deadline=$((SECONDS + $2))
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$SECONDS" -lt "$deadline" ] || return 1
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
+resource_stop_process() {
+    local pid="$1" name="$2" grace="${3:-20}"
+    [ -n "$pid" ] || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    resource_wait_process_exit "$pid" "$grace" && return 0
+    echo "FAIL: $name pid $pid did not stop after ${grace}s; sending SIGKILL" >&2
+    kill -KILL "$pid" 2>/dev/null || true
+    resource_wait_process_exit "$pid" 5 \
+        || echo "FAIL: $name pid $pid remained alive after SIGKILL" >&2
+    return 1
+}
+
 resource_cleanup() {
+    local result=$?
+    trap - EXIT
     set +e
     for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do
-        kill -TERM "$pid" 2>/dev/null || true
+        [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
     done
-    for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do wait "$pid" 2>/dev/null || true; done
-    resource_stop_controller
+    for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do
+        resource_stop_process "$pid" sandbox-ctl || result=1
+    done
+    resource_stop_controller || result=1
     for sid in "${RESOURCE_SANDBOX_IDS[@]:-}"; do
         [ -n "$sid" ] || continue
         ip link delete "${RESOURCE_TAPS[$sid]}" 2>/dev/null || true
         rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null || true
     done
-    case_workspace_cleanup
+    case_workspace_cleanup || result=1
+    exit "$result"
 }
 
 resource_read_balloon() {

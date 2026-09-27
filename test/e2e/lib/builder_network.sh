@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 start_builder_network() {
+MMDS_PORT="$(free_port)"
 if "$BIN/connector-ctl" vswitch status "$SWITCH" >/dev/null 2>&1; then fail "fixture switch already exists: $SWITCH"; fi
 ip netns add "$SW_NETNS"
 NETNS_CREATED=1
