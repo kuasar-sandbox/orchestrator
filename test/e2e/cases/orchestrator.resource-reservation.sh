@@ -65,7 +65,7 @@ if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ] && [ "$reser
     grow_phase=prepressure
     target_reference=$initial_target
 else
-    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
+    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
     deadline=$((SECONDS + 30))
     while [ "$SECONDS" -lt "$deadline" ]; do
         grep -q pressure-probe-ready "$WORK/$sid.log" && break
@@ -87,7 +87,7 @@ fi
 reservation_after="$(resource_wait_reserved_grow "$sid" "$pid" 30 "$startup_budget" "$capacity")"
 reservation_after="$(resource_wait_covered_grow "$sid" "$pid" 30 "$target_reference" "$capacity")"
 if [ "$grow_phase" = prepressure ]; then
-    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
+    "$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.start'
     deadline=$((SECONDS + 30))
     while [ "$SECONDS" -lt "$deadline" ]; do
         grep -q pressure-probe-ready "$WORK/$sid.log" && break
@@ -96,7 +96,7 @@ if [ "$grow_phase" = prepressure ]; then
     done
     grep -q pressure-probe-ready "$WORK/$sid.log" || resource_fail "pressure probe did not become ready"
 fi
-"$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.delivery'
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-dynamic.delivery'
 
 deadline=$((SECONDS+45))
 while [ "$SECONDS" -lt "$deadline" ]; do

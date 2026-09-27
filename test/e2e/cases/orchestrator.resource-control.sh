@@ -58,7 +58,7 @@ if [ "$grows" -gt 0 ] && [ "$target_before" -lt "$initial_target" ]; then
     grow_phase=prepressure
     target_reference=$initial_target
 fi
-"$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-static.start'
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-static.start'
 deadline=$((SECONDS + 30))
 while [ "$SECONDS" -lt "$deadline" ]; do
     grep -q pressure-probe-ready "$WORK/$sid.log" && break
@@ -77,7 +77,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.25
 done
 [ "$target_after" -lt "$target_reference" ] || resource_fail "static grow did not reduce CH balloon target below $target_reference"
-"$BIN/sandbox-ctl" exec --run-root "$WORK/run" "$sid" -- /bin/sh -c 'touch /tmp/resource-static.delivery'
+"$BIN/sandbox-ctl" exec --run-root "$WORK/run" --sandbox-id "$sid" -- /bin/sh -c 'touch /tmp/resource-static.delivery'
 deadline=$((SECONDS+45))
 while [ "$SECONDS" -lt "$deadline" ]; do
     grep -q 'workload done' "$WORK/$sid.log" && break
