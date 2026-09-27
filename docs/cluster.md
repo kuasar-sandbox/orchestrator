@@ -831,11 +831,15 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 - The admin listener offers only node-stub-ctl management queries; the API listener simulates conductor control APIs; the Data listener simulates ordinary data, CONNECT and exec.
 - Node actions including `restart-link`, `reboot-empty` and `crash/start`.
 
-`make test-e2e` does not build binaries: it passes `E2E_BIN` (defaulting to the sibling project repository’s assembled binary directory) to `test/e2e/run_all.sh` and requires that multi-repository artifact set beforehand. For the local stub-only flow, run `make build` followed by `make test-e2e-cluster-stub`; this target uses the local `BINDIR` to start real `cluster-ctl registry/router/placer` and `node-stub-ctl`. See [Makefile](../Makefile). `test/e2e/e2e_cluster_stub.sh` covers N=1 and multi-member Registry, joint/old_grace membership cutover, group import, key distribution, explicit create/Reserve, stable-SandboxID CmdConnect, SandboxID↔NodeSandboxID translation, control/build reaching the API listener, data/exec reaching the Data listener, ExecSession Reserve/CmdExecSession issuance, `service=exec` KAT rejection/two-hop validation and the second-hop buffered tunnel, route cache, BuildRegister, orphan-route cleanup, reconnect full-sync convergence after a lost Build Delete, and emptied-node convergence. The stub's `reboot-empty` deliberately empties simulated state; it is not proof that real conductor startup deletes durable SQLite rows.
+Source stub integration runs with `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh`
+or the required `make test-source` gate. It uses the selected source workspace
+and starts real control-plane processes without a MicroVM. Prepared product
+E2E uses the [shared public runner and focused cases](node.md#15-tests).
+`test/source/cluster_stub.sh` covers N=1 and multi-member Registry, joint/old_grace membership cutover, group import, key distribution, explicit create/Reserve, stable-SandboxID CmdConnect, SandboxID↔NodeSandboxID translation, control/build reaching the API listener, data/exec reaching the Data listener, ExecSession Reserve/CmdExecSession issuance, `service=exec` KAT rejection/two-hop validation and the second-hop buffered tunnel, route cache, BuildRegister, orphan-route cleanup, reconnect full-sync convergence after a lost Build Delete, and emptied-node convergence. The stub's `reboot-empty` deliberately empties simulated state; it is not proof that real conductor startup deletes durable SQLite rows.
 
-The companion real `e2e_cluster_real.sh` case keeps the common lifecycle and
-Build/cancellation/reclamation matrix in `registry-n1`. `registry-redirect`
-derives the exact Registry owner from the actual node-link redirect and confirms
+The independent `orchestrator.cluster-lifecycle.sh` owns the real lifecycle,
+Build cancellation/reclamation and Router restart contracts.
+`orchestrator.cluster-recovery.sh` derives the exact Registry owner from the actual node-link redirect and confirms
 that the node used it. It restarts that owner and Router, requires a new node-link
 connection, then uses the existing bounded placer probe to require the expected
 node. The recovered topology and empty Router cache must then serve one real

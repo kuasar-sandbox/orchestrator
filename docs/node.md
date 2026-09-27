@@ -1925,60 +1925,62 @@ unavailable, then re-export. Capture cases delete the carrier before returning
 the structured result and require torn responses to leave the running row and
 old pair unchanged.
 
-The required owner entry [e2e_capture_cli.sh](../test/e2e/e2e_capture_cli.sh) runs
-all three CLI integration groups and every current subcase against the selected
-real products. Missing `BIN` products or the prepared `ORCH_CLI_TEST_BIN`, an
-empty selection, an unfinished subcase or any Skip fails this entry. The existing
-build/helper stage compiles the test executable from its independent test pin;
-hosted artifact E2E consumes that executable and `BIN` without source checkout
-or compilation. Optional local `go test` still skips these groups without
-`KUASAR_TEST_SANDBOX_CTL`. With `BIN` pointing to the selected, already built
-product directory, run from this repository:
+Required source integration runs through `make test-source` with Go 1.26.1+
+and `ORG` pointing to the selected integration source workspace. It builds the
+exact sibling sandboxer's CLI for the three capture/publication groups above;
+missing groups, unfinished subcases or any Skip fail. `test/source/builder_state.sh`
+executes the required state, concurrency, policy and publication-planning Go
+contracts and rejects missing or skipped tests. Unit/race/vet, helper regressions,
+privileged UFFD/Collector checks, unit upgrade, journal identity, cluster stub
+integration and performance gates remain source checks, independent of product E2E.
 
-```bash
-KUASAR_TEST_SANDBOX_CTL="$BIN/sandbox-ctl" go test ./internal/orch \
-  -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$' \
-  -count=1 -v
+Product E2E follows **prebuilt products → prepare → `<suite>.<case>.sh` → the
+shared public runner**. The full filename is the case ID; its first segment is
+the suite. The project owns the nine suites `basic`, `storage`, `image`,
+`network`, `sandbox`, `snapshot`, `orchestrator`, `builder`, and `telemetry`.
+Cases consume `BIN`, `WORK`, `OUT`, `E2E_LIB`, prepared helper paths and prepared
+images. They do not compile, search sibling source trees, pull fallback images,
+or select a host product in place of a missing prepared input. Real guest builds,
+flattening, snapshots and publication are operations under test and stay real.
+
+From the assembled project platform directory, use its sole public entrypoint:
+
+```sh
+python3 test/e2e/e2e prepare --release-dir /path/to/platform --workdir /path/to/prepared
+python3 /path/to/prepared/test/e2e/e2e list --suite orchestrator
+python3 /path/to/prepared/test/e2e/e2e run --workdir /path/to/prepared --include orchestrator.lifecycle.sh
 ```
 
-Inspect each group and its current subcases for actual execution; a successful
-test process containing skipped groups does not validate this CLI contract.
+Preparation must supply the selected products, helper executables and local
+images required by the selection. KVM cases require Linux, root, systemd and
+the prepared Kernel/Runtime. Missing inputs fail the case. Helpers own fixture,
+process, network, HTTP and observation primitives; each case owns its scenario.
+See the project [E2E contract](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/172)
+for aggregation and release acceptance.
 
-Real-microVM native-exec cases cover token issuance, service=exec CONNECT and guest execution separately for standalone and cluster. That evidence covers those native-exec paths; it does not automatically accept later pause/resume or other stages of the aggregate script.
-
-Feature E2E lives with implementation in orchestrator/test/e2e/. Lightweight cluster stubs and real-microVM cases requiring vmlinux, Cloud Hypervisor, mkfs.erofs and sandbox-runtime.bundle share run_all.sh. Direct script invocation sets BIN to the assembled project binary directory. Make test-e2e passes E2E_BIN, defaulting to the sibling project's bin/architecture directory; it prepares test helpers and runs required source checks, but does not build those product prerequisites. Local stub execution uses make build followed by make test-e2e-cluster-stub. The component integration job assembles candidate sources with the other repositories and runs this entry. Individual scripts can skip missing heavy prerequisites, while full gates use REQUIRE_*=1 to fail instead.
-
-For a direct Proxy E2E (including its MMDS restart wrapper), prepare the native helpers first and pass both executable paths. From the orchestrator repository, with the assembled product binaries and existing KVM/Docker/zot prerequisites available:
-
-```bash
-e2e_arch="$(uname -m)"
-make e2e-fixtures TARGET_ARCH="$e2e_arch"
-e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
-BIN="$PWD/../kuasar-sandbox/bin/$e2e_arch" \
-CUSTOM_PROXY_BIN="$e2e_tools/custom-proxy" \
-TELEMETRY_GRPC_PROBE_BIN="$e2e_tools/telemetry-grpc-probe" \
-REQUIRE_PROXY=1 bash test/e2e/e2e_orchestrator_proxy.sh
-```
-
-Adjust `BIN` if the product set is assembled elsewhere. The script checks the required prepared gRPC probe before heavy setup; it does not compile helpers during E2E. `make test-e2e` supplies these paths automatically for the complete suite.
-
-| Script | Coverage |
+| Maintained case | Required assertions |
 |---|---|
-| e2e_orchestrator.sh | Unit auto-install; /health and 401 control paths; Build register/trigger/status and cross-key ownership 404; bare create/list/kill with KVM. |
-| e2e_runtask.sh | Pure-userspace launchers without root/systemd/KVM: pidfile locking/duplicate rejection, exact-run bootstrap, single-stage cold/two-stage restore, execve, TASK_* and duplicate MANIFEST_KEY stripping; config CLI round trips. |
-| e2e_builder_unit_upgrade.sh | Isolated real systemd: generated slice update, preserved live runtime properties, and exact-source one-time removal; checks actual cgroup values after reload. |
-| e2e_run_builder.sh | Real target-aware pipeline with KVM/vswitch/store-ctl/zot and guest pulls through management VIP: IMG/SBX/SNP; all source kinds; image/checkpoint publication matrix; Manifest/named Bundle; top-level E without full staging/C; portable C image refs; local/Bundle checkpoints; S→E cold selection; fixed memory-C wait; closure and canonical Create after row TTL. Also COPY/bare, parent/ctl isolation with finite VMM limits, live conductor recovery preserving the exact claim/run-id/processes, real total-timeout fencing and claim/reservation release, terminal cleanup and log/DB/artifact secrecy. |
-| e2e_execute.sh | Real template cold launch/guest exec; persistent RunDir/BaseDir with diff/checkpoint only in BaseDir; no large RunRoot artifacts; PathID native exec; local Pause/Resume and restore policy; failed Create's owner-free dead; explicit finalizer removes row/directories while preserving node files. |
-| e2e_mmds_routes.sh | Execute's Proxy topology for static/secret lifecycle and local UDS service. |
-| e2e_mmds_routes_proxy_restart.sh | Proxy topology for MMDS full resync/fail-closed recovery. |
-| e2e_orchestrator_proxy.sh | Master/workers, sole data ingress, route sync, authentication, auto-resume and CONNECT relay. |
-| e2e_cluster_stub.sh | Real Registry/Router/Placer plus node-stub-ctl with distinct API/Data listeners: node-link, Reserve, control/data/exec/build routing, stable IDs and membership changes. |
-| go test ./test/e2e/cluster_stub | Executable h2c integration: Build live projection and empty full snapshot removal of projection/exact-owner ref after a lost Delete. |
-| e2e_cluster_real.sh | Real cluster control/node-ctl/microVM: single Registry, node-link redirect and joint Registry-route/node-row/directory convergence after Delete. |
-| e2e_density.sh | Node admission, reclamation and density behavior. |
-| e2e_sandbox_cold_target.sh | Production-shaped cold Sandbox target driven by node-ctl resource controller. |
-
-Make test-e2e executes test/e2e/run_all.sh. The project repository supplies the common environment, aggregate entry and genuinely cross-component combinations without copying these scripts.
+| [`basic.orchestrator-cli.sh`](../test/e2e/cases/basic.orchestrator-cli.sh); [`orchestrator.api.sh`](../test/e2e/cases/orchestrator.api.sh); [`builder.api.sh`](../test/e2e/cases/builder.api.sh) | CLI help/config, unit installation, health/authentication, registration/trigger/status, cross-key ownership and invalid requests. |
+| [`orchestrator.runtask.sh`](../test/e2e/cases/orchestrator.runtask.sh) | Pidfile exclusion, exact-run bootstrap, cold/restore launcher stages, execve and TASK_*/duplicate MANIFEST_KEY stripping. |
+| [`orchestrator.lifecycle.sh`](../test/e2e/cases/orchestrator.lifecycle.sh) | WaitAssignment/readiness/init failures, starting SetTimeout/Pause/Kill, Create parking, RunDir/BaseDir ownership, resource/lease observations, list/detail and finalization preserving node files. |
+| [`orchestrator.exec.sh`](../test/e2e/cases/orchestrator.exec.sh) | Explicit KAT issuance and conditions (empty, exact, OR, cwd/user/TTY), PTY resize/stdin/stdout/stderr/exit, envd initialization/hostname, marker and real FloatingIP HTTP. |
+| [`orchestrator.pause-wake.sh`](../test/e2e/cases/orchestrator.pause-wake.sh) | Guest /app delegation and frozen process/listener/counter state; accepted Pause cancellation with SIGTERM/143 barrier; same-token waking request; memory-policy node/body/header false/null precedence, cold E, repeated cleanup, native usage and TTL/reaper behavior. |
+| [`orchestrator.snapshot.sh`](../test/e2e/cases/orchestrator.snapshot.sh) | Local baseline/delta memory restore, disk-layer separation, portable keep/move export, noWake denial, self-only prefetch and cleanup. Real Bundle A/B/C closed graphs preserve historical memory; Store publication, retained local resume and E-only export/import preserve canonical references. |
+| [`orchestrator.resource-startup.sh`](../test/e2e/cases/orchestrator.resource-startup.sh); [`orchestrator.resource-admission.sh`](../test/e2e/cases/orchestrator.resource-admission.sh) | Repeated 8GiB/low-allocation startup and finite VMM versus unbounded parent/ctl limits; default and small-capacity headroom across exec/pause/resume; bounded shutdown. Hardware capacity, explicit 512MiB cold reservation/balloon, Python execution and connected/settled admission precede red-zone rejection. |
+| [`orchestrator.resource-control.sh`](../test/e2e/cases/orchestrator.resource-control.sh); [`orchestrator.resource-recovery.sh`](../test/e2e/cases/orchestrator.resource-recovery.sh); [`orchestrator.resource-reservation.sh`](../test/e2e/cases/orchestrator.resource-reservation.sh) | Real sandbox-local pressure/grow and CH balloon delivery without OOM, controller restart/inventory convergence and reservation lifecycle. |
+| [`orchestrator.proxy.sh`](../test/e2e/cases/orchestrator.proxy.sh); [`orchestrator.proxy-auth.sh`](../test/e2e/cases/orchestrator.proxy-auth.sh) | Sole data ingress; explicit local/stable identity, duplicate-ID rejection, parking, static stats/native traffic, correct/missing/wrong token behavior without idle refresh, canonical WebSocket, signed files, passive noWake, raw CONNECT and native exec. |
+| [`orchestrator.proxy-wake.sh`](../test/e2e/cases/orchestrator.proxy-wake.sh) | Condition-denied exec leaves a paused guest untouched; the same authorized KAT cold-resumes it and health/traffic converge. |
+| [`orchestrator.proxy-restart.sh`](../test/e2e/cases/orchestrator.proxy-restart.sh) | Prepared custom extension ingress/private WebSocket; missing-master admission 503 without resource ownership; master route resync, worker failure/replacement readiness, metrics and worker reaping. |
+| [`orchestrator.mmds.sh`](../test/e2e/cases/orchestrator.mmds.sh); [`orchestrator.mmds-recovery.sh`](../test/e2e/cases/orchestrator.mmds-recovery.sh) | Independent guests run static, initial/unresolved secret, update/rotation/delete, undeclared-route rejection and UDS service assertions. Recovery restarts Proxy between update and full resync. Both inspect DB/log/route-table plaintext secrecy. |
+| [`orchestrator.cluster-lifecycle.sh`](../test/e2e/cases/orchestrator.cluster-lifecycle.sh) | One Create after node-link/placer readiness; group/stable-ID exec, E pause/wake, WebSocket, data/stats/list and route/node/directory finalization. Routed Build cancellation frees capacity; retained status is the first request after Router restart; canonical peer/reuse survives transient deletion with no retained directory FDs. |
+| [`orchestrator.cluster-recovery.sh`](../test/e2e/cases/orchestrator.cluster-recovery.sh) | Three Registries observe a real node-link redirect, restart its actual owner, await node-link and placer convergence, then one Create, data readiness and DELETE finalization on Registry and node. |
+| [`builder.image.sh`](../test/e2e/cases/builder.image.sh) | Independent duplicate-pool prewarm, real image pull/flatten with request-selected DNS and Phase-A reservation; terminal conflict/list state; e2b/bare image results and canonical cold Create after Build-row TTL. |
+| [`builder.steps.sh`](../test/e2e/cases/builder.steps.sh) | Real RUN/ENV/WORKDIR, delegated guest cgroups, start/ready inheritance, exact live worker/claim/process adoption after conductor SIGKILL, scoped phase cleanup and A/B/C resource ownership. Snapshot/image metadata, one task-local source preparation, SNP-to-image materialization, and Build MMDS immutability/terminal secrecy remain asserted. |
+| [`builder.context.sh`](../test/e2e/cases/builder.context.sh) | Unconfigured COPY/files 501, malformed or missing context 400, presigned direct upload and present false→true idempotency, real COPY default/chown ownership and A/B request DNS. |
+| [`builder.sandbox.sh`](../test/e2e/cases/builder.sandbox.sh) | Direct top-level E without A/B/C, target capacity/env and source closure; E-to-image auto resolution; memory-C fixed no-ready wait, fresh S→E identity and no inherited commands; canonical E/snapshot Create after row TTL. |
+| [`builder.failure.sh`](../test/e2e/cases/builder.failure.sh) | Repeated unassigned runner/Builder units are collected with journals retained; real hanging RUN cancellation versus automatic total timeout, queued capacity recovery, claim/process/cgroup/port/directory reclamation, canonical peer and live-guest survival, FD closure and deterministic business-error diagnostics. |
+| [`builder.publish.sh`](../test/e2e/cases/builder.publish.sh) | Five real local/Bundle and Manifest/named-location publication operations with stable DB/key: no intermediate image for top E, portable image refs under S→E delta, exact Store object changes, closed Bundle directories and canonical image/snapshot Create after row TTL. |
+| [`telemetry.proxy.sh`](../test/e2e/cases/telemetry.proxy.sh); [`telemetry.backends.sh`](../test/e2e/cases/telemetry.backends.sh); [`telemetry.guest.sh`](../test/e2e/cases/telemetry.guest.sh) | Prometheus counter baseline/increase after a real 404 and independent backend contracts; real guest OTLP HTTP/gRPC/native traffic, local/stable identity, pause/restart history/noWake, Collector absence/disconnection and namespace ownership. |
 
 ### Native usage read validation
 

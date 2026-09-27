@@ -110,7 +110,7 @@ class JournalIdentityTest(unittest.TestCase):
 
 class BuilderJournalLookupTest(unittest.TestCase):
     def lookup(self, entries):
-        source = (Path(__file__).resolve().parents[1] / "e2e_run_builder.sh").read_text()
+        source = (Path(__file__).with_name("builder_journal.sh")).read_text()
         function = re.search(r"(?ms)^build_journal_unit\(\).*?^\}", source).group()
         with tempfile.TemporaryDirectory() as temporary:
             journal = Path(temporary) / "journal.jsonl"

@@ -17,7 +17,7 @@ SCRIPT = Path(__file__).parents[1] / "cases" / "orchestrator.cluster-recovery.sh
 
 
 def function(name):
-    match = re.search(r"^" + name + r"\(\) \{.*?^\}", SCRIPT.read_text(), re.M | re.S)
+    match = re.search(r"^" + name + r"\(\) \{.*?^\}", (SCRIPT.read_text() + "\n" + SCRIPT.parents[1].joinpath("lib/cluster_http.sh").read_text()), re.M | re.S)
     if not match:
         raise AssertionError("missing redirect gate: " + name)
     return match.group()

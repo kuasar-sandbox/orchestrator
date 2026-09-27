@@ -13,26 +13,24 @@ import time
 import unittest
 
 
-SOURCE = Path(__file__).with_name("execute_pause_contract.sh").read_text()
+ROOT = Path(__file__).resolve().parent
+INSTRUMENT = (ROOT / "execute_instrument.sh").read_text()
+DRIVER = (ROOT.parent / "cases/orchestrator.pause-wake.sh").read_text()
+CONTRACT = (ROOT / "execute_contract.sh").read_text()
 
 
-def snippet(start, end):
-    # Fail closed if the E2E boundaries move or become ambiguous. Bash itself
-    # expands the original heredoc; do not duplicate/unescape the wrapper here.
-    if SOURCE.count(start) != 1 or SOURCE.count(end) != 1:
+def snippet(source, start, end):
+    if source.count(start) != 1 or source.count(end) != 1:
         raise AssertionError(f"ambiguous/missing E2E snippet: {start!r}, {end!r}")
-    return SOURCE[SOURCE.index(start):SOURCE.index(end, SOURCE.index(start))]
+    return source[source.index(start):source.index(end, source.index(start))]
 
 
-BARRIER_PATHS = snippet('PAUSE_BARRIER_TARGET="$WORK/', 'stop_owned_units() {')
-WRAPPER = snippet('cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF', 'printf \'%s\\n\' "$SID" > "$PAUSE_BARRIER_TARGET"')
-LAUNCH = snippet('printf \'%s\\n\' "$SID" > "$PAUSE_BARRIER_TARGET"', 'for _ in $(seq 1 1500); do')
-CANCEL_START = 'for _ in $(seq 1 1500); do'
-if SOURCE.count(CANCEL_START) != 1:
-    raise AssertionError("ambiguous/missing Pause cancellation boundary")
-CANCEL = SOURCE[SOURCE.index(CANCEL_START):]
+BARRIER_PATHS = snippet(INSTRUMENT, 'PAUSE_BARRIER_TARGET="$WORK/', 'mkdir -p "$ORCH_BIN_DIR"')
+WRAPPER = INSTRUMENT[INSTRUMENT.index('cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF'):]
+LAUNCH = snippet(DRIVER, 'printf \'%s\\n\' "$SID" > "$PAUSE_BARRIER_TARGET"', 'for _ in $(seq 1 1500); do')
+CANCEL = snippet(DRIVER, 'for _ in $(seq 1 1500); do', 'wait_sandbox_state "$SID" paused 1200 || {')
 FAIL = 'fail() { echo "FAIL: $*" >&2; exit 1; }'
-CLEANUP = snippet('stop_owned_units() {', 'cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF')
+CLEANUP = snippet(CONTRACT, 'stop_owned_units() {', 'setup_proxy_netns() {') + 'trap cleanup EXIT\n'
 
 
 class ExecutePauseCancellation(unittest.TestCase):

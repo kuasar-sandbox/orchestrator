@@ -224,9 +224,9 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         self.assertNotIn("GOTOOLCHAIN=local", GO)
 
 
-class ArtifactJournalContract(unittest.TestCase):
-    def test_required_binary_journal_does_not_invoke_go(self):
-        entry = Path(__file__).resolve().parents[1] / "e2e_journal_contract.sh"
+class SourceJournalContract(unittest.TestCase):
+    def test_journal_helper_gate_does_not_invoke_go(self):
+        entry = Path(__file__).resolve().parents[2] / "source/journal_contract.sh"
         with tempfile.TemporaryDirectory() as temporary:
             tools = Path(temporary)
             (tools / "go").write_text("#!/bin/sh\nexit 97\n")
@@ -235,27 +235,26 @@ class ArtifactJournalContract(unittest.TestCase):
                                     env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
                                          "REQUIRE_PROXY": "1", "GOROOT": "/missing-source-toolchain"})
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("e2e_journal_contract: OK", result.stdout)
+            self.assertIn("journal source contract: OK", result.stdout)
 
 
 class PreparedCustomProxy(unittest.TestCase):
     def test_missing_grpc_probe_is_rejected_before_heavy_prerequisites(self):
-        entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
+        entry = Path(__file__).resolve().parents[1] / "cases/telemetry.guest.sh"
         source = entry.read_text()
-        preflight = source[source.index("skip() {"):source.index("for b in node-ctl ")]
+        preflight = source[source.index("fail() {"):source.index("NATIVE_USAGE_ENABLED=")]
         env = {**os.environ, "REQUIRE_PROXY": "1"}
         env.pop("TELEMETRY_GRPC_PROBE_BIN", None)
         result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + preflight],
                                 env=env, capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("TELEMETRY_GRPC_PROBE_BIN", result.stdout)
-        self.assertIn("e2e-fixtures", result.stdout)
+        self.assertIn("TELEMETRY_GRPC_PROBE_BIN", result.stderr)
+        self.assertIn("prepared", result.stderr)
 
     def test_prepared_bytes_are_installed_for_the_runtime_user(self):
-        entry = Path(__file__).resolve().parents[1] / "e2e_orchestrator_proxy.sh"
-        setup = entry.read_text().split("CUSTOM_PROXY_EXTENSION_E2E=0\n", 1)[1].split(
-            "declare -a PIDS=()", 1
-        )[0]
+        source = Path(__file__).with_name("proxy_guest.sh").read_text()
+        setup = re.search(r"(?ms)^install_prepared_proxy\(\) \{\n.*?^\}", source).group()
+        setup += "\ninstall_prepared_proxy\n"
         with tempfile.TemporaryDirectory(prefix="proxy-owner-") as temporary:
             root = Path(temporary)
             prepared = root / "prepared proxy"
@@ -272,7 +271,7 @@ class PreparedCustomProxy(unittest.TestCase):
                     work.mkdir(mode=0o700)
                     result = subprocess.run(
                         ["bash", "-c", "set -euo pipefail\nskip() { exit 1; }\n" + setup
-                         + '\n[ "$CUSTOM_PROXY_EXTENSION_E2E" = 1 ]\nprintf "%s\\n" "$CUSTOM_PROXY_BIN"'],
+                         + '\nprintf "%s\\n" "$CUSTOM_PROXY_BIN"'],
                         env={**os.environ, "WORK": str(work), "CUSTOM_PROXY_BIN": str(prepared),
                              "KUASAR_ARTIFACT_E2E": artifact},
                         capture_output=True, text=True, timeout=5,
@@ -297,7 +296,7 @@ class TelemetrySourceExecution(unittest.TestCase):
         root = Path(__file__).resolve().parents[3]
         source = (root / "scripts/ci-source-checks.sh").read_text()
         start = source.index("bash scripts/ci-e2e-build.sh source ")
-        commands = source[start:source.index("\nTELEMETRY_SOURCE_ROOT=", start)]
+        commands = source[start:]
         with tempfile.TemporaryDirectory(prefix="source-netns-") as temporary:
             work = Path(temporary)
             tools = work / "tools"

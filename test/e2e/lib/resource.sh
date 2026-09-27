@@ -26,6 +26,7 @@ resource_init() {
     RESOURCE_DAEMON_PID=""
     RESOURCE_SANDBOX_PIDS=()
     RESOURCE_SANDBOX_IDS=()
+    declare -gA RESOURCE_TAPS=()
     [ -d /sys/fs/cgroup/sandboxes ] || mkdir /sys/fs/cgroup/sandboxes
     echo "+memory +cpu" >/sys/fs/cgroup/sandboxes/cgroup.subtree_control 2>/dev/null || true
     local blk="$WORK/base.img"
@@ -35,10 +36,14 @@ resource_init() {
 
 resource_setup_sandbox() {
     local sid="$1"
+    local tap="r${BASHPID}n${#RESOURCE_SANDBOX_IDS[@]}"
+    [ ! -e "/sys/fs/cgroup/sandboxes/$sid" ] || resource_fail "foreign cgroup exists: $sid"
+    ip link show "$tap" >/dev/null 2>&1 && resource_fail "foreign TAP exists: $tap"
+    mkdir "/sys/fs/cgroup/sandboxes/$sid"
     RESOURCE_SANDBOX_IDS+=("$sid")
-    mkdir -p "/sys/fs/cgroup/sandboxes/$sid"
-    ip tuntap add "${sid}-tap" mode tap 2>/dev/null || true
-    ip link set "${sid}-tap" up
+    RESOURCE_TAPS["$sid"]="$tap"
+    ip tuntap add "$tap" mode tap
+    ip link set "$tap" up
     truncate -s 1G "$WORK/${sid}.diff"
     mkfs.ext4 -q -F -O ^has_journal "$WORK/${sid}.diff"
 }
@@ -53,7 +58,7 @@ resources:
     cgroup_path: /sys/fs/cgroup/sandboxes/$sid
     controller: $WORK/sandbox-resource.sock
   startup: { memory: ${startup}MiB }
-network: { tap: ${sid}-tap }
+network: { tap: ${RESOURCE_TAPS[$sid]} }
 boot:
   kernel: file://$BIN/vmlinux
   runtime: file://$BIN/sandbox-runtime.bundle
@@ -207,7 +212,7 @@ resource_cleanup() {
     for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do wait "$pid" 2>/dev/null || true; done
     resource_stop_controller
     for sid in "${RESOURCE_SANDBOX_IDS[@]:-}"; do
-        ip link delete "${sid}-tap" 2>/dev/null || true
+        ip link delete "${RESOURCE_TAPS[$sid]}" 2>/dev/null || true
         rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null || true
     done
 }

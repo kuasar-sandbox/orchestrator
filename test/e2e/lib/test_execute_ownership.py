@@ -7,7 +7,8 @@ import subprocess
 import tempfile
 import unittest
 
-SOURCE = Path(__file__).with_name("execute_contract.sh").read_text()
+SOURCE = "\n".join(Path(__file__).with_name(name).read_text()
+                   for name in ("execute_contract.sh", "execute_artifact.sh"))
 
 
 def function(name):

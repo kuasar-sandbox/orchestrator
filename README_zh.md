@@ -105,37 +105,43 @@ Go 二进制使用 `CGO_ENABLED=0` 构建。
 ```bash
 make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
 make build TARGET_ARCH=aarch64  # 交叉编译;也接受 amd64/arm64 别名
-make test                       # 单元测试
-e2e_arch="$(uname -m)"
-e2e_tools="$PWD/build/e2e-tools/$e2e_arch"
-bash scripts/ci-e2e-build.sh cli "$e2e_arch" "$e2e_tools"
-ORCH_CLI_TEST_BIN="$e2e_tools/orch-cli.test" make test-e2e  # 需要项目组装的完整 BIN
+make test                       # 单元和 helper 测试
+ORG=/path/to/exact/sources make test-source  # source/race/vet/integration 门禁
 ```
 
-Owner suite 包含 `e2e_capture_cli.sh`,使用所选真实 `sandbox-ctl` 和 `node-ctl`
-执行 `TestCapturePairCLIToPausedDatabase`、`TestUploadCaptureCLIToPausedDatabase`
-和 `TestExportPublicationCLIAPI`. 全部当前子用例都必须完成且不得 Skip,包括
-结构化结果提交前删除载体、拒绝撕裂的 capture 响应,以及制品不可读后的 portable
-CLI/API 矩阵. 缺产品、缺 helper、空选择或只有父测试结果均失败.
-本地可选 `go test` 未设置 `KUASAR_TEST_SANDBOX_CTL` 时仍可跳过这些组,
-但不能作为必需入口的执行证据.
+Capture CLI/DB fixture 合同属于源码集成。必需 source gate 编译 exact sibling
+sandboxer 的 `sandbox-ctl`，从当前 orchestrator 源码执行
+`TestCapturePairCLIToPausedDatabase`、`TestUploadCaptureCLIToPausedDatabase`
+和 `TestExportPublicationCLIAPI`。每个组选中后必须执行子用例，所有已开始的子用例
+必须通过；Skip、失败、仅父测试结果、缺 exact sibling 源码均失败。
 
-本地命令通过既有 fixture 脚本准备 CLI helper, 然后传给 `make test-e2e`.
-Hosted artifact 验证在
-prepare 前按独立固定的 owner test revision 构建 `orch-cli.test`;runner 只消费
-该执行文件与 `BIN`,不获取源码或编译. 既有必需 source 检查同时执行 runner 的
-输入、选择与 Skip 门禁回归. 针对性入口为:
+产品 E2E 遵循 **预构建产品 → prepare → `<suite>.<case>.sh` → 统一公开 runner**。
+完整文件名是 case ID，第一段是 suite。项目只使用 `basic`、`storage`、`image`、
+`network`、`sandbox`、`snapshot`、`orchestrator`、`builder`、`telemetry` 九个 suite。
+用例消费 `BIN`、`WORK`、`OUT`、`E2E_LIB`、已准备的 helper 路径与本地镜像；
+不编译、不发现兄弟源码仓、不自动拉取后备镜像、不以主机产品替代缺失的准备输入。
+真实 guest build、flatten、snapshot 与 publish 是被测操作，继续真实执行。
 
-```bash
-BIN=/path/to/selected/bin ORCH_CLI_TEST_BIN=/path/to/prepared/orch-cli.test \
-  bash test/e2e/e2e_capture_cli.sh
+在已组装的项目平台目录中，使用唯一公开入口：
+
+```sh
+python3 test/e2e/e2e prepare --release-dir /path/to/platform --workdir /path/to/prepared
+python3 /path/to/prepared/test/e2e/e2e list --suite orchestrator
+python3 /path/to/prepared/test/e2e/e2e run --workdir /path/to/prepared --include orchestrator.lifecycle.sh
 ```
+
+准备阶段必须提供所选产品、helper 可执行文件和本地镜像。KVM 用例还要求 Linux、
+root、systemd 与已准备的 Kernel/Runtime；缺少输入直接失败。共享 helper 只负责
+fixture、进程、网络、HTTP 和观测原语，每个 case 自己拥有测试场景。
+聚合与发布验收见项目 [E2E 合同](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/172)。
+
+[Owner 覆盖表](docs/node_zh.md#15-测试) 将每个实质合同映射到维护的独立用例。
 
 真实沙箱要求 Linux、systemd、root 权限、KVM、sandboxer、connector 及 guest-runtime 产生的 Runtime/VMLinux 制品。
 变更范围可以限定在本仓，构建仍需上述依赖闭包；跨仓契约变更必须关联 companion PR 并使用精确源码组合的集成测试验证，
 见 [Organization 贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。
 
-本地 `make test-e2e-cluster-stub` 流程启动真实控制面进程,但不启动 MicroVM。
+源码 `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh` 流程启动真实控制面进程,但不启动 MicroVM。
 运行目录保持私有;失败输出只报告诊断文件名和大小,不输出原始响应、日志或含
 capability 的对象。本地排查可设置 `CLUSTER_STUB_KEEP_WORK=1` 保留运行目录,
 并私下检视;不要上传未脱敏文件。它不能替代真实 MicroVM 集成测试。
@@ -149,7 +155,7 @@ runner/builder unit 名称。清理只停止这些 unit 实例,只移除本次�
 主机级互斥锁;第二个并行 execute/MMDS 调用在创建资源前被拒绝。锁描述符不会
 传给守护进程。异步启动断言等待实际 runner 调用记录,不放宽 sandbox 身份或
 启动模式检查。`make test` 包含隔离清理及并发回归;这些检查不能替代真实
-execute 和 MMDS 两个用例。
+对应的 lifecycle、exec、pause/wake、snapshot 和 MMDS 用例。
 
 ## 部署概览
 

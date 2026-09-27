@@ -1112,19 +1112,18 @@ node,但不启动 microVM.每个进程使用彼此不同的 admin,API 和 Data l
   Data listener 只模拟 ordinary data,CONNECT 与 exec.
 - 支持 `restart-link`、`reboot-empty`、`crash/start` 等节点动作。
 
-`make test-e2e` 不构建二进制：它把 `E2E_BIN`（默认兄弟项目主仓的组装后二进制目录）传给
-`test/e2e/run_all.sh`，要求事先准备多仓制品。只跑本地 stub 时，先 `make build`，再
-`make test-e2e-cluster-stub`；后者以本地 `BINDIR` 启动真实 `cluster-ctl registry/router/placer`
-与 `node-stub-ctl`。见 [Makefile](../Makefile)。
-`test/e2e/e2e_cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
+源码 stub 集成使用 `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh`，
+也由必需的 `make test-source` 执行。它使用所选源码工作区，启动真实控制面进程而不启动
+MicroVM。准备后的产品 E2E 使用[统一公开 runner 和独立用例](node_zh.md#15-测试)。
+`test/source/cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
 import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、SandboxID 与 NodeSandboxID
 转换,control/build 命中 API listener,data/exec 命中 Data listener,ExecSession Reserve/CmdExecSession 签发,
 `service=exec` KAT 拒绝/双层校验与第二跳 buffered tunnel,route cache,BuildRegister,
 孤儿 route 清理、Build Delete 丢失后的 reconnect full-sync 收敛和节点清空收敛。
 桩的 `reboot-empty` 故意清空模拟状态，不是实际 conductor 启动删除 durable SQLite row 的证明。
 
-配套的真实 `e2e_cluster_real.sh` 将通用生命周期和 Build/取消/回收矩阵保留在
-`registry-n1`. `registry-redirect` 从实际 node-link redirect 得到精确 Registry
+独立的 `orchestrator.cluster-lifecycle.sh` 拥有真实生命周期、Build 取消/回收及
+Router 重启合同。`orchestrator.cluster-recovery.sh` 从实际 node-link redirect 得到精确 Registry
 owner, 并确认 node 使用了该 owner. 重启该 owner 与 Router, 要求出现新的 node-link
 连接, 然后复用既有有界 placer probe 确认预期节点. 恢复后的拓扑与空 Router cache
 必须完成一次真实 Create, 通过既有有界只读 guest `/health` 就绪探测, 最后正常

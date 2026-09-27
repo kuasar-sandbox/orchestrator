@@ -8,7 +8,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
-	        test vet bench test-e2e release test-release clean help
+	        test test-source vet bench release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -32,9 +32,6 @@ endif
 GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
-E2E_BIN        ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
-ZOT_BIN        ?= zot
-VGW_BIN        ?= versitygw
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -78,13 +75,7 @@ test:
 	CGO_ENABLED=0 $(GO) test ./...
 	bash test/source/runtask_privilege.sh
 	bash test/source/vmm_cgroup.sh
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_cluster_stub_diagnostics.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_ownership.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_pause_cancellation.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_execute_recovery.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_density_*.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_orchestrator_proxy_go.py'
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_placer_readiness.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_*.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-telemetry-image-pull.py
 
 vet:
@@ -98,7 +89,7 @@ clean:
 
 # Product E2E is executed by the shared project framework from prepared artifacts.
 # Local source checks remain available through the compiler-capable source gate.
-test-e2e:
+test-source:
 	bash scripts/ci-source-checks.sh
 
 VERSION ?= v0.1.0
@@ -126,7 +117,7 @@ help:
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e                   run compiler-capable orchestrator source integration checks"
+	@echo "  test-source                run compiler-capable orchestrator source integration checks"
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"

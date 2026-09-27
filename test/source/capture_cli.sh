@@ -4,6 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 : "${ORG:?ORG must point to the exact integration source workspace}"
 SANDBOXER_SOURCE_ROOT="${SANDBOXER_SOURCE_ROOT:-$ORG/sandboxer}"
 [ -f "$SANDBOXER_SOURCE_ROOT/go.mod" ] || {
