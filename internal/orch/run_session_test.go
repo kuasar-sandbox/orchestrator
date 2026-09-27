@@ -163,7 +163,6 @@ func TestRunSessionDisconnectRetirementLosesToSandboxAssignmentCommit(t *testing
 	}
 }
 
-
 func TestRunSessionDisconnectRetirementLosesToReconnectedIdleGeneration(t *testing.T) {
 	o := testOrch(t)
 	p, lc, baseCtx, _ := startRunPoolTestWithIndex(t, 2, &o.runs)
@@ -186,7 +185,7 @@ func TestRunSessionDisconnectRetirementLosesToReconnectedIdleGeneration(t *testi
 	go func() {
 		_, err := p.Assign(baseCtx, "block-pool-retirement", func(gotRunID string) error {
 			if gotRunID != blockerRunID {
-				return fmt.Errorf("blocker runID = %q, want %q", gotRunID, blockerRunID)
+				return errors.New("blocking assignment selected unexpected run")
 			}
 			close(commitStarted)
 			<-commitGate
