@@ -45,13 +45,7 @@ PY
 
 resource_run_sandbox "$sid"
 pid=$RESOURCE_LAST_PID
-deadline=$((SECONDS+30))
-while [ "$SECONDS" -lt "$deadline" ]; do
-    if resource_memory_control_observed "$sid" && grep -q control-workload-ready "$WORK/$sid.log" 2>/dev/null; then break; fi
-    kill -0 "$pid" || resource_fail "$sid exited before control readiness"
-    sleep 0.2
-done
-resource_memory_control_observed "$sid" || resource_fail "memory control did not initialize"
+resource_wait_static_control_ready "$sid" "$pid" 30
 read -r target_before actual_before <<<"$(resource_read_balloon "$sid")"
 [[ "$target_before" =~ ^[0-9]+$ && "$actual_before" =~ ^[0-9]+$ ]] || resource_fail "invalid initial CH balloon state"
 capacity=$((1024 * 1024 * 1024))

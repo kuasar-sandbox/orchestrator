@@ -57,12 +57,17 @@ code="$(curl -sS --noproxy '*' -D "$WORK/data.headers" -o "$WORK/data.body" -w '
 [ "$code" = 404 ] || { cat "$WORK/data.body"; echo "missing proxy route returned $code (want 404)" >&2; exit 1; }
 grep -Eqi '^X-Kuasar-Proxy-Error:[[:space:]]*not_found[[:space:]]*$' "$WORK/data.headers" || { cat "$WORK/data.headers"; echo "missing proxy route omitted typed not_found error" >&2; exit 1; }
 
-code="$(curl -sS --noproxy '*' -o "$WORK/api-data.body" -w '%{http_code}' -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$API_PORT/health")"
+code="$(curl -sS --noproxy '*' -D "$WORK/api-data.headers" -o "$WORK/api-data.body" -w '%{http_code}' \
+    -H 'Host: 49983-private-s1.sandboxes.e2e.local' -H 'X-Sandbox-Id: private-s1' \
+    "http://127.0.0.1:$API_PORT/private/sandboxes/private-s1/49983/health")"
 [ "$code" = 404 ] || { cat "$WORK/api-data.body"; echo "conductor incorrectly served data host: $code" >&2; exit 1; }
+! grep -Eiq '^X-Kuasar-Proxy-Error:' "$WORK/api-data.headers" ||
+    { cat "$WORK/api-data.headers"; echo "conductor data Host reached Proxy" >&2; exit 1; }
 
-code="$(curl -sS --noproxy '*' -o "$WORK/api-connect.body" -w '%{http_code}' -X CONNECT -H 'Host: 49983-unknown.sandboxes.e2e.local' "http://127.0.0.1:$API_PORT/")"
+code="$(curl -sS --noproxy '*' -D "$WORK/api-connect.headers" -o "$WORK/api-connect.body" -w '%{http_code}' \
+    -X CONNECT -H 'Host: 49983-private-s1.invalid' "http://127.0.0.1:$API_PORT/private-connect")"
 case "$code" in 404|405) ;; *) cat "$WORK/api-connect.body"; echo "conductor API accepted data CONNECT: $code" >&2; exit 1;; esac
-! grep -qi 'X-Kuasar-Proxy-Error' "$WORK/api-connect.body" ||
-    { cat "$WORK/api-connect.body"; echo "conductor API CONNECT leaked proxy response" >&2; exit 1; }
+! grep -Eiq '^X-Kuasar-Proxy-Error:' "$WORK/api-connect.headers" ||
+    { cat "$WORK/api-connect.headers"; echo "conductor CONNECT reached Proxy" >&2; exit 1; }
 
 echo "PASS orchestrator.proxy.sh"

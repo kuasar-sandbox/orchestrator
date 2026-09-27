@@ -124,10 +124,12 @@ echo "==> B2: fromTemplate=$SOURCE_IMAGE + steps + startCmd/readyCmd"
 register e2e-tpl e2b '' 1
 B2_TID="$TID"; B2_BID="$BID"
 [ "$B2_BID" != "$SOURCE_BID" ] || fail "new registration reused B1 build id"
+# The prepared e2b image already owns the guest user/home prerequisite.
+# Verify it after the live-recovery barrier before applying the remaining steps.
 B2_BODY=$(cat <<EOF
 {"fromTemplate":"$SOURCE_IMAGE",
  "steps":[
-   {"type":"RUN","args":["touch /tmp/issue374-recovery-started; while [ ! -e /tmp/issue374-recovery-ready ]; do sleep 0.1; done; rm /tmp/issue374-recovery-started /tmp/issue374-recovery-ready; useradd -m -d /home/user user || adduser -D user"]},
+   {"type":"RUN","args":["touch /tmp/issue374-recovery-started; while [ ! -e /tmp/issue374-recovery-ready ]; do sleep 0.1; done; rm /tmp/issue374-recovery-started /tmp/issue374-recovery-ready; id user >/dev/null && test -d /home/user"]},
    {"type":"RUN","args":["grep -Eq '^0::/user(/|$)' /proc/self/cgroup && test ! -s /sys/fs/cgroup/cgroup.procs && for group in user ptys socats; do test -d /sys/fs/cgroup/\$group && test -e /sys/fs/cgroup/\$group/cpu.weight && test -e /sys/fs/cgroup/\$group/memory.max && test -e /sys/fs/cgroup/\$group/io.weight || exit 1; done"]},
    {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
    {"type":"ENV","args":["BUILT","yes"]},

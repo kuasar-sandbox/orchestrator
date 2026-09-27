@@ -2603,6 +2603,8 @@ migrate,node-link(注册/事件/命令往返)等).
 必需的状态、并发、策略及发布规划 Go 合同，并拒绝缺失/跳过测试。单元/race/vet、helper
 回归、特权 UFFD/Collector 检查、unit upgrade、journal 身份、cluster stub 集成和性能
 门禁属于独立源码检查。
+Helper 回归直接执行资源用例使用的就绪、grow 事件和实时 reservation 判定，覆盖
+延迟、非法及被后续状态替代的观察值；同时验证 capture 结果完整性和先恢复再准备的顺序。
 
 产品 E2E 遵循 **预构建产品 → prepare → `<suite>.<case>.sh` → 统一公开 runner**。
 完整文件名是 case ID，第一段是 suite。项目只使用 `basic`、`storage`、`image`、

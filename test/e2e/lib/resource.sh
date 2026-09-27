@@ -7,6 +7,7 @@ set -euo pipefail
 resource_fail() { echo "FAIL: $*" >&2; exit 1; }
 
 resource_init() {
+    . "${E2E_LIB:?}/orchestrator/resource_observation.sh"
     : "${BIN:?BIN must point to prepared products}"
     : "${WORK:?WORK must be provided by the E2E runner}"
     : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
@@ -177,22 +178,7 @@ resource_wait_state() {
     local sid="$1" pid="$2" mode="$3" timeout="$4" deadline
     deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        local rows
-        rows="$("$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" 2>/dev/null || true)"
-        if SID="$sid" MODE="$mode" ROWS="$rows" python3 - <<'PY' 2>/dev/null
-import json, os
-rows=json.loads(os.environ["ROWS"])
-match=[r for r in rows if r.get("sandbox_id")==os.environ["SID"]]
-assert len(match)==1, rows
-r=match[0]
-assert r.get("connected") is True and r.get("provisional", False) is False, r
-assert r.get("stage")=="settled", r
-if os.environ["MODE"]=="synced":
-    assert len(rows)==1 and r.get("recovery_source")=="synced", (rows,r)
-else:
-    assert r.get("recovery_source") in {"admit","synced"}, r
-PY
-        then return 0; fi
+        if resource_reservation_matches "$sid" "$mode"; then return 0; fi
         kill -0 "$pid" 2>/dev/null || resource_fail "$sid exited before reservation state $mode"
         sleep 0.25
     done
@@ -273,12 +259,21 @@ resource_memory_control_observed() {
 }
 
 resource_reservation_memory() {
-    local sid="$1" rows
-    rows=$("$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock") || return 1
-    SID="$sid" ROWS="$rows" python3 -c 'import json,os
-m=[r for r in json.loads(os.environ["ROWS"]) if r.get("sandbox_id")==os.environ["SID"]]
-assert len(m)==1 and m[0].get("connected") is True and not m[0].get("provisional",False), m
-print(m[0]["allocatable_memory"])'
+    local sid="$1" reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    SID="$sid" RESERVATIONS_JSON="$reservations" python3 - 2>/dev/null <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+matches = [row for row in rows if row.get("sandbox_id") == os.environ["SID"]]
+assert len(matches) == 1, rows
+row = matches[0]
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+print(row["allocatable_memory"])
+PY
 }
 
 resource_wait_local_grow() {

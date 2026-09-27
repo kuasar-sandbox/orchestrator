@@ -1933,6 +1933,9 @@ executes the required state, concurrency, policy and publication-planning Go
 contracts and rejects missing or skipped tests. Unit/race/vet, helper regressions,
 privileged UFFD/Collector checks, unit upgrade, journal identity, cluster stub
 integration and performance gates remain source checks, independent of product E2E.
+Helper regressions exercise the resource cases' actual readiness, grow-event and
+live-reservation predicates with delayed, invalid and superseding observations.
+They also verify capture result completeness and recovery-before-setup ordering.
 
 Product E2E follows **prebuilt products → prepare → `<suite>.<case>.sh` → the
 shared public runner**. The full filename is the case ID; its first segment is
