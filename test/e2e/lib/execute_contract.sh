@@ -46,7 +46,7 @@ cleanup() {
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
     if [ -n "${CASE_OUT:-}" ]; then
         mkdir -p "$CASE_OUT/runtime"
-        cp "$WORK"/*.log "$WORK"/*.out "$CASE_OUT/runtime/" 2>/dev/null || true
+        cp "$WORK"/*.log "$WORK"/*.out "$WORK"/*.journal "$CASE_OUT/runtime/" 2>/dev/null || true
     fi
     [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
     if [ -n "${EXECUTE_STATE_EXPECTED:-}" ] && [ "$forwarding_clean" = 1 ]; then
