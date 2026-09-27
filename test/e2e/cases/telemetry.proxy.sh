@@ -52,29 +52,58 @@ start_proxy "$NODE" "$WORK/proxy.yaml" "$WORK/proxy.log"
 PROXY=$PROXY_HELPER_PID
 proxy_case_wait_data "$PROXY" 127.0.0.1 "$DATA_PORT" "$STATS" "$WORK/proxy.log" || exit 1
 
+notfound_total() {
+    python3 - "$1" <<'PY'
+import math
+import re
+import sys
+
+total = 0.0
+with open(sys.argv[1], encoding="utf-8") as stream:
+    for line in stream:
+        match = re.fullmatch(
+            r'data_requests_total\{([^}]*)\}\s+(\S+)(?:\s+\S+)?',
+            line.strip(),
+        )
+        if match and re.search(r'(?:^|,)\s*result="notfound"(?:,|$)', match[1]):
+            value = float(match[2])
+            if not math.isfinite(value) or value < 0:
+                raise SystemExit("invalid notfound counter")
+            total += value
+print(total)
+PY
+}
+
+# Readiness traffic can increment badrequest. Only the target notfound series
+# may satisfy this assertion, and it must grow beyond the pre-request baseline.
+metrics_ready=0
+deadline=$((SECONDS + 20))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" >"$WORK/metrics.before" 2>/dev/null; then
+        baseline="$(notfound_total "$WORK/metrics.before")"
+        metrics_ready=1
+        break
+    fi
+    kill -0 "$PROXY" 2>/dev/null || { cat "$WORK/proxy.log" >&2; exit 1; }
+    sleep 0.2
+done
+[ "$metrics_ready" = 1 ] || { echo "proxy master metrics did not become ready" >&2; exit 1; }
+
 code="$(curl -sS --noproxy '*' -o "$WORK/data.body" -w '%{http_code}'     -H 'Host: 49983-unknown.sandboxes.e2e.local'     "http://127.0.0.1:$DATA_PORT/health")"
 [ "$code" = 404 ] || { cat "$WORK/data.body"; echo "missing route returned $code" >&2; exit 1; }
 
 deadline=$((SECONDS + 20))
 while [ "$SECONDS" -lt "$deadline" ]; do
-    if curl -fsS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" >"$WORK/metrics.out" 2>/dev/null &&
-       grep -Eq 'data_requests_total\\{[^}]*result="notfound"[^}]*\\}[[:space:]]+[1-9][0-9]*(\\.[0-9]+)?; then
-        echo "PASS telemetry.proxy.sh"
-        exit 0
+    if curl -fsS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" >"$WORK/metrics.out" 2>/dev/null; then
+        current="$(notfound_total "$WORK/metrics.out")"
+        if python3 -c 'import sys; sys.exit(0 if float(sys.argv[2]) > float(sys.argv[1]) else 1)' "$baseline" "$current"; then
+            echo "PASS telemetry.proxy.sh"
+            exit 0
+        fi
     fi
     kill -0 "$PROXY" 2>/dev/null || { cat "$WORK/proxy.log" >&2; exit 1; }
     sleep 0.2
 done
 cat "$WORK/proxy.log" >&2
-echo "proxy master metrics omitted aggregated notfound data_requests_total" >&2
-exit 1
- "$WORK/metrics.out"; then
-        echo "PASS telemetry.proxy.sh"
-        exit 0
-    fi
-    kill -0 "$PROXY" 2>/dev/null || { cat "$WORK/proxy.log" >&2; exit 1; }
-    sleep 0.2
-done
-cat "$WORK/proxy.log" >&2
-echo "proxy master metrics omitted aggregated data_requests_total" >&2
+echo "proxy master notfound counter did not increase beyond $baseline" >&2
 exit 1
