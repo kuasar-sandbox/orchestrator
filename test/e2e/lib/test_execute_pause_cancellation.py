@@ -24,12 +24,15 @@ def snippet(start, end):
     return SOURCE[SOURCE.index(start):SOURCE.index(end, SOURCE.index(start))]
 
 
-BARRIER_PATHS = snippet('PAUSE_BARRIER_TARGET="$WORK/', 'mkdir -p "$ORCH_BIN_DIR"')
-WRAPPER = snippet('cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF', 'declare -a PIDS=()')
+BARRIER_PATHS = snippet('PAUSE_BARRIER_TARGET="$WORK/', 'stop_owned_units() {')
+WRAPPER = snippet('cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF', 'printf \'%s\\n\' "$SID" > "$PAUSE_BARRIER_TARGET"')
 LAUNCH = snippet('printf \'%s\\n\' "$SID" > "$PAUSE_BARRIER_TARGET"', 'for _ in $(seq 1 1500); do')
-CANCEL = snippet('for _ in $(seq 1 1500); do', 'wait_sandbox_state "$SID" paused 1200 || {')
-FAIL = re.search(r"(?m)^fail\(\).*", SOURCE).group()
-CLEANUP = snippet('stop_owned_units() {', '\nfree_port() {')
+CANCEL_START = 'for _ in $(seq 1 1500); do'
+if SOURCE.count(CANCEL_START) != 1:
+    raise AssertionError("ambiguous/missing Pause cancellation boundary")
+CANCEL = SOURCE[SOURCE.index(CANCEL_START):]
+FAIL = 'fail() { echo "FAIL: $*" >&2; exit 1; }'
+CLEANUP = snippet('stop_owned_units() {', 'cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF')
 
 
 class ExecutePauseCancellation(unittest.TestCase):
