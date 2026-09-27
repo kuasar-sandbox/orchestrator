@@ -133,6 +133,8 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK")
     echo "==> PASS: paused history never woke sandbox; disconnect returned 503; TSDB restart retained history"
 stop_telemetry
 assert_native_usage "$SID" paused
+# The previous Collector has stopped; only the new write-only export may satisfy this check.
+: > "$WORK/telemetry-native.jsonl"
 ended=""
         cat >"$WORK/telemetry-usage.yaml" <<EOF
 config_socket: $WORK/node-ctl.socket

@@ -3,12 +3,12 @@
 SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/proxy.sh"
 . "$SCRIPT_DIR/build_fixture_units.sh"
- : "${BIN:?BIN must point to prepared products}"
+: "${BIN:?BIN must point to prepared products}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-c${BASHPID}}"
 : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
 E2E_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
- : "${ZOT_BIN:?ZOT_BIN must point to the prepared registry binary}"
+: "${ZOT_BIN:?ZOT_BIN must point to the prepared registry binary}"
 SW_NETNS="${SW_NETNS:-e2ec_${BASHPID}}"
 
 step() { echo "==> $*" >&2; }
@@ -53,7 +53,7 @@ done
 command -v python3 >/dev/null 2>&1 || fail "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || fail "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || fail "docker not usable"
-[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || fail "zot not found (set ZOT_BIN or install zot on PATH)"
+[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || fail "prepared registry is missing: $ZOT_BIN"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || fail "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || fail "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || fail "systemd not PID1"
@@ -75,6 +75,11 @@ for u in "${UNIT_NAMES[@]}"; do
     [ -e "$UNIT_DIR/$u" ] && fail "$UNIT_DIR/$u exists; refusing to clobber"
     OURS+=("$UNIT_DIR/$u")
 done
+# Full case IDs and node-local sandbox IDs exceed sun_path under CI's run root.
+# Keep runtime sockets short and retain observations in the runner's output root.
+CASE_OUT="${OUT:-$WORK}"
+mkdir -p "$CASE_OUT"
+WORK="$(mktemp -d /tmp/c-XXXXXX)"
 mkdir -p "$WORK/r" "$WORK/l" "$WORK/s" "$WORK/z/d" "$WORK/g" "$WORK/br" "$WORK/bl" "$WORK/cr" "$WORK/cl"
 declare -a PIDS=()
 declare -a REGISTRY_PIDS=()
@@ -98,7 +103,10 @@ cleanup() {
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
-    : # The common runner owns the case output directory.
+    mkdir -p "$CASE_OUT/runtime"
+    cp "$WORK"/*.log "$CASE_OUT/runtime/" 2>/dev/null || true
+    [ ! -f "$WORK/build-actions.json" ] || cp "$WORK/build-actions.json" "$CASE_OUT/runtime/"
+    [ -n "${E2E_KEEP:-}" ] && step "kept runtime directory: $WORK" || rm -rf "$WORK"
 }
 trap cleanup EXIT
 

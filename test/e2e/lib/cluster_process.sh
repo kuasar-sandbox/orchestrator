@@ -130,6 +130,9 @@ EOF
 
     kill "$build_pid" 2>/dev/null || true
     wait "$build_pid" 2>/dev/null || true
+    for i in "${!PIDS[@]}"; do
+        [ "${PIDS[$i]}" != "$build_pid" ] || PIDS[$i]=""
+    done
     stop_build_fixture_units "$WORK" 2>/dev/null || true
 }
 

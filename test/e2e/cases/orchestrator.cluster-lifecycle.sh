@@ -242,6 +242,9 @@ PY_CLUSTER_BUILD
         if [ -e "$WORK/restart-request" ] && [ ! -e "$WORK/restart-ready" ]; then
             kill "$ROUTER_PID"
             wait "$ROUTER_PID" || true
+            for i in "${!PIDS[@]}"; do
+                [ "${PIDS[$i]}" != "$ROUTER_PID" ] || PIDS[$i]=""
+            done
             "$BIN/cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
             ROUTER_PID=$!
             PIDS+=("$ROUTER_PID")
@@ -251,5 +254,10 @@ PY_CLUSTER_BUILD
         fi
         sleep 0.1
     done
-    wait "$ACTION_TEST_PID" || fail "Build action capacity/restart acceptance"
+    action_status=0
+    wait "$ACTION_TEST_PID" || action_status=$?
+    for i in "${!PIDS[@]}"; do
+        [ "${PIDS[$i]}" != "$ACTION_TEST_PID" ] || PIDS[$i]=""
+    done
+    [ "$action_status" = 0 ] || fail "Build action capacity/restart acceptance"
 echo "PASS orchestrator.cluster-lifecycle.sh"
