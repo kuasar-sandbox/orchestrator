@@ -433,11 +433,10 @@ func (o *Orchestrator) runSessionDurableAssigned(ctx context.Context, kind, runI
 	}
 }
 
-func (o *Orchestrator) runSessionAssignmentActive(kind, runID string) bool {
-	if o.runSessionActive(kind, runID) {
-		return true
-	}
-	return o.allowLegacyAssignmentWithoutRunSession
+func (o *Orchestrator) acquireRunSessionAssignmentFence(kind, runID string) (bool, func()) {
+	o.runSessionsMu.Lock()
+	active := o.runSessions[runSessionKey{kind: kind, runID: runID}] != nil || o.allowLegacyAssignmentWithoutRunSession
+	return active, o.runSessionsMu.Unlock
 }
 
 func (o *Orchestrator) runSessionActive(kind, runID string) bool {

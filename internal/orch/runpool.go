@@ -36,7 +36,7 @@ type runConsumeReq struct {
 	taskID       string
 	ctx          context.Context
 	commit       func(runID string) error
-	sessionFence func(runID string) bool
+	sessionFence func(runID string) (bool, func())
 	resp         chan runConsumeResp
 	stopCancel   func() bool
 	// startAttempts is the finite wave of already in-flight or demand-created
@@ -124,7 +124,7 @@ func (p *runPool) Assign(ctx context.Context, taskID string, commit func(runID s
 	return p.AssignWithFence(ctx, taskID, nil, commit)
 }
 
-func (p *runPool) AssignWithFence(ctx context.Context, taskID string, sessionFence func(runID string) bool, commit func(runID string) error) (string, error) {
+func (p *runPool) AssignWithFence(ctx context.Context, taskID string, sessionFence func(runID string) (bool, func()), commit func(runID string) error) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -333,19 +333,24 @@ func (p *runPool) loop(ctx context.Context) {
 				idle = append([]idleRun{w}, idle...)
 				continue
 			}
-			if req.sessionFence != nil && !req.sessionFence(w.runID) {
-				err := fmt.Errorf("run pool: run %s has no active run session", w.runID)
-				replyWait(w.req, runWaitResp{err: err})
-				queueControl(runControlReq{op: "stop", runID: w.runID})
-				// Losing an idle session retires that runner, not the task
-				// waiting for capacity. Preserve FIFO order and replenish the
-				// waiting requests' start wave; subsequent unit-start failures
-				// still use the existing finite-wave/cancellation handling.
-				pending = append([]*runConsumeReq{req}, pending...)
-				addStartAttempts(pending, ensure())
-				continue
+			releaseSessionFence := func() {}
+			if req.sessionFence != nil {
+				active, release := req.sessionFence(w.runID)
+				if release != nil {
+					releaseSessionFence = release
+				}
+				if !active {
+					err := fmt.Errorf("run pool: run %s has no active run session", w.runID)
+					replyWait(w.req, runWaitResp{err: err})
+					queueControl(runControlReq{op: "stop", runID: w.runID})
+					releaseSessionFence()
+					pending = append([]*runConsumeReq{req}, pending...)
+					addStartAttempts(pending, ensure())
+					continue
+				}
 			}
 			if err := req.commit(w.runID); err != nil {
+				releaseSessionFence()
 				replyConsume(req, runConsumeResp{err: err})
 				if p.kind == runKindBuild {
 					// Build preparation can be cancelled after touching this unit.
@@ -361,6 +366,7 @@ func (p *runPool) loop(ctx context.Context) {
 			p.runs.assigned(w.runID)
 			replyWait(w.req, runWaitResp{taskID: req.taskID, ok: true})
 			replyConsume(req, runConsumeResp{runID: w.runID})
+			releaseSessionFence()
 		}
 	}
 

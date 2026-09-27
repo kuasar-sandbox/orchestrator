@@ -602,7 +602,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	assignStarted := time.Now()
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
-	runID, err := o.runnerPool.AssignWithFence(assignmentCtx, sb.ID, func(runID string) bool { return o.runSessionAssignmentActive(runKindSandbox, runID) }, func(runID string) error {
+	runID, err := o.runnerPool.AssignWithFence(assignmentCtx, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
 		// Serialize the runner-binding linearization point with Kill/Delete and
 		// other lifecycle mutations. If deletion wins, the exact CAS below misses

@@ -25,6 +25,24 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+
+func TestWaitSandboxAssignmentRetriesInterruptedResponse(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.sock")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var attempts atomic.Int32
+	sid, err := waitSandboxAssignmentWithRetry(ctx, missing, "run-1", func(callCtx context.Context, socket, kind, runID string) (string, error) {
+		if attempts.Add(1) < 3 {
+			_, callErr := configsock.WaitAssignment(callCtx, missing, kind, runID)
+			return "", callErr
+		}
+		return "sid-replayed", nil
+	})
+	if err != nil || sid != "sid-replayed" || attempts.Load() != 3 {
+		t.Fatalf("assignment retry = %q, %v after %d attempts", sid, err, attempts.Load())
+	}
+}
+
 func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
 	readyR, readyW, err := os.Pipe()
 	if err != nil {

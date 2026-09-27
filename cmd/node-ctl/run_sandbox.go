@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"golang.org/x/sys/unix"
@@ -78,7 +79,7 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 		}
 		defer session.Close()
 	}
-	sid, err := ops.waitAssignment(context.Background(), socket, "sandbox", runID)
+	sid, err := waitSandboxAssignmentWithRetry(context.Background(), socket, runID, ops.waitAssignment)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
 	}
@@ -92,6 +93,35 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
 	return ops.launchTask(socket, sid, runID, ready, vmmCgroup)
+}
+
+
+func waitSandboxAssignmentWithRetry(ctx context.Context, socket, runID string, wait func(context.Context, string, string, string) (string, error)) (string, error) {
+	delay := 20 * time.Millisecond
+	for {
+		sid, err := wait(ctx, socket, "sandbox", runID)
+		if err == nil || !configsock.IsRetryableError(err) {
+			return sid, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
 }
 
 func connectReadinessSocket(path string) (*os.File, error) {

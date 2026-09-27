@@ -723,7 +723,7 @@ func TestRunPoolAssignWithFenceRetiresIdleDisconnectedRunAndUsesReplacement(t *t
 	assigned := make(chan runConsumeResp, 1)
 	var committed string
 	go func() {
-		id, err := p.AssignWithFence(ctx, "replacement-task", func(id string) bool { return id != stale }, func(id string) error { committed = id; return nil })
+		id, err := p.AssignWithFence(ctx, "replacement-task", func(id string) (bool, func()) { return id != stale, func() {} }, func(id string) error { committed = id; return nil })
 		assigned <- runConsumeResp{runID: id, err: err}
 	}()
 	select {
@@ -775,7 +775,7 @@ func TestRunPoolAssignWithFenceRetiresPreWaitDisconnectedRunAndUsesLiveStart(t *
 	assigned := make(chan runConsumeResp, 1)
 	var committed string
 	go func() {
-		id, err := p.AssignWithFence(ctx, "pre-wait-task", func(id string) bool { return id != stale }, func(id string) error { committed = id; return nil })
+		id, err := p.AssignWithFence(ctx, "pre-wait-task", func(id string) (bool, func()) { return id != stale, func() {} }, func(id string) error { committed = id; return nil })
 		assigned <- runConsumeResp{runID: id, err: err}
 	}()
 	// A demand start proves the consumer is pending before the stale runner
@@ -813,7 +813,7 @@ func TestRunPoolAssignWithFenceCancellationAfterIdleSessionLoss(t *testing.T) {
 	assigned := make(chan runConsumeResp, 1)
 	committed := false
 	go func() {
-		id, err := p.AssignWithFence(ctx, "cancel-after-session-loss", func(id string) bool { return id != stale }, func(string) error { committed = true; return nil })
+		id, err := p.AssignWithFence(ctx, "cancel-after-session-loss", func(id string) (bool, func()) { return id != stale, func() {} }, func(string) error { committed = true; return nil })
 		assigned <- runConsumeResp{runID: id, err: err}
 	}()
 	select {
@@ -860,7 +860,7 @@ func TestRunPoolAssignWithFencePreservesFiniteReplacementStartFailure(t *testing
 	}
 	stale, waiter := addIdleRunForTest(t, p, lc, ctx)
 	committed := false
-	got, err := p.AssignWithFence(ctx, "finite-replacement-wave", func(id string) bool { return id != stale }, func(string) error { committed = true; return nil })
+	got, err := p.AssignWithFence(ctx, "finite-replacement-wave", func(id string) (bool, func()) { return id != stale, func() {} }, func(string) error { committed = true; return nil })
 	if err == nil || !strings.Contains(err.Error(), "replacement-start-failed") || got != "" || committed {
 		t.Fatalf("replacement wave = %q, %v, committed=%t", got, err, committed)
 	}
@@ -999,7 +999,7 @@ func TestRunPoolAssignWithFenceSkipsDisconnectedIdleBeforeHealthyCapacity(t *tes
 			var commits []string
 			// Model the real fence between session removal and the queued idle-retire
 			// event: the first waiter still exists, but only the next runner has a session.
-			got, err := p.AssignWithFence(ctx, "healthy-request", func(id string) bool { return id == healthy }, func(id string) error { commits = append(commits, id); return nil })
+			got, err := p.AssignWithFence(ctx, "healthy-request", func(id string) (bool, func()) { return id == healthy, func() {} }, func(id string) error { commits = append(commits, id); return nil })
 			if err != nil || got != healthy {
 				t.Fatalf("stale idle %s rejected an unrelated request despite live idle %s: got %q, err %v; commits %v", stale, healthy, got, err, commits)
 			}
@@ -1023,5 +1023,49 @@ func TestRunPoolAssignWithFenceSkipsDisconnectedIdleBeforeHealthyCapacity(t *tes
 				t.Fatal("healthy waiter did not receive task")
 			}
 		})
+	}
+}
+
+
+func TestRunPoolAssignmentFenceReleasesAfterRetiredRunIsForgotten(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Second)
+	defer cancel()
+	stale, waiter := addIdleRunForTest(t, p, lc, ctx)
+	released := make(chan bool, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.AssignWithFence(ctx, "guarded-retirement", func(id string) (bool, func()) {
+			if id != stale {
+				return true, func() {}
+			}
+			return false, func() {
+				_, _, waiting := p.runs.ownerPool(id)
+				released <- !waiting
+			}
+		}, func(string) error { return nil })
+		done <- err
+	}()
+	select {
+	case forgotten := <-released:
+		if !forgotten {
+			t.Fatal("session fence released before retired run was forgotten")
+		}
+	case <-ctx.Done():
+		t.Fatal("session fence was not released")
+	}
+	select {
+	case got := <-waiter.resp:
+		if got.err == nil || got.ok {
+			t.Fatalf("retired waiter = %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("retired waiter did not receive rejection")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pending assignment did not stop after cancellation")
 	}
 }

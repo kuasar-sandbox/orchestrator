@@ -1204,7 +1204,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	var mmdsRow *types.Sandbox
 	joinCancellation := func() {}
 	defer func() { joinCancellation() }()
-	if _, err := o.builderRunPool.AssignWithFence(buildCtx, b.BuildID, func(runID string) bool { return o.runSessionAssignmentActive(runKindBuild, runID) }, func(runID string) error {
+	if _, err := o.builderRunPool.AssignWithFence(buildCtx, b.BuildID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindBuild, runID) }, func(runID string) error {
 		var locateErr error
 		unit, locateErr = o.resolveRunUnit(buildCtx, runKindBuild, runID)
 		if locateErr != nil {
