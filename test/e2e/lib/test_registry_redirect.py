@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPT = Path(__file__).parents[1] / "e2e_cluster_real.sh"
+SCRIPT = Path(__file__).parents[1] / "cases" / "orchestrator.cluster-recovery.sh"
 
 
 def function(name):
@@ -144,7 +144,7 @@ wait_node_sandbox_finalized() { record finalized; }
         self.assertLess(source.index("run_redirect_recovery"), source.index('code="$(create_sandbox'))
         self.assertLess(source.index("run_redirect_recovery"), source.index("router_req DELETE"))
         gate = function("wait_redirect_placer")
-        self.assertIn("lib/placer_readiness.py", gate)
+        self.assertIn('"$SCRIPT_DIR/placer_readiness.py"', gate)
         self.assertIn('--expected-node "$NODE_ID"', gate)
         restart = function("restart_redirect_owner")
         self.assertIn('"$WORK/$REDIRECT_OWNER.yaml"', restart)
