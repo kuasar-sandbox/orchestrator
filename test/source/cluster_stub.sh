@@ -54,7 +54,7 @@ if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
         REGISTRIES="${rest%%:*}"
         SCALERS="${rest##*:}"
         step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES placers=$SCALERS)"
-        CLUSTER_STUB_BUILT="${CLUSTER_STUB_BUILT:-1}" CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" "$0"
+        CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" bash "$0"
     done
     exit 0
 fi

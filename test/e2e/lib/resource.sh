@@ -23,11 +23,14 @@ resource_init() {
     : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
     RESOURCE_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
     docker image inspect "$RESOURCE_IMAGE" >/dev/null 2>&1         || resource_fail "prepared base image is missing: $RESOURCE_IMAGE"
+    . "$E2E_LIB/orchestrator/case_workspace.sh"
+    case_workspace_init
     mkdir -p "$WORK/run" "$WORK/lib" "$WORK/units"
     RESOURCE_DAEMON_PID=""
     RESOURCE_SANDBOX_PIDS=()
     RESOURCE_SANDBOX_IDS=()
     declare -gA RESOURCE_TAPS=()
+    trap resource_cleanup EXIT
     [ -d /sys/fs/cgroup/sandboxes ] || mkdir /sys/fs/cgroup/sandboxes
     echo "+memory +cpu" >/sys/fs/cgroup/sandboxes/cgroup.subtree_control 2>/dev/null || true
     local blk="$WORK/base.img"
@@ -213,9 +216,11 @@ resource_cleanup() {
     for pid in "${RESOURCE_SANDBOX_PIDS[@]:-}"; do wait "$pid" 2>/dev/null || true; done
     resource_stop_controller
     for sid in "${RESOURCE_SANDBOX_IDS[@]:-}"; do
+        [ -n "$sid" ] || continue
         ip link delete "${RESOURCE_TAPS[$sid]}" 2>/dev/null || true
         rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null || true
     done
+    case_workspace_cleanup
 }
 
 resource_read_balloon() {

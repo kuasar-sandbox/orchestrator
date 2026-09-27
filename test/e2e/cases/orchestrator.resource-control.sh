@@ -3,7 +3,6 @@ set -euo pipefail
 : "${E2E_LIB:?}"
 . "$E2E_LIB/orchestrator/resource.sh"
 resource_init
-trap resource_cleanup EXIT
 
 sid=resource-static
 resource_setup_sandbox "$sid"

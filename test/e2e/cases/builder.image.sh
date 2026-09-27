@@ -5,7 +5,6 @@ write_builder_config
 start_conductor
 . "$SCRIPT_DIR/builder_proxy.sh"
 start_builder_proxy
-start_conductor
 # Before any registration, both size=1 entries must independently prewarm.
 # Count only this fixture's RunID pidfiles, never deployment units.
 idle_builders=0

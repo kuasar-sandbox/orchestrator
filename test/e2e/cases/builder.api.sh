@@ -5,6 +5,7 @@ set -euo pipefail
 : "${WORK:?WORK must be provided by the platform E2E runner}"
 : "${E2E_LIB:?E2E_LIB must point to prepared E2E helpers}"
 . "$E2E_LIB/orchestrator/build_fixture_units.sh"
+. "$E2E_LIB/orchestrator/case_workspace.sh"
 NODE="$BIN/node-ctl"
 KEY="$BIN/e2b-key-ctl"
 for tool in "$NODE" "$KEY"; do [ -x "$tool" ] || { echo "missing prepared product: $tool" >&2; exit 1; }; done
@@ -12,12 +13,19 @@ command -v curl >/dev/null
 command -v python3 >/dev/null
 [ -d /run/systemd/system ] || { echo "systemd manager is required" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "root is required" >&2; exit 1; }
+case_workspace_init
 
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 DOMAIN="sandboxes.e2e.local"
 mkdir -p "$WORK/units" "$WORK/run" "$WORK/lib"
 PID=""
-cleanup() { set +e; stop_build_fixture_units "$WORK" 2>/dev/null || true; [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null || true; }
+cleanup() {
+  set +e
+  stop_build_fixture_units "$WORK" 2>/dev/null || true
+  [ -n "$PID" ] && kill "$PID" 2>/dev/null
+  wait "$PID" 2>/dev/null || true
+  case_workspace_cleanup
+}
 trap cleanup EXIT
 fail() { echo "FAIL builder.api.sh: $*" >&2; exit 1; }
 field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }

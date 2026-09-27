@@ -3,7 +3,6 @@ set -euo pipefail
 : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
 . "$E2E_LIB/orchestrator/resource.sh"
 resource_init
-trap resource_cleanup EXIT
 
 resource_write_controller "$WORK/controller.yaml" false
 resource_start_controller "$WORK/controller.yaml"

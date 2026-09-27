@@ -5,11 +5,13 @@ set -euo pipefail
 : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
 . "$E2E_LIB/orchestrator/proxy.sh"
 . "$E2E_LIB/orchestrator/proxy_case.sh"
+. "$E2E_LIB/orchestrator/case_workspace.sh"
 
 NODE="$BIN/node-ctl"
 [ -x "$NODE" ] || { echo "missing prepared node-ctl" >&2; exit 1; }
 command -v curl >/dev/null
 command -v python3 >/dev/null
+case_workspace_init
 
 DATA_PORT="$(proxy_case_free_port)"
 API_PORT="$(proxy_case_free_port)"
@@ -39,6 +41,7 @@ cleanup() {
     set +e
     [ -n "$PROXY" ] && stop_proxy "$PROXY"
     if [ -n "$CONDUCTOR" ]; then kill -TERM "$CONDUCTOR" 2>/dev/null; wait "$CONDUCTOR" 2>/dev/null || true; fi
+    case_workspace_cleanup
 }
 trap cleanup EXIT
 

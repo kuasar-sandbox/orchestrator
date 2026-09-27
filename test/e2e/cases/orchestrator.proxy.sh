@@ -5,9 +5,11 @@ set -euo pipefail
 : "${E2E_LIB:?}"
 . "$E2E_LIB/orchestrator/proxy.sh"
 . "$E2E_LIB/orchestrator/proxy_case.sh"
+. "$E2E_LIB/orchestrator/case_workspace.sh"
 NODE="$BIN/node-ctl"
 [ -x "$NODE" ] || { echo "missing prepared node-ctl" >&2; exit 1; }
 command -v curl >/dev/null
+case_workspace_init
 mkdir -p "$WORK/run"
 PORT="$(proxy_case_free_port)"
 STATS="$WORK/proxy-stats.sock"
@@ -34,7 +36,13 @@ printf 'manifest: { key: "" }\n' >"$WORK/manifest.yaml"
 "$NODE" conductor serve --config "$WORK/conductor.yaml" >"$WORK/conductor.log" 2>&1 &
 CONDUCTOR=$!
 PROXY=""
-cleanup() { set +e; [ -n "$PROXY" ] && stop_proxy "$PROXY"; kill "$CONDUCTOR" 2>/dev/null; wait "$CONDUCTOR" 2>/dev/null || true; }
+cleanup() {
+    set +e
+    [ -n "$PROXY" ] && stop_proxy "$PROXY"
+    kill "$CONDUCTOR" 2>/dev/null
+    wait "$CONDUCTOR" 2>/dev/null || true
+    case_workspace_cleanup
+}
 trap cleanup EXIT
 proxy_case_wait_http "$CONDUCTOR" "http://127.0.0.1:$API_PORT/health" api.sandboxes.e2e.local "$WORK/conductor.log"     || { echo "conductor not ready" >&2; exit 1; }
 

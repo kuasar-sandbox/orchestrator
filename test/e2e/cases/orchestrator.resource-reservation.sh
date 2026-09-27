@@ -3,7 +3,6 @@ set -euo pipefail
 : "${E2E_LIB:?}"
 . "$E2E_LIB/orchestrator/resource.sh"
 resource_init
-trap resource_cleanup EXIT
 
 validate_grow_events() {
     local sid="$1" initial_budget="$2" capacity="$3"

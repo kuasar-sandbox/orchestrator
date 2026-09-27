@@ -3,7 +3,6 @@ set -euo pipefail
 : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
 . "$E2E_LIB/orchestrator/resource.sh"
 resource_init
-trap resource_cleanup EXIT
 
 # Capacity describes virtual hardware. The cold startup reservation is 512MiB,
 # independent of the 8GiB capacity and 128MiB steady allocation.
