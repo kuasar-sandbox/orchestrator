@@ -2,8 +2,13 @@
 
 import ast
 import functools
+import http.server
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -87,6 +92,93 @@ class PlacerReadinessTest(unittest.TestCase):
             wait_for_placer("http://placer", "/group", "expected", timeout=0.2,
                             opener=WrongNodeOpener(), monotonic=clock.monotonic,
                             sleep=clock.sleep)
+
+    def test_registry_discovery_must_converge_before_local_placement(self):
+        opener = SequenceOpener([
+            Response({}, status=200), Response({}, status=503),
+            Response({}, status=200), Response({}, status=200),
+            Response({"node_id": "expected"}),
+        ])
+        clock = Clock()
+        wait_for_placer(
+            "http://placer", "/group", "expected", timeout=0.3,
+            build=False, route_key="user/one-create",
+            registry_urls=["http://registry-1", "http://registry-2"],
+            api_key="fixture-only", opener=opener,
+            monotonic=clock.monotonic, sleep=clock.sleep)
+        self.assertEqual([r.full_url for r, _ in opener.requests], [
+            "http://registry-1/route-link/verify-key?group=%2Fgroup",
+            "http://registry-2/route-link/verify-key?group=%2Fgroup",
+            "http://registry-1/route-link/verify-key?group=%2Fgroup",
+            "http://registry-2/route-link/verify-key?group=%2Fgroup",
+            "http://placer/placer-link/place",
+        ])
+        for request, _ in opener.requests[:-1]:
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.get_header("X-api-key"), "fixture-only")
+            self.assertIsNone(request.data)
+        payload = json.loads(opener.requests[-1][0].data)
+        self.assertEqual(payload["route_key"], "user/one-create")
+        self.assertFalse(payload["build"])
+        self.assertNotIn("build_resources", payload)
+
+    def test_registry_timeout_never_probes_a_mutating_endpoint(self):
+        for status in [403, 503]:
+            with self.subTest(status=status):
+                opener = SequenceOpener([Response({}, status=status) for _ in range(3)])
+                clock = Clock()
+                with self.assertRaisesRegex(AssertionError, f"Registry http://registry: HTTP {status}"):
+                    wait_for_placer(
+                        "http://placer", "/group", "expected", timeout=0.2,
+                        registry_urls=["http://registry"], api_key="fixture-only",
+                        opener=opener, monotonic=clock.monotonic, sleep=clock.sleep)
+                self.assertTrue(opener.requests)
+                self.assertTrue(all(r.method == "GET" for r, _ in opener.requests))
+
+    def test_cli_checks_real_http_discovery_then_sandbox_placement(self):
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                requests.append((self.command, self.path, self.headers.get("X-API-KEY")))
+                self.send_response(503 if len(requests) == 1 else 200)
+                self.end_headers()
+
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append((self.command, self.path, payload))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"node_id":"expected"}')
+
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                result = subprocess.run([
+                    sys.executable, str(Path(__file__).with_name("placer_readiness.py")),
+                    "--url", url, "--registry-url", url, "--group", "/group",
+                    "--expected-node", "expected", "--route-key", "user/one-create",
+                    "--timeout", "2",
+                ], env={**os.environ, "PLACER_API_KEY": "fixture-only"},
+                    capture_output=True, text=True, timeout=5)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r[:2] for r in requests], [
+            ("GET", "/route-link/verify-key?group=%2Fgroup"),
+            ("GET", "/route-link/verify-key?group=%2Fgroup"),
+            ("POST", "/placer-link/place"),
+        ])
+        self.assertEqual(requests[0][2], "fixture-only")
+        self.assertFalse(requests[-1][2]["build"])
+        self.assertEqual(requests[-1][2]["route_key"], "user/one-create")
+        self.assertNotIn("fixture-only", result.stdout + result.stderr)
 
     def test_wiring_preserves_retained_status_before_placer_gate(self):
         source = (Path(__file__).resolve().parents[1] / "cases/orchestrator.cluster-lifecycle.sh").read_text()

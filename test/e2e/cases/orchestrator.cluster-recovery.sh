@@ -46,8 +46,13 @@ PY
 }
 
 wait_redirect_placer() {
-    python3 "$SCRIPT_DIR/placer_readiness.py" \
-        --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID"
+    local port registry_args=()
+    for port in "${CONTROL_PORTS[@]}"; do
+        registry_args+=(--registry-url "http://127.0.0.1:$port")
+    done
+    PLACER_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/placer_readiness.py" \
+        --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID" \
+        --route-key "$ROUTE_KEY" "${registry_args[@]}"
 }
 
 stop_redirect_process() {
