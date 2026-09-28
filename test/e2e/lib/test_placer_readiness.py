@@ -188,7 +188,8 @@ class PlacerReadinessTest(unittest.TestCase):
         self.assertLess(restart, retained)
         self.assertLess(retained, enabled)
 
-    def registration(self, opener, *, post_restart=True, placer_url="http://placer"):
+    def registration(self, opener, *, post_restart=True, placer_url="http://placer",
+                     registry_urls=()):
         # Execute the maintained registration primitive without
         # starting a VM. The readiness loop itself is not mocked.
         path = Path(__file__).with_name("build_client.py")
@@ -201,8 +202,9 @@ class PlacerReadinessTest(unittest.TestCase):
             monotonic=clock.monotonic, sleep=clock.sleep))
         write = Mock(return_value=({"templateID": "transient-test", "buildID": "build-test"}, {}))
         scope = {"args": SimpleNamespace(placer_url=placer_url, group="/group",
-                                        expected_node="expected", cpu=2, post_restart=post_restart), "wait_for_placer": gate,
-                 "require": write, "json": json}
+                                        expected_node="expected", cpu=2, post_restart=post_restart,
+                                        registry_url=registry_urls), "wait_for_placer": gate,
+                 "require": write, "json": json, "key": "fixture-only"}
         exec(compile(ast.Module(body=[register], type_ignores=[]), str(path), "exec"), scope)
         return scope["register"], write, gate
 
@@ -227,6 +229,17 @@ class PlacerReadinessTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "timeout waiting for placer"):
             register("query-hang")
         write.assert_not_called()
+
+    def test_post_restart_build_waits_for_registry_and_preserves_build_request(self):
+        opener = SequenceOpener([Response({}, status=503), Response({}),
+                                 Response({"node_id": "expected"})])
+        register, write, _ = self.registration(opener, registry_urls=["http://registry"])
+        register("after-restart")
+        self.assertEqual([r.method for r, _ in opener.requests], ["GET", "GET", "POST"])
+        payload = json.loads(opener.requests[-1][0].data)
+        self.assertTrue(payload["build"])
+        self.assertEqual(payload["build_resources"], BUILD_RESOURCES)
+        write.assert_called_once()
 
     def test_mutating_registration_failure_is_not_retried(self):
         register, write, _ = self.registration(SequenceOpener([Response({"node_id": "expected"})]))

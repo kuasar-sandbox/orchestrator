@@ -39,6 +39,7 @@ def configure():
     parser.add_argument("--restart-request")
     parser.add_argument("--restart-ready")
     parser.add_argument("--placer-url")
+    parser.add_argument("--registry-url", action="append", default=[])
     parser.add_argument("--expected-node")
     args = parser.parse_args()
     key = os.environ["BUILD_ACTION_API_KEY"]
@@ -88,7 +89,8 @@ def register(label, target=None):
         # Watch failover can invalidate a previously ready view between
         # Build actions. Recheck before each new registration, not the write.
         assert args.expected_node, "--placer-url requires --expected-node"
-        wait_for_placer(args.placer_url, args.group, args.expected_node)
+        wait_for_placer(args.placer_url, args.group, args.expected_node,
+                        registry_urls=args.registry_url, api_key=key)
     value, _ = require("POST", "/v3/templates", 202,
                        {"name": "issue372-" + label, "cpuCount": args.cpu, "memoryMB": 6144},
                        header=json.dumps({"target": target}) if target else None)

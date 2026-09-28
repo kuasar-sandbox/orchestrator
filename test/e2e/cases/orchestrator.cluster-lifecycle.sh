@@ -154,7 +154,8 @@ PYTHONPATH="$SCRIPT_DIR" BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 - \
     --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
     --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
     --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" \
-    --placer-url "http://127.0.0.1:$PLACER_PORT" --expected-node "$NODE_ID" <<'PY_CLUSTER_BUILD' &
+    --placer-url "http://127.0.0.1:$PLACER_PORT" --expected-node "$NODE_ID" \
+    --registry-url "http://127.0.0.1:$CONTROL_PORT" <<'PY_CLUSTER_BUILD' &
 from build_client import *
 args = configure()
 fds_before = conductor_fds()
