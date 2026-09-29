@@ -27,7 +27,83 @@ The normal reservation loop neither samples nor writes sandbox cgroups, calls CH
 
 Builder registration/execution ledgers remain separate from these per-Sandbox reservations. Each actual Build phase uses ordinary sandbox-ctl admission and release. Build.Resources configures A/B resources; final Sandbox resources resolve independently. Builder service/slice only supplies ownership, delegation and group cleanup, with no orchestrator CPU/memory enforcement. The existing VMM leaf policy and conservative recovery inventory remain unchanged.
 
-### 1.2 Terminology
+### 1.2 Memory multiplexing model
+
+The controller is designed for a node where sandbox memory demand is typically uneven:
+many sandboxes remain idle or lightly used for long periods while a smaller set becomes
+memory-intensive for shorter intervals. The goal is to reuse memory released by idle
+sandboxes across the node without treating every sandbox Capacity as continuously
+resident or reserved, while keeping enough reaction margin that a burst can grow before
+guest OOM causes workload loss.
+
+The mechanism deliberately separates three roles:
+
+- **Balloon/Budget is the sandbox memory-sizing actuator.** Balloon inflation reduces the
+  guest Budget and is the operation that actually makes an idle sandbox relinquish guest
+  memory. Balloon deflation increases Budget after growth has been authorized.
+- **NodeReservation is the cross-sandbox allocation ledger.** Memory is reusable by other
+  sandboxes only after a completed local shrink is committed as a smaller reservation.
+  Host RSS or a lower `memory.high` does not by itself release node capacity.
+- **`memory.high` is primarily a host-side pressure/throttling boundary, not the reclaim
+  owner.** It slows a VMM as host charge approaches the configured pressure region and
+  makes pressure observable through PSI/`memory.events`, giving the Budget-growth loop
+  time to obtain reservation and deflate the balloon before guest headroom is exhausted.
+  Kernel reclaim may occur while a cgroup is above `memory.high`, but that reclaim is
+  not the node's accounting event and does not substitute for balloon shrink plus
+  reservation release.
+
+This makes growth and shrink intentionally asymmetric. Growth is safety-prioritized:
+reserve node capacity first, relax `memory.high`, then deflate the balloon. Shrink is
+conservative: inflate the balloon, observe safe current progress, lower `memory.high`,
+then release reservation. Reclaiming idle memory may therefore lag; granting unreserved
+guest memory is never used to improve density.
+
+`Headroom` is the sandbox-local reaction margin, while the node's emergency pool is a
+shared safety margin. They are complementary: per-sandbox headroom lets ordinary bursts
+survive detection and control latency; the shared pool avoids requiring every mostly-idle
+sandbox to reserve its worst-case burst simultaneously. OOM/high-urgency handling is a
+last safety path, not the normal growth signal.
+
+Under concurrent growth, sandboxes do not transfer memory directly to one another.
+Each sandbox retains its own growth objective and requests reservation from the common
+node pool. State serializes aggregate reservation changes so concurrent requests cannot
+oversell the same headroom. Normal new grants are additionally shaped by the node-wide
+runtime grant token bucket; red/critical zones preserve node safety and the emergency
+pool. Runtime growth has no node-side FIFO wait queue: a sandbox that receives a partial
+or zero grant keeps its local objective and retries after the returned cooldown or a
+later observation/pressure event.
+
+The complete steady-state feedback model is therefore:
+
+```text
+idle sandbox
+  guest headroom rises
+    -> balloon inflate
+    -> observe safe smaller Budget
+    -> memory.high down
+    -> release NodeReservation
+    -> node pool becomes reusable
+
+bursting sandbox
+  guest report or host pressure
+    -> RequestBudget
+    -> node atomically charges grant
+    -> memory.high up
+    -> balloon deflate
+    -> guest receives more Budget
+
+host pressure fast path
+  VMM charge approaches/exceeds memory.high
+    -> reclaim/throttle + PSI/events signal
+    -> sandbox-local growth request
+    -> reservation grant/cooldown
+```
+
+The design does not promise that every sandbox can reach Capacity simultaneously.
+Capacity is the per-sandbox ceiling; NodeReservation is the amount currently promised
+from the shared node pool.
+
+### 1.3 Terminology
 
 | Name | Definition | Owner |
 |---|---|---|
@@ -43,7 +119,7 @@ Headroom is not the total Budget. CPU `allocatable` expresses the relative sched
 
 Sandbox-local state also includes `TargetBudget`, `CurrentBudget`, `ObservedBudget` and `DemandMemory`; the node neither needs nor stores them. On the normal controlled path, the sandbox obtains enough NodeReservation before increasing Budget and releases reservation only after shrink converges. Emergency guest `deflate_on_oom` is an exception to the phased soft guarantee: it changes neither target nor reservation. Existing `memory.high` continues bounding host VMM charge, while the sandbox marks target/current unstable and prohibits shrink. Snapshot still computes BudgetAtSnapshot from the safe upper bound of both sides.
 
-### 1.3 Core invariants
+### 1.4 Core invariants
 
 - `0 < NodeReservation <= Capacity`.
 - `reservedMemory = sum(live NodeReservation)`.
