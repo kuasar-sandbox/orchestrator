@@ -262,8 +262,8 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 //
 // Returning nil signals the serveConn loop to skip writing here; the
 // connection stays open and the admission worker is responsible for the
-// reply. The conn-EOF monitor cancels the queue entry if the client
-// disconnects while queued.
+// reply. Client disconnect while queued is detected lazily via TTL expiry
+// or worker WriteMessage failure; serveConn remains the sole reader on conn.
 func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *string) *Message {
 	// A recovered provisional or ACK-lost Admit is already charged. Let the
 	// matching lease owner atomically replace that charge before applying gates

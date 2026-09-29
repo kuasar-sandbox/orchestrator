@@ -1,8 +1,11 @@
 package nodectl
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"sync/atomic"
@@ -597,5 +600,96 @@ func TestIdleSweeperRemovesSandboxIndex(t *testing.T) {
 	sweeper.sweep()
 	if _, found := state.SnapshotSandboxResource("expired"); found {
 		t.Fatal("sweeper retained expired SID index entry")
+	}
+}
+
+// TestServer_AdmitQueueFullWireRejectionAndDiagnostic verifies that when a
+// short-term blocked Admit request arrives while the admission queue is at
+// capacity, Server.handleAdmit returns a wire queue_full rejection, the
+// admission controller emits an admit_queue_full diagnostic after releasing
+// queueMu, queue depth remains unchanged, and no reservation is added to State.
+func TestServer_AdmitQueueFullWireRejectionAndDiagnostic(t *testing.T) {
+	state := NewState(1000<<20, 8000, 0, 0, Watermarks{
+		HighFactor: .90, LowFactor: .70, EmergencyFactor: .05, StartupFactor: 1,
+	})
+	admission := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Hour, QueueMaxDepth: 1,
+	})
+	logs := &queueLockCheckingWriter{queueMu: &admission.queueMu}
+	logger := slog.New(slog.NewJSONHandler(logs, nil))
+	admission.SetWiring(state, logger, func(*PendingAdmit) (*Message, error) { return nil, nil })
+	srv := &Server{
+		State: state, Admission: admission, Logf: t.Logf,
+	}
+
+	// Consume main headroom so that incoming requests are short-term blocked
+	// (800 MiB reserved leaves 150 MiB headroom after 50 MiB emergency buffer,
+	// while remaining in zone yellow rather than zone red).
+	installReservationForTest(t, state, Reservation{
+		Token: "existing-token", SandboxID: "existing",
+		Capacity: Resources{MemoryBytes: 800 << 20}, ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20},
+		ReservationMemory: 800 << 20, Stage: StageSettled,
+	})
+
+	c1Client, c1Server := net.Pipe()
+	defer c1Client.Close()
+	defer c1Server.Close()
+	c2Client, c2Server := net.Pipe()
+	defer c2Client.Close()
+	defer c2Server.Close()
+
+	req1 := &Message{
+		Type: TypeAdmit, SandboxID: "sb-1",
+		CapacityMemoryBytes: 256 << 20, FloorMemoryBytes: 64 << 20, StartupBudgetMemory: 200 << 20,
+	}
+	token1 := ""
+	// First request is short-term blocked and enqueued; handleAdmit returns nil to signal async handling.
+	resp1 := srv.handleAdmit(c1Server, 4242, req1, &token1)
+	if resp1 != nil {
+		t.Fatalf("first admit expected nil (queued), got %+v", resp1)
+	}
+	if admission.QueueDepth() != 1 {
+		t.Fatalf("queue depth = %d, want 1", admission.QueueDepth())
+	}
+
+	// Second request arrives while queue is at capacity (QueueMaxDepth = 1).
+	req2 := &Message{
+		Type: TypeAdmit, SandboxID: "sb-2",
+		CapacityMemoryBytes: 256 << 20, FloorMemoryBytes: 64 << 20, StartupBudgetMemory: 200 << 20,
+	}
+	token2 := ""
+	resp2 := srv.handleAdmit(c2Server, 4243, req2, &token2)
+	if resp2 == nil {
+		t.Fatal("second admit expected wire rejection, got nil")
+	}
+	if resp2.Status != StatusRejected || resp2.Reason != "queue_full" {
+		t.Fatalf("second admit response = %+v, want StatusRejected reason=queue_full", resp2)
+	}
+	if resp2.Msg != "admission queue at capacity" {
+		t.Fatalf("second admit Msg = %q, want %q", resp2.Msg, "admission queue at capacity")
+	}
+
+	// Verify lock-free diagnostic emission.
+	if logs.wroteWhileLocked {
+		t.Fatal("queue diagnostic was written while queueMu was held")
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.buf.Bytes()), &record); err != nil {
+		t.Fatalf("decode queue diagnostic: %v: %s", err, logs.buf.String())
+	}
+	if record["event"] != "admit_queue_full" || record["sandbox_id"] != "sb-2" ||
+		record["queue_max_depth"] != float64(1) {
+		t.Fatalf("queue diagnostic = %v", record)
+	}
+
+	// Verify queue depth is unchanged.
+	if admission.QueueDepth() != 1 {
+		t.Fatalf("queue depth = %d, want 1 (unchanged)", admission.QueueDepth())
+	}
+
+	// Verify state reservations are unchanged (only the initial existing reservation exists).
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.Reserved.MemoryBytes != 800<<20 {
+		t.Fatalf("unexpected state reservations after queue_full rejection: %+v", snapshot)
 	}
 }

@@ -213,7 +213,7 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 	defer a.queueMu.Unlock()
 	var diagnostics []admissionDiagnostic
 
-	// 1. cancelled (conn EOF / TTL fired)
+	// 1. cancelled (TTL expired)
 	for e := a.queue.Front(); e != nil; {
 		next := e.Next()
 		p := e.Value.(*PendingAdmit)
@@ -221,14 +221,25 @@ func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 		case <-p.cancelCh:
 			a.queue.Remove(e)
 			// reply with Rejected only if conn still alive — write may fail
-			// on EOF case; ignore.
+			// on dead socket; ignore.
 			_ = WriteMessage(p.conn, &Message{
 				Type:   TypeAdmitResponse,
 				Status: StatusRejected,
 				Reason: "queue_canceled",
-				Msg:    "queued admit canceled (TTL or client disconnect)",
+				Msg:    "queued admit canceled (TTL expiry)",
 			})
 			_ = p.conn.Close()
+			diagnostics = append(diagnostics, admissionDiagnostic{
+				level: slog.LevelInfo,
+				msg:   "admission queue entry canceled",
+				attrs: []any{
+					"event", "admit_queue_canceled",
+					"sandbox_id", p.req.SandboxID,
+					"reason", "ttl_expired",
+					"queue_position", p.queuedPos,
+					"waited_ms", time.Since(p.queuedAt).Milliseconds(),
+				},
+			})
 		default:
 		}
 		e = next
@@ -564,13 +575,37 @@ func (a *AdmissionController) ConsumeToken() bool {
 	return a.consumeToken()
 }
 
-// Enqueue inserts a pending admit at the tail. Caller is responsible
-// for arranging conn-EOF monitoring (the goroutine that calls
-// PendingAdmit.cancel on read EOF). Returns false if queue is at cap.
+// Enqueue inserts a pending admit at the tail. Returns false if queue is at cap.
+// Client disconnect while queued is detected lazily via TTL expiry or worker
+// WriteMessage failure; caller must not attach a second reader to conn.
 func (a *AdmissionController) Enqueue(req *Message, conn net.Conn, peerPID int) (*PendingAdmit, bool) {
+	var diagnostics []admissionDiagnostic
+	// Registered before Lock so it runs after the Unlock defer (defers
+	// unwind LIFO): a synchronous logger must not extend the queue
+	// critical section (same rule as processQueueLocked).
+	defer func() {
+		if a.logger == nil {
+			return
+		}
+		for _, d := range diagnostics {
+			a.logger.Log(context.Background(), d.level, d.msg, d.attrs...)
+		}
+	}()
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
 	if a.queue.Len() >= a.policy.QueueMaxDepth {
+		// The client gets a queue_full rejection but, without this
+		// diagnostic, the server-side trail shows nothing between
+		// AnalyzeRequest and the response (orchestrator#265).
+		diagnostics = append(diagnostics, admissionDiagnostic{
+			level: slog.LevelInfo,
+			msg:   "admission queue full, admit dropped",
+			attrs: []any{
+				"event", "admit_queue_full",
+				"sandbox_id", req.SandboxID,
+				"queue_max_depth", a.policy.QueueMaxDepth,
+			},
+		})
 		return nil, false
 	}
 	p := &PendingAdmit{
