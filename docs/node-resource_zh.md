@@ -50,34 +50,37 @@ sandbox 在较短阶段密集使用内存。设计目标不是持续按每个 sa
 - **NodeReservation 是跨 sandbox 的分配总账。** 只有本地 shrink 已安全完成并提交更小
   reservation 后,这部分额度才可供其他 sandbox 重新使用。Host RSS 下降或单独降低
   `memory.high` 都不等于释放节点额度。
-- **`memory.high` 主要是 host 侧压力/节流边界,不是回收所有者。** VMM host charge 接近
-  压力区时,它使 VMM 减速并通过 PSI/`memory.events` 暴露压力,为 Budget grow 闭环争取
-  时间,使其能在 guest headroom 耗尽前取得 reservation 并 deflate balloon。cgroup 超过
-  `memory.high` 时 Linux 可能执行 reclaim,但该 reclaim 不是节点的记账事件,也不能替代
-  balloon shrink + reservation release。
+- **`memory.high` 主要是 host 侧节流边界,不是回收所有者。** VMM host charge 超过
+  `memory.high` 后,Linux 对 cgroup 执行 reclaim 和节流;产生的 stall 与
+  `memory.events.local` 提供压力反馈。仅仅接近阈值不会触发它的节流或 `high` 事件。
+  减缓后续增长是为了给 Budget grow 闭环争取取得 reservation 和 deflate balloon 的时间。
+  此路径上的内核 reclaim 不是节点的记账事件,也不能替代 balloon shrink + reservation
+  release。`memory.high` 不是硬上限,实际占用可以超过它;参见
+  [Linux cgroup v2 内存接口](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files)。
 
-因此 grow 和 shrink 有意采用不对称策略。Grow 以安全为优先:先预留节点额度,再放宽
-`memory.high`,最后 deflate balloon。Shrink 则保守执行:先 inflate balloon,观察到安全的
-current 进展,再降低 `memory.high`,最后释放 reservation。空闲内存回收可以滞后;系统不会
-为了提高密度而先向 guest 提供尚未预留的内存。
+因此 grow 和 shrink 有意采用不对称策略。在正常受控路径中,grow 以安全为优先:
+先预留节点额度,再放宽 `memory.high`,最后 deflate balloon。Shrink 则保守执行:
+先 inflate balloon,观察到安全的 current 进展,再降低 `memory.high`,最后释放
+reservation。空闲内存回收可以滞后。Guest 应急 `deflate_on_oom` 是 §1.3 描述的显式
+例外,不是正常提高密度的机制,也不等于 node 已经 grant。
 
-`Headroom` 是每个 sandbox 本地的反应余量,node emergency pool 是共享安全余量。两者互补:
-per-sandbox headroom 用于覆盖普通突发从发现到完成控制的延迟;共享 pool 则避免大量长期
-空闲 sandbox 各自都为最坏突发长期保留一份大额度。OOM/high-urgency 是最后的安全路径,
-不是正常 grow 的主要信号。
+`Headroom` 是每个 sandbox 本地的反应余量,node emergency pool 是共享安全余量。
+Per-sandbox headroom 帮助覆盖发现压力到完成控制的延迟;共享 pool 保留给 high-urgency
+grow（§4.3）,不供普通 grow 使用。它不能替代本地 headroom,也不保证每次突发都能及时
+取得内存。OOM/high-urgency 是最后的安全路径,不是正常 grow 的主要信号。
 
 大量 sandbox 并发 grow 时,sandbox 之间不直接转移内存。每个 sandbox 保留自己的 grow
 objective,并向共同 node pool 请求 reservation。State 串行化 aggregate reservation 更新,
 所以并发请求不能重复消费同一份 headroom。普通新增 grant 还受 node-wide runtime grant
 token bucket 整形;red/critical zone 继续保护 node safety 和 emergency pool。Runtime grow
-没有 node 侧 FIFO 等待队列:收到 partial/zero grant 的 sandbox 保留本地 objective,根据
-返回的 cooldown 或后续 observation/pressure event 重试。
+没有 node 侧 FIFO 等待队列:收到 partial/zero grant 的 sandbox 保留本地 objective,在本地
+控制器处理 observation、pressure event 和未完成事务时,遵守返回的 cooldown 继续重试。
 
-完整的稳态反馈模型为:
+稳态反馈模型为:
 
 ```text
 idle sandbox
-  guest headroom 上升
+  guest MemAvailable 上升
     -> balloon inflate
     -> 观察到安全的较小 Budget
     -> memory.high down
@@ -93,14 +96,15 @@ bursting sandbox
     -> guest 获得更多 Budget
 
 host pressure fast path
-  VMM charge 接近/超过 memory.high
-    -> reclaim/throttle + PSI/events signal
+  VMM charge 超过 memory.high
+    -> 节流（伴随内核 reclaim）+ PSI/events 反馈
     -> sandbox-local grow request
     -> reservation grant/cooldown
 ```
 
 该设计不承诺所有 sandbox 可以同时达到 Capacity。Capacity 是单 sandbox 的上限;
-NodeReservation 才是共享 node pool 当前已经承诺给该 sandbox 的额度。
+NodeReservation 才是共享 node pool 当前已经承诺给该 sandbox 的额度。避免 guest OOM
+是设计目标,不是在容量、可授予额度或控制闭环响应时间不足时仍能兑现的无条件保证。
 
 ### 1.3 术语
 
@@ -121,7 +125,7 @@ sandbox 内部另有 `TargetBudget`、`CurrentBudget`、`ObservedBudget` 和
 `DemandMemory`;node 不需要也不保存这些状态。正常受控路径中 sandbox 先取得足够
 `NodeReservation` 才扩大 Budget,并在 shrink 收敛后才释放 reservation。
 `deflate_on_oom` 的 guest 应急 deflate 是阶段化软保证的例外:它不改变 target 或
-reservation,原有 `memory.high` 继续限制 host VMM charge,sandbox 把 target/current
+reservation,原有 `memory.high` 继续对超过阈值的 host VMM charge 施加节流,sandbox 把 target/current
 标记为 unstable 并禁止 shrink。snapshot 仍按两侧安全上界计算
 `BudgetAtSnapshot`。
 
