@@ -36,7 +36,73 @@ Builder registration/execution 两本账与逐 Sandbox reservation 分开. 每�
 Builder service/slice 只承担归属, 委托和整组回收,orchestrator 不增加 CPU/内存限额;
 现役 VMM 叶子策略和保守只读 recovery inventory 保持不变.
 
-### 1.2 术语
+### 1.2 内存复用设计模型
+
+该控制器面向的节点负载具有明显的不均衡性:大量 sandbox 长时间空闲或低负载,只有较少
+sandbox 在较短阶段密集使用内存。设计目标不是持续按每个 sandbox 的 Capacity 驻留或预留
+内存,而是把空闲 sandbox 释放的内存重新用于节点上的其他 sandbox;同时保留足够的反应余量,
+使突发负载能够在 guest OOM 导致工作丢失之前完成扩容。
+
+机制刻意把三个职责分开:
+
+- **Balloon/Budget 是单 sandbox 的内存大小执行器。** Balloon inflate 降低 guest Budget,
+  是空闲 sandbox 实际交还 guest 内存的操作;grow 获得授权后通过 balloon deflate 扩大 Budget。
+- **NodeReservation 是跨 sandbox 的分配总账。** 只有本地 shrink 已安全完成并提交更小
+  reservation 后,这部分额度才可供其他 sandbox 重新使用。Host RSS 下降或单独降低
+  `memory.high` 都不等于释放节点额度。
+- **`memory.high` 主要是 host 侧压力/节流边界,不是回收所有者。** VMM host charge 接近
+  压力区时,它使 VMM 减速并通过 PSI/`memory.events` 暴露压力,为 Budget grow 闭环争取
+  时间,使其能在 guest headroom 耗尽前取得 reservation 并 deflate balloon。cgroup 超过
+  `memory.high` 时 Linux 可能执行 reclaim,但该 reclaim 不是节点的记账事件,也不能替代
+  balloon shrink + reservation release。
+
+因此 grow 和 shrink 有意采用不对称策略。Grow 以安全为优先:先预留节点额度,再放宽
+`memory.high`,最后 deflate balloon。Shrink 则保守执行:先 inflate balloon,观察到安全的
+current 进展,再降低 `memory.high`,最后释放 reservation。空闲内存回收可以滞后;系统不会
+为了提高密度而先向 guest 提供尚未预留的内存。
+
+`Headroom` 是每个 sandbox 本地的反应余量,node emergency pool 是共享安全余量。两者互补:
+per-sandbox headroom 用于覆盖普通突发从发现到完成控制的延迟;共享 pool 则避免大量长期
+空闲 sandbox 各自都为最坏突发长期保留一份大额度。OOM/high-urgency 是最后的安全路径,
+不是正常 grow 的主要信号。
+
+大量 sandbox 并发 grow 时,sandbox 之间不直接转移内存。每个 sandbox 保留自己的 grow
+objective,并向共同 node pool 请求 reservation。State 串行化 aggregate reservation 更新,
+所以并发请求不能重复消费同一份 headroom。普通新增 grant 还受 node-wide runtime grant
+token bucket 整形;red/critical zone 继续保护 node safety 和 emergency pool。Runtime grow
+没有 node 侧 FIFO 等待队列:收到 partial/zero grant 的 sandbox 保留本地 objective,根据
+返回的 cooldown 或后续 observation/pressure event 重试。
+
+完整的稳态反馈模型为:
+
+```text
+idle sandbox
+  guest headroom 上升
+    -> balloon inflate
+    -> 观察到安全的较小 Budget
+    -> memory.high down
+    -> release NodeReservation
+    -> node pool 可被其他 sandbox 复用
+
+bursting sandbox
+  guest report 或 host pressure
+    -> RequestBudget
+    -> node 原子记账 grant
+    -> memory.high up
+    -> balloon deflate
+    -> guest 获得更多 Budget
+
+host pressure fast path
+  VMM charge 接近/超过 memory.high
+    -> reclaim/throttle + PSI/events signal
+    -> sandbox-local grow request
+    -> reservation grant/cooldown
+```
+
+该设计不承诺所有 sandbox 可以同时达到 Capacity。Capacity 是单 sandbox 的上限;
+NodeReservation 才是共享 node pool 当前已经承诺给该 sandbox 的额度。
+
+### 1.3 术语
 
 | 名称 | 定义 | 所有者 |
 |---|---|---|
@@ -59,7 +125,7 @@ reservation,原有 `memory.high` 继续限制 host VMM charge,sandbox 把 target
 标记为 unstable 并禁止 shrink。snapshot 仍按两侧安全上界计算
 `BudgetAtSnapshot`。
 
-### 1.3 核心不变量
+### 1.4 核心不变量
 
 - `0 < NodeReservation <= Capacity`。
 - `reservedMemory = sum(live NodeReservation)`。
