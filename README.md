@@ -2,6 +2,14 @@
 
 # orchestrator
 
+For the first cross-component sandbox or Demo, follow the project
+[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
+with the matching aggregate release and
+[workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md).
+This component can still be built/deployed independently; workbench is not a
+production runtime dependency. Published architectures are specific to the
+selected release; source support does not imply all historical assets exist.
+
 `orchestrator` is the **E2B-compatible node service and multi-node control plane** for [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
 It provides the northbound API, node-local lifecycle orchestration, data-plane proxy integration, tenant credentials, resource admission, and the Registry/Router/Placer control plane used to operate a cluster of Kuasar Sandbox nodes. The repository evolves and releases independently while participating in project-level cross-component validation and aggregate releases.
@@ -265,7 +273,7 @@ Before extraction the archive gate rejects extra payloads, aliases, duplicate
 entries, links, incorrect numeric root ownership and incorrect modes.
 Material directories remain component-scoped.
 
-This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the node and cluster binaries plus deployment files. Documentation and E2E sources are collected from the selected component tag into the project platform archive rather than duplicated in the component archive.
+This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the node and cluster binaries plus deployment files. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact component tags and validating the combined system on real KVM infrastructure. An orchestrator component version and a project aggregate version are related by the aggregate selection; they are not required to have the same number.
 

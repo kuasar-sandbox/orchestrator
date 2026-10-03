@@ -2,6 +2,11 @@
 
 # orchestrator
 
+首次运行跨组件沙箱或 Demo，推荐从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)
+使用匹配聚合版本的 [workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)。
+本组件仍可独立构建和部署，workbench 不是生产运行的强制依赖。预构建架构以所选
+发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
+
 `orchestrator` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 的 **E2B 兼容节点服务与多节点控制面**。
 
 它提供北向 API、节点本地生命周期编排、数据面 Proxy 集成、租户凭据、资源准入,以及运营集群的 Registry/Router/Placer。
@@ -244,8 +249,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 解包前拒绝额外载荷、路径别名、重复条目、链接、错误 root 数字属主和错误权限。
 材料目录仍按组件隔离。
 
-本仓库独立发布 `vX.Y.Z`。x86_64 组件包包含节点/集群二进制和部署文件;
-文档与 E2E 从所选组件 Tag 收集到项目平台包,不在组件包中重复携带。
+本仓库独立发布 `vX.Y.Z`。已发布原生架构的组件包包含节点/集群二进制和部署文件;
+聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
 
 项目聚合版本为 `release-vX.Y.Z`,选择精确组件 Tag 并在真实 KVM 基础设施验证组合。
 组件版本与聚合版本通过 selection 关联,不要求版本号相同。
