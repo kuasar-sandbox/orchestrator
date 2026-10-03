@@ -1,0 +1,196 @@
+name: Open Source Fast Baseline
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/open-source-fast-baseline.yml
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out complete reachable history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan Git history and GitHub records
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          repo = os.environ['REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          owner, name = repo.split('/', 1)
+          max_blob = 16 * 1024 * 1024
+          rules = [
+              ('private-key', re.compile(rb'-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----')),
+              ('aws-access-key', re.compile(rb'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b')),
+              ('github-token', re.compile(rb'\bgh[pousr]_[A-Za-z0-9]{20,}\b')),
+              ('slack-token', re.compile(rb'\bxox[baprs]-[A-Za-z0-9-]{10,}\b')),
+              ('google-api-key', re.compile(rb'\bAIza[0-9A-Za-z_-]{35}\b')),
+              ('basic-auth-url', re.compile(rb'https?://[^/\s:@]+:[^@\s/]+@')),
+          ]
+          suspicious_path = re.compile(r'(?i)(^|/)(?:\.env(?:\.|$)|credentials?(?:\.|$)|secrets?(?:\.|$)|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.|$)|[^/]+\.(?:p12|pfx|jks|kubeconfig|key))')
+          findings = []
+          suspicious = set()
+          oversized = []
+
+          def run(*args, input_text=None):
+              return subprocess.run(args, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+
+          objects = run('git', 'rev-list', '--objects', '--all').splitlines()
+          paths = collections.defaultdict(set)
+          for row in objects:
+              oid, _, path = row.partition(' ')
+              if path:
+                  paths[oid].add(path)
+              else:
+                  paths.setdefault(oid, set())
+          rows = run('git', 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)', input_text='\n'.join(paths) + '\n').splitlines()
+          blobs = {fields[0]: int(fields[2]) for fields in map(str.split, rows) if len(fields) == 3 and fields[1] == 'blob'}
+          for oid, size in blobs.items():
+              names = sorted(paths.get(oid, ())) or ['<unknown-path>']
+              for path in names:
+                  if suspicious_path.search(path):
+                      suspicious.add(path)
+              if size > max_blob:
+                  oversized.append((size, names[0], oid[:12]))
+                  continue
+              data = subprocess.check_output(['git', 'cat-file', 'blob', oid])
+              for rule, pattern in rules:
+                  for match in pattern.finditer(data):
+                      findings.append(('git-blob', names[0], oid[:12], rule, data.count(b'\n', 0, match.start()) + 1))
+
+          def request_json(path_or_url, payload=None):
+              url = path_or_url if path_or_url.startswith('http') else 'https://api.github.com' + path_or_url
+              body = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(url, data=body, method='POST' if body is not None else 'GET')
+              req.add_header('Accept', 'application/vnd.github+json')
+              req.add_header('Authorization', f'Bearer {token}')
+              req.add_header('X-GitHub-Api-Version', '2022-11-28')
+              if body is not None:
+                  req.add_header('Content-Type', 'application/json')
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  return json.load(response)
+
+          def paginate(path, dict_key=None):
+              page = 1
+              while True:
+                  sep = '&' if '?' in path else '?'
+                  data = request_json(f'{path}{sep}per_page=100&page={page}')
+                  items = data.get(dict_key, []) if dict_key else data
+                  if not items:
+                      break
+                  yield from items
+                  if len(items) < 100:
+                      break
+                  page += 1
+
+          def scan_text(value, location):
+              if not value:
+                  return
+              data = value.encode('utf-8', 'replace')
+              for rule, pattern in rules:
+                  for match in pattern.finditer(data):
+                      findings.append(('github-record', location, '-', rule, data.count(b'\n', 0, match.start()) + 1))
+
+          issue_count = 0
+          for item in paginate(f'/repos/{repo}/issues?state=all&direction=asc'):
+              issue_count += 1
+              kind = 'pr' if 'pull_request' in item else 'issue'
+              scan_text(item.get('title'), f'{kind}#{item["number"]}:title')
+              scan_text(item.get('body'), f'{kind}#{item["number"]}:body')
+
+          record_counts = {}
+          for label, endpoint in [
+              ('issue-comments', f'/repos/{repo}/issues/comments?direction=asc'),
+              ('review-comments', f'/repos/{repo}/pulls/comments?direction=asc'),
+              ('commit-comments', f'/repos/{repo}/comments?direction=asc'),
+          ]:
+              count = 0
+              for item in paginate(endpoint):
+                  count += 1
+                  scan_text(item.get('body'), f'{label}:{item.get("id")}')
+              record_counts[label] = count
+
+          review_count = 0
+          cursor = None
+          while True:
+              query = '''query($owner:String!, $name:String!, $after:String) { repository(owner:$owner, name:$name) { pullRequests(first:50, after:$after, orderBy:{field:CREATED_AT,direction:ASC}) { nodes { number reviews(first:100) { nodes { databaseId body } } } pageInfo { hasNextPage endCursor } } } }'''
+              result = request_json('https://api.github.com/graphql', {'query': query, 'variables': {'owner': owner, 'name': name, 'after': cursor}})
+              pulls = result['data']['repository']['pullRequests']
+              for pr in pulls['nodes']:
+                  for review in pr['reviews']['nodes']:
+                      review_count += 1
+                      scan_text(review.get('body'), f'pr#{pr["number"]}:review:{review.get("databaseId")}')
+              if not pulls['pageInfo']['hasNextPage']:
+                  break
+              cursor = pulls['pageInfo']['endCursor']
+
+          releases = list(paginate(f'/repos/{repo}/releases'))
+          for release in releases:
+              tag = release.get('tag_name') or '<untagged>'
+              scan_text(release.get('name'), f'release:{tag}:name')
+              scan_text(release.get('body'), f'release:{tag}:body')
+              for asset in release.get('assets', []):
+                  scan_text(asset.get('name'), f'release:{tag}:asset:{asset.get("id")}')
+
+          artifacts = list(paginate(f'/repos/{repo}/actions/artifacts', 'artifacts'))
+          live_artifacts = [item for item in artifacts if not item.get('expired')]
+          for artifact in artifacts:
+              scan_text(artifact.get('name'), f'actions-artifact:{artifact.get("id")}')
+
+          findings = sorted(set(findings))
+          lines = [
+              f'# Open-source fast baseline: `{repo}`', '',
+              'Matched values are intentionally redacted; only locations and rule names are reported.', '',
+              '## Coverage',
+              f'- reachable Git objects: {len(paths)}',
+              f'- unique blobs scanned: {len(blobs) - len(oversized)}',
+              f'- oversized blobs listed: {len(oversized)}',
+              f'- issues/PRs: {issue_count}',
+              f'- issue comments: {record_counts.get("issue-comments", 0)}',
+              f'- review comments: {record_counts.get("review-comments", 0)}',
+              f'- review submissions: {review_count}',
+              f'- commit comments: {record_counts.get("commit-comments", 0)}',
+              f'- releases: {len(releases)}',
+              f'- Actions artifacts: {len(artifacts)} total; {len(live_artifacts)} non-expired', '',
+              f'## High-confidence candidates ({len(findings)})',
+          ]
+          if findings:
+              lines.extend(['| Source | Location | Blob | Rule | Line |', '| --- | --- | --- | --- | ---: |'])
+              for source, location, oid, rule, line in findings[:500]:
+                  lines.append(f'| {source} | `{location}` | `{oid}` | {rule} | {line} |')
+          else:
+              lines.append('No high-confidence credential pattern was detected.')
+          lines.extend(['', f'## Suspicious paths ({len(suspicious)})'])
+          lines.extend(f'- `{path}`' for path in sorted(suspicious)[:500]) if suspicious else lines.append('None detected.')
+          lines.extend(['', f'## Oversized blobs ({len(oversized)})'])
+          if oversized:
+              for size, path, oid in sorted(oversized, reverse=True)[:200]:
+                  lines.append(f'- {size} bytes: `{path}` at `{oid}`')
+          else:
+              lines.append('None detected.')
+          rendered = '\n'.join(lines) + '\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as target:
+              target.write(rendered)
+          print(rendered)
+          PY

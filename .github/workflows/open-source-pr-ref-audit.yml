@@ -1,0 +1,14 @@
+name: Open Source Pull-Request Ref Audit
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/open-source-pr-ref-audit.yml
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  audit:
+    uses: kuasar-sandbox/.github/.github/workflows/open-source-pr-ref-audit.yml@91b6ff50c8aaaca8919c3f110f337d4a265c7cbf
