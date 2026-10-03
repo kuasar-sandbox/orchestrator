@@ -242,7 +242,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
 
 四个官方 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package,
-目标为 Linux/amd64 且 `CGO_ENABLED=0`。打包从所选源码树复制十二个部署文件,
+目标为所选 Linux 架构（x86_64 对应 amd64，aarch64 对应 arm64），且 `CGO_ENABLED=0`。
+打包从所选源码树复制十二个部署文件,
 通过既有 `RELEASE_*_SOURCE_DIR`、可选 `RELEASE_*_SOURCE_SHA` 及版本选择
 收集实际 Accelerator、Connector、Sandboxer 依赖材料。独立验证只检查 bundle
 中的依赖 URL/commit 字段相互一致,不要求验证主机具备兄弟仓或依赖 Tag。

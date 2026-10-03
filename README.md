@@ -263,7 +263,8 @@ separation and the refusal to replace published assets remain required.
 Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
 
 The four official Go executables must identify their own Orchestrator command
-main packages and target Linux/amd64 with `CGO_ENABLED=0`. Packaging copies
+main packages and target the selected Linux architecture (amd64 for x86_64,
+arm64 for aarch64) with `CGO_ENABLED=0`. Packaging copies
 the twelve deployment files from the selected source tree and collects the actual
 Accelerator, Connector and Sandboxer dependency materials using the existing
 `RELEASE_*_SOURCE_DIR`, optional `RELEASE_*_SOURCE_SHA` and version selections.
