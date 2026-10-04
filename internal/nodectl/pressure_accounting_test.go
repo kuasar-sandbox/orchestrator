@@ -260,6 +260,9 @@ func TestCapacityOffsetDoesNotInventProgress(t *testing.T) {
 	if len(s.PressureSnapshot().Demands) != 1 {
 		t.Fatal("fixture did not retain initial pressure")
 	}
+	if !s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("unexecutable grow wait did not block unattended recovery")
+	}
 	if _, _, err := s.ReconcileAndGrant("filler", filler-32*mib, 0, UrgencyNormal, a); err != nil {
 		t.Fatal(err)
 	}
@@ -285,6 +288,47 @@ func TestCapacityOffsetDoesNotInventProgress(t *testing.T) {
 	}
 	if p := s.PressureSnapshot(); len(p.Demands) != 0 || p.Protected != 0 {
 		t.Fatalf("executable progress retained the established wait: %+v", p)
+	}
+	if s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("executable progress kept unattended recovery blocked")
+	}
+}
+
+func TestPendingExecutableMemoryDemandFiltersRecoveryNonMemoryAndExpiredWaits(t *testing.T) {
+	s := NewState(1<<30, 1000, 0, 0, Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	now := time.Now()
+	s.initPressureLocked()
+	s.pressure.clock = func() time.Time { return now }
+
+	// Sticky critical is coordination state, not an executable-demand gate.
+	s.pressure.record = PressureRecord{Zone: ZoneCritical, Version: 1}
+	if s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("sticky critical without demand blocked unattended recovery")
+	}
+
+	s.pressure.demands["admit:recovery"] = &memoryDemand{
+		sid: "recovery", identity: "r", amount: 128 << 20, first: now, last: now, recovery: true, memoryBlocked: true,
+	}
+	s.pressure.demands["admit:rate"] = &memoryDemand{
+		sid: "rate", identity: "q", amount: 128 << 20, first: now, last: now, recovery: true, memoryBlocked: false,
+	}
+	if s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("recovery or non-memory wait blocked unattended recovery")
+	}
+
+	s.pressure.demands["grow:running"] = &memoryDemand{
+		sid: "running", identity: "g", amount: 64 << 20, first: now, last: now, memoryBlocked: true,
+	}
+	if !s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("fresh running memory wait was not reported")
+	}
+
+	now = now.Add(max(minimumDemandFreshness, 3*s.pressure.policy.FailureInterval, 2*s.pressure.policy.Interval) + time.Second)
+	if s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("expired running memory wait kept unattended recovery blocked")
+	}
+	if _, ok := s.pressure.demands["grow:running"]; ok {
+		t.Fatal("expired demand was not discarded")
 	}
 }
 

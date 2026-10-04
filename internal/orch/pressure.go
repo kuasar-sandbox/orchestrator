@@ -394,9 +394,11 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 		p.resultMu.Lock()
 		p.blocked = workerBlocked
 		p.resultMu.Unlock()
-		if !resumeBusy && !now.Before(resumeAfter) && !p.admission.IsDrained() {
-			// Age order gives unattended recoveries eventual service. A real Wake
-			// already shares the same launch claim and cannot create another runner.
+		if !resumeBusy && !now.Before(resumeAfter) && !p.admission.IsDrained() && !p.state.HasPendingExecutableMemoryDemand() {
+			// Age order gives unattended recoveries eventual service after
+			// currently runnable work has consumed the headroom that pressure
+			// coordination just created. A real Wake still shares the normal
+			// admission/launch claim and is not gated by this coordinator hint.
 			sort.Slice(rows, func(i, j int) bool {
 				if rows[i].PressureSinceUnixNano == rows[j].PressureSinceUnixNano {
 					return rows[i].ID < rows[j].ID

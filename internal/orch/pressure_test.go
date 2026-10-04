@@ -524,6 +524,80 @@ func TestPressurePauseRejectsRAMBackedCheckpointMount(t *testing.T) {
 	}
 }
 
+func TestPressureUnattendedRecoveryWaitsForExecutableDemand(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{artifactPrepareErr: errors.New("saved snapshot unavailable")}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb := &types.Sandbox{ID: "unattended-demand", Profile: types.ProfileBare, TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StatePaused, ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: checkpointSnapshotRef, SandboxRef: checkpointSandboxRef}, ResourceObligation: true, PauseReason: types.PauseReasonResource, PressureVersion: 7, PressureSinceUnixNano: time.Now().UnixNano(), ManifestKey: strings.Repeat("f", 64), APISecret: deriveTestAPISecret(t, strings.Repeat("f", 64)), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "sandboxes", "unattended-demand")}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	s := attachPressure(t, o)
+	policy := nodectl.DefaultPressurePolicy()
+	policy.Interval = 20 * time.Millisecond
+	o.memoryPressure.Load().policy = policy
+	if err := s.ConfigurePressure(policy, nodectl.PressureRecord{Zone: nodectl.ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	acceptedCreate := nodectl.LaunchAdmission{Operation: nodectl.OperationCreate, Accepted: true, Identity: "busy-accepted"}
+	if _, _, err := s.Admit(nodectl.AdmitSpec{SandboxID: "busy", Token: "busy", Capacity: nodectl.Resources{MemoryBytes: 1 << 30}, InitialBudget: 512 << 20, Admission: &acceptedCreate}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SetSettled("busy", 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	acceptedSaved := nodectl.LaunchAdmission{Operation: nodectl.OperationRecovery, SavedSource: true, Accepted: true, Identity: "filler-accepted"}
+	if _, _, err := s.Admit(nodectl.AdmitSpec{SandboxID: "filler", Token: "filler", Capacity: nodectl.Resources{MemoryBytes: 4 << 30}, InitialBudget: 3328 << 20, Admission: &acceptedSaved}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SetSettled("filler", 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	allocator := nodectl.NewAllocator(nodectl.AllocatorPolicy{MemoryGrantPerSecBytes: 4 << 30, MinGrantStep: 64 << 20, MaxGrantStep: 64 << 20})
+	got, found, err := s.ReconcileAndGrant("busy", 512<<20, 64<<20, nodectl.UrgencyNormal, allocator)
+	if err != nil || !found || got.Decision.GrantedDelta != 0 {
+		t.Fatalf("fixture grow found=%v grant=%d err=%v", found, got.Decision.GrantedDelta, err)
+	}
+	if !s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("fixture did not create executable memory demand")
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); o.RunMemoryPressure(workerCtx) }()
+	defer func() { cancel(); <-done }()
+	time.Sleep(4 * policy.Interval)
+	if lc.starts.Load() != 0 {
+		t.Fatal("unattended recovery competed with unresolved executable grow demand")
+	}
+
+	if _, found, err := s.Release("filler"); err != nil || !found {
+		t.Fatalf("release filler found=%v err=%v", found, err)
+	}
+	got, found, err = s.ReconcileAndGrant("busy", 512<<20, 64<<20, nodectl.UrgencyNormal, allocator)
+	if err != nil || !found || got.Decision.GrantedDelta != 64<<20 {
+		t.Fatalf("post-release grow found=%v grant=%d err=%v", found, got.Decision.GrantedDelta, err)
+	}
+	if s.HasPendingExecutableMemoryDemand() {
+		t.Fatal("satisfied executable demand kept recovery blocked")
+	}
+
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for lc.starts.Load() == 0 {
+		select {
+		case <-deadline.C:
+			t.Fatal("unattended recovery did not resume after executable demand cleared")
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestPressureUnattendedRecoveryWithUnrelatedGrants(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{artifactPrepareErr: errors.New("saved snapshot unavailable")}

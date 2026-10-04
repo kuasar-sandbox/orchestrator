@@ -466,6 +466,27 @@ func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budge
 	}
 }
 
+// HasPendingExecutableMemoryDemand reports whether currently runnable work has
+// a fresh memory-headroom wait that has made no executable Budget progress.
+// Recovery-origin waits are excluded so a saved-source recovery never blocks
+// itself. This is a coordinator hint only; admission remains authoritative.
+func (s *State) HasPendingExecutableMemoryDemand() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initPressureLocked()
+	now := s.pressure.clock()
+	for key, d := range s.pressure.demands {
+		if !s.pressure.demandFresh(d, now) {
+			s.clearDemandLocked(key)
+			continue
+		}
+		if d.memoryBlocked && !d.recovery {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *State) PressureSnapshot() PressureSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
