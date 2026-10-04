@@ -160,6 +160,7 @@ type pressureState struct {
 	// One saved-source startup owns the complete-budget lane until Settled or
 	// confirmed Release; a disconnected client does not relinquish it.
 	exclusive             string
+	backgroundRecovery    string
 	clock                 func() time.Time
 	lastReservationChange time.Time
 }
@@ -400,7 +401,9 @@ func (s *State) failDemandLocked(key, sid, identity string, amount, baseline uin
 	// Select one beneficiary. Recovery outranks grow; within a class the first
 	// valid waiter keeps its funds until progress or cancellation.
 	selected := p.demands[p.beneficiary]
-	if !p.demandFresh(selected, now) || (recovery && !selected.recovery) {
+	backgroundRecovery := recovery && p.backgroundRecovery == sid
+	selectedBackground := selected != nil && p.backgroundRecovery != "" && selected.sid == p.backgroundRecovery
+	if !p.demandFresh(selected, now) || (recovery && !backgroundRecovery && !selected.recovery) || (!backgroundRecovery && selectedBackground) {
 		p.beneficiary = key
 	}
 	p.holdSince = time.Time{}
@@ -425,6 +428,44 @@ func (s *State) ForgetDemand(key string) {
 	s.initPressureLocked()
 	s.clearDemandLocked(key)
 	s.signalPressureLocked()
+}
+
+// TryClaimBackgroundRecovery reserves the coordinator's single unattended
+// recovery slot only when no fresh memory-blocked demand from another sandbox
+// competes for managed-pool headroom. The candidate's own prior recovery wait
+// is ignored; final admission rechecks the same condition under State.mu.
+func (s *State) TryClaimBackgroundRecovery(sid string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initPressureLocked()
+	if sid == "" || (s.pressure.backgroundRecovery != "" && s.pressure.backgroundRecovery != sid) || s.competingExecutableDemandLocked(sid, s.pressure.clock()) {
+		return false
+	}
+	s.pressure.backgroundRecovery = sid
+	return true
+}
+
+func (s *State) ReleaseBackgroundRecovery(sid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initPressureLocked()
+	if s.pressure.backgroundRecovery == sid {
+		s.pressure.backgroundRecovery = ""
+		s.signalPressureLocked()
+	}
+}
+
+func (s *State) competingExecutableDemandLocked(sid string, now time.Time) bool {
+	for key, d := range s.pressure.demands {
+		if !s.pressure.demandFresh(d, now) {
+			s.clearDemandLocked(key)
+			continue
+		}
+		if d.sid != sid && d.memoryBlocked {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budget uint64) {
@@ -550,11 +591,27 @@ func (s *State) AnalyzeLaunch(sid string, budget uint64, launch LaunchAdmission)
 
 func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAdmission) Outcome {
 	s.initPressureLocked()
-	s.advancePressureLocked(s.pressure.clock())
+	now := s.pressure.clock()
+	s.advancePressureLocked(now)
 	pool := s.AllocatablePool.MemoryBytes
+	backgroundRecovery := launch.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid
+	if backgroundRecovery && s.competingExecutableDemandLocked(sid, now) {
+		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
+	}
 	startup := s.startupPoolBytesLocked()
 	if budget == 0 || pool == 0 || budget > pool {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_node_capacity", RejectMsg: "initial budget exceeds node pool"}
+	}
+	// Unattended recovery is deliberately more conservative than an explicit
+	// Wake: it must not consume enough managed-pool headroom to recreate the
+	// node's red/critical reservation pressure. The exact saved Budget is known
+	// here, so this uses the existing raw watermarks without a new margin or
+	// host-memory signal. Explicit/user recovery has no coordinator claim and
+	// keeps the normal OperationRecovery admission semantics.
+	if backgroundRecovery {
+		if s.reservedMemory > pool || budget > pool-s.reservedMemory || zoneRank(s.memoryZoneForReservedLocked(s.reservedMemory+budget)) >= zoneRank(ZoneRed) {
+			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
+		}
 	}
 	if !launch.SavedSource && budget > startup {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_startup_pool", RejectMsg: "initial budget exceeds startup pool"}

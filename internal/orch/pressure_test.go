@@ -652,3 +652,22 @@ func TestPressureRecoveryPacesSuccessiveWaiters(t *testing.T) {
 		t.Fatalf("failed preparations lost their recovery obligations: %+v", p)
 	}
 }
+
+func TestPressureBackgroundRecoveryClaimCanSelectDemandOwnerAfterOlderCandidate(t *testing.T) {
+	s := nodectl.NewState(4<<30, 4000, 0, 0, nodectl.Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	// The coordinator scans oldest A before B. B's own failed recovery demand
+	// must block A but must not prevent reaching and claiming B.
+	accepted := nodectl.LaunchAdmission{Operation: nodectl.OperationRecovery, SavedSource: true, Accepted: true, Identity: "filler"}
+	if _, _, err := s.Admit(nodectl.AdmitSpec{SandboxID: "filler", Token: "filler", Capacity: nodectl.Resources{MemoryBytes: 4 << 30}, InitialBudget: 3800 << 20, Admission: &accepted}); err != nil {
+		t.Fatal(err)
+	}
+	recoveryB := nodectl.LaunchAdmission{Operation: nodectl.OperationRecovery, SavedSource: true, Accepted: true, Identity: "run-b"}
+	s.RecordAdmissionWait("b", recoveryB, 512<<20)
+	if s.TryClaimBackgroundRecovery("a") {
+		t.Fatal("older A bypassed B's pending recovery demand")
+	}
+	if !s.TryClaimBackgroundRecovery("b") {
+		t.Fatal("coordinator could not continue to demand-owning candidate B")
+	}
+	s.ReleaseBackgroundRecovery("b")
+}

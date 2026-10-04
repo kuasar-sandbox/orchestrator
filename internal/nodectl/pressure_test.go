@@ -377,3 +377,92 @@ func TestPressureGrowWaitsForReleaseNotZoneRelief(t *testing.T) {
 		t.Fatalf("grant changed the recovery obligation or failed to consume actual headroom: %+v", p)
 	}
 }
+
+func TestBackgroundRecoveryClaimSkipsOwnerDemandAndFencesNewCompetitor(t *testing.T) {
+	s, now := pressureTestState(t)
+	s.mu.Lock()
+	s.failDemandLocked("admit:b", "b", "run-b", 400, 0, true, *now)
+	s.mu.Unlock()
+	if s.TryClaimBackgroundRecovery("a") {
+		t.Fatal("older unrelated candidate ignored B's executable demand")
+	}
+	if !s.TryClaimBackgroundRecovery("b") {
+		t.Fatal("demand owner could not claim its own background retry")
+	}
+
+	// A new ordinary grow after selection must win before B's final Admit.
+	s.mu.Lock()
+	s.failDemandLocked("grow:running", "running", "tok", 100, 0, false, *now)
+	beneficiary := s.pressure.beneficiary
+	s.mu.Unlock()
+	if beneficiary != "grow:running" {
+		t.Fatalf("background recovery displaced ordinary beneficiary: %q", beneficiary)
+	}
+
+	// An ordinary Resume/Wake demand has the same priority over claimed
+	// background work; the historical recovery class must not hide it.
+	s.mu.Lock()
+	s.clearDemandLocked("grow:running")
+	s.failDemandLocked("admit:wake", "wake", "run-wake", 100, 0, true, *now)
+	beneficiary = s.pressure.beneficiary
+	s.mu.Unlock()
+	if beneficiary != "admit:wake" {
+		t.Fatalf("background recovery displaced ordinary Wake beneficiary: %q", beneficiary)
+	}
+	launch := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "run-b"}
+	if got := s.AnalyzeLaunch("b", 100, launch); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+		t.Fatalf("new demand did not fence final background admission: %+v", got)
+	}
+
+	s.ForgetDemand("admit:wake")
+	if got := s.AnalyzeLaunch("b", 100, launch); got.Status != OutcomeAdmitted {
+		t.Fatalf("cleared competitor did not release final fence: %+v", got)
+	}
+	s.ReleaseBackgroundRecovery("b")
+}
+
+func TestOrdinaryRecoveryAdmissionHasNoBackgroundClaimFence(t *testing.T) {
+	s, now := pressureTestState(t)
+	s.mu.Lock()
+	s.failDemandLocked("grow:running", "running", "tok", 100, 0, false, *now)
+	s.mu.Unlock()
+	// A user/Proxy Wake has no coordinator claim. Its existing recovery
+	// admission/protection semantics remain authoritative.
+	launch := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "wake"}
+	if got := s.AnalyzeLaunch("wake", 100, launch); got.Status != OutcomeAdmitted {
+		t.Fatalf("ordinary recovery changed admission semantics: %+v", got)
+	}
+}
+
+func TestBackgroundRecoveryMustNotProjectRawRed(t *testing.T) {
+	s, _ := pressureTestState(t)
+	// Pool=1000, red starts at 850. Leave absolute room for the recovery while
+	// making its exact saved Budget project the node into red.
+	installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "running", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 700, Stage: StageSettled})
+	if !s.TryClaimBackgroundRecovery("saved") {
+		t.Fatal("background recovery claim unexpectedly blocked")
+	}
+	background := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "saved:1"}
+	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+		t.Fatalf("background recovery projected raw red but was admitted: %+v", got)
+	}
+
+	// The same exact resource state must not change explicit/user Wake semantics.
+	s.ReleaseBackgroundRecovery("saved")
+	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeAdmitted {
+		t.Fatalf("ordinary Wake inherited background stability gate: %+v", got)
+	}
+
+	// Once real managed-pool headroom makes the post-recovery state yellow,
+	// unattended recovery can proceed without waiting for effective critical to clear.
+	if _, found, err := s.ReconcileAndGrant("running", 600, 0, UrgencyNormal, NewAllocator(AllocatorPolicy{})); err != nil || !found {
+		t.Fatalf("release running reservation: found=%v err=%v", found, err)
+	}
+	if !s.TryClaimBackgroundRecovery("saved") {
+		t.Fatal("background recovery claim did not reopen after release")
+	}
+	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeAdmitted {
+		t.Fatalf("post-recovery yellow state was not admitted: %+v", got)
+	}
+	s.ReleaseBackgroundRecovery("saved")
+}

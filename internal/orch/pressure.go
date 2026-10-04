@@ -410,8 +410,12 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 				if _, charged := p.state.SnapshotSandboxResource(sb.ID); charged {
 					continue
 				}
+				if !p.state.TryClaimBackgroundRecovery(sb.ID) {
+					continue
+				}
 				resumeBusy = true
 				go func(saved *types.Sandbox) {
+					defer p.state.ReleaseBackgroundRecovery(saved.ID)
 					deadline := saved.DeadlineUnix
 					_, attempt, err := o.ensureResumeAccepted(ctx, saved.ID, &deadline, types.ResumeRequest{Trigger: types.ResumeTriggerWake, Mode: types.ResumeMemory}, func(current *types.Sandbox) error {
 						if !current.ResourceObligation || current.PauseReason != types.PauseReasonResource || current.PressureVersion != saved.PressureVersion || current.ResumeSource != saved.ResumeSource {
