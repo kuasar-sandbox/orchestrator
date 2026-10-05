@@ -855,6 +855,8 @@ Each instance receives configuration through reserved e2b metadata namespaces `k
 | checkpoint | Host-only Create-local Pause defaults: merge_ref/drop_caches true/false/null; Sandbox row only, not runtime YAML/snapshot.cfg |
 | mmds | Portable exact routes plus request-scoped initial secrets; split before persistence so metadata retains routes only |
 
+For node-owned vSwitch attachments, conductor reads the switch `generation_bits` capability once and assigns a process-local monotonically advancing attachment sequence modulo that width. The generation is passed through both CLI Attach and TAPFD PREPARE. `generation_bits=0` is legacy behavior. The sequence is deliberately not durable Sandbox identity and may restart after conductor restart; failed Attach attempts may consume a generation.
+
 Resource and traffic merge by leaf. Public resource JSON permits only:
 
 ```json

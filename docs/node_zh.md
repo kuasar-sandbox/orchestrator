@@ -1044,6 +1044,8 @@ JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定�
 | `resource` | 严格 partial patch:`resources.{capacity.{cpu,memory},allocatable.{cpu,memory},startup.memory}` |
 | `traffic` | host-only 的 per-Sandbox `max_inflight.{total,forward,e2b:envd,e2b:code-interpreter,exec}` 显式 patch;不进入 guest |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
+
+节点拥有的 vSwitch attachment 首次分配时由 conductor 读取一次 switch `generation_bits`,随后使用进程内单调 attachment sequence 按该 bit 宽度取模,并通过 CLI Attach 与 TAPFD PREPARE 传给 connector。`generation_bits=0` 保持 legacy 行为。该 sequence 不是持久 Sandbox 身份,conductor 重启后允许重新开始;失败 Attach 也可以消耗一个 generation。
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |

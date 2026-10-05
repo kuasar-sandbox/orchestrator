@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,6 +34,54 @@ func TestAttachUsesTapFDSocketPrepare(t *testing.T) {
 	if port.Port != "12" || port.FloatingIP != "100.100.96.12" ||
 		port.MAC != "02:00:00:00:80:0c" || port.InnerIP != "169.254.0.21" {
 		t.Fatalf("port = %+v", port)
+	}
+}
+
+func TestGenerationBitsReadsStatus(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "connector-ctl")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\n' '{\"generation_bits\":4}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New(bin, "sw0").GenerationBits(context.Background())
+	if err != nil || got != 4 {
+		t.Fatalf("GenerationBits=%d err=%v", got, err)
+	}
+}
+
+func TestGenerationBitsUsesTapFDInfo(t *testing.T) {
+	sock, reqCh, closeFn := serveTapFDOnce(t, "TAPFD/1 OK generation_bits=4\n")
+	defer closeFn()
+	got, err := New("missing-connector-ctl", "sw0", WithTapFDSocket(sock)).GenerationBits(context.Background())
+	if err != nil || got != 4 {
+		t.Fatalf("GenerationBits=%d err=%v", got, err)
+	}
+	if req := <-reqCh; req != "TAPFD/1 INFO VSWITCH=sw0\n" {
+		t.Fatalf("request=%q", req)
+	}
+}
+
+func TestGenerationBitsOldTapFDProviderFallsBackToZero(t *testing.T) {
+	sock, _, closeFn := serveTapFDOnce(t, "TAPFD/1 ERR code=BAD_REQUEST message=unsupported_request_op_INFO\n")
+	defer closeFn()
+	got, err := New("missing-connector-ctl", "sw0", WithTapFDSocket(sock)).GenerationBits(context.Background())
+	if err != nil || got != 0 {
+		t.Fatalf("GenerationBits=%d err=%v", got, err)
+	}
+}
+
+func TestAttachUsesTapFDGeneration(t *testing.T) {
+	sock, reqCh, closeFn := serveTapFDOnce(t, "TAPFD/1 OK port=12 generation=3 floating_ip=100.100.48.11 mac=02:00:00:00:80:0c ip=169.254.0.21 mode=tap\n")
+	defer closeFn()
+	port, err := New("connector-ctl", "sw0", WithTapFDSocket(sock)).Attach(context.Background(), AttachReq{Generation: 3, InnerIP: "169.254.0.21"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := <-reqCh, "TAPFD/1 PREPARE VSWITCH=sw0 INNER_IP=169.254.0.21 GENERATION=3\n"; got != want {
+		t.Fatalf("request=%q want=%q", got, want)
+	}
+	if port.Generation != 3 {
+		t.Fatalf("generation=%d", port.Generation)
 	}
 }
 

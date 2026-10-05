@@ -125,8 +125,11 @@ type Orchestrator struct {
 	// and Build detach -> ownership-clear/final-delete sequences. A detached but
 	// still-persisted port blocks allocation so a retry cannot detach a reused
 	// connector slot.
-	networkAllocationMu  sync.Mutex
-	detachedPortsPending map[string]struct{}
+	networkAllocationMu           sync.Mutex
+	detachedPortsPending          map[string]struct{}
+	networkGenerationBitsResolved bool
+	networkGenerationBits         uint8
+	networkAttachmentSequence     uint64
 
 	runnerPool     *runPools
 	builderRunPool *runPools
@@ -2188,12 +2191,49 @@ func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.Net
 	if len(o.detachedPortsPending) != 0 {
 		return nil, fmt.Errorf("orch: network allocation blocked while detached ownership awaits durable cleanup")
 	}
+	generation, err := o.nextNetworkAttachmentGeneration(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return o.vs.Attach(ctx, vswitch.AttachReq{
+		Generation:       generation,
 		InnerIP:          ip.String(),
 		TransitGatewayIP: network.TransitGatewayIP,
 		TransitGeneveVNI: network.TransitGeneveVNI,
 		TransitMAC:       network.TransitMAC,
 	})
+}
+
+type vsGenerationBitsProvider interface {
+	GenerationBits(context.Context) (uint8, error)
+}
+
+// nextNetworkAttachmentGeneration is process-local by design. Generation is a
+// short network-incarnation fence, not durable Sandbox identity. A conductor
+// restart may restart the sequence; correctness still depends only on whether
+// the same (slot,generation) is reused while stale network state survives.
+func (o *Orchestrator) nextNetworkAttachmentGeneration(ctx context.Context) (uint32, error) {
+	if !o.networkGenerationBitsResolved {
+		provider, ok := o.vs.(vsGenerationBitsProvider)
+		if ok {
+			bits, err := provider.GenerationBits(ctx)
+			if err != nil {
+				return 0, fmt.Errorf("orch: resolve vswitch generation bits: %w", err)
+			}
+			o.networkGenerationBits = bits
+		}
+		o.networkGenerationBitsResolved = true
+	}
+	bits := o.networkGenerationBits
+	if bits == 0 {
+		return 0, nil
+	}
+	if bits > 20 {
+		return 0, fmt.Errorf("orch: invalid vswitch generation bits %d", bits)
+	}
+	generation := uint32(o.networkAttachmentSequence & ((uint64(1) << bits) - 1))
+	o.networkAttachmentSequence++
+	return generation, nil
 }
 
 // LaunchSpecFor is retained as a pure compatibility/test helper for sandbox

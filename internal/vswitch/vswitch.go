@@ -54,6 +54,7 @@ const (
 // attachOutput mirrors connector pkg/vswitch AttachOutput (subset we use).
 type attachOutput struct {
 	Port       uint32 `json:"port"`
+	Generation uint32 `json:"generation,omitempty"`
 	PortMAC    string `json:"port_mac"`
 	InnerIP    string `json:"inner_ip"`
 	FloatingIP string `json:"floating_ip"`
@@ -63,6 +64,7 @@ type attachOutput struct {
 // Port is the orchestrator-facing result of an attach.
 type Port struct {
 	Port       string // 1-based port handle (for detach / open-port)
+	Generation uint32 // caller-supplied attachment generation
 	FloatingIP string // host-reachable address for user ports
 	MAC        string // per-port MAC -> Network.MAC
 	InnerIP    string // echoes the inner ip we requested
@@ -100,10 +102,48 @@ func New(bin, sw string, opts ...Option) *CLI {
 // optional GENEVE transit parameters (tenant-network overlay) when overridden via
 // metadata (see internal/orch override). Zero-valued transit fields are omitted.
 type AttachReq struct {
+	Generation       uint32 // caller-supplied attachment generation
 	InnerIP          string // plain inner IP, required
 	TransitGatewayIP string // GENEVE gateway IP
 	TransitGeneveVNI uint32 // GENEVE VNI
 	TransitMAC       string // transit destination MAC
+}
+
+// GenerationBits returns the switch-level FloatingIP generation width. Older
+// connector binaries omit the field and therefore decode as legacy zero.
+func (c *CLI) GenerationBits(ctx context.Context) (uint8, error) {
+	if c.tapFDSocket != "" {
+		out, err := c.tapfdCall(ctx, "INFO", "VSWITCH="+c.sw)
+		if err != nil {
+			var providerErr *tapFDProviderError
+			if errors.As(err, &providerErr) && providerErr.code == "BAD_REQUEST" && strings.Contains(providerErr.message, "unsupported_request_op") {
+				return 0, nil // pre-generation TAPFD provider: preserve legacy mode
+			}
+			return 0, err
+		}
+		raw := out["generation_bits"]
+		if raw == "" {
+			return 0, nil
+		}
+		bits, err := strconv.ParseUint(raw, 10, 8)
+		if err != nil {
+			return 0, fmt.Errorf("connector tapfd info %s: invalid generation_bits %q: %w", c.sw, raw, err)
+		}
+		return uint8(bits), nil
+	}
+	cmd := exec.CommandContext(ctx, c.bin, "vswitch", "status", c.sw)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("connector vswitch status %s: %w: %s", c.sw, err, errb.String())
+	}
+	var status struct {
+		GenerationBits uint8 `json:"generation_bits,omitempty"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		return 0, fmt.Errorf("connector vswitch status %s: parse %q: %w", c.sw, out.String(), err)
+	}
+	return status.GenerationBits, nil
 }
 
 // Attach allocates a tap port on the switch for the request's guest inner IP.
@@ -112,6 +152,9 @@ func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
 		return c.prepare(ctx, req)
 	}
 	args := []string{"vswitch", "attach", c.sw, "--inner-ip=" + req.InnerIP, "--port=0"}
+	if req.Generation != 0 {
+		args = append(args, "--generation="+strconv.FormatUint(uint64(req.Generation), 10))
+	}
 	if req.TransitGatewayIP != "" {
 		args = append(args, "--transit-gateway-ip="+req.TransitGatewayIP)
 	}
@@ -133,6 +176,7 @@ func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
 	}
 	return &Port{
 		Port:       strconv.FormatUint(uint64(a.Port), 10),
+		Generation: a.Generation,
 		FloatingIP: a.FloatingIP,
 		MAC:        a.PortMAC,
 		InnerIP:    a.InnerIP,
@@ -181,6 +225,9 @@ func (c *CLI) prepare(ctx context.Context, req AttachReq) (*Port, error) {
 		"VSWITCH=" + c.sw,
 		"INNER_IP=" + req.InnerIP,
 	}
+	if req.Generation != 0 {
+		fields = append(fields, "GENERATION="+strconv.FormatUint(uint64(req.Generation), 10))
+	}
 	if req.TransitGatewayIP != "" {
 		fields = append(fields, "TRANSIT_GATEWAY_IP="+req.TransitGatewayIP)
 	}
@@ -208,8 +255,16 @@ func (c *CLI) prepare(ctx context.Context, req AttachReq) (*Port, error) {
 	if mode := out["mode"]; mode != "" && mode != "tap" {
 		return nil, fmt.Errorf("connector tapfd prepare %s: prepared port %s is %s, not tap", c.sw, port, mode)
 	}
+	generation := uint64(0)
+	if raw := out["generation"]; raw != "" {
+		generation, err = strconv.ParseUint(raw, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("connector tapfd prepare %s: invalid generation %q: %w", c.sw, raw, err)
+		}
+	}
 	return &Port{
 		Port:       port,
+		Generation: uint32(generation),
 		FloatingIP: out["floating_ip"],
 		MAC:        out["mac"],
 		InnerIP:    out["ip"],
