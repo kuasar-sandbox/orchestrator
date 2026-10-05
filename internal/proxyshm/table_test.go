@@ -712,7 +712,7 @@ func TestWorkerStartingActivationWaitsWithoutWakeAndFailsOnRollback(t *testing.T
 			var wakes atomic.Int32
 			worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
 			entry := routesync.RouteEntry{
-				SandboxID: "s1", StableID: "stable-s1", Profile: "e2b", State: routesync.StateStarting,
+				SandboxID: "s1", StableID: "stable-s1", Profile: "e2b", State: routesync.StateStarting, RunID: "run-1",
 				EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
 			}
 			tbl.BeginSync()
@@ -887,5 +887,183 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 	}
 	if tid, tok, ok := view.SandboxInfo(route.SandboxID); ok || tid != "" || tok != "" {
 		t.Fatalf("paused SandboxInfo = %q %q ok=%v", tid, tok, ok)
+	}
+}
+
+func TestWorkerActivateRoutePinsWakeSuccessorBackend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	updates := &Updates{ch: make(chan struct{})}
+	wakeSeen := make(chan string, 1)
+	worker := NewWorkerView(tbl, updates, func(sid string) { wakeSeen <- sid }, time.Second)
+	pinned := make(chan struct{}, 1)
+	worker.activationObserved = func(sid, runID string, route proxy.Route) {
+		if sid == "s1" && runID == "run-1" && route == (proxy.Route{Kind: proxy.KindTCP, Addr: "192.0.2.10:8080"}) {
+			pinned <- struct{}{}
+		}
+	}
+	entry := routesync.RouteEntry{SandboxID: "s1", StableID: "stable-s1", Profile: "bare", State: routesync.StatePaused, ForwardAccessToken: "forward"}
+	tbl.BeginSync()
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	binding, found, err := worker.LookupRoute(context.Background(), "s1", proxy.LegacyTarget(8080))
+	if err != nil || !found {
+		t.Fatalf("LookupRoute found=%v err=%v", found, err)
+	}
+
+	type result struct {
+		route proxy.Route
+		found bool
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() { r, ok, err := worker.ActivateRoute(context.Background(), binding); done <- result{r, ok, err} }()
+	select {
+	case <-wakeSeen:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not wake")
+	}
+
+	entry.State, entry.RunID, entry.FloatingIP = routesync.StateStarting, "run-1", "192.0.2.10"
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case <-pinned:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not pin first successor")
+	}
+	// A second launch incarnation reusing the same sandbox identity must not be
+	// accepted by the already parked request, even though credentials are stable.
+	entry.RunID, entry.FloatingIP = "run-2", "192.0.2.11"
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		if got.err != nil || got.found || got.route != (proxy.Route{}) {
+			t.Fatalf("retargeted activation = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successor replacement did not fail closed")
+	}
+}
+
+func TestWorkerActivateRoutePinsWakeSuccessorAddressThroughRunning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	updates := &Updates{ch: make(chan struct{})}
+	wakeSeen := make(chan string, 1)
+	worker := NewWorkerView(tbl, updates, func(sid string) { wakeSeen <- sid }, time.Second)
+	entry := routesync.RouteEntry{SandboxID: "s1", StableID: "stable-s1", Profile: "bare", State: routesync.StatePaused, ForwardAccessToken: "forward"}
+	tbl.BeginSync()
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	binding, found, err := worker.LookupRoute(context.Background(), "s1", proxy.LegacyTarget(8080))
+	if err != nil || !found {
+		t.Fatalf("LookupRoute found=%v err=%v", found, err)
+	}
+	type result struct {
+		route proxy.Route
+		found bool
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() { r, ok, err := worker.ActivateRoute(context.Background(), binding); done <- result{r, ok, err} }()
+	select {
+	case <-wakeSeen:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not wake")
+	}
+	entry.State, entry.RunID, entry.FloatingIP = routesync.StateStarting, "run-1", "192.0.2.10"
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	entry.State = routesync.StateRunning
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		want := proxy.Route{Kind: proxy.KindTCP, Addr: "192.0.2.10:8080"}
+		if got.err != nil || !got.found || got.route != want {
+			t.Fatalf("activation = %+v want %+v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching successor did not activate")
+	}
+}
+
+func TestWorkerActivateRouteAllowsSameRunBackendAssignmentBeforePin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	updates := &Updates{ch: make(chan struct{})}
+	wakeSeen := make(chan string, 1)
+	worker := NewWorkerView(tbl, updates, func(sid string) { wakeSeen <- sid }, time.Second)
+	entry := routesync.RouteEntry{SandboxID: "s1", StableID: "stable-s1", Profile: "bare", State: routesync.StatePaused, ForwardAccessToken: "forward"}
+	tbl.BeginSync()
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	binding, found, err := worker.LookupRoute(context.Background(), "s1", proxy.LegacyTarget(8080))
+	if err != nil || !found {
+		t.Fatalf("lookup found=%v err=%v", found, err)
+	}
+	type result struct {
+		route proxy.Route
+		found bool
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() { r, ok, err := worker.ActivateRoute(context.Background(), binding); done <- result{r, ok, err} }()
+	select {
+	case <-wakeSeen:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not wake")
+	}
+	entry.State, entry.RunID = routesync.StateStarting, "run-1"
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump() // no FloatingIP yet: not pinnable
+	entry.FloatingIP = "192.0.2.10"
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump() // same RunID resource assignment
+	entry.State = routesync.StateRunning
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		want := proxy.Route{Kind: proxy.KindTCP, Addr: "192.0.2.10:8080"}
+		if got.err != nil || !got.found || got.route != want {
+			t.Fatalf("activation=%+v want=%+v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activation did not complete")
 	}
 }

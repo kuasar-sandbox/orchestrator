@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -341,13 +342,14 @@ func (b *Broadcaster) Notify() {
 
 // WorkerView is a read-only proxy.Router and MMDS source backed by shared memory.
 type WorkerView struct {
-	table       *Table
-	admission   *proxyadmission.Worker
-	updates     *Updates
-	wake        func(string)
-	defaultPark time.Duration
-	mmdsClient  *mmdsrpc.Client
-	mmdsTimeout time.Duration
+	table              *Table
+	admission          *proxyadmission.Worker
+	updates            *Updates
+	wake               func(string)
+	defaultPark        time.Duration
+	mmdsClient         *mmdsrpc.Client
+	mmdsTimeout        time.Duration
+	activationObserved func(string, string, proxy.Route) // test-only synchronization hook
 }
 
 func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration) *WorkerView {
@@ -419,11 +421,21 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 	}
 	seenStarting := r.State == routesync.StateStarting
 	woke := false
+	initialRunID := ""
+	initialRoute := proxy.Route{}
+	initialPinned := false
+	if seenStarting {
+		initialRoute = workerDialRoute(r, expected)
+		initialPinned = pinnableActivationRoute(r.RunID, initialRoute)
+		if initialPinned {
+			initialRunID = r.RunID
+		}
+	}
 	if r.State == routesync.StatePaused && v.wake != nil {
 		v.wake(expected.SandboxID)
 		woke = true
 	}
-	return v.waitRouteActivated(ctx, expected, woke, seenStarting, initialRev)
+	return v.waitRouteActivated(ctx, expected, woke, seenStarting, initialRev, initialPinned, initialRunID, initialRoute)
 }
 
 func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.ConnectTarget) (proxy.RouteBinding, bool) {
@@ -448,7 +460,22 @@ func workerDialRoute(r routesync.RouteEntry, expected proxy.RouteBinding) proxy.
 	return proxy.RouteForTarget(types.Profile(r.Profile), r.EnvdUDS, r.CiUDS, r.FloatingIP, expected.Target)
 }
 
-func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.RouteBinding, woke, seenStarting bool, initialRev uint64) (proxy.Route, bool, error) {
+func pinnableActivationRoute(runID string, route proxy.Route) bool {
+	if runID == "" {
+		return false
+	}
+	switch route.Kind {
+	case proxy.KindTCP:
+		host, _, err := net.SplitHostPort(route.Addr)
+		return err == nil && host != ""
+	case proxy.KindUDS:
+		return route.UDS != ""
+	default:
+		return false
+	}
+}
+
+func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.RouteBinding, woke, seenStarting bool, initialRev uint64, pinned bool, successorRunID string, successorRoute proxy.Route) (proxy.Route, bool, error) {
 	deadline := time.Now().Add(v.parkTimeout())
 	nextWake := time.Now().Add(time.Second)
 	for {
@@ -467,9 +494,33 @@ func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.Rout
 			if route.Kind != expected.Kind {
 				return proxy.Route{}, false, nil
 			}
+			// A parked request may cross paused -> starting -> running, but it must
+			// never retarget to a different launch incarnation or backend while it
+			// waits. The starting route is the first authoritative publication of
+			// the newly attached network/UDS ownership, so pin both RunID and dial
+			// target there and require the running publication to match exactly.
+			if seenStarting {
+				if !pinned || r.RunID != successorRunID || route != successorRoute {
+					return proxy.Route{}, false, nil
+				}
+			}
 			return route, true, nil
 		case routesync.StateStarting:
+			route := workerDialRoute(r, expected)
+			if route.Kind != expected.Kind {
+				return proxy.Route{}, false, nil
+			}
 			seenStarting = true
+			if pinned {
+				if r.RunID != successorRunID || route != successorRoute {
+					return proxy.Route{}, false, nil
+				}
+			} else if pinnableActivationRoute(r.RunID, route) {
+				pinned, successorRunID, successorRoute = true, r.RunID, route
+				if v.activationObserved != nil {
+					v.activationObserved(expected.SandboxID, successorRunID, successorRoute)
+				}
+			}
 		case routesync.StatePaused:
 			if seenStarting || (woke && routeRev != initialRev) {
 				return proxy.Route{}, false, nil
