@@ -193,8 +193,10 @@ Ordinary HTTP:
 2. It selects EnvdAccessToken or ForwardAccessToken for the target and applies the node's effective authentication policy to `X-Access-Token`. Eligible `/files` requests can also verify a signature with EnvdAccessToken; §6 describes mode-specific enforcement.
 3. After admission by that policy, `TryBeginParking` checks sandbox total and target-service limits together. Success publishes the shared count and enters parking. Exhaustion returns 429 without Wake, Activate, or dial.
 4. `ActivateRoute` revalidates the binding, including admission generation/effective policy, before Wake/waiting and again after lifecycle work. It constructs the final backend from the latest running route and fails closed if the binding changes.
-5. It dials envd UDS or `floatingip:port` once. With `proxy_netns`, the floating-IP dial occurs in that namespace.
+5. It dials envd UDS or `floatingip:port` from that running route. With `proxy_netns`, the floating-IP dial occurs in that namespace.
 6. It writes one HTTP request and streams the response, or relays a negotiated HTTP/1.1 WebSocket upgrade. Response completion or final relay completion closes the flow and releases its quota exactly once.
+
+Ordinary HTTP observes the selected route's running state, RunID, backend address and authorization identity for its current target until the exchange ends. A withdrawn route cancels its transport without waiting for TCP retransmission timeouts. Before any guest HTTP bytes are written, the same admitted request may activate its original binding again and dial the latest endpoint; it retains its one admission/traffic flow and the client's context/deadline. Once forwarding starts, cancellation closes the backend and uses the existing upstream-error handling; it never replays HTTP bytes. Policy updates, including limited/unlimited transitions and changes to other services' credentials, do not evict an already accepted transport; any later reactivation still checks the original full binding. This is local transport availability behavior, not a packet-isolation condition; connector generation remains independent. CONNECT keeps its existing stream and half-close behavior.
 
 CONNECT:
 

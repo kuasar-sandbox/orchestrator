@@ -35,9 +35,10 @@ const (
 )
 
 type Route struct {
-	Kind Kind
-	UDS  string // KindUDS
-	Addr string // KindTCP, host:port
+	Kind  Kind
+	UDS   string // KindUDS
+	Addr  string // KindTCP, host:port
+	RunID string // current transport incarnation; never part of authorization
 }
 
 // RouteBinding is the stable sandbox identity and exact logical target that an
@@ -113,6 +114,19 @@ func LegacyTarget(port int) ConnectTarget {
 type Router interface {
 	LookupRoute(ctx context.Context, sandboxID string, target ConnectTarget) (RouteBinding, bool, error)
 	ActivateRoute(ctx context.Context, expected RouteBinding) (Route, bool, error)
+}
+
+// ErrRouteChanged cancels only a transport selected from an obsolete route.
+// Before guest bytes are written, the same admitted HTTP request may activate
+// its original authorized binding again. A started HTTP exchange is never replayed.
+var ErrRouteChanged = errors.New("proxy: active route changed")
+
+// RouteWatcher optionally binds ordinary HTTP transport to a running route.
+// It preserves the parent context and cancels with ErrRouteChanged when that
+// route ceases to be usable. stop must release and join the local observation.
+// CONNECT retains its existing stream and half-close semantics.
+type RouteWatcher interface {
+	WatchRoute(ctx context.Context, expected RouteBinding, current Route) (context.Context, context.CancelFunc)
 }
 
 // ExecIdentity is the credential and node-local identity needed to authorize an
@@ -333,23 +347,25 @@ func (p *Proxy) forwardRoute(w http.ResponseWriter, r *http.Request, binding Rou
 		return
 	}
 	defer flow.Close()
-	if request.Revalidate != nil {
-		if err := request.Revalidate(r.Context()); err != nil {
-			if p.log != nil {
-				p.log.Warn("proxy extension private authorization became stale",
-					"sandbox_id", request.SandboxID, "service", request.Target.Service,
-					"port", request.Target.Port, "err", err)
-			}
-			p.mx.Inc(`data_requests_total{result="route_error"}`)
-			writeProxyError(w, http.StatusConflict, "private authorization became stale", ProxyErrorStale)
+	var backend net.Conn
+	var err error
+	if r.Method == http.MethodConnect {
+		if !p.revalidateForward(w, r, request) {
 			return
 		}
-	}
-	backend, err := p.dial(r.Context(), route)
-	if err != nil {
-		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
-		return
+		backend, err = p.dial(r.Context(), route)
+		if err != nil {
+			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
+			return
+		}
+	} else {
+		var stop context.CancelFunc
+		backend, r, stop, ok = p.dialHTTPRoute(w, r, binding, route, request)
+		if !ok {
+			return
+		}
+		defer stop()
 	}
 	backend = flow.AttachBackend(backend)
 	if r.Method == http.MethodConnect {
@@ -446,29 +462,37 @@ func (p *Proxy) activateRoute(w http.ResponseWriter, r *http.Request, binding Ro
 		writeProxyError(w, http.StatusConflict, "sandbox route changed", ProxyErrorRouteError)
 		return Route{}, nil, false
 	}
-	route, found, err := p.router.ActivateRoute(r.Context(), binding)
-	if err != nil {
+	route, ok := p.resolveActiveRoute(w, r, binding)
+	if !ok {
 		flow.Close()
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "sandbox activation failed", ProxyErrorRouteError)
 		return Route{}, nil, false
 	}
+	return route, flow, true
+}
+
+// resolveActiveRoute does not acquire a second admission or traffic flow when
+// an undelivered ordinary HTTP request must leave a stale transport target.
+func (p *Proxy) resolveActiveRoute(w http.ResponseWriter, r *http.Request, binding RouteBinding) (Route, bool) {
+	route, found, err := p.router.ActivateRoute(r.Context(), binding)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "sandbox activation failed", ProxyErrorRouteError)
+		return Route{}, false
+	}
 	if !found {
-		flow.Close()
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
 		// Admission already entered parking. Keep the public status, but do not
 		// advertise a pre-admission typed stale error to a chained cluster router:
 		// retrying this same logical request would create a second ingress.
 		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorRouteError)
-		return Route{}, nil, false
+		return Route{}, false
 	}
 	if route.Kind != binding.Kind || (route.Kind != KindUDS && route.Kind != KindTCP) {
-		flow.Close()
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return Route{}, nil, false
+		return Route{}, false
 	}
-	return route, flow, true
+	return route, true
 }
 
 func (p *Proxy) tryBeginParking(sandboxID string, service ConnectService, binding proxyadmission.Binding) (TrafficFlow, error) {

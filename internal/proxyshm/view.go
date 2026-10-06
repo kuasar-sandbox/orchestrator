@@ -445,7 +445,9 @@ func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.Connect
 }
 
 func workerDialRoute(r routesync.RouteEntry, expected proxy.RouteBinding) proxy.Route {
-	return proxy.RouteForTarget(types.Profile(r.Profile), r.EnvdUDS, r.CiUDS, r.FloatingIP, expected.Target)
+	route := proxy.RouteForTarget(types.Profile(r.Profile), r.EnvdUDS, r.CiUDS, r.FloatingIP, expected.Target)
+	route.RunID = r.RunID
+	return route
 }
 
 func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.RouteBinding, woke, seenStarting bool, initialRev uint64) (proxy.Route, bool, error) {

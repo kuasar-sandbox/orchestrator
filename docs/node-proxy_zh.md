@@ -43,7 +43,7 @@ API UDS，不使用 Proxy StatsSocket。
   activation,worker 模型不变。
 - **转发 netns 可配置**:`proxy_netns` 指向 connector 管理平面 netns 时,worker 进程
   在该 netns 内运行,proxy 到 `floatingip:port` 的访问和 MMDS listener 都位于其中.
-- **无上游连接池**:普通 HTTP 每请求拨一次后端并关闭;CONNECT 是一条请求绑定一条
+- **无上游连接池**:普通 HTTP 为每条请求建立独立后端连接并关闭;CONNECT 是一条请求绑定一条
   TCP/UDS 连接。不同 sandbox/port 不复用上游连接。
 - **鉴权先于生命周期副作用**:普通 HTTP 与 non-exec CONNECT 固定执行
   `LookupRoute → authorize(RouteBinding) → TryBeginParking → ActivateRoute → fresh Route → dial`。
@@ -300,9 +300,11 @@ service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显�
 4. 进入 `ActivateRoute`:在 Wake/等待前重验包含 admission generation/effective policy 的
    binding,完成生命周期动作后再
    重验一次,并从最新 running route 构造最终 backend;binding 改变时 fail closed;
-5. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
+5. 根据当前 running route 拨 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
    netns 内拨号;
 6. 写入一条 HTTP 请求，流式复制响应，或转发协商成功的 HTTP/1.1 WebSocket Upgrade；响应或完整 relay 结束后一次性关闭 flow 并释放额度。
+
+普通 HTTP 在交换结束前持续观察所选路由的 running 状态、RunID、后端地址以及当前 target 的授权身份。路由撤销会取消该传输，无需等待 TCP 重传超时。在尚未向 guest 写入任何 HTTP 字节时，同一个已获准请求可以用原 binding 再次执行激活并拨最新端点；它保留原有的一次 admission/traffic flow 以及客户端 context/deadline。一旦开始转发，取消只关闭后端并沿用现有 upstream-error 处理，绝不重放 HTTP 字节。策略更新（包括 limited/unlimited 切换和其他服务凭据修改）不会驱逐已接受的传输；后续如需重新激活，仍校验原有完整 binding。这是本机传输可用性行为，不是报文隔离的前置条件；connector generation 的隔离机制保持独立。CONNECT 继续使用既有的 stream 和 half-close 语义。
 
 CONNECT:
 
