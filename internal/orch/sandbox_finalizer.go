@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -571,7 +572,9 @@ func (o *Orchestrator) fenceSandboxRunner(ctx context.Context, runID string) err
 		return err
 	}
 	if unit == "" {
-		return nil // successful enumeration proved absence
+		// systemd may have collected the unit before trimming its delegated
+		// tree. Check the configured instances for this exact retained RunID.
+		return o.pruneSandboxCgroups(ctx, runID, "")
 	}
 	if err := o.lc.Stop(ctx, unit); err != nil {
 		active, listErr := o.sandboxUnitActive(ctx, unit)
@@ -591,6 +594,28 @@ func (o *Orchestrator) fenceSandboxRunner(ctx context.Context, runID string) err
 	}
 	if active {
 		return fmt.Errorf("sandbox runner unit %s remained active after stop/reset", unit)
+	}
+	return o.pruneSandboxCgroups(ctx, runID, unit)
+}
+
+func (o *Orchestrator) pruneSandboxCgroups(ctx context.Context, runID, unit string) error {
+	pruner, ok := o.lc.(launcher.SandboxCgroupPruner)
+	if !ok || runID == "" {
+		return nil // launchers without delegated systemd cgroups
+	}
+	if unit != "" {
+		return pruner.PruneSandboxCgroup(ctx, unit)
+	}
+	seen := make(map[string]bool)
+	for _, pool := range o.poolConfigs(runKindSandbox) {
+		candidate := instanceUnit(pool.Unit, runID)
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		if err := pruner.PruneSandboxCgroup(ctx, candidate); err != nil {
+			return err
+		}
 	}
 	return nil
 }
