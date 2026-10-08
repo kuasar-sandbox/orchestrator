@@ -15,7 +15,9 @@ runner_test_binary="${NODE_CTL_RUNNER_TEST_BINARY:-$BIN/node-ctl-runner-test}"
 [ -x "$runner_test_binary" ] || fail "missing prepared runner test binary: $runner_test_binary"
 cp "$runner_test_binary" "$ORCH_BIN_DIR/node-ctl"
 printf '%s\n' "$WORK" > "$ORCH_BIN_DIR/runner-e2e-workdir"
-for b in connector-ctl flatten-ctl manifest-ctl; do
+# SDK execution resolves CH beside this sandbox-ctl wrapper; unlike the old
+# CLI exec, it does not enter BIN. Keep the exact prepared VMM adjacent too.
+for b in connector-ctl flatten-ctl manifest-ctl cloud-hypervisor; do
     ln -s "$BIN/$b" "$ORCH_BIN_DIR/$b"
 done
 cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF
