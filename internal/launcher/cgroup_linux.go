@@ -19,7 +19,7 @@ type SandboxCgroupPruner interface {
 	PruneSandboxCgroup(context.Context, string) error
 }
 
-var sandboxInstance = regexp.MustCompile(`^[A-Za-z0-9_.:-]+@sr-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.service$`)
+var sandboxInstance = regexp.MustCompile(`^[A-Za-z0-9_.:\\-]+@sr-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.service$`)
 
 func (s *Systemd) PruneSandboxCgroup(ctx context.Context, unit string) error {
 	if !sandboxInstance.MatchString(unit) {
@@ -46,7 +46,38 @@ func (s *Systemd) PruneSandboxCgroup(ctx context.Context, unit string) error {
 	if stat.Type != unix.CGROUP2_SUPER_MAGIC {
 		return fmt.Errorf("launcher: sandbox runner slice is not cgroup v2")
 	}
-	return pruneEmptyCgroup(ctx, root, unit, root.Remove)
+	return pruneUnitCgroup(ctx, root, unit, root.Remove)
+}
+
+// systemd's cg_unescape removes one leading underscore. Decode existing names
+// rather than duplicate its version-dependent list of reserved prefixes.
+func pruneUnitCgroup(ctx context.Context, root *os.Root, unit string, remove func(string) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return err
+	}
+	match := ""
+	for _, entry := range entries {
+		if strings.TrimPrefix(entry.Name(), "_") != unit {
+			continue
+		}
+		if match != "" {
+			return fmt.Errorf("launcher: ambiguous cgroup names for %s", unit)
+		}
+		match = entry.Name()
+	}
+	if match == "" {
+		return nil
+	}
+	return pruneEmptyCgroup(ctx, root, match, remove)
 }
 
 // Only rmdir is used: no tasks are killed or moved, no control files are

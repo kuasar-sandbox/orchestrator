@@ -149,3 +149,73 @@ func TestPruneSandboxCgroupRejectsNonRunnerPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestSandboxInstanceSupportsConfiguredTemplateNames(t *testing.T) {
+	for _, prefix := range []string{"sandbox-runner", "custom.runner:v2", `custom\x2dworker`} {
+		unit := prefix + "@sr-00000000-0000-7000-8000-000000000001.service"
+		if !sandboxInstance.MatchString(unit) {
+			t.Fatalf("configured template prefix rejected: %q", unit)
+		}
+	}
+}
+
+func TestPruneUnitCgroupUsesSystemdDecodedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		prefix  string
+		escaped bool
+	}{
+		{"_runner", true}, {".runner", true}, {"cpu.runner", true},
+		{"bpf-bind-network-interface.runner", true},
+		{"bpf-bind-network-interface.runner", false}, // older systemd
+		{`custom\x2dworker`, false}, {"sandbox-runner", false},
+	} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			_, root, remove := cgroupFixture(t)
+			unit := tc.prefix + "@sr-00000000-0000-7000-8000-000000000001.service"
+			if !sandboxInstance.MatchString(unit) {
+				t.Fatalf("configured instance rejected: %s", unit)
+			}
+			name := unit
+			if tc.escaped {
+				name = "_" + unit
+			}
+			if err := root.Rename(testSandboxUnit, name); err != nil {
+				t.Fatal(err)
+			}
+			if err := pruneUnitCgroup(context.Background(), root, unit, remove); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := root.Stat(name); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("delegated subtree retained: %v", err)
+			}
+			if _, err := root.Stat("other.service"); err != nil {
+				t.Fatalf("unrelated unit changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPruneUnitCgroupPreservesDifferentDecodedOwner(t *testing.T) {
+	_, root, remove := cgroupFixture(t)
+	if err := root.Rename(testSandboxUnit, "_"+testSandboxUnit); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneUnitCgroup(context.Background(), root, "_"+testSandboxUnit, remove); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Stat("_" + testSandboxUnit); err != nil {
+		t.Fatalf("removed a different decoded unit: %v", err)
+	}
+}
+
+func TestPruneUnitCgroupRejectsAmbiguityBeforeRemoval(t *testing.T) {
+	_, root, _ := cgroupFixture(t)
+	if err := root.Mkdir("_"+testSandboxUnit, 0700); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := pruneUnitCgroup(context.Background(), root, testSandboxUnit, func(string) error { called = true; return nil })
+	if err == nil || called {
+		t.Fatalf("ambiguous ownership allowed removal: err=%v removed=%t", err, called)
+	}
+}
