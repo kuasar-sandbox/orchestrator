@@ -192,6 +192,38 @@ TAGS=()
 
 
 
+class SDKShutdownJournal(unittest.TestCase):
+    def check_journal(self, text):
+        case = Path(__file__).resolve().parents[1] / "cases/orchestrator.resource-startup.sh"
+        source = case.read_text()
+        start = source.index("    # KillMode=control-group")
+        end = source.index('    echo "==> PASS: 8GiB/256MiB', start)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal"
+            journal.write_text(text)
+            script = 'set -euo pipefail\nfail() { echo "$*" >&2; exit 1; }\n' + source[start:end]
+            return subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                                  env={**os.environ, "LOW_JOURNAL": str(journal), "iteration": "1"}, timeout=5)
+
+    def test_public_sdk_shutdown_retains_signal_and_exit_evidence(self):
+        result = self.check_journal(
+            "[sandbox-sdk] received terminated, requested vmm.shutdown via API\n"
+            "[sandbox-sdk] CH exited code=0\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_signal_exit_and_escalation_remain_failures(self):
+        valid = "[sandbox-sdk] received terminated\n[sandbox-sdk] CH exited code=0\n"
+        for text, diagnostic in (
+            ("[sandbox-sdk] CH exited code=0\n", "did not observe StopUnit"),
+            ("[sandbox-sdk] received terminated\n", "did not observe CH exit"),
+            (valid + "[sandbox-sdk] CH didn't exit within 10s; sending SIGKILL\n", "escalated shutdown"),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                result = self.check_journal(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+
 class RunnerLifecycleIdentity(unittest.TestCase):
     def test_kernel_worker_is_not_a_second_userspace_vmm(self):
         with tempfile.TemporaryDirectory() as directory:
