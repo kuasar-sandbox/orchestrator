@@ -224,6 +224,29 @@ class SDKShutdownJournal(unittest.TestCase):
                 self.assertIn(diagnostic, result.stderr)
 
 
+class TerminalEvidence(unittest.TestCase):
+    def test_collected_runtime_keeps_bounded_result_without_private_fields(self):
+        rid = "sr-00000000-0000-7000-8000-000000000001"
+        state = {"state": "dead", "run_id": "", "sandbox_result_run_id": rid,
+                 "sandbox_result_json": json.dumps({"stage": "run", "exit_code": 1,
+                     "signal": "killed", "error": "private diagnostic", "env": "private environment"}),
+                 "metadata": "private metadata", "base_dir": "private path"}
+        with mock.patch.object(runner_lifecycle, "row", return_value=state):
+            evidence = runner_lifecycle.terminal_evidence(Path("/fixture"), "test-run")
+        self.assertEqual(evidence, {"sid": "test-run", "state": "dead", "run_id": "", "result_run_id": rid,
+            "result": {"stage": "run", "exit_code": 1, "signal": "killed", "error_present": True}})
+        self.assertNotIn("private", json.dumps(evidence))
+
+    def test_unrecognized_result_content_is_not_printed(self):
+        state = {"state": "dead", "run_id": "private run", "sandbox_result_run_id": "private result",
+                 "sandbox_result_json": json.dumps({"stage": "private stage", "signal": "private signal",
+                    "exit_code": "private code", "error": "private error"})}
+        with mock.patch.object(runner_lifecycle, "row", return_value=state):
+            evidence = runner_lifecycle.terminal_evidence(Path("/fixture"), "test-run")
+        self.assertEqual(evidence["result"], {"error_present": True})
+        self.assertNotIn("private", json.dumps(evidence))
+
+
 class RunnerLifecycleIdentity(unittest.TestCase):
     def test_kernel_worker_is_not_a_second_userspace_vmm(self):
         with tempfile.TemporaryDirectory() as directory:

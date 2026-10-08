@@ -178,6 +178,27 @@ def assert_dead(work, observed, run_root=None):
             raise ValueError("automatic cleanup left an original unit process alive")
 
 
+def terminal_evidence(work, sid):
+    """Keep the durable cause after a failed run has already been collected."""
+    state = row(work, sid)
+    result = json.loads(state.get("sandbox_result_json") or "{}")
+    evidence = {"sid": sid, "state": state["state"], "result": {}}
+    for source, target in (("run_id", "run_id"), ("sandbox_result_run_id", "result_run_id")):
+        value = state.get(source, "")
+        evidence[target] = value if re.fullmatch(r"sr-[0-9a-fA-F-]{36}", value) else ""
+    if isinstance(result, dict):
+        # Do not print arbitrary error strings, metadata, argv or environments.
+        if result.get("stage") in ("prepare", "start", "run"):
+            evidence["result"]["stage"] = result["stage"]
+        code = result.get("exit_code")
+        if type(code) is int and 0 <= code <= 255:
+            evidence["result"]["exit_code"] = code
+        if result.get("signal") in ("terminated", "killed", "interrupt", "aborted", "segmentation fault"):
+            evidence["result"]["signal"] = result["signal"]
+        evidence["result"]["error_present"] = bool(result.get("error"))
+    return evidence
+
+
 def cleanup_diagnostics(work, observed):
     """Bounded ownership facts only; never argv, environment, or credentials."""
     state = row(work, observed["sid"])
