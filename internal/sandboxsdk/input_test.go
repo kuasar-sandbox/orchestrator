@@ -2,9 +2,12 @@ package sandboxsdk
 
 import (
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -149,5 +152,74 @@ func TestReadinessCompletesShortWrites(t *testing.T) {
 	r.Notify(sandbox.ReadinessReady)
 	if w.String() != "control_ready\nready\n" || w.closes != 1 {
 		t.Fatalf("wire=%q closes=%d", w.String(), w.closes)
+	}
+}
+
+func TestInputExecutableTaskPATH(t *testing.T) {
+	spec := generatedSpec(t)
+	spec.Exec = configresolve.ExecutablesForNodeCtl(filepath.Join(t.TempDir(), "node-ctl")).SandboxCtl()
+	if spec.Exec != "sandbox-ctl" {
+		t.Fatalf("fallback = %q", spec.Exec)
+	}
+	taskBin, ambientBin := t.TempDir(), t.TempDir()
+	for _, dir := range []string{taskBin, ambientBin} {
+		for _, name := range []string{"sandbox-ctl", "spoofed"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("unused"), 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Setenv("PATH", ambientBin)
+	env := map[string]string{"MANIFEST_KEY": "", "PATH": taskBin}
+	in, err := Parse(spec, types.ResumeSource{}, nil, env, "sb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Exec != filepath.Join(taskBin, "sandbox-ctl") {
+		t.Fatalf("resolved executable = %q", in.Exec)
+	}
+	if spec.Exec != "sandbox-ctl" {
+		t.Fatal("mutated launch spec")
+	}
+	for _, tc := range []struct {
+		name, exec, path string
+		args             []string
+	}{
+		{name: "missing task PATH", exec: "sandbox-ctl"},
+		{name: "missing executable", exec: "sandbox-ctl", path: t.TempDir()},
+		{name: "spoofed bare name", exec: "spoofed", path: taskBin},
+		{name: "spoofed absolute name", exec: filepath.Join(taskBin, "spoofed"), path: taskBin},
+		{name: "relative executable", exec: "./sandbox-ctl", path: taskBin},
+		{name: "relative PATH", exec: "sandbox-ctl", path: ".:" + taskBin},
+		{name: "empty PATH entry", exec: "sandbox-ctl", path: ":" + taskBin},
+		{name: "unexpected argv", exec: "sandbox-ctl", path: taskBin, args: append(append([]string{}, spec.Args...), "--unknown", "x")},
+		{name: "unexpected command", exec: "sandbox-ctl", path: taskBin, args: []string{"stop"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := spec
+			bad.Exec = tc.exec
+			bad.Workdir = taskBin
+			if tc.args != nil {
+				bad.Args = tc.args
+			}
+			if _, err := Parse(bad, types.ResumeSource{}, nil, map[string]string{"MANIFEST_KEY": "", "PATH": tc.path}, "sb-1"); err == nil {
+				t.Fatal("accepted invalid launch")
+			}
+		})
+	}
+	for _, mode := range []os.FileMode{0644, os.ModeDir} {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "sandbox-ctl")
+		if mode == os.ModeDir {
+			err = os.Mkdir(target, 0755)
+		} else {
+			err = os.WriteFile(target, nil, mode)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(spec, types.ResumeSource{}, nil, map[string]string{"MANIFEST_KEY": "", "PATH": dir}, "sb-1"); err == nil {
+			t.Fatal("accepted non-executable PATH entry")
+		}
 	}
 }

@@ -27,12 +27,6 @@ type Input struct {
 
 // Parse keeps task-owned sources and the node-owned cgroup outside LaunchSpec.
 func Parse(spec configsock.LaunchSpec, source types.ResumeSource, locations map[string]string, env map[string]string, sandboxID string) (*Input, error) {
-	if filepath.Base(spec.Exec) != "sandbox-ctl" || !filepath.IsAbs(spec.Exec) {
-		return nil, fmt.Errorf("unexpected sandbox executable")
-	}
-	if len(spec.Args) == 0 || spec.Args[0] != "run" {
-		return nil, fmt.Errorf("sandbox launch must invoke run")
-	}
 	in := &Input{Exec: spec.Exec, Workdir: spec.Workdir, Source: source, Locations: config.RefLocations{}, Env: map[string]string{}}
 	for k, v := range env {
 		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(v, 0) {
@@ -42,6 +36,21 @@ func Parse(spec configsock.LaunchSpec, source types.ResumeSource, locations map[
 	}
 	if _, ok := in.Env["MANIFEST_KEY"]; !ok {
 		return nil, fmt.Errorf("missing authoritative manifest key")
+	}
+	// configresolve returns a bare helper name when it is not beside node-ctl.
+	// Resolve against the task environment, never the SDK process's PATH.
+	if !strings.ContainsRune(in.Exec, os.PathSeparator) {
+		resolved, err := in.lookPath(in.Exec)
+		if err != nil {
+			return nil, fmt.Errorf("resolve sandbox executable: %w", err)
+		}
+		in.Exec = resolved
+	}
+	if filepath.Base(in.Exec) != "sandbox-ctl" || !filepath.IsAbs(in.Exec) {
+		return nil, fmt.Errorf("unexpected sandbox executable")
+	}
+	if len(spec.Args) == 0 || spec.Args[0] != "run" {
+		return nil, fmt.Errorf("sandbox launch must invoke run")
 	}
 	values := map[string]string{}
 	allowed := map[string]bool{"--sandbox-id": true, "--path-id": true, "--config": true, "--manifest-config": true, "--run-root": true, "--base-root": true, "--log-to": true, "--stdout-to": true, "--stderr-to": true, "--console": true}
