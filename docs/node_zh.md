@@ -2699,9 +2699,11 @@ fixture、进程、网络、HTTP 和观测原语，每个 case 自己拥有测�
 | [`builder.publish.sh`](../test/e2e/cases/builder.publish.sh) | 保持 DB/key 的五个真实 local/Bundle、Manifest/named-location 发布操作：顶层 E 无中间 image、S→E delta 的 portable image 引用、精确 Store 对象变化、Bundle 目录闭包和 row TTL 后 canonical image/snapshot Create。 |
 | [`telemetry.proxy.sh`](../test/e2e/cases/telemetry.proxy.sh); [`telemetry.backends.sh`](../test/e2e/cases/telemetry.backends.sh); [`telemetry.guest.sh`](../test/e2e/cases/telemetry.guest.sh) | 真实 404 前后的 Prometheus counter 基线/增加与独立 backend 合同；真实 guest OTLP HTTP/gRPC/native traffic、local/stable 身份、pause/restart history/noWake、Collector 缺失/断连及 namespace 归属。 |
 
-生命周期/source E2E instrumentation 使用预制的测试 runner binary：
-`go test -c -o node-ctl-runner-test ./cmd/node-ctl`，以
-`$BIN/node-ctl-runner-test` 或 `NODE_CTL_RUNNER_TEST_BINARY` 提供。仅测试 binary
+生命周期/source E2E instrumentation 使用预制的测试 runner binary。
+平台 helper build 在精确的测试版本上通过 `go test -c ./cmd/node-ctl` 编译，
+并通过 `NODE_CTL_RUNNER_TEST_BINARY` 提供已校验的
+`fixtures/bin/node-ctl-runner-test`。独立预制 fixture 也可将同一测试 binary
+放置在 `$BIN/node-ctl-runner-test`；prepare 和 E2E 均不编译它。仅测试 binary
 根据专用 marker 启用 launch hook，观察 prepared source 并注入既有 readiness/envd 失败；
 production node-ctl 没有注入开关。Snapshot/export 与 Builder 保持原有 CLI fixture。
 

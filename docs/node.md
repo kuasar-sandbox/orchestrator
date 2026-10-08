@@ -2025,9 +2025,12 @@ for aggregation and release acceptance.
 | [`builder.publish.sh`](../test/e2e/cases/builder.publish.sh) | Five real local/Bundle and Manifest/named-location publication operations with stable DB/key: no intermediate image for top E, portable image refs under S→E delta, exact Store object changes, closed Bundle directories and canonical image/snapshot Create after row TTL. |
 | [`telemetry.proxy.sh`](../test/e2e/cases/telemetry.proxy.sh); [`telemetry.backends.sh`](../test/e2e/cases/telemetry.backends.sh); [`telemetry.guest.sh`](../test/e2e/cases/telemetry.guest.sh) | Prometheus counter baseline/increase after a real 404 and independent backend contracts; real guest OTLP HTTP/gRPC/native traffic, local/stable identity, pause/restart history/noWake, Collector absence/disconnection and namespace ownership. |
 
-The lifecycle/source E2E instrumentation uses a prepared test-only runner binary:
-`go test -c -o node-ctl-runner-test ./cmd/node-ctl`. Supply it as
-`$BIN/node-ctl-runner-test` or `NODE_CTL_RUNNER_TEST_BINARY`. Its marker-enabled
+The lifecycle/source E2E instrumentation uses a prepared test-only runner binary.
+The platform helper build compiles `go test -c ./cmd/node-ctl` at the exact test
+revision and supplies the verified `fixtures/bin/node-ctl-runner-test` through
+`NODE_CTL_RUNNER_TEST_BINARY`. Standalone prepared fixtures may supply the same
+binary as `$BIN/node-ctl-runner-test`; preparation and E2E never compile it.
+Its marker-enabled
 launch hook observes prepared sources and injects existing readiness/envd failures;
 production node-ctl has no injection switch. Snapshot/export and Builder still use
 their existing CLI fixtures.
