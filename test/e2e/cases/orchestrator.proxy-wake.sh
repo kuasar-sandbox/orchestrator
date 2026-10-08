@@ -376,6 +376,20 @@ exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 1
 PRESSURE_EXEC_PID=$!
 PIDS+=("$PRESSURE_EXEC_PID")
 pressure_wait_parking || fail "ordinary critical request did not park"
+# Record the second primary before its explicit Snapshot as well; later
+# recovery must preserve its identity, payload and increasing work counter.
+second_ready=""
+for _ in $(seq 1 200); do
+    if pressure_guest_state "$SECOND" > "$WORK/pressure-second-before.json" 2>/dev/null &&
+       python3 - "$WORK/pressure-second-before.json" <<'PY_SECOND'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["held"] == 576*(1<<20) and v["nonce"] and v["tick"] >= 0, v
+PY_SECOND
+    then second_ready=1; break; fi
+    sleep .2
+done
+[ -n "$second_ready" ] || fail "second held primary did not finish allocation"
 code=$(req POST "/sandboxes/$SECOND/pause" "$AK")
 [ "$code" = 204 ] || fail "second explicit Pause=$code"
 wait "$PRESSURE_EXEC_PID" || fail "parked Proxy Wake did not recover adopted Snapshot"
@@ -405,8 +419,11 @@ budgets=[int(n) for n in re.findall(r'restore BudgetAtSnapshot reserved=(\d+)',t
 pool=__import__("json").load(open(sys.argv[3]))["pool_memory"]
 assert any(int(pool*.4)<n<=pool for n in budgets), budgets
 PY_BUDGET
-# ---- unattended mixed-workload rotation ---------------------------------
+# ---- background policy hold followed by actual resource relief ---------
 # Re-enable the second saved workload once, then send no more Wake/Connect.
+# Background recovery must not recreate raw red pressure merely to rotate
+# these incompatible held workloads (#440). The running primary must progress
+# while the other Snapshot remains intact; real Delete then permits recovery.
 # Read-only native exec probes below cannot launch a paused sandbox.
 allowed=""
 for _ in $(seq 1 100); do
@@ -424,63 +441,86 @@ curl -sS --noproxy '*' --max-time 120 -o "$WORK/pressure-connect.body" -w '%{htt
     --data '{"timeout":600}' "http://127.0.0.1:$PORT/sandboxes/$SECOND/connect" > "$WORK/pressure-connect.code" &
 PRESSURE_CONNECT_PID=$!
 PIDS+=("$PRESSURE_CONNECT_PID")
-python3 - "$BIN" "$WORK" "$EXECUTE_RUN_ROOT" "$FIRST" "$SECOND" <<'PY_ROTATION' || fail "unattended pressure rotation did not preserve both primary workloads"
+python3 - "$BIN" "$WORK" "$EXECUTE_RUN_ROOT" "$FIRST" "$SECOND" <<'PY_POLICY' || fail "background policy did not preserve a stable primary and saved source"
 import json, sqlite3, subprocess, sys, time
 from pathlib import Path
-binary, directory, runtime, first, second = sys.argv[1:]; work = Path(directory); run_root = Path(runtime)
-ids = (first, second); seen = {sid: {} for sid in ids}; running_since = {}
-expected = {first: json.loads((work / "pressure-before.json").read_text())["nonce"]}
-start = time.monotonic(); deadline = start + 180; last = None
-with (work / "pressure-rotation.log").open("w") as output:
+binary, directory, runtime, first, second = sys.argv[1:]
+work = Path(directory); run_root = Path(runtime); stable_since = None
+baseline = json.loads((work / "pressure-second-before.json").read_text())
+seen = None; deadline = time.monotonic() + 180
+def primary(sid):
+    r = subprocess.run([binary + "/sandbox-ctl", "exec", "--run-root", str(run_root / "sandboxes"),
+        "--sandbox-id", sid, "--", "/bin/cat", "/tmp/pressure-state.json"], capture_output=True, timeout=3)
+    return json.loads(r.stdout) if r.returncode == 0 else None
+with (work / "pressure-policy.log").open("w") as output:
     while time.monotonic() < deadline:
-        p = json.loads(subprocess.check_output([binary + "/node-ctl", "resource", "pressure", "--socket", str(work / "node-ctl.socket")], timeout=5))
+        p = json.loads(subprocess.check_output([binary + "/node-ctl", "resource", "pressure",
+            "--socket", str(work / "node-ctl.socket")], timeout=5))
         assert p["reserved_memory"] <= p["pool_memory"], p
-        if p["pending_recoveries"]:
-            assert p["zone"] == "critical", p
-        with sqlite3.connect((work / "lib/node-ctl.db").resolve().as_uri() + "?mode=ro", uri=True, timeout=2) as db:
-            rows = db.execute("select id,state,run_id,running_since_ns from sandboxes where id in (?,?)", ids).fetchall()
-        assert len(rows) == 2 and all(row[1] in ("running", "paused", "starting") for row in rows), rows
-        output.write(json.dumps(dict(at=time.time(), pressure=p, lifecycle=rows)) + "\n"); output.flush()
-        for sid, state, run_id, since in rows:
-            if state != "running": continue
-            if run_id not in running_since:
-                assert since > max((stamp for rid, stamp in running_since.items() if rid in seen[sid]), default=0), (sid, since, running_since)
-                running_since[run_id] = since
-            try:
-                result = subprocess.run([binary + "/sandbox-ctl", "exec", "--run-root", str(run_root / "sandboxes"), "--sandbox-id", sid, "--", "/bin/cat", "/tmp/pressure-state.json"], capture_output=True, timeout=3)
-                if result.returncode: continue  # capture can win this read-only probe
-                held = json.loads(result.stdout)
-            except (subprocess.TimeoutExpired, json.JSONDecodeError): continue
-            assert held["held"] == (384 if sid == first else 576)*(1<<20), held
-            assert held["nonce"] == expected.setdefault(sid, held["nonce"]), (sid, held)
-            old = seen[sid].get(run_id)
-            assert held["tick"] >= max((value["last"] for value in seen[sid].values()), default=0), (sid, held, seen[sid])
-            if old is None:
-                seen[sid][run_id] = dict(first=held["tick"], last=held["tick"])
-            else:
-                old["last"] = held["tick"]
-            if old is None: print("==> warm primary observed", sid, run_id, held["held"], held["tick"], flush=True)
-        last = {sid: sum(value["last"] > value["first"] for value in runs.values()) for sid, runs in seen.items()}
-        # Observe sustained contention for at least a minute, including at least
-        # two distinct warm runs per workload without another external Wake.
-        if time.monotonic()-start >= 60 and all(count >= 2 for count in last.values()): break
+        with sqlite3.connect((work / "lib/node-ctl.db").resolve().as_uri()+"?mode=ro", uri=True, timeout=2) as db:
+            rows = {r[0]: r[1:] for r in db.execute("select id,state,run_id,running_since_ns from sandboxes where id in (?,?)", (first,second))}
+        assert len(rows)==2 and all(r[0] in ("running","paused","starting") for r in rows.values()), rows
+        output.write(json.dumps(dict(at=time.time(), pressure=p, lifecycle=rows))+"\n"); output.flush()
+        by_sid = {r["sandbox_id"]: r for r in p["sandboxes"]}
+        ready = (rows[second][0]=="running" and rows[first][0] in ("paused","starting")
+                 and by_sid[first].get("recovery_obligation") and p["pending_recoveries"]==1
+                 and p["capturing"]==0)
+        if not ready:
+            assert stable_since is None, ("stable primary was evicted by background recovery", p, rows)
+            time.sleep(.5); continue
+        try: held = primary(second)
+        except (subprocess.TimeoutExpired, json.JSONDecodeError): held = None
+        if held is None: time.sleep(.5); continue
+        assert held["nonce"]==baseline["nonce"] and held["held"]==baseline["held"]==576*(1<<20), held
+        assert held["tick"]>=baseline["tick"], held
+        assert not any(d["sandbox_id"]==first for d in p.get("demands",[])), p
+        if stable_since is None:
+            stable_since=time.monotonic(); seen=(rows[second][1], held["tick"])
+        assert rows[second][1]==seen[0], ("background hold replaced the live RunID", rows)
+        if time.monotonic()-stable_since>=20 and held["tick"]>seen[1]:
+            (work/"pressure-stable-primary.json").write_text(json.dumps(dict(first=rows[first],second=rows[second],held=held)))
+            break
         time.sleep(.5)
-    else:
-        raise AssertionError(dict(warm_runs=last, pressure=p))
-(work / "pressure-rotation-result.json").write_text(json.dumps(dict(warm_runs=seen, seconds=time.monotonic()-start)))
-print("==> unattended mixed-workload rotation passed", json.dumps(last))
-PY_ROTATION
+    else: raise AssertionError(("no stable policy hold", p, rows))
+print("==> background policy preserved the saved obligation and progressing primary")
+PY_POLICY
 wait "$PRESSURE_CONNECT_PID" || fail "second ordinary Connect transport failed"
 [ "$(cat "$WORK/pressure-connect.code")" = 200 ] || fail "second ordinary Connect response"
 for i in "${!PIDS[@]}"; do [ "${PIDS[$i]}" != "$PRESSURE_CONNECT_PID" ] || PIDS[$i]=""; done
+# Actual release, not a larger pool, a relaxed watermark or a second Wake,
+# must unlock the saved primary's unattended recovery.
+code=$(req DELETE "/sandboxes/$SECOND" "$AK"); [ "$code" = 204 ] || fail "second pressure delete=$code"
+wait_sandbox_state "$SECOND" missing 600 || fail "second pressure delete finalization"
+wait_sandbox_state "$FIRST" running 600 || fail "saved primary did not recover after real relief"
+recovered=""
+for _ in $(seq 1 100); do
+    pressure_guest_state "$FIRST" > "$WORK/pressure-final-primary.json"
+    pressure_status
+    if python3 - "$WORK/pressure-before.json" "$WORK/pressure-final-primary.json" "$WORK/pressure-status.json" <<'PY_RELIEF'
+import json,sys
+before,after,p=[json.load(open(x)) for x in sys.argv[1:]]
+assert before["nonce"]==after["nonce"] and before["held"]==after["held"]==384*(1<<20)
+assert p["reserved_memory"]<=p["pool_memory"],p
+raise SystemExit(0 if after["tick"]>before["tick"] and p["pending_recoveries"]==0 else 1)
+PY_RELIEF
+    then recovered=1; break; fi
+    sleep .2
+done
+[ -n "$recovered" ] || fail "automatic recovery lost payload, identity, progress or obligation accounting"
+echo "==> real relief restored the saved primary without another Wake"
 # Stop new background acceptance while the existing normal Delete path drains
 # every owned consumer and obligation. This does not certify ambiguous cleanup.
 "$BIN/node-ctl" resource drain --socket "$WORK/sandbox-resource.sock" >/dev/null
-for sid in "$FIRST" "$SECOND"; do
+for sid in "$FIRST"; do
     code=$(req DELETE "/sandboxes/$sid" "$AK"); [ "$code" = 204 ] || fail "pressure delete=$code"
     wait_sandbox_state "$sid" missing 600 || fail "pressure delete finalization"
 done
 pressure_status
 cat "$WORK/pressure-status.json" > "$WORK/pressure-final.log"
+python3 - "$WORK/pressure-status.json" <<'PY_CLEAN'
+import json,sys
+p=json.load(open(sys.argv[1]))
+assert p["reserved_memory"]==0 and p["pending_recoveries"]==0 and p["pending_cleanup"]==0,p
+PY_CLEAN
 stop_proxy_master
 echo "PASS orchestrator.proxy-wake.sh"

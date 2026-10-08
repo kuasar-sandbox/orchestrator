@@ -477,6 +477,17 @@ func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budge
 		return
 	}
 	oc := s.admissionBudgetLocked(sid, budget, admission)
+	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByRecoveryPolicy {
+		// A policy fence is not executable memory demand. In particular it
+		// must not trigger Pause to make its own projected watermark safe.
+		// Cancel only this exact attempt's unused protection, never Q or a
+		// charged reservation (or a successor's admission hold).
+		key := "admit:" + sid
+		if d := s.pressure.demands[key]; d != nil && d.identity == admission.Identity {
+			s.clearDemandLocked(key)
+		}
+		return
+	}
 	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByMainBudget {
 		s.failDemandLocked("admit:"+sid, sid, admission.Identity, budget, 0, admission.Operation != OperationCreate, s.pressure.clock())
 		return
@@ -596,7 +607,7 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 	pool := s.AllocatablePool.MemoryBytes
 	backgroundRecovery := launch.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid
 	if backgroundRecovery && s.competingExecutableDemandLocked(sid, now) {
-		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
+		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 	}
 	startup := s.startupPoolBytesLocked()
 	if budget == 0 || pool == 0 || budget > pool {
@@ -610,7 +621,7 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 	// keeps the normal OperationRecovery admission semantics.
 	if backgroundRecovery {
 		if s.reservedMemory > pool || budget > pool-s.reservedMemory || zoneRank(s.memoryZoneForReservedLocked(s.reservedMemory+budget)) >= zoneRank(ZoneRed) {
-			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
+			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 		}
 	}
 	if !launch.SavedSource && budget > startup {
