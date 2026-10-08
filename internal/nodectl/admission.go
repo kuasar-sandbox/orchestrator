@@ -39,10 +39,11 @@ type AdmissionPolicy struct {
 type BlockReason int
 
 const (
-	BlockNone              BlockReason = iota
-	BlockedByMainBudget                // initial Budget > main headroom (waits for Settled/Released)
-	BlockedByStartupBudget             // initial Budget > pre-settled headroom (waits for Settled/Released-before-settled)
-	BlockedByTokenBucket               // token bucket empty (waits for refill — uses one-shot timer)
+	BlockNone               BlockReason = iota
+	BlockedByMainBudget                 // initial Budget > main headroom (waits for Settled/Released)
+	BlockedByStartupBudget              // initial Budget > pre-settled headroom (waits for Settled/Released-before-settled)
+	BlockedByTokenBucket                // token bucket empty (waits for refill — uses one-shot timer)
+	BlockedByRecoveryPolicy             // discretionary recovery waits for stable headroom; never drives Pause
 )
 
 // Outcome captures a decision the admission worker can take.

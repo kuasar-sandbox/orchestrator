@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -410,7 +411,7 @@ func TestBackgroundRecoveryClaimSkipsOwnerDemandAndFencesNewCompetitor(t *testin
 		t.Fatalf("background recovery displaced ordinary Wake beneficiary: %q", beneficiary)
 	}
 	launch := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "run-b"}
-	if got := s.AnalyzeLaunch("b", 100, launch); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+	if got := s.AnalyzeLaunch("b", 100, launch); got.Status != OutcomeShortTermBlock || got.Block != BlockedByRecoveryPolicy {
 		t.Fatalf("new demand did not fence final background admission: %+v", got)
 	}
 
@@ -443,7 +444,7 @@ func TestBackgroundRecoveryMustNotProjectRawRed(t *testing.T) {
 		t.Fatal("background recovery claim unexpectedly blocked")
 	}
 	background := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "saved:1"}
-	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeShortTermBlock || got.Block != BlockedByRecoveryPolicy {
 		t.Fatalf("background recovery projected raw red but was admitted: %+v", got)
 	}
 
@@ -465,4 +466,64 @@ func TestBackgroundRecoveryMustNotProjectRawRed(t *testing.T) {
 		t.Fatalf("post-recovery yellow state was not admitted: %+v", got)
 	}
 	s.ReleaseBackgroundRecovery("saved")
+}
+
+// A background policy refusal is not executable workload demand: waiting for
+// a safer watermark must not evict another guest to manufacture that watermark.
+func TestBackgroundPolicyWaitDoesNotBecomePressureDemand(t *testing.T) {
+	for _, reserved := range []uint64{0, 700} {
+		t.Run(fmt.Sprint(reserved), func(t *testing.T) {
+			s, now := pressureTestState(t)
+			if reserved != 0 {
+				installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "running", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: reserved, Stage: StageSettled})
+			}
+			if !s.TryClaimBackgroundRecovery("saved") {
+				t.Fatal("claim")
+			}
+			launch := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "saved:1"}
+			for i := 0; i < 10; i++ {
+				s.RecordAdmissionWait("saved", launch, 900)
+				*now = now.Add(time.Second)
+			}
+			p := s.PressureSnapshot()
+			if p.PauseEligible || len(p.Demands) != 0 || p.Protected != 0 || p.Beneficiary != "" {
+				t.Fatalf("policy refusal manufactured pressure: %+v", p)
+			}
+			if p.ReservedMemory != reserved {
+				t.Fatalf("changed actual reservation: %+v", p)
+			}
+			s.ReleaseBackgroundRecovery("saved")
+			// An explicit recovery still has its ordinary memory-demand semantics.
+			if reserved != 0 {
+				s.RecordAdmissionWait("saved", launch, 900)
+				if len(s.PressureSnapshot().Demands) != 1 {
+					t.Fatal("ordinary recovery lost pressure demand")
+				}
+			}
+		})
+	}
+}
+
+func TestBackgroundPolicyClearsOnlyExactUnusedHold(t *testing.T) {
+	for _, identity := range []string{"current", "successor"} {
+		t.Run(identity, func(t *testing.T) {
+			s, now := pressureTestState(t)
+			s.ObserveObligation("saved", 1, "paused", false)
+			s.mu.Lock()
+			s.failDemandLocked("admit:saved", "saved", identity, 900, 0, true, *now)
+			s.mu.Unlock()
+			if !s.TryClaimBackgroundRecovery("saved") {
+				t.Fatal("claim")
+			}
+			s.RecordAdmissionWait("saved", LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "current"}, 900)
+			p := s.PressureSnapshot()
+			want := 0
+			if identity == "successor" {
+				want = 1
+			}
+			if len(p.Demands) != want || p.Pending != 1 || p.Paused != 1 || p.ReservedMemory != 0 {
+				t.Fatalf("exact attempt fence or durable obligation changed: %+v", p)
+			}
+		})
+	}
 }
