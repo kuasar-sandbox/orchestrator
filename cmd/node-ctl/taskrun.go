@@ -1,8 +1,6 @@
 package main
 
-// Shared scaffold for the in-unit sandbox launcher: lock the run pidfile
-// (double-start guard), fetch a LaunchSpec over the config-socket, then start
-// sandbox-ctl as the unit parent's direct child.
+// Shared scaffold for the assigned sandbox runner and bounded result reporting.
 
 import (
 	"context"
@@ -21,23 +19,27 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxsdk"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
-// optional task-local artifact preparation, and starts the sandbox-ctl child.
+// optional task-local artifact preparation, and owns the SDK lifecycle.
 // runAssignedSandbox has locked the run pidfile before this function is called.
 func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
+	return launchTaskWithExecution(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, log, executeSandboxAndReport)
+}
+
+func launchTaskWithExecution(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger,
+	execute func(context.Context, string, string, string, configsock.LaunchSpec, types.ResumeSource, map[string]string, map[string]string, *os.File, *os.File) error) error {
 	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
 		prepareArtifact: taskartifact.Prepare,
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
-		chdir:           os.Chdir,
-		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
-			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready)
+		execute: func(ctx context.Context, spec configsock.LaunchSpec, source types.ResumeSource, locations, env map[string]string, vmmCgroup, ready *os.File) error {
+			return execute(ctx, socket, sandboxID, runID, spec, source, locations, env, vmmCgroup, ready)
 		},
 		log: log,
 	})
@@ -59,8 +61,7 @@ type taskLaunchOps struct {
 	prepareArtifact func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error)
 	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
 	setenv          func(string, string) error
-	chdir           func(string) error
-	startChild      func(string, []string, []string, *os.File, *os.File) error
+	execute         func(context.Context, configsock.LaunchSpec, types.ResumeSource, map[string]string, map[string]string, *os.File, *os.File) error
 	log             *slog.Logger
 }
 
@@ -71,6 +72,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if stopContext == nil {
 		stopContext = func() {}
 	}
+	defer stopContext()
 	if ops.log == nil {
 		ops.log = slog.Default()
 	}
@@ -90,8 +92,12 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if _, ok := bootstrap.Env["MANIFEST_KEY"]; !ok {
 		return fmt.Errorf("sandbox task bootstrap has no authoritative manifest key")
 	}
-	if err := installTaskEnvironment(bootstrap.Env, ops.setenv); err != nil {
-		return err
+	// taskartifact still uses the existing narrow bootstrap environment.
+	// The SDK receives explicit credentials and never installs environment.
+	if bootstrap.Prepare != nil {
+		if err := installTaskEnvironment(bootstrap.Env, ops.setenv); err != nil {
+			return err
+		}
 	}
 
 	taskCtx := ctx
@@ -144,38 +150,28 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if arg, ok := launchSpecArtifactArg(spec.Args); ok {
 		return fmt.Errorf("launch spec must not set task-owned artifact argument %q", arg)
 	}
-	workdir := spec.Workdir
-	if workdir == "" {
-		workdir = bootstrap.Workdir
+	final := *spec
+	if final.Workdir == "" {
+		final.Workdir = bootstrap.Workdir
 	}
-	if workdir != "" {
-		if err := ops.chdir(workdir); err != nil {
-			return fmt.Errorf("chdir %s: %w", workdir, err)
-		}
-	}
-	argv := []string{spec.Exec, "run"}
-	argv = append(argv, spec.Args[1:]...)
-	if !preparedSource.Empty() {
-		switch preparedSource.Kind {
-		case types.ResumeSourceSandbox:
-			argv = append(argv, "--from", preparedSource.Ref)
-		case types.ResumeSourceSnapshot:
-			argv = append(argv, "--restore", preparedSource.Ref)
-		default:
-			return fmt.Errorf("task prepared unsupported source kind %q", preparedSource.Kind)
-		}
-	}
-	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
-	env := taskEnv(authoritativeEnv)
-	// Preparation cancellation must not become the runtime lifetime. The
-	// sole spawn boundary derives child FD numbers and owns readiness Close.
-	cancelDeadline()
-	stopContext()
-	if ops.startChild == nil {
-		return errors.New("sandbox child starter is not configured")
+	if err := validateTaskEnvironment(authoritativeEnv); err != nil {
+		return err
 	}
-	return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
+	env := make(map[string]string)
+	for _, entry := range taskEnv(authoritativeEnv) {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	// The preparation deadline ends here. Keep the signal lifetime context
+	// alive until SDK cleanup and result publication are complete.
+	cancelDeadline()
+	if ops.execute == nil {
+		return errors.New("sandbox SDK executor is not configured")
+	}
+	return ops.execute(ctx, final, preparedSource, locations, env, vmmCgroup, ready)
 }
 
 func completeSandboxPrepareWithRetry(
@@ -211,19 +207,19 @@ func completeSandboxPrepareWithRetry(
 	}
 }
 
-func appendRefLocationArgs(args []string, locations map[string]string) []string {
-	names := make([]string, 0, len(locations))
-	for name := range locations {
-		names = append(names, name)
+func validateTaskEnvironment(env map[string]string) error {
+	for key, value := range env {
+		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, 0) {
+			return fmt.Errorf("invalid task environment key %q", key)
+		}
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		args = append(args, "--ref-location", name+"="+locations[name])
-	}
-	return args
+	return nil
 }
 
 func installTaskEnvironment(env map[string]string, setenv func(string, string) error) error {
+	if err := validateTaskEnvironment(env); err != nil {
+		return err
+	}
 	if setenv == nil {
 		return fmt.Errorf("task environment installer is not configured")
 	}
@@ -233,9 +229,6 @@ func installTaskEnvironment(env map[string]string, setenv func(string, string) e
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if key == "" || strings.ContainsRune(key, '=') || strings.IndexByte(key, 0) >= 0 || strings.IndexByte(env[key], 0) >= 0 {
-			return fmt.Errorf("invalid task environment key %q", key)
-		}
 		if err := setenv(key, env[key]); err != nil {
 			return fmt.Errorf("set task environment %s: %w", key, err)
 		}
@@ -343,27 +336,48 @@ type sandboxRunReportedError struct{ err error }
 func (e sandboxRunReportedError) Error() string { return e.err.Error() }
 func (e sandboxRunReportedError) Unwrap() error { return e.err }
 
-func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File) error {
-	cmd := exec.Command(path)
-	cmd.Args = argv
-	cmd.Env = env
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := sandboxproc.Start(cmd, vmmCgroup, ready); err != nil {
-		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultStart, err)
-		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
-			return sandboxRunReportedError{err: errors.Join(err, reportErr)}
+func executeSandboxAndReport(ctx context.Context, socket, sandboxID, runID string, spec configsock.LaunchSpec, source types.ResumeSource, locations, env map[string]string, cgroup, ready *os.File) error {
+	return executeSandboxAndReportWith(ctx, sandboxID, runID, spec, source, locations, env, cgroup, ready,
+		sandboxsdk.Execute, func(result configsock.SandboxExecutionResult) error {
+			return postSandboxResultWithRetry(socket, sandboxID, runID, result)
+		})
+}
+
+func executeSandboxAndReportWith(ctx context.Context, sandboxID, runID string, spec configsock.LaunchSpec, source types.ResumeSource, locations, env map[string]string, cgroup, ready *os.File,
+	execute func(context.Context, *sandboxsdk.Input, *os.File, *sandboxsdk.Readiness) (int, error), report func(configsock.SandboxExecutionResult) error) error {
+	readiness := sandboxsdk.NewReadiness(ready)
+	input, err := sandboxsdk.Parse(spec, source, locations, env, sandboxID)
+	stage := types.SandboxResultStart
+	code := 1
+	if err == nil {
+		// Entering the library replaces successfully starting sandbox-ctl.
+		// CLI config/start/runtime failures were all child exit results.
+		stage = types.SandboxResultRun
+		code, err = execute(ctx, input, cgroup, readiness)
+		if err != nil && code <= 0 {
+			code = 1
 		}
-		return sandboxRunReportedError{err: err}
+		code &= 255 // match the former CLI process exit status
+		// SDK diagnostics have already been routed and drained. Match the
+		// former child error at node-ctl's boundary, without relabeling the
+		// detailed runtime error as a second node-ctl diagnostic.
+		err = nil
+		if code != 0 {
+			err = fmt.Errorf("exit status %d", code)
+		}
 	}
-	err := cmd.Wait()
-	result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultRun, err)
-	if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
+	_ = readiness.Close()
+	result := sandboxExecutionResult(sandboxID, runID, stage, err)
+	if stage == types.SandboxResultRun {
+		result.ExitCode = &code
+		result.Error = ""
+		if code != 0 {
+			result.Error = fmt.Sprintf("exit status %d", code)
+		}
+	}
+	reportErr := report(result)
+	if err != nil || reportErr != nil {
 		return sandboxRunReportedError{err: errors.Join(err, reportErr)}
-	}
-	if err != nil {
-		return sandboxRunReportedError{err: err}
 	}
 	return nil
 }

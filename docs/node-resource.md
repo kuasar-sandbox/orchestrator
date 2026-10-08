@@ -523,7 +523,7 @@ cleanup cannot turn a charged consumer into free memory.
 
 ResourceProbe.Allocated and cluster projected memory load use reservedMemory, not host charge. E2B memoryMB still means Capacity/SKU.
 
-Per-sandbox resource statistics use the current sandbox-ctl owner independently of the controller's heartbeat/reservation path:
+Per-sandbox resource statistics use the current sandboxer lifecycle owner independently of the controller's heartbeat/reservation path:
 
 - `cpuCapacity`: effective capacity in cores; `cpuAllocatable`: the relative scheduling specification mapped to `cpu.weight`, without a hard fractional-core quota or performance guarantee.
 - `memoryCapacity`: effective Capacity in bytes; `memoryHeadroom`: final `resources.allocatable.memory`, the balloon headroom, not Budget, guest free memory or NodeReservation.

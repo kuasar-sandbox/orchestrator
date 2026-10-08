@@ -297,18 +297,18 @@ class RunnerLifecycleIdentity(unittest.TestCase):
             child.terminate()
             child.wait(timeout=5)
 
-    def test_lease_requires_runtime_pid_not_parent(self):
+    def test_lease_requires_shared_node_runtime_pid(self):
         with tempfile.TemporaryDirectory() as directory:
             work=Path(directory)
             observed=self.observed()
-            observed["processes"]["runtime"]["pid"]=102
+            observed["processes"]["runtime"]["pid"]=101
             leases=work/"sandbox-resource.sock.leases"
             leases.mkdir()
             path=leases/(runner_lifecycle.hashlib.sha256(observed["sid"].encode()).hexdigest()+".json")
-            lease={"sandbox_id":observed["sid"],"pid":101,"client_features":["state_sync_v1"]}
+            lease={"sandbox_id":observed["sid"],"pid":102,"client_features":["state_sync_v1"]}
             path.write_text(json.dumps(lease))
             with self.assertRaises(ValueError):runner_lifecycle.verify_lease(work,observed)
-            lease["pid"]=102
+            lease["pid"]=101
             path.write_text(json.dumps(lease))
             runner_lifecycle.verify_lease(work,observed)
 
