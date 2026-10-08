@@ -174,9 +174,10 @@ class SplitExecuteWorkspace(unittest.TestCase):
     def test_pressure_embedded_python_uses_the_declared_short_root(self):
         text = (HELPER.parent.parent / 'cases/orchestrator.proxy-wake.sh').read_text()
         (self.work / 'pressure-before.json').write_text(json.dumps({'nonce':'fixture-only'}))
+        (self.work / 'pressure-second-before.json').write_text(json.dumps({'nonce':'second-fixture'}))
         env = dict(os.environ, BIN='/fixture/bin', WORK=str(self.work),
                    EXECUTE_RUN_ROOT=str(self.run_root), FIRST=self.sid, SECOND='second-sandbox')
-        for marker, expected_count in [('PY_DIAG',1),('PY_SATISFIED',2),('PY_ROTATION',1)]:
+        for marker, expected_count in [('PY_DIAG',1),('PY_SATISFIED',2),('PY_POLICY',1)]:
             with self.subTest(marker=marker):
                 header = re.search(r'^\s*python3 - .*<<\'' + marker + r'\'.*$', text, re.M)
                 self.assertIsNotNone(header)
