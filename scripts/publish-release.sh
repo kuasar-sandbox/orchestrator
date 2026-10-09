@@ -61,7 +61,7 @@ assemble_architectures() {
     cp "$directory/assets/$name" "$output/assets/$name"
   done
   cp "$x86/release-notes.md" "$output/release-notes.md"
-  printf '\nArchitectures: x86_64 and aarch64 (ARM cross-build; native validation scope is declared by the aggregate).\n' >> "$output/release-notes.md"
+  printf '\nArchitectures: native x86_64 and aarch64 (runtime validation scope is declared by the aggregate).\n' >> "$output/release-notes.md"
   (cd "$output/assets" && sha256sum ./*.tar.gz | sed 's@  ./@  @') > "$output/assets/SHA256SUMS"
   release_cli validate "$tag" all "$output"
 }

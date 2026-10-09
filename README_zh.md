@@ -101,7 +101,16 @@ move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkp
 
 ## 构建与测试
 
-构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。
+本地构建使用环境提供的 Go, 并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择.
+CI 构建和打包使用原生 x86_64/aarch64 Runner, 在一次运行中为每种架构固定已通过
+验证的 Workbench 镜像. 普通源码、race、vet 和 helper 检查在 build 模式中使用
+ordinary UID 和任务私有可写路径. systemd、真实 Docker telemetry backend 和
+network namespace 检查在 system 模式中执行, 保留其能力要求和断言.
+`scripts/ci-source-checks.sh --ordinary` 与 `--privileged` 分别选择这些检查,
+缺省仍运行全部检查. 发布编排使用环境提供的、支持 `api --slurp` 的 `gh`, 凭据不进入
+源码执行环境.
+Publisher 的归档校验器在独立 Workbench 调用中从受信发布源码编译, 该调用禁用缓存
+恢复和保存. 组装与发布执行同一校验器, 不再次编译.
 
 Go 源码构建需要 Go 1.26.1+，并将 `accelerator`、`connector`、`sandboxer` 放在本仓的兄弟目录；修改范围仅在本仓也不免除构建依赖。内部 `require` 使用各组件目标正式版本（Daily Preview 去掉预发布后缀），目标 Tag 可以尚不存在，因为实际构建由本地 `replace` 选择兄弟仓源码。`GOWORK=off` 不会禁用这些替换。验证必须记录实际源码 SHA，不能把版本标签当作已编译提交。运行真实沙箱还需 Runtime/Kernel 等运行工件，不能与 Go 编译前置混同。
 

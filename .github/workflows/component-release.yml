@@ -153,10 +153,21 @@ jobs:
           release=$(gh api "repos/$repository/releases/tags/$version")
           jq -e --arg tag "$version" --arg sha "$sha" '.tag_name == $tag and .target_commitish == $sha and .draft == false' <<< "$release" >/dev/null
           echo "sandboxer_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Select immutable native Workbench images
+        run: |
+          python3 trusted/platform/ci/hosted/workbench.py select \
+            --framework-sha "${{ steps.framework.outputs.sha }}" --output workbench.json
+      - name: Upload Workbench selection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: workbench-selection-${{ github.run_id }}
+          path: workbench.json
+          if-no-files-found: error
+          retention-days: 1
     if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
   build:
     needs: preflight
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
       contents: read
@@ -173,11 +184,6 @@ jobs:
           ref: ${{ needs.preflight.outputs.framework_sha }}
           path: trusted/platform
           persist-credentials: false
-      - name: Bootstrap native or cross build
-        run: |
-          profile=artifact-build
-          if [ "$TARGET_ARCH" = aarch64 ]; then profile=artifact-cross; fi
-          bash trusted/platform/ci/hosted/bootstrap.sh --profile "$profile"
       - name: Verify dependency releases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -202,6 +208,11 @@ jobs:
               '.tag_name == $version and .draft == false and .prerelease == $prerelease' \
               "$repository-release.json" >/dev/null
           done
+      - name: Download Workbench selection
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: workbench-selection-${{ github.run_id }}
+          path: workbench-selection
       - name: Check out exact orchestrator source
         id: checkout-orchestrator
         continue-on-error: true
@@ -270,28 +281,26 @@ jobs:
           ref: ${{ needs.preflight.outputs.sandboxer_sha }}
           path: src/sandboxer
           persist-credentials: false
-      - name: Assemble source workspace
-        run: |
-          set -euo pipefail
-          rm -f go.work go.work.sum
-          go work init ./src/accelerator ./src/connector ./src/orchestrator ./src/sandboxer
-      - name: Build and test orchestrator
-        working-directory: src/orchestrator
-        run: |
-          taskset -pc "$KUASAR_BUILD_CPUS" "$$" >/dev/null
-          set -euo pipefail
-          if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
-          make build
-      - name: Package the component release
-        working-directory: src/orchestrator
-        env:
-          VERSION: ${{ needs.preflight.outputs.version }}
-        run: |
-          set -euo pipefail
-          [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
-          export SOURCE_DATE_EPOCH
-          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
-          bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
+      - name: Build, test and package orchestrator
+        uses: ./trusted/platform/.github/actions/workbench
+        with:
+          selection: workbench-selection/workbench.json
+          sources: src
+          arch: ${{ matrix.arch }}
+          cpus: '2'
+          memory-gib: '8'
+          run: |
+            set -euo pipefail
+            go work init ./accelerator ./connector ./orchestrator ./sandboxer
+            cd orchestrator
+            if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
+            make build
+            VERSION='${{ needs.preflight.outputs.version }}'
+            [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
+            export SOURCE_DATE_EPOCH
+            SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
+            bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
+            bash scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle
       - name: Upload validated release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -303,9 +312,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - x86_64
-          - aarch64
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
   publish:
     needs:
       - preflight
@@ -334,6 +345,30 @@ jobs:
           gh --version
           gh_help="$(gh api --help)"
           [[ "$gh_help" == *--slurp* ]] || { echo "environment gh must support api --slurp" >&2; exit 1; }
+      - name: Download Workbench selection
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: workbench-selection-${{ github.run_id }}
+          path: workbench-selection
+      - name: Prepare trusted archive validator source
+        run: |
+          mkdir -p publisher-tools/orchestrator
+          cp scripts/release-archive-validator.go publisher-tools/orchestrator/
+      - name: Compile trusted archive validator
+        uses: ./trusted/platform/.github/actions/workbench
+        with:
+          selection: workbench-selection/workbench.json
+          sources: publisher-tools
+          cache: 'false'
+          arch: x86_64
+          cpus: '2'
+          memory-gib: '8'
+          run: |
+            set -euo pipefail
+            cd orchestrator
+            GO111MODULE=off GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local \
+              GOOS=linux GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' \
+              go build -p "$KUASAR_BUILD_JOBS" -trimpath -o release-archive-validator release-archive-validator.go
       - name: Download validated x86_64 bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -346,6 +381,7 @@ jobs:
           path: staged/aarch64
       - name: Assemble the two validated architecture archives
         env:
+          RELEASE_ARCHIVE_VALIDATOR: ${{ github.workspace }}/publisher-tools/orchestrator/release-archive-validator
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.preflight.outputs.version }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
@@ -353,6 +389,7 @@ jobs:
           bash scripts/publish-release.sh assemble "$VERSION" staged/x86_64 staged/aarch64 release-bundle
       - name: Publish orchestrator release
         env:
+          RELEASE_ARCHIVE_VALIDATOR: ${{ github.workspace }}/publisher-tools/orchestrator/release-archive-validator
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.preflight.outputs.version }}
           SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}

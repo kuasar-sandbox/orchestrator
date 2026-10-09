@@ -103,7 +103,18 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 
 ## Build and test
 
-Builds use environment-provided Go and inherit its `GOROOT` and `GOTOOLCHAIN` selection. Release automation requires a working `gh` with `api --slurp` support on `PATH`; the project does not install, replace, or authenticate these environment tools against fixed binary digests.
+Local builds use environment-provided Go and inherit its `GOROOT` and
+`GOTOOLCHAIN` selection. CI builds and packages use native x86_64/aarch64 runners
+with the admitted Workbench image pinned once per architecture and run. Ordinary
+source/race/vet/helper checks run in build mode with an ordinary UID and private
+writable paths. The systemd, real Docker telemetry backends and network-namespace
+checks run in system mode, preserving their required capabilities and assertions.
+`scripts/ci-source-checks.sh --ordinary` and `--privileged` select those groups;
+the default still runs all checks. Release orchestration uses environment-provided
+`gh` with `api --slurp`; its credentials do not enter the source environment.
+The publisher's archive validator is compiled from trusted publisher source in a
+separate Workbench invocation with cache restore/save disabled. Assembly and
+publication execute that exact validator without another compilation.
 
 The Go binaries are built with `CGO_ENABLED=0`.
 
