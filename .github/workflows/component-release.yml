@@ -288,6 +288,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          cache-coverage: release-orchestrator
           outputs: orchestrator/release-bundle
           arch: ${{ matrix.arch }}
           cpus: '2'
