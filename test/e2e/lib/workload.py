@@ -164,8 +164,15 @@ def run_hold(duration, target_mib):
     while time.time() < end:
         # Touch every page without discarding the allocation. Do not count
         # process exit, an OOM, or an empty allocation as coordination success.
-        if any(held[index] != 255 for index in range(0, len(held), 4096)):
-            raise RuntimeError("held-memory contents changed")
+        first_bad = next((index for index in range(0, len(held), 4096) if held[index] != 255), None)
+        if first_bad is not None:
+            # Bounded evidence; keep the original fatal invariant unchanged.
+            raise RuntimeError(
+                f"held-memory contents changed: first_page={first_bad // 4096} "
+                f"offset={first_bad} observed={held[first_bad]} "
+                f"prefix={bytes(held[first_bad:first_bad + 16]).hex()} "
+                f"tick={tick} held={len(held)}"
+            )
         tick += 1
         with open(state_file + ".new", "w") as output:
             json.dump(dict(nonce=nonce, held=len(held), tick=tick), output)
