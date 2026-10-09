@@ -72,6 +72,10 @@ type runSandboxOps struct {
 }
 
 func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error {
+	// Retain sandbox-ctl's process policy now that this runner owns the SDK.
+	// A diagnostic fallback to closed stderr must not bypass cleanup/reporting.
+	// Both production and test-runner dispatch enter here; other commands do not.
+	signal.Ignore(syscall.SIGPIPE)
 	if err := ops.lockPidfile(pidfile); err != nil {
 		return err
 	}
