@@ -103,11 +103,11 @@ move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkp
 
 本地构建使用环境提供的 Go, 并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择.
 CI 构建和打包使用原生 x86_64/aarch64 Runner, 在一次运行中为每种架构固定已通过
-验证的 Workbench 镜像. 普通源码、race、vet 和 helper 检查在 build 模式中使用
-ordinary UID 和任务私有可写路径. systemd、真实 Docker telemetry backend 和
-network namespace 检查在 system 模式中执行, 保留其能力要求和断言.
-`scripts/ci-source-checks.sh --ordinary` 与 `--privileged` 分别选择这些检查,
-缺省仍运行全部检查. 发布编排使用环境提供的、支持 `api --slurp` 的 `gh`, 凭据不进入
+验证的 Workbench 镜像. 发布构建、普通测试和打包在 build 模式中使用 ordinary UID
+和任务私有可写路径. 完整的 `bash scripts/ci-source-checks.sh` 门禁在 Workbench
+system 模式运行, 一并执行源码、race、vet、helper 测试和 systemd、真实 Docker
+telemetry backend、network namespace 检查, 保留全部能力要求与断言.
+发布编排使用环境提供的、支持 `api --slurp` 的 `gh`, 凭据不进入
 源码执行环境.
 Publisher 的归档校验器在独立 Workbench 调用中从受信发布源码编译, 该调用禁用缓存
 恢复和保存. 组装与发布执行同一校验器, 不再次编译.
