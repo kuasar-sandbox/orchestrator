@@ -295,6 +295,9 @@ jobs:
           memory-gib: '8'
           run: |
             set -euo pipefail
+            export ACCELERATOR_VERSION='${{ needs.preflight.outputs.accelerator_version }}'
+            export CONNECTOR_VERSION='${{ needs.preflight.outputs.connector_version }}'
+            export SANDBOXER_VERSION='${{ needs.preflight.outputs.sandboxer_version }}'
             go work init ./accelerator ./connector ./orchestrator ./sandboxer
             cd orchestrator
             if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi

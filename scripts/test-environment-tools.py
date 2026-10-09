@@ -2,6 +2,7 @@
 """Release jobs consume the environment CLI without installing or selecting tools."""
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -93,6 +94,55 @@ class EnvironmentTools(unittest.TestCase):
             self.assertNotIn("GOTOOLCHAIN: local", source)
         for directory in ("scripts", "release"):
             self.assertFalse((ROOT / directory / "install-gh-cli.sh").exists())
+
+    def test_workbench_package_receives_only_explicit_dependency_versions(self):
+        lines = (ROOT / ".github/workflows/component-release.yml").read_text().splitlines()
+        start = next(i for i, line in enumerate(lines)
+                     if line.strip() == "- name: Build, test and package orchestrator")
+        run = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+        prefix = " " * (len(lines[run]) - len(lines[run].lstrip()) + 2)
+        command = []
+        for line in lines[run + 1:]:
+            if not line.startswith(prefix):
+                break
+            command.append(line[len(prefix):])
+        values = {"source_sha": "a" * 40, "version": "v1.2.3-preview.20261009.4",
+                  "accelerator_version": "v2.3.4", "connector_version": "v3.4.5-preview.20261008.2",
+                  "sandboxer_version": "v4.5.6"}
+        program = re.sub(r"\$\{\{ needs\.preflight\.outputs\.([a-z_]+) \}\}",
+                         lambda match: values[match.group(1)], "\n".join(command))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            scripts = root / "orchestrator/scripts"
+            tools.mkdir()
+            scripts.mkdir(parents=True)
+            commands = {
+                "go": "#!/bin/sh\nexit 0\n", "make": "#!/bin/sh\nexit 0\n",
+                "git": "#!/bin/sh\ncase $1 in rev-parse) echo " + values["source_sha"]
+                       + ";; show) echo 1;; *) exit 92;; esac\n",
+            }
+            for name, contents in commands.items():
+                path = tools / name
+                path.write_text(contents)
+                path.chmod(0o755)
+            (scripts / "release.sh").write_text(
+                'set -eu\nprintf "%s|%s|%s|%s|%s|%s\\n" "$1" "$2" "$3" '
+                '"$ACCELERATOR_VERSION" "$CONNECTOR_VERSION" "$SANDBOXER_VERSION" >> "$OBSERVED"\n')
+            observed = root / "observed"
+            for arch in ("x86_64", "aarch64"):
+                with self.subTest(arch=arch):
+                    observed.unlink(missing_ok=True)
+                    # Workbench does not inherit the release job's host env.
+                    environment = {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                   "HOME": str(root), "TARGET_ARCH": arch, "OBSERVED": str(observed)}
+                    result = subprocess.run([shutil.which("bash"), "-euo", "pipefail", "-c", program],
+                                            cwd=root, env=environment, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(observed.read_text().splitlines(), [
+                        "|".join((operation, values["version"], arch, values["accelerator_version"],
+                                  values["connector_version"], values["sandboxer_version"]))
+                        for operation in ("package", "validate")])
 
 
 if __name__ == "__main__":
