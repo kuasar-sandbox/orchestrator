@@ -154,6 +154,8 @@ jobs:
           jq -e --arg tag "$version" --arg sha "$sha" '.tag_name == $tag and .target_commitish == $sha and .draft == false' <<< "$release" >/dev/null
           echo "sandboxer_sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Select immutable native Workbench images
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 trusted/platform/ci/hosted/workbench.py select \
             --framework-sha "${{ steps.framework.outputs.sha }}" --output workbench.json
