@@ -22,7 +22,7 @@ write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller, $3=l
     esac
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { auth: enforce, park_timeout: 120s }
+proxy: { auth: enforce, park_timeout: ${PROXY_PARK_TIMEOUT:-120s} }
 mmds:
   enabled: true
   listen: "$PROXY_NS_IP:$MMDS_PORT"
@@ -87,7 +87,7 @@ start_orchestrator() { # $1=log path
     write_proxy_config "$WORK/proxy.yaml" \
         "$WORK/node-ctl.socket" "$EXECUTE_RUN_ROOT" "127.0.0.1:$PROXY_PORT" \
         "$PROXY_NETNS" "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" \
-        1024 2 enforce 120s "${PROXY_METRICS_LISTEN:--}" - - "${PROXY_EXECUTABLE:--}"
+        1024 2 enforce "${PROXY_PARK_TIMEOUT:-120s}" "${PROXY_METRICS_LISTEN:--}" - - "${PROXY_EXECUTABLE:--}"
     # Preserve the pre-start namespace identity and addresses so a failed bind
     # can be distinguished from teardown/recreation during Proxy startup.
     proxy_ns_before=$(stat -Lc '%d:%i' "/var/run/netns/$PROXY_NETNS" 2>&1 || true)

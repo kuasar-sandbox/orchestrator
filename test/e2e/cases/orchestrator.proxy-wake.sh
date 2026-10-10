@@ -48,11 +48,20 @@ wait_sandbox_state "$SID" missing 120 || fail "delete finalization"
 # these two primary guest workloads; it never changes host services/resources.
 build_image_template bare
 stop_orchestrator
+# Preserve the original 100s client / 120s parking allowance after the full
+# 60s critical hold. These are deadlines, not additional sleeps or retries.
+PROXY_PARK_TIMEOUT=180s
 write_orchestrator_config unset controller
 python3 - "$WORK/config.yaml" <<'PY_CONFIG'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1]); text = path.read_text()
+# Proxy Wake supplies no requested lifetime, so resume uses this node default.
+# Match the pressure guests' explicit 600s create/Connect lifetime; the normal
+# 120s default could expire during the critical hold and trigger an unrelated
+# automatic Pause before the background-recovery assertion.
+assert text.count("  timeout_sec: 120\n") == 1
+text = text.replace("  timeout_sec: 120\n", "  timeout_sec: 600\n", 1)
 # P=1GiB fits either full-capacity Snapshot, while both held workloads plus
 # their real headroom cannot run together. No workload size enters node policy.
 text = text.replace("physical_memory: auto", "physical_memory: 1792MiB", 1)
@@ -63,7 +72,9 @@ text = text.replace(needle, """  watermarks: { low_factor: 0.70, high_factor: 0.
   # This deliberately small pool must exercise memory shortage, not the
   # independent normal-grow rate limiter's one-second bucket.
   rate_limits: { memory_grant_per_sec_factor: 1.0 }
-  pressure: { interval: 2s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 5s, red_to_yellow_hold: 5s, yellow_to_green_hold: 5s, minimum_run_time: 2s }
+  # Keep critical refusal observable through the bounded 40s allocation
+  # barrier below. The single parked request has a 160s end-to-end deadline.
+  pressure: { interval: 2s, failure_interval: 500ms, critical_after_rounds: 3, pause_after_rounds: 3, critical_exit_hold: 60s, red_to_yellow_hold: 5s, yellow_to_green_hold: 5s, minimum_run_time: 2s }
 """ + needle, 1)
 path.write_text(text)
 PY_CONFIG
@@ -284,7 +295,7 @@ PY_CREATE
     wait_sandbox_state "$PRESSURE_SID" running 600 || fail "pressure primary did not start"
 }
 pressure_guest_state() {
-    "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$1" -- /bin/cat /tmp/pressure-state.json
+    timeout 3 "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$1" -- /bin/cat /tmp/pressure-state.json
 }
 pressure_create 384
 FIRST=$PRESSURE_SID
@@ -367,19 +378,14 @@ PY_ADOPT
 wait_paused_cleanup "$FIRST" 600 || fail "resource Pause cleanup incomplete"
 pressure_memory_observation after || fail "resource Pause did not release the old physical consumer"
 [ "$(checkpoint_pair "$FIRST" snapshot "$WORK/lib/sandboxes/$FIRST/checkpoint/$FIRST.snapshot")" = "$SNAPSHOT_PAIR" ] || fail "adoption changed Snapshot source"
-"$BIN/node-ctl" resource drain --disable --socket "$WORK/sandbox-resource.sock" >/dev/null
-code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
-[ "$code" = 409 ] || fail "ordinary repeated Pause=$code"
-# A real request remains parked across the critical policy refusal. It is sent
-# once; there is no replay of a delivered operation or a killed exec session.
-exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 100 &
-PRESSURE_EXEC_PID=$!
-PIDS+=("$PRESSURE_EXEC_PID")
-pressure_wait_parking || fail "ordinary critical request did not park"
+# Explicit Wake has priority over normal grow. Establish the second held
+# workload before submitting Wake, while admission is still drained to fence
+# background recovery. Drain does not block this existing consumer's growth.
 # Record the second primary before its explicit Snapshot as well; later
 # recovery must preserve its identity, payload and increasing work counter.
 second_ready=""
-for _ in $(seq 1 200); do
+second_deadline=$((SECONDS + 40))
+while [ "$SECONDS" -lt "$second_deadline" ]; do
     if pressure_guest_state "$SECOND" > "$WORK/pressure-second-before.json" 2>/dev/null &&
        python3 - "$WORK/pressure-second-before.json" <<'PY_SECOND'
 import json, sys
@@ -390,6 +396,24 @@ PY_SECOND
     sleep .2
 done
 [ -n "$second_ready" ] || fail "second held primary did not finish allocation"
+pressure_status
+cp "$WORK/pressure-status.json" "$WORK/pressure-before-wake.json"
+python3 - "$WORK/pressure-before-wake.json" "$FIRST" "$SECOND" <<'PY_WAKE_BARRIER' || fail "critical Wake precondition expired before request"
+import json, sys
+p = json.load(open(sys.argv[1])); rows = {r["sandbox_id"]: r for r in p["sandboxes"]}
+assert p["zone"] == "critical" and p["pool_memory"] == 1<<30, p
+assert rows[sys.argv[2]]["state"] == "paused" and rows[sys.argv[2]]["pause_reason"] == "explicit", rows
+assert rows[sys.argv[3]]["state"] == "running", rows
+PY_WAKE_BARRIER
+"$BIN/node-ctl" resource drain --disable --socket "$WORK/sandbox-resource.sock" >/dev/null
+code=$(req POST "/sandboxes/$FIRST/pause" "$AK")
+[ "$code" = 409 ] || fail "ordinary repeated Pause=$code"
+# A real request remains parked across the critical policy refusal. It is sent
+# once; there is no replay of a delivered operation or a killed exec session.
+exec_through_proxy_connect "$FIRST" "$FIRST_KAT" "PRESSURE_RESTORED_$RANDOM" 1 160 &
+PRESSURE_EXEC_PID=$!
+PIDS+=("$PRESSURE_EXEC_PID")
+pressure_wait_parking || fail "ordinary critical request did not park"
 code=$(req POST "/sandboxes/$SECOND/pause" "$AK")
 [ "$code" = 204 ] || fail "second explicit Pause=$code"
 wait "$PRESSURE_EXEC_PID" || fail "parked Proxy Wake did not recover adopted Snapshot"
@@ -397,7 +421,16 @@ for i in "${!PIDS[@]}"; do [ "${PIDS[$i]}" != "$PRESSURE_EXEC_PID" ] || PIDS[$i]
 wait_sandbox_state "$FIRST" running 600 || fail "adopted Snapshot did not resume"
 restored=""
 for _ in $(seq 1 100); do
-    pressure_guest_state "$FIRST" > "$WORK/pressure-after.json"
+    if pressure_guest_state "$FIRST" > "$WORK/pressure-after.json"; then
+        :
+    else
+        probe_status=$?
+        # A bounded read can time out while the restored guest faults pages.
+        # Retry that observation; preserve every other exec failure.
+        [ "$probe_status" -eq 124 ] || exit "$probe_status"
+        sleep .2
+        continue
+    fi
     if python3 - "$WORK/pressure-before.json" "$WORK/pressure-after.json" <<'PY_MEMORY'
 import json, sys
 before,after=[json.load(open(p)) for p in sys.argv[1:]]
@@ -426,7 +459,11 @@ PY_BUDGET
 # while the other Snapshot remains intact; real Delete then permits recovery.
 # Read-only native exec probes below cannot launch a paused sandbox.
 allowed=""
-for _ in $(seq 1 100); do
+# A Wake accepted before the second Pause releases its reservation can renew
+# the critical hold. Allow the full 60s hold plus pressure sampling margin;
+# return immediately when actual relief makes recovery eligible.
+allowed_deadline=$((SECONDS + 75))
+while [ "$SECONDS" -lt "$allowed_deadline" ]; do
     pressure_status
     if python3 - "$WORK/pressure-status.json" <<'PY_ORDINARY'
 import json, sys
@@ -494,7 +531,16 @@ wait_sandbox_state "$SECOND" missing 600 || fail "second pressure delete finaliz
 wait_sandbox_state "$FIRST" running 600 || fail "saved primary did not recover after real relief"
 recovered=""
 for _ in $(seq 1 100); do
-    pressure_guest_state "$FIRST" > "$WORK/pressure-final-primary.json"
+    if pressure_guest_state "$FIRST" > "$WORK/pressure-final-primary.json"; then
+        :
+    else
+        probe_status=$?
+        # A bounded read can time out while the restored guest faults pages.
+        # Retry that observation; preserve every other exec failure.
+        [ "$probe_status" -eq 124 ] || exit "$probe_status"
+        sleep .2
+        continue
+    fi
     pressure_status
     if python3 - "$WORK/pressure-before.json" "$WORK/pressure-final-primary.json" "$WORK/pressure-status.json" <<'PY_RELIEF'
 import json,sys
