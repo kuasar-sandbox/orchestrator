@@ -440,13 +440,9 @@ must be positive. The current node policy reaches image cold start,
 portable E/S artifacts and does not alter per-message socket deadlines,
 Sandbox TTL, or Builder total/step/readiness deadlines.
 
-```yaml
-sandbox:
-  timeouts:
-    app_start: 3s
-```
-
-Use an explicit value only when the workload needs a different startup budget.
+Set `sandbox.timeouts.app_start` to a positive duration such as `3s` only when
+the workload needs a different startup budget; see the nested configuration in
+the [conductor deployment example](../deploy/conductor.example.yaml).
 This does not add launch retries or change when a Build is considered ready.
 
 ## 4. e2b API contract

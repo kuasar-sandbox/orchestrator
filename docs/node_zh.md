@@ -594,14 +594,9 @@ cold start、`run --from`、`run --restore` 及每个 Builder 阶段，不从 po
 E/S 制品继承，也不改变单条消息的 socket 期限、Sandbox TTL 或 Builder 的
 总期限、步骤期限、readiness 期限。
 
-```yaml
-sandbox:
-  timeouts:
-    app_start: 3s
-```
-
-仅在工作负载需要不同启动预算时显式设置。此配置不增加启动重试，也不改变
-Build 就绪的判定。
+仅在工作负载需要不同启动预算时将 `sandbox.timeouts.app_start` 显式设置为
+`3s` 等正时长；嵌套结构参见 [conductor 部署示例](../deploy/conductor.example.yaml)。
+此配置不增加启动重试，也不改变 Build 就绪的判定。
 
 ## 4. e2b API 契约
 
