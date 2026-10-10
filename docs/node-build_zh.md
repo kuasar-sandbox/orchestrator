@@ -731,3 +731,71 @@ Builder 对 checkpoint S 调用 `sandbox-ctl publish --json --quiet`，接受 ch
 Export 新增 HTTP 报告字段见[节点发布与迁移](node_zh.md#814-publishtemplate-与-migration)。
 直接发布 image/Sandbox 的 `PublishSource` 调用保持既有 role/ref 契约、source 所有权和
 流式行为。报告不增加 payload 缓存、额外 staging 文件、GC 或删除权限。
+
+<a id="explicit-target-recipe"></a>
+## 7. 显式 Image、E 和 S 的客户端配方
+
+前提是已配置 Node/API key/TLS 信任，`APP_IMAGE` 为可达、原生架构、digest 固定
+且已包含应用的镜像。复用 Node 的 registry 凭据，不需要 COPY bucket。上文
+Register、Trigger、Status 是权威契约；这里使用 HTTP，不虚构 SDK target 参数。
+项目固定的 E2B Python 2.25.1 支持 auto 流程，但 `Template.build(headers=...)`
+把 Builder 头同时传给 Register 和 Trigger，不适合 register-only 显式目标。
+
+选择 `BUILD_KIND=img` 仅发布镜像，`sbx` 发布带 portable 默认值的冷 E，`snp`
+发布初始化内存 S。S 需设置实际服务 `APP_START` 和 `APP_READY`；显式 Image
+不能传入这些命令。auto 无有效命令时选 Image，有有效 start 或 ready 时选内存
+S，永不自动选 E。本例使用 Demo 执行预算，请按节点检查准入。
+
+```python
+import json, os, time, urllib.request
+api = os.environ["E2B_API_URL"].rstrip("/")
+key = os.environ["E2B_API_KEY"]
+targets = {
+    "img": {"kind": "image"},
+    "sbx": {"kind": "sandbox", "memory": False},
+    "snp": {"kind": "sandbox", "memory": True},
+}
+kind = os.environ["BUILD_KIND"]  # img, sbx, snp
+
+def call(method, path, body=None, extra=None):
+    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+    headers.update(extra or {})
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(api + path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read()
+        return json.loads(raw) if raw else None
+
+registered = call("POST", "/v3/templates",
+    {"name": "explicit-example", "profile": "e2b", "cpuCount": 2, "memoryMB": 6144},
+    {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})})
+tid, bid = registered["templateID"], registered["buildID"]
+print("Keep registration/build handles:", tid, bid)
+trigger = {"fromImage": os.environ["APP_IMAGE"]}
+if kind == "snp":
+    trigger.update(startCmd=os.environ["APP_START"], readyCmd=os.environ["APP_READY"])
+call("POST", f"/v2/templates/{tid}/builds/{bid}", trigger)
+deadline = time.monotonic() + 900
+while True:
+    status = call("GET", f"/templates/{tid}/builds/{bid}/status")
+    assert status["buildID"] == bid
+    if status["status"] == "error":
+        raise RuntimeError("Build failed; inspect this build's status/logs")
+    if status["status"] == "ready":
+        assert status["profile"] == "e2b" and status["kind"] == kind
+        assert status["target"]["kind"] == targets[kind]["kind"]
+        assert status["target"].get("memory", False) == targets[kind].get("memory", False)
+        assert status["templateID"].startswith(f"e2b-{kind}-")
+        print("Canonical template:", status["templateID"])
+        break
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Polling stopped; build may still run. Use cancel/status with saved handles.")
+    time.sleep(2)
+```
+
+成功后使用 canonical ID create 并检查命令/文件；S 还需 pause/connect 比对状态，
+见[首个应用流程](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md#first-application)。
+客户端轮询超时不会取消执行。保存 `tid/bid`，检查阶段/原因并按 §1.1 Cancel/
+DELETE 等待所有权清理完成。结果不明时不要盲目重复 Trigger。删除 Build 行不删
+远端工件，应另行保留 canonical ID 与父链/密钥依赖。旧 Release 必须按打包契约
+核对后才使用这些当前 main 目标选项。
