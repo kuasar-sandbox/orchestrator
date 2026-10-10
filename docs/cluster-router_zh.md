@@ -505,7 +505,9 @@ SDK `ConnectionConfig.sandbox_headers` 将自定义头合入 envd 请求，命�
 应用端口请求须由应用/网关传递 Group、route key、stable sandbox identity、
 目标端口及对应 scoped forward token（§5–§7）；不得把租户 API key 泄露给
 Guest。分别验证 SDK 命令/文件与应用端口的认证请求。在隔离验收 group 内检查
-缺少 Group/route key、错误凭据及未授权目标均失败，且不会激活其他沙箱；检查
+缺少 Group、错误凭据及未授权目标均失败，且不会激活其他沙箱。Create 省略
+route key 时可获得新生成的 key；缺少 route key 的拒绝应在需要现有 route 的
+后续操作（如 connect、pause、数据请求）上验证。检查
 节点 endpoint 选择，证明控制和数据使用各自 listener。
 
 成功标准是真实 create、命令/文件往返、pause/resume、kill；Registry stub 测试

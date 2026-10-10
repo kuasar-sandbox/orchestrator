@@ -386,8 +386,11 @@ For application-port access, the application/gateway must carry Group, route key
 stable sandbox identity, target port and the appropriate scoped forward token
 (§5–§7); it must not leak the tenant API key to the guest. Verify both the SDK
 commands/files path and an authenticated request to the intended application port.
-In an isolated acceptance group, confirm missing Group/route key, wrong credentials
-and an unauthorized target fail without activating a different sandbox. Inspect
+In an isolated acceptance group, confirm missing Group, wrong credentials and an
+unauthorized target fail without activating a different sandbox. Create may omit
+route key and receive a newly generated one; verify missing route key rejection
+on subsequent operations that require the existing route, such as connect, pause
+and data requests. Inspect
 node endpoint selection to prove control and data use their distinct listeners.
 
 Success means real create, command/file roundtrip, pause/resume and kill; Registry
