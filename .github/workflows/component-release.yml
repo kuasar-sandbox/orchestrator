@@ -47,6 +47,7 @@ jobs:
       actions: read
       contents: read
     outputs:
+      preview_manifest_digest: ${{ steps.request.outputs.preview_manifest_digest }}
       accelerator_version: ${{ steps.request.outputs.accelerator_version }}
       connector_version: ${{ steps.request.outputs.connector_version }}
       sandboxer_version: ${{ steps.request.outputs.sandboxer_version }}
@@ -97,6 +98,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
+          PREVIEW_EVIDENCE_OUTPUT: preview-evidence.json
           VERSION: ${{ inputs.version }}
           TARGET_ARCH: all
         run: |
@@ -159,13 +161,34 @@ jobs:
         run: |
           python3 trusted/platform/ci/hosted/workbench.py select \
             --framework-sha "${{ steps.framework.outputs.sha }}" --output workbench.json
+      - name: Freeze admitted source and selected dependency tags
+        env:
+          SOURCE_REF: ${{ steps.request.outputs.source_ref }}
+          SOURCE_SHA: ${{ steps.request.outputs.source_sha }}
+          ACCELERATOR_TAG: ${{ steps.request.outputs.accelerator_version }}
+          ACCELERATOR_SHA: ${{ steps.dependencies.outputs.accelerator_sha }}
+          CONNECTOR_TAG: ${{ steps.request.outputs.connector_version }}
+          CONNECTOR_SHA: ${{ steps.dependencies.outputs.connector_sha }}
+          SANDBOXER_TAG: ${{ steps.request.outputs.sandboxer_version }}
+          SANDBOXER_SHA: ${{ steps.dependencies.outputs.sandboxer_sha }}
+        run: |
+          set -euo pipefail
+          dependencies=()
+          dependencies+=(--dependency accelerator "$ACCELERATOR_TAG" "$ACCELERATOR_SHA")
+          dependencies+=(--dependency connector "$CONNECTOR_TAG" "$CONNECTOR_SHA")
+          dependencies+=(--dependency sandboxer "$SANDBOXER_TAG" "$SANDBOXER_SHA")
+          python3 -B trusted/platform/release/producer-inputs.py freeze orchestrator "$SOURCE_REF" "$SOURCE_SHA" producer-inputs.tar "${dependencies[@]}"
       - name: Upload Workbench selection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: workbench-selection-${{ github.run_id }}
-          path: workbench.json
+          path: |
+            workbench.json
+            producer-inputs.tar
+            preview-evidence.json
           if-no-files-found: error
           retention-days: 1
+
     if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
   build:
     needs: preflight
@@ -215,74 +238,10 @@ jobs:
         with:
           name: workbench-selection-${{ github.run_id }}
           path: workbench-selection
-      - name: Check out exact orchestrator source
-        id: checkout-orchestrator
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/orchestrator
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          path: src/orchestrator
-          persist-credentials: false
-      - name: Retry exact orchestrator source checkout
-        if: steps.checkout-orchestrator.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/orchestrator
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          path: src/orchestrator
-          persist-credentials: false
-      - name: Check out accelerator dependency
-        id: checkout-accelerator
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/accelerator
-          ref: ${{ needs.preflight.outputs.accelerator_sha }}
-          path: src/accelerator
-          persist-credentials: false
-      - name: Retry accelerator dependency checkout
-        if: steps.checkout-accelerator.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/accelerator
-          ref: ${{ needs.preflight.outputs.accelerator_sha }}
-          path: src/accelerator
-          persist-credentials: false
-      - name: Check out connector dependency
-        id: checkout-connector
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/connector
-          ref: ${{ needs.preflight.outputs.connector_sha }}
-          path: src/connector
-          persist-credentials: false
-      - name: Retry connector dependency checkout
-        if: steps.checkout-connector.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/connector
-          ref: ${{ needs.preflight.outputs.connector_sha }}
-          path: src/connector
-          persist-credentials: false
-      - name: Check out sandboxer dependency
-        id: checkout-sandboxer
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/sandboxer
-          ref: ${{ needs.preflight.outputs.sandboxer_sha }}
-          path: src/sandboxer
-          persist-credentials: false
-      - name: Retry sandboxer dependency checkout
-        if: steps.checkout-sandboxer.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: kuasar-sandbox/sandboxer
-          ref: ${{ needs.preflight.outputs.sandboxer_sha }}
-          path: src/sandboxer
-          persist-credentials: false
+      - name: Restore fixed producer inputs
+        env:
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar orchestrator "$SOURCE_SHA" src --dependency accelerator "${{ needs.preflight.outputs.accelerator_version }}" "${{ needs.preflight.outputs.accelerator_sha }}" --dependency connector "${{ needs.preflight.outputs.connector_version }}" "${{ needs.preflight.outputs.connector_sha }}" --dependency sandboxer "${{ needs.preflight.outputs.sandboxer_version }}" "${{ needs.preflight.outputs.sandboxer_sha }}"
       - name: Build, test and package orchestrator
         uses: ./trusted/platform/.github/actions/workbench
         with:
@@ -404,6 +363,8 @@ jobs:
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
+          PREVIEW_EVIDENCE_FILE: workbench-selection/preview-evidence.json
+          PREVIEW_EVIDENCE_DIGEST: ${{ needs.preflight.outputs.preview_manifest_digest }}
           RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}
           TARGET_ARCH: all
         run: |

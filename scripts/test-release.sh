@@ -229,8 +229,11 @@ fi
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
-  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW")" -eq 2 ] \
-    || fail "release workflow does not pin the build and retry $input checkouts"
+  grep -Fq -- "--dependency ${input%_version} \"\${{ needs.preflight.outputs.$input }}\" \"\${{ needs.preflight.outputs.${input%_version}_sha }}\"" "$WORKFLOW" \
+    || fail "release restore does not bind $input tag and SHA to trusted preflight outputs"
+  if grep -Fq "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW"; then
+    fail "release workflow refetches a dependency by bare SHA"
+  fi
 done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
   || fail "release workflow does not verify dependency releases"
@@ -406,7 +409,7 @@ for dependency in accelerator connector sandboxer; do
       fail "validator accepted changed $dependency source column $column"
     fi
     grep -Fq "missing or inconsistent source record for $dependency" "$candidate/result.log" \
-      || fail "dependency source mutation failed for an unrelated reason"
+      || { cat "$candidate/result.log" >&2; fail "dependency source mutation failed for an unrelated reason"; }
   done
 done
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \

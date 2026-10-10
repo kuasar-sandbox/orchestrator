@@ -132,6 +132,8 @@ release_unit() {
 revalidate_preview_line() {
   local tag="$1" unit
   [[ "$tag" == *-preview.* ]] || return 0
+  : "${PREVIEW_EVIDENCE_FILE:?Preview publication requires admitted manifest evidence}"
+  : "${PREVIEW_EVIDENCE_DIGEST:?Preview publication requires its trusted preflight digest}"
   unit="$(release_unit "$tag")"
   "$SCRIPT_DIR/validate-preview-line.sh" "$unit" "$tag" \
     "${AGGREGATE_VERSION:?AGGREGATE_VERSION is required for a Preview}" \

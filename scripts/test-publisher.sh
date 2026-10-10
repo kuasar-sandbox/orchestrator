@@ -123,7 +123,10 @@ if [ "${1:-}" = api ]; then
     cp "$input" "$request"
   fi
   case "$method $endpoint" in
-    "GET repos/kuasar-sandbox/kuasar-sandbox/contents/releases/daily-preview.yaml?ref=$aggregate_sha")
+    "GET repos/kuasar-sandbox/kuasar-sandbox/git/ref/heads/main")
+      emit "$(jq -cn --arg sha "$aggregate_sha" '{object: {type: "commit", sha: $sha}}')" "$filter"
+      ;;
+    "GET repos/kuasar-sandbox/kuasar-sandbox/contents/releases/daily-preview.yaml?ref=main")
       emit "$(jq -cn --arg content "${FAKE_PLATFORM_MANIFEST:?}" '{content: $content}')" "$filter"
       ;;
     "GET repos/kuasar-sandbox/kuasar-sandbox/releases/tags/${aggregate_version%-preview.*}")
@@ -261,6 +264,13 @@ common_env=(
   FAKE_AGGREGATE_SHA="$AGGREGATE_SHA"
   FAKE_PLATFORM_MANIFEST="$FAKE_PLATFORM_MANIFEST"
 )
+
+if [ "$EXPECTED_PRERELEASE" = true ]; then
+  env "${common_env[@]}" PREVIEW_EVIDENCE_OUTPUT="$TMP/preview.json" GITHUB_OUTPUT="$TMP/preflight.outputs" \
+    "$(dirname "$PUBLISHER")/validate-preview-line.sh" "$UNIT" "$TAG" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
+  common_env+=(PREVIEW_EVIDENCE_FILE="$TMP/preview.json"
+    PREVIEW_EVIDENCE_DIGEST="$(sed -n 's/^preview_manifest_digest=//p' "$TMP/preflight.outputs")")
+fi
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
 
