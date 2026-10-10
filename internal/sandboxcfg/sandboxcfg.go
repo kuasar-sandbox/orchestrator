@@ -360,6 +360,7 @@ type Params struct {
 	TapFD          TapFD
 	EnvVars        map[string]string        // create-time launch env
 	Resources      rtconfig.ResourcesConfig // fully resolved node + tenant + restore policy
+	Timeouts       rtconfig.TimeoutsConfig  // current node startup policy
 	Usage          rtconfig.UsageConfig     // current node policy, never artifact inheritance
 	Network        NetworkSpec              // resolved logical network (request over artifact over node defaults)
 	MMDSEnabled    bool
@@ -481,6 +482,7 @@ func (p Params) buildImageColdConfig() (*rtconfig.SandboxConfig, error) {
 	// runner assignment. The renderer installs that single authoritative value;
 	// run-sandbox adds only the inherited cgroup capability at exec time.
 	c.Resources = p.Resources
+	c.Timeouts = p.Timeouts
 	usage, err := p.runtimeUsage()
 	if err != nil {
 		return nil, err
@@ -547,6 +549,7 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 	}
 	c := &SandboxHostConfig{
 		Resources:      p.Resources,
+		Timeouts:       p.Timeouts,
 		Usage:          usage,
 		Network:        p.buildRuntimeNetwork(),
 		Boot:           boot,
@@ -586,6 +589,7 @@ func (p Params) BuildSnapshotHostConfig() (*SnapshotHostConfig, error) {
 	}
 	return &SnapshotHostConfig{
 		Resources: p.Resources,
+		Timeouts:  p.Timeouts,
 		Usage:     usage,
 		Network:   p.buildRuntimeNetwork(),
 		Boot:      boot,

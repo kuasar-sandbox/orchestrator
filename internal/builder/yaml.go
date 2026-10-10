@@ -116,6 +116,7 @@ func (p *buildPipeline) importYAML() (map[string]any, error) {
 	s := p.spec
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
+		"timeouts":  s.RuntimeTimeouts,
 		"network":   p.networkDoc(),
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
@@ -155,6 +156,7 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 	s := p.spec
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
+		"timeouts":  s.RuntimeTimeouts,
 		"network":   p.networkDoc(),
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
@@ -193,6 +195,7 @@ func (p *buildPipeline) sourceStepsYAML() map[string]any {
 	}
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
+		"timeouts":  s.RuntimeTimeouts,
 		// Persistent source actions describe a later Create from the template;
 		// materialization must not execute them and then preserve them to execute
 		// a second time in the produced Sandbox.

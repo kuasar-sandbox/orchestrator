@@ -586,6 +586,23 @@ telemetry 不会启用 usage, 停止 telemetry 不会停止原生计量. `flush_
 调度原生 append, 不触发 fsync 或设备缓存 flush. 参见经实际解析器校验的
 [conductor 部署示例](../deploy/conductor.example.yaml).
 
+### 3.4 应用启动策略
+
+节点配置 `sandbox.timeouts.app_start` 控制 SDK ACK 后的应用启动期限。
+省略时使用 SDK 默认值 `2s`，显式时长必须为正数。当前节点策略传递到 image
+cold start、`run --from`、`run --restore` 及每个 Builder 阶段，不从 portable
+E/S 制品继承，也不改变单条消息的 socket 期限、Sandbox TTL 或 Builder 的
+总期限、步骤期限、readiness 期限。
+
+```yaml
+sandbox:
+  timeouts:
+    app_start: 3s
+```
+
+仅在工作负载需要不同启动预算时显式设置。此配置不增加启动重试，也不改变
+Build 就绪的判定。
+
 ## 4. e2b API 契约
 
 基址 `https://api.<domain>`;鉴权 **`X-API-KEY`**(SDK)或 **`Authorization: Bearer`**
