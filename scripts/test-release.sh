@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+
+# Archive fixtures target x86_64 even when this gate runs on an ARM host.
+# Validators run natively; payload fixtures are inspected, never executed.
 # Archive fixtures prescribe 0755 directories regardless of the caller's umask.
 # mktemp still creates the enclosing workspace with mode 0700.
 umask 022
@@ -341,16 +344,16 @@ build:
 	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
 	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
 	mkdir -p bin/x86_64
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
 EOF
 fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts go.mod cmd deploy Makefile)"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/cmd/node-ctl/main.go"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
@@ -562,7 +565,7 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-argume
     node-stub-ctl) other=e2b-key-ctl ;;
     e2b-key-ctl) other=node-ctl ;;
     command-line-arguments)
-      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 \
+      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
         go build -o "$TMP/command-line-tool" ./cmd/node-ctl/main.go)
       install -m 0755 "$TMP/command-line-tool" "$candidate/root/bin/node-ctl"
       binary=node-ctl
