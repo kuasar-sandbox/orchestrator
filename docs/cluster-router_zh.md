@@ -447,3 +447,69 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 - [node-proxy_zh.md](node-proxy_zh.md) — node 内部数据面转发、CONNECT 和 envd signature。
 
 - [Router 实现](../internal/router/router.go) — 鉴权模式、缓存寿命、端点选择和 exec admission。
+
+<a id="client-onboarding"></a>
+## 12. 最小集群客户端验收
+
+从现有 [Registry](cluster_zh.md)、[Placer 配置及 file provider](cluster-placer_zh.md)
+和[部署顺序](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)
+开始。这里是单 group 验收，不是 HA 参考配置。
+
+1. 注册具有匹配 runtime/kernel、工件访问和目标 selector label 的合格节点，确认
+   node-link full sync 及该 group 的 ready placer。复用 provider JSON，把示意
+   `tmpl-1` 换成精确 ready Build 发布的真实 canonical `e2b-img/sbx/snp-...` ID。
+   按受保护 provider 契约配置 ManifestKey/APISecret，只给客户端该 APISecret
+   签发的 API key。
+2. SDK 命令/文件测试使用 provider 示例 `target_port=49983`，明确仅限 envd。
+   如需测试其他应用端口，使用无固定端口约束的 group 或为该端口配置 group；
+   49983 不代表所有服务。
+3. 配置公共 Router TLS、`api.<domain>` 及 sandbox host DNS/证书，使用
+   `auth.data_plane: enforce`。Registry TLS 独立。当前 Router→Node 的
+   APIEndpoint/DataEndpoint 必须为可达的**内部明文** listener，分别指向
+   Conductor/Proxy，并用私有网络访问控制保护。公共 HTTPS 不加密此跳；不能
+   把 TLS-only 节点 listener 当作明文 endpoint。
+4. 设置精确 provider `KUASAR_GROUP`、可用 `TEMPLATE_ID`，复用 API URL/key/
+   domain/CA。项目固定 **e2b==2.25.1**，Create 及后续控制/数据请求传同一
+   Group 和调用方选择的 route key：
+
+```python
+import os, uuid
+from e2b import Sandbox
+headers = {
+    "X-Kuasar-Sandbox-Group": os.environ["KUASAR_GROUP"],
+    "X-Kuasar-Route-Key": str(uuid.uuid4()),
+}
+options = dict(api_url=os.environ["E2B_API_URL"],
+               api_key=os.environ["E2B_API_KEY"],
+               domain=os.environ["E2B_DOMAIN"], headers=headers)
+sandbox = Sandbox.create(os.environ["TEMPLATE_ID"], timeout=300, **options)
+sid = sandbox.sandbox_id
+print("Retain group, route key, stable SID:", headers, sid)
+try:
+    assert sandbox.commands.run("printf cluster-ok").stdout == "cluster-ok"
+    sandbox.files.write("/tmp/cluster-proof", "cluster-state")
+    sandbox.pause()
+    sandbox = Sandbox.connect(sid, **options)
+    assert sandbox.files.read("/tmp/cluster-proof") == "cluster-state"
+finally:
+    sandbox.kill()
+```
+
+SDK `ConnectionConfig.sandbox_headers` 将自定义头合入 envd 请求，命令/文件
+客户端使用该配置。重连创建新客户端，须再次传 `options`。主动选择 route key
+可避免依赖 SDK 暴露 Router 额外的 `routeKey` 返回字段。应用若跨进程运行，
+持久保存 `(group, route key, stable SID)`。头传递已对照 2.25.1 源码，不能
+推广到所有 SDK 版本。SDK 不创建 group、不签发根密钥、不恢复 Registry 状态，
+也不会为浏览器访问 `get_host(port)` 自动注入这些头。
+
+应用端口请求须由应用/网关传递 Group、route key、stable sandbox identity、
+目标端口及对应 scoped forward token（§5–§7）；不得把租户 API key 泄露给
+Guest。分别验证 SDK 命令/文件与应用端口的认证请求。在隔离验收 group 内检查
+缺少 Group/route key、错误凭据及未授权目标均失败，且不会激活其他沙箱；检查
+节点 endpoint 选择，证明控制和数据使用各自 listener。
+
+成功标准是真实 create、命令/文件往返、pause/resume、kill；Registry stub 测试
+不能证明 VM 路径。NoNode 时查 group 导入、selector、健康/容量和工件；控制成功
+而数据失败时查头、target_port、DNS/TLS、Proxy 内部入口。身份不符立即停止。
+只 kill 测试所属实例；移除 provider 文件不是实例清理，也不会立即撤销已绑定行
+的凭据。共享模板/密钥应保留至保留策略允许删除。

@@ -321,3 +321,79 @@ Long-lived CONNECT uses the same route resolution, but tunnels are never reused.
 - [cluster-placer.md](cluster-placer.md) — verify-key, Place, and key-distribution sources.
 - [node-proxy.md](node-proxy.md) — node-internal data-plane forwarding, CONNECT, and envd signatures.
 - [Router implementation](../internal/router/router.go) — authentication modes, cache lifetime, endpoint selection, and exec admission.
+
+<a id="client-onboarding"></a>
+## 12. Minimal cluster client acceptance
+
+Start from the existing [Registry](cluster.md), [Placer configuration and file
+provider](cluster-placer.md#3-configuration) and [deployment order](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md).
+This is a one-group acceptance path, not an HA reference configuration.
+
+1. Register eligible nodes with matching runtime/kernel/artifact access and the
+   intended selector labels. Ensure node-link full sync and a ready placer for
+   this group. Reuse the provider JSON schema, replacing illustrative `tmpl-1`
+   with an actually published canonical `e2b-img/sbx/snp-...` ID from an exact
+   ready Build. Configure its ManifestKey/APISecret under the existing protected
+   provider contract; give clients only an API key signed by that APISecret.
+2. For this SDK command/file test, use the provider's example `target_port=49983`.
+   That constraint deliberately limits data to envd. To test an arbitrary user
+   application port as well, use a group without a fixed port constraint or one
+   configured for that port; do not assume 49983 represents every service.
+3. Configure public Router TLS, `api.<domain>` and sandbox host DNS/certificates.
+   Use `auth.data_plane: enforce`. Registry TLS is independent. Current
+   Router→Node APIEndpoint/DataEndpoint must be reachable **plaintext internal**
+   listeners, respectively Conductor and Proxy; protect them with private network
+   access controls. Public HTTPS does not encrypt that hop. Do not advertise a
+   TLS-only node listener as a plaintext endpoint.
+4. Set `KUASAR_GROUP` to the exact provider group, `TEMPLATE_ID` to its usable
+   template, and reuse API URL/key/domain/CA settings. With the project's pinned
+   **e2b==2.25.1**, pass the same Group and caller-chosen route key on Create and
+   every later control/data operation:
+
+```python
+import os, uuid
+from e2b import Sandbox
+headers = {
+    "X-Kuasar-Sandbox-Group": os.environ["KUASAR_GROUP"],
+    "X-Kuasar-Route-Key": str(uuid.uuid4()),
+}
+options = dict(api_url=os.environ["E2B_API_URL"],
+               api_key=os.environ["E2B_API_KEY"],
+               domain=os.environ["E2B_DOMAIN"], headers=headers)
+sandbox = Sandbox.create(os.environ["TEMPLATE_ID"], timeout=300, **options)
+sid = sandbox.sandbox_id
+print("Retain group, route key, stable SID:", headers, sid)
+try:
+    assert sandbox.commands.run("printf cluster-ok").stdout == "cluster-ok"
+    sandbox.files.write("/tmp/cluster-proof", "cluster-state")
+    sandbox.pause()
+    sandbox = Sandbox.connect(sid, **options)
+    assert sandbox.files.read("/tmp/cluster-proof") == "cluster-state"
+finally:
+    sandbox.kill()
+```
+
+The SDK's `ConnectionConfig.sandbox_headers` merges custom headers into envd
+requests; command and file clients use that configuration. Reconnecting creates
+another client, so pass `options` again. Choosing the route key avoids relying on
+SDK exposure of the Router's extra `routeKey` response field. Persist
+`(group, route key, stable SID)` in the application if it outlives this process.
+This header propagation is verified against 2.25.1 source, not a promise for all
+SDK versions. The SDK does not provision groups, sign API roots, recover Registry
+state or inject these headers into a browser request to `get_host(port)`.
+
+For application-port access, the application/gateway must carry Group, route key,
+stable sandbox identity, target port and the appropriate scoped forward token
+(§5–§7); it must not leak the tenant API key to the guest. Verify both the SDK
+commands/files path and an authenticated request to the intended application port.
+In an isolated acceptance group, confirm missing Group/route key, wrong credentials
+and an unauthorized target fail without activating a different sandbox. Inspect
+node endpoint selection to prove control and data use their distinct listeners.
+
+Success means real create, command/file roundtrip, pause/resume and kill; Registry
+stub tests alone do not prove this VM path. On NoNode, check group import, selector,
+node health/capacity and artifact access; on control success/data failure, check
+header propagation, target_port, DNS/TLS and the Proxy internal endpoint. Stop on
+identity mismatch. Kill only test-owned instances; removing a provider file is
+not instance cleanup or immediate revocation of credentials already bound to rows.
+Retain shared templates/keys until the retention policy permits deletion.

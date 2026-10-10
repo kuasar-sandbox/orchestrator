@@ -44,7 +44,9 @@ behavior.
 `ForwardAuthorized` is handler-style: it owns the response on success and
 failure, does not return a normal error, and does not verify Kuasar's
 `X-Access-Token`. It supports the current ordinary HTTP and CONNECT transport;
-it does not add WebSocket support. The wrapped handler serves the node's
+it also relays negotiated HTTP/1.1 WebSocket upgrades through the shared core
+transport. HTTP/2 extended CONNECT and arbitrary Upgrade protocols are not
+supported; see [transport boundaries](../../docs/node-proxy.md#51-http11-websocket-forwarding). The wrapped handler serves the node's
 `data_listen` sandbox ingress, while MMDS remains outside the wrapper.
 
 This is process organization for statically linked, same-UID trusted code, not
