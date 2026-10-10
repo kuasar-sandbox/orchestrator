@@ -144,25 +144,19 @@ func hotPathTraceSegment(t *testing.T, trace string) string {
 
 func isLegacyUnixSocketAnnotation(line, socket string) bool {
 	const prefix = "<(null):["
-	fdStart := -1
-	for _, syscall := range []string{"write(", "writev(", "pwrite64("} {
-		if start := strings.Index(line, syscall); start >= 0 {
-			fdStart = start + len(syscall)
-			break
-		}
-	}
-	if fdStart < 0 {
+	rest, ok := hotPathWriteArgs(line)
+	if !ok {
 		return false
 	}
-	start := strings.Index(line[fdStart:], prefix)
+	fdStart := 0
+	start := strings.Index(rest, prefix)
 	if start < 0 {
 		return false
 	}
-	start += fdStart
-	if _, err := strconv.ParseUint(strings.TrimSpace(line[fdStart:start]), 10, 64); err != nil {
+	if _, err := strconv.ParseUint(strings.TrimSpace(rest[fdStart:start]), 10, 64); err != nil {
 		return false
 	}
-	annotation := line[start+len(prefix):]
+	annotation := rest[start+len(prefix):]
 	end := strings.Index(annotation, "]>")
 	if end < 0 {
 		return false
@@ -189,11 +183,56 @@ func isLegacyUnixSocketAnnotation(line, socket string) bool {
 	return true
 }
 
+// hotPathWriteArgs returns the argument string following the write-family
+// syscall invocation at the start of an strace record (e.g. `474607 writev(`),
+// or ok=false when the record does not start with write, writev, or pwrite64.
+// Anchoring to the record start keeps a quoted payload that merely mentions a
+// syscall (e.g. a regular-file pwrite64 whose payload contains
+// `write(6<{eventfd-count=0}>,`) from being parsed as the target descriptor.
+func hotPathWriteArgs(line string) (args string, ok bool) {
+	rest := strings.TrimLeft(line, "0123456789 ")
+	for _, syscall := range []string{"writev(", "pwrite64(", "write("} {
+		if strings.HasPrefix(rest, syscall) {
+			return rest[len(syscall):], true
+		}
+	}
+	return "", false
+}
+
+// isEventfdAnnotation reports whether the write target's descriptor
+// annotation is an eventfd, covering both the legacy
+// <anon_inode:[eventfd]> rendering and the strace >= 6.x extended form,
+// e.g. write(5<{eventfd-count=0, eventfd-id=112, eventfd-semaphore=0}>, ...).
+// Only the descriptor annotation of the record's own syscall is inspected, so
+// a regular-file write whose payload merely contains "<{eventfd" or even a
+// full `write(...<{eventfd...}>` fragment cannot bypass the gate.
+func isEventfdAnnotation(line string) bool {
+	rest, ok := hotPathWriteArgs(line)
+	if !ok {
+		return false
+	}
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(rest) || rest[i] != '<' {
+		return false
+	}
+	annotation := rest[i+1:]
+	end := strings.IndexByte(annotation, '>')
+	if end < 0 {
+		return false
+	}
+	annotation = annotation[:end]
+	return annotation == "anon_inode:[eventfd]" ||
+		strings.HasPrefix(annotation, "{eventfd")
+}
+
 func isAllowedHotPathWrite(line, socket string) bool {
 	return strings.Contains(line, "<UNIX") ||
 		strings.Contains(line, "<pipe:") ||
 		strings.Contains(line, "<socket:[") ||
-		strings.Contains(line, "<anon_inode:[eventfd]>") ||
+		isEventfdAnnotation(line) ||
 		isLegacyUnixSocketAnnotation(line, socket)
 }
 
@@ -310,6 +349,10 @@ func TestLegacyUnixSocketAnnotation(t *testing.T) {
 			line: `123 write(7</tmp/output>, "<(null):[12708690->12710563,\"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock\"]>", 96) = 96`,
 		},
 		{
+			name: "pwrite64 annotation only in regular file payload",
+			line: `123 pwrite64(7</tmp/output>, "write(7<(null):[12708690->12710563,\"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock\"]>", 96, 0) = 96`,
+		},
+		{
 			name: "nonnumeric file descriptor",
 			line: `123 write(fd<(null):[12708690->12710563,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]>, "ok", 2) = 2`,
 		},
@@ -333,6 +376,57 @@ func TestLegacyUnixSocketAnnotation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isLegacyUnixSocketAnnotation(tt.line, socket); got != tt.want {
 				t.Fatalf("isLegacyUnixSocketAnnotation() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAllowedHotPathWriteEventfd(t *testing.T) {
+	const socket = "/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"
+	for _, tt := range []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "legacy eventfd annotation",
+			line: `474607 write(5<anon_inode:[eventfd]>, "\1\0\0\0\0\0\0\0", 8) = 8`,
+			want: true,
+		},
+		{
+			name: "extended eventfd annotation via writev",
+			line: `474607 writev(5<anon_inode:[eventfd]>, [{iov_base="\1\0\0\0\0\0\0\0", iov_len=8}], 1) = 8`,
+			want: true,
+		},
+		{
+			name: "extended eventfd annotation via pwrite64",
+			line: `474607 pwrite64(5<{eventfd-count=0, eventfd-id=112, eventfd-semaphore=0}>, "\1\0\0\0\0\0\0\0", 8, 0) = 8`,
+			want: true,
+		},
+		{
+			name: "regular file still rejected",
+			line: `474607 write(5</tmp/output>, "\1\0\0\0\0\0\0\0", 8) = 8`,
+			want: false,
+		},
+		{
+			name: "regular file with eventfd text in payload still rejected",
+			line: `474607 write(5</tmp/output>, "<{eventfd", 9) = 9`,
+			want: false,
+		},
+		{
+			name: "pwrite64 to regular file with eventfd write fragment in payload still rejected",
+			line: `474607 pwrite64(5</tmp/output>, "write(6<{eventfd-count=0}>, pad", 27, 0) = 27`,
+			want: false,
+		},
+		{
+			name: "writev to regular file with eventfd write fragment in payload still rejected",
+			line: `474607 writev(5</tmp/output>, [{iov_base="write(6<{eventfd-count=0}>, ", iov_len=27}], 1) = 27`,
+			want: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAllowedHotPathWrite(tt.line, socket); got != tt.want {
+				t.Fatalf("isAllowedHotPathWrite() = %t, want %t", got, tt.want)
 			}
 		})
 	}
