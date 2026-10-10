@@ -301,32 +301,65 @@ func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 }
 
 func TestImportSourceLeaseAllowsOnlyOnePlacerToRange(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
-	_, srv := testScaleRegistry(t, ctx, "n1")
-	defer srv.Close()
-	defer cancel()
+	for _, delay := range []time.Duration{0, 220 * time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+			_, srv := testScaleRegistry(t, ctx, "n1")
+			defer srv.Close()
+			defer cancel()
 
-	src1 := newCountingGroupSource("/g")
-	src2 := newCountingGroupSource("/g")
-	cfg := clustercfg.PlacementConfig{
-		Candidates: 1, ImportSourceOwnerCount: 2, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "50ms",
-	}
-	link := RegistryLink{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}
-	svc1 := NewRemoteLinksWithGroups([]RegistryLink{link}, src1, testImportSources("counting-source", src1), cfg, discard)
-	svc2 := NewRemoteLinksWithGroups([]RegistryLink{link}, src2, testImportSources("counting-source", src2), cfg, discard)
-	peers := func() []string { return []string{"s1", "s2"} }
-	svc1.SetImportSourceOwnerSource("s1", peers)
-	svc2.SetImportSourceOwnerSource("s2", peers)
-	seedNodeListView(t, svc1, "n1")
-	seedNodeListView(t, svc2, "n1")
-	svc1.Start(ctx)
-	svc2.Start(ctx)
+			src1 := newCountingGroupSource("/g")
+			src2 := newCountingGroupSource("/g")
+			cfg := clustercfg.PlacementConfig{
+				Candidates: 1, ImportSourceOwnerCount: 2, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "50ms",
+			}
+			server := srv
+			if delay > 0 {
+				// Model a healthy lease request taking longer than the old startup sleep.
+				server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					if req.URL.Path == registry.PlacerLinkImportSourcePath {
+						select {
+						case <-time.After(delay):
+						case <-req.Context().Done():
+							return
+						}
+					}
+					srv.Config.Handler.ServeHTTP(w, req)
+				}))
+				defer func() {
+					cancel()
+					server.Close()
+				}()
+			}
+			link := RegistryLink{Name: "registry", BaseURL: server.URL, Client: server.Client()}
+			svc1 := NewRemoteLinksWithGroups([]RegistryLink{link}, src1, testImportSources("counting-source", src1), cfg, discard)
+			svc2 := NewRemoteLinksWithGroups([]RegistryLink{link}, src2, testImportSources("counting-source", src2), cfg, discard)
+			peers := func() []string { return []string{"s1", "s2"} }
+			svc1.SetImportSourceOwnerSource("s1", peers)
+			svc2.SetImportSourceOwnerSource("s2", peers)
+			seedNodeListView(t, svc1, "n1")
+			seedNodeListView(t, svc2, "n1")
+			svc1.Start(ctx)
+			svc2.Start(ctx)
 
-	time.Sleep(180 * time.Millisecond)
-	c1, c2 := src1.rangeCalls.Load(), src2.rangeCalls.Load()
-	if (c1 > 0 && c2 > 0) || (c1 == 0 && c2 == 0) {
-		t.Fatalf("Range calls svc1=%d svc2=%d, want exactly one source owner", c1, c2)
+			// Start is asynchronous: observe an acquired lease before checking
+			// exclusivity, including when registration or acquisition is slow.
+			deadline := time.Now().Add(5 * time.Second)
+			for src1.rangeCalls.Load() == 0 && src2.rangeCalls.Load() == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for a source owner to call Range")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			// Keep the full observation window after startup. Counts never reset,
+			// so a second source owner at any point still fails the assertion.
+			time.Sleep(180 * time.Millisecond)
+			c1, c2 := src1.rangeCalls.Load(), src2.rangeCalls.Load()
+			if (c1 > 0 && c2 > 0) || (c1 == 0 && c2 == 0) {
+				t.Fatalf("Range calls svc1=%d svc2=%d, want exactly one source owner", c1, c2)
+			}
+		})
 	}
 }
 
