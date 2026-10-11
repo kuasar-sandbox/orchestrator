@@ -431,6 +431,24 @@ not enable usage, and stopping telemetry does not stop native accounting.
 `flush_interval` schedules native appends, not fsync or device-cache flushes.
 See the parsed [conductor deployment example](../deploy/conductor.example.yaml).
 
+### 3.4 Application startup policy
+
+Node-local `sandbox.timeouts.app_start` configures the SDK post-ACK application
+startup deadline. Omission uses the SDK default of `2s`; an explicit duration
+must be positive. The current node policy reaches image cold start,
+`run --from`, `run --restore` and every Builder phase. It is not inherited from
+portable E/S artifacts and does not alter per-message socket deadlines,
+Sandbox TTL, or Builder total/step/readiness deadlines.
+
+Set `sandbox.timeouts.app_start` to a positive duration such as `3s` only when
+the workload needs a different startup budget; see the nested configuration in
+the [conductor deployment example](../deploy/conductor.example.yaml).
+This does not add launch retries or change when a Build is considered ready.
+
+Upgrade conductor and `run-builder` together: Build task schema version 7 carries
+this node policy. A worker with an older schema is rejected at bootstrap and
+prepare completion, so it cannot silently fall back to the SDK default.
+
 ## 4. e2b API contract
 
 Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDKs or **Authorization: Bearer** for CLI builds, parsing both identically. APISecret signs keys through e2b-key-ctl gen-apikey; conductor verifies their MAC to identify tenants without a static api_keys table (§7).
