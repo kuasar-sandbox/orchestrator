@@ -13,16 +13,21 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"golang.org/x/sys/unix"
 )
 
 // runSandbox is the ExecStart of sandbox-runner@<run-id>.service: it waits until
 // the run-id is assigned a sandbox id, fetches that sandbox's LaunchSpec over the
-// config-socket, starts sandbox-ctl as its direct child, waits once, and reports
-// the bounded child result before exiting.
+// config-socket, owns the sandboxer SDK lifecycle, and reports the bounded
+// result after runtime and borrowed resource cleanup.
 //
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 func runSandbox(args []string, log *slog.Logger) error {
+	return runSandboxWithTask(args, log, launchTask)
+}
+
+func runSandboxWithTask(args []string, log *slog.Logger, launch func(context.Context, func(), string, string, string, *os.File, *os.File, *slog.Logger) error) error {
 	fs := flag.NewFlagSet("run-sandbox", flag.ExitOnError)
 	pidfile := fs.String("pidfile", "", "pidfile to lock+write (TASK_PIDFILE)")
 	socket := fs.String("config-socket", "", "config-socket UDS (TASK_CONFIG_SOCKET)")
@@ -41,9 +46,12 @@ func runSandbox(args []string, log *slog.Logger) error {
 		waitAssignment: configsock.WaitAssignment,
 		connectReady:   connectReadinessSocket,
 		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
-			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+			signals := make(chan os.Signal, 4)
+			signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+			defer signal.Stop(signals)
+			ctx, stop := sandbox.RunSignalContext(context.Background(), signals)
 			defer stop()
-			return launchTask(ctx, stop, socket, sid, runID, ready, cgroup, log)
+			return launch(ctx, stop, socket, sid, runID, ready, cgroup, log)
 		},
 	})
 }
@@ -64,6 +72,10 @@ type runSandboxOps struct {
 }
 
 func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error {
+	// Retain sandbox-ctl's process policy now that this runner owns the SDK.
+	// A diagnostic fallback to closed stderr must not bypass cleanup/reporting.
+	// Both production and test-runner dispatch enter here; other commands do not.
+	signal.Ignore(syscall.SIGPIPE)
 	if err := ops.lockPidfile(pidfile); err != nil {
 		return err
 	}
@@ -88,8 +100,8 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	if err != nil {
 		return fmt.Errorf("connect readiness socket: %w", err)
 	}
-	// The connection owns the bridge until child Start consumes it. Any config,
-	// chdir, argv, or Start failure returns through this defer and turns into EOF
+	// The connection owns the bridge until SDK readiness closes it. Any config
+	// or startup failure returns through this defer and turns into EOF
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
 	return ops.launchTask(socket, sid, runID, ready, vmmCgroup)
@@ -134,8 +146,7 @@ func connectReadinessSocket(path string) (*os.File, error) {
 		return nil, err
 	}
 	// File returns a duplicate. Keep it close-on-exec throughout every fallible
-	// preparation step. sandboxproc.Start explicitly passes the child copy;
-	// the parent descriptor never needs to become inheritable.
+	// preparation step and SDK execution; CH must never inherit it.
 	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
 	if err != nil {
 		_ = f.Close()

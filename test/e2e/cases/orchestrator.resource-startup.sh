@@ -148,13 +148,13 @@ PY
     done
     [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] || fail "vmm cgroup remained after StopUnit"
     journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
-    # KillMode=control-group may terminate CH before sandbox-ctl reaches the API.
-    grep -Fq '[sandbox-ctl] received terminated' "$LOW_JOURNAL" \
+    # KillMode=control-group may terminate CH before the SDK runner reaches the API.
+    grep -Fq '[sandbox-sdk] received terminated' "$LOW_JOURNAL" \
         || fail "low-allocatable[$iteration] run did not observe StopUnit"
-    grep -Fq '[sandbox-ctl] CH exited code=' "$LOW_JOURNAL" \
+    grep -Fq '[sandbox-sdk] CH exited code=' "$LOW_JOURNAL" \
         || fail "low-allocatable[$iteration] run did not observe CH exit"
     # Under deliberate memory.high pressure, CH's direct systemd signal can race
-    # sandbox-ctl's shutdown API and make CH report a non-zero shutdown exit. The
+    # the SDK runner's shutdown API and make CH report a non-zero shutdown exit. The
     # lifecycle contract here is bounded exit and cgroup removal without SIGKILL.
     ! grep -Fq "CH didn't exit within" "$LOW_JOURNAL" \
         || fail "low-allocatable[$iteration] run escalated shutdown to SIGKILL"

@@ -104,7 +104,7 @@ class SplitExecuteWorkspace(unittest.TestCase):
     def test_snapshot_reads_short_runtime_pid_files_and_disk_state(self):
         directory = self.run_root / 'sandboxes' / self.sid
         directory.mkdir(parents=True)
-        (directory / (self.sid + '.pid')).write_text('102')
+        (directory / (self.sid + '.pid')).write_text('101')
         (self.run_root / 'runners').mkdir()
         (self.run_root / 'runners' / (self.rid + '.pid')).write_text('101')
         state = dict(state='running', run_id=self.rid, run_dir=str(directory),
@@ -113,9 +113,12 @@ class SplitExecuteWorkspace(unittest.TestCase):
         identities = {
             101: dict(pid=101, ppid=1, start_ticks=1, cgroup=self.cgroup+'/ctl', executable='node-ctl'),
             102: dict(pid=102, ppid=101, start_ticks=2, cgroup=self.cgroup+'/ctl', executable='sandbox-ctl'),
-            103: dict(pid=103, ppid=102, start_ticks=3, cgroup=self.cgroup+'/vmm', executable='cloud-hypervisor'),
+            103: dict(pid=103, ppid=101, start_ticks=3, cgroup=self.cgroup+'/vmm', executable='cloud-hypervisor'),
         }
         synthetic = {
+            '/sys/fs/cgroup' + self.cgroup + '/ctl/cgroup.procs': '101\n',
+            '/proc/101/status': 'Kthread:\t0\n',
+            '/proc/102/status': 'Kthread:\t0\n',
             '/sys/fs/cgroup' + self.cgroup + '/vmm/cgroup.procs': '103\n',
             '/proc/103/status': 'Kthread:\t0\n',
             '/proc/101/smaps_rollup': 'Pss: 1 kB\nPrivate_Clean: 0 kB\nPrivate_Dirty: 1 kB\n',
@@ -131,7 +134,23 @@ class SplitExecuteWorkspace(unittest.TestCase):
              mock.patch.object(Path, 'read_text', read), mock.patch.object(Path, 'iterdir', children):
             kwargs = {'run_root': self.run_root} if 'run_root' in inspect.signature(self.helper.snapshot).parameters else {}
             observed = self.helper.snapshot(self.work, self.sid, self.prefix, **kwargs)
-        self.assertEqual(observed['processes'], dict(parent=identities[101], runtime=identities[102], ch=identities[103]))
+            # Reject the retired child-process ownership model, not just accept
+            # the new shared RunID/runtime PID in the happy-path fixture.
+            with self.subTest(invalid='separate runtime PID'):
+                (directory / (self.sid + '.pid')).write_text('102')
+                try:
+                    with self.assertRaisesRegex(ValueError, 'node-ctl must own both'):
+                        self.helper.snapshot(self.work, self.sid, self.prefix, **kwargs)
+                finally:
+                    (directory / (self.sid + '.pid')).write_text('101')
+            with self.subTest(invalid='CH parent'), mock.patch.dict(identities[103], ppid=102):
+                with self.assertRaisesRegex(ValueError, 'process parent chain'):
+                    self.helper.snapshot(self.work, self.sid, self.prefix, **kwargs)
+            with self.subTest(invalid='extra ctl process'), mock.patch.dict(synthetic, {
+                    '/sys/fs/cgroup' + self.cgroup + '/ctl/cgroup.procs': '101\n102\n'}):
+                with self.assertRaisesRegex(ValueError, 'ctl leaf must contain only node-ctl'):
+                    self.helper.snapshot(self.work, self.sid, self.prefix, **kwargs)
+        self.assertEqual(observed['processes'], dict(parent=identities[101], runtime=identities[101], ch=identities[103]))
 
     def test_dead_check_rejects_a_retained_short_runtime_directory(self):
         (self.run_root / 'sandboxes' / self.sid).mkdir(parents=True)

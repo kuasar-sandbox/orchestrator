@@ -93,8 +93,8 @@ def snapshot(work, sid, prefix, run_root=None):
         raise ValueError("unit does not own the live test run")
     parent_pid = int((run_root / "runners" / (rid + ".pid")).read_text())
     runtime_pid = int((run_dir / (sid + ".pid")).read_text())
-    if parent_pid != int(props["MainPID"]) or parent_pid == runtime_pid:
-        raise ValueError("resident parent and runtime PID identities are not distinct")
+    if parent_pid != int(props["MainPID"]) or parent_pid != runtime_pid:
+        raise ValueError("node-ctl must own both RunID and SDK runtime PID identities")
     members = userspace_members((Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "vmm/cgroup.procs").read_text().split())
     if len(members) != 1:
         identities = []
@@ -111,14 +111,17 @@ def snapshot(work, sid, prefix, run_root=None):
                 identities.append(details)
         raise ValueError("VMM leaf must contain exactly the current CH process: " + repr(identities))
     identities = dict(parent=process(parent_pid), runtime=process(runtime_pid), ch=process(int(members[0])))
-    if identities["parent"]["executable"] != "node-ctl" or identities["runtime"]["executable"] != "sandbox-ctl":
+    if identities["parent"]["executable"] != "node-ctl" or identities["runtime"]["executable"] != "node-ctl":
         raise ValueError("unexpected runner/runtime executable")
     if identities["ch"]["executable"] != "cloud-hypervisor":
         raise ValueError("unexpected VMM executable")
-    if identities["runtime"]["ppid"] != parent_pid or identities["ch"]["ppid"] != runtime_pid:
+    if not same_process(identities["parent"], identities["runtime"]) or identities["ch"]["ppid"] != runtime_pid:
         raise ValueError("runtime/CH process parent chain does not match the exact runner")
     if any(identities[k]["cgroup"] != cgroup + "/ctl" for k in ("parent", "runtime")) or identities["ch"]["cgroup"] != cgroup + "/vmm":
         raise ValueError("runner process left its expected delegated cgroup")
+    ctl_members = userspace_members((Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "ctl/cgroup.procs").read_text().split())
+    if ctl_members != [str(parent_pid)]:
+        raise ValueError("SDK runner ctl leaf must contain only node-ctl, with no sandbox-ctl child")
     memory = {}
     for line in (Path("/proc") / str(parent_pid) / "smaps_rollup").read_text().splitlines():
         key, _, value = line.partition(":")
@@ -144,8 +147,8 @@ def verify_lease(work, observed):
     lease = json.loads(lease_path.read_text())
     if lease["sandbox_id"] != observed["sid"] or lease["pid"] != observed["processes"]["runtime"]["pid"]:
         raise ValueError("StateSync lease did not retain the runtime PID identity")
-    if lease["pid"] == observed["processes"]["parent"]["pid"]:
-        raise ValueError("resident parent masqueraded as runtime in the controller lease")
+    if lease["pid"] != observed["processes"]["parent"]["pid"]:
+        raise ValueError("SDK runtime lease must belong to the resident node-ctl owner")
     if "state_sync_v1" not in lease.get("client_features", []):
         raise ValueError("runtime does not advertise StateSync")
 
@@ -173,6 +176,27 @@ def assert_dead(work, observed, run_root=None):
             continue
         if start_ticks == expected["start_ticks"]:
             raise ValueError("automatic cleanup left an original unit process alive")
+
+
+def terminal_evidence(work, sid):
+    """Keep the durable cause after a failed run has already been collected."""
+    state = row(work, sid)
+    result = json.loads(state.get("sandbox_result_json") or "{}")
+    evidence = {"sid": sid, "state": state["state"], "result": {}}
+    for source, target in (("run_id", "run_id"), ("sandbox_result_run_id", "result_run_id")):
+        value = state.get(source, "")
+        evidence[target] = value if re.fullmatch(r"sr-[0-9a-fA-F-]{36}", value) else ""
+    if isinstance(result, dict):
+        # Do not print arbitrary error strings, metadata, argv or environments.
+        if result.get("stage") in ("prepare", "start", "run"):
+            evidence["result"]["stage"] = result["stage"]
+        code = result.get("exit_code")
+        if type(code) is int and 0 <= code <= 255:
+            evidence["result"]["exit_code"] = code
+        if result.get("signal") in ("terminated", "killed", "interrupt", "aborted", "segmentation fault"):
+            evidence["result"]["signal"] = result["signal"]
+        evidence["result"]["error_present"] = bool(result.get("error"))
+    return evidence
 
 
 def cleanup_diagnostics(work, observed):

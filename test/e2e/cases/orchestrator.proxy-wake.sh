@@ -130,13 +130,27 @@ for name in ("pause-barrier-target", "pause-barrier-reached", "pause-barrier-rel
 PY_DIAG
     for sid in "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}"; do
         [ -n "$sid" ] || continue
+        timeout 5 python3 - "$SCRIPT_DIR" "$WORK" "$sid" "$RUNNER_PREFIX" <<'PY_TERMINAL'
+import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import runner_lifecycle
+record = runner_lifecycle.terminal_evidence(Path(sys.argv[2]), sys.argv[3])
+print("durable runner termination " + json.dumps(record, sort_keys=True), flush=True)
+for rid in sorted({record["run_id"], record["result_run_id"]} - {""}):
+    result = subprocess.run(["systemctl", "show", sys.argv[4] + rid + ".service",
+        "--property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus"],
+        text=True, capture_output=True, timeout=3, check=False)
+    print("runner unit result " + rid + " " + result.stdout[:2048], flush=True)
+PY_TERMINAL
         echo "==> guest memory/state sid=$sid"
         timeout 5 "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$sid" -- /bin/cat /proc/meminfo /tmp/pressure-state.json
         timeout 5 curl -fsS --unix-socket "$EXECUTE_RUN_ROOT/sandboxes/$sid/ch.sock" http://localhost/api/v1/vm.info |
             python3 -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps({"memory_actual_size":v.get("memory_actual_size"), "balloon":v.get("config",{}).get("balloon")}))'
         echo "==> guest/controller journal sid=$sid"
-        timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 200 -o cat |
-            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected|exec: open guest session:|reverse-channel: (restore|attach|quiesce)' | tail -100
+        # Keep the beginning of bounded guest panic reports, not just trailing goexit frames.
+        timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 800 -o cat |
+            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected|exec: open guest session:|reverse-channel: (restore|attach|quiesce)|CH exited code=|received (terminated|interrupt)|primary.*(exit|signal)|held-memory|RuntimeError:|fatal error:|panic:|SIG[A-Z]+:|^runtime:|^goroutine [0-9]+|^Kernel panic|^CPU:|^Call Trace:|^RIP:' | tail -120
     done
     echo "==> conductor pressure/settlement events"
     grep -E 'node pressure|resource controller listening|grant .*sid=|settled .*sid=|inventory' "$WORK/orch-pressure.log" |
