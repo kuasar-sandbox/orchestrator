@@ -598,6 +598,10 @@ E/S 制品继承，也不改变单条消息的 socket 期限、Sandbox TTL 或 B
 `3s` 等正时长；嵌套结构参见 [conductor 部署示例](../deploy/conductor.example.yaml)。
 此配置不增加启动重试，也不改变 Build 就绪的判定。
 
+请同时升级 conductor 和 `run-builder`：Build 任务 schema 版本 7 传递此节点
+策略。旧 schema 的 worker 会在 bootstrap 及 prepare completion 时被拒绝，
+避免静默回退到 SDK 默认值。
+
 ## 4. e2b API 契约
 
 基址 `https://api.<domain>`;鉴权 **`X-API-KEY`**(SDK)或 **`Authorization: Bearer`**
