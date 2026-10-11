@@ -425,13 +425,14 @@ func (u UnitsConfig) PoolWaitDuration() time.Duration {
 
 // SandboxConfig is the sandbox-instance defaults, sub-grouped for clarity.
 type SandboxConfig struct {
-	TimeoutSec int             `yaml:"timeout_sec" json:"timeout_sec"` // default TTL; default 300
-	DeadTTL    string          `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
-	Capacity   int             `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator, §4.2); 0 = unbounded
-	Resources  ResourcesConfig `yaml:"resources" json:"resources"`     // capacity + resource control
-	Usage      UsageConfig     `yaml:"usage" json:"usage"`             // node-local native accounting policy
-	Network    NetworkConfig   `yaml:"network" json:"network"`         // vswitch + inner IP
-	Boot       BootConfig      `yaml:"boot" json:"boot"`               // boot artifacts (kernel / guest runtime / overlay)
+	TimeoutSec int                   `yaml:"timeout_sec" json:"timeout_sec"` // default TTL; default 300
+	DeadTTL    string                `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
+	Capacity   int                   `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator, §4.2); 0 = unbounded
+	Resources  ResourcesConfig       `yaml:"resources" json:"resources"`     // capacity + resource control
+	Timeouts   SandboxTimeoutsConfig `yaml:"timeouts,omitempty" json:"timeouts,omitempty"`
+	Usage      UsageConfig           `yaml:"usage" json:"usage"`     // node-local native accounting policy
+	Network    NetworkConfig         `yaml:"network" json:"network"` // vswitch + inner IP
+	Boot       BootConfig            `yaml:"boot" json:"boot"`       // boot artifacts (kernel / guest runtime / overlay)
 }
 
 func (s SandboxConfig) DeadTTLDur() time.Duration {
@@ -1139,6 +1140,9 @@ func validateAdvertisedEndpoint(name, endpoint string) error {
 }
 
 func (c *Conductor) validateDeclarative() error {
+	if err := c.Sandbox.Timeouts.validate(); err != nil {
+		return err
+	}
 	if _, _, err := c.Sandbox.Usage.Runtime().Intervals(); err != nil {
 		return fmt.Errorf("config: sandbox.%w", err)
 	}

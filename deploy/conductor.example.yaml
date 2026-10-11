@@ -89,6 +89,8 @@ paths:
 # Sandbox-instance defaults.
 sandbox:
   timeout_sec: 300                                # default TTL
+  # timeouts:                                    # node-local SDK policy, also used by Builder
+  #   app_start: 2s                               # post-ACK startup; positive when set
   dead_ttl: 24h                                   # owner-free dead-row diagnostic retention
   usage:
     enabled: false                               # native lifecycle accounting, independent of telemetry

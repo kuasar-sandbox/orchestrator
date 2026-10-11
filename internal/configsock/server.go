@@ -282,6 +282,7 @@ type BuildSpec struct {
 	Net                         BuildNet                  `json:"net"`
 	TemplateNetwork             sandboxcfg.NetworkSpec    `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
 	Resources                   rtconfig.ResourcesConfig  `json:"resources"`        // A/B execution resources
+	RuntimeTimeouts             rtconfig.TimeoutsConfig   `json:"runtime_timeouts,omitempty"`
 	SandboxResources            rtconfig.ResourcesConfig  `json:"sandbox_resources"`
 	SandboxSpec                 sandboxcfg.SandboxSpec    `json:"sandbox_spec"`
 	SandboxNamespaces           []string                  `json:"sandbox_namespaces,omitempty"`
