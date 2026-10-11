@@ -225,6 +225,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 ## 发布模型
 
+所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
+
 使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
 `bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
 不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生

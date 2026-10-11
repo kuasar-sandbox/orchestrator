@@ -240,6 +240,8 @@ Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintai
 
 ## Release model
 
+The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
+
 Build from the selected source with the component Makefile. `release.sh package`
 uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
 it collects materials and creates the bundle without rebuilding those binaries
