@@ -142,6 +142,27 @@ images. They do not compile, search sibling source trees, pull fallback images,
 or select a host product in place of a missing prepared input. Real guest builds,
 flattening, snapshots and publication are operations under test and stay real.
 
+Metadata, Proxy and guest-telemetry cases can reuse immutable execute-image
+preparation when the public runner supplies `E2E_TEMPLATE_CACHE_DIR` and
+`E2E_TEMPLATE_CACHE_PROVENANCE`. The first `build_image_template` call still
+uses real `fromImage` construction. It exports verified, unencrypted tarstream
+content; later calls verify and import it under their own keys into independent
+Stores, then register new template/Build identities through `fromTemplate`.
+The requested e2b/bare profile remains case-specific. Guest boot, workload,
+network, snapshot and cleanup assertions remain real; dedicated Builder/Demo
+and `build_ready_template` preparation do not use this cache.
+
+Entries bind the complete prepared digest, native architecture, full execute
+image config ID, recipe version and reader/tool hashes. Publication is atomic
+under a lock. Matching corruption fails without rebuilding; interrupted staging
+is never a hit. No key, encrypted Store, live VM, snapshot or writable disk is
+shared. The runner owns retention and never reuses an earlier run's directory.
+`run --no-template-cache` (or an older runner without these inputs) preserves
+ordinary preparation. Per-case `template-preparation.jsonl` records hit/miss/
+disabled and total duration; `template-cache-phases.jsonl` separates production,
+export/verification, import and API registration costs. Compare real paired runs
+at identical inputs/resources before claiming a speedup.
+
 From the assembled project platform directory, use its sole public entrypoint:
 
 ```sh

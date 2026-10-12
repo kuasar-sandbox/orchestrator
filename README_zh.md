@@ -136,6 +136,22 @@ sandboxer 的 `sandbox-ctl`，从当前 orchestrator 源码执行
 不编译、不发现兄弟源码仓、不自动拉取后备镜像、不以主机产品替代缺失的准备输入。
 真实 guest build、flatten、snapshot 与 publish 是被测操作，继续真实执行。
 
+当公开 runner 提供 `E2E_TEMPLATE_CACHE_DIR` 与
+`E2E_TEMPLATE_CACHE_PROVENANCE` 时，元数据、Proxy 和 guest telemetry 用例可以
+复用不可变的 execute 镜像准备。第一次 `build_image_template` 仍执行真实
+`fromImage` 构建，导出已验证且未加密的 tarstream；后续调用验证内容，用自己的
+密钥导入独立 Store，再通过 `fromTemplate` 注册新的 template/Build 身份。
+请求的 e2b/bare profile 保持用例独立。Guest 启动、工作负载、网络、快照和清理
+断言仍真实执行；专门的 Builder/Demo 与 `build_ready_template` 准备不使用缓存。
+
+条目绑定完整准备摘要、原生架构、完整 execute 镜像 config ID、配方版本和读取
+工具摘要，持锁原子发布。匹配条目损坏即失败，不重建；中断暂存不会命中。
+不共享密钥、加密 Store、活动 VM、快照或可写磁盘。runner 负责保留目录，后续
+运行不会复用旧目录。`run --no-template-cache`（或未提供这些输入的旧 runner）
+保留普通准备路径。每个用例的 `template-preparation.jsonl` 记录 hit/miss/disabled
+和总时长，`template-cache-phases.jsonl` 分别记录生产、导出/校验、导入和 API
+注册成本。性能收益必须通过相同输入与资源下的真实配对运行测量。
+
 在已组装的项目平台目录中，使用唯一公开入口：
 
 ```sh
