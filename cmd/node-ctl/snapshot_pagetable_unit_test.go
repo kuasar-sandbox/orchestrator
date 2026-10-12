@@ -112,3 +112,32 @@ func TestSnapshotPagingRootsPreserveIntegerIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshotPagingOpaqueKVMABI(t *testing.T) {
+	bytes := make([]uint16, 312)
+	cr3, cr4 := uint64(0x12345045), uint64(0x3506e0)
+	var raw [8]byte
+	binary.LittleEndian.PutUint64(raw[:], cr3)
+	for i, v := range raw {
+		bytes[240+i] = uint16(v)
+	}
+	binary.LittleEndian.PutUint64(raw[:], cr4)
+	for i, v := range raw {
+		bytes[248+i] = uint16(v)
+	}
+	state, _ := json.Marshal(map[string]any{"sregs": bytes})
+	envelope, _ := json.Marshal(map[string]any{"snapshot_data": map[string]any{"state": string(state)}})
+	roots, err := diagnosticCPUs(envelope)
+	if err != nil || len(roots) != 1 || roots[0].CR3 != cr3 || roots[0].CR4 != cr4 {
+		t.Fatalf("opaque ABI: %v %v", roots, err)
+	}
+	bytes[0] = 256
+	state, _ = json.Marshal(map[string]any{"sregs": bytes})
+	if _, err := diagnosticCPUs(state); err == nil {
+		t.Fatal("accepted oversized ABI byte")
+	}
+	state, _ = json.Marshal(map[string]any{"sregs": bytes[:311]})
+	if _, err := diagnosticCPUs(state); err == nil {
+		t.Fatal("accepted truncated ABI")
+	}
+}

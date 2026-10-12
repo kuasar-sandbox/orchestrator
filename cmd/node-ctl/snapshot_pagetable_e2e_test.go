@@ -57,6 +57,29 @@ func diagnosticCPUs(raw []byte) ([]diagnosticCPU, error) {
 		}
 		switch v := node.(type) {
 		case map[string]any:
+			// kvm-bindings 0.12.1 serializes kvm_sregs as 312 opaque ABI bytes.
+			// x86 UAPI offsets: CR3=240, CR4=248 (not JSON named fields).
+			if fields, ok := v["sregs"].([]any); ok {
+				if len(fields) != 312 {
+					return errors.New("unsupported serialized kvm_sregs size")
+				}
+				var raw [312]byte
+				for i, field := range fields {
+					number, ok := field.(json.Number)
+					if !ok {
+						return errors.New("non-integer kvm_sregs byte")
+					}
+					value, err := strconv.ParseUint(string(number), 10, 8)
+					if err != nil {
+						return err
+					}
+					raw[i] = byte(value)
+				}
+				found = append(found, diagnosticCPU{path + "/sregs-abi", binary.LittleEndian.Uint64(raw[240:248]), binary.LittleEndian.Uint64(raw[248:256])})
+				if len(found) > 16 {
+					return errors.New("too many CPU roots")
+				}
+			}
 			if n, ok := v["cr3"].(json.Number); ok {
 				cr3, e := strconv.ParseUint(string(n), 10, 64)
 				if e != nil {
