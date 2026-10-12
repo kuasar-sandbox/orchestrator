@@ -47,13 +47,17 @@ class SnapshotWitnessTests(unittest.TestCase):
         self.assertEqual(result["source_ff_bytes"], 16)
         self.assertEqual(result["status"], "observed")
         self.assertFalse(result["payload_digest_verified"])
-        args = run.call_args.args[0]
+        args = run.call_args_list[0].args[0]
         self.assertEqual(args[1], "__e2e_snapshot_window")
         self.assertIn("-length", args)
         self.assertEqual(args[-1], "16")
         self.assertTrue(args[args.index("-ref") + 1].endswith("@digest:" + "a" * 64))
         self.assertEqual(run.call_args.kwargs["timeout"], 4)
         self.assertNotIn("prefix_hex", result)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0][1], "__e2e_snapshot_pagetable")
+        self.assertEqual(run.call_args_list[1].args[0][-1], str(self.witness["first_bad_va"]))
+        self.assertIn("saved_paging", result)
 
     def test_unusable_page_witness_never_invokes_reader(self):
         cases = [dict(self.witness, pagemap_status="pfn_zero_or_masked"),

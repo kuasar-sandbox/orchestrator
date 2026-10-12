@@ -53,12 +53,18 @@ def inspect(binary, manifest_path, journal_path):
     if process.returncode or len(process.stdout) > 8192:
         raise ValueError("bounded production reader could not resolve snapshot")
     result = json.loads(process.stdout)
+    table = subprocess.run([str(binary), "__e2e_snapshot_pagetable", "-ref", ref,
+                            "-virtual-address", str(va)], capture_output=True, text=True,
+                           timeout=4, check=False)
+    paging = {"status": "unavailable"}
+    if table.returncode == 0 and len(table.stdout) <= 32768:
+        paging = json.loads(table.stdout)
     if result.get("memory_bytes") != 1 << 30 or result.get("offset") != address or result.get("length") != 16:
         raise ValueError("snapshot geometry mismatch")
     after = path.lstat()
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
         raise ValueError("snapshot changed during observation")
-    return {"status": "observed", "sandbox_id": manifest["sandbox_id"],
+    return {"status": "observed", "sandbox_id": manifest["sandbox_id"], "saved_paging": paging,
             "address_basis": "failure-time Guest PFN; capture-time migration not excluded",
             "guest_physical_address": address, "source_nonzero_bytes": result["nonzero"],
             "source_ff_bytes": result["ff_bytes"], "source_sha256": result["sha256"],

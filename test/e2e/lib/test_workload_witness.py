@@ -36,7 +36,7 @@ class WitnessTests(unittest.TestCase):
         self.assertLessEqual(len(record['kernel_release']), 128)
         self.assertEqual(record['first_bad_va'], base + offset)
         self.assertEqual(ctypes.c_ubyte.from_address(base + offset).value, 255)
-        self.assertEqual(read.call_args.args[1:], (8, ((base + offset) // record['page_size']) * 8))
+        self.assertEqual(read.call_args_list[0].args[1:], (8, ((base + offset) // record['page_size']) * 8))
         return record
 
     def test_visible_pfn_and_real_address_math(self):
@@ -44,6 +44,14 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(r['pagemap_raw'], '0x8000000000003039')
         self.assertEqual(r['pfn'], 12345)
         self.assertEqual(r['guest_physical_address'], 12345 * r['page_size'] + r['first_bad_va'] % r['page_size'])
+
+    def test_zero_page_and_missing_neighbor_metadata(self):
+        page = ((1 << 63) | 8064).to_bytes(8, sys.byteorder)
+        zero_flags = (1 << 24).to_bytes(8, sys.byteorder)
+        r = self.evidence(error=[page, zero_flags, page, page, bytes(8), bytes(8)])
+        self.assertTrue(r["kernel_zero_page"])
+        self.assertEqual(r["kpageflags"], "0x0000000001000000")
+        self.assertEqual([x["present"] for x in r["neighbor_mappings"]], [True, True, False, False])
 
     def test_nonpresent_swapped_and_masked(self):
         for entry, status in [(0, 'not_present_or_swapped'), ((1 << 62) | 7, 'not_present_or_swapped'), (1 << 63, 'pfn_zero_or_masked')]:

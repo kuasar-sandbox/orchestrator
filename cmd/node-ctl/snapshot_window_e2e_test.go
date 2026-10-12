@@ -149,6 +149,9 @@ func inspectSnapshotDiagnostic(ctx context.Context, raw string, offset, length u
 
 // snapshotWindowProcess exists only in the prepared Go test executable.
 func snapshotWindowProcess() {
+	if len(os.Args) > 1 && os.Args[1] == "__e2e_snapshot_pagetable" {
+		os.Exit(runSnapshotPageTableDiagnostic(os.Args[2:]))
+	}
 	if len(os.Args) < 2 || os.Args[1] != "__e2e_snapshot_window" {
 		return
 	}

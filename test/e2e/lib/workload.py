@@ -180,6 +180,30 @@ def held_memory_witness(held, first_bad):
             else:
                 evidence.update(pagemap_status="pfn_visible", pfn=pfn,
                                 guest_physical_address=pfn * page_size + address % page_size)
+                # Failure-only metadata: do not read or instantiate additional payload pages.
+                try:
+                    with open("/proc/kpageflags", "rb", buffering=0) as flags:
+                        raw_flags = os.pread(flags.fileno(), 8, pfn * 8)
+                    if len(raw_flags) == 8:
+                        bits = int.from_bytes(raw_flags, sys.byteorder)
+                        evidence.update(kpageflags=f"0x{bits:016x}", kernel_zero_page=bool(bits & (1 << 24)))
+                except OSError:
+                    evidence["kpageflags_status"] = "unavailable"
+                try:
+                    samples = []
+                    for delta in (-4096, 0, 4096, 8192, (2 << 20) - 4096, 2 << 20):
+                        other = address + delta
+                        if not base <= other < base + len(held):
+                            continue
+                        with open("/proc/self/pagemap", "rb", buffering=0) as mapping:
+                            item = os.pread(mapping.fileno(), 8, (other // page_size) * 8)
+                        if len(item) == 8:
+                            value = int.from_bytes(item, sys.byteorder)
+                            samples.append(dict(delta=delta, raw=f"0x{value:016x}",
+                                                present=bool(value & (1 << 63)), pfn=value & ((1 << 55) - 1)))
+                    evidence["neighbor_mappings"] = samples
+                except OSError:
+                    evidence["neighbor_mapping_status"] = "unavailable"
     except Exception as error:
         evidence.update(pagemap_status="unavailable", diagnostic_error=type(error).__name__[:64])
     print("held-memory witness " + json.dumps(evidence, sort_keys=True), file=sys.stderr, flush=True)
