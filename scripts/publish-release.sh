@@ -61,7 +61,7 @@ assemble_architectures() {
     cp "$directory/assets/$name" "$output/assets/$name"
   done
   cp "$x86/release-notes.md" "$output/release-notes.md"
-  printf '\nArchitectures: x86_64 and aarch64 (ARM cross-build; native validation scope is declared by the aggregate).\n' >> "$output/release-notes.md"
+  printf '\nArchitectures: native x86_64 and aarch64 (runtime validation scope is declared by the aggregate).\n' >> "$output/release-notes.md"
   (cd "$output/assets" && sha256sum ./*.tar.gz | sed 's@  ./@  @') > "$output/assets/SHA256SUMS"
   release_cli validate "$tag" all "$output"
 }
@@ -132,6 +132,8 @@ release_unit() {
 revalidate_preview_line() {
   local tag="$1" unit
   [[ "$tag" == *-preview.* ]] || return 0
+  : "${PREVIEW_EVIDENCE_FILE:?Preview publication requires admitted manifest evidence}"
+  : "${PREVIEW_EVIDENCE_DIGEST:?Preview publication requires its trusted preflight digest}"
   unit="$(release_unit "$tag")"
   "$SCRIPT_DIR/validate-preview-line.sh" "$unit" "$tag" \
     "${AGGREGATE_VERSION:?AGGREGATE_VERSION is required for a Preview}" \

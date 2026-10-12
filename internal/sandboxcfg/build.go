@@ -29,6 +29,7 @@ type BuildColdParams struct {
 	InnerIP          string
 	EnvVars          map[string]string
 	Resources        rtconfig.ResourcesConfig
+	Timeouts         rtconfig.TimeoutsConfig
 	Network          NetworkSpec
 	MMDSEnabled      bool
 	Spec             SandboxSpec
@@ -56,7 +57,8 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		Template: types.TemplateID{Profile: p.Profile, Kind: types.KindImg, Ref: p.ImageRef},
 		Runtime:  p.Runtime, Kernel: p.Kernel, OverlayDiffTpl: p.OverlayDiffTpl,
 		TapFD: p.TapFD, EnvVars: p.EnvVars, Resources: p.Resources,
-		Network: p.Network, MMDSEnabled: p.MMDSEnabled, Spec: p.Spec,
+		Timeouts: p.Timeouts,
+		Network:  p.Network, MMDSEnabled: p.MMDSEnabled, Spec: p.Spec,
 	}
 	projected, err := ordinary.buildImageColdConfig()
 	if err != nil {

@@ -98,6 +98,12 @@ check_go_binary() {
 
 validate_archive_paths() {
   local archive="$1"
+  if [ "${RELEASE_ARCHIVE_VALIDATOR+x}" = x ]; then
+    [ -x "$RELEASE_ARCHIVE_VALIDATOR" ] || fail "trusted release archive validator is not executable"
+    "$RELEASE_ARCHIVE_VALIDATOR" "$archive" \
+      || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
+    return
+  fi
   # This standard-library-only host parser is independent of the product module.
   GO111MODULE=off GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
     GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \

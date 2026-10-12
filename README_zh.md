@@ -101,7 +101,16 @@ move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkp
 
 ## 构建与测试
 
-构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。
+本地构建使用环境提供的 Go, 并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择.
+CI 构建和打包使用原生 x86_64/aarch64 Runner, 在一次运行中为每种架构固定已通过
+验证的 Workbench 镜像. 发布构建、普通测试和打包在 build 模式中使用 ordinary UID
+和任务私有可写路径. 完整的 `bash scripts/ci-source-checks.sh` 门禁在 Workbench
+system 模式运行, 一并执行源码、race、vet、helper 测试和 systemd、真实 Docker
+telemetry backend、network namespace 检查, 保留全部能力要求与断言.
+发布编排使用环境提供的、支持 `api --slurp` 的 `gh`, 凭据不进入
+源码执行环境.
+Publisher 的归档校验器在独立 Workbench 调用中从受信发布源码编译, 该调用禁用缓存
+恢复和保存. 组装与发布执行同一校验器, 不再次编译.
 
 Go 源码构建需要 Go 1.26.1+，并将 `accelerator`、`connector`、`sandboxer` 放在本仓的兄弟目录；修改范围仅在本仓也不免除构建依赖。内部 `require` 使用各组件目标正式版本（Daily Preview 去掉预发布后缀），目标 Tag 可以尚不存在，因为实际构建由本地 `replace` 选择兄弟仓源码。`GOWORK=off` 不会禁用这些替换。验证必须记录实际源码 SHA，不能把版本标签当作已编译提交。运行真实沙箱还需 Runtime/Kernel 等运行工件，不能与 Go 编译前置混同。
 
@@ -215,6 +224,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 命名发布是逻辑提交,不承诺 final/parent fsync 的断电持久性;完整矩阵和失败规则由 Build 维护。
 
 ## 发布模型
+
+所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
 
 使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
 `bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,

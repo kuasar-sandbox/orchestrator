@@ -2,6 +2,25 @@
 
 # Telemetry — sandbox metrics and history
 
+<a id="release-scope"></a>
+## Source and release scope
+
+This contract describes orchestrator main, including the merged standalone service
+(#359), namespace contract (#364), native Collector assembly (#370) and query/export
+separation (#371). It is implemented, not the earlier system-wide OTel proposal.
+The separate control-plane tracing PR #219 does not establish delivered API tracing.
+Sandbox business ingress/query here is metrics-specific; linked infrastructure
+Collector components do not imply sandbox logs/traces query support.
+
+For deployment, pin one aggregate Release and inspect its selected orchestrator
+version, packaged guide and `node-ctl telemetry --help`; validate configuration with
+that binary and run this document's verification path. A main-branch guide, a
+Preview manifest or an open release-selection PR is not proof of Stable inclusion.
+Do not backport this configuration by inference to older releases. Unit tests and
+namespace/OTLP integration coverage establish their tested cases, not arbitrary
+exporter destinations or production capacity. Validate your chosen exporter,
+query backend, identity isolation and retention under your own failure conditions.
+
 ## 1. Component and authority
 
 Telemetry is a separate node process, alongside Conductor and Proxy:

@@ -187,7 +187,8 @@ func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {
 		},
 		PortMAC: p.spec.Net.MAC, InnerIP: p.spec.Net.InnerIP,
 		EnvVars: p.spec.SandboxEnv, Resources: p.spec.SandboxResources,
-		Network: p.spec.TemplateNetwork, MMDSEnabled: p.spec.MMDSEnabled,
+		Timeouts: p.spec.RuntimeTimeouts,
+		Network:  p.spec.TemplateNetwork, MMDSEnabled: p.spec.MMDSEnabled,
 		Spec: p.spec.SandboxSpec, NamespacePresent: namespaces,
 		StartCmd: p.startCmd, ReadyCmd: p.readyCmd,
 	}).BuildColdConfig()

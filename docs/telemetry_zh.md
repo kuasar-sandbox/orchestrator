@@ -2,6 +2,22 @@
 
 # Telemetry — 沙箱指标与历史查询
 
+<a id="release-scope"></a>
+## 源码与发布范围
+
+本契约描述 orchestrator main，包括已合入的独立服务（#359）、namespace 契约
+（#364）、原生 Collector 组装（#370）和查询/导出分离（#371）。它已实现，
+不是早期系统级 OTel 提案。独立的控制面 tracing PR #219 不构成已交付 API
+tracing 的证据。此处沙箱业务入口/查询仅支持指标；链接的基础设施 Collector
+组件不代表提供沙箱日志或 traces 查询。
+
+部署时固定一个 aggregate Release，核对所选 orchestrator 版本、打包指南和
+该二进制的 `node-ctl telemetry --help`，用它校验配置并执行本文验证流程。
+main 文档、Preview manifest 或未合入版本选择 PR 都不能证明 Stable 已包含。
+不要推测旧版本支持此配置。单测和 namespace/OTLP 集成覆盖仅证明其已测场景，
+不证明任意 exporter 目标或生产容量；须验证所选 exporter、查询后端、身份
+隔离与保留策略在自身故障条件下的行为。
+
 ## 1. 组件与权威边界
 
 Telemetry 是独立节点进程，与 Conductor、Proxy 并列：

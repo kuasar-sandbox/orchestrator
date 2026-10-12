@@ -2138,6 +2138,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		TemplateNetwork:   pend.templateNetwork,
 		Resources:         pend.resources,
 		SandboxResources:  pend.sandboxResources,
+		RuntimeTimeouts:   o.cfg.Sandbox.Timeouts.Runtime(),
 		SandboxSpec:       pend.spec,
 		SandboxNamespaces: buildSandboxNamespaces(b.Metadata),
 		SandboxEnv:        cloneStringMap(b.Env),

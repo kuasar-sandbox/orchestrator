@@ -2141,6 +2141,7 @@ func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, s
 		TapFD:          sandboxTapFD(o.vs.TapFD(sb.VswitchPort)), EnvVars: sb.Env,
 		Resources:   resources,
 		Usage:       o.cfg.Sandbox.Usage.Runtime(),
+		Timeouts:    o.cfg.Sandbox.Timeouts.Runtime(),
 		Network:     network,
 		MMDSEnabled: o.cfg.MMDS.Enabled,
 		Spec:        spec,

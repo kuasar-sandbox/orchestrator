@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+
+# Archive fixtures target x86_64 even when this gate runs on an ARM host.
+# Validators run natively; payload fixtures are inspected, never executed.
 # Archive fixtures prescribe 0755 directories regardless of the caller's umask.
 # mktemp still creates the enclosing workspace with mode 0700.
 umask 022
@@ -229,8 +232,11 @@ fi
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
-  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW")" -eq 2 ] \
-    || fail "release workflow does not pin the build and retry $input checkouts"
+  grep -Fq -- "--dependency ${input%_version} \"\${{ needs.preflight.outputs.$input }}\" \"\${{ needs.preflight.outputs.${input%_version}_sha }}\"" "$WORKFLOW" \
+    || fail "release restore does not bind $input tag and SHA to trusted preflight outputs"
+  if grep -Fq "ref: \${{ needs.preflight.outputs.${input%_version}_sha }}" "$WORKFLOW"; then
+    fail "release workflow refetches a dependency by bare SHA"
+  fi
 done
 grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
   || fail "release workflow does not verify dependency releases"
@@ -338,16 +344,16 @@ build:
 	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
 	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
 	mkdir -p bin/x86_64
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
 EOF
 fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts go.mod cmd deploy Makefile)"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/cmd/node-ctl/main.go"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
@@ -406,7 +412,7 @@ for dependency in accelerator connector sandboxer; do
       fail "validator accepted changed $dependency source column $column"
     fi
     grep -Fq "missing or inconsistent source record for $dependency" "$candidate/result.log" \
-      || fail "dependency source mutation failed for an unrelated reason"
+      || { cat "$candidate/result.log" >&2; fail "dependency source mutation failed for an unrelated reason"; }
   done
 done
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
@@ -559,7 +565,7 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-argume
     node-stub-ctl) other=e2b-key-ctl ;;
     e2b-key-ctl) other=node-ctl ;;
     command-line-arguments)
-      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 \
+      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
         go build -o "$TMP/command-line-tool" ./cmd/node-ctl/main.go)
       install -m 0755 "$TMP/command-line-tool" "$candidate/root/bin/node-ctl"
       binary=node-ctl

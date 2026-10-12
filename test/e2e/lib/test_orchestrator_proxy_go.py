@@ -209,6 +209,50 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         self.assertTrue((self.root / "telemetry-grpc-probe").is_file())
         self.assertFalse(self.log.exists(), "real builds invoked the mismatched PATH driver")
 
+    def test_declared_wrapper_uses_one_selected_driver_and_preserves_workspace(self):
+        owner = Path(__file__).resolve().parents[3]
+        driver = self.root / 'selected-go'
+        driver.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+            "with open(os.environ['DRIVER_LOG'],'a') as f: f.write(json.dumps({'argv':sys.argv[1:],"
+            "'env':{k:os.environ.get(k) for k in ['GOWORK','GOARCH','GOOS','CGO_ENABLED','GOTOOLCHAIN','CC']}})+'\\n')\n"
+            "sys.exit(23 if os.environ.get('FAIL_NODE') and './cmd/node-ctl' in sys.argv else 0)\n")
+        driver.chmod(0o755)
+        alternate = self.root / 'alternate'
+        self.fake_go(alternate, 'wrong-path-driver', 47)
+        output = self.root / 'declared'; output.mkdir()
+        log = self.root / 'driver.jsonl'
+        env = dict(os.environ, KUASAR_E2E_GO=str(driver), GOROOT=str(self.root/'invalid-goroot'),
+                   PATH=str(alternate)+os.pathsep+os.environ['PATH'], DRIVER_LOG=str(log),
+                   GOWORK=str(self.root/'fixed.work'), GOTOOLCHAIN='local', CC='preserved-cc')
+        wrapper = owner / 'scripts/build-e2e-helpers.sh'
+        for arch, goarch in [('x86_64','amd64'),('aarch64','arm64')]:
+            with self.subTest(arch=arch):
+                if log.exists(): log.unlink()
+                result = subprocess.run(['bash',str(wrapper),arch,str(output)],cwd=owner,env=env,text=True,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                rows = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(len(rows),3)
+                self.assertEqual([r['env']['GOWORK'] for r in rows],['off','off',env['GOWORK']])
+                for row in rows:
+                    self.assertEqual(row['env'],dict(GOWORK=row['env']['GOWORK'],GOARCH=goarch,GOOS='linux',
+                                                     CGO_ENABLED='0',GOTOOLCHAIN='local',CC='preserved-cc'))
+                self.assertEqual(rows[2]['argv'],['-C',str(owner),'test','-c','-trimpath','-o',str(output/'node-ctl-runner-test'),'./cmd/node-ctl'])
+        selected_root = self.root / 'selected-root'
+        (selected_root/'bin').mkdir(parents=True)
+        shutil.copy2(driver,selected_root/'bin/go')
+        goroot_env=dict(env,GOROOT=str(selected_root)); goroot_env.pop('KUASAR_E2E_GO')
+        log.unlink()
+        result=subprocess.run(['bash',str(wrapper),'x86_64',str(output)],cwd=owner,
+                              env=goroot_env,text=True,capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(len(log.read_text().splitlines()),3)
+        log.unlink()
+        result = subprocess.run(['bash',str(wrapper),'x86_64',str(output)],cwd=owner,
+                                env=dict(env,FAIL_NODE='1'),text=True,capture_output=True)
+        self.assertEqual(result.returncode,23,result.stderr)
+        self.assertEqual(len(log.read_text().splitlines()),3)
+        self.assertFalse(self.log.exists(),'selected driver failure fell back to PATH')
+
     def test_carried_go_entry_wins_after_sudo_path_reset(self):
         selected = self.fake_go(self.root / "chosen", "carried-go")
         alternate = self.root / "secure"

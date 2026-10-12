@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "recipe": "scripts/build-e2e-helpers.sh",
+  "dependencies": [
+    "accelerator",
+    "connector",
+    "sandboxer"
+  ],
+  "helpers": [
+    {
+      "name": "custom-proxy",
+      "env": "CUSTOM_PROXY_BIN",
+      "cases": [
+        "orchestrator.*.sh",
+        "builder.*.sh",
+        "telemetry.backends.sh",
+        "telemetry.guest.sh",
+        "telemetry.proxy.sh"
+      ]
+    },
+    {
+      "name": "telemetry-grpc-probe",
+      "env": "TELEMETRY_GRPC_PROBE_BIN",
+      "cases": [
+        "orchestrator.*.sh",
+        "builder.*.sh",
+        "telemetry.backends.sh",
+        "telemetry.guest.sh",
+        "telemetry.proxy.sh"
+      ]
+    },
+    {
+      "name": "node-ctl-runner-test",
+      "env": "NODE_CTL_RUNNER_TEST_BINARY",
+      "cases": [
+        "orchestrator.*.sh",
+        "builder.*.sh",
+        "telemetry.backends.sh",
+        "telemetry.guest.sh",
+        "telemetry.proxy.sh"
+      ]
+    }
+  ]
+}

@@ -374,3 +374,78 @@ Export's additional HTTP report fields are documented in
 Direct image/Sandbox `PublishSource` calls keep their existing role/ref contract,
 source ownership and streaming behavior. Reporting introduces no payload cache,
 extra staging files, GC or deletion authority.
+
+<a id="explicit-target-recipe"></a>
+## 7. Client recipe for explicit Image, E and S
+
+Use an already configured Node/API key/TLS trust and a reachable, native-architecture
+`APP_IMAGE` pinned by digest. The image already contains your application. Reuse
+Node's registry credentials; this recipe needs no COPY bucket. Registration,
+trigger and status above are the authority; this is an HTTP recipe, not an invented
+SDK target option. The project's pinned E2B Python 2.25.1 supports the auto flow,
+but `Template.build(headers=...)` sends Builder headers to both Register and
+Trigger and is therefore unsuitable for register-only explicit targets.
+
+Choose `BUILD_KIND=img` to publish only the image, `sbx` for cold E with portable
+Sandbox defaults, or `snp` for initialized memory S. For S, set `APP_START` and
+`APP_READY` to the actual service start and readiness commands. Explicit Image
+must not receive them. `auto` without effective commands selects Image, with
+effective start or ready selects memory S, and never selects E automatically.
+This example uses the Demo's execution budget; validate admission for your node.
+
+```python
+import json, os, time, urllib.request
+api = os.environ["E2B_API_URL"].rstrip("/")
+key = os.environ["E2B_API_KEY"]
+targets = {
+    "img": {"kind": "image"},
+    "sbx": {"kind": "sandbox", "memory": False},
+    "snp": {"kind": "sandbox", "memory": True},
+}
+kind = os.environ["BUILD_KIND"]  # img, sbx, snp
+
+def call(method, path, body=None, extra=None):
+    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+    headers.update(extra or {})
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(api + path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read()
+        return json.loads(raw) if raw else None
+
+registered = call("POST", "/v3/templates",
+    {"name": "explicit-example", "profile": "e2b", "cpuCount": 2, "memoryMB": 6144},
+    {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})})
+tid, bid = registered["templateID"], registered["buildID"]
+print("Keep registration/build handles:", tid, bid)
+trigger = {"fromImage": os.environ["APP_IMAGE"]}
+if kind == "snp":
+    trigger.update(startCmd=os.environ["APP_START"], readyCmd=os.environ["APP_READY"])
+call("POST", f"/v2/templates/{tid}/builds/{bid}", trigger)
+deadline = time.monotonic() + 900
+while True:
+    status = call("GET", f"/templates/{tid}/builds/{bid}/status")
+    assert status["buildID"] == bid
+    if status["status"] == "error":
+        raise RuntimeError("Build failed; inspect this build's status/logs")
+    if status["status"] == "ready":
+        assert status["profile"] == "e2b" and status["kind"] == kind
+        assert status["target"]["kind"] == targets[kind]["kind"]
+        assert status["target"].get("memory", False) == targets[kind].get("memory", False)
+        assert status["templateID"].startswith(f"e2b-{kind}-")
+        print("Canonical template:", status["templateID"])
+        break
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Polling stopped; build may still run. Use cancel/status with saved handles.")
+    time.sleep(2)
+```
+
+On success, create with the canonical ID and verify application commands/files;
+for S additionally pause/connect and compare state. Use the [first application
+walkthrough](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md#first-application).
+A client polling timeout does not cancel execution. Retain `tid/bid`, inspect the
+phase/reason and use §1.1 Cancel/DELETE until ownership cleanup is complete. Do not
+repeat an ambiguous Trigger blindly. Deleting a Build row does not delete remote
+artifacts; retain canonical IDs and parent/key dependencies separately. Older
+Release binaries must be checked against their packaged contract before using
+these current-main target options.

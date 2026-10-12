@@ -103,7 +103,19 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 
 ## Build and test
 
-Builds use environment-provided Go and inherit its `GOROOT` and `GOTOOLCHAIN` selection. Release automation requires a working `gh` with `api --slurp` support on `PATH`; the project does not install, replace, or authenticate these environment tools against fixed binary digests.
+Local builds use environment-provided Go and inherit its `GOROOT` and
+`GOTOOLCHAIN` selection. CI builds and packages use native x86_64/aarch64 runners
+with the admitted Workbench image pinned once per architecture and run. Release
+builds, ordinary tests and packaging use build mode with an ordinary UID and
+private writable paths. The complete `bash scripts/ci-source-checks.sh` gate runs
+in Workbench system mode, retaining source/race/vet/helper tests together with
+systemd, real Docker telemetry backend and network-namespace checks. Their
+required capabilities and assertions remain mandatory. Release orchestration
+uses environment-provided `gh` with `api --slurp`; its credentials do not enter
+the source environment.
+The publisher's archive validator is compiled from trusted publisher source in a
+separate Workbench invocation with cache restore/save disabled. Assembly and
+publication execute that exact validator without another compilation.
 
 The Go binaries are built with `CGO_ENABLED=0`.
 
@@ -227,6 +239,8 @@ Complete commands/configuration/API and cluster entry rules remain in [Node](doc
 Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintained in [Node paths and lifecycle](docs/node.md). Create input identity, stable versus node-local identity, credential binding, conflicts and retry behavior live in [Node §4.1.2](docs/node.md#412-create-identity). The complete Build directory/task/publication/recovery and retention contracts live in [Node Build](docs/node-build.md); retained Registry Build projection and reconnect convergence live in [Cluster](docs/cluster.md). Canonical artifacts remain launch authority independently of retained Build rows. Named publication is a logical commit, without a final-file/parent fsync power-loss guarantee; Build owns the full matrix and failure behavior.
 
 ## Release model
+
+The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
 
 Build from the selected source with the component Makefile. `release.sh package`
 uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;

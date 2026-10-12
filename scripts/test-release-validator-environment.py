@@ -42,6 +42,39 @@ class ValidatorEnvironment(unittest.TestCase):
                     self.assertFalse(marker.exists(), "ambient Go wrapper executed")
                     self.assertEqual(config.read_text(), settings)
 
+    def test_precompiled_validator_preserves_arguments_failures_and_never_compiles(self):
+        with tempfile.TemporaryDirectory(prefix="archive-parser-precompiled-") as temporary:
+            work = Path(temporary)
+            validator = work / "trusted-validator"
+            validator.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$VALIDATOR_ARGS"\n'
+                                 'exit "${VALIDATOR_EXIT:-0}"\n')
+            validator.chmod(0o755)
+            tools = work / "tools"
+            tools.mkdir()
+            go = tools / "go"
+            go.write_text('#!/bin/sh\ntouch "$COMPILE_MARKER"\nexit 99\n')
+            go.chmod(0o755)
+            archive = work / "archive with spaces.tar.gz"
+            command = 'set -euo pipefail\nROOT=$1\nfail() { echo "$*" >&2; exit 1; }\n' + FUNCTION + '\nvalidate_archive_paths "$2"\n'
+            environment = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                               RELEASE_ARCHIVE_VALIDATOR=str(validator),
+                               VALIDATOR_ARGS=str(work / "args"), COMPILE_MARKER=str(work / "compiled"))
+            for exit_code in ("0", "73"):
+                with self.subTest(exit_code=exit_code):
+                    result = subprocess.run(["bash", "-c", command, "test", str(ROOT), str(archive)],
+                                            env=dict(environment, VALIDATOR_EXIT=exit_code),
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, exit_code == "0", result.stderr)
+                    self.assertEqual((work / "args").read_text().splitlines(), [str(archive)])
+                    self.assertFalse((work / "compiled").exists())
+            for unavailable in ("", str(work / "missing"), str(work / "args")):
+                result = subprocess.run(["bash", "-c", command, "test", str(ROOT), str(archive)],
+                                        env=dict(environment, RELEASE_ARCHIVE_VALIDATOR=unavailable),
+                                        text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("trusted release archive validator is not executable", result.stderr)
+                self.assertFalse((work / "compiled").exists())
+
     def test_parser_does_not_load_the_callers_product_module(self):
         with tempfile.TemporaryDirectory(prefix="archive-parser-module-") as temporary:
             work = Path(temporary)
