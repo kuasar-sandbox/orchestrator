@@ -156,6 +156,13 @@ def held_memory_witness(held, first_bad):
     evidence = dict(pid=os.getpid(), euid=os.geteuid(), pagemap_status="unavailable")
     evidence["kernel_release"] = os.uname().release[:128]
     try:
+        with open("/proc/self/comm", "rb") as source:
+            raw_comm = source.read(17)
+        if raw_comm.endswith(b"\n") and 1 < len(raw_comm) <= 16:
+            evidence["comm"] = raw_comm[:-1].decode("utf-8", errors="strict")
+    except Exception:
+        pass
+    try:
         import ctypes
         base = ctypes.addressof(ctypes.c_ubyte.from_buffer(held))
         address = base + first_bad

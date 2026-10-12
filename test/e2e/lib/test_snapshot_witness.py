@@ -59,6 +59,41 @@ class SnapshotWitnessTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].args[0][-1], str(self.witness["first_bad_va"]))
         self.assertIn("saved_paging", result)
 
+    def test_optional_primary_identity(self):
+        self.write_witness(dict(self.witness, comm="python3", pid=1,
+                                kernel_release="6.1.169-sandbox-g21f1e158f70e"))
+        primary = {"primary_process": {"status": "diagnostic-unavailable"},
+                   "walks": [{"status": "saved_entry_not_present"}]}
+        with patch.object(snapshot_witness.subprocess, "run", side_effect=[
+                self.response(), SimpleNamespace(returncode=0, stdout=json.dumps(primary))]) as run:
+            result = snapshot_witness.inspect("/test/runner", self.manifest, self.journal)
+        args = run.call_args.args[0]
+        self.assertEqual(args[-6:], ["-primary-comm", "python3", "-namespace-pid", "1",
+                                    "-kernel-release", "6.1.169-sandbox-g21f1e158f70e"])
+        self.assertEqual(result["saved_paging"], primary)
+        self.assertEqual(result["source_ff_bytes"], 16)
+
+    def test_bad_optional_identity_retains_old_invocation(self):
+        for fields in [dict(comm="x" * 16, pid=1, kernel_release="kernel"),
+                       dict(comm="python3", pid=True, kernel_release="kernel"),
+                       dict(comm="python3", pid=42, kernel_release="kernel"),
+                       dict(comm="python3", pid=1),
+                       dict(comm="private\x00value", pid=1, kernel_release="kernel")]:
+            self.write_witness(dict(self.witness, **fields))
+            with patch.object(snapshot_witness.subprocess, "run", return_value=self.response()) as run:
+                snapshot_witness.inspect("/test/runner", self.manifest, self.journal)
+            self.assertNotIn("-primary-comm", run.call_args.args[0])
+
+    def test_paging_unavailable_preserves_physical_observation(self):
+        for response in [SimpleNamespace(returncode=1, stdout=""),
+                         SimpleNamespace(returncode=0, stdout="bad json"),
+                         SimpleNamespace(returncode=0, stdout="x" * 32769),
+                         snapshot_witness.subprocess.TimeoutExpired("test", 4), OSError()]:
+            with patch.object(snapshot_witness.subprocess, "run", side_effect=[self.response(), response]):
+                result = snapshot_witness.inspect("/test/runner", self.manifest, self.journal)
+            self.assertEqual(result["saved_paging"]["status"], "unavailable")
+            self.assertEqual(result["source_ff_bytes"], 16)
+
     def test_unusable_page_witness_never_invokes_reader(self):
         cases = [dict(self.witness, pagemap_status="pfn_zero_or_masked"),
                  dict(self.witness, pfn=0), dict(self.witness, page_size=65536),

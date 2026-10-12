@@ -137,6 +137,12 @@ func diagnosticCPUs(raw []byte) ([]diagnosticCPU, error) {
 }
 
 func walkSnapshotTable(ctx context.Context, memory sparse.Source, cpu diagnosticCPU, va uint64) (diagnosticWalk, error) {
+	return walkSnapshotTableWithPayload(ctx, memory, memory, cpu, va)
+}
+
+// Metadata can require a stricter reader than the resolved leaf payload: an
+// unlayered payload hole is meaningful zero content, not missing task identity.
+func walkSnapshotTableWithPayload(ctx context.Context, memory, payload sparse.Source, cpu diagnosticCPU, va uint64) (diagnosticWalk, error) {
 	out := diagnosticWalk{CPU: cpu, VA: va, Status: "unresolved"}
 	// This diagnostic is deliberately restricted to the one-GiB x86 test.
 	if memory.Size() != 1<<30 || va >= 1<<47 {
@@ -186,7 +192,7 @@ func walkSnapshotTable(ctx context.Context, memory sparse.Source, cpu diagnostic
 			if physical > memory.Size()-16 {
 				return out, errors.New("mapped address outside saved RAM")
 			}
-			data, err := snapshotDiagnosticWindow(ctx, memory, physical, 16)
+			data, err := snapshotDiagnosticWindow(ctx, payload, physical, 16)
 			if err != nil {
 				return out, err
 			}
@@ -205,6 +211,9 @@ func runSnapshotPageTableDiagnostic(args []string) int {
 	fs := flag.NewFlagSet("snapshot-pagetable", flag.ContinueOnError)
 	raw := fs.String("ref", "", "retained local snapshot")
 	va := fs.Uint64("virtual-address", 0, "observed user virtual address")
+	comm := fs.String("primary-comm", "", "failure-time task comm")
+	nsPID := fs.Uint64("namespace-pid", 0, "failure-time innermost namespace pid")
+	release := fs.String("kernel-release", "", "failure-time kernel release")
 	if fs.Parse(args) != nil || fs.NArg() != 0 || *va == 0 {
 		return 2
 	}
@@ -229,11 +238,8 @@ func runSnapshotPageTableDiagnostic(args []string) int {
 		fmt.Fprintln(os.Stderr, "unresolved snapshot graph")
 		return 1
 	}
-	cpus, err := diagnosticCPUs(root.StateJSON)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
+	primary := primarySnapshot(context.Background(), root.Memory, *comm, *nsPID, *release, *va)
+	cpus, cpuErr := diagnosticCPUs(root.StateJSON)
 	walks := make([]diagnosticWalk, 0, len(cpus))
 	for _, cpu := range cpus {
 		w, e := walkSnapshotTable(context.Background(), root.Memory, cpu, *va)
@@ -242,7 +248,15 @@ func runSnapshotPageTableDiagnostic(args []string) int {
 		}
 		walks = append(walks, w)
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"basis": "saved CPU CR3; primary process identity not assumed", "walks": walks}); err != nil {
+	cpuStatus := "observed"
+	if cpuErr != nil {
+		cpuStatus = "diagnostic-unavailable"
+	}
+	encoded, err := json.Marshal(map[string]any{"basis": "saved CPU CR3; primary process identity not assumed", "cpu_status": cpuStatus, "walks": walks, "primary_process": primary})
+	if err != nil || len(encoded)+1 > 32768 {
+		return 1
+	}
+	if _, err := os.Stdout.Write(append(encoded, '\n')); err != nil {
 		return 1
 	}
 	return 0

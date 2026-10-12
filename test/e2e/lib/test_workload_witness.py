@@ -39,6 +39,15 @@ class WitnessTests(unittest.TestCase):
         self.assertEqual(read.call_args_list[0].args[1:], (8, ((base + offset) // record['page_size']) * 8))
         return record
 
+    def test_comm_is_bounded_and_optional(self):
+        for raw, expected in [(b"python3\n", "python3"), (b"x" * 15 + b"\n", "x" * 15),
+                              (b"x" * 17, None), (b"\xff\n", None)]:
+            with patch('builtins.open', mock_open(read_data=raw)) as opened, patch.object(self.w.os, 'pread', return_value=bytes(8)), contextlib.redirect_stderr(io.StringIO()) as output:
+                self.w.held_memory_witness(bytearray(16), 0)
+            record = json.loads(output.getvalue().removeprefix('held-memory witness '))
+            self.assertEqual(record.get('comm'), expected)
+            opened().read.assert_called_once_with(17)
+
     def test_visible_pfn_and_real_address_math(self):
         r = self.evidence((1 << 63) | 12345)
         self.assertEqual(r['pagemap_raw'], '0x8000000000003039')

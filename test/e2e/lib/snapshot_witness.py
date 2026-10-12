@@ -53,12 +53,24 @@ def inspect(binary, manifest_path, journal_path):
     if process.returncode or len(process.stdout) > 8192:
         raise ValueError("bounded production reader could not resolve snapshot")
     result = json.loads(process.stdout)
-    table = subprocess.run([str(binary), "__e2e_snapshot_pagetable", "-ref", ref,
-                            "-virtual-address", str(va)], capture_output=True, text=True,
-                           timeout=4, check=False)
+    table_args = [str(binary), "__e2e_snapshot_pagetable", "-ref", ref,
+                  "-virtual-address", str(va)]
+    comm, pid, release = (witness.get(key) for key in ("comm", "pid", "kernel_release"))
+    if (isinstance(comm, str) and 0 < len(comm.encode("utf-8")) <= 15
+            and not any(c in comm for c in "\x00\n\r")
+            and type(pid) is int and pid == 1
+            and isinstance(release, str) and 0 < len(release) <= 128
+            and not any(c in release for c in "\x00\n\r")):
+        table_args += ["-primary-comm", comm, "-namespace-pid", str(pid),
+                       "-kernel-release", release]
     paging = {"status": "unavailable"}
-    if table.returncode == 0 and len(table.stdout) <= 32768:
-        paging = json.loads(table.stdout)
+    try:
+        table = subprocess.run(table_args, capture_output=True, text=True,
+                               timeout=4, check=False)
+        if table.returncode == 0 and len(table.stdout) <= 32768:
+            paging = json.loads(table.stdout)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
     if result.get("memory_bytes") != 1 << 30 or result.get("offset") != address or result.get("length") != 16:
         raise ValueError("snapshot geometry mismatch")
     after = path.lstat()
