@@ -151,6 +151,40 @@ def run_idle(duration):
     time.sleep(duration)
 
 
+def held_memory_witness(held, first_bad):
+    # Failure-only: no copy, resize, pinning, or extra buffer reads.
+    evidence = dict(pid=os.getpid(), euid=os.geteuid(), pagemap_status="unavailable")
+    evidence["kernel_release"] = os.uname().release[:128]
+    try:
+        import ctypes
+        base = ctypes.addressof(ctypes.c_ubyte.from_buffer(held))
+        address = base + first_bad
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        evidence.update(buffer_base=base, first_bad_va=address, page_size=page_size)
+        with open("/proc/self/pagemap", "rb", buffering=0) as pagemap:
+            raw = os.pread(pagemap.fileno(), 8, (address // page_size) * 8)
+        if len(raw) != 8:
+            evidence.update(pagemap_status="short_read", pagemap_bytes=len(raw),
+                            pagemap_raw_bytes=raw.hex())
+        else:
+            entry = int.from_bytes(raw, sys.byteorder)
+            evidence["pagemap_raw"] = f"0x{entry:016x}"
+            present, swapped = bool(entry & (1 << 63)), bool(entry & (1 << 62))
+            evidence.update(present=present, swapped=swapped)
+            pfn = entry & ((1 << 55) - 1)
+            if not present or swapped:
+                evidence["pagemap_status"] = "not_present_or_swapped"
+            elif pfn == 0:
+                # Cannot distinguish a masked PFN from real frame zero.
+                evidence["pagemap_status"] = "pfn_zero_or_masked"
+            else:
+                evidence.update(pagemap_status="pfn_visible", pfn=pfn,
+                                guest_physical_address=pfn * page_size + address % page_size)
+    except Exception as error:
+        evidence.update(pagemap_status="unavailable", diagnostic_error=type(error).__name__[:64])
+    print("held-memory witness " + json.dumps(evidence, sort_keys=True), file=sys.stderr, flush=True)
+
+
 def run_hold(duration, target_mib):
     # The node receives no workload size or completion hint. This controlled
     # primary guest process survives Snapshot; native exec sessions do not.
@@ -166,6 +200,11 @@ def run_hold(duration, target_mib):
         # process exit, an OOM, or an empty allocation as coordination success.
         first_bad = next((index for index in range(0, len(held), 4096) if held[index] != 255), None)
         if first_bad is not None:
+            try:
+                held_memory_witness(held, first_bad)
+            except BaseException:
+                # Even import, allocation, or output failure must not mask the mismatch.
+                pass
             # Bounded evidence; keep the original fatal invariant unchanged.
             raise RuntimeError(
                 f"held-memory contents changed: first_page={first_bad // 4096} "

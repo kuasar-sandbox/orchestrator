@@ -92,6 +92,7 @@ pressure_diagnostics() (
     # sandbox metadata, resource tokens, or the whole conductor configuration.
     set +e
     echo "==> pressure failure diagnostics"
+    printf 'host kernel: '; uname -sr
     timeout 5 "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket"
     timeout 5 "$BIN/node-ctl" resource status --socket "$WORK/sandbox-resource.sock"
     timeout 5 "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" |
