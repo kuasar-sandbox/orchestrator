@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -104,7 +106,7 @@ class SnapshotWitnessTests(unittest.TestCase):
             with self.subTest(witness=witness):
                 self.write_witness(witness)
                 with patch.object(snapshot_witness.subprocess, "run") as run:
-                    with self.assertRaises(ValueError):
+                    with self.assertRaises(snapshot_witness.DiagnosticUnavailable):
                         snapshot_witness.inspect("/test/runner", self.manifest, self.journal)
                     run.assert_not_called()
 
@@ -112,16 +114,111 @@ class SnapshotWitnessTests(unittest.TestCase):
         path = self.dest / self.name
         path.unlink()
         path.write_bytes(b"replacement")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(snapshot_witness.DiagnosticUnavailable) as error:
             snapshot_witness.inspect("/test/runner", self.manifest, self.journal)
+
+        self.assertEqual(error.exception.reason, "retention_invalid")
 
     def test_reader_failure_and_wrong_geometry_rejected(self):
         for response in [SimpleNamespace(returncode=1, stdout="", stderr="private diagnostic"),
                          self.response(memory_bytes=2 << 30), self.response(offset=0)]:
             with self.subTest(response=response):
                 with patch.object(snapshot_witness.subprocess, "run", return_value=response):
-                    with self.assertRaises(ValueError):
+                    with self.assertRaises(snapshot_witness.DiagnosticUnavailable):
                         snapshot_witness.inspect("/test/runner", self.manifest, self.journal)
+
+    def public_result(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["snapshot_witness.py", "--binary", "/private/runner",
+                                "--manifest", str(self.manifest),
+                                "--journal", str(self.journal)]), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            snapshot_witness.main()
+        self.assertEqual(errors.getvalue(), "")
+        text = output.getvalue()
+        self.assertEqual(len(text.splitlines()), 1)
+        return json.loads(text.removeprefix("snapshot-page witness "))
+
+    def assert_unavailable(self, reason):
+        self.assertEqual(self.public_result(), {"status": "unavailable", "reason": reason})
+
+    def test_absent_marker_precedes_all_snapshot_access(self):
+        self.journal.write_text("synthetic journal without a witness\n")
+        self.manifest = self.root / "missing-private-manifest"
+        original_stat = Path.stat
+        accessed = []
+        def stat(path, *args, **kwargs):
+            accessed.append(path)
+            return original_stat(path, *args, **kwargs)
+        with patch.object(snapshot_witness.subprocess, "run") as run, \
+                patch.object(Path, "stat", stat), patch.object(Path, "lstat") as lstat:
+            self.assert_unavailable("no_held_memory_witness")
+        self.assertEqual(accessed, [self.journal])
+        lstat.assert_not_called()
+        run.assert_not_called()
+
+    def test_malformed_witness_json_is_distinct_from_absence(self):
+        for payload in ('{private malformed', 'null', '[]', '"private"'):
+            with self.subTest(payload=payload):
+                self.journal.write_text("held-memory witness " + payload)
+                with patch.object(snapshot_witness.subprocess, "run") as run:
+                    self.assert_unavailable("witness_json_invalid")
+                run.assert_not_called()
+
+    def test_masked_pfn_and_bad_geometry_are_distinct(self):
+        for changes, reason in [
+                ({"pagemap_status": "pfn_zero_or_masked"}, "pfn_unavailable"),
+                ({"pfn": 0}, "witness_geometry_invalid"),
+                ({"guest_physical_address": True}, "witness_geometry_invalid")]:
+            with self.subTest(reason=reason):
+                self.write_witness(dict(self.witness, **changes))
+                with patch.object(snapshot_witness.subprocess, "run") as run:
+                    self.assert_unavailable(reason)
+                run.assert_not_called()
+
+    def test_reader_failure_is_private_and_not_decode_failure(self):
+        for response in [SimpleNamespace(returncode=1, stdout="private stdout",
+                                         stderr="private stderr"),
+                         OSError("private exception /private/path"),
+                         snapshot_witness.subprocess.TimeoutExpired(
+                             "/private/command", 4, output="private", stderr="private")]:
+            with self.subTest(kind=type(response).__name__):
+                with patch.object(snapshot_witness.subprocess, "run", side_effect=[response]) as run:
+                    self.assert_unavailable("snapshot_reader_failed")
+                self.assertEqual(run.call_count, 1)
+
+    def test_malformed_reader_output_has_fixed_reason(self):
+        cases = [SimpleNamespace(returncode=0, stdout=value, stderr="private stderr")
+                 for value in ('private invalid json', '[]', 'null', '{}', 'x' * 8193)]
+        cases += [self.response(memory_bytes=2 << 30), self.response(offset=0),
+                  self.response(sha256="private"), self.response(nonzero="private"),
+                  self.response(source_runs={"private": {}})]
+        for response in cases:
+            with self.subTest(size=len(response.stdout)):
+                with patch.object(snapshot_witness.subprocess, "run", return_value=response) as run:
+                    self.assert_unavailable("snapshot_output_invalid")
+                self.assertEqual(run.call_count, 1)
+
+    def test_retention_failure_is_private(self):
+        self.manifest.write_text("private invalid manifest")
+        with patch.object(snapshot_witness.subprocess, "run") as run:
+            self.assert_unavailable("retention_invalid")
+        run.assert_not_called()
+
+    def test_unexpected_failure_has_private_internal_reason(self):
+        with patch.object(snapshot_witness, "inspect", side_effect=TypeError("private detail")):
+            self.assert_unavailable("diagnostic_internal_error")
+
+    def test_existing_input_size_limits(self):
+        self.journal.write_text("x" * (2 * 1024 * 1024 + 1))
+        with patch.object(snapshot_witness.subprocess, "run") as run:
+            self.assert_unavailable("witness_json_invalid")
+        run.assert_not_called()
+        self.write_witness(self.witness)
+        self.manifest.write_text("x" * (64 * 1024 + 1))
+        with patch.object(snapshot_witness.subprocess, "run") as run:
+            self.assert_unavailable("retention_invalid")
+        run.assert_not_called()
 
     def test_retention_refuses_overwrite_or_count_limit(self):
         with self.assertRaises(FileExistsError):

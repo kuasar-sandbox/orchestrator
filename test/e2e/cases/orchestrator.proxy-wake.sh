@@ -168,7 +168,7 @@ PY_TERMINAL
         # Keep the beginning of bounded guest panic reports, not just trailing goexit frames.
         timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 800 -o cat |
             tee "$WORK/pressure-$sid.journal" |
-            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected|exec: open guest session:|reverse-channel: (restore|attach|quiesce)|CH exited code=|received (terminated|interrupt)|primary.*(exit|signal)|held-memory|RuntimeError:|fatal error:|panic:|SIG[A-Z]+:|^runtime:|^goroutine [0-9]+|^Kernel panic|^CPU:|^Call Trace:|^RIP:|^general protection fault|^BUG:|^Oops:|^#PF:|^RSP:|^RAX:|^RDX:|^RBP:|^R10:|^R13:|^FS:|^GS:|^CS:|^CR0:|^CR2:|^PKRU:|^Modules linked in:|^Code:|^ [a-zA-Z_][a-zA-Z_0-9]*\+0x' | tail -120
+            python3 "$SCRIPT_DIR/proxy_wake_journal.py"
         timeout 5 python3 "$SCRIPT_DIR/snapshot_witness.py" \
             --binary "$ORCH_BIN_DIR/node-ctl" \
             --manifest "$WORK/pressure-$sid-snapshot.json" \
