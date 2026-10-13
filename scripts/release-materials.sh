@@ -307,6 +307,26 @@ release_materials_hash_tree() {
   ) > "$output"
 }
 
+# Some upstream submodules omit their repository-root license from the module
+# zip. Supplement only this exact, verified module version with the unmodified
+# upstream notice tracked in the selected component source. Do not exempt the
+# module from inventory or accept a missing notice for an unknown version.
+release_materials_go_license_source() {
+  local module="$1" version="$2" directory="$3" notice digest
+  case "$module@$version" in
+    github.com/rootless-containers/proto/go-proto@v0.0.0-20230421021042-4cd87ebadd67)
+      notice="$ROOT/scripts/release-notices/rootless-containers-proto"
+      [ -f "$notice/COPYING" ] && [ ! -L "$notice/COPYING" ] \
+        || fail "pinned rootless-containers/proto COPYING is missing"
+      digest="$(sha256sum "$notice/COPYING" | awk '{print $1}')"
+      [ "$digest" = cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 ] \
+        || fail "pinned rootless-containers/proto COPYING differs from upstream"
+      directory="$notice"
+      ;;
+  esac
+  printf '%s\n' "$directory"
+}
+
 release_materials_finish() {
   local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
   local module version checksum directory toolchain toolchain_root installed_toolchain source payload
@@ -345,6 +365,7 @@ release_materials_finish() {
       github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;;
     esac
     directory="$(release_materials_go_source "$module" "$version" "$checksum")"
+    directory="$(release_materials_go_license_source "$module" "$version" "$directory")"
     release_materials_copy_licenses "$directory" "go/$module@$version"
   done < "$RELEASE_MATERIALS_WORK/go-modules-sorted"
 

@@ -344,3 +344,5 @@ Use the language selector at the beginning of each paired specification. Shared 
 ## License
 
 Original project content in this repository is licensed under the [Apache License 2.0](LICENSE). Preserve the applicable attribution and license declarations for generated or third-party material. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
+
+The pinned `rootless-containers/proto/go-proto` module omits its repository-root license. Packaging supplements that exact module version with the unchanged upstream Apache-2.0 notice in [scripts/release-notices/rootless-containers-proto](scripts/release-notices/rootless-containers-proto/NOTICE), checks its digest and retains the normal source/checksum inventory. Other versions still require their own license material.

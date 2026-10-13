@@ -1,0 +1,10 @@
+Release-material provenance (maintained by Kuasar):
+
+github.com/rootless-containers/proto/go-proto
+v0.0.0-20230421021042-4cd87ebadd67
+
+The Go submodule archive omits the repository-root COPYING file.
+COPYING is an unmodified copy from the exact upstream source commit:
+https://github.com/rootless-containers/proto/blob/4cd87ebadd670f849a518618bc9862e703f9baa5/COPYING
+Upstream Git blob: d645695673349e3947e8e5ae42332d0ac3164cd7
+SHA-256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30

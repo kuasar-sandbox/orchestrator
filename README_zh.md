@@ -317,3 +317,5 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 原创内容采用 [Apache License 2.0](LICENSE)。生成或第三方材料须保留适用 attribution/license 声明。
 见 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [Organization 贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。
+
+固定版本的 `rootless-containers/proto/go-proto` 模块归档缺少仓库根目录许可证。打包仅为该精确版本补入 [scripts/release-notices/rootless-containers-proto](scripts/release-notices/rootless-containers-proto/NOTICE) 中未修改的上游 Apache-2.0 声明，核验摘要并保留正常 source/checksum 清单。其他版本仍须提供各自的许可材料。

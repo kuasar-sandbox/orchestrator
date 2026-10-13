@@ -93,7 +93,7 @@ test-source:
 	bash scripts/ci-source-checks.sh
 
 VERSION ?= v0.1.0
-ACCELERATOR_VERSION ?= v0.1.3
+ACCELERATOR_VERSION ?= v0.1.7
 CONNECTOR_VERSION ?= v0.1.2
 SANDBOXER_VERSION ?= v0.1.3
 
