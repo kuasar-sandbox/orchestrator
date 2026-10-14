@@ -192,6 +192,61 @@ TAGS=()
 
 
 
+class SDKShutdownJournal(unittest.TestCase):
+    def check_journal(self, text):
+        case = Path(__file__).resolve().parents[1] / "cases/orchestrator.resource-startup.sh"
+        source = case.read_text()
+        start = source.index("    # KillMode=control-group")
+        end = source.index('    echo "==> PASS: 8GiB/256MiB', start)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal"
+            journal.write_text(text)
+            script = 'set -euo pipefail\nfail() { echo "$*" >&2; exit 1; }\n' + source[start:end]
+            return subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                                  env={**os.environ, "LOW_JOURNAL": str(journal), "iteration": "1"}, timeout=5)
+
+    def test_public_sdk_shutdown_retains_signal_and_exit_evidence(self):
+        result = self.check_journal(
+            "[sandbox-sdk] received terminated, requested vmm.shutdown via API\n"
+            "[sandbox-sdk] CH exited code=0\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_signal_exit_and_escalation_remain_failures(self):
+        valid = "[sandbox-sdk] received terminated\n[sandbox-sdk] CH exited code=0\n"
+        for text, diagnostic in (
+            ("[sandbox-sdk] CH exited code=0\n", "did not observe StopUnit"),
+            ("[sandbox-sdk] received terminated\n", "did not observe CH exit"),
+            (valid + "[sandbox-sdk] CH didn't exit within 10s; sending SIGKILL\n", "escalated shutdown"),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                result = self.check_journal(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+
+class TerminalEvidence(unittest.TestCase):
+    def test_collected_runtime_keeps_bounded_result_without_private_fields(self):
+        rid = "sr-00000000-0000-7000-8000-000000000001"
+        state = {"state": "dead", "run_id": "", "sandbox_result_run_id": rid,
+                 "sandbox_result_json": json.dumps({"stage": "run", "exit_code": 1,
+                     "signal": "killed", "error": "private diagnostic", "env": "private environment"}),
+                 "metadata": "private metadata", "base_dir": "private path"}
+        with mock.patch.object(runner_lifecycle, "row", return_value=state):
+            evidence = runner_lifecycle.terminal_evidence(Path("/fixture"), "test-run")
+        self.assertEqual(evidence, {"sid": "test-run", "state": "dead", "run_id": "", "result_run_id": rid,
+            "result": {"stage": "run", "exit_code": 1, "signal": "killed", "error_present": True}})
+        self.assertNotIn("private", json.dumps(evidence))
+
+    def test_unrecognized_result_content_is_not_printed(self):
+        state = {"state": "dead", "run_id": "private run", "sandbox_result_run_id": "private result",
+                 "sandbox_result_json": json.dumps({"stage": "private stage", "signal": "private signal",
+                    "exit_code": "private code", "error": "private error"})}
+        with mock.patch.object(runner_lifecycle, "row", return_value=state):
+            evidence = runner_lifecycle.terminal_evidence(Path("/fixture"), "test-run")
+        self.assertEqual(evidence["result"], {"error_present": True})
+        self.assertNotIn("private", json.dumps(evidence))
+
+
 class RunnerLifecycleIdentity(unittest.TestCase):
     def test_kernel_worker_is_not_a_second_userspace_vmm(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -297,18 +352,18 @@ class RunnerLifecycleIdentity(unittest.TestCase):
             child.terminate()
             child.wait(timeout=5)
 
-    def test_lease_requires_runtime_pid_not_parent(self):
+    def test_lease_requires_shared_node_runtime_pid(self):
         with tempfile.TemporaryDirectory() as directory:
             work=Path(directory)
             observed=self.observed()
-            observed["processes"]["runtime"]["pid"]=102
+            observed["processes"]["runtime"]["pid"]=101
             leases=work/"sandbox-resource.sock.leases"
             leases.mkdir()
             path=leases/(runner_lifecycle.hashlib.sha256(observed["sid"].encode()).hexdigest()+".json")
-            lease={"sandbox_id":observed["sid"],"pid":101,"client_features":["state_sync_v1"]}
+            lease={"sandbox_id":observed["sid"],"pid":102,"client_features":["state_sync_v1"]}
             path.write_text(json.dumps(lease))
             with self.assertRaises(ValueError):runner_lifecycle.verify_lease(work,observed)
-            lease["pid"]=102
+            lease["pid"]=101
             path.write_text(json.dumps(lease))
             runner_lifecycle.verify_lease(work,observed)
 

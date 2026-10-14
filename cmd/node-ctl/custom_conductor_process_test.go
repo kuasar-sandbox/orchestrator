@@ -23,6 +23,8 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	snapshotWindowProcess()
+	runnerE2EProcess()
 	customTelemetryProcess()
 	switch os.Getenv(customProxyProcessMode) {
 	case "node-ctl":

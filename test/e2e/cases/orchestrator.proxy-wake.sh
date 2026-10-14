@@ -86,12 +86,29 @@ wait_proxy_topology_ready "$PROXY_MASTER_PID"
 pressure_status() {
     "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket" > "$WORK/pressure-status.json"
 }
+pressure_retain_snapshot() {
+    local sid="$1" destination="$WORK/pressure-evidence/$1"
+    mkdir -p "$WORK/pressure-evidence"
+    timeout 5 python3 "$SCRIPT_DIR/retain_checkpoint.py" \
+        --checkpoint "$WORK/lib/sandboxes/$sid/checkpoint" \
+        --allowed-sandbox-root "$WORK/lib/sandboxes" \
+        --destination "$destination" --sandbox-id "$sid" \
+        > "$WORK/pressure-$sid-snapshot.json" 2>/dev/null || \
+        echo "==> snapshot evidence unavailable (original assertions retained)" >&2
+    return 0
+}
 pressure_diagnostics() (
     # Best-effort, bounded diagnostics preserve the original assertion/exit.
     # Project explicit nonsecret fields: never print API credentials, full
     # sandbox metadata, resource tokens, or the whole conductor configuration.
     set +e
     echo "==> pressure failure diagnostics"
+    printf 'host kernel: '; uname -sr
+    # Read-only host policy evidence; does not alter THP, page state, or the test.
+    for policy in enabled shmem_enabled defrag; do
+        path="/sys/kernel/mm/transparent_hugepage/$policy"
+        [ ! -r "$path" ] || printf 'host THP %s: %s\n' "$policy" "$(head -c 256 "$path")"
+    done
     timeout 5 "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket"
     timeout 5 "$BIN/node-ctl" resource status --socket "$WORK/sandbox-resource.sock"
     timeout 5 "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" |
@@ -130,13 +147,32 @@ for name in ("pause-barrier-target", "pause-barrier-reached", "pause-barrier-rel
 PY_DIAG
     for sid in "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}"; do
         [ -n "$sid" ] || continue
+        timeout 5 python3 - "$SCRIPT_DIR" "$WORK" "$sid" "$RUNNER_PREFIX" <<'PY_TERMINAL'
+import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import runner_lifecycle
+record = runner_lifecycle.terminal_evidence(Path(sys.argv[2]), sys.argv[3])
+print("durable runner termination " + json.dumps(record, sort_keys=True), flush=True)
+for rid in sorted({record["run_id"], record["result_run_id"]} - {""}):
+    result = subprocess.run(["systemctl", "show", sys.argv[4] + rid + ".service",
+        "--property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus"],
+        text=True, capture_output=True, timeout=3, check=False)
+    print("runner unit result " + rid + " " + result.stdout[:2048], flush=True)
+PY_TERMINAL
         echo "==> guest memory/state sid=$sid"
         timeout 5 "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$sid" -- /bin/cat /proc/meminfo /tmp/pressure-state.json
         timeout 5 curl -fsS --unix-socket "$EXECUTE_RUN_ROOT/sandboxes/$sid/ch.sock" http://localhost/api/v1/vm.info |
             python3 -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps({"memory_actual_size":v.get("memory_actual_size"), "balloon":v.get("config",{}).get("balloon")}))'
         echo "==> guest/controller journal sid=$sid"
-        timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 200 -o cat |
-            grep -E 'memory:|mem_report|sensor:|BudgetAtSnapshot|workload|Cloud Hypervisor|runtime.*(ready|exit)|admit rejected|exec: open guest session:|reverse-channel: (restore|attach|quiesce)' | tail -100
+        # Keep the beginning of bounded guest panic reports, not just trailing goexit frames.
+        timeout 5 journalctl "KUASAR_SANDBOX_ID=$sid" --no-pager -n 800 -o cat |
+            tee "$WORK/pressure-$sid.journal" |
+            python3 "$SCRIPT_DIR/proxy_wake_journal.py"
+        timeout 5 python3 "$SCRIPT_DIR/snapshot_witness.py" \
+            --binary "$ORCH_BIN_DIR/node-ctl" \
+            --manifest "$WORK/pressure-$sid-snapshot.json" \
+            --journal "$WORK/pressure-$sid.journal"
     done
     echo "==> conductor pressure/settlement events"
     grep -E 'node pressure|resource controller listening|grant .*sid=|settled .*sid=|inventory' "$WORK/orch-pressure.log" |
@@ -363,6 +399,7 @@ pressure_memory_observation before || fail "live pressure consumer observation f
 "$BIN/node-ctl" resource drain --socket "$WORK/sandbox-resource.sock" >/dev/null
 : > "$PAUSE_BARRIER_RELEASE"
 wait_sandbox_state "$FIRST" paused 600 || fail "resource capture did not finish"
+pressure_retain_snapshot "$FIRST"
 # The lifecycle fence serializes adoption with cleanup. Drain postpones only
 # background launch acceptance; adoption performs no capture or new RunID.
 SNAPSHOT_PAIR=$(checkpoint_pair "$FIRST" snapshot "$WORK/lib/sandboxes/$FIRST/checkpoint/$FIRST.snapshot")
@@ -416,6 +453,7 @@ PIDS+=("$PRESSURE_EXEC_PID")
 pressure_wait_parking || fail "ordinary critical request did not park"
 code=$(req POST "/sandboxes/$SECOND/pause" "$AK")
 [ "$code" = 204 ] || fail "second explicit Pause=$code"
+pressure_retain_snapshot "$SECOND"
 wait "$PRESSURE_EXEC_PID" || fail "parked Proxy Wake did not recover adopted Snapshot"
 for i in "${!PIDS[@]}"; do [ "${PIDS[$i]}" != "$PRESSURE_EXEC_PID" ] || PIDS[$i]=""; done
 wait_sandbox_state "$FIRST" running 600 || fail "adopted Snapshot did not resume"

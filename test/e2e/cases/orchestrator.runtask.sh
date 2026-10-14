@@ -37,55 +37,19 @@ SOCK="$WORK/node-ctl.socket"
 RUN_ID="sr-00000000-0000-7000-8000-$(python3 -c 'import uuid; print(uuid.uuid4().hex[-12:])')"
 RUN_ROOT="$WORK/runroot"
 PIDFILE="$RUN_ROOT/runners/$RUN_ID.pid"
-OUTFILE="$WORK/marker.json"
 READY_SOCK="$RUN_ROOT/sandboxes/probe/ready.sock"
 READY_WIRE="$WORK/ready.wire"
 mkdir -p "$WORK/wd" "$RUN_ROOT/runners" "$RUN_ROOT/sandboxes/probe"
 
-cat > "$WORK/marker.py" <<'CHILD'
-#!/usr/bin/env python3
-import fcntl, json, os, pathlib, sys, time
-root = pathlib.Path(os.environ["PROBE_ROOT"])
-args = sys.argv[1:]
-ready = int(next(a.split("=", 1)[1] for a in args if a.startswith("--ready-fd=")))
-vmm = int(next(a.split("fd=", 1)[1] for a in args if a.startswith("--cgroup-path=fd=")))
-assert [a for a in args if not a.startswith(("--ready-fd=", "--cgroup-path="))] == ["run", "A", "B"]
-assert os.readlink(f"/proc/self/fd/{vmm}").endswith("/vmm")
-parent_pidfile = next((root / "runroot/runners").glob("*.pid"))
-parent_identity = parent_pidfile.stat()
-for name in os.listdir("/proc/self/fd"):
-    fd = int(name)
-    if fd <= 2:
-        continue
-    try:
-        st = os.fstat(fd)
-        target = os.readlink(f"/proc/self/fd/{fd}")
-    except OSError:
-        continue
-    assert (st.st_dev, st.st_ino) != (parent_identity.st_dev, parent_identity.st_ino), "inherited parent PID descriptor"
-    assert not target.startswith("socket:") or fd == ready, "inherited parent Run session descriptor"
-assert not any(k.startswith("TASK_") for k in os.environ), "bootstrap environment escaped into child"
-assert os.environ["MANIFEST_KEY"] == "task-authoritative-key"
-assert os.environ["SECRET"] == "fixture-value"
-assert pathlib.Path.cwd() == root / "wd"
-# Simulate the runtime's separate identity, never the parent RunID lock.
-runtime_pidfile = root / "runroot/sandboxes/probe/probe.pid"
-identity_fd = os.open(runtime_pidfile, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-fcntl.lockf(identity_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-os.write(identity_fd, str(os.getpid()).encode())
-# O_EXCL makes any duplicate child launch a test failure.
-with (root / "marker.json").open("x") as stream:
-    json.dump({"pid": os.getpid(), "ppid": os.getppid(), "parent_only_fds_absent": True}, stream)
-os.write(ready, b"control_ready\nready\n")
-os.close(ready)
-deadline = time.monotonic() + 45
-while not (root / "release-child").exists():
-    assert time.monotonic() < deadline, "parent test did not release child"
-    time.sleep(0.02)
-os.close(identity_fd)
-sys.exit(7)
+# Block SDK config loading on a task-owned FIFO. This exercises the resident
+# owner/session/lock boundary without requiring a guest or spawning sandbox-ctl.
+mkfifo "$WORK/sandbox.yaml"
+cat > "$WORK/sandbox-ctl" <<'CHILD'
+#!/bin/sh
+touch "${PROBE_ROOT}/unexpected-child"
+exit 7
 CHILD
-chmod +x "$WORK/marker.py"
+chmod +x "$WORK/sandbox-ctl"
 
 cat > "$WORK/server.py" <<'SERVER'
 import json, os, pathlib, select, socket, socketserver, struct, sys, threading, time
@@ -198,8 +162,14 @@ class H(BaseHTTPRequestHandler):
             event("bootstrap")
             self.reply({"sandbox_id": "probe", "run_id": run_id, "workdir": str(root / "wd"),
                         "env": {"MANIFEST_KEY": "task-authoritative-key"},
-                        "final": {"exec": str(root / "marker.py"), "args": ["run", "A", "B"],
-                                  "workdir": str(root / "wd"), "env": {"SECRET": "fixture-value", "PROBE_ROOT": str(root)}}})
+                        "final": {"exec": str(root / "sandbox-ctl"), "args": [
+                            "run", "--sandbox-id", "probe", "--path-id", "probe",
+                            "--config", str(root / "sandbox.yaml"), "--manifest-config", "",
+                            "--run-root", str(root / "runroot/sandboxes"), "--base-root", str(root / "base"),
+                            "--log-to", "default", "--stdout-to", str(root / "stdout"),
+                            "--stderr-to", str(root / "stderr"), "--console", "off"],
+                                  "workdir": str(root / "wd"), "env": {"SECRET": "fixture-value", "PROBE_ROOT": str(root),
+                                      "SANDBOX_CH_PATH": str(root / "unused-cloud-hypervisor")}}})
         elif self.path == "/internal/run/sandbox-result":
             result = req.get("result", {})
             if req.get("run_id") != run_id or req.get("sandbox_id") != "probe" or result.get("run_id") != run_id or result.get("sid") != "probe":
@@ -236,39 +206,31 @@ systemd-run --quiet --unit="$UNIT" --service-type=exec \
     --setenv="TASK_RUN_ID=$RUN_ID" --setenv=TASK_SANDBOX_ID=legacy \
     --setenv=MANIFEST_KEY=inherited-wrong-key \
     "$ORCH" run-sandbox
-for _ in $(seq 1 100); do [ -s "$OUTFILE" ] && [ -f "$READY_WIRE" ] && break; sleep 0.1; done
-[ -s "$OUTFILE" ] && [ -f "$READY_WIRE" ] || {
-    journalctl -u "$UNIT.service" --no-pager -n 80 >&2 || true
-    cat "$WORK/server.log" >&2
-    fail "direct child did not finish readiness"
-}
-printf 'control_ready\nready\n' > "$WORK/ready.expected"
-cmp -s "$WORK/ready.expected" "$READY_WIRE" || fail "readiness wire was not exact"
-PARENT_PID="$(tr -d '[:space:]' < "$PIDFILE")"
-CHILD_PID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$OUTFILE")"
-[ "$PARENT_PID" != "$CHILD_PID" ] || fail "runtime replaced the resident parent"
-[ "$(systemctl show "$UNIT.service" -p MainPID --value)" = "$PARENT_PID" ] || fail "unit MainPID is not the parent"
-[ "$(readlink "/proc/$PARENT_PID/exe")" = "$(readlink -f "$ORCH")" ] || fail "MainPID no longer executes node-ctl"
-[ "$(cat "$RUN_ROOT/sandboxes/probe/probe.pid")" = "$CHILD_PID" ] || fail "runtime PID identity is not child-owned"
-UNIT_CGROUP="$(systemctl show "$UNIT.service" -p ControlGroup --value)"
-for pid in "$PARENT_PID" "$CHILD_PID"; do
-    [ "$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")" = "$UNIT_CGROUP/ctl" ] || fail "process $pid escaped delegated ctl"
+for _ in $(seq 1 100); do
+    [ -f "$WORK/events.jsonl" ] && grep -q '"event": "bootstrap"' "$WORK/events.jsonl" && break
+    sleep 0.1
 done
+grep -q '"event": "bootstrap"' "$WORK/events.jsonl" || fail "SDK bootstrap not received"
+PARENT_PID="$(tr -d '[:space:]' < "$PIDFILE")"
+[ "$(systemctl show "$UNIT.service" -p MainPID --value)" = "$PARENT_PID" ] || fail "unit MainPID is not the SDK owner"
+[ "$(readlink "/proc/$PARENT_PID/exe")" = "$(readlink -f "$ORCH")" ] || fail "MainPID no longer executes node-ctl"
+UNIT_CGROUP="$(systemctl show "$UNIT.service" -p ControlGroup --value)"
+[ "$(awk -F: '$1 == "0" { print $3 }' "/proc/$PARENT_PID/cgroup")" = "$UNIT_CGROUP/ctl" ] || fail "SDK owner escaped ctl"
+[ "$(cat "/sys/fs/cgroup$UNIT_CGROUP/ctl/cgroup.procs")" = "$PARENT_PID" ] || fail "unexpected ctl child"
 [ ! -s "/sys/fs/cgroup$UNIT_CGROUP/cgroup.procs" ] || fail "unit root contains a process"
-python3 - "$WORK" "$PARENT_PID" <<'CHECK'
+[ ! -s "/sys/fs/cgroup$UNIT_CGROUP/vmm/cgroup.procs" ] || fail "VMM started before config load"
+[ ! -e "$WORK/unexpected-child" ] || fail "sandbox-ctl executable was invoked"
+python3 - "$WORK" <<'CHECK'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
-marker = json.loads((root / "marker.json").read_text())
-assert marker["ppid"] == int(sys.argv[2])
-assert marker["parent_only_fds_absent"]
 events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
 names = [e["event"] for e in events]
-assert names.index("session") < names.index("assignment") < names.index("readiness-connect") < names.index("bootstrap") < names.index("readiness-eof"), names
-assert "result" not in names, "result arrived while child still runs"
+assert names.index("session") < names.index("assignment") < names.index("readiness-connect") < names.index("bootstrap"), names
+assert "result" not in names, "result arrived while SDK config loading is blocked"
 CHECK
-echo "==> PASS: resident parent/direct child identity, FD isolation and readiness EOF before child exit"
+echo "==> PASS: SDK owner identity, assignment ordering and no sandbox-ctl process"
 
-# Reconnect must not ask for assignment or launch another child.
+# Reconnect must not ask for assignment or execute the SDK twice.
 touch "$WORK/drop-first-session"
 for _ in $(seq 1 50); do
     [ "$(grep -c '"event": "session"' "$WORK/events.jsonl")" -ge 2 ] && break
@@ -277,8 +239,8 @@ done
 [ "$(grep -c '"event": "session"' "$WORK/events.jsonl")" -ge 2 ] || fail "parent did not reconnect"
 [ "$(grep -c '"event": "assignment"' "$WORK/events.jsonl")" = 1 ] || fail "session reconnect repeated assignment"
 [ "$(grep -c '"event": "bootstrap"' "$WORK/events.jsonl")" = 1 ] || fail "session reconnect repeated bootstrap"
-kill -0 "$CHILD_PID" || fail "session reconnect killed the child"
-echo "==> PASS: same-run reconnect without duplicate assignment or child launch"
+kill -0 "$PARENT_PID" || fail "session reconnect killed the SDK owner"
+echo "==> PASS: same-run reconnect without duplicate assignment or SDK execution"
 
 DUP_UNIT="e2e-runtask-duplicate-${WORK##*/}@$RUN_ID"
 set +e
@@ -293,13 +255,14 @@ set -e
 grep -qi 'lock' "$WORK/dup.log" || { cat "$WORK/dup.log"; fail "double-start omitted lock error"; }
 echo "==> PASS: duplicate parent refused"
 
-# The child exits with a known failure. Hold the result ACK briefly and prove
-# that the unit parent, not a detached reporter, remains responsible for it.
-touch "$WORK/release-child"
-for _ in $(seq 1 50); do grep -q '"event": "result"' "$WORK/events.jsonl" && break; sleep 0.1; done
-grep -q '"event": "result"' "$WORK/events.jsonl" || fail "child exit was not reported"
-kill -0 "$PARENT_PID" || fail "parent exited before its result ACK"
-[ ! -e "/proc/$CHILD_PID" ] || fail "direct child was not reaped before reporting"
+# Release config loading with invalid YAML. The SDK fails before VM side
+# effects; hold the result ACK to prove the owner reports after readiness EOF.
+timeout 10 sh -c 'printf "invalid: [\n" > "$1"' sh "$WORK/sandbox.yaml"
+for _ in $(seq 1 50); do grep -q '"event": "result"' "$WORK/events.jsonl" && [ -f "$READY_WIRE" ] && break; sleep 0.1; done
+grep -q '"event": "result"' "$WORK/events.jsonl" || fail "SDK failure was not reported"
+[ -f "$READY_WIRE" ] && [ ! -s "$READY_WIRE" ] || fail "SDK failure did not emit readiness EOF"
+kill -0 "$PARENT_PID" || fail "SDK owner exited before its result ACK"
+[ ! -e "$WORK/unexpected-child" ] || fail "sandbox-ctl executable was invoked"
 python3 - "$WORK/events.jsonl" "$PARENT_PID" "$RUN_ID" <<'RESULT'
 import json, sys
 events = [json.loads(line) for line in open(sys.argv[1])]
@@ -307,14 +270,14 @@ results = [e for e in events if e["event"] == "result"]
 assert len(results) == 1, results
 r = results[0]
 assert r["pid"] == int(sys.argv[2])
-assert r["result"]["stage"] == "run" and r["result"]["exit_code"] == 7, r
+assert r["result"]["stage"] == "run" and r["result"]["exit_code"] == 1, r
 assert r["result"]["sid"] == "probe" and r["result"]["run_id"] == sys.argv[3]
 RESULT
 touch "$WORK/allow-result-ack"
 for _ in $(seq 1 50); do [ ! -e "/proc/$PARENT_PID" ] && break; sleep 0.1; done
 [ ! -e "/proc/$PARENT_PID" ] || fail "parent stayed alive after ACK"
 [ "$(grep -c '"event": "result"' "$WORK/events.jsonl")" = 1 ] || fail "parent emitted duplicate/conflicting results"
-echo "==> PASS: child exit reaped once and reported once by parent before exit"
+echo "==> PASS: SDK failure reported once after readiness EOF and before owner exit"
 
 systemctl stop "$UNIT.service"
 for _ in $(seq 1 50); do [ ! -e "/sys/fs/cgroup$UNIT_CGROUP" ] && break; sleep 0.1; done

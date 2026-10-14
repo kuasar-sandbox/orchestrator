@@ -521,7 +521,7 @@ urgency、Origin 均不能赋予恢复特权。Snapshot 模板创建仍是 Creat
 `ResourceProbe.Allocated` 和 cluster projected memory load 使用
 `reservedMemory`,不是 host charge。E2B `memoryMB` 继续表示 Capacity/SKU。
 
-per-sandbox resource stats 读取当前 sandbox-ctl owner,独立于 controller heartbeat/reservation 路径:
+per-sandbox resource stats 读取当前 sandboxer lifecycle owner,独立于 controller heartbeat/reservation 路径:
 
 - `cpuCapacity`: 生效 capacity,单位为核;`cpuAllocatable`: 映射到 `cpu.weight` 的相对调度规格,不表示 fractional-core 硬 quota 或性能保证.
 - `memoryCapacity`: 生效 Capacity 字节数;`memoryHeadroom`: 最终 `resources.allocatable.memory`,表示气球 headroom,不是 Budget、guest free memory 或 NodeReservation.

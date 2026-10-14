@@ -14,14 +14,17 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxsdk"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,7 +45,7 @@ func TestWaitSandboxAssignmentRetriesInterruptedResponse(t *testing.T) {
 	}
 }
 
-func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
+func TestRunAssignedSandboxReadinessFDOrderingAndSDKExecution(t *testing.T) {
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +87,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
 
 	runRoot := filepath.Join(t.TempDir(), "run")
 	runPidfile := nodepath.RunnerPID(runRoot, "run-1")
-	startErr := errors.New("child start failed")
+	startErr := errors.New("SDK start failed")
 	err = runAssignedSandbox(runPidfile, "/config.sock", "run-1", runSandboxOps{
 		lockPidfile: func(path string) error {
 			order = append(order, "run pidfile")
@@ -133,21 +136,13 @@ func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
 					}, nil
 				},
 				setenv: func(string, string) error { return nil },
-				chdir: func(path string) error {
-					order = append(order, "chdir")
-					assertCloseOnExec("chdir", true)
-					assertCgroupCloseOnExec("chdir", true)
-					if path != "/work" {
-						t.Fatalf("chdir = %q", path)
-					}
-					return nil
-				},
-				startChild: func(path string, argv, _ []string, vmm, ready *os.File) error {
-					order = append(order, "start child")
-					assertCloseOnExec("start child", true)
-					assertCgroupCloseOnExec("start child", true)
-					if path != "/bin/sandbox-ctl" || !reflect.DeepEqual(argv, []string{path, "run"}) || vmm != vmmCgroup || ready != readyW {
-						t.Fatalf("child path=%q argv=%q vmm=%v ready=%v", path, argv, vmm, ready)
+
+				execute: func(ctx context.Context, spec configsock.LaunchSpec, source types.ResumeSource, locations, env map[string]string, vmm, ready *os.File) error {
+					order = append(order, "execute SDK")
+					assertCloseOnExec("execute SDK", true)
+					assertCgroupCloseOnExec("execute SDK", true)
+					if spec.Exec != "/bin/sandbox-ctl" || spec.Workdir != "/work" || !reflect.DeepEqual(spec.Args, []string{"run"}) || vmm != vmmCgroup || ready != readyW || ctx.Err() != nil {
+						t.Fatalf("SDK input mismatch: %+v", spec)
 					}
 					return startErr
 				},
@@ -159,13 +154,13 @@ func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
 	}
 	wantOrder := []string{
 		"run pidfile", "prepare cgroup", "assignment", "connect ready",
-		"launch task", "fetch spec", "chdir", "stop context", "start child",
+		"launch task", "fetch spec", "execute SDK", "stop context",
 	}
 	if !reflect.DeepEqual(order, wantOrder) {
 		t.Fatalf("order = %q, want %q", order, wantOrder)
 	}
 	if _, err := readyW.Write([]byte("x")); err == nil {
-		t.Fatal("ready fd remained open after child Start failure")
+		t.Fatal("ready fd remained open after SDK start failure")
 	}
 }
 
@@ -410,7 +405,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer vmm.Close()
-	startErr := errors.New("child start intercepted")
+	startErr := errors.New("SDK execution intercepted")
 	var fetches, reads, completions int
 	stopped := false
 	err = launchTaskWith(context.Background(), func() { stopped = true }, "/config.sock", "sid", "run-1", nil, vmm, taskLaunchOps{
@@ -449,38 +444,28 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 				Env: map[string]string{"MANIFEST_KEY": "must-not-win", "FINAL_ONLY": "yes"},
 			}, nil
 		},
-		chdir: func(path string) error {
-			if path != "/task-work" {
-				t.Fatalf("workdir = %q", path)
+		execute: func(ctx context.Context, spec configsock.LaunchSpec, source types.ResumeSource, locations, env map[string]string, _, _ *os.File) error {
+			if stopped || ctx.Err() != nil {
+				t.Fatal("runtime lifetime stopped before SDK execution")
 			}
-			return nil
-		},
-		startChild: func(path string, argv, env []string, _, _ *os.File) error {
-			if !stopped {
-				t.Fatal("task cancellation resources were not stopped before child Start")
+			if spec.Workdir != "/task-work" || spec.Exec != "/bin/sandbox-ctl" || !reflect.DeepEqual(spec.Args, []string{"run"}) {
+				t.Fatalf("SDK launch spec = %+v", spec)
 			}
-			wantSuffix := []string{
-				"--restore", "manifest://root",
-				"--ref-location", "a-location=file:///a",
-				"--ref-location", "z-location=file:///z",
+			if source.Kind != types.ResumeSourceSnapshot || source.Ref != "manifest://root" || source.SandboxRef == "" {
+				t.Fatalf("source = %+v", source)
 			}
-			if path != "/bin/sandbox-ctl" || len(argv) < len(wantSuffix) || !reflect.DeepEqual(argv[len(argv)-len(wantSuffix):], wantSuffix) {
-				t.Fatalf("child path/argv = %q, %q", path, argv)
+			if !reflect.DeepEqual(locations, map[string]string{"a-location": "file:///a", "z-location": "file:///z"}) {
+				t.Fatalf("locations=%v", locations)
 			}
-			manifestEntries := 0
-			for _, entry := range env {
-				switch {
-				case entry == "MANIFEST_KEY=authoritative-key":
-					manifestEntries++
-				case strings.HasPrefix(entry, "MANIFEST_KEY="):
-					t.Fatalf("non-authoritative manifest key in child env: %q", entry)
-				case strings.HasPrefix(entry, "TASK_"):
-					t.Fatalf("bootstrap variable leaked into child env: %q", entry)
+			if env["MANIFEST_KEY"] != "authoritative-key" || env["FINAL_ONLY"] != "yes" || env["KUASAR_RUN_ID"] != "run-1" {
+				t.Fatal("SDK authoritative environment mismatch")
+			}
+			for key := range env {
+				if strings.HasPrefix(key, "TASK_") {
+					t.Fatal("bootstrap environment leaked")
 				}
 			}
-			if manifestEntries != 1 {
-				t.Fatalf("authoritative MANIFEST_KEY entries = %d", manifestEntries)
-			}
+
 			return startErr
 		},
 	})
@@ -498,7 +483,7 @@ func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer vmm.Close()
-	startErr := errors.New("child start intercepted")
+	startErr := errors.New("SDK execution intercepted")
 	var fetches int
 	err = launchTaskWith(context.Background(), func() {}, "/config.sock", "sid", "run", nil, vmm, taskLaunchOps{
 		fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
@@ -516,9 +501,11 @@ func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
 			t.Fatal("cold path used a second RPC")
 			return nil, nil
 		},
-		setenv:     func(string, string) error { return nil },
-		chdir:      func(string) error { return nil },
-		startChild: func(string, []string, []string, *os.File, *os.File) error { return startErr },
+		setenv: func(string, string) error { return nil },
+
+		execute: func(context.Context, configsock.LaunchSpec, types.ResumeSource, map[string]string, map[string]string, *os.File, *os.File) error {
+			return startErr
+		},
 	})
 	if !errors.Is(err, startErr) || fetches != 1 {
 		t.Fatalf("cold launch = %v, fetches=%d", err, fetches)
@@ -548,9 +535,12 @@ func TestRunAssignedSandboxPrepareFailureClosesReadinessFD(t *testing.T) {
 				fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
 					return nil, wantErr
 				},
-				setenv:     func(string, string) error { return nil },
-				chdir:      func(string) error { return nil },
-				startChild: func(string, []string, []string, *os.File, *os.File) error { t.Fatal("child Start called"); return nil },
+				setenv: func(string, string) error { return nil },
+
+				execute: func(context.Context, configsock.LaunchSpec, types.ResumeSource, map[string]string, map[string]string, *os.File, *os.File) error {
+					t.Fatal("SDK execution called")
+					return nil
+				},
 			})
 		},
 	})
@@ -609,9 +599,9 @@ func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
 					}, nil
 				},
 				setenv: func(string, string) error { return nil },
-				chdir:  func(string) error { return nil },
-				startChild: func(string, []string, []string, *os.File, *os.File) error {
-					t.Fatal("child Start called")
+
+				execute: func(context.Context, configsock.LaunchSpec, types.ResumeSource, map[string]string, map[string]string, *os.File, *os.File) error {
+					t.Fatal("SDK execution called")
 					return nil
 				},
 			})
@@ -622,80 +612,74 @@ func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
 	}
 }
 
-func TestLaunchTaskReportFailureKeepsObservedChildResult(t *testing.T) {
+func TestSDKReportFailureKeepsObservedResult(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		execPath  string
-		wantStage types.SandboxExecutionStage
-		wantExit  *int
+		name    string
+		invalid bool
+		code    int
+		runErr  error
+		stage   types.SandboxExecutionStage
 	}{
-		{name: "start", execPath: filepath.Join(t.TempDir(), "missing-sandbox-ctl"), wantStage: types.SandboxResultStart},
-		{name: "run", wantStage: types.SandboxResultRun, wantExit: intPtr(7)},
+		{name: "adapter", invalid: true, stage: types.SandboxResultStart},
+		{name: "terminal", code: 7, stage: types.SandboxResultRun},
+		{name: "usage", code: 2, runErr: errors.New("invalid environment default"), stage: types.SandboxResultRun},
+		{name: "startup", runErr: errors.New("SDK startup failed"), stage: types.SandboxResultRun},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			execPath := tc.execPath
-			if execPath == "" {
-				execPath = filepath.Join(dir, "sandbox-ctl-test")
-				if err := os.WriteFile(execPath, []byte("#!/bin/sh\nexit 7\n"), 0o700); err != nil {
-					t.Fatal(err)
-				}
+			spec := sdkLaunchSpec(t)
+			if tc.invalid {
+				spec.Exec = "/bin/sh"
 			}
-			socket := filepath.Join(dir, "config.sock")
-			var results []configsock.SandboxExecutionResult
-			server, done := startSandboxLaunchResultServer(t, socket, func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case configsock.PathTaskSandboxBootstrap:
-					_ = json.NewEncoder(w).Encode(configsock.SandboxTaskSpec{
-						SandboxID: "sid", RunID: "run-1", Env: map[string]string{"MANIFEST_KEY": "key"},
-						Final: &configsock.LaunchSpec{Exec: execPath, Args: []string{"run"}},
-					})
-				case configsock.PathRunSandboxResult:
-					var req configsock.SandboxResultRequest
-					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-						t.Errorf("decode result: %v", err)
-						return
-					}
-					results = append(results, req.Result)
-					w.WriteHeader(http.StatusConflict)
-					_ = json.NewEncoder(w).Encode(configsock.SandboxResultResponse{Error: "report rejected"})
-				default:
-					t.Errorf("unexpected path %s", r.URL.Path)
-					http.NotFound(w, r)
-				}
-			})
-			defer closeTestHTTPServer(t, server, done)
-
-			vmm, err := os.Open(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer vmm.Close()
 			readyR, readyW, err := os.Pipe()
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer readyR.Close()
-
-			err = launchTask(context.Background(), func() {}, socket, "sid", "run-1", readyW, vmm, nil)
+			var got configsock.SandboxExecutionResult
+			cleaned := false
+			err = executeSandboxAndReportWith(context.Background(), "sid", "run-1", spec, types.ResumeSource{}, nil, map[string]string{"MANIFEST_KEY": ""}, nil, readyW,
+				func(ctx context.Context, in *sandboxsdk.Input, cg *os.File, ready *sandboxsdk.Readiness) (int, error) {
+					if tc.invalid {
+						t.Fatal("executed rejected input")
+					}
+					cleaned = true
+					return tc.code, tc.runErr
+				}, func(result configsock.SandboxExecutionResult) error {
+					got = result
+					if !tc.invalid && !cleaned {
+						t.Fatal("published before SDK cleanup")
+					}
+					_ = readyR.SetReadDeadline(time.Now().Add(time.Second))
+					wire, err := io.ReadAll(readyR)
+					if err != nil || len(wire) != 0 {
+						t.Fatalf("readiness not EOF before result: %q %v", wire, err)
+					}
+					return errors.New("report rejected")
+				})
 			var reported sandboxRunReportedError
 			if !errors.As(err, &reported) || !strings.Contains(err.Error(), "report rejected") {
-				t.Fatalf("launchTask error = %v, want marked rejected report", err)
+				t.Fatalf("reported error=%v", err)
 			}
-			if len(results) != 1 {
-				t.Fatalf("reported results = %d, want exactly one: %+v", len(results), results)
+			if got.Stage != tc.stage || got.SID != "sid" || got.RunID != "run-1" {
+				t.Fatalf("result=%+v", got)
 			}
-			got := results[0]
-			if got.Stage != tc.wantStage || got.SID != "sid" || got.RunID != "run-1" {
-				t.Fatalf("result identity/stage = %+v, want %s sid/run-1", got, tc.wantStage)
-			}
-			if tc.wantExit != nil {
-				if got.ExitCode == nil || *got.ExitCode != *tc.wantExit {
-					t.Fatalf("exit code = %v, want %d", got.ExitCode, *tc.wantExit)
+			if !tc.invalid {
+				want := tc.code
+				if tc.runErr != nil && want <= 0 {
+					want = 1
+				}
+				if got.ExitCode == nil || *got.ExitCode != want {
+					t.Fatalf("exit=%v want %d", got.ExitCode, want)
 				}
 			}
 		})
 	}
+}
+
+func sdkLaunchSpec(t *testing.T) configsock.LaunchSpec {
+	t.Helper()
+	dir := t.TempDir()
+	return configsock.LaunchSpec{Exec: "/opt/bin/sandbox-ctl", Workdir: dir, Args: []string{"run", "--sandbox-id", "sid", "--path-id", "sid", "--config", dir + "/sandbox.yaml", "--manifest-config", "", "--run-root", dir + "/run", "--base-root", dir + "/base", "--log-to", "default", "--stdout-to", dir + "/stdout", "--stderr-to", dir + "/stderr", "--console", "off"}}
 }
 
 func TestLaunchTaskPrepareFailureClosesReadinessBeforeReportACK(t *testing.T) {
@@ -913,3 +897,113 @@ func closeTestHTTPServer(t *testing.T, server *http.Server, done <-chan error) {
 }
 
 func intPtr(v int) *int { return &v }
+
+func TestLaunchTaskUsesLibraryWithoutSandboxCtlProcess(t *testing.T) {
+	spec := sdkLaunchSpec(t)
+	marker := filepath.Join(spec.Workdir, "child-started")
+	spec.Exec = filepath.Join(spec.Workdir, "sandbox-ctl")
+	if err := os.WriteFile(spec.Exec, []byte("#!/bin/sh\ntouch '"+marker+"'\nexit 7\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(spec.Workdir, "config.sock")
+	var got configsock.SandboxExecutionResult
+	server, done := startSandboxLaunchResultServer(t, socket, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case configsock.PathTaskSandboxBootstrap:
+			_ = json.NewEncoder(w).Encode(configsock.SandboxTaskSpec{SandboxID: "sid", RunID: "run", Env: map[string]string{"MANIFEST_KEY": ""}, Final: &spec})
+		case configsock.PathRunSandboxResult:
+			var req configsock.SandboxResultRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+			}
+			got = req.Result
+			_ = json.NewEncoder(w).Encode(configsock.SandboxResultResponse{})
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	defer closeTestHTTPServer(t, server, done)
+	cg, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cg.Close()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	err = launchTask(context.Background(), func() {}, socket, "sid", "run", w, cg, nil)
+	if err == nil || err.Error() != "exit status 1" {
+		t.Fatalf("expected CLI-equivalent SDK config failure, got %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("sandbox-ctl child was executed")
+	}
+	if got.Stage != types.SandboxResultRun || got.ExitCode == nil || *got.ExitCode != 1 || got.Error != "exit status 1" {
+		t.Fatalf("library failure result=%+v", got)
+	}
+	_ = r.SetReadDeadline(time.Now().Add(time.Second))
+	if wire, err := io.ReadAll(r); err != nil || len(wire) != 0 {
+		t.Fatalf("readiness=%q %v", wire, err)
+	}
+}
+
+func TestSDKExecutionLifetimeAndCleanupPrecedeResult(t *testing.T) {
+	spec := sdkLaunchSpec(t)
+	signals := make(chan os.Signal, 4)
+	ctx, stop := sandbox.RunSignalContext(context.Background(), signals)
+	defer stop()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	running := make(chan struct{})
+	cleanup := make(chan struct{})
+	reported := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- executeSandboxAndReportWith(ctx, "sid", "run", spec, types.ResumeSource{}, nil, map[string]string{"MANIFEST_KEY": ""}, nil, w,
+			func(ctx context.Context, _ *sandboxsdk.Input, _ *os.File, ready *sandboxsdk.Readiness) (int, error) {
+				ready.Notify(sandbox.ReadinessControlReady)
+				ready.Notify(sandbox.ReadinessReady)
+				close(running)
+				<-ctx.Done()
+				close(cleanup)
+				return 0, nil
+			}, func(result configsock.SandboxExecutionResult) error {
+				select {
+				case <-cleanup:
+				default:
+					t.Error("result before cleanup")
+				}
+				if result.ExitCode == nil || *result.ExitCode != 0 || result.RunID != "run" {
+					t.Errorf("result=%+v", result)
+				}
+				close(reported)
+				return nil
+			})
+	}()
+	<-running
+	_ = r.SetReadDeadline(time.Now().Add(time.Second))
+	wire, err := io.ReadAll(r)
+	if err != nil || string(wire) != "control_ready\nready\n" {
+		t.Fatalf("ready must close while VM is alive: %q %v", wire, err)
+	}
+	select {
+	case <-reported:
+		t.Fatal("reported while VM alive")
+	default:
+	}
+	signals <- syscall.SIGTERM
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("signal did not stop execution")
+	}
+}

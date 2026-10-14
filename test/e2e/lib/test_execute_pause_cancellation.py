@@ -33,6 +33,43 @@ FAIL = 'fail() { echo "FAIL: $*" >&2; exit 1; }'
 CLEANUP = snippet(CONTRACT, 'stop_owned_units() {', 'setup_proxy_netns() {') + 'trap cleanup EXIT\n'
 
 
+class ExecuteInstrumentLayout(unittest.TestCase):
+    def test_sdk_runner_keeps_the_prepared_hypervisor_adjacent(self):
+        # The sandbox-ctl wrapper is a real file, not a link to the product.
+        # SDK lookup therefore uses its staged directory, not BIN. Like a
+        # systemd runner, this shell has no prepared products in its PATH.
+        with tempfile.TemporaryDirectory(prefix="runner-layout-") as directory:
+            root = Path(directory)
+            work, products, helpers = (root / name for name in ("case work", "products", "helpers"))
+            for path in (work, products, helpers):
+                path.mkdir()
+            for name in ("connector-ctl", "flatten-ctl", "manifest-ctl", "cloud-hypervisor"):
+                path = products / name
+                path.write_text("#!/bin/sh\nexit 99\n")
+                path.chmod(0o755)
+            runner = helpers / "node-ctl-runner-test"
+            runner.write_text("#!/bin/sh\nexit 98\n")
+            runner.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/bash", "-c", "set -euo pipefail\n" + FAIL + '\n. "$1"',
+                 "_", str(ROOT / "execute_instrument.sh")],
+                env={"PATH": "/usr/bin:/bin", "WORK": str(work), "BIN": str(products),
+                     "NODE_CTL_RUNNER_TEST_BINARY": str(runner)},
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            staged = work / "orch-bin"
+            self.assertEqual((staged / "node-ctl").read_bytes(), runner.read_bytes())
+            self.assertEqual((staged / "runner-e2e-workdir").read_text(), str(work) + "\n")
+            wrapper = staged / "sandbox-ctl"
+            self.assertTrue(wrapper.is_file())
+            self.assertFalse(wrapper.is_symlink())
+            hypervisor = staged / "cloud-hypervisor"
+            self.assertTrue(hypervisor.is_symlink(), "SDK runner is missing its adjacent prepared hypervisor")
+            self.assertEqual(hypervisor.resolve(strict=True), products / "cloud-hypervisor")
+            self.assertTrue(os.access(hypervisor, os.X_OK))
+
+
 class ExecutePauseCancellation(unittest.TestCase):
     def setUp(self):
         self.fixture = tempfile.TemporaryDirectory(prefix="execute-pause-")

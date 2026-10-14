@@ -151,6 +151,71 @@ def run_idle(duration):
     time.sleep(duration)
 
 
+def held_memory_witness(held, first_bad):
+    # Failure-only: no copy, resize, pinning, or extra buffer reads.
+    evidence = dict(pid=os.getpid(), euid=os.geteuid(), pagemap_status="unavailable")
+    evidence["kernel_release"] = os.uname().release[:128]
+    try:
+        with open("/proc/self/comm", "rb") as source:
+            raw_comm = source.read(17)
+        if raw_comm.endswith(b"\n") and 1 < len(raw_comm) <= 16:
+            evidence["comm"] = raw_comm[:-1].decode("utf-8", errors="strict")
+    except Exception:
+        pass
+    try:
+        import ctypes
+        base = ctypes.addressof(ctypes.c_ubyte.from_buffer(held))
+        address = base + first_bad
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        evidence.update(buffer_base=base, first_bad_va=address, page_size=page_size)
+        with open("/proc/self/pagemap", "rb", buffering=0) as pagemap:
+            raw = os.pread(pagemap.fileno(), 8, (address // page_size) * 8)
+        if len(raw) != 8:
+            evidence.update(pagemap_status="short_read", pagemap_bytes=len(raw),
+                            pagemap_raw_bytes=raw.hex())
+        else:
+            entry = int.from_bytes(raw, sys.byteorder)
+            evidence["pagemap_raw"] = f"0x{entry:016x}"
+            present, swapped = bool(entry & (1 << 63)), bool(entry & (1 << 62))
+            evidence.update(present=present, swapped=swapped)
+            pfn = entry & ((1 << 55) - 1)
+            if not present or swapped:
+                evidence["pagemap_status"] = "not_present_or_swapped"
+            elif pfn == 0:
+                # Cannot distinguish a masked PFN from real frame zero.
+                evidence["pagemap_status"] = "pfn_zero_or_masked"
+            else:
+                evidence.update(pagemap_status="pfn_visible", pfn=pfn,
+                                guest_physical_address=pfn * page_size + address % page_size)
+                # Failure-only metadata: do not read or instantiate additional payload pages.
+                try:
+                    with open("/proc/kpageflags", "rb", buffering=0) as flags:
+                        raw_flags = os.pread(flags.fileno(), 8, pfn * 8)
+                    if len(raw_flags) == 8:
+                        bits = int.from_bytes(raw_flags, sys.byteorder)
+                        evidence.update(kpageflags=f"0x{bits:016x}", kernel_zero_page=bool(bits & (1 << 24)))
+                except OSError:
+                    evidence["kpageflags_status"] = "unavailable"
+                try:
+                    samples = []
+                    for delta in (-4096, 0, 4096, 8192, (2 << 20) - 4096, 2 << 20):
+                        other = address + delta
+                        if not base <= other < base + len(held):
+                            continue
+                        with open("/proc/self/pagemap", "rb", buffering=0) as mapping:
+                            item = os.pread(mapping.fileno(), 8, (other // page_size) * 8)
+                        if len(item) == 8:
+                            value = int.from_bytes(item, sys.byteorder)
+                            samples.append(dict(delta=delta, raw=f"0x{value:016x}",
+                                                present=bool(value & (1 << 63)), pfn=value & ((1 << 55) - 1)))
+                    evidence["neighbor_mappings"] = samples
+                except OSError:
+                    evidence["neighbor_mapping_status"] = "unavailable"
+    except Exception as error:
+        evidence.update(pagemap_status="unavailable", diagnostic_error=type(error).__name__[:64])
+    print("held-memory witness " + json.dumps(evidence, sort_keys=True), file=sys.stderr, flush=True)
+
+
 def run_hold(duration, target_mib):
     # The node receives no workload size or completion hint. This controlled
     # primary guest process survives Snapshot; native exec sessions do not.
@@ -164,8 +229,20 @@ def run_hold(duration, target_mib):
     while time.time() < end:
         # Touch every page without discarding the allocation. Do not count
         # process exit, an OOM, or an empty allocation as coordination success.
-        if any(held[index] != 255 for index in range(0, len(held), 4096)):
-            raise RuntimeError("held-memory contents changed")
+        first_bad = next((index for index in range(0, len(held), 4096) if held[index] != 255), None)
+        if first_bad is not None:
+            try:
+                held_memory_witness(held, first_bad)
+            except BaseException:
+                # Even import, allocation, or output failure must not mask the mismatch.
+                pass
+            # Bounded evidence; keep the original fatal invariant unchanged.
+            raise RuntimeError(
+                f"held-memory contents changed: first_page={first_bad // 4096} "
+                f"offset={first_bad} observed={held[first_bad]} "
+                f"prefix={bytes(held[first_bad:first_bad + 16]).hex()} "
+                f"tick={tick} held={len(held)}"
+            )
         tick += 1
         with open(state_file + ".new", "w") as output:
             json.dump(dict(nonce=nonce, held=len(held), tick=tick), output)
