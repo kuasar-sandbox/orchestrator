@@ -121,3 +121,5 @@ help:
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
+
+# RFC 246 temporary SOURCE caller acceptance; this branch must not be merged.
