@@ -61,7 +61,7 @@ if [ "$RECOVERY_PENDING" = 1 ]; then
 fi
 execute_state_recover "$BIN"
 
-for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor mkfs.erofs; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"

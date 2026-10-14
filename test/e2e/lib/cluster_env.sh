@@ -45,7 +45,7 @@ fail() {
 }
 
 
-for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl cloud-hypervisor mkfs.erofs; do
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl cloud-hypervisor; do
     [ -x "$BIN/$b" ] || fail "missing $BIN/$b"
 done
 [ -f "$BIN/vmlinux" ] || fail "missing $BIN/vmlinux"

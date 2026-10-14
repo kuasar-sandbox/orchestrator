@@ -14,7 +14,7 @@ require (
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
-	github.com/kuasar-sandbox/accelerator v0.1.7-preview.20261013.0.20261014005452-b736dee899eb
+	github.com/kuasar-sandbox/accelerator v0.1.7-preview.20261014.2.0.20261014161115-81526f693b5c
 	github.com/kuasar-sandbox/connector v0.1.2
 	github.com/kuasar-sandbox/sandboxer v0.1.3
 	github.com/oklog/ulid/v2 v2.1.1
@@ -166,6 +166,7 @@ require (
 	github.com/knadh/koanf/maps v0.1.2 // indirect
 	github.com/knadh/koanf/providers/confmap v1.0.0 // indirect
 	github.com/knadh/koanf/v2 v2.3.3 // indirect
+	github.com/kuasar-sandbox/go-erofs v0.0.0-20261014160540-827da6f90114 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/lightstep/go-expohisto v1.0.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20251013123823-9fd1530e3ec3 // indirect

@@ -18,7 +18,7 @@ MGMT_VIP="169.254.169.254"                   # host-side mgmt NIC IP; guests rou
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
 # ---- prerequisite checks --------------------------------------------------
-for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl mkfs.erofs; do
+for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
     [ -x "$BIN/$b" ] || fail "missing $BIN/$b; prepare the required products"
 done
 for f in vmlinux sandbox-runtime.bundle; do

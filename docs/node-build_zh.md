@@ -402,7 +402,7 @@ run-builder 对每阶段调用
 
 - **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
   复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
-  经 `/opt/sandbox-runtime` 投影出 `flatten-ctl` 与 `mkfs.erofs`。若
+  经 `/opt/sandbox-runtime` 投影出 静态 `flatten-ctl`。若
   `builder.referer.enabled=true`,guest 先以租户 registry 凭据执行
   `flatten-ctl referer lookup --json --owner <owner> <fromImage>`;lookup 只接受格式有效且
   未过期的 referrer,hit 时宿主校验
@@ -417,7 +417,7 @@ run-builder 对每阶段调用
   image-class root 时，以及 `checkpoint.remote.manifest=true` 时，writeback 被跳过，禁止为了
   referrer 单独创建中间 IMG Manifest。`MANIFEST_KEY` 只在宿主用于 owner token 和 publication，
   不进入 guest referer 命令。
-  lookup、export 与 writeback 均通过 `--conversion-semantics` 要求相同的生成器转换政策，宿主还会核验 lookup 返回的政策后才接受命中。当前政策为 `umoci-erofs-no-xattr-v1`：完整校验并应用 OCI 层，最终 EROFS 不输出 xattr，包含 file capability 与 security label。referrer 缺少或不匹配转换政策时视作转换 miss，仍保留 owner、有效期、平台与租户鉴权检查。不支持该政策的旧 guest runtime 明确失败，启用 lookup fallback 也不会静默使用旧生成器。原始 layer cache 和显式选用的旧 artifact 仍可使用。转换政策、内部 Plan schema 与 artifact 内容身份分别管理。
+  lookup、export 与 writeback 均通过 `--conversion-semantics` 要求相同的生成器转换政策，宿主还会核验 lookup 返回的政策后才接受命中。当前政策为 `umoci-go-erofs-no-xattr-v1`：完整校验并应用 OCI 层，由 Go 库生成最终 EROFS 不输出 xattr，包含 file capability 与 security label。referrer 缺少或不匹配转换政策时视作转换 miss，仍保留 owner、有效期、平台与租户鉴权检查。不支持该政策的旧 guest runtime 明确失败，启用 lookup fallback 也不会静默使用旧生成器。原始 layer cache 和显式选用的旧 artifact 仍可使用。转换政策、内部 Plan schema 与 artifact 内容身份分别管理。
 
 - **B build/materialize**(有 steps 或 source E 时):image source 以 base 镜像为 root
   (本地工件或 `manifest://`)+ builder runtime + 大可写 upper(同一 diff_template)；

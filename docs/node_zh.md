@@ -487,7 +487,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
-| `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl、mkfs.erofs(§11) |
+| `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl(§11) |
 | `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏文件提供;restore 不需要(overlay 链来自快照) |
 | `checkpoint.mode` | `local` | 暂停态本机 capture:`local` = 现有 tarstream,`bundle` = multi-Manifest ZIP Bundle；输出固定在 Sandbox `BaseDir/checkpoint`(§1.6、§8.1) |
 | `checkpoint.merge_ref` / `.drop_caches` | 未设置 | Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省 |
@@ -2471,7 +2471,7 @@ plugin 平面,机群路由经 registry 聚合。
 
 - 单一 **`sandbox-runtime.bundle`** 由 `guest-runtime` 构建:把 `sandboxer` 产出的
   `sandbox-init` 打成 virtio-pmem/DAX runtime,并在 `/opt/sandbox-runtime/bin/`
-  内置固定版本 `envd`、`flatten-ctl`、`mkfs.erofs`。runtime bundle 保持 raw EROFS
+  内置固定版本 `envd`、`flatten-ctl`。runtime bundle 保持 raw EROFS
   从 offset 0 开始,随后是 zero padding 和只含空 `.kuasar.digest.<hex>` marker 的
   ZIP;该runtime carrier的identity覆盖EROFS+padding,构建时一次生成,启动/恢复从 EOF
   直接读取。成品总长
@@ -2532,7 +2532,7 @@ plugin 平面,机群路由经 registry 聚合。
 | `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧只用 `info --json --manifest-config` 验证 registry referer hit | 三种 image carrier 的 config 读取和最终发布均走 sandboxer typed opener；租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | sandboxer `pkg/artifact` + `pkg/sandbox` | Builder 的 image/Sandbox logical source 直接 Manifest ingest 或 single-root Bundle publication；本地 IMG→顶层 E 无中间文件 | typed role、customer key、write admission、root-last、sparse semantics、named-location atomic/reuse validation 均由 sandboxer 统一实现；Build finale 不调用 `manifest-ctl store` |
 | `manifest-ctl`(accelerator) | 独立的 Manifest store CLI；Builder final publication 不经该 CLI | `MANIFEST_KEY` 经调用进程环境 |
-| `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、[Build §5](node-build_zh.md#5-按目标执行与发布)) |
+| `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 的宿主工具 | 确定性打包 runtime；Guest 由静态 flatten-ctl 内部的 Go 库导出 EROFS 镜像(§11、[Build §5](node-build_zh.md#5-按目标执行与发布)) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,[Build §5](node-build_zh.md#5-按目标执行与发布)) | 原版不改;协议 pin 见 §4.2/§4.3 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
 | `node-ctl proxy` | UDS routesync(双向 h2c 帧化 JSON)+ 独立 Data listener | 同节点,运维带外起;Proxy master 注册一次,worker 共享继承 Data listener fd + shm 路由视图;master 冻结的 EffectiveConfig 含 `paths.run_root`,worker 不重读 `proxy.yaml`(node-proxy.md §2/§3/§4) |
