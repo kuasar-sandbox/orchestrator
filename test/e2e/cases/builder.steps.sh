@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["bpf-map","bpf-tc","cgroup-v2","docker","journald","kvm","netns","systemd","tun","userfaultfd"]
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/builder_env.sh"
 write_builder_config

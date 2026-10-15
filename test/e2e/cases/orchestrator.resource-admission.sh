@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["cgroup-v2","docker","kvm","tun"]
 set -euo pipefail
 : "${E2E_LIB:?E2E_LIB must point to prepared helpers}"
 . "$E2E_LIB/orchestrator/resource.sh"

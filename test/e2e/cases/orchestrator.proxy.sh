@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: []
 set -euo pipefail
 : "${BIN:?}"
 : "${WORK:?}"

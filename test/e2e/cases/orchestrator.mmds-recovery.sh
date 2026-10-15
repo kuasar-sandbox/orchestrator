@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["bpf-map","bpf-tc","cgroup-v2","docker","kvm","netns","systemd","tun","userfaultfd"]
 set -euo pipefail
 MMDS_ROUTES_E2E=1
 MMDS_SECRET_INITIAL_VALUE=MMDS_SECRET_INITIAL_GUEST_E2E

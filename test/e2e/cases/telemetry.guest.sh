@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["bpf-map","bpf-tc","cgroup-v2","docker","kvm","netns","systemd","tun","userfaultfd"]
 set -euo pipefail
 fail() { echo "$*" >&2; exit 1; }
 [ -x "${TELEMETRY_GRPC_PROBE_BIN:-}" ] || fail "prepared TELEMETRY_GRPC_PROBE_BIN is required"

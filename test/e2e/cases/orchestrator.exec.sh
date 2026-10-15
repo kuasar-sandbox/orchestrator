@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: ["bpf-map","bpf-tc","cgroup-v2","docker","kvm","netns","systemd","tun","userfaultfd"]
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/execute_env.sh"
 write_orchestrator_config unset controller

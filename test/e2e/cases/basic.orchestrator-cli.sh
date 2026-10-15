@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# e2e-requires: []
 set -euo pipefail
 
 : "${BIN:?BIN must point to the prepared platform binary directory}"
