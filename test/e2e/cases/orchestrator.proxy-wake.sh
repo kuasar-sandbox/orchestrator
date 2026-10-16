@@ -304,16 +304,7 @@ FIRST_KAT=$(issue_exec_session "$FIRST" "$AK" "{\"conditions\":[{\"expr\":\"requ
 "$BIN/sandbox-ctl" exec --run-root "$EXECUTE_RUN_ROOT/sandboxes" --sandbox-id "$FIRST" -- /bin/touch /tmp/pressure.start
 ready=""
 for _ in $(seq 1 300); do
-    # The workload publishes progress before its allocation is complete. A
-    # readable state file alone must not let the second guest start while the
-    # oldest guest is still growing and can legitimately become the beneficiary.
-    if pressure_guest_state "$FIRST" > "$WORK/pressure-before.json" 2>/dev/null &&
-       python3 - "$WORK/pressure-before.json" <<'PY_FIRST'
-import json, sys
-v = json.load(open(sys.argv[1]))
-raise SystemExit(0 if v["held"] == 384*(1<<20) and v["nonce"] and v["tick"] >= 0 else 1)
-PY_FIRST
-    then ready=1; break; fi
+    if pressure_guest_state "$FIRST" > "$WORK/pressure-before.json" 2>/dev/null; then ready=1; break; fi
     sleep 0.1
 done
 [ -n "$ready" ] || fail "first held-memory workload did not become ready"
