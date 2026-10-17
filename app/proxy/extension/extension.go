@@ -24,8 +24,20 @@ type MasterHost interface {
 
 // ManagementWrapper is an optional capability implemented by the same
 // MasterExtension object. WrapManagement is called once after Start succeeds.
-// The returned handler may add, rewrite, or replace any stats-socket route;
+// The returned handler may add, rewrite, or replace stats-socket routes except
+// the core-owned /readyz and /status paths;
 // returning nil fails startup.
 type ManagementWrapper interface {
 	WrapManagement(http.Handler) http.Handler
+}
+
+// Shutdown is an optional capability of the configured master or worker
+// extension. After all data and MMDS business has drained, the core cancels the
+// Start context and calls Shutdown once to join background work. ctx is the
+// remaining original shutdown budget, not a new timeout. Implementations must
+// return by its deadline; an expired or failed callback forces process cleanup.
+// InplaceRestart requires this capability even when signal triggering is off.
+// Ordinary startup remains compatible with extensions implementing only Start.
+type Shutdown interface {
+	Shutdown(context.Context) error
 }

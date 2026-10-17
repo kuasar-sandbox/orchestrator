@@ -114,7 +114,7 @@ Proxy's [public material types](../app/proxy/proxy.go) are deliberately differen
 | Type | Fields or method |
 |---|---|
 | `Config` | Alias of `config.Proxy` |
-| `Runtime` | `Logger *slog.Logger`, `TLS TLSMaterialProvider`, `MasterExtension extension.MasterExtension`, `WorkerExtension extension.WorkerExtension`; the opposite role's extension field is ignored |
+| `Runtime` | `ListenerFiles map[string]*os.File`, `Logger *slog.Logger`, `TLS TLSMaterialProvider`, `MasterExtension extension.MasterExtension`, `WorkerExtension extension.WorkerExtension`; the opposite role's extension field is ignored |
 | `TLSMaterial` | `CertificateChain [][]byte`, `PrivateKey crypto.Signer`, `ClientCAs *x509.CertPool`; no `RootCAs` |
 | `TLSMaterialProvider` | `TLSMaterial(context.Context) (TLSMaterial, error)`; no purpose argument |
 | `TLSMaterialProviderFunc` | Function adapter with that exact signature |
@@ -123,6 +123,83 @@ Proxy's [public material types](../app/proxy/proxy.go) are deliberately differen
 `RoleMaster = "master"` and `RoleWorker = "worker"`. Certificate/signer matching, paired presence, empty-material TLS disablement and required verified client certificates with `ClientCAs` follow the same server-material constraints. Core retains minimum TLS 1.2 and `h2`/`http/1.1` ALPN. `Hooks.Configure` takes `(context.Context, *Config) error`; `Hooks.BindRuntime` takes `(context.Context, Process, *Runtime) error`, as shown above.
 
 Process-owned mapping and transport cleanup are defined once in the [Proxy worker lifetime contract](node-proxy.md#91-worker-lifetime-and-transport-cancellation). Public source, Hook and wrapper interfaces follow below; those are not another data-plane implementation.
+
+<a id="proxy-lifecycle"></a>
+### Proxy lifecycle, named listeners and InplaceRestart
+
+Each master incarnation runs Configure once from the accepted original input.
+B's derived paths never become the next baseline. BindRuntime returns fresh
+process-local bindings for each master and worker epoch. InplaceRestart reruns
+initialization in the pinned target image; it does not mutate a running
+instance's frozen configuration or dynamically load extensions.
+
+Master BindRuntime may deliver `Runtime.ListenerFiles`. A successful return
+transfers file ownership to App even if a later startup step fails; a failing
+hook retains ownership. The name set is frozen on return. Supply independent
+duplicates when retaining handles elsewhere. Worker hooks must not deliver
+listener files: workers receive internal bootstrap copies. Named inputs can
+also come from `app/activation.Receive()`; the final master automatically
+consumes activation when entering through node-ctl. Do not deliver the same
+name through both sources. Configuration explicitly selects names; see
+[listener and deployment rules](node-proxy.md#95-named-listeners-and-systemd-deployment).
+
+The public App provides:
+
+```go
+type RestartID string
+func (a *App) WaitReady(context.Context) error
+func (a *App) Status() Status
+func (a *App) Shutdown(context.Context) error
+func (a *App) InplaceRestart(context.Context) (RestartID, error)
+```
+
+WaitReady observes this instance's business readiness, including initial
+Bookmark and all configured workers. Status owns its snapshot and separates
+local readiness, whole-service availability and operation progress. Shutdown
+includes B and fixes the first configured deadline. With a zero timeout, this
+explicit call still drains gracefully without a deadline. It returns
+`ErrForcedClose` when required;
+canceling a wait does not cancel cleanup. A stop requested before Run prevents
+startup. From a handler, arrange shutdown asynchronously so it cannot wait for
+its own request to drain.
+
+InplaceRestart returns acceptance plus an ID. A canceled pre-acceptance context
+aborts the request; afterward the engine continues independently. Observe
+Status/logs for completion because exec replaces the caller's Go stack.
+`ErrNotReady`, `ErrStopped`, `ErrRestartInProgress` and `ErrIncompatible` are
+recognizable with `errors.Is`. Incompatible conductor/target/resources or an
+extension without completion support reject the operation before draining A.
+B and workers cannot start nested operations.
+
+`inplace_restart` defaults to false and controls only native main-entry SIGUSR2
+registration. Both signal and direct App calls require positive
+`shutdown_timeout`; enabling the signal with a zero timeout fails configuration
+validation. Run retains SIGINT/TERM
+handling; RunContext leaves trigger/signal assembly to the embedding entry.
+Keep custom triggers on the main coordinator (`Status.CoordinatorPID` equals
+the current master PID) and preserve their configuration
+when the executable entry runs again. The core action does not choose a signal.
+
+Both master and worker extensions may implement this optional completion point:
+
+```go
+type Shutdown interface {
+    Shutdown(context.Context) error
+}
+```
+
+Business drains before the core cancels Start's context and invokes Shutdown
+with the remaining budget. Join background work and release only owned runtime
+handles; handle partially failed Start as well. No-background-work extensions
+can return immediately. Ordinary startup retains compatibility without this
+interface; InplaceRestart requires it regardless of the signal setting.
+Callback errors retain their meaning; a returned error alone is not reported as
+forced closure. Deadline expiry and actual forced cleanup remain observable.
+`Traffic().Get` exposes `InplaceRestart` while service observations may be incomplete;
+idle consumers must wait for normal single-instance observations. The
+[custom-proxy example](../examples/custom-proxy/README.md) joins its route Watch.
+Lifecycle, listener and control resources remain core-owned; extensions should
+not close service-shared listeners or retain Hosts after Shutdown completion.
 
 ### Telemetry bootstrap and extension
 
@@ -489,9 +566,10 @@ type ManagementWrapper interface {
 }
 ```
 
-`WrapManagement` wraps the existing handler on `stats_socket`. It may add or
-override any local path, proxy elsewhere, or call the built-in traffic handler.
-There is no reserved namespace or conflict registry. Returning nil aborts
+`WrapManagement` wraps the existing handler on `stats_socket`. The core reserves
+`/readyz` and `/status`; all other paths retain the ability to add/override local
+handlers, proxy elsewhere or call the built-in traffic handler. There is no
+additional reserved namespace or conflict registry. Returning nil aborts
 startup; panics are not recovered. A nil extension or one without this optional
 interface uses the original handler directly.
 

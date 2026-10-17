@@ -136,17 +136,49 @@ type Table struct {
 
 // Create replaces path with a zeroed route table of capacity records.
 func Create(path string, capacity int) (*Table, error) {
+	return create(path, capacity, false)
+}
+
+// CreateExclusive creates a private continuation's table without replacing any
+// preexisting file. Failed creation removes only the newly created artifact.
+func CreateExclusive(path string, capacity int) (*Table, error) {
+	return create(path, capacity, true)
+}
+
+func create(path string, capacity int, exclusive bool) (_ *Table, returnErr error) {
 	if capacity <= 0 {
 		capacity = defaultCapacity
 	}
 	if err := os.MkdirAll(parentDir(path), 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
+	if exclusive {
+		flags = os.O_RDWR | os.O_CREATE | os.O_EXCL
+	}
+	f, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	defer func() {
+		if exclusive && returnErr != nil {
+			_ = os.Remove(path)
+		}
+	}()
+	return CreateFromFile(path, f, capacity)
+}
+
+// CreateFromFile initializes a service-owned file after the prior instance's
+// mappings and workers have ended. The caller retains file ownership. It must
+// never be called while an older instance can still use this table.
+func CreateFromFile(path string, f *os.File, capacity int) (*Table, error) {
+	if capacity <= 0 {
+		capacity = defaultCapacity
+	}
+	if err := f.Truncate(0); err != nil {
+		return nil, err
+	}
 	size := Size(capacity)
 	if err := f.Truncate(int64(size)); err != nil {
 		return nil, err

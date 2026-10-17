@@ -25,9 +25,9 @@ import (
 const (
 	workerBootstrapEnvironment = "KUASAR_INTERNAL_PROXY_WORKER_BOOTSTRAP_FD"
 	workerBootstrapMagic       = "kuasar-proxy-worker-bootstrap"
-	workerBootstrapVersion     = 2
-	workerConfigSchemaVersion  = 2
-	workerFDProtocolVersion    = 2
+	workerBootstrapVersion     = 3
+	workerConfigSchemaVersion  = 3
+	workerFDProtocolVersion    = 3
 	maxWorkerBootstrapBytes    = maxEffectiveConfigBytes + 64<<10
 )
 
@@ -40,6 +40,7 @@ const (
 type Process = proxyextension.Process
 
 type workerFDMapping struct {
+	Control   int `json:"control"`
 	Data      int `json:"data"`
 	MMDS      int `json:"mmds"`
 	Wake      int `json:"wake"`
@@ -50,6 +51,7 @@ type workerFDMapping struct {
 }
 
 type workerEnvelope struct {
+	Identity            controlIdentity                  `json:"identity"`
 	Magic               string                           `json:"magic"`
 	ProtocolVersion     int                              `json:"protocolVersion"`
 	Role                proxyextension.Role              `json:"role"`
@@ -66,6 +68,7 @@ type workerEnvelope struct {
 
 // WorkerBootstrap is a verified, one-use master-to-worker handoff.
 type WorkerBootstrap struct {
+	identity           controlIdentity
 	process            Process
 	effective          *EffectiveConfig
 	executableIdentity componentexec.ExecutableIdentity
@@ -138,12 +141,16 @@ func ClearWorkerEnvironment() {
 	}
 }
 
-func newWorkerBootstrapFile(workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, fds workerFDMapping) (*os.File, error) {
+func newWorkerBootstrapFile(workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, fds workerFDMapping, identity controlIdentity) (*os.File, error) {
 	if effective == nil || effective.config == nil || len(effective.raw) == 0 {
 		return nil, fmt.Errorf("proxy worker bootstrap: effective config is required")
 	}
 	if err := validateWorkerIdentity(workerID, epoch); err != nil {
 		return nil, err
+	}
+	identity.WorkerID, identity.WorkerEpoch = workerID, epoch
+	if identity.BootID == "" {
+		return nil, fmt.Errorf("proxy worker bootstrap: boot id is required")
 	}
 	if workerIndex < 0 || workerIndex >= effective.config.Workers {
 		return nil, fmt.Errorf("proxy worker bootstrap: invalid worker index")
@@ -156,7 +163,8 @@ func newWorkerBootstrapFile(workerIndex int, workerID string, epoch uint64, effe
 		return nil, err
 	}
 	raw, err := json.Marshal(workerEnvelope{
-		Magic: workerBootstrapMagic, ProtocolVersion: workerBootstrapVersion,
+		Identity: identity,
+		Magic:    workerBootstrapMagic, ProtocolVersion: workerBootstrapVersion,
 		Role: RoleWorker, WorkerID: workerID, WorkerEpoch: epoch,
 		WorkerIndex:         workerIndex,
 		ConfigSchemaVersion: workerConfigSchemaVersion, FDProtocolVersion: workerFDProtocolVersion,
@@ -234,6 +242,9 @@ func ReceiveWorkerBootstrap() (*WorkerBootstrap, error) {
 	if err := validateWorkerIdentity(encoded.WorkerID, encoded.WorkerEpoch); err != nil {
 		return nil, err
 	}
+	if encoded.Identity.BootID == "" || encoded.Identity.WorkerID != encoded.WorkerID || encoded.Identity.WorkerEpoch != encoded.WorkerEpoch {
+		return nil, fmt.Errorf("proxy worker bootstrap: mismatched control identity")
+	}
 	if encoded.WorkerIndex < 0 {
 		return nil, fmt.Errorf("proxy worker bootstrap: invalid worker index")
 	}
@@ -260,6 +271,7 @@ func ReceiveWorkerBootstrap() (*WorkerBootstrap, error) {
 		return nil, fmt.Errorf("proxy worker bootstrap: invalid worker index")
 	}
 	return &WorkerBootstrap{
+		identity:  encoded.Identity,
 		process:   Process{Role: RoleWorker, WorkerID: encoded.WorkerID, WorkerEpoch: encoded.WorkerEpoch},
 		effective: effective, executableIdentity: encoded.ExecutableIdentity, fds: encoded.FDs, workerIndex: encoded.WorkerIndex,
 	}, nil
@@ -282,6 +294,7 @@ func validateWorkerFDMapping(fds workerFDMapping, bootstrapFD int) error {
 		fd       int
 		optional bool
 	}{
+		{name: "control", fd: fds.Control},
 		{name: "data", fd: fds.Data},
 		{name: "mmds", fd: fds.MMDS, optional: true},
 		{name: "wake", fd: fds.Wake},
@@ -305,11 +318,15 @@ func validateWorkerFDMapping(fds workerFDMapping, bootstrapFD int) error {
 }
 
 func newSealedWorkerFile(payload []byte) (*os.File, error) {
-	fd, err := unix.MemfdCreate("kuasar-proxy-worker-bootstrap", unix.MFD_ALLOW_SEALING|unix.MFD_CLOEXEC)
+	return newSealedRuntimeFile("kuasar-proxy-worker-bootstrap", payload)
+}
+
+func newSealedRuntimeFile(name string, payload []byte) (*os.File, error) {
+	fd, err := unix.MemfdCreate(name, unix.MFD_ALLOW_SEALING|unix.MFD_CLOEXEC)
 	if err != nil {
 		return nil, fmt.Errorf("proxy worker bootstrap: memfd: %w", err)
 	}
-	file := os.NewFile(uintptr(fd), "kuasar-proxy-worker-bootstrap")
+	file := os.NewFile(uintptr(fd), name)
 	if err := writeWorkerPayload(file, payload); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("proxy worker bootstrap: write: %w", err)

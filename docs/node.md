@@ -1258,9 +1258,9 @@ Name must be referenced by a current secret route. PUT replaces opaque bytes wit
 
 **③ Plugin plane:** PUT /internal/plugin/{id}/register registers Proxy master or an observer and holds the h2c connection as both lease and routesync stream ([node-proxy.md](node-proxy.md) §4). First body frame is register{caps}; route_wake subscriptions can later send wake/route_barrier_ack. Response is hello(policy) → initial upserts → bookmark → live upsert/delete/barrier. Wake/ACK share a serialized upstream writer.
 
-Capabilities are independent: subscribe route/route_wake, proxy marker with optional stats_socket, and mmds. Barrier participation requires exact proxy ID, route_wake subscription and proxy marker, not stats_socket. Disconnect unregisters; a new same-ID registration unregisters/disconnects its predecessor. Optional plugin_pidfile checks peer PID, otherwise socket 0600 applies. Proxy and agents subscribe locally, independently of cross-network node-link mTLS.
+Capabilities are independent: subscribe route/route_wake, proxy marker with optional stats_socket, and mmds. Barriers cover the current admitted registrations with route_wake subscription and proxy marker, independently of their IDs and stats_socket. Disconnect unregisters; a new same-ID registration unregisters/disconnects its predecessor. Optional plugin_pidfile checks peer PID, otherwise socket 0600 applies. During InplaceRestart, the original coordinator opens B's conductor connection and passes it to B, preserving this PID admission. Proxy and agents subscribe locally, independently of cross-network node-link mTLS.
 
-Confidential MMDS projection cannot be self-granted by arbitrary plugins. Only exact ID proxy with route_wake, non-nil proxy and mmds=true receives service registry, mmds_routes and mmds_route_secret_values. Ordinary observers and cluster/node-link do not receive route values; other IDs claiming mmds=true are rejected. Master fails closed before full Bookmark and clears mutable route/value/service views on disconnect rather than indefinitely serving stale secrets.
+Confidential MMDS projection requires an admitted registration with route_wake, non-nil proxy and mmds=true. The registration ID identifies ownership and same-ID replacement; it does not grant a role. Ordinary observers and cluster/node-link do not receive route values. Master fails closed before the initial Bookmark and clears mutable route/value/service views on disconnect rather than indefinitely serving stale secrets.
 
 **④ API plane:** remaining paths use the same wrapped e2b control http.Handler as api.listen, including export/import, over local plaintext h2c with API-key authentication. Export/import CLI uses it (§8.1).
 
@@ -1738,7 +1738,7 @@ Cluster registration explicitly carries both; they are not derived from bind add
 
 Router→node currently uses plaintext HTTP/CONNECT. The two registered endpoints must therefore address distinct internal plaintext listeners, never TLS-enabled node listeners. Supplied deployment examples use conductor `:3000` and Proxy `:3443`, terminating external TLS at Router or a load balancer. Node-link retains its independent mTLS.
 
-Proxy master can register an optional stats_socket. Each worker pushes Prometheus counters and per-Sandbox absolute traffic values through its own socketpair. Conductor's traffic API queries only the current trusted Proxy registration's stats endpoint. Route-barrier participation is independent of this socket. Each logical ingress is counted once, at the final node worker.
+Proxy master can register an optional stats_socket. Each worker pushes Prometheus counters and per-Sandbox absolute traffic values through its own socketpair. Conductor's traffic API queries one current admitted Proxy registration's stats endpoint. During InplaceRestart, `inplaceRestart: true` tells consumers that these values may omit another instance's work; idle consumers must account for this incomplete window. There is no cross-instance aggregation. Route-barrier participation is independent of this socket. Each logical ingress is counted once, at the final node worker.
 
 ### 9.2 Route authority and broadcast
 

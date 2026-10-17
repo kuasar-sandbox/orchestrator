@@ -39,7 +39,7 @@ import (
 var version = "0.2.0-dev"
 
 func main() {
-	if proxyapp.WorkerBootstrapPresent() {
+	if proxyapp.WorkerBootstrapPresent() || proxyapp.ContinuationPresent() {
 		componentexec.ClearEnvironment()
 		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		if err := publicproxy.New(publicproxy.Hooks{}).Run(); err != nil {

@@ -213,14 +213,20 @@ func guardRequest(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{
+// HTTPServer constructs the existing HTTP/1 endpoint without starting I/O. The
+// Proxy worker owns its ordered data/MMDS shutdown through a drain controller.
+func (s *Server) HTTPServer(ctx context.Context) *http.Server {
+	return &http.Server{
 		Handler:           s.Handler(),
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
+}
+
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	srv := s.HTTPServer(ctx)
 	go func() {
 		<-ctx.Done()
 		// Close cancels every in-flight request context, so handlers parked

@@ -31,7 +31,7 @@ the live telemetry registration's separate API UDS, not Proxy StatsSocket.
 - **Separate forwarding and control planes:** the proxy decides routes, applies authentication policy, and forwards bytes. The conductor owns sandbox lifecycle authority.
 - **One subscribing master, multiple forwarding workers:** only the proxy master registers a config-socket plugin. Workers neither connect to the conductor nor hold independent routesync subscriptions.
 - **Separate route views:** fixed-length data-plane fields enter shared memory, which workers mmap read-only. Variable-length `mmds_routes` and `mmds_route_secret_values` remain in the master's bounded heap. Workers query an exact path through inherited local socketpair RPC. Secret-value plaintext never enters mmap.
-- **Inherited listener FDs:** the master binds the data/MMDS listeners and passes the same FD to all workers, which accept and forward connections. A future systemd socket-activation implementation could replace master-side binding without changing this worker model.
+- **Inherited listener FDs:** configuration selects a TCP address or a named activated listener for data and MMDS independently. The master gives each worker its own descriptor for the same listening socket. Service-owned copies preserve listeners across InplaceRestart.
 - **Configurable forwarding network namespace:** with `proxy_netns` pointing to the connector management namespace, workers run there; their `floatingip:port` access and the MMDS listener also use that namespace.
 - **No upstream connection pool:** ordinary HTTP dials and closes a backend for each request. Each CONNECT binds one request to one TCP/UDS connection. Connections are never reused across sandboxes or ports.
 - **Authentication policy precedes lifecycle effects:** ordinary HTTP and non-exec CONNECT follow `LookupRoute → authorize(RouteBinding) → TryBeginParking → ActivateRoute → fresh Route → dial`. Lookup never wakes, resumes, parks, or dials; Activate revalidates the binding before and after lifecycle effects. Invalid ordinary credentials cannot wake a sandbox or consume traffic parking/admission when the node's effective policy is `enforce`. Node `log`/`off` modes admit ordinary requests according to §6.
@@ -56,9 +56,11 @@ Static customization interfaces, configuration hooks, runtime binding, private r
 | Field | Default | Meaning |
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | Conductor config-socket; the master registers on its plugin plane and synchronizes routes |
-| `paths.proxy_executable` | Empty | Absolute executable for a statically customized Proxy master; empty uses the built-in implementation. Static diagnostics check regular/executable status, absence of group/world writability, and same-file identity, without inferring ownership from the diagnostic command's EUID. Actual root dispatch requires root ownership; non-root dispatch accepts root or its own EUID. Used only for node-ctl → master dispatch, never to select a worker executable |
+| `paths.proxy_executable` | Empty | Absolute executable for a statically customized Proxy master; empty uses the built-in implementation. Static diagnostics check regular/executable status, absence of group/world writability, and same-file identity, without inferring ownership from the diagnostic command's EUID. Actual root dispatch requires root ownership; non-root dispatch accepts root or its own EUID. It selects node-ctl → master dispatch and the target opened when InplaceRestart is accepted; workers use their own master's image |
 | `paths.run_root` | Required | Node RunRoot; workers construct `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock` locally. This path is not transmitted in routesync `Policy` or shared route records |
-| `data_listen` | Required | The node's only sandbox data ingress; the master binds once and gives workers the same listener FD |
+| `data_listen` | Required | The node's sandbox data ingress: TCP `host:port`, or `fd=<name>` for an explicitly supplied named TCP listener |
+| `shutdown_timeout` | `0` | Non-negative duration; zero disables InplaceRestart and makes automatic termination immediate. Explicit App.Shutdown still drains gracefully. A positive budget is shared by data/MMDS and, for full stop, all instances |
+| `inplace_restart` | `false` | Register SIGUSR2 in the original master entry when true; direct `App.InplaceRestart` works with either value |
 | `proxy_netns` | Empty | Forwarding namespace; empty uses the current namespace. Otherwise workers run there and the conductor-projected MMDS address is bound there; `data_listen` stays in the master's current namespace |
 | `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | Traffic-stats UDS owned and registered with the conductor by the master. Must be absolute, cannot conflict with config/SHM paths, and has mode 0600 |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | Shared route-table mmap file |
@@ -98,11 +100,11 @@ client / cluster-router ── data ───► Proxy DataEndpoint
 
 Key points:
 
-- The conductor sees one fixed plugin ID, `proxy`. Registration's `Proxy` field is the trusted Proxy marker; `StatsSocket` is a separate optional traffic-stats address.
+- A/A′ register as `proxy`; temporary B uses a private instance ID. IDs identify ownership and same-name replacement. The admitted registration's `Proxy` capability identifies its role; `StatsSocket` is a separate optional traffic-stats address.
 - Only the master listens on `stats_socket`. The conductor's public traffic GET reads the master's aggregate cache through this UDS, without querying workers on demand. A missing `StatsSocket` does not remove the route-barrier participant.
 - Workers do not register plugins or hold independent complete route tables. Route mmap remains master-write/worker-read-only; in admission mmap, each worker writes only its own absolute-counter column. The master restarts crashed workers, and replacements read the current route/admission view directly.
 - Master exit takes its workers down. After systemd restarts the master, it registers again and rebuilds shared tables.
-- The plugin ID must be exactly `proxy`, and registration must satisfy `subscribe.kind=route_wake`, `proxy!=nil`, and `mmds=true` before the conductor projects MMDS policy, routes, and secret values. Ordinary observers and node-link never receive these confidential values.
+- Admitted registrations must satisfy `subscribe.kind=route_wake`, `proxy!=nil`, and `mmds=true` before the conductor projects MMDS policy, routes, and secret values. Connection admission, valid MMDS state and registration epochs remain enforced. Ordinary observers and node-link never receive these confidential values.
 
 ## 4. routesync and shared route views
 
@@ -111,7 +113,7 @@ routesync remains framed JSON over h2c; the proxy master dials the conductor:
 ```text
 master → conductor : register{subscribe: route_wake, proxy{stats_socket?}, mmds}
 master → conductor : wake{sid} / route_barrier_ack{barrier_id}
-conductor → master : hello{policy}
+conductor → master : hello{policy, proxy_capabilities}
 conductor → master : upsert* → bookmark → upsert/delete/route_barrier...
 ```
 
@@ -133,7 +135,9 @@ master:    traffic patch validate/merge → admission apply → route SHM Upsert
 
 `ApplyUpsert` treats admission and route changes as one rollback-capable transaction. Failure in validation, arena allocation, MMDS projection, or route SHM Upsert restores the previous admission/route view. The master's ACK only means that the `starting RouteBinding` and effective limits needed for parking have entered its serving view. It does not mean the sandbox is running, a backend is dialable, envd has completed `/init`, or any worker is healthy/ready. Zero serving workers, worker restarts, and stats-stream faults do not enter the Create condition. One upstream writer serializes Wake and BarrierAck frames. If an earlier Upsert fails to apply, the subscriber sends no ACK and terminates the session; the conductor rolls back the waiting Create and returns 503. Barrier IDs exist only in this in-memory coordination, not the route changelog, shared table, Sandbox schema, or log fields.
 
-Currently there is one master participant, fixed plugin ID `proxy`. After ACK, Create rechecks that the registration epoch is still the current lease. Disconnect, same-ID replacement, and late or old-session ACKs cannot complete the barrier. Internally completion requires all members of the participant set, not a quorum. If multiple traffic-serving masters are explicitly configured in the future, all must ACK before 201 can return.
+The barrier includes all valid Proxy participants, including A and B during replacement. After ACK, Create rechecks registration epochs and the participant set. Disconnect, same-ID replacement, and late or old-session ACKs cannot complete the barrier. All members must ACK before 201 can return. `Hello.proxy_capabilities` includes `inplace_restart_v1` when conductor supports these multi-instance semantics; its absence permits compatible single-instance service but rejects InplaceRestart before draining A.
+
+With conductor `paths.plugin_pidfile` configured, the PID allowlist remains enforced. The original coordinator opens B's dedicated conductor connection and passes its descriptor over private control, including on reconnect. The connection retains the authorized coordinator PID. B still registers separately and receives its own route stream; other processes gain no new admission rule.
 
 The MMDS extension is not stored in fixed records. For each active sandbox, the master replaces routes and values under one lock; `route_capacity` bounds the heap-entry count. `BeginSync` and routesync disconnection immediately clear the heap and mark it unavailable. A new master starts with an empty view; a full `Bookmark` is required before queries reopen. A worker-only restart does not clear the surviving master's heap; its replacement reconnects through inherited RPC and waits for the shared view to be synchronized before serving. Each `Hello{Policy}` atomically replaces the whole service registry. Running/starting Upsert updates the heap before publishing the SHM route; paused/Delete revokes the heap before updating SHM. Thus workers that sampled an old active row also fail closed, preventing a new lifecycle from being combined with old secrets. `RunID` enters fixed records to bind MMDSv2 tokens to an incarnation. MMDS route declarations and secret-value plaintext never enter fixed records, metrics, or logs.
 
@@ -156,7 +160,7 @@ The shared view is an asynchronously converging route cache. Default creation us
 
 Protected `RouteEntry` states are `starting|running|paused|dead`. Entries explicitly carry `StableID`, `APISecret`, `APISecretFingerprint`, `ManifestKeyFingerprint`, `ServiceSecret`, `EnvdAccessToken`, `TrafficAccessToken`, and `ForwardAccessToken`. Raw ManifestKey never enters routes. Node forwarding selects only EnvdAccessToken or ForwardAccessToken for its target. TrafficAccessToken is projected in the protected view for external gateways and e2b data-plane components, but the node platform layer does not consume it. `StableID + ServiceSecret` verifies exec KATs; shared-table keys and local run directories still use NodeSandboxID exclusively. Existing `MmdsSecret` independently signs MMDS tokens and is not a route secret value; route secret values enter only the master's heap through the trusted projection described above.
 
-On the routesync wire, `MaxInflightPatch` carries only explicit sandbox leaves. The master merges it with destination-node `proxy.yaml` defaults and writes fixed effective values plus `{admission slot,generation}` into route SHM. Pointers enter neither SHM nor route equality. Current internal boundaries are routesync version 8, route SHM schema 9, worker bootstrap/config/FD protocol version 2, and admission arena version 2. These are hard compatibility cuts: mismatched conductor/proxy/registry/router protocol versions or old SHM/bootstrap formats fail closed.
+On the routesync wire, `MaxInflightPatch` carries only explicit sandbox leaves. The master merges it with destination-node `proxy.yaml` defaults and writes fixed effective values plus `{admission slot,generation}` into route SHM. Pointers enter neither SHM nor route equality. Current internal boundaries are routesync version 8, route SHM schema 9, worker bootstrap/config/FD protocol version 3, and admission arena version 2. These are hard compatibility cuts: mismatched conductor/proxy/registry/router protocol versions or old SHM/bootstrap formats fail closed.
 
 Resource-paused and explicitly paused routes both park after the existing authentication policy. The node decides eligibility from current durable intent: adoption removes resource auto-recovery and its critical exemption, but a real still-parked request or later Wake can use ordinary rules. Starting continues to wait for the new running endpoint. No delivered nonidempotent request is replayed, and previously killed native exec children are not preserved. Pressure facts also survive full route synchronization/Bookmark and extension projection; they do not enter NodeList or Cluster placement decisions.
 
@@ -473,7 +477,7 @@ The hot path never writes the socket. One sender may coalesce arbitrary intermed
 
 Master queries read a continuously maintained aggregate cache, without GET-time fan-out to workers. It compares `idleSince` using Linux boottime and emits only UTC wall time. The effective timestamp is the maximum of worker idle time, the trust start of the current master/worker set, and the first observation of current RunID as running. A disconnected worker stats stream immediately starts a 503 window and terminates that worker. Only after `Wait` confirms exit and kernel closure of backend FDs does the master remove all of its contributions. A replacement sends hello+ready with a new epoch. Stats remains unavailable until ready, and the worker starts serving data listeners only after stats readiness.
 
-Workers send absolute state to the master over socketpairs; the conductor queries only the currently registered `stats_socket`. Route SHM remains master-write/worker-read-only, without a stats area or worker writes. Mutable worker admission columns exist only in the separate arena, never in route records that can move during backshift.
+Workers send absolute state to their master over socketpairs; the conductor queries one live admitted Proxy. During InplaceRestart, `inplaceRestart` marks its instance-local statistics as incomplete service traffic. Failed reads remain unavailable and do not count as zero. Route SHM remains master-write/worker-read-only, without a stats area or worker writes. Mutable worker admission columns exist only in the separate arena, never in route records that can move during backshift.
 
 ## 9. Reliability
 
@@ -493,9 +497,9 @@ restarting workers inside an otherwise long-lived process.
 Successful route SHM and admission arena mappings belong to the worker process.
 `PreparedWorker.Close` closes inherited descriptors but does not unmap either
 mapping. Existing handlers, extensions and traffic GC may still hold references
-when `Run` returns. No ownership flag, reference count, graceful-drain protocol or
-`http.Server.Shutdown` join is needed to reclaim process-owned mappings. The
-kernel reclaims them when the subprocess exits. Mapping constructors still clean
+when a forced `Run` completion returns. Graceful draining waits for business and
+extension completion first; process exit remains the final mapping ownership
+boundary. The kernel reclaims mappings when the subprocess exits. Constructors still clean
 up their own unsuccessful operations; low-level mapping tests can explicitly
 unmap only after every reader has stopped. Worker lifecycle tests use child
 processes instead of requiring production teardown to serve test-only reuse.
@@ -514,6 +518,216 @@ CONNECT retains half-close semantics; its original HTTP request context is not a
 universal tunnel-close signal. Native exec keeps its existing KAT / first-frame /
 CEL / traffic-admission ordering.
 
+
+### 9.2 Business readiness and service status
+
+Each master reserves `GET /readyz` and `GET /status` on its own 0600 `stats_socket`.
+Both return JSON with `Cache-Control: no-store`; other methods return 405.
+`/readyz` returns 200 only after initial Bookmark, local initialization and every
+configured worker's actual data and enabled-MMDS acceptance; otherwise it returns
+503. Zero sandboxes is valid; disabled MMDS does not block readiness. Later
+worker or route-state faults remove readiness until recovery. These reads never
+call a Guest. Stats-stream readiness and an open TCP port are insufficient.
+
+```sh
+curl --fail --silent --show-error --max-time 2 \
+  --unix-socket /run/sandbox/proxy-stats.sock http://localhost/readyz
+curl --silent --show-error --max-time 2 \
+  --unix-socket /run/sandbox/proxy-stats.sock http://localhost/status
+```
+
+Status exposes local `ready`, `instance_id`, `boot_id`, `pid`, `phase`,
+`routes_synced`, `workers.{ready,expected}`, `data`, `mmds` and `reasons`.
+Phases are `starting/prepared/serving/draining/stopped/failed`; an unconfirmed
+peer is `unknown`. Reasons include `initial_sync_pending`, `worker_not_ready`,
+`route_state_unavailable` and `draining`. `service_ready` requires at least one
+known ready instance and no complete-service stop. `instances` includes actual
+management and metrics addresses. `inplace_restart` holds the current or last
+operation's ID, phase, pinned target identity, attempts, latest error, next
+attempt, result and forced-close count. Transition/result logs retain history.
+The shared data port is never used to confirm a particular candidate's readiness.
+
+### 9.3 Bounded shutdown
+
+Shutdown independently stops data and MMDS acceptance and waits for each
+endpoint's accepted work. A worker exits after both have ended; dependencies
+remain available while its work still uses them. This does not guarantee request
+sequences such as data calling MMDS or consecutive data/MMDS requests.
+Ordinary responses, streaming bodies, HTTP/1 WebSocket and CONNECT tunnels, and
+the supported HTTP/2/h2c paths participate. Existing keep-alive/H2 connections
+cannot begin new business after drain starts; established tunnels can finish.
+Listener Serve returning, HTTP Shutdown finishing and hijacked tunnels ending
+are separate events. No new transport protocol is implied.
+
+For HTTP/1, draining half-closes the response direction and consumes pending
+input until the peer closes its write direction or the shared deadline expires.
+This preserves a completed response when another request was already pipelined.
+A keep-alive client that reads the complete response but leaves its write
+direction open can therefore consume the remaining drain budget. Closing that
+connection at the deadline is reported as forced even when the response body
+was delivered in full. That result describes connection cleanup and does not
+mean that an already completed response failed.
+
+`shutdown_timeout` defaults to zero. Automatic termination (SIGINT/SIGTERM in
+Run, or RunContext cancellation) then cleans up immediately; explicit
+`App.Shutdown(ctx)` still drains accepted work without a configured deadline.
+InplaceRestart requires a positive timeout. With a positive value, one instance
+shares the budget across data and MMDS. Each of the two restart drains gets one
+budget; full Shutdown shares one deadline across A/A′ and B. Repeated calls never
+extend it, and caller cancellation ends only the wait. Deadline expiry closes
+remaining work and reaps processes;
+`ErrForcedClose` and `completed_with_forced_close` distinguish this outcome.
+An extension's optional `Shutdown(context.Context) error` joins its work after
+the core cancels its Start context. See [extension lifecycle](extensions.md#proxy-lifecycle).
+
+### 9.4 InplaceRestart
+
+Both built-in Proxy and xproxy use **A → ready B → drained A → original-PID exec
+→ ready A′ → drained/reaped B → A′ alone**. Each takeover requires business
+readiness from dedicated local control. Initial Bookmark suffices for route
+initialization; there is no old-instance catch-up condition. At most two
+instances may retain business. B and workers cannot start nested operations.
+
+Deploy a compatible binary as a separate protected file and atomically replace
+the configured executable path. An accepted operation opens and pins that
+target's identity and digest plus the original declarative input. B, A′ and
+retries use those inputs even if the deployment path or YAML later changes.
+Each master reruns Configure from that original input and checks takeover
+compatibility. For initial adoption from an older version, use ordinary service
+startup first. Conductor must advertise `inplace_restart_v1`, and configured
+extensions must provide Shutdown; these checks also apply to programmatic calls.
+
+With a positive `shutdown_timeout` and `inplace_restart: true`, trigger the original master:
+
+```sh
+systemctl kill --kill-who=main --signal=SIGUSR2 kuasar-proxy.service
+```
+
+The default false leaves SIGUSR2 unregistered; it does not disable
+`App.InplaceRestart(ctx)` when the timeout is positive. Enabling the signal with
+a zero timeout is a configuration error. `App.Run()` retains SIGINT/SIGTERM handling. A custom
+entry uses `RunContext()` and calls App actions itself; see the
+[public lifecycle API](extensions.md#proxy-lifecycle). Acceptance returns an
+operation ID, not final completion; the original Go stack cannot survive exec.
+Inspect status throughout the operation, including B's private socket while the
+original master's management endpoint is temporarily unavailable.
+
+Before A stops accepting, a failed B is drained/reaped and A keeps serving.
+After that boundary the coordinator recovers automatically: it replaces failed
+B, retries failed exec, retries A′ initialization, repairs A′ during B drain,
+and retries B reclamation. Candidate preparation is bounded by 30 seconds;
+retry delays are 1/2/4/8/10 seconds, capped at 10 with no fixed attempt limit.
+Preparation, drain and backoff have separate clocks. Stop cancels future
+attempts. Persistent faults remain visible; removing their cause resumes the
+same operation. Runtime-fatal main-process faults require deployment supervision.
+Recovery never replays user requests or restores connections lost in a crash.
+
+A/A′ retain configured `shm_path` and `stats_socket`; B creates checked private
+names in the same parent directories. Only owned resources are removed after
+actual process exit. Address listeners and activated listeners both retain
+service copies; they are not rebound during replacement. Closing an instance's
+listener never performs a socket-wide shutdown on another holder.
+
+For metrics, empty disables all instances; fixed `host:p` uses p for A/A′ and
+p+1 for B; port 0 remains dynamically assigned. Port 65535 rejects the operation.
+B binds and retains its metrics listener before A drains; a conflict fails that
+preparation without scanning further ports. IPv6 follows the same rule. Counters
+may reset per instance and scraping may have a short gap. Ordinary startup logs
+a metrics bind failure and continues serving; restart requires the configured
+metrics resources to be available before A drains.
+
+Traffic statistics remain instance-local. The existing traffic response exposes
+`inplaceRestart: true` from acceptance through operation cleanup, including when
+B answers during the exec gap. Idle consumers must treat these observations as
+incomplete and read normal single-instance statistics again after completion.
+An unavailable read is still an error, never zero or evidence that restart ended.
+There are no persistent statistics records, completion files or cross-instance
+counter aggregation. Each generation keeps existing admission limits and
+single-generation concurrency slack. Reserve capacity for two instances, two
+quota sets, FD/memory peaks and the adjacent metrics port.
+
+### 9.5 Named listeners and systemd deployment
+
+`data_listen: "fd=proxy-data"` and conductor `mmds.listen: "fd=proxy-mmds"`
+select names exactly; either may independently remain a TCP address. Names are
+case-sensitive, nonempty, and contain no whitespace, colon or NUL. Invalid,
+missing, duplicate, unused, non-listening or non-TCP inputs fail startup; two
+names cannot alias one socket. Environment inputs never override configuration
+or cause an address to fall back to an inherited listener.
+
+`app/activation.Receive()` adapts `LISTEN_FDS` and `LISTEN_FDNAMES` beginning at
+FD 3. Absent input yields an empty map; zero accepts an empty name set. An
+absent LISTEN_PID is allowed; a supplied empty, invalid or mismatched PID fails
+without taking or closing its FDs. Processing clears activation environment;
+owned descriptors are close-on-exec until explicitly passed to successors.
+The final master consumes activation across node-ctl → xproxy; worker bootstrap
+and logging descriptors remain separate. For direct runtime file ownership,
+see [Runtime.ListenerFiles](extensions.md#proxy-lifecycle).
+
+The following units are deployment templates. Create the connector management
+namespace and forwarding/address configuration first, then choose the MMDS
+address that matches it. For example, with `proxy_netns: sw0_mgmt` and connector
+forwarding to `127.0.0.1:19254` in that namespace:
+
+```ini
+# kuasar-proxy-data.socket
+[Socket]
+ListenStream=0.0.0.0:3443
+Accept=no
+FileDescriptorName=proxy-data
+Service=kuasar-proxy.service
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# kuasar-proxy-mmds.socket
+[Socket]
+ListenStream=127.0.0.1:19254
+NetworkNamespacePath=/run/netns/sw0_mgmt
+Accept=no
+FileDescriptorName=proxy-mmds
+Service=kuasar-proxy.service
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# kuasar-proxy.service
+[Unit]
+Requires=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
+After=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
+
+[Service]
+Type=simple
+ExecStart=/opt/kuasar/bin/node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+Sockets=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
+KillMode=mixed
+TimeoutStopSec=45s
+Restart=on-failure
+```
+
+Set `shutdown_timeout: 30s` and `inplace_restart: true` in proxy.yaml for this
+signal example, plus `data_listen: fd=proxy-data`. Conductor owns
+`mmds: {enabled: true, listen: fd=proxy-mmds}`. Omit the MMDS unit and its service
+references when MMDS is disabled. Keep runtime directory permissions, binary
+ownership, namespace access and control-socket admission consistent with the
+service identity. Add ordering for the deployment's actual conductor and network
+setup units. Put `NetworkNamespacePath` in the MMDS unit's `[Socket]` section,
+create that namespace first, and verify its listener with
+`ip netns exec sw0_mgmt ss -ltn`. Putting only the service in a namespace does
+not move existing sockets. See
+[systemd namespace semantics](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml).
+
+`KillMode=mixed` lets the main process coordinate graceful stop before systemd's
+final cgroup cleanup. Keep `TimeoutStopSec` above the application budget with
+reaping margin. Ordinary `systemctl restart kuasar-proxy.service` retains active
+socket units; queued connections still depend on backlog and client timeouts.
+For complete shutdown, stop both socket units and the service together so
+incoming traffic cannot activate it again. Install or alter production units
+only through the deployment process.
 
 ## 10. Performance
 

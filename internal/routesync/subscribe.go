@@ -33,6 +33,10 @@ type InvalidatableSink interface {
 	InvalidateSync()
 }
 
+// CapabilitySink observes the current authority's optional compatibility
+// promises. Their absence does not reject an ordinary single-instance session.
+type CapabilitySink interface{ SetProxyCapabilities([]string) }
+
 // WakeSource yields sandbox ids the subscriber wants the orchestrator to resume. It
 // blocks until a wake is available or ctx is done (ok=false on ctx done). A nil
 // WakeSource means the subscriber issues no wakes (a pure route observer).
@@ -129,6 +133,9 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	// Reader: preserve the established BeginSync-before-policy callback order,
 	// then apply route frames until EOF/error.
 	s.sink.BeginSync()
+	if sink, ok := s.sink.(CapabilitySink); ok {
+		sink.SetProxyCapabilities(hello.Hello.ProxyCapabilities)
+	}
 	s.sink.SetPolicy(hello.Hello.Policy)
 	for {
 		m, err := ReadMsg(resp.Body)

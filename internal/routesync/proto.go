@@ -253,11 +253,16 @@ type Msg struct {
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.
 type Hello struct {
-	Version    int               `json:"version"`
-	Policy     Policy            `json:"policy,omitempty"`
-	ResumeFrom string            `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
-	Redirect   *NodeLinkRedirect `json:"redirect,omitempty"`
+	ProxyCapabilities []string          `json:"proxy_capabilities,omitempty"`
+	Version           int               `json:"version"`
+	Policy            Policy            `json:"policy,omitempty"`
+	ResumeFrom        string            `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
+	Redirect          *NodeLinkRedirect `json:"redirect,omitempty"`
 }
+
+// InplaceRestartV1 promises capability-based Proxy registration, all-participant
+// route barriers, and instance-local statistics marked during InplaceRestart.
+const InplaceRestartV1 = "inplace_restart_v1"
 
 // ValidateHello enforces the single supported protocol version before a client
 // processes route or command frames from the session.

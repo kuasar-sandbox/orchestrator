@@ -7,10 +7,16 @@ import (
 )
 
 func listenUnix(path string) (net.Listener, error) {
+	return listenUnixMode(path, false)
+}
+
+func listenUnixMode(path string, exclusive bool) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	_ = os.Remove(path)
+	if !exclusive {
+		_ = os.Remove(path)
+	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err

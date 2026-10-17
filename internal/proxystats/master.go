@@ -46,7 +46,10 @@ type runMarker struct {
 // MasterStats holds continuously aggregated worker contributions. Public reads
 // touch this cache only; they never query worker processes.
 type MasterStats struct {
-	mu sync.Mutex
+	// InplaceRestart is set before sharing the master with readers. It reports
+	// operation state only; no other instance's counters are collected.
+	InplaceRestart func() bool
+	mu             sync.Mutex
 
 	metrics  *metrics.M
 	expected map[string]struct{}
@@ -301,7 +304,12 @@ func (m *MasterStats) Available() bool {
 }
 
 // SandboxTrafficStats implements orch.SandboxTrafficProvider structurally.
-func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID string, profile types.Profile, state types.State) (*api.TrafficStats, error) {
+func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID string, profile types.Profile, state types.State) (result *api.TrafficStats, returnErr error) {
+	defer func() {
+		if result != nil && m.InplaceRestart != nil {
+			result.InplaceRestart = m.InplaceRestart()
+		}
+	}()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.availableLocked() {
@@ -331,7 +339,7 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	}
 	baseline := laterPoint(m.trustSince, marker.since)
 	aggregate := m.traffic[sandboxID]
-	result := &api.TrafficStats{
+	result = &api.TrafficStats{
 		State: string(state), Services: make(map[string]api.ServiceTrafficStats, len(services)),
 	}
 	var topIdle timePoint

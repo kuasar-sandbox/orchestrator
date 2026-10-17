@@ -96,7 +96,15 @@ func (r *Registry) Remove(p *Plugin) {
 func (r *Registry) markRouteStreamReady(p *Plugin) {
 	r.mu.Lock()
 	if r.m[p.ID] == p {
+		joining := !p.ready
 		p.ready = true
+		if joining && proxyRouteParticipantReady(p) {
+			// A new subscriber may have snapshotted before a pending mutation.
+			// Existing barriers cannot certify its view without its own ACK.
+			for _, b := range r.barriers {
+				b.failLocked(ErrProxyRouteLeaseChanged)
+			}
+		}
 	}
 	r.mu.Unlock()
 }
@@ -120,20 +128,21 @@ func (r *Registry) routeBarrierAck(p *Plugin, barrierID string) {
 }
 
 // BeginProxyRouteBarrier captures the complete current traffic-serving proxy
-// participant set. V1 has one trusted ProxyPluginID lease, but proxyRouteBarrier
-// deliberately implements all-of completion over a set.
+// participant set. IDs identify leases; the admitted capabilities identify roles.
 func (r *Registry) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	p := r.m[routesync.ProxyPluginID]
-	if !proxyRouteParticipantReady(p) {
-		return nil, ErrProxyRouteUnavailable
+	var participants []*Plugin
+	for _, p := range r.m {
+		if proxyRouteParticipantReady(p) {
+			participants = append(participants, p)
+		}
 	}
-	return r.beginRouteBarrierLocked([]*Plugin{p})
+	return r.beginRouteBarrierLocked(participants)
 }
 
 func proxyRouteParticipantReady(p *Plugin) bool {
-	return p != nil && p.ready && p.ID == routesync.ProxyPluginID &&
+	return p != nil && p.ready &&
 		p.Caps.Subscribe != nil && p.Caps.Subscribe.Kind == routesync.KindRouteWake &&
 		p.Caps.Proxy != nil
 }
@@ -234,6 +243,12 @@ func (b *proxyRouteBarrier) Commit() error {
 			return ErrProxyRouteLeaseChanged
 		}
 	}
+	for _, p := range r.m {
+		if proxyRouteParticipantReady(p) && b.required[p.epoch] != p {
+			delete(r.barriers, b.id)
+			return ErrProxyRouteLeaseChanged
+		}
+	}
 	delete(r.barriers, b.id)
 	return nil
 }
@@ -262,16 +277,31 @@ func (b *proxyRouteBarrier) failLocked(err error) {
 	b.signalLocked()
 }
 
-// ProxyStatsTarget returns the master-only stats endpoint from the current
-// trusted proxy registration. The registration connection remains its lease.
+// ProxyStatsTarget returns one live admitted Proxy's statistics. Prefer the
+// ordinary registration while it exists; B can answer during the exec gap.
+// The returned snapshot is instance-local, with its InplaceRestart flag telling
+// consumers when it cannot be treated as complete service traffic.
 func (r *Registry) ProxyStatsTarget() (string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	plugin := r.m[routesync.ProxyPluginID]
-	if plugin == nil || plugin.Caps.Proxy == nil || plugin.Caps.Proxy.StatsSocket == nil || plugin.Caps.Proxy.StatsSocket.Path == "" {
+	var selected *Plugin
+	for _, p := range r.m {
+		if p.Caps.Proxy == nil {
+			continue
+		}
+		endpoint := p.Caps.Proxy.StatsSocket
+		if endpoint == nil || !validLocalSocket(endpoint.Path) {
+			continue
+		}
+		if selected == nil || p.ID == routesync.ProxyPluginID ||
+			(selected.ID != routesync.ProxyPluginID && p.epoch > selected.epoch) {
+			selected = p
+		}
+	}
+	if selected == nil {
 		return "", false
 	}
-	return plugin.Caps.Proxy.StatsSocket.Path, true
+	return selected.Caps.Proxy.StatsSocket.Path, true
 }
 
 // handlePluginRegister authenticates the subscriber (plugin_pidfile / socket perms),
@@ -311,16 +341,16 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	defer s.deps.Plugins.Remove(p)
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
 	hooks := &routesync.StreamHooks{
-		RouteStreamReady: func() { s.deps.Plugins.markRouteStreamReady(p) },
-		RouteBarrierAck:  func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
+		ProxyCapabilities: []string{routesync.InplaceRestartV1},
+		RouteStreamReady:  func() { s.deps.Plugins.markRouteStreamReady(p) },
+		RouteBarrierAck:   func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
 	}
 	routesync.ServeStream(ctx, w, r.Body, s.deps.RouteSource, reg, hooks, s.log)
 	s.log.Info("plugin deregistered", "id", id)
 }
 
-func isTrustedMMDSProxyRegistration(id string, reg routesync.Register) bool {
-	return id == routesync.ProxyPluginID &&
-		reg.Subscribe != nil && reg.Subscribe.Kind == routesync.KindRouteWake &&
+func isTrustedMMDSProxyRegistration(_ string, reg routesync.Register) bool {
+	return reg.Subscribe != nil && reg.Subscribe.Kind == routesync.KindRouteWake &&
 		reg.Proxy != nil && reg.Mmds
 }
 

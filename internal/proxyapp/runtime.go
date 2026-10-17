@@ -8,6 +8,8 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"maps"
+	"net"
 	"os"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
@@ -24,6 +26,7 @@ type TLSMaterial struct {
 
 // Bindings are process-local adapters populated by the public proxy App.
 type Bindings struct {
+	ListenerFiles   map[string]*os.File
 	Logger          *slog.Logger
 	TLSMaterial     func(context.Context) (TLSMaterial, error)
 	MasterExtension proxyextension.MasterExtension
@@ -33,6 +36,15 @@ type Bindings struct {
 // Runtime is fully resolved before a master creates shared state/listeners or
 // a worker advertises readiness.
 type Runtime struct {
+	// inherited and retain are available only to the private service engine.
+	// retain consumes the complete duplicate collection on success.
+	inherited       *retainedResources
+	retain          func(*retainedResources) error
+	privatePaths    bool
+	inplaceRestart  func() bool
+	candidateDial   func(context.Context) (net.Conn, error)
+	Instance        *Instance
+	ListenerFiles   map[string]*os.File
 	Logger          *slog.Logger
 	DataTLS         *tls.Config
 	MasterExtension proxyextension.MasterExtension
@@ -75,7 +87,8 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Proxy, bindings Bindi
 		dataTLS = serverTLSConfig(&certificate, nil)
 	}
 	return &Runtime{
-		Logger: logger, DataTLS: dataTLS,
+		ListenerFiles: maps.Clone(bindings.ListenerFiles),
+		Logger:        logger, DataTLS: dataTLS,
 		MasterExtension: bindings.MasterExtension, WorkerExtension: bindings.WorkerExtension,
 	}, nil
 }

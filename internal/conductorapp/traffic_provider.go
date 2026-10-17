@@ -10,7 +10,8 @@ import (
 )
 
 // ExternalTrafficProvider reads traffic snapshots from the currently
-// registered independent proxy master.
+// registered Proxy. During InplaceRestart, the returned flag explicitly marks
+// the instance-local snapshot as incomplete service traffic.
 type ExternalTrafficProvider struct {
 	Plugins *configsock.Registry
 }

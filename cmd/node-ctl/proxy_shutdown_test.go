@@ -283,6 +283,7 @@ route_capacity: 16
 workers: 2
 auth: off
 park_timeout: 100ms
+shutdown_timeout: 2s
 `, configSocket, filepath.Join(dir, "run"), dataAddr, filepath.Join(dir, "proxy-routes.shm"))
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)

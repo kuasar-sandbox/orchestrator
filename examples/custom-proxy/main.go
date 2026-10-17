@@ -23,6 +23,7 @@ import (
 type masterExtension struct {
 	log  *slog.Logger
 	host proxy.MasterHost
+	done chan struct{}
 }
 
 // workerExtension is a fresh object in each worker epoch. Its authentication
@@ -145,7 +146,9 @@ func privateIngressTarget(r *http.Request) (sandboxID string, port int, guestPat
 
 func (e *masterExtension) Start(ctx context.Context, host proxy.MasterHost) error {
 	e.host = host
+	e.done = make(chan struct{})
 	go func() {
+		defer close(e.done)
 		err := host.Routes().Watch(ctx, func(event proxy.RouteEvent) error {
 			e.log.Info("route observation", "kind", event.Kind, "generation", event.Generation, "sandbox_id", event.SandboxID)
 			return nil
@@ -156,6 +159,22 @@ func (e *masterExtension) Start(ctx context.Context, host proxy.MasterHost) erro
 	}()
 	return nil
 }
+
+// The App cancels Start's context after business drains, before joining the
+// extension. A failed/partial Start must also be safe to finish.
+func (e *masterExtension) Shutdown(ctx context.Context) error {
+	if e.done == nil {
+		return nil
+	}
+	select {
+	case <-e.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *workerExtension) Shutdown(context.Context) error { return nil }
 
 func (e *masterExtension) WrapManagement(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

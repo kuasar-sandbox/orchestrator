@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
@@ -1280,6 +1281,11 @@ func parseAbsoluteFileURI(raw string) (*url.URL, error) {
 
 // validateProxy checks the conductor-owned proxy policy and MMDS invariants.
 func (c *Conductor) validateProxy() error {
+	if c.MMDS.Enabled {
+		if _, err := listenresource.Parse(c.MMDS.Listen); err != nil {
+			return fmt.Errorf("config: mmds.listen: %w", err)
+		}
+	}
 	switch c.Proxy.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
 	default:
@@ -1304,19 +1310,27 @@ func (c *Conductor) validateProxy() error {
 // conductor pushes the authoritative auth/park policy over the registration stream;
 // local values are bootstrap fallbacks until that handshake completes.
 type Proxy struct {
-	ConfigSocket  string             `yaml:"config_socket" json:"config_socket"`   // serve control socket to register + sync on (= serve paths.config_socket)
-	Paths         ProxyPathsConfig   `yaml:"paths" json:"paths"`                   // node-local paths used directly by proxy workers
-	DataListen    string             `yaml:"data_listen" json:"data_listen"`       // required sandbox data ingress
-	ProxyNetNS    string             `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and MMDS listen
-	StatsSocket   string             `yaml:"stats_socket" json:"stats_socket"`     // master-only traffic stats UDS; default <dir(config_socket)>/proxy-stats.sock
-	ShmPath       string             `yaml:"shm_path" json:"shm_path"`             // shared route table path; default <dir(config_socket)>/proxy-routes.shm
-	RouteCapacity int                `yaml:"route_capacity" json:"route_capacity"` // fixed shared route slots; default 65536
-	Workers       int                `yaml:"workers" json:"workers"`               // worker processes supervised by this master; default 1
-	TLS           TLSConfig          `yaml:"tls" json:"tls"`                       // data-plane listener cert (= serve's wildcard); "" = h2c
-	Auth          string             `yaml:"auth" json:"auth"`                     // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
-	ParkTimeout   string             `yaml:"park_timeout" json:"park_timeout"`     // bootstrap fallback; default 30s
-	MetricsListen string             `yaml:"metrics_listen" json:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
-	Traffic       ProxyTrafficConfig `yaml:"traffic" json:"traffic"`               // per-Sandbox traffic admission defaults
+	// ShutdownTimeout bounds automatic termination and InplaceRestart drains.
+	// Empty or zero disables restart and makes automatic termination immediate.
+	// Explicit App.Shutdown still drains gracefully without a configured deadline.
+	ShutdownTimeout string `yaml:"shutdown_timeout" json:"shutdown_timeout"`
+	// InplaceRestart controls only the native master's SIGUSR2 registration.
+	// Programmatic App.InplaceRestart requires a positive ShutdownTimeout,
+	// independently of this signal setting.
+	InplaceRestart bool               `yaml:"inplace_restart" json:"inplace_restart"`
+	ConfigSocket   string             `yaml:"config_socket" json:"config_socket"`   // serve control socket to register + sync on (= serve paths.config_socket)
+	Paths          ProxyPathsConfig   `yaml:"paths" json:"paths"`                   // node-local paths used directly by proxy workers
+	DataListen     string             `yaml:"data_listen" json:"data_listen"`       // required sandbox data ingress
+	ProxyNetNS     string             `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and MMDS listen
+	StatsSocket    string             `yaml:"stats_socket" json:"stats_socket"`     // master-only traffic stats UDS; default <dir(config_socket)>/proxy-stats.sock
+	ShmPath        string             `yaml:"shm_path" json:"shm_path"`             // shared route table path; default <dir(config_socket)>/proxy-routes.shm
+	RouteCapacity  int                `yaml:"route_capacity" json:"route_capacity"` // fixed shared route slots; default 65536
+	Workers        int                `yaml:"workers" json:"workers"`               // worker processes supervised by this master; default 1
+	TLS            TLSConfig          `yaml:"tls" json:"tls"`                       // data-plane listener cert (= serve's wildcard); "" = h2c
+	Auth           string             `yaml:"auth" json:"auth"`                     // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
+	ParkTimeout    string             `yaml:"park_timeout" json:"park_timeout"`     // bootstrap fallback; default 30s
+	MetricsListen  string             `yaml:"metrics_listen" json:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+	Traffic        ProxyTrafficConfig `yaml:"traffic" json:"traffic"`               // per-Sandbox traffic admission defaults
 }
 
 // Clone returns a deep copy of the independent proxy configuration.
@@ -1420,8 +1434,22 @@ func ValidateProxyFinal(p *Proxy) error {
 }
 
 func (p *Proxy) validateDeclarative() error {
+	if p.DataListen != "" {
+		if _, err := listenresource.Parse(p.DataListen); err != nil {
+			return fmt.Errorf("proxy config: data_listen: %w", err)
+		}
+	}
+	if p.ShutdownTimeout != "" {
+		duration, err := time.ParseDuration(p.ShutdownTimeout)
+		if err != nil || duration < 0 {
+			return fmt.Errorf("proxy config: shutdown_timeout must be a non-negative duration")
+		}
+	}
 	if p.Paths.ProxyExecutable != "" && !filepath.IsAbs(p.Paths.ProxyExecutable) {
 		return fmt.Errorf("proxy config: paths.proxy_executable must be absolute")
+	}
+	if p.InplaceRestart && p.ShutdownTimeoutDur() <= 0 {
+		return fmt.Errorf("proxy config: inplace_restart requires a positive shutdown_timeout")
 	}
 	switch p.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
@@ -1458,6 +1486,12 @@ func (p *Proxy) ParkTimeoutDur() time.Duration {
 		return 30 * time.Second
 	}
 	return d
+}
+
+// ShutdownTimeoutDur returns the validated budget. An omitted value is zero.
+func (p *Proxy) ShutdownTimeoutDur() time.Duration {
+	duration, _ := time.ParseDuration(p.ShutdownTimeout)
+	return duration
 }
 
 func decodeKnownYAML(b []byte, out any) error {

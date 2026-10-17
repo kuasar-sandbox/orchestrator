@@ -1636,16 +1636,16 @@ master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连�
 经同一个上行 writer 串行发送。能力相互
 **独立,不强制组合**:`subscribe`(`route` | `route_wake`),`proxy{stats_socket?}`
 (可信 Proxy registration marker 及可选 traffic stats endpoint),`mmds`.route barrier participant
-只要求固定 `proxy` id,`route_wake` subscription 与 `proxy` marker,不依赖 stats socket.**断连即反注册**;同
+覆盖当前通过准入且具有 `route_wake` subscription 与 `proxy` marker 的注册，不依赖 id 或 stats socket。**断连即反注册**;同
 id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
-其中,未配则仅靠 socket 0600(同 admin).Proxy master,平台 agent 均经此订阅.
+其中,未配则仅靠 socket 0600(同 admin)。InplaceRestart 期间由原主协调进程打开 B 的 conductor 连接并传给 B，保持此 PID 准入。Proxy master,平台 agent 均经此订阅.
 此平面是**节点本地** UDS,与接入集群的 node-link(§10,跨网 mTLS)正交。
 
-MMDS confidential 投影不是任意 plugin 自报的权限。只有 id 精确为 `proxy`,且同时满足
+MMDS confidential 投影要求注册通过连接准入，且同时满足
 `subscribe.kind=route_wake`、`proxy!=nil`、`mmds=true` 的 registration 才收到 conductor
 MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 route observer
-两者均不收,node-link/cluster stream 也不收。伪装为其它 id 的 `mmds=true` registration
-被拒绝.Proxy master 在完整 Bookmark 前 fail closed,断流即清空可变 route/value/service
+两者均不收,node-link/cluster stream 也不收。id 只标识注册归属和同名替换，不授予角色。
+Proxy master 在初始 Bookmark 前 fail closed,断流即清空可变 route/value/service
 视图,不会无限期服务断连前的 secret。
 
 **④ api 平面** — 其余路径回落到 e2b 控制面 handler(与 TLS `api.listen` **同一个**
@@ -2250,7 +2250,7 @@ mTLS.
 
 Proxy master 注册可选 `stats_socket`,每个 worker 经独立 socketpair 推送 Prometheus counter
 与 per-sandbox traffic 绝对值;conductor traffic API 只查询当前 trusted Proxy registration 的
-stats endpoint.route barrier participation 不依赖 stats socket.每条 logical ingress 只在最终
+stats endpoint。InplaceRestart 期间返回 `inplaceRestart: true`，提醒 idle 消费方此时统计可能缺少另一实例的在途业务，不构造跨实例汇总。route barrier participation 不依赖 stats socket.每条 logical ingress 只在最终
 node worker 统计一次.
 
 ### 9.2 路由权威与广播

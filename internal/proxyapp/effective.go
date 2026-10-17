@@ -14,6 +14,19 @@ import (
 
 const maxEffectiveConfigBytes = 4 << 20
 
+// compatibleTakeover compares only settings needed to reuse service resources
+// and preserve its admission, worker and termination contract. Configure still
+// runs from the original input; certificate paths and policy fallbacks can vary.
+func compatibleTakeover(a, b *publicconfig.Proxy) bool {
+	return a.DataListen == b.DataListen && a.ProxyNetNS == b.ProxyNetNS &&
+		a.ConfigSocket == b.ConfigSocket && a.Paths == b.Paths &&
+		a.StatsSocket == b.StatsSocket && a.ShmPath == b.ShmPath &&
+		a.Workers == b.Workers && a.RouteCapacity == b.RouteCapacity &&
+		a.MetricsListen == b.MetricsListen && a.Traffic == b.Traffic &&
+		a.ShutdownTimeoutDur() == b.ShutdownTimeoutDur() &&
+		a.InplaceRestart == b.InplaceRestart && (a.TLS.Cert == "") == (b.TLS.Cert == "")
+}
+
 // EffectiveConfig is the canonical, immutable declarative snapshot shared by
 // one proxy master and all of its worker epochs. Runtime bindings never enter
 // this value.

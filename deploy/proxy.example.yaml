@@ -24,6 +24,11 @@ paths:
 # fd to all workers. This is the node's only sandbox data entry point. The paired
 # conductor example uses :3000, so both services can run on one node.
 data_listen: ":3443"
+# Use "fd=proxy-data" for a named activated TCP listener; configuration selects
+# the source, without environment override or bind fallback.
+shutdown_timeout: 30s                       # positive, shared by data/MMDS drain
+inplace_restart: false                     # true registers SIGUSR2 in the main entry;
+                                           # App.InplaceRestart works with either value
 
 # Forwarding plane netns. Set this to the connector --mgmt-extract netns so workers'
 # floatingip dials and the conductor-projected MMDS listener live with the vswitch

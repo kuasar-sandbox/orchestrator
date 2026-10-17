@@ -42,6 +42,20 @@ start_proxy() {
     PROXY_HELPER_PID=$!
 }
 
+proxy_business_ready() {
+    local pid="$1" stats_socket="$2"
+    curl --fail --silent --show-error --noproxy '*' --max-time 2 \
+        --unix-socket "$stats_socket" http://localhost/readyz 2>/dev/null \
+        | python3 -c '
+import json, sys
+status = json.load(sys.stdin)
+assert status["ready"] is True and status["pid"] == int(sys.argv[1])
+assert status["routes_synced"] is True
+assert status["workers"]["ready"] == status["workers"]["expected"] > 0
+assert status["data"] == "serving" and status["mmds"] in ("serving", "disabled")
+' "$pid" 2>/dev/null
+}
+
 wait_proxy_ready() {
     local pid="$1" host="$2" port="$3" stats_socket="$4" log="$5"
     local timeout_seconds="${6:-30}" deadline
@@ -51,12 +65,7 @@ wait_proxy_ready() {
             collect_proxy_log "$log"
             return 1
         fi
-        if [ -S "$stats_socket" ] && timeout 1 bash -c '
-            exec 9<>"/dev/tcp/$1/$2"
-            printf "GET / HTTP/1.1\r\nHost: readiness.invalid\r\nConnection: close\r\n\r\n" >&9
-            IFS= read -r line <&9
-            case "$line" in HTTP/*) exit 0;; *) exit 1;; esac
-        ' _ "$host" "$port" 2>/dev/null; then
+        if proxy_business_ready "$pid" "$stats_socket"; then
             return 0
         fi
         sleep 0.1

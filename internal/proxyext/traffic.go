@@ -45,7 +45,8 @@ func (s *trafficSource) Get(ctx context.Context, sandboxID string) (proxyextensi
 		return proxyextension.TrafficView{}, err
 	}
 	view := proxyextension.TrafficView{
-		SandboxID: sandboxID, Profile: route.Profile,
+		InplaceRestart: stats.InplaceRestart,
+		SandboxID:      sandboxID, Profile: route.Profile,
 		State:       proxyextension.RouteState(stats.State),
 		MaxInflight: maxInflight,
 		Inflight: proxyextension.TrafficInflight{

@@ -38,9 +38,8 @@ API UDS，不使用 Proxy StatsSocket。
 - **分离路由视图**:固定长度的数据面字段写共享内存,worker mmap 只读;可变长的
   `mmds_routes` 与 `mmds_route_secret_values` 只放 master 有界 heap,worker 经继承的
   本机 socketpair RPC 按 exact path 查询。secret plaintext 不进入 mmap。
-- **listener fd 继承**:master 绑定 data/MMDS listener,把同一个 fd 传给所有
-  worker;worker 执行 accept 和转发。后续可把 master bind 替换为 systemd socket
-  activation,worker 模型不变。
+- **listener FD 继承**：data 与 MMDS 分别按配置选择 TCP 地址或命名激活 listener。
+  每个 worker 持有同一监听 socket 的独立描述符；服务级副本跨 InplaceRestart 保留。
 - **转发 netns 可配置**:`proxy_netns` 指向 connector 管理平面 netns 时,worker 进程
   在该 netns 内运行,proxy 到 `floatingip:port` 的访问和 MMDS listener 都位于其中.
 - **无上游连接池**:普通 HTTP 为每条请求建立独立后端连接并关闭;CONNECT 是一条请求绑定一条
@@ -78,9 +77,11 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
-| `paths.proxy_executable` | 空 | 静态定制 Proxy master 的绝对 executable;空使用内置实现.静态 config 诊断检查 regular/executable,非 group/world-writable 和 same-file,不按诊断 EUID 判断 owner;实际 root dispatch 只接受 root-owned,非 root dispatch 接受 root-owned 或本 EUID-owned.只用于 node-ctl → master,不用于选择 worker executable |
+| `paths.proxy_executable` | 空 | 静态定制 Proxy master 的绝对 executable;空使用内置实现.静态 config 诊断检查 regular/executable,非 group/world-writable 和 same-file,不按诊断 EUID 判断 owner;实际 root dispatch 只接受 root-owned,非 root dispatch 接受 root-owned 或本 EUID-owned.用于 node-ctl → master 分派及 InplaceRestart 受理时打开目标;worker 使用自己 master 的程序映像 |
 | `paths.run_root` | (必填) | 节点 RunRoot;worker 本地构造 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
-| `data_listen` | (必填) | 节点唯一 sandbox 数据入口;master 绑定一次并把同一 listener FD 交给 worker |
+| `data_listen` | (必填) | Sandbox 数据入口：TCP `host:port`，或显式交付的命名 TCP listener `fd=<name>` |
+| `shutdown_timeout` | `0` | 非负时长；0 时 InplaceRestart 不可用、自动终止立即收尾，显式 App.Shutdown 仍优雅排空。正值由 data/MMDS 共用，完整停机跨全部实例共用 |
+| `inplace_restart` | `false` | true 时原生主入口注册 SIGUSR2；两种取值都允许直接调用 App.InplaceRestart |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns.非空时 worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | master 独占监听并注册给 conductor 的 traffic stats UDS;必须是绝对路径且不得与 config/SHM 路径冲突,权限 0600 |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
@@ -123,17 +124,18 @@ client / cluster-router ── data ───► Proxy DataEndpoint
 
 要点:
 
-- conductor 只看到一个固定 plugin id `proxy`;registration 的 `Proxy` 字段是可信 Proxy
-  marker,`StatsSocket` 是独立可选的 traffic stats 地址.
+- A/A′ 使用 `proxy` 注册，临时 B 使用私有实例 ID。ID 表示注册归属与同名替换；
+  经过准入的 registration `Proxy` 能力表示角色，`StatsSocket` 是独立可选的统计地址。
 - `stats_socket` 只由 master 监听;conductor 的公开 traffic GET 经该 UDS 读 master
   聚合缓存,不会查询时扇出 worker.缺少 `StatsSocket` 不影响 route barrier participant.
 - worker 不注册 plugin,不保存独立全量路由表;route mmap 仍是 master 单写/worker 只读,
   admission mmap 则由每个 worker 只写自己的 absolute-counter column。崩溃后由 master
   重启,replacement 直接读取当前 route/admission view。
 - master 退出会带走其 worker;systemd 重启 master 后重新注册并重建共享表。
-- plugin id 必须精确为 `proxy`,且 registration 同时满足
+- 通过连接准入的 registration 同时满足
   `subscribe.kind=route_wake`、`proxy!=nil`、`mmds=true`,conductor 才投影 MMDS policy、
-  routes 和 secret values;普通 observer 与 node-link 均收不到这些 confidential values。
+  routes 和 secret values；继续校验 MMDS 状态和注册代次。普通 observer 与 node-link
+  均收不到这些 confidential values。
 
 ## 4. routesync 与共享路由视图
 
@@ -179,10 +181,13 @@ projection 或 route SHM Upsert 失败都会恢复旧 admission/route view。mas
 Create 回滚并返回 503。barrier id 只存在于本次内存协调,不进入 route changelog、共享表、
 Sandbox schema 或日志字段。
 
-当前只有固定 plugin id `proxy` 的一个 master participant。Create 在 ACK 后再次核验该
-registration epoch 仍为当前租约;断连、同 id replacement、迟到或旧 session ACK 都不能完成
-barrier。完成规则内部按 all-of participant set 实现,不采用 quorum;若以后显式配置多个
-traffic-serving master,必须全部 ACK 后才能返回 201。
+屏障覆盖全部有效 Proxy 参与者，包括重启期间的 A 与 B。Create 在 ACK 后再次核验
+注册代次和参与集合；断连、同 ID 替换、迟到或旧 session ACK 都不能完成屏障。
+全部参与者 ACK 后才能返回 201。Conductor 在 `Hello.proxy_capabilities` 中用
+`inplace_restart_v1` 声明这些多实例配套能力；缺失时兼容的单实例仍可运行，
+InplaceRestart 在排空 A 前拒绝。
+
+配置 conductor `paths.plugin_pidfile` 时仍严格执行 PID 白名单。原主进程连接固定的 conductor socket，通过私有控制连接把 B 专用连接交给它，重连也走此路径；SO_PEERCRED 保持已获授权的原主 PID。B 独立注册并接收路由，不增加其他进程的准入规则。
 
 MMDS 扩展不写固定表。master 对每个 active sandbox 在一个锁内替换 routes + values;
 heap entry 总数受 `route_capacity` 限制。`BeginSync` 与 routesync 断开
@@ -252,7 +257,7 @@ MMDS token 签名,不等于 route secret values;后者仅经上述可信投影�
 `proxy.yaml` 默认值与该 patch 合并后,把 fixed effective value 及
 `{admission slot,generation}` 写入 route SHM,不会把 pointer 写入 SHM 或用于 route equality。
 当前内部兼容边界为 routesync version 8、route SHM schema 9、worker bootstrap/config/FD
-protocol version 2，以及 admission arena version 2。这些都是内部 hard cut；协议版本不匹配的
+protocol version 3，以及 admission arena version 2。这些都是内部 hard cut；协议版本不匹配的
 conductor/proxy/registry/router 或旧 SHM/bootstrap 不兼容且 fail closed。
 
 初始 durable starting upsert 可以没有 FloatingIP、UDS 或其它 backend endpoint;worker 按
@@ -728,7 +733,7 @@ worker;只有 `Wait` 确认进程退出、内核已关闭其 backend FD 后才�
 replacement 以新 epoch 发 hello+ready,在 ready 前不开放 stats,并且 worker 也是在 stats ready
 后才开始 Serve 数据 listener。
 
-worker 经 socketpair 把绝对状态交给 master,conductor 只经当前注册的 `stats_socket` 查询.
+worker 经 socketpair 把绝对状态交给各自 master；conductor 查询一个已准入的当前 Proxy。InplaceRestart 期间通过 `inplaceRestart` 标记实例本地统计不代表完整服务；读取失败仍不可用，不能计为零。
 route SHM 仍是 master 单写,worker 只读,没有 stats 区或 worker 写入;worker 的 mutable admission
 column 只存在于独立 arena,不进入会因 backshift 移动的 route record。
 
@@ -760,7 +765,11 @@ column 只存在于独立 arena,不进入会因 backshift 移动的 route record
 
 Proxy worker 是专用、单次运行的子进程。内置入口及定制 App 在 `Run` 返回后必须退出该进程；它们不是供常驻进程在内部反复重启 worker 的 API。
 
-成功建立的 route SHM 和 admission arena 映射由 worker 进程拥有。`PreparedWorker.Close` 关闭继承的描述符，但不卸载这两份映射。`Run` 返回时，已有 handler、扩展和 traffic GC 仍可能持有引用。回收进程级映射不需要所有权标志、引用计数、优雅排空协议或等待 `http.Server.Shutdown`；内核在子进程退出时统一回收。映射构造函数仍清理自己尚未成功返回的操作；底层映射测试只有在所有读者退出后才可显式卸载。worker 生命周期测试使用子进程，不让生产退出路径为测试中的进程内复用增加机制。
+成功建立的 route SHM 和 admission arena 映射由 worker 进程拥有。`PreparedWorker.Close`
+关闭继承描述符，但不卸载两份映射。优雅停机先等待业务与扩展结束；强制完成时仍可能有
+handler、扩展和 traffic GC 持有引用。进程退出是最终所有权边界，内核统一回收映射。
+构造函数仍清理自己未成功返回的操作；底层测试仅在全部读者退出后显式卸载。
+worker 生命周期测试使用真实子进程。
 
 这不改变正常请求的清理。请求或完整隧道结束时仍关闭 backend，并恰好释放一次 inflight 贡献。supervisor 仍必须等待进程退出，才清理该 worker 的共享计数和统计贡献：卸载一个进程的映射不会清零其他进程仍使用的共享内存。master route apply 和 Create barrier 不等待 worker 健康或 handler 退出。
 
@@ -768,6 +777,176 @@ Proxy worker 是专用、单次运行的子进程。内置入口及定制 App �
 
 
 
+
+### 9.2 业务就绪与服务状态
+
+每个 master 在自己的 0600 `stats_socket` 上保留 `GET /readyz` 与 `GET /status`。
+两者返回 JSON 和 `Cache-Control: no-store`，其他方法返回 405。成功应用初始 Bookmark、
+完成本地初始化、全部配置 worker 进入 data 与已启用 MMDS 的实际接纳循环后，
+`/readyz` 返回 200，否则返回 503。零沙箱可就绪，MMDS disabled 不阻塞。
+后续 worker 或必要路由状态失效会撤销 ready，恢复后重新计算。检查只读状态，
+不访问 Guest；统计通道 ready 或 TCP 端口存在均不足以证明业务就绪。
+
+```sh
+curl --fail --silent --show-error --max-time 2 \
+  --unix-socket /run/sandbox/proxy-stats.sock http://localhost/readyz
+curl --silent --show-error --max-time 2 \
+  --unix-socket /run/sandbox/proxy-stats.sock http://localhost/status
+```
+
+本地字段包括 `ready`、`instance_id`、`boot_id`、`pid`、`phase`、`routes_synced`、
+`workers.{ready,expected}`、`data`、`mmds` 与 `reasons`。实例阶段为
+`starting/prepared/serving/draining/stopped/failed`，无法确认的对端为 `unknown`。
+原因码包括 `initial_sync_pending`、`worker_not_ready`、`route_state_unavailable`、
+`draining`。`service_ready` 要求服务未进入完整停机，且至少一个已知实例 ready。
+`instances` 列出实际管理与 metrics 地址；`inplace_restart` 包含当前或最近操作的 ID、
+阶段、固定目标身份、尝试次数、最近错误、下次尝试、结果和强制关闭数量。
+阶段与结果日志保留历史。共享 data 端口不用于确认某个候选实例就绪。
+
+### 9.3 有界停机
+
+data 与 MMDS 独立停止接纳、等待各自已接纳的工作；worker 在两者都结束后退出。
+仍被业务使用的依赖保留到业务结束。不保证 data 内调用 MMDS、连续 data 或 MMDS
+请求等组合流程一定成功。
+普通响应、流式正文、HTTP/1 WebSocket、CONNECT 隧道及已有 HTTP/2/h2c 路径均参与。
+排空开始后已有 keep-alive/H2 连接不能开始新业务；已建立隧道可继续完成。
+监听 Serve 返回、HTTP Shutdown 完成与 hijack 隧道结束分别等待，不增加新协议。
+
+HTTP/1 排空会半关闭响应方向，并继续读取已到达的输入，直到对端关闭写方向或共同
+期限到达，避免已有流水线请求导致完整响应被连接重置截断。合法的 keep-alive 客户端
+即使已读完响应，也可能仍保持写方向打开，因此可能耗尽剩余排空预算。期限到达时
+关闭该连接会报告强制收尾，即使响应正文已完整送达；该结果描述连接收尾，并不代表
+已经完整送达的响应失败。
+
+`shutdown_timeout` 默认 0。此时自动终止（Run 的 SIGINT/SIGTERM、RunContext 的
+context 取消）立即收尾；显式 `App.Shutdown(ctx)` 仍优雅排空已接纳业务，不设置隐含
+期限。InplaceRestart 要求正时长。正值下单实例 data/MMDS 共用预算，两轮重启排空
+各有一次预算；完整 Shutdown 对 A/A′ 与 B 共用一个期限，重复调用不延长。
+调用 context 取消只结束等待。超时关闭剩余工作并回收实际进程，
+`ErrForcedClose` 与 `completed_with_forced_close` 区分强制结果。
+核心在业务排空后取消扩展 Start 的 context，再调用可选
+`Shutdown(context.Context) error` 等待其结束，见[扩展生命周期](extensions_zh.md#proxy-lifecycle)。
+
+### 9.4 InplaceRestart
+
+内置 Proxy 与 xproxy 共用 **A → B 就绪 → A 排空 → 原主 PID exec → A′ 就绪
+→ B 排空并回收 → A′ 单实例**。每次接管先通过专属本地控制确认业务就绪。
+初始 Bookmark 即满足路由初始化条件，不要求追平旧实例。最多两套实例持有业务；
+B 与 worker 不发起嵌套操作。
+
+将兼容目标构建为独立、权限受保护的文件，再原子替换部署路径。操作受理时固定目标文件
+身份、摘要及原始声明式输入；之后修改部署路径或 YAML，不改变本次 B、A′ 和重试使用的
+输入。各 master 从相同原始输入执行 Configure 并校验接管兼容性。首次从旧版本采用此
+能力时先按普通方式启动。Conductor 必须声明 `inplace_restart_v1`，已配置扩展必须提供
+Shutdown；程序化调用执行相同预检。
+
+配置正值 `shutdown_timeout` 和 `inplace_restart: true` 后，向原主进程发送：
+
+```sh
+systemctl kill --kill-who=main --signal=SIGUSR2 kuasar-proxy.service
+```
+
+默认 false 不注册 SIGUSR2；只要 timeout 为正，仍可直接调用 `App.InplaceRestart(ctx)`。
+timeout 为 0 时启用信号属于配置错误。`App.Run()` 保留
+SIGINT/SIGTERM 行为；自定义入口使用 `RunContext()` 自行调用动作，见
+[公共生命周期 API](extensions_zh.md#proxy-lifecycle)。方法返回受理结果与操作 ID，
+最终完成通过状态观察；原 Go 调用栈不会跨 exec 保留。原 master 管理端点短暂不可用时，
+可继续查询 B 的私有 stats socket。
+
+A 停止接纳前，B 失败则排空并回收 B，A 继续服务。越过此边界后，协调器自动替换故障 B、
+重试 exec、重试 A′ 初始化，在 B 排空期间恢复 A′，并重试 B 回收。候选准备单次 30s；
+退避依次为 1/2/4/8/10 秒，10 秒封顶，不限制固定次数。准备、排空、退避分别计时。
+停机取消后续尝试；持续故障保留可观察状态，解除原因后同一操作继续。
+主进程致命故障由部署监督机制处理。恢复不重放业务，也不恢复崩溃时丢失的连接。
+
+A/A′ 保持显式 `shm_path` 与 `stats_socket`；B 在相同父目录派生并检查私有路径。
+实际进程结束后仅清理自有资源。地址来源和 FD 来源均保留服务级 listener 副本，
+接管时不重新 bind；关闭本代 listener 不执行影响其他持有者的底层 socket shutdown。
+
+metrics 为空则均关闭；固定 `host:p` 的 A/A′ 用 p、B 用 p+1；端口 0 各自动态分配；
+65535 拒绝操作。B 必须实际 bind 并持有端口后才排空 A，冲突时本次准备失败，
+不扫描其他端口；IPv6 同样处理。每代计数可重置，抓取可短暂空窗。
+普通启动时 metrics 绑定失败仍告警并继续服务；重启则在排空 A 前确认所需资源可用。
+
+业务统计保留实例本地读数。现有 traffic 返回中的 `inplaceRestart: true` 从受理持续到
+操作清理结束，exec 间隙由 B 返回时也保持。idle 消费方须理解此时统计不完整，不能据此
+证明整个服务空闲；操作完成后重新读取正常单实例统计。读取失败仍不可用，不填零，
+也不据此推断重启结束。不增加持久统计记录、完成凭据或跨实例计数汇总。
+各代保留既有额度和单代并发余量，部署预留双实例 CPU、内存、FD、两份额度和相邻 metrics
+端口，不进行跨代额度转移。
+
+### 9.5 命名监听### 9.5 命名监听与 systemd 部署
+
+`data_listen: "fd=proxy-data"` 与 conductor `mmds.listen: "fd=proxy-mmds"`
+精确选择名称；两者可分别继续使用 TCP 地址，四种组合均支持。名称区分大小写、非空，
+不含空白、冒号或 NUL。缺失、重复、未使用、错误类型、非 TCP 监听资源均导致启动失败，
+两个名称不能引用同一 socket。环境不覆盖配置，也不将地址监听自动回退到继承 FD。
+
+`app/activation.Receive()` 按 `LISTEN_FDS`、`LISTEN_FDNAMES` 从 FD 3 接收。
+没有输入时返回空集合，零数量接受空名称集合。未提供 LISTEN_PID 时不校验；
+提供的空值、非法值、不匹配 PID 均失败，且不接管或关闭其 FD。处理后清理 activation
+环境，接管文件设置 close-on-exec，再按需显式传给后继。最终 master 消费
+node-ctl → xproxy 链路中的 activation，worker bootstrap 和日志 FD 独立处理。
+直接交付文件的所有权见 [Runtime.ListenerFiles](extensions_zh.md#proxy-lifecycle)。
+
+以下为部署模板。先建立 connector 管理 netns、地址与转发，再选择匹配的 MMDS 地址。
+例如 `proxy_netns: sw0_mgmt` 且 connector 转发到该命名空间内的 `127.0.0.1:19254`：
+
+```ini
+# kuasar-proxy-data.socket
+[Socket]
+ListenStream=0.0.0.0:3443
+Accept=no
+FileDescriptorName=proxy-data
+Service=kuasar-proxy.service
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# kuasar-proxy-mmds.socket
+[Socket]
+ListenStream=127.0.0.1:19254
+NetworkNamespacePath=/run/netns/sw0_mgmt
+Accept=no
+FileDescriptorName=proxy-mmds
+Service=kuasar-proxy.service
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# kuasar-proxy.service
+[Unit]
+Requires=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
+After=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
+
+[Service]
+Type=simple
+ExecStart=/opt/kuasar/bin/node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+Sockets=kuasar-proxy-data.socket kuasar-proxy-mmds.socket
+KillMode=mixed
+TimeoutStopSec=45s
+Restart=on-failure
+```
+
+此信号示例在 proxy.yaml 设置 `shutdown_timeout: 30s`、`inplace_restart: true`、
+`data_listen: fd=proxy-data`；conductor 配置
+`mmds: {enabled: true, listen: fd=proxy-mmds}`。MMDS disabled 时移除对应 socket unit
+及 service 中的引用。运行目录、程序所有权、netns 权限和控制连接准入须匹配服务身份。
+依部署实际 conductor 与网络准备 unit 补充启动顺序。在 MMDS unit 的 `[Socket]` 中
+设置 `NetworkNamespacePath`，先创建该 netns，再用
+`ip netns exec sw0_mgmt ss -ltn` 检查实际监听位置。仅改变 service 的 netns 不会移动
+已经存在的 socket，见
+[systemd 命名空间语义](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)。
+
+`KillMode=mixed` 先让主进程协调停机，再由 systemd 执行最终 cgroup 清理。
+`TimeoutStopSec` 应大于应用期限并保留回收余量。普通
+`systemctl restart kuasar-proxy.service` 保留已启动的 socket unit，排队连接仍受 backlog
+与客户端超时限制。完整停服应同时停止两个 socket unit 和 service，避免新流量重新激活。
+生产 unit 的安装与修改属于部署流程。
 
 ## 10. 性能
 

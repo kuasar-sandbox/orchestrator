@@ -8,6 +8,26 @@
   ],
   "helpers": [
     {
+      "name": "proxy-lifecycle",
+      "env": "PROXY_LIFECYCLE_BIN",
+      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+    },
+    {
+      "name": "proxy-lifecycle-target",
+      "env": "PROXY_LIFECYCLE_TARGET_BIN",
+      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+    },
+    {
+      "name": "node-ctl-inplace-target",
+      "env": "NODE_CTL_INPLACE_TARGET_BIN",
+      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+    },
+    {
+      "name": "custom-proxy-inplace-target",
+      "env": "CUSTOM_PROXY_INPLACE_TARGET_BIN",
+      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+    },
+    {
       "name": "custom-proxy",
       "env": "CUSTOM_PROXY_BIN",
       "cases": [

@@ -168,6 +168,7 @@ func (l *acceptingListener) Accept() (net.Conn, error) {
 }
 
 type preparedWorkerHarness struct {
+	control     *controlPeer
 	worker      *PreparedWorker
 	table       *proxyshm.Table
 	data        *acceptingListener
@@ -196,6 +197,8 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 		t.Fatal(err)
 	}
 	statsMaster, statsWorker := net.Pipe()
+	controlMaster, controlWorker := net.Pipe()
+	identity := controlIdentity{BootID: "test-worker", WorkerID: "proxy-test", WorkerEpoch: 3}
 	mmdsMaster, mmdsWorker := net.Pipe()
 	dataBase, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -203,10 +206,12 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 	}
 	data := &acceptingListener{Listener: dataBase}
 	harness := &preparedWorkerHarness{
-		table: table, data: data, notifyWrite: notifyWrite,
+		control: newControlPeer(controlMaster, identity),
+		table:   table, data: data, notifyWrite: notifyWrite,
 		wakeRead: wakeRead, statsMaster: statsMaster, mmdsMaster: mmdsMaster,
 	}
 	harness.worker = &PreparedWorker{
+		control:   newControlPeer(controlWorker, identity),
 		effective: effective,
 		process: proxyextension.Process{
 			Role: proxyextension.RoleWorker, WorkerID: "proxy-test", WorkerEpoch: 3,
@@ -217,6 +222,7 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 	}
 	go func() { _, _ = io.Copy(io.Discard, statsMaster) }()
 	t.Cleanup(func() {
+		_ = controlMaster.Close()
 		_ = harness.worker.Close()
 		_ = notifyWrite.Close()
 		_ = wakeRead.Close()
@@ -281,6 +287,24 @@ func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 	if host.Process() != (proxyextension.Process{Role: proxyextension.RoleWorker, WorkerID: "proxy-test", WorkerEpoch: 3}) {
 		t.Fatalf("host process=%+v", host.Process())
 	}
+	if err := harness.control.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := harness.control.receive()
+	if err != nil || prepared.Kind != "prepared" {
+		t.Fatalf("prepared=%+v err=%v", prepared, err)
+	}
+	if harness.data.accepts.Load() != 0 {
+		t.Fatal("worker accepted before start command")
+	}
+	if err := harness.control.send(controlMessage{Kind: "start"}); err != nil {
+		t.Fatal(err)
+	}
+	serving, err := harness.control.receive()
+	if err != nil || serving.Kind != "serving" {
+		t.Fatalf("serving=%+v err=%v", serving, err)
+	}
+	_ = harness.control.SetReadDeadline(time.Time{})
 
 	request := func(address string) {
 		t.Helper()

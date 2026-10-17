@@ -288,16 +288,8 @@ func startTestServer(t *testing.T, deps Deps) (string, *http.Client) {
 func startTestServerWithContext(t *testing.T, ctx context.Context, deps Deps) (string, *http.Client, <-chan error) {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "ctl.sock")
-	done := make(chan error, 1)
-	go func() { done <- New(sock, deps, discardLogger()).Serve(ctx) }()
-	for range 400 { // wait for ListenUnix + chmod to publish the socket
-		if _, err := os.Stat(sock); err == nil {
-			return sock, HTTPClient(sock), done
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("server did not bind")
-	return "", nil, done
+	done := startTestServerAt(t, ctx, sock, deps)
+	return sock, HTTPClient(sock), done
 }
 
 func mustWrite(t *testing.T, path, content string) {
@@ -943,14 +935,18 @@ func rawGet(t *testing.T, client *http.Client, path string) (int, []byte) {
 func startTestServerAt(t *testing.T, ctx context.Context, sock string, deps Deps) <-chan error {
 	t.Helper()
 	done := make(chan error, 1)
-	go func() { done <- New(sock, deps, discardLogger()).Serve(ctx) }()
-	for range 400 {
-		if _, err := os.Stat(sock); err == nil {
-			return done
-		}
-		time.Sleep(5 * time.Millisecond)
+	ready := make(chan struct{})
+	go func() { done <- New(sock, deps, discardLogger()).ServeReady(ctx, ready) }()
+	// bind(2) publishes the Unix path before listen(2) finishes. The server's
+	// readiness notification also confirms that its permissions are applied.
+	select {
+	case <-ready:
+		return done
+	case err := <-done:
+		t.Fatalf("server exited before ready: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not become ready")
 	}
-	t.Fatal("server did not bind")
 	return done
 }
 

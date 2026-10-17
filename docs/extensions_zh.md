@@ -211,8 +211,8 @@ Wake 或 worker notification。
 
 `MasterHost.Traffic().Get` 以当前 route identity 直接读取 master 的进程内 worker aggregate，
 不经 stats UDS 回环，返回 map/pointer 副本；V1 没有 Traffic Watch。断线期间保留 route 仍可查询，
-要求新鲜度的调用者同时检查 Route `SyncState`。Management wrapper 可添加、覆盖或透传任意本地
-route；框架不保留 namespace、不做 route conflict 检测，也不规定认证。
+要求新鲜度的调用者同时检查 Route `SyncState`。核心保留 `/readyz` 与 `/status`；Management
+wrapper 可添加、覆盖或透传其他本地 route。框架不再保留额外 namespace、不做 route conflict 检测，也不规定扩展认证。
 
 `WorkerHost.Process()` 返回当前 worker id/epoch；`GetRoute(sid)` 只做当前 SHM 点查并返回
 独立的非秘密 `RouteView` 副本，不暴露 raw record/Router/可变指针，也不提供 worker Route
@@ -242,7 +242,7 @@ Proxy 的 [公共材料类型](../app/proxy/proxy.go) 与 Conductor 有明确区
 | 类型 | 字段或方法 |
 |---|---|
 | `Config` | `config.Proxy` 的 alias |
-| `Runtime` | `Logger *slog.Logger`, `TLS TLSMaterialProvider`, `MasterExtension extension.MasterExtension`, `WorkerExtension extension.WorkerExtension`;忽略另一角色的 extension 字段 |
+| `Runtime` | `ListenerFiles map[string]*os.File`, `Logger *slog.Logger`, `TLS TLSMaterialProvider`, `MasterExtension extension.MasterExtension`, `WorkerExtension extension.WorkerExtension`;忽略另一角色的 extension 字段 |
 | `TLSMaterial` | `CertificateChain [][]byte`, `PrivateKey crypto.Signer`, `ClientCAs *x509.CertPool`;没有 `RootCAs` |
 | `TLSMaterialProvider` | `TLSMaterial(context.Context) (TLSMaterial, error)`;没有 purpose 参数 |
 | `TLSMaterialProviderFunc` | 与该方法签名完全一致的函数适配器 |
@@ -255,6 +255,64 @@ Core 固定最低 TLS 1.2 与 `h2`/`http/1.1` ALPN。
 `Hooks.BindRuntime` 为 `(context.Context, Process, *Runtime) error`,如上例。
 映射与传输清理统一见 [Proxy worker 生命周期](node-proxy_zh.md#91-worker-生命周期与传输取消);
 下述 source、Hook 与 wrapper 接口不构成另一套数据面实现。
+
+<a id="proxy-lifecycle"></a>
+### Proxy 生命周期、命名监听与 InplaceRestart
+
+每个 master 实例从操作受理时的相同原始输入执行一次 Configure；B 的派生路径不会成为
+下次基线。BindRuntime 在各 master 与 worker epoch 中重新创建进程材料。
+InplaceRestart 在固定目标映像中重新初始化，不修改运行中实例的冻结配置，也不动态加载扩展。
+
+Master 的 BindRuntime 可交付 `Runtime.ListenerFiles map[string]*os.File`。
+成功返回即把文件关闭责任移交 App，包括后续启动失败；Hook 返回错误时仍由提供者负责。
+返回后冻结命名集合；调用者要保留句柄须提供独立副本。Worker Hook 不得交付监听文件，
+worker 使用内部 bootstrap 副本。`app/activation.Receive()` 可接收环境 FD；
+node-ctl 链路中的最终 master 自动消费 activation。两种来源不得重复交付同名文件。
+配置显式选择名称，见[监听与部署规约](node-proxy_zh.md#95-命名监听与-systemd-部署)。
+
+公共 App 提供：
+
+```go
+type RestartID string
+func (a *App) WaitReady(context.Context) error
+func (a *App) Status() Status
+func (a *App) Shutdown(context.Context) error
+func (a *App) InplaceRestart(context.Context) (RestartID, error)
+```
+
+WaitReady 等待本实例业务就绪，包括初始 Bookmark 和全部配置 worker。
+Status 返回独立快照，区分本地、整个服务和操作状态。Shutdown 包含 B，以第一次调用固定
+期限；timeout 为 0 时显式调用仍优雅排空，不设置隐含期限。强制收尾返回可识别的
+`ErrForcedClose`；取消等待不取消实际清理。Run 前已请求停止
+就不再启动。在 handler 内应异步安排停机，避免等待自己的请求排空。
+
+InplaceRestart 返回受理结果与 ID。受理前 context 取消会中止请求，受理后引擎独立推进。
+最终结果通过 Status 与日志观察，原 Go 调用栈不跨 exec 保留。
+`ErrNotReady`、`ErrStopped`、`ErrRestartInProgress`、`ErrIncompatible` 可用
+`errors.Is` 识别。Conductor、目标或资源不兼容，以及扩展缺少结束能力，会在排空 A 前
+拒绝操作。B 与 worker 不能发起嵌套操作。
+
+`inplace_restart` 默认 false，仅控制原生主入口注册 SIGUSR2；两种取值下直接调用 App
+都要求正值 `shutdown_timeout`。timeout 为 0 时启用信号会在配置校验时拒绝。
+Run 保留 SIGINT/TERM；RunContext 由嵌入入口自行组装信号和触发器。自定义触发器应只安装
+在 `Status.CoordinatorPID` 等于当前 master PID 的主协调实例，并在程序入口重新运行时
+保持原配置。核心动作不选择信号。
+
+Master 与 worker 扩展都可实现以下可选结束接口：
+
+```go
+type Shutdown interface {
+    Shutdown(context.Context) error
+}
+```
+
+业务排空后，核心先取消 Start context，再用剩余预算调用 Shutdown。扩展等待后台工作
+结束，只释放自有材料，也应处理部分失败的 Start。无后台工作的扩展可立即返回。
+普通启动兼容没有此接口的扩展，InplaceRestart 则始终要求该接口，与信号开关无关。
+回调错误保留原有含义，不仅因返回错误就标记强制关闭；超时和实际强制清理分别可观察。
+`Traffic().Get` 的 `InplaceRestart` 标记服务观测可能不完整，idle 消费方应等待正常单实例读数。[custom-proxy 示例](../examples/custom-proxy/README_zh.md)
+等待路由 Watch 退出。生命周期、listener 与控制资源仍由核心拥有；扩展不得关闭服务共享
+listener，也不得在 Shutdown 完成后继续使用 Host。
 
 ### Telemetry bootstrap 与扩展
 
@@ -506,7 +564,10 @@ type ManagementWrapper interface {
 }
 ```
 
-`WrapManagement` 包装 stats_socket 上的既有 handler，可增加/覆盖任意本地路径、反代或调用内置 traffic handler。没有保留 namespace 或冲突 registry。返回 nil 会终止启动，不恢复 panic。扩展为 nil 或不提供该接口时，直接使用原 handler。
+`WrapManagement` 包装 stats_socket 上的既有 handler。核心保留 `/readyz` 与 `/status`；
+其余路径继续支持增加/覆盖本地 handler、反代或调用内置 traffic handler。
+没有额外保留 namespace 或冲突 registry。返回 nil 会终止启动，不恢复 panic。
+扩展为 nil 或不提供该接口时，直接使用原 handler。
 
 ### Master 路由源
 

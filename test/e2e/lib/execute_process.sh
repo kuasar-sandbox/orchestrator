@@ -68,8 +68,8 @@ EOF
 
 ORCH_PID=""
 ORCH_LOG=""
-start_orchestrator() { # $1=log path
-    local log_path="$1" ready="" proxy_ns_before proxy_addresses_before
+start_conductor() { # $1=log path; starts only the owned control-plane process
+    local log_path="$1" ready=""
     ORCH_LOG="$log_path"
     "$ORCH_BIN_DIR/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log_path" 2>&1 &
     ORCH_PID=$!
@@ -83,6 +83,11 @@ start_orchestrator() { # $1=log path
         sleep 0.5
     done
     [ -n "$ready" ] || { sed 's/^/  /' "$log_path"; fail "orchestrator health did not become ready"; }
+}
+
+start_orchestrator() { # $1=log path
+    local proxy_ns_before proxy_addresses_before
+    start_conductor "$1"
 
     write_proxy_config "$WORK/proxy.yaml" \
         "$WORK/node-ctl.socket" "$EXECUTE_RUN_ROOT" "127.0.0.1:$PROXY_PORT" \

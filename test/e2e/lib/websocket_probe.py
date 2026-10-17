@@ -44,12 +44,13 @@ def read_frame(reader, masked=False):
 
 class Guest(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    idle_timeout = 10
 
     def log_message(self, *_):
         pass
 
     def do_GET(self):
-        self.connection.settimeout(10)
+        self.connection.settimeout(self.idle_timeout)
         self.close_connection = True
         if self.path == "/health":
             self.send_response(204)
@@ -123,8 +124,10 @@ def main():
     parser.add_argument("--path", default="/ws")
     parser.add_argument("--token", default="")
     parser.add_argument("--header", action="append", default=[])
+    parser.add_argument("--idle-timeout", type=float, default=10)
     args = parser.parse_args()
     if args.mode == "serve":
+        Guest.idle_timeout = args.idle_timeout
         http.server.ThreadingHTTPServer(("0.0.0.0", args.port), Guest).serve_forever()
     elif args.mode == "probe":
         probe(args)
@@ -133,7 +136,7 @@ def main():
         path = "/tmp/kuasar-websocket.py"
         install = f"import base64;open({path!r},'wb').write(base64.b64decode({encoded!r}))"
         print(f"python3 -c {shlex.quote(install)}\n"
-              f"python3 {path} serve --port {args.port} </dev/null >/tmp/kuasar-websocket.log 2>&1 &\n"
+              f"python3 {path} serve --port {args.port} --idle-timeout {args.idle_timeout} </dev/null >/tmp/kuasar-websocket.log 2>&1 &\n"
               f"python3 {path} wait --port {args.port}")
     else:
         deadline = time.monotonic() + 15

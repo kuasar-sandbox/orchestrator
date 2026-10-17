@@ -2,6 +2,7 @@ package proxyapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
+	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
@@ -18,7 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
 
-func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) error {
+func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) (returnErr error) {
 	if effective == nil || view == nil || admission == nil || stats == nil || logger == nil {
 		return fmt.Errorf("proxy worker process: unresolved startup state")
 	}
@@ -67,7 +69,12 @@ func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epo
 		})
 		return err
 	}
-	parentFiles := []*os.File{wakeRead, notifyWrite, statsMaster, mmdsRPCMaster}
+	controlMaster, controlWorker, err := newSocketPair("proxy-control")
+	if err != nil {
+		closeFiles([]*os.File{dataFile, mmdsFile, wakeRead, wakeWrite, notifyRead, notifyWrite, statsMaster, statsWorker, mmdsRPCMaster, mmdsRPCWorker, admissionFile})
+		return err
+	}
+	parentFiles := []*os.File{wakeRead, notifyWrite, statsMaster, mmdsRPCMaster, controlMaster}
 	defer closeFiles(parentFiles)
 	workerFiles := make([]*os.File, 0, 8)
 	nextDescriptor := 3
@@ -81,12 +88,16 @@ func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epo
 		return descriptor
 	}
 	fds := workerFDMapping{
-		Data: addWorkerFile(dataFile), MMDS: addWorkerFile(mmdsFile),
+		Control: addWorkerFile(controlWorker),
+		Data:    addWorkerFile(dataFile), MMDS: addWorkerFile(mmdsFile),
 		Wake: addWorkerFile(wakeWrite), Notify: addWorkerFile(notifyRead), Stats: addWorkerFile(statsWorker),
 		MMDSRPC:   addWorkerFile(mmdsRPCWorker),
 		Admission: addWorkerFile(admissionFile),
 	}
-	bootstrapFile, err := newWorkerBootstrapFile(workerIndex, workerID, epoch, effective, fds)
+	identity := instance.identity
+	identity.WorkerID = workerID
+	identity.WorkerEpoch = epoch
+	bootstrapFile, err := newWorkerBootstrapFile(workerIndex, workerID, epoch, effective, fds, identity)
 	if err != nil {
 		closeFiles(workerFiles)
 		return err
@@ -94,6 +105,16 @@ func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epo
 	bootstrapDescriptor := nextDescriptor
 	workerFiles = append(workerFiles, bootstrapFile)
 	defer closeFiles(workerFiles)
+	controlConn, err := net.FileConn(controlMaster)
+	if err != nil {
+		return err
+	}
+	peer := newControlPeer(controlConn, identity)
+	defer peer.Close()
+	if !instance.attachWorker(workerIndex, epoch, peer) {
+		return nil
+	}
+	defer func() { instance.workerExited(workerIndex, epoch, returnErr) }()
 
 	removeNotify := view.RegisterNotifyWriter(notifyWrite)
 	defer removeNotify()
@@ -137,6 +158,9 @@ func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epo
 	if err := appnet.StartCommandInNetNS(proxyNamespace, command); err != nil {
 		return err
 	}
+	instance.mu.Lock()
+	instance.workers[workerIndex].pid = command.Process.Pid
+	instance.mu.Unlock()
 	closeFiles(workerFiles)
 	workerFiles = nil
 
@@ -144,24 +168,65 @@ func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epo
 	go func() { streamResult <- stats.ReadWorkerStream(workerCtx, statsMaster, workerID, epoch) }()
 	waitResult := make(chan error, 1)
 	go func() { waitResult <- command.Wait() }()
+	controlResult := make(chan error, 1)
+	go func() {
+		for {
+			message, err := peer.receive()
+			if err == nil {
+				err = instance.workerEvent(workerIndex, epoch, message)
+			}
+			if err != nil {
+				controlResult <- err
+				return
+			}
+		}
+	}()
 
 	var result error
-	select {
-	case err := <-streamResult:
-		if ctx.Err() == nil {
-			stats.StreamFault(workerID, epoch)
-			if err == nil {
-				err = fmt.Errorf("stats stream ended before worker exit")
+	waiting := true
+	for waiting {
+		select {
+		case err := <-streamResult:
+			streamResult = nil
+			if instance.workerFinishing(workerIndex, epoch) {
+				continue
 			}
-			result = fmt.Errorf("proxy worker %s stats stream: %w", workerID, err)
+			instance.workerFault(workerIndex, epoch)
+			if ctx.Err() == nil {
+				stats.StreamFault(workerID, epoch)
+				if err == nil {
+					err = fmt.Errorf("stats stream ended before worker exit")
+				}
+				result = fmt.Errorf("proxy worker %s stats stream: %w", workerID, err)
+			}
+			cancelWorker()
+			result = errors.Join(result, <-waitResult)
+			waiting = false
+		case err := <-controlResult:
+			controlResult = nil
+			if instance.workerFinishing(workerIndex, epoch) {
+				continue
+			}
+			instance.workerFault(workerIndex, epoch)
+			result = fmt.Errorf("proxy worker %s control: %w", workerID, err)
+			cancelWorker()
+			result = errors.Join(result, <-waitResult)
+			waiting = false
+		case err := <-waitResult:
+			result = err
+			stats.StreamFault(workerID, epoch)
+			_ = statsMaster.Close()
+			if streamResult != nil {
+				<-streamResult
+			}
+			waiting = false
 		}
-		cancelWorker()
-		<-waitResult
-	case err := <-waitResult:
-		result = err
-		stats.StreamFault(workerID, epoch)
-		_ = statsMaster.Close()
-		<-streamResult
+	}
+	// Wait may win the select before the control reader applies the final
+	// stopped acknowledgement. The exited process has closed its control FD:
+	// consume every queued frame through EOF before publishing worker exit.
+	if controlResult != nil {
+		<-controlResult
 	}
 	stats.WorkerExited(workerID, epoch)
 	workerBegun = false
@@ -189,9 +254,9 @@ func listenerFile(listener net.Listener) (*os.File, error) {
 	}
 	switch value := listener.(type) {
 	case *net.TCPListener:
-		return value.File()
+		return listenresource.Dup(value, "proxy-tcp-listener")
 	case *net.UnixListener:
-		return value.File()
+		return listenresource.Dup(value, "proxy-unix-listener")
 	default:
 		return nil, fmt.Errorf("proxy: unsupported listener type %T", listener)
 	}

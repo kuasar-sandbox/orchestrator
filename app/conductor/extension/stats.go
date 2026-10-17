@@ -45,14 +45,17 @@ type TrafficCounters struct {
 }
 
 type TrafficStats struct {
-	State       string                         `json:"state"`
-	MaxInflight config.MaxInflight             `json:"maxInflight"`
-	Inflight    TrafficInflight                `json:"inflight"`
-	IdleSince   *time.Time                     `json:"idleSince,omitempty"`
-	Services    map[string]ServiceTrafficStats `json:"services"`
-	Platform    TrafficCounters                `json:"platform"`
-	Transit     TrafficCounters                `json:"transit"`
-	Egress      struct{}                       `json:"egress"` // No publishable egress statistics.
+	// InplaceRestart marks a temporary, incomplete service traffic snapshot.
+	// Idle consumers must not infer service idleness while this is true.
+	InplaceRestart bool                           `json:"inplaceRestart,omitempty"`
+	State          string                         `json:"state"`
+	MaxInflight    config.MaxInflight             `json:"maxInflight"`
+	Inflight       TrafficInflight                `json:"inflight"`
+	IdleSince      *time.Time                     `json:"idleSince,omitempty"`
+	Services       map[string]ServiceTrafficStats `json:"services"`
+	Platform       TrafficCounters                `json:"platform"`
+	Transit        TrafficCounters                `json:"transit"`
+	Egress         struct{}                       `json:"egress"` // No publishable egress statistics.
 }
 
 const (

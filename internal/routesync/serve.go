@@ -59,6 +59,9 @@ type RevisionSource interface {
 // StreamHooks bind proxy-specific lease coordination to the generic route
 // stream without making observers or cluster node-links barrier participants.
 type StreamHooks struct {
+	// ProxyCapabilities is supplied by the admitting conductor. A generic
+	// route authority cannot promise admission or durable completion support.
+	ProxyCapabilities []string
 	// RouteStreamReady fires after the live event subscription is installed and
 	// before the initial snapshot is streamed. A barrier published after this
 	// callback is therefore buffered behind the snapshot rather than lost.
@@ -101,10 +104,12 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 		}
 	}
 	var onSubscribed func()
+	var capabilities []string
 	if hooks != nil {
 		onSubscribed = hooks.RouteStreamReady
+		capabilities = hooks.ProxyCapabilities
 	}
-	serveAuthority(ctx, w, flusher.Flush, body, src, reg, onUp, onSubscribed, log)
+	serveAuthority(ctx, w, flusher.Flush, body, src, reg, onUp, onSubscribed, capabilities, log)
 }
 
 // ServeAuthority runs the route-authority side of one bidirectional stream over a
@@ -116,10 +121,10 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 // The proxy plane reaches this through ServeStream. The cluster node-link calls
 // StreamAuthority directly and is therefore forced onto the non-MMDS projection.
 func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
-	serveAuthority(ctx, w, flush, body, src, reg, onUp, nil, log)
+	serveAuthority(ctx, w, flush, body, src, reg, onUp, nil, nil, log)
 }
 
-func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), onSubscribed func(), log *slog.Logger) {
+func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), onSubscribed func(), capabilities []string, log *slog.Logger) {
 	// Handshake: policy first (flush so the peer's RoundTrip returns), then the
 	// shared route-stream loop. The cluster node-link sends a NodeRegister frame
 	// instead of Hello and calls StreamAuthority directly.
@@ -128,7 +133,7 @@ func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	if !includeMMDS {
 		policy.MMDS = nil
 	}
-	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: policy}}); err != nil {
+	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: policy, ProxyCapabilities: capabilities}}); err != nil {
 		return
 	}
 	flush()

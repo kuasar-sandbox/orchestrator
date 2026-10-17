@@ -67,9 +67,7 @@ func TestProxyRouteBarrierAllOfParticipants(t *testing.T) {
 	r := NewRegistry()
 	first := addReadyPlugin(r, "proxy-a")
 	second := addReadyPlugin(r, "proxy-b")
-	r.mu.Lock()
-	b, err := r.beginRouteBarrierLocked([]*Plugin{first, second})
-	r.mu.Unlock()
+	b, err := r.BeginProxyRouteBarrier()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +85,35 @@ func TestProxyRouteBarrierAllOfParticipants(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProxyRouteBarrierRejectsParticipantJoiningBeforeCommit(t *testing.T) {
+	r := NewRegistry()
+	first := addReadyPlugin(r, "proxy-a")
+	b, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cancel()
+	r.routeBarrierAck(first, b.ID())
+	if err := b.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second := addReadyPlugin(r, "proxy-b")
+	if err := b.Commit(); !errors.Is(err, ErrProxyRouteLeaseChanged) {
+		t.Fatalf("barrier certified a view without the joining participant: %v", err)
+	}
+	next, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Cancel()
+	r.markRouteStreamReady(second) // duplicate readiness does not change the set.
+	r.routeBarrierAck(first, next.ID())
+	r.routeBarrierAck(second, next.ID())
+	if err := next.Commit(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -212,7 +239,26 @@ func TestTrustedMMDSProxyRegistrationShape(t *testing.T) {
 			t.Fatal("non-proxy MMDS registration was trusted")
 		}
 	}
-	if isTrustedMMDSProxyRegistration("observer", trusted) {
-		t.Fatal("non-proxy plugin id was trusted")
+	if !isTrustedMMDSProxyRegistration("proxy-candidate", trusted) {
+		t.Fatal("admitted Proxy capabilities were coupled to a fixed instance id")
+	}
+}
+
+func TestRegistryStatsTargetDuringRestart(t *testing.T) {
+	r := NewRegistry()
+	first := addReadyPlugin(r, routesync.ProxyPluginID)
+	second := addReadyPlugin(r, "proxy-b")
+	first.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/a.sock"}
+	second.Caps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/b.sock"}
+	if socket, ok := r.ProxyStatsTarget(); !ok || socket != "/run/a.sock" {
+		t.Fatalf("ordinary instance target: %s %v", socket, ok)
+	}
+	r.Remove(first)
+	if socket, ok := r.ProxyStatsTarget(); !ok || socket != "/run/b.sock" {
+		t.Fatalf("candidate during exec gap: %s %v", socket, ok)
+	}
+	r.Remove(second)
+	if _, ok := r.ProxyStatsTarget(); ok {
+		t.Fatal("disconnected target remained")
 	}
 }

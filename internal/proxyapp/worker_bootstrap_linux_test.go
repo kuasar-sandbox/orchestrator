@@ -22,7 +22,7 @@ func TestWorkerBootstrapSealedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	fds := validWorkerFDMapping()
-	file, err := newWorkerBootstrapFile(0, "proxy-3", 7, effective, fds)
+	file, err := newWorkerBootstrapFile(0, "proxy-3", 7, effective, fds, controlIdentity{BootID: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestWorkerBootstrapCloseReleasesUnconsumedDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	descriptors := make([]int, 7)
+	descriptors := make([]int, 8)
 	for index := range descriptors {
 		descriptors[index], err = unix.Dup(int(file.Fd()))
 		if err != nil {
@@ -204,7 +204,8 @@ func TestWorkerBootstrapCloseReleasesUnconsumedDescriptors(t *testing.T) {
 		}
 	}
 	bootstrap := &WorkerBootstrap{fds: workerFDMapping{
-		Data: descriptors[0], MMDS: descriptors[1], Wake: descriptors[2],
+		Control: descriptors[7],
+		Data:    descriptors[0], MMDS: descriptors[1], Wake: descriptors[2],
 		Notify: descriptors[3], Stats: descriptors[4], MMDSRPC: descriptors[5], Admission: descriptors[6],
 	}}
 	if err := bootstrap.Close(); err != nil {
@@ -231,7 +232,8 @@ func validWorkerEnvelope(t *testing.T) workerEnvelope {
 		t.Fatal(err)
 	}
 	return workerEnvelope{
-		Magic: workerBootstrapMagic, ProtocolVersion: workerBootstrapVersion, Role: RoleWorker,
+		Identity: controlIdentity{BootID: "test", WorkerID: "proxy-0", WorkerEpoch: 1},
+		Magic:    workerBootstrapMagic, ProtocolVersion: workerBootstrapVersion, Role: RoleWorker,
 		WorkerID: "proxy-0", WorkerEpoch: 1, WorkerIndex: 0,
 		ConfigSchemaVersion: workerConfigSchemaVersion, FDProtocolVersion: workerFDProtocolVersion,
 		ExecutableIdentity: identity,
@@ -241,7 +243,7 @@ func validWorkerEnvelope(t *testing.T) workerEnvelope {
 }
 
 func validWorkerFDMapping() workerFDMapping {
-	return workerFDMapping{Data: 100, MMDS: -1, Wake: 101, Notify: 102, Stats: 103, MMDSRPC: 104, Admission: 105}
+	return workerFDMapping{Control: 106, Data: 100, MMDS: -1, Wake: 101, Notify: 102, Stats: 103, MMDSRPC: 104, Admission: 105}
 }
 
 func marshalWorkerEnvelope(t *testing.T, value workerEnvelope) []byte {

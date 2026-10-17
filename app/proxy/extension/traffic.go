@@ -33,9 +33,12 @@ type ServiceTrafficView struct {
 // TrafficView combines the current route identity with the in-process master
 // traffic aggregate. All maps and pointers are independent copies.
 type TrafficView struct {
-	SandboxID string
-	Profile   Profile
-	State     RouteState
+	// InplaceRestart marks a temporary, incomplete service traffic snapshot.
+	// Idle consumers must not infer service idleness while this is true.
+	InplaceRestart bool
+	SandboxID      string
+	Profile        Profile
+	State          RouteState
 	// MaxInflight is the effective policy applied by this Proxy master. Zero
 	// leaves mean unlimited and omitted Sandbox metadata has already been
 	// merged with this target node's Proxy defaults.

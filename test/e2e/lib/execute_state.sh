@@ -431,6 +431,10 @@ execute_state_recover() { # bin
     esac
     echo "==> recovering interrupted e2e_execute run $EXECUTE_STATE_RUN_KEY (switch=$EXECUTE_STATE_SWITCH)" >&2
 
+    if ! execute_state_path_absent "$EXECUTE_STATE_WORK/proxy-lifecycle.units"; then
+        source "$(dirname "${BASH_SOURCE[0]}")/proxy_lifecycle.sh"
+        proxy_lifecycle_cleanup_units "$EXECUTE_STATE_WORK" "$EXECUTE_STATE_RUN_KEY" || return 1
+    fi
     execute_state_stop_owned_units "$EXECUTE_STATE_RUNNER_PREFIX" "$EXECUTE_STATE_BUILDER_PREFIX" || return 1
     for namespace in "$EXECUTE_STATE_PROXY_NETNS" "$EXECUTE_STATE_SWITCH_NETNS"; do
         execute_state_stop_netns_processes "$namespace" || return 1

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -34,6 +37,19 @@ func TestFreezeRuntimeCarriesRoleExtensionsWithoutSerialization(t *testing.T) {
 
 func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 	bootstrap := testComponentBootstrap(t)
+	statsPath := filepath.Join(t.TempDir(), "stats.sock")
+	configPath := filepath.Join(filepath.Dir(statsPath), "config.sock")
+	listener, err := net.Listen("unix", configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The core runner is replaced in this hook test. Acknowledge its
+		// retirement through the same private transport as the real authority.
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go server.Serve(listener)
+	t.Cleanup(func() { _ = server.Close() })
 	var configureCalls atomic.Int32
 	var bindCalls atomic.Int32
 	var retained *Config
@@ -44,6 +60,8 @@ func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 			retained = cfg
 			cfg.Paths.RunRoot = "/run/custom-proxy"
 			cfg.DataListen = "127.0.0.1:8443"
+			cfg.StatsSocket = statsPath
+			cfg.ConfigSocket = configPath
 			return nil
 		},
 		BindRuntime: func(_ context.Context, process Process, runtime *Runtime) error {

@@ -117,6 +117,9 @@ func TestMMDSPolicyProjectionIsTrustedProxyOnly(t *testing.T) {
 			go ServeAuthority(ctx, downWriter, func() {}, upReader, source, reg, nil, nil)
 
 			hello := readTestMessage(t, downReader)
+			if len(hello.Hello.ProxyCapabilities) != 0 {
+				t.Fatal("generic authority promised conductor lifecycle capabilities")
+			}
 			upsert := readTestMessage(t, downReader)
 			bookmark := readTestMessage(t, downReader)
 			if hello.Type != TypeHello || upsert.Type != TypeUpsert || bookmark.Type != TypeBookmark {

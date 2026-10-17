@@ -12,13 +12,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"os"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
 
+	"github.com/kuasar-sandbox/orchestrator/app/activation"
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
+	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
@@ -51,8 +55,14 @@ func (f TLSMaterialProviderFunc) TLSMaterial(ctx context.Context) (TLSMaterial, 
 // Runtime holds non-serializable process-local startup bindings. A fresh value
 // is bound in the master and every worker epoch.
 type Runtime struct {
-	Logger *slog.Logger
-	TLS    TLSMaterialProvider
+	// ListenerFiles supplies named TCP listeners to the master. Successful
+	// BindRuntime transfers ownership of every delivered file to App, including
+	// on later startup failure. A failing hook retains ownership. The name set
+	// is frozen on return; callers retaining a handle must deliver a duplicate.
+	// Workers receive listeners through the private bootstrap, not this field.
+	ListenerFiles map[string]*os.File
+	Logger        *slog.Logger
+	TLS           TLSMaterialProvider
 	// MasterExtension is the one trusted, statically linked extension used by
 	// the master process. Worker processes ignore this field.
 	MasterExtension proxyextension.MasterExtension
@@ -72,8 +82,11 @@ func (*Runtime) UnmarshalJSON([]byte) error {
 	return fmt.Errorf("proxy Runtime is process-local and cannot be deserialized")
 }
 
-// Hooks are the only startup customization points. Configure runs exactly once
-// in the master; BindRuntime runs once in the master and once in every worker.
+// Hooks are the startup customization points. Each master incarnation calls
+// Configure from the same accepted original input; workers use its frozen
+// result. BindRuntime runs in each master and each worker epoch. Runtime objects
+// and background tasks belong to that incarnation and must not outlive its
+// optional extension Shutdown completion.
 type Hooks struct {
 	Configure   func(context.Context, *Config) error
 	BindRuntime func(context.Context, Process, *Runtime) error
@@ -84,6 +97,7 @@ type App struct {
 	hooks       Hooks
 	initialized bool
 	ran         atomic.Bool
+	service     *proxyapp.Service
 
 	workerPresent    func() bool
 	receiveWorker    func() (*proxyapp.WorkerBootstrap, error)
@@ -98,6 +112,7 @@ func New(hooks Hooks) *App {
 	return &App{
 		hooks:         hooks,
 		initialized:   true,
+		service:       proxyapp.NewService(),
 		workerPresent: proxyapp.WorkerBootstrapPresent,
 		receiveWorker: proxyapp.ReceiveWorkerBootstrap,
 		receiveComponent: func() (*componentexec.Bootstrap, error) {
@@ -118,12 +133,16 @@ func (a *App) Run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return a.RunContext(ctx)
+	return a.runContext(ctx, true)
 }
 
 // RunContext enters either the custom master bootstrap or the private worker
 // bootstrap. Worker state is detected before any CLI/config-file handling.
 func (a *App) RunContext(ctx context.Context) error {
+	return a.runContext(ctx, false)
+}
+
+func (a *App) runContext(ctx context.Context, signals bool) (returnErr error) {
 	if err := a.requireInitialized(); err != nil {
 		return err
 	}
@@ -133,12 +152,22 @@ func (a *App) RunContext(ctx context.Context) error {
 	if !a.ran.CompareAndSwap(false, true) {
 		return fmt.Errorf("proxy app can only be run once")
 	}
+	defer func() { a.service.FinishEntry(returnErr) }()
 	if a.workerPresent() {
 		componentexec.ClearEnvironment()
 		return a.runWorkerProcess(ctx)
 	}
+	if proxyapp.ContinuationPresent() {
+		continuation, err := proxyapp.ReceiveContinuation()
+		if err != nil {
+			return err
+		}
+		defer continuation.Close()
+		componentexec.ClearEnvironment()
+		return proxyapp.RunEntry(ctx, a.service, continuation.Input(), continuation, a.prepareService, a.runMaster)
+	}
 	proxyapp.ClearWorkerEnvironment()
-	return a.runMasterProcess(ctx)
+	return a.runMasterProcess(ctx, signals)
 }
 
 func (a *App) requireInitialized() error {
@@ -148,7 +177,7 @@ func (a *App) requireInitialized() error {
 	return nil
 }
 
-func (a *App) runMasterProcess(ctx context.Context) error {
+func (a *App) runMasterProcess(ctx context.Context, signals bool) error {
 	bootstrap, err := a.receiveComponent()
 	if errors.Is(err, componentexec.ErrNoBootstrap) {
 		return fmt.Errorf("custom proxy must be invoked through node-ctl proxy")
@@ -159,38 +188,66 @@ func (a *App) runMasterProcess(ctx context.Context) error {
 	if err := componentexec.VerifyCurrentExecutable(bootstrap.ComponentIdentity); err != nil {
 		return err
 	}
+	return proxyapp.RunEntry(ctx, a.service, proxyapp.ServiceInput{Config: bootstrap.Config, Executable: bootstrap.ComponentExecutable, Signals: signals}, nil, a.prepareService, a.runMaster)
+}
+
+func (a *App) prepareService(ctx context.Context, input proxyapp.ServiceInput) (_ *proxyapp.Startup, returnErr error) {
 	var cfg publicconfig.Proxy
-	if err := decodeConfig(bootstrap.Config, &cfg); err != nil {
-		return fmt.Errorf("custom proxy bootstrap config: %w", err)
+	if err := decodeConfig(input.Config, &cfg); err != nil {
+		return nil, fmt.Errorf("custom proxy bootstrap config: %w", err)
 	}
 	immutableExecutable := cfg.Paths.ProxyExecutable
-	if immutableExecutable == "" || immutableExecutable != bootstrap.ComponentExecutable {
-		return fmt.Errorf("custom proxy bootstrap executable does not match config")
+	if !input.Native && (immutableExecutable == "" || immutableExecutable != input.Executable) {
+		return nil, fmt.Errorf("custom proxy bootstrap executable does not match config")
 	}
 	if a.hooks.Configure != nil {
 		if err := a.hooks.Configure(ctx, &cfg); err != nil {
-			return fmt.Errorf("custom proxy configure: %w", err)
+			return nil, fmt.Errorf("custom proxy configure: %w", err)
 		}
 	}
 	if cfg.Paths.ProxyExecutable != immutableExecutable {
-		return fmt.Errorf("custom proxy Configure must not change paths.proxy_executable")
+		return nil, fmt.Errorf("custom proxy Configure must not change paths.proxy_executable")
 	}
 	effective, err := proxyapp.FreezeConfig(&cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	runtimeBindings := &Runtime{}
 	process := Process{Role: RoleMaster}
 	if a.hooks.BindRuntime != nil {
 		if err := a.hooks.BindRuntime(ctx, process, runtimeBindings); err != nil {
-			return fmt.Errorf("custom proxy bind runtime for master: %w", err)
+			return nil, fmt.Errorf("custom proxy bind runtime for master: %w", err)
 		}
 	}
+	// Ownership begins at the successful BindRuntime return, before any
+	// environment adaptation or runtime-material validation can fail.
+	owned := maps.Clone(runtimeBindings.ListenerFiles)
+	if owned == nil {
+		owned = make(map[string]*os.File)
+	}
+	defer func() {
+		if returnErr != nil {
+			listenresource.Close(owned)
+		}
+	}()
+	received, err := activation.Receive()
+	if err != nil {
+		return nil, err
+	}
+	defer listenresource.Close(received)
+	for name, file := range received {
+		if _, exists := owned[name]; exists {
+			return nil, fmt.Errorf("proxy listener %q delivered by both activation and BindRuntime", name)
+		}
+		owned[name] = file
+		delete(received, name) // The App's frozen collection now owns this file.
+	}
+	runtimeBindings.ListenerFiles = owned
 	resolved, err := proxyapp.ResolveRuntime(ctx, effective.Config(), freezeRuntime(runtimeBindings))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return a.runMaster(ctx, effective, resolved)
+	return &proxyapp.Startup{Effective: effective, Runtime: resolved, Release: func() { listenresource.Close(owned) }}, nil
 }
 
 func (a *App) runWorkerProcess(ctx context.Context) error {
@@ -221,6 +278,11 @@ func (a *App) runWorkerProcess(ctx context.Context) error {
 		}
 	}
 	effective := bootstrap.EffectiveConfig()
+	owned := maps.Clone(runtimeBindings.ListenerFiles)
+	defer listenresource.Close(owned)
+	if len(owned) != 0 {
+		return fmt.Errorf("proxy worker BindRuntime must not deliver ListenerFiles")
+	}
 	resolved, err := proxyapp.ResolveRuntime(ctx, effective.Config(), freezeRuntime(runtimeBindings))
 	if err != nil {
 		return err
@@ -249,7 +311,8 @@ func decodeConfig(raw []byte, out *publicconfig.Proxy) error {
 
 func freezeRuntime(runtime *Runtime) proxyapp.Bindings {
 	bindings := proxyapp.Bindings{
-		Logger: runtime.Logger, MasterExtension: runtime.MasterExtension,
+		ListenerFiles: maps.Clone(runtime.ListenerFiles),
+		Logger:        runtime.Logger, MasterExtension: runtime.MasterExtension,
 		WorkerExtension: runtime.WorkerExtension,
 	}
 	if runtime.TLS != nil {

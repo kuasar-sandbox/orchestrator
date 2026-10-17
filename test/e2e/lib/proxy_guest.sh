@@ -62,7 +62,7 @@ fail_proxy_startup() {
 }
 wait_proxy_topology_ready() {
     local master="$1" deadline now endpoint target data_ready mmds_ready workers_ready
-    local workers worker_count worker_ns wp got state last_state=""
+    local workers worker_count worker_ns wp got state last_state="" business_ready
     endpoint="$(python3 - "$PROXY_NS_IP" "$MMDS_PORT" <<'PY'
 import socket, sys
 print(f"{socket.inet_aton(sys.argv[1])[::-1].hex().upper()}:{int(sys.argv[2]):04X}")
@@ -93,12 +93,14 @@ PY
         done
         workers_ready=0
         [ "$worker_count" -eq "$PROXY_WORKERS" ] && [ "$worker_ns" -eq 1 ] && workers_ready=1
-        state="data=$data_ready mmds=$mmds_ready workers=$worker_count/$PROXY_WORKERS workers_netns=$worker_ns"
+        business_ready=0
+        proxy_business_ready "$master" "$WORK/proxy-stats.sock" && business_ready=1
+        state="readyz=$business_ready data=$data_ready mmds=$mmds_ready workers=$worker_count/$PROXY_WORKERS workers_netns=$worker_ns"
         if [ "$state" != "$last_state" ]; then
             proxy_timeline "readiness progress: $state"
             last_state="$state"
         fi
-        if [ "$data_ready" -eq 1 ] && [ "$mmds_ready" -eq 1 ] && [ "$workers_ready" -eq 1 ]; then
+        if [ "$business_ready" -eq 1 ] && [ "$data_ready" -eq 1 ] && [ "$mmds_ready" -eq 1 ] && [ "$workers_ready" -eq 1 ]; then
             proxy_timeline "master pid=$master registered; data and MMDS listeners ready; workers=[$workers] in proxy_netns=$PROXY_NETNS"
             return 0
         fi
