@@ -47,28 +47,63 @@ trap 'exit 143' TERM
 prometheus_image="${TELEMETRY_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996}"
 clickhouse_image="${TELEMETRY_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77}"
 prepare_image() {
-    local image="$1" attempt
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
-        # Reuse the public Docker Hub transport already used by platform's
-        # source and exact-assets suites. Docker verifies the unchanged pinned
-        # manifest digest; this does not select another tag or backend version.
-        image="m.daocloud.io/docker.io/$image"
-        if ! docker image inspect "$image" >/dev/null 2>&1; then
-            for attempt in 1 2 3; do
-                if timeout 3m docker pull "$image" >&2; then
-                    break
-                fi
-                if [ "$attempt" -eq 3 ]; then
-                    echo "FAIL: image pull failed after $attempt attempts: $image" >&2
-                    return 1
-                fi
-                echo "Retrying image pull after attempt $attempt: $image" >&2
-                sleep "$((attempt * 2))"
-            done
-        fi
+    local image="$1" attempt output status failure reason
+    local url_pattern='https?://[^[:space:]"<>]+'
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        printf '%s\n' "$image"
+        return 0
     fi
-    printf '%s\n' "$image"
+    # Pull the requested upstream reference unchanged, including its digest.
+    # Bound both attempts and runtime; never retry authentication, integrity,
+    # certificate or unknown failures merely because Docker returned nonzero.
+    for attempt in 1 2 3; do
+        if output="$(timeout --kill-after=5s 3m docker pull "$image" 2>&1)"; then
+            printf '%s\n' "$image"
+            return 0
+        else
+            status=$?
+        fi
+        if [ "$status" -ne 1 ] && [ "$status" -ne 124 ]; then
+            echo "FAIL: image pull command exited with status $status: $image" >&2
+            return "$status"
+        fi
+        # Docker errors can contain signed URLs. Do not log them or classify
+        # transient-looking words/status codes embedded in those URLs.
+        failure="${output,,}"
+        while [[ "$failure" =~ $url_pattern ]]; do
+            failure="${failure/"${BASH_REMATCH[0]}"/[url]}"
+        done
+        case "$failure" in
+            *unauthorized*|*"authentication required"*|*"authentication failed"*|*denied*|*forbidden*|*certificate*|*x509*|*digest*mismatch*|*digest*invalid*|*digest*verification*|*verification*failed*|*checksum*mismatch*|*manifest*unknown*|*manifest*not*found*|*no*matching*manifest*)
+                echo "FAIL: non-retryable image pull: $image" >&2
+                return "$status"
+                ;;
+        esac
+        reason="pull timeout"
+        if [ "$status" -ne 124 ]; then
+            case "$failure" in
+                *tls*handshake*timeout*|*i/o*timeout*|*connection*timed*out*|*connection*reset*|*connection*refused*|*temporary*failure*in*name*resolution*|*temporary*failure*resolving*|*unexpected*eof*|*502*bad*gateway*|*503*service*unavailable*|*504*gateway*timeout*|*429*too*many*requests*|*500*internal*server*error*|*": eof"|*$'\n'eof|eof)
+                    reason="transient registry/network error"
+                    ;;
+                *)
+                    if [[ "$failure" =~ status(\ code)?[:\ ]+(429|500|502|503|504)([^0-9]|$) ]]; then
+                        reason="transient registry HTTP status"
+                    else
+                        echo "FAIL: non-retryable image pull: $image" >&2
+                        return "$status"
+                    fi
+                    ;;
+            esac
+        fi
+        if [ "$attempt" -eq 3 ]; then
+            echo "FAIL: image pull failed after $attempt attempts ($reason): $image" >&2
+            return "$status"
+        fi
+        echo "Retrying image pull after attempt $attempt ($reason): $image" >&2
+        sleep "$((attempt * 2))"
+    done
 }
+
 prometheus_image="$(prepare_image "$prometheus_image")"
 clickhouse_image="$(prepare_image "$clickhouse_image")"
 docker image inspect "$prometheus_image" "$clickhouse_image" >"$TELEMETRY_BACKEND_OUT_DIR/images.json"
