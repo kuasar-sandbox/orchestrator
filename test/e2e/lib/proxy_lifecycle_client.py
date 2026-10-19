@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Observe real Proxy images, service actions and unretried Guest business."""
 import base64
+import errno
 import hashlib
 import http.client
 import json
@@ -37,8 +38,34 @@ def record_service_exit(path):
 def cgroup_processes(cgroup):
     try:
         return (cgroup / 'cgroup.procs').read_text().split()
-    except FileNotFoundError:
-        return []  # systemd may remove the empty cgroup between observations.
+    except OSError as error:
+        # Removal can race either opening the path or reading an open cgroup.
+        if error.errno in (errno.ENOENT, errno.ENODEV):
+            return []
+        raise
+
+
+def wait_exec_shutdown_observations(cgroup, exit_record, owned, started):
+    # cgroup.procs can be empty before the last owned PID is reaped. Wait for
+    # every existing final assertion within the same original 18-second budget.
+    while (cgroup_processes(cgroup) or not exit_record.exists() or
+           any(Path('/proc', pid).exists() for pid in owned)) and time.monotonic() - started < 18:
+        time.sleep(.02)
+
+
+def owned_process_observations(owned):
+    result = {}
+    for pid in owned:
+        try:
+            lines = Path('/proc', pid, 'status').read_text().splitlines()
+            result[pid] = {key: value.strip() for key, value in
+                           (line.split(':', 1) for line in lines if ':' in line)
+                           if key in ('State', 'PPid', 'TracerPid', 'Threads', 'NSpid')}
+        except FileNotFoundError:
+            result[pid] = {'gone_during_observation': True}
+        except OSError as error:
+            result[pid] = {'observation_errno': error.errno}
+    return result
 
 
 class UnixHTTP(http.client.HTTPConnection):
@@ -496,8 +523,13 @@ class Probe:
                 assert tunnel.recv(1) == b'', 'tunnel survived application deadline'
             else:
                 complete()
-            while (cgroup_processes(self.cgroup) or not exit_record.exists()) and time.monotonic() - started < 18:
-                time.sleep(.02)
+            wait_exec_shutdown_observations(self.cgroup, exit_record, owned, started)
+            remaining_owned = [pid for pid in owned if Path('/proc', pid).exists()]
+            if remaining_owned:
+                observation = dict(elapsed=time.monotonic() - started,
+                                   pids=owned_process_observations(remaining_owned))
+                self.log(kind='exec_stop_incomplete', **observation)
+                print('exec-stop cleanup incomplete: ' + json.dumps(observation), file=sys.stderr, flush=True)
             assert not cgroup_processes(self.cgroup), 'B/workers survived their own drain budget'
             assert all(not Path('/proc', pid).exists() for pid in owned), owned
             result = json.loads(exit_record.read_text())

@@ -588,7 +588,7 @@ func testServiceRealImageReplacement(t *testing.T, scenario serviceScenario) {
 			}
 			if err != nil {
 				mu.Lock()
-				if faultWindow.Load() && (errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)) {
+				if fixtureExpectedConnectionLoss(err, faultWindow.Load()) {
 					expectedLosses = append(expectedLosses, err)
 				} else {
 					t.Logf("unexpected connection result: during_injected_failure=%v type=%T error=%v", faultWindow.Load(), err, err)
