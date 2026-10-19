@@ -4,6 +4,7 @@ import errno
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 
 
@@ -63,7 +64,19 @@ class ExecBoundary:
             deliver = os.WSTOPSIG(status)
             if deliver in (signal.SIGTRAP, signal.SIGSTOP):
                 deliver = 0
-            self.call(7, tid, deliver)
+            try:
+                self.call(7, tid, deliver)
+            except OSError as error:
+                print(f'exec boundary CONT failed: main_pid={self.pid} '
+                      f'tid={tid} status={status:#x} signal={deliver} '
+                      f'errno={error.errno}', file=sys.stderr, flush=True)
+                if error.errno != errno.ESRCH or tid == self.pid:
+                    raise
+                # Another thread can exec after this thread's stop was reaped,
+                # destroying the stopped sibling before CONT. ESRCH is not
+                # proof of death: retain ownership until an exit/exec event.
+                # Only the original PID's EXEC event above succeeds; keep the
+                # original deadline and all main-exit/waitpid failures.
         raise AssertionError('main did not reach exec')
 
     def detach(self):

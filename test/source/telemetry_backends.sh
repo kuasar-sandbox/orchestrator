@@ -47,7 +47,7 @@ trap 'exit 143' TERM
 prometheus_image="${TELEMETRY_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996}"
 clickhouse_image="${TELEMETRY_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77}"
 prepare_image() {
-    local image="$1" attempt output status failure reason
+    local image="$1" attempt output status failure reason timed_out
     local url_pattern='https?://[^[:space:]"<>]+'
     if docker image inspect "$image" >/dev/null 2>&1; then
         printf '%s\n' "$image"
@@ -57,13 +57,20 @@ prepare_image() {
     # Bound both attempts and runtime; never retry authentication, integrity,
     # certificate or unknown failures merely because Docker returned nonzero.
     for attempt in 1 2 3; do
-        if output="$(timeout --kill-after=5s 3m docker pull "$image" 2>&1)"; then
+        if output="$(LC_ALL=C timeout --verbose --kill-after=5s 3m docker pull "$image" 2>&1)"; then
             printf '%s\n' "$image"
             return 0
         else
             status=$?
         fi
-        if [ "$status" -ne 1 ] && [ "$status" -ne 124 ]; then
+        timed_out=false
+        if [ "$status" -eq 124 ]; then
+            timed_out=true
+        elif [ "$status" -eq 137 ] && [[ "$output" == *"timeout: sending signal KILL to command 'docker'"* ]]; then
+            # Distinguish timeout's kill-after fallback from an unrelated KILL.
+            timed_out=true
+        fi
+        if [ "$status" -ne 1 ] && [ "$timed_out" != true ]; then
             echo "FAIL: image pull command exited with status $status: $image" >&2
             return "$status"
         fi
@@ -80,9 +87,9 @@ prepare_image() {
                 ;;
         esac
         reason="pull timeout"
-        if [ "$status" -ne 124 ]; then
+        if [ "$timed_out" != true ]; then
             case "$failure" in
-                *tls*handshake*timeout*|*i/o*timeout*|*connection*timed*out*|*connection*reset*|*connection*refused*|*temporary*failure*in*name*resolution*|*temporary*failure*resolving*|*unexpected*eof*|*502*bad*gateway*|*503*service*unavailable*|*504*gateway*timeout*|*429*too*many*requests*|*500*internal*server*error*|*": eof"|*$'\n'eof|eof)
+                *tls*handshake*timeout*|*i/o*timeout*|*client.timeout*exceeded*|*context*deadline*exceeded*|*connection*timed*out*|*connection*reset*|*connection*refused*|*temporary*failure*in*name*resolution*|*temporary*failure*resolving*|*unexpected*eof*|*502*bad*gateway*|*503*service*unavailable*|*504*gateway*timeout*|*429*too*many*requests*|*500*internal*server*error*|*": eof"|*$'\n'eof|eof)
                     reason="transient registry/network error"
                     ;;
                 *)

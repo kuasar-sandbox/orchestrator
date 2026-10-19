@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "test/source/telemetry_backends.sh"
 IMAGE = "example/backend:1@sha256:" + "a" * 64
 MIRROR = "m.daocloud.io/docker.io/" + IMAGE
+KILL_DIAGNOSTIC = "timeout: sending signal KILL to command 'docker'"
 
 
 class ImagePullTests(unittest.TestCase):
@@ -37,8 +38,8 @@ docker() {
     fi
 }
 timeout() {
-    echo "$1 $2" >> "$TEST_DIR/timeouts"
-    shift 2
+    echo "$1 $2 $3" >> "$TEST_DIR/timeouts"
+    shift 3
     "$@"
 }
 sleep() { echo "$1" >> "$TEST_DIR/sleeps"; }
@@ -69,12 +70,14 @@ sleep() { echo "$1" >> "$TEST_DIR/sleeps"; }
                 self.assertEqual(result.stdout.strip(), IMAGE)
                 self.assertEqual(logs["inspects"], [IMAGE])
                 self.assertEqual(logs["pulls"], ["pull " + IMAGE])
-                self.assertEqual(logs["timeouts"], ["--kill-after=5s 3m"])
+                self.assertEqual(logs["timeouts"], ["--verbose --kill-after=5s 3m"])
                 self.assertEqual(logs["sleeps"], [])
 
     def test_transient_failures_preserve_digest_and_stdout(self):
         for failure in ("net/http: TLS handshake timeout", "read: connection reset by peer",
                         "i/o timeout", "unexpected EOF", "503 Service Unavailable",
+                        "net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)",
+                        "context deadline exceeded",
                         "502 Bad Gateway", "504 Gateway Timeout",
                         "Temporary failure in name resolution", "connection refused",
                         "connection timed out", 'Get "https://registry.example/v2/": EOF',
@@ -87,20 +90,54 @@ sleep() { echo "$1" >> "$TEST_DIR/sleeps"; }
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), IMAGE)
                 self.assertEqual(logs["pulls"], ["pull " + IMAGE] * 3)
-                self.assertEqual(logs["timeouts"], ["--kill-after=5s 3m"] * 3)
+                self.assertEqual(logs["timeouts"], ["--verbose --kill-after=5s 3m"] * 3)
                 self.assertEqual(logs["sleeps"], ["2", "4"])
                 self.assertNotIn("docker progress", result.stderr)
 
     def test_transient_exhaustion_or_timeout_stays_fatal(self):
-        for code, failure in ((1, "TLS handshake timeout"), (124, "")):
+        for code, failure in ((1, "TLS handshake timeout"), (124, ""), (137, KILL_DIAGNOSTIC)):
             with self.subTest(code=code):
                 result, logs = self.run_case(failures=99, failure_code=code, failure=failure)
                 self.assertEqual(result.returncode, code)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(logs["pulls"], ["pull " + IMAGE] * 3)
-                self.assertEqual(logs["timeouts"], ["--kill-after=5s 3m"] * 3)
+                self.assertEqual(logs["timeouts"], ["--verbose --kill-after=5s 3m"] * 3)
                 self.assertEqual(logs["sleeps"], ["2", "4"])
                 self.assertIn("failed after 3 attempts", result.stderr)
+
+    def test_timeout_statuses_retry_and_recover(self):
+        for code in (124, 137):
+            with self.subTest(code=code):
+                result, logs = self.run_case(failures=2, failure_code=code,
+                                             failure=KILL_DIAGNOSTIC if code == 137 else "")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), IMAGE)
+                self.assertEqual(len(logs["pulls"]), 3)
+                self.assertEqual(logs["sleeps"], ["2", "4"])
+
+    def test_real_timeout_kill_after_exhausts_bounded_attempts(self):
+        source = SCRIPT.read_text()
+        function = source[source.index("prepare_image() {"):source.index('\nprometheus_image="$(prepare_image')]
+        function = function.replace("--kill-after=5s 3m", "--kill-after=0.1s 0.1s")
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "docker"
+            fake.write_text("""#!/bin/bash
+if [ "$1" = image ]; then exit 1; fi
+echo pull >> "$TEST_DIR/pulls"
+trap '' TERM
+sleep 30
+""")
+            fake.chmod(0o755)
+            env = dict(os.environ, TEST_DIR=directory, IMAGE=IMAGE,
+                       PATH=directory + os.pathsep + os.environ["PATH"])
+            result = subprocess.run(
+                ["bash", "-c", 'set -euo pipefail\nsleep() { :; }\n' + function
+                 + '\nprepare_image "$IMAGE"'],
+                env=env, text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 137, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual((Path(directory) / "pulls").read_text().splitlines(), ["pull"] * 3)
+            self.assertIn("failed after 3 attempts (pull timeout)", result.stderr)
 
     def test_permanent_and_unknown_failures_do_not_retry(self):
         for failure in ("unauthorized: authentication required", "requested access denied",
