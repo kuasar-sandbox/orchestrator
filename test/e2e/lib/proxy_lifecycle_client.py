@@ -423,8 +423,34 @@ class Probe:
             time.sleep(.02)
         assert self.main_pid() == 0, 'application did not finish its own bounded shutdown'
         result = json.loads(exit_record.read_text())
-        assert result == dict(SERVICE_RESULT='success', EXIT_CODE='exited',
-                              EXIT_STATUS='0', INVOCATION_ID=invocation), result
+        try:
+            assert result == dict(SERVICE_RESULT='success', EXIT_CODE='exited',
+                                  EXIT_STATUS='0', INVOCATION_ID=invocation), result
+        except AssertionError:
+            # Query this invocation before cleanup removes the failed unit.
+            # JSON keeps large fields bounded by journalctl's default limit;
+            # do not request --all or include environment/command-line fields.
+            diagnostic = dict(kind='full_shutdown_journal', unit=self.config['unit'],
+                              invocation=invocation)
+            try:
+                journal = subprocess.run(
+                    ['journalctl', '--no-pager', '--quiet', '--output=json',
+                     '--output-fields=MESSAGE,PRIORITY,_PID', '--lines=80',
+                     '_SYSTEMD_UNIT=' + self.config['unit'],
+                     '_SYSTEMD_INVOCATION_ID=' + invocation],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=5)
+                diagnostic.update(returncode=journal.returncode,
+                                  journal_tail=journal.stdout[-16384:].decode('utf-8', 'replace'))
+            except (OSError, subprocess.TimeoutExpired) as error:
+                diagnostic['journal_error'] = type(error).__name__
+            try:
+                # The runner also recognizes legacy commands inside a line.
+                print(json.dumps(diagnostic).replace('##[', r'\u0023\u0023['),
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # Diagnostic output must not replace the original failure.
+            raise
         # ExecStopPost must also have ended before checking the complete cgroup.
         while cgroup_processes(self.cgroup) and time.monotonic() - started < 15:
             time.sleep(.02)
