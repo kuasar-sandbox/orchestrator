@@ -68,6 +68,31 @@ def owned_process_observations(owned):
     return result
 
 
+def report_process_limit(pids, config, cgroup, main_pid):
+    # Preserve the raw cgroup sample, including duplicates. These subsequent
+    # /proc reads are observations, not an atomic process snapshot.
+    sample = pids[:32]
+    processes = owned_process_observations(sample)
+    for pid in sample:
+        try:
+            processes[pid]['exe'] = os.readlink('/proc/' + pid + '/exe')[:512]
+        except OSError as error:
+            processes[pid]['exe_errno'] = error.errno
+    observation = dict(kind='process_limit_observation', time=time.time(),
+                       entry=config['entry'], source=config['source'],
+                       unit=config['unit'], cgroup=str(cgroup), main_pid=main_pid,
+                       observed_count=len(pids), unique_count=len(set(pids)),
+                       pids=sample, truncated=len(pids) > len(sample),
+                       processes=processes)
+    try:
+        # A diagnostic must not become a workflow command or hide the original
+        # process-count assertion if stderr is unavailable.
+        print(json.dumps(observation).replace('#', r'\u0023'),
+              file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 class UnixHTTP(http.client.HTTPConnection):
     def __init__(self, socket_path, **kwargs):
         super().__init__('localhost', **kwargs)
@@ -90,6 +115,7 @@ class Probe:
         self.errors = []
         self.requests = 0
         self.peaks = dict(processes=0, rss_kib=0, fds=0)
+        self.process_limit_reported = False
         self.stable_fds = []
         self.out = open(config['output'], 'x', buffering=1)
         self.output_lock = threading.Lock()
@@ -192,6 +218,9 @@ class Probe:
             for name, value in dict(processes=len(pids), rss_kib=rss, fds=fds).items():
                 self.peaks[name] = max(value, self.peaks[name])
             self.log(kind='resources', pids=pids, rss_kib=rss, fds=fds)
+            if len(pids) > 6 and not self.process_limit_reported:
+                self.process_limit_reported = True
+                report_process_limit(pids, self.config, self.cgroup, self.pid)
             self.stop.wait(.02)
 
     def finite(self, key):
