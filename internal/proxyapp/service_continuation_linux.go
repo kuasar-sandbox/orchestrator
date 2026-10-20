@@ -250,7 +250,8 @@ func (s *Service) runCandidate(ctx context.Context) error {
 		select {
 		case <-changed:
 		case err := <-s.localDone:
-			_ = sendSnapshot()
+			snapshotErr := sendSnapshot()
+			s.logCandidateShutdown("local_business_ended", snapshotErr, err)
 			if err != nil {
 				return s.finishCandidateError(err, messages, connectionError)
 			}
@@ -310,7 +311,7 @@ func (s *Service) finishCandidateAfterControlLoss(cause error) error {
 	s.mu.Lock()
 	s.knownService = nil
 	s.stopOnce.Do(func() { close(s.stop) })
-	local, done, logger := s.local, s.localDone, s.logger
+	local, done := s.local, s.localDone
 	deadline := s.stopDeadline
 	if !s.stopRequested {
 		deadline = time.Now().Add(s.timeout)
@@ -319,6 +320,16 @@ func (s *Service) finishCandidateAfterControlLoss(cause error) error {
 	s.mu.Unlock()
 	local.requestStop(deadline)
 	err := <-done
+	s.logCandidateShutdown("coordinator_control_closed", cause, err)
+	return errors.Join(cause, err)
+}
+
+// The business result is already joined. Report it whichever completion branch
+// wins, without consuming localDone again or changing the terminal handoff.
+func (s *Service) logCandidateShutdown(reason string, controlErr, err error) {
+	s.mu.Lock()
+	logger, parent := s.logger, s.parent
+	s.mu.Unlock()
 	result := "completed"
 	if errors.Is(err, ErrForcedClose) {
 		result = "completed_with_forced_close"
@@ -326,11 +337,10 @@ func (s *Service) finishCandidateAfterControlLoss(cause error) error {
 		result = "failed"
 	}
 	if logger != nil {
-		logger.Info("proxy candidate shutdown", "boot_id", s.parent.boot,
-			"operation_id", s.parent.operation, "reason", "coordinator_control_closed",
-			"result", result, "control_error", cause, "error", err)
+		logger.Info("proxy candidate shutdown", "boot_id", parent.boot,
+			"operation_id", parent.operation, "reason", reason,
+			"result", result, "control_error", controlErr, "error", err)
 	}
-	return errors.Join(cause, err)
 }
 
 // All business has ended or failed to start before this call. Closing a Unix
