@@ -118,6 +118,19 @@ func (i *Instance) workerFinishing(index int, epoch uint64) bool {
 	return w.epoch == epoch && (i.stopping || w.stopping) && w.dataDone && w.mmdsDone
 }
 
+// workerStreamFinishing allows a validated stats Goodbye to arrive before the
+// independent control reader applies a stopping instance's queued lifecycle
+// acknowledgments. This only defers the stream-fault decision: worker exit,
+// terminal control messages and the original instance deadline still govern
+// completion. EOF and protocol errors remain faults before endpoint completion.
+func (i *Instance) workerStreamFinishing(index int, epoch uint64, streamErr error) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	w := i.workers[index]
+	return w.epoch == epoch && ((i.stopping || w.stopping) && w.dataDone && w.mmdsDone ||
+		streamErr == nil && i.stopping)
+}
+
 // drainWorkers stops both endpoints independently, then ends workers only
 // after both have drained. The instance shares one deadline across all workers.
 func (i *Instance) drainWorkers() error {

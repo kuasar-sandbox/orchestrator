@@ -188,7 +188,7 @@ func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, 
 		select {
 		case err := <-streamResult:
 			streamResult = nil
-			if instance.workerFinishing(workerIndex, epoch) {
+			if instance.workerStreamFinishing(workerIndex, epoch, err) {
 				continue
 			}
 			instance.workerFault(workerIndex, epoch)
