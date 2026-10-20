@@ -24,6 +24,35 @@ start_stats_sink() {
     fail "native stats export fixture did not bind"
 }
 
+wait_native_traffic_reference() {
+    local sid="$1" deadline_us remaining_ms remaining code curl_status
+    # A healthy Collector can hold the traffic read lock. Only temporary
+    # unavailability is retryable; every request shares this ten-second budget.
+    deadline_us=$(( ${EPOCHREALTIME/./} + 10000000 ))
+    while :; do
+        remaining_ms=$(( (deadline_us - ${EPOCHREALTIME/./}) / 1000 ))
+        (( remaining_ms > 0 )) || break
+        printf -v remaining '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
+        curl_status=0
+        code=$(curl -sS --noproxy '*' --max-time "$remaining" \
+            -o "$WORK/resp.body" -w '%{http_code}' -X GET \
+            -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" \
+            "http://127.0.0.1:$PORT/sandboxes/$sid/stats/traffic") || curl_status=$?
+        if [ "$curl_status" -ne 0 ]; then
+            dump_logs
+            fail "native traffic reference transport=$curl_status HTTP=$code"
+        fi
+        case "$code" in
+            200) return ;;
+            503) sleep 0.1 ;;
+            *) cat "$WORK/resp.body"; dump_logs; fail "native traffic reference=$code" ;;
+        esac
+    done
+    cat "$WORK/resp.body"
+    dump_logs
+    fail "native traffic reference=503 after 10s"
+}
+
 wait_native_export() { # exact SID, section, native public API reference
     local sid="$1" section="$2" reference="$3"
     for _ in $(seq 1 100); do

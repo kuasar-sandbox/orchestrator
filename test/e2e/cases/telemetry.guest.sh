@@ -110,8 +110,12 @@ EOF
     grep -q 'OTLP_GRPC_PEER_IDENTITY_OK' "$WORK/telemetry-guest-grpc.out" \
         || { cat "$WORK/telemetry-guest-grpc.out"; dump_logs; fail "guest OTLP/gRPC through management service"; }
     for section in resource traffic; do
-        code=$(req GET "/sandboxes/$SID/stats/$section" "$AK")
-        [ "$code" = 200 ] || fail "native $section reference=$code"
+        if [ "$section" = traffic ]; then
+            wait_native_traffic_reference "$SID"
+        else
+            code=$(req GET "/sandboxes/$SID/stats/$section" "$AK")
+            [ "$code" = 200 ] || fail "native $section reference=$code"
+        fi
         cp "$WORK/resp.body" "$WORK/telemetry-native-$section.json"
         wait_native_export "$SID" "$section" "$WORK/telemetry-native-$section.json"
     done
