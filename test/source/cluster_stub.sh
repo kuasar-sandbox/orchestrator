@@ -417,16 +417,42 @@ wait_tcp "$ROUTER_PORT" "router"
 
 step "waiting for node_link credential-pair cache"
 python3 - "$ADMIN" "$NODES" <<'PY' || fail "credential pairs were not distributed to all stub nodes"
-import json, sys, time, urllib.request
+import json, re, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
+last_nodes, last_read_attempt = None, None
+exceptions = {}
 for _ in range(300):
     try:
         nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=1))
+        last_nodes, last_read_attempt = nodes, _ + 1
         if len(nodes) == want and all(len(n.get("keys", [])) >= 1 for n in nodes):
             sys.exit(0)
-    except Exception:
-        pass
+    except Exception as exc:
+        name = type(exc).__name__
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", name) or (name not in exceptions and len(exceptions) >= 8):
+            name = "other"
+        exceptions[name] = exceptions.get(name, 0) + 1
     time.sleep(0.1)
+# Print only bounded IDs/counts; never keys, response bodies, or exception messages.
+counts = []
+if isinstance(last_nodes, list):
+    for node in last_nodes[:32]:
+        if not isinstance(node, dict):
+            counts.append({"node_id": None, "key_count": None})
+            continue
+        node_id, keys = node.get("node_id"), node.get("keys", [])
+        counts.append({
+            "node_id": node_id if isinstance(node_id, str) and re.fullmatch(r"stub-[0-9]{1,6}", node_id) else None,
+            "key_count": len(keys) if isinstance(keys, list) else None,
+        })
+print("credential-pair readiness: " + json.dumps({
+    "expected_nodes": want,
+    "node_count": len(last_nodes) if isinstance(last_nodes, list) else None,
+    "last_read_attempt": last_read_attempt,
+    "nodes": counts,
+    "nodes_truncated": isinstance(last_nodes, list) and len(last_nodes) > 32,
+    "exception_counts": exceptions,
+}, sort_keys=True), file=sys.stderr)
 sys.exit(1)
 PY
 
