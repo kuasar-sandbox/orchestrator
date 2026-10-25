@@ -41,6 +41,33 @@ resource_write_pressure_workload fixture "$3" "$WORK/start" "$WORK/delivery"
 ''', "_", str(LIB), str(self.work), mode], capture_output=True, text=True, timeout=5)
         return result
 
+    def test_raw_template_is_not_created_as_the_active_diff(self):
+        # Exercise the real setup/configuration functions, recording their
+        # filesystem commands without requiring privileged host tools.
+        result = subprocess.run(["bash", "-c", r'''
+set -euo pipefail
+. "$1"
+WORK="$2"
+BIN="$WORK/bin"
+RESOURCE_BASE_REF=file:///prepared/base.img
+RESOURCE_SANDBOX_IDS=()
+declare -A RESOURCE_TAPS=()
+mkdir() { :; }
+ip() { [ "$1 $2" != "link show" ]; }
+truncate() { printf '%s\n' "$*" >"$WORK/truncate.args"; }
+mkfs.ext4() { printf '%s\n' "$*" >"$WORK/mkfs.args"; }
+resource_setup_sandbox fixture
+resource_write_sandbox fixture 320 1024 512 false
+''', "_", str(LIB), str(self.work)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        template = self.work / "fixture.template.ext4"
+        self.assertEqual((self.work / "truncate.args").read_text(), f"-s 1G {template}\n")
+        self.assertEqual((self.work / "mkfs.args").read_text(), f"-q -F -O ^has_journal {template}\n")
+        self.assertFalse((self.work / "fixture.diff").exists())
+        config = (self.work / "fixture.yaml").read_text()
+        self.assertIn(f"diff: file://{self.work}/fixture.diff,", config)
+        self.assertIn(f"diff_template: file://{template}", config)
+
     def launch(self, mode):
         result = self.fixture(mode)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -49,8 +49,10 @@ resource_setup_sandbox() {
     RESOURCE_TAPS["$sid"]="$tap"
     ip tuntap add "$tap" mode tap
     ip link set "$tap" up
-    truncate -s 1G "$WORK/${sid}.diff"
-    mkfs.ext4 -q -F -O ^has_journal "$WORK/${sid}.diff"
+    # Raw ext4 is an immutable provisioning input. The sandbox creates its
+    # active DIFF at the separate, initially absent path on first use.
+    truncate -s 1G "$WORK/${sid}.template.ext4"
+    mkfs.ext4 -q -F -O ^has_journal "$WORK/${sid}.template.ext4"
 }
 
 resource_write_sandbox() {
@@ -70,7 +72,7 @@ boot:
   cmdline: "console=hvc0"
   root:
     base: $RESOURCE_BASE_REF
-    overlay: { diff: file://$WORK/${sid}.diff }
+    overlay: { diff: file://$WORK/${sid}.diff, diff_template: file://$WORK/${sid}.template.ext4 }
 EOF
     if [ "$placeholder" = true ]; then
         printf 'launch:\n  placeholder: true\n' >>"$WORK/$sid.yaml"
