@@ -835,10 +835,9 @@ func mustRefLocationURI(t *testing.T, cfg *config.Config, name string) string {
 func TestExportKeepSourceAfterCleanupSucceedsWithoutSourceWrites(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
-	cfg := &config.Config{}
-	cfg.Paths.RunRoot = filepath.Join(dir, "run")
-	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
-	o := testOrchCfgAt(t, cfg, dbPath)
+	// Publication can leave checkpoint-release work using SQLite after the
+	// export returns. Use the fixture that drains it before TempDir cleanup.
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	ctx := context.Background()
 	mk := strings.Repeat("8", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
