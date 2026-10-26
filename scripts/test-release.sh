@@ -185,18 +185,32 @@ fi
 bash "$ROOT/scripts/test-preview-line.sh"
 bash "$ROOT/scripts/test-delete-preview.sh"
 
-mkdir -p "$TMP/source-bin"
-cat > "$TMP/source-bin/gh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-[ "${1:-}" = api ] || exit 2
-[ "${2:-}" = "repos/$GITHUB_REPOSITORY/git/ref/heads/${FAKE_SOURCE_REF:?}" ] || exit 2
-printf '%s\n' "${FAKE_SOURCE_SHA:?}"
-EOF
-chmod +x "$TMP/source-bin/gh"
-env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator FAKE_SOURCE_REF=release/v1.2.x FAKE_SOURCE_SHA=1111111111111111111111111111111111111111 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.2.3 orchestrator >/dev/null
-if env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator FAKE_SOURCE_REF=release/v1.2.x FAKE_SOURCE_SHA=1111111111111111111111111111111111111111 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.3.0 orchestrator >/dev/null 2>&1; then
-  fail "release source validator accepted a tag from another version line"
+# The component passes every input unchanged to the fixed trusted helper.
+mkdir -p "$TMP/source-entry/trusted/platform/release"
+cat > "$TMP/source-entry/trusted/platform/release/producer-inputs.py" <<'PYENTRY'
+import os, sys
+from pathlib import Path
+unit = os.environ['ENTRY_UNIT']
+prefix = unit + '-' if unit in ('runtime', 'vmlinux') else ''
+assert sys.argv[1:] == ['admit', unit, 'release/v1.2.x', '1' * 40,
+                       prefix + 'v1.2.3', os.environ['GITHUB_REPOSITORY'], 'producer-source.tar']
+if os.environ.get('ENTRY_REJECT'): raise SystemExit(23)
+Path('producer-source.tar').write_text('admitted fixture')
+PYENTRY
+(
+  cd "$TMP/source-entry"
+  export GITHUB_REPOSITORY=kuasar-sandbox/orchestrator ENTRY_UNIT=orchestrator
+  bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.2.3 orchestrator
+  [ -f producer-source.tar ] || fail "source admission was not preserved"
+  rm producer-source.tar
+  status=0
+  ENTRY_REJECT=1 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.2.3 orchestrator || status=$?
+  [ "$status" -eq 23 ] || fail "source admission failure was not preserved"
+  [ ! -e producer-source.tar ] || fail "rejected admission produced an artifact"
+)
+rm "$TMP/source-entry/trusted/platform/release/producer-inputs.py"
+if (cd "$TMP/source-entry"; bash "$ROOT/scripts/validate-release-source.sh" main 1111111111111111111111111111111111111111 v1.2.3 connector) >/dev/null 2>&1; then
+  fail "source validator accepted a missing trusted helper"
 fi
 bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
 

@@ -177,7 +177,7 @@ jobs:
           dependencies+=(--dependency accelerator "$ACCELERATOR_TAG" "$ACCELERATOR_SHA")
           dependencies+=(--dependency connector "$CONNECTOR_TAG" "$CONNECTOR_SHA")
           dependencies+=(--dependency sandboxer "$SANDBOXER_TAG" "$SANDBOXER_SHA")
-          python3 -B trusted/platform/release/producer-inputs.py freeze orchestrator "$SOURCE_REF" "$SOURCE_SHA" producer-inputs.tar "${dependencies[@]}"
+          python3 -B trusted/platform/release/producer-inputs.py freeze orchestrator "$SOURCE_REF" "$SOURCE_SHA" producer-inputs.tar --admission producer-source.tar --version "${{ steps.request.outputs.version }}" "${dependencies[@]}"
       - name: Upload Workbench selection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
