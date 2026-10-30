@@ -315,27 +315,36 @@ BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_B_KEY=$(basename "$BUNDLE_B_TARGET" .bundle)
 [[ "$BUNDLE_B_TARGET" == *.bundle && "$BUNDLE_B_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "bundle B target does not encode its root ManifestKey: $BUNDLE_B_TARGET"
-python3 - "$BUNDLE_B_TARGET" "$BUNDLE_A_KEY" <<'PY' \
-    || fail "bundle B retained external refs or omitted its embedded A manifest"
-import sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    names = set(archive.namelist())
-if "bundle/refs" in names:
-    raise SystemExit("bundle B unexpectedly retained external refs")
-want = "manifest/" + sys.argv[2]
-if want not in names:
-    raise SystemExit(f"bundle B entries omit embedded A manifest {want!r}")
-PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_B_TARGET" >"$WORK/bundle-b.json" || fail "bundle B snapshot.cfg is unreadable"
-python3 - "$WORK/bundle-b.json" "$BUNDLE_A_KEY" <<'PY' \
-    || fail "bundle B snapshot.cfg is not a manifest-only logical graph"
-import json, sys
+# A working-set parent can be trimmed into a new historical S even when it is
+# the only local parent (sandboxer#380). Validate B's actual memory graph, not
+# an identity that was only stable for legacy/all-dirty A. Restore below still
+# has to prove that the embedded history preserves A's guest state.
+python3 - "$WORK/bundle-b.json" "$WORK/bundle-local.json" "$BUNDLE_B_TARGET" "$BUNDLE_B_KEY" <<'PY_BUNDLE_B' \
+    || fail "bundle B does not own its bounded manifest-only memory graph"
+import json, re, sys, zipfile
 with open(sys.argv[1], encoding="utf-8") as stream:
     cfg = json.load(stream)
-want = "manifest://" + sys.argv[2]
-if not (cfg.get("FromRefs") or []) or cfg["FromRefs"][0] != want:
-    raise SystemExit(f"bundle B FromRefs={cfg.get('FromRefs')!r}, want first {want!r}")
+with open(sys.argv[2], encoding="utf-8") as stream:
+    parent = json.load(stream)
+refs, suffix = cfg.get("FromRefs") or [], parent.get("FromRefs") or []
+if len(refs) != 1 + len(suffix) or refs[1:] != suffix:
+    raise SystemExit(f"B memory refs={refs!r}, want one history plus inherited {suffix!r}")
+if any(not isinstance(ref, str) or re.fullmatch(r"manifest://[0-9a-f]{64}", ref) is None for ref in refs):
+    raise SystemExit(f"B memory refs are not logical Manifest references: {refs!r}")
+if "manifest://" + sys.argv[4] in refs:
+    raise SystemExit("B memory graph references its own root")
+with zipfile.ZipFile(sys.argv[3]) as archive:
+    names = set(archive.namelist())
+if "bundle/refs" in names:
+    raise SystemExit("bundle B unexpectedly retained external Bundle locations")
+# Only the new local history is owned by B. The inherited suffix retains its
+# portable remote provenance; requiring those published template manifests to
+# be copied into B would cross the external boundary we just verified above.
+member = "manifest/" + refs[0].removeprefix("manifest://")
+if member not in names:
+    raise SystemExit(f"bundle B omits referenced memory history manifest {member!r}")
 def strings(value):
     if isinstance(value, str):
         yield value
@@ -348,10 +357,10 @@ def strings(value):
 bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value]
 if bad:
     raise SystemExit(f"physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
-PY
+PY_BUNDLE_B
 
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_CHAIN_RESTORE_$RANDOM"
-wait_sandbox_state "$SID" running 20 || fail "bundle B with embedded A manifest did not restore"
+wait_sandbox_state "$SID" running 20 || fail "bundle B with embedded memory history did not restore"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-chain-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-chain-read.out" \
