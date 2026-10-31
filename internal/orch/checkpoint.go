@@ -3,12 +3,14 @@ package orch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
 // cleanupCheckpoint runs under the SID lifecycle lock, after runner fencing,
@@ -52,6 +54,21 @@ func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox)
 		args = append(args, "--restore", source.Ref)
 	}
 	args = append(args, "--from", e)
+	retained, err := o.st.Checkpoint(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if retained != nil {
+		pair := artifact.CheckpointSource{SandboxRef: retained.Source.Ref}
+		if retained.Source.Kind == types.ResumeSourceSnapshot {
+			pair.SnapshotRef, pair.SandboxRef = retained.Source.Ref, retained.Source.SandboxRef
+		}
+		encoded, err := json.Marshal([]artifact.CheckpointSource{pair})
+		if err != nil {
+			return err
+		}
+		args = append(args, "--retain", string(encoded))
+	}
 	args = append(args, "--ref-location-parent", o.cfg.Checkpoint.Remote.RefLocationParent)
 	cmd := exec.CommandContext(ctx, o.executables.OrchestratorCtl(), args...)
 	inheritSourceOperation(ctx, cmd)

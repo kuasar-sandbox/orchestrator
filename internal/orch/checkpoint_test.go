@@ -114,7 +114,7 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			cfg.Checkpoint.MergeRef = tc.node.MergeRef
 			cfg.Checkpoint.DropCaches = tc.node.DropCaches
 			o, sb, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, tc.metadata)
-			if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(tc.action)); err != nil {
+			if _, err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(tc.action)); err != nil {
 				t.Fatal(err)
 			}
 			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
@@ -145,7 +145,7 @@ func TestPauseSandboxCaptureAndTTLAutoPauseSelection(t *testing.T) {
 		t.Run(mode+" explicit sandbox", func(t *testing.T) {
 			cfg := checkpointOrchestratorConfig(t, mode)
 			o, sb, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, "")
-			if err := o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}); err != nil {
+			if _, err := o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}); err != nil {
 				t.Fatal(err)
 			}
 			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
@@ -201,7 +201,7 @@ func TestExplicitPauseDefaultsToSnapshotIndependentlyOfAutoPauseMemory(t *testin
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+	if _, err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
 		t.Fatal(err)
 	}
 	if args := readCheckpointArgs(t, argsPath); len(args) == 0 || args[0] != "snapshot" {
@@ -246,7 +246,7 @@ func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 			if tc.auto {
 				err = o.pauseSandbox(context.Background(), sb)
 			} else {
-				err = o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+				_, err = o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
 			}
 			if !errors.Is(err, api.ErrBadRequest) {
 				t.Fatalf("Pause error = %v, want ErrBadRequest", err)
@@ -272,7 +272,7 @@ func TestSnapshotFailureLeavesSandboxRunning(t *testing.T) {
 	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
 	o, sb, apiKey, launcher, vs, _ := newCheckpointPauseFixture(t, cfg, "")
 	t.Setenv("CHECKPOINT_FAIL", "1")
-	if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err == nil {
+	if _, err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err == nil {
 		t.Fatal("Pause succeeded despite snapshot failure")
 	}
 	stored, err := o.st.Get(context.Background(), sb.ID)
@@ -292,7 +292,7 @@ func TestSandboxExportFailureLeavesRunningOwnershipUnchanged(t *testing.T) {
 	o, sb, apiKey, launcher, vs, _ := newCheckpointPauseFixture(t, cfg, "")
 	t.Setenv("CHECKPOINT_FAIL", "1")
 	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
-	if err := o.Pause(context.Background(), sb.ID, apiKey, request); err == nil {
+	if _, err := o.Pause(context.Background(), sb.ID, apiKey, request); err == nil {
 		t.Fatal("Pause succeeded despite Sandbox export failure")
 	}
 	stored, err := o.st.Get(context.Background(), sb.ID)
@@ -320,7 +320,8 @@ func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
 
 	pauseDone := make(chan error, 1)
 	go func() {
-		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+		_, err := o.Pause(requestCtx, sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+		pauseDone <- err
 	}()
 	waitForCheckpointFile(t, started)
 
@@ -405,7 +406,8 @@ func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *tes
 
 	pauseDone := make(chan error, 1)
 	go func() {
-		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+		_, err := o.Pause(requestCtx, sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+		pauseDone <- err
 	}()
 	waitForCheckpointFile(t, started)
 	cancelRequest()

@@ -115,7 +115,7 @@ func (r *Registry) routeBarrierAck(p *Plugin, barrierID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	b := r.barriers[barrierID]
-	if b == nil || b.err != nil || r.m[p.ID] != p || !p.ready {
+	if b == nil || b.pause || b.err != nil || r.m[p.ID] != p || !p.ready {
 		return
 	}
 	if required := b.required[p.epoch]; required != p {
@@ -138,16 +138,16 @@ func (r *Registry) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 			participants = append(participants, p)
 		}
 	}
-	return r.beginRouteBarrierLocked(participants)
+	return r.beginRouteBarrierLocked(participants, false)
 }
 
 func proxyRouteParticipantReady(p *Plugin) bool {
 	return p != nil && p.ready &&
 		p.Caps.Subscribe != nil && p.Caps.Subscribe.Kind == routesync.KindRouteWake &&
-		p.Caps.Proxy != nil
+		p.Caps.Proxy != nil && (p.lease == nil || p.lease.Err() == nil)
 }
 
-func (r *Registry) beginRouteBarrierLocked(required []*Plugin) (*proxyRouteBarrier, error) {
+func (r *Registry) beginRouteBarrierLocked(required []*Plugin, allowEmpty bool) (*proxyRouteBarrier, error) {
 	id, err := newRouteBarrierID()
 	if err != nil {
 		return nil, err
@@ -166,7 +166,10 @@ func (r *Registry) beginRouteBarrierLocked(required []*Plugin) (*proxyRouteBarri
 		b.required[p.epoch] = p
 	}
 	if len(b.required) == 0 {
-		return nil, ErrProxyRouteUnavailable
+		if !allowEmpty {
+			return nil, ErrProxyRouteUnavailable
+		}
+		b.signalLocked()
 	}
 	r.barriers[id] = b
 	return b, nil
@@ -196,6 +199,8 @@ type proxyRouteBarrier struct {
 	done     chan struct{}
 	signaled bool
 	err      error
+	pause    bool
+	activity routesync.PauseAck
 }
 
 func (b *proxyRouteBarrier) ID() string { return b.id }
@@ -238,7 +243,7 @@ func (b *proxyRouteBarrier) Commit() error {
 		return ErrProxyRouteUnavailable
 	}
 	for epoch, p := range b.required {
-		if p.epoch != epoch || !p.ready || r.m[p.ID] != p {
+		if p.epoch != epoch || !proxyRouteParticipantReady(p) || r.m[p.ID] != p {
 			delete(r.barriers, b.id)
 			return ErrProxyRouteLeaseChanged
 		}
@@ -344,6 +349,7 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 		ProxyCapabilities: []string{routesync.InplaceRestartV1},
 		RouteStreamReady:  func() { s.deps.Plugins.markRouteStreamReady(p) },
 		RouteBarrierAck:   func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
+		PauseAck:          func(barrierID string, ack routesync.PauseAck) { s.deps.Plugins.pauseAck(p, barrierID, ack) },
 	}
 	routesync.ServeStream(ctx, w, r.Body, s.deps.RouteSource, reg, hooks, s.log)
 	s.log.Info("plugin deregistered", "id", id)

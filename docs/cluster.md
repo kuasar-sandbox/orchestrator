@@ -589,7 +589,7 @@ When node_list is not ready, it may list + repair only from the same node_list o
 | `node_sandbox_id` | Current node-local execution ID |
 | `sandbox_generation` | Registry-owned generation of the current NodeSandboxID |
 | `next_sandbox_generation` | Next allocatable generation; persisted only by Registry, never sent to the node |
-| `state` | `reserved` / `ready` / `paused` / `dead` |
+| `state` | `reserved` / `ready` / `pausing` / `paused` / `dead` |
 | `node_id` | Current hosting node |
 | `profile` | Sandbox profile fixed by create intent, consistent with node ownership and event facts |
 | `api_secret_fingerprint` | Complete APISecret fingerprint bound to the sandbox business record; lifecycle commands/ownership cleanup use it to prevent operations across bindings |
@@ -607,9 +607,13 @@ State machine:
 
 ```text
 none -> reserved -> ready
-ready -> paused -> reserved -> ready
-ready/paused/reserved -> dead/tombstone
+ready -> pausing -> paused -> reserved -> ready
+ready/pausing/paused/reserved -> dead/tombstone
 ```
+
+`pausing` preserves the current node binding. Router forwards authenticated data to that node;
+node Proxy parks it and requests Wake. Pause/Resume sequencing remains conductor-owned.
+Checkpoint deletion forwards its child API path and never invokes sandbox deletion.
 
 An actually emptied node, a killed sandbox, or a sandbox missing after restart converges through dead-route cleanup. A later explicit create/recovery Reserve can place it again. A host/conductor restart alone does not mean every durable paused or recovering sandbox is missing; the node's reconciled report and exact ownership determine cleanup.
 
@@ -696,7 +700,7 @@ Once a group disappears from its provider, new Place/verify-key calls treat it a
 
 Router is the stateless northbound E2B control/data entry. Registry supplies authenticated, group-scoped route and Build state through the protocols defined in this document; the node remains lifecycle/resource authority. Public clients retain stable SandboxID, while the selected node target may change. Protected route credentials must not be exposed through public observation or ordinary watch/list responses (§11).
 
-The complete [Router contract](cluster-router.md) owns cache keys/revisions, membership discovery, operation-specific request conversion, API/data endpoint selection, native-exec token and first-frame admission, retry boundaries, and forwarding. A complete node target can be forwarded to even while paused/starting; the node owns parking/activation. Registry Reserve/Resolve schemas remain defined in [§8](#8-route_link), rather than copied into the Router implementation guide.
+The complete [Router contract](cluster-router.md) owns cache keys/revisions, membership discovery, operation-specific request conversion, API/data endpoint selection, native-exec token and first-frame admission, retry boundaries, and forwarding. A complete node target can be forwarded to even while pausing/paused/starting; the node owns parking/activation. Registry Reserve/Resolve schemas remain defined in [§8](#8-route_link), rather than copied into the Router implementation guide.
 
 Read these as two ends of one protocol: this document defines what Registry accepts, persists and returns; the Router guide defines how its caller uses those results. Neither ordinary data lookup nor stale-route retry is permission to create an unknown Sandbox, skip authentication, or replay admitted exec bytes.
 
@@ -814,7 +818,7 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 
 ## 15. Performance
 
-- Hot data path: a complete node-target cache hit forwards directly to the node, including paused/starting, without Registry access.
+- Hot data path: a complete node-target cache hit forwards directly to the node, including pausing/paused/starting, without Registry access.
 - Cold Place path: group → route_link owner → ready-placer failover → node-owner connectivity/current-usage check → authoritative node admission. Definitively failed candidates are excluded before reselection; ambiguous Build dispatch stays pinned.
 - Very many groups: Router does not subscribe to groups; Registry does not scan across them; placer import pages independently by source_id.
 - Very many nodes: node_link shards by node_id; node_list holds only a low-frequency directory, not high-frequency usage.

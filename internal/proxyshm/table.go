@@ -911,6 +911,17 @@ func parentDir(path string) string {
 }
 
 func sameActivationRoute(a, b routesync.RouteEntry) bool {
+	// Capture/cleanup progress is not a failed Resume. Preserve the activation
+	// revision throughout pausing -> paused, including intermediate cleanup
+	// publications. Entering starting still advances it, so a coalesced
+	// starting -> paused rollback remains visible to parked callers.
+	if (a.State == routesync.StatePausing || a.State == routesync.StatePaused) && (b.State == routesync.StatePausing || b.State == routesync.StatePaused) {
+		a.State, b.State = routesync.StatePaused, routesync.StatePaused
+		a.RunID, b.RunID = "", ""
+		a.EnvdUDS, b.EnvdUDS, a.CiUDS, b.CiUDS, a.FloatingIP, b.FloatingIP = "", "", "", "", "", ""
+		a.ArtifactLocation, b.ArtifactLocation = "", ""
+	}
+
 	a.PauseReason, b.PauseReason = "", ""
 	a.ResourceObligation, b.ResourceObligation = false, false
 	a.PressureVersion, b.PressureVersion = 0, 0

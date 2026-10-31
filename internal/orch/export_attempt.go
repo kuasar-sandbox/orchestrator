@@ -23,6 +23,7 @@ const (
 // publish/finalize boundary with a concurrently accepted resume.
 type exportAttempt struct {
 	sid          string
+	checkpointID string
 	source       types.ResumeSource
 	toTemplate   bool
 	state        exportAttemptState
@@ -35,7 +36,7 @@ type exportAttemptGroup struct {
 	active map[string]*exportAttempt
 }
 
-func (g *exportAttemptGroup) Begin(sid string, source types.ResumeSource, toTemplate bool, cancelUpload context.CancelCauseFunc) (*exportAttempt, bool) {
+func (g *exportAttemptGroup) Begin(sid string, source types.ResumeSource, toTemplate bool, checkpointID string, cancelUpload context.CancelCauseFunc) (*exportAttempt, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.active == nil {
@@ -45,7 +46,7 @@ func (g *exportAttemptGroup) Begin(sid string, source types.ResumeSource, toTemp
 		return nil, false
 	}
 	attempt := &exportAttempt{
-		sid:          sid,
+		sid: sid, checkpointID: checkpointID,
 		source:       source,
 		toTemplate:   toTemplate,
 		state:        exportPublishing,
@@ -86,7 +87,7 @@ func (g *exportAttemptGroup) ResumeAccepted(sid string, cause error) (exportAtte
 	found := false
 	g.mu.Lock()
 	attempt := g.active[sid]
-	if attempt != nil && attempt.state == exportPublishing {
+	if attempt != nil && attempt.state == exportPublishing && attempt.checkpointID == "" {
 		found = true
 		if attempt.toTemplate {
 			attempt.state = exportDetached

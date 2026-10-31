@@ -1132,6 +1132,8 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	switch e.State {
 	case routesync.StateRunning:
 		rec.State = StateReady
+	case routesync.StatePausing:
+		rec.State = StatePausing
 	case routesync.StatePaused:
 		rec.State = StatePaused
 	default:
@@ -2089,7 +2091,7 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			sandboxPlans = append(sandboxPlans, plan)
 			continue
 		}
-		shouldReset := s.State == StateReady || s.State == StatePaused
+		shouldReset := s.State == StateReady || s.State == StatePausing || s.State == StatePaused
 		if s.State == StateReserved {
 			if r.hasInflight(flightKey(s.Group, s.RouteKey)) {
 				continue

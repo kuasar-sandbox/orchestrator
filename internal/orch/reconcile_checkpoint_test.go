@@ -60,3 +60,24 @@ func TestReconcileAdoptionReleasesCheckpointsWithoutRetiringRun(t *testing.T) {
 		t.Fatal("checkpoint release made adopted runner assignable again")
 	}
 }
+
+func TestReconcileInterruptedPauseNeverAdoptsLiveRunnerAsRunning(t *testing.T) {
+	f := newDiskCheckpointFixture(t, "interrupted-pause")
+	f.o.cfg.Units = multiPoolUnits()
+	actual := instanceUnit("shared@.service", f.sb.RunID)
+	lc := &multiPoolLauncher{reconcileLauncher: &reconcileLauncher{units: []launcher.Unit{{Name: actual, ActiveState: "active"}}}}
+	f.o.lc = lc
+	if ok, err := f.o.st.SetPausing(context.Background(), f.sb.ID, f.sb.RunID, true); err != nil || !ok {
+		t.Fatalf("gate=%v %v", ok, err)
+	}
+	if err := f.o.ReconcileSandboxes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row, err := f.o.st.Get(context.Background(), f.sb.ID)
+	if err != nil || row.State != types.StateDead || row.RunID != "" {
+		t.Fatalf("uncertain capture was adopted: %+v %v", row, err)
+	}
+	if !containsString(lc.stopped, actual) {
+		t.Fatal("interrupted capture runner was not fenced")
+	}
+}

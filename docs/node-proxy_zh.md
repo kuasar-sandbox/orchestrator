@@ -164,6 +164,20 @@ master 把下行路由流投影到共享内存:
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
+Pause 使用 routesync v9 的 `pause_barrier{barrier_id,route}` 和
+`pause_ack{barrier_id,pause_ack}`. Conductor 固定本次开始时在线且 ready 的 Proxy 集合,
+忽略此前已断链的 Proxy, 不持久化清单; 空参与集允许继续. 各 master 先应用 `pausing`
+路由, 再通过私有控制通道同步采样所有 worker, 包括正在 drain 的 worker. Worker 在
+parking/backend 计数共用的 per-SID 锁内复核门禁, unlimited 流量同样参与统计.
+每个 ACK 携带各服务的 parking/connected 计数; 采样不完整同时返回 error. Pause 需要
+worker 握手, Create 的原有 master-only 屏障不变. `ifIdle=true` 时非零计数返回 409,
+握手失败返回 503. 握手中断链、替换或新增参与者均使本次固定集合失败.
+
+新请求鉴权后对 `pausing` 和 `paused` 使用相同 park/Wake 流程; conductor 以 SID 锁将
+Wake 排在 Pause 之后. 全量同步包含尚未提交的门禁, 断链也不恢复旧 running 路由.
+已有流量继续计数直到结束. `pausing → paused` 及捕获后的端点清空不推进 activation
+revision; `starting → paused` 即使被合并仍表示恢复失败. idle 保证仅覆盖本次在线参与者.
+
 每个 Create 都使用同一有序 stream 建立 route-applied barrier:
 
 ```text
@@ -215,11 +229,11 @@ Snapshot-specific location 改为与 E/S kind 正交的 `artifact_location`;V5 �
 sid hash ─► record slot ─► RouteEntry (Lookup 只读)
                          ├─ running → auth 后 Activate 重验并转发
                          ├─ starting → auth 后 park,不发 Wake;回滚即结束
-                         └─ paused → auth 后才发 wake pipe 并 park
+                         └─ pausing/paused → auth 后才发 wake pipe 并 park
 ```
 
 普通 route Lookup 对 missing/paused/starting 都不写 wake pipe;只有请求已按返回的
-`RouteBinding` 完成鉴权后,Activate 才可对 paused sid 写 wake pipe。starting 已由 conductor
+`RouteBinding` 完成鉴权后,Activate 才可对 pausing/paused sid 写 wake pipe。starting 已由 conductor
 launch owner 推进,Activate 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新
 立即结束 starting 请求。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
@@ -244,7 +258,7 @@ node-local ID。若外部系统显式把刚删除的 NodeSandboxID 立即分配�
 凭据投影和同名运行目录.节点不得主动执行这种跨逻辑沙箱的即时 ID 复用;
 为不同逻辑沙箱显式指定迁移 target 时应使用新的 NodeSandboxID,或先确认路由视图已经收敛。
 
-受保护 `RouteEntry` 的 state 为 `starting|running|paused|dead`,并显式携带
+受保护 `RouteEntry` 的 state 为 `starting|running|pausing|paused|dead`,并显式携带
 `StableID`、`APISecret`、`APISecretFingerprint`、
 `ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
 `ForwardAccessToken`。
@@ -580,7 +594,7 @@ master 的分配事务保留一个 spare slot:先撤销旧 binding、分配新 b
 旧 release 或者在本 worker 初始化前完成,或者见新 tag 后不操作,不会减少新 identity 计数。
 acquire 在发布增量前后重验 generation;撤销则在同一本地 slot 锁内撤回增量。
 既有完整 RouteBinding/ExecIdentity 相等检查继续保护 activation 的凭据与策略;arena Valid 只表示 generation 存活。
-正常 starting/running/paused 更新与未改变 binding 的 full-sync 重放保留 generation/计数。
+正常 starting/running/pausing/paused 更新与未改变 binding 的 full-sync 重放保留 generation/计数。
 本上界不把新旧身份合为一个 quota,也不承诺降低 limit 时驱逐已有 flow。
 worker 落点不是静态 M/N quota:单个 worker 可用全部 M,但多个 worker 不能各自独立用 M。
 不引入 watchdog、锁超时、争锁即杀进程、每 flow master RPC 或全局 limiter。
@@ -690,7 +704,7 @@ bare Sandbox 空闲响应示例（不适用的 e2b 上限为零）：
 Sandbox row 推导;全零对象明确表示 unlimited。worker stats unavailable 时该 API 仍可返回 503,
 但不影响 master route/admission authority 或 Create barrier。
 
-顶层 `idleSince` 仅在 state=running 且所有 inflight 为零时返回;starting/paused 即使零连接
+顶层 `idleSince` 仅在 state=running 且所有 inflight 为零时返回;starting/pausing/paused 即使零连接
 也不返回顶层时间。service 的 `idleSince` 也只在该 service 两项为零时出现。接口不返回
 `idle`、`idleForSeconds`、last-open/close、累计连接数、速率、延迟、端口明细或 worker
 身份;`Cache-Control: no-store`.Proxy route 未完成同步,
@@ -752,7 +766,7 @@ column 只存在于独立 arena,不进入会因 backshift 移动的 route record
 - **standalone Connect**:成功响应等待先行路由更新已应用并获 ACK,使首个请求能在 starting
   上 parking,而不会选中旧 running 实例。它不等待 VM ready。barrier 失败返回 503,调用方
   取消会结束等待;两者都不取消已受理的 resume。cluster CmdConnect 保持独立的受理及归属协议。
-- **park / wake**:Lookup 不发送 Wake;通过有效鉴权策略的 Activate 才能对 paused sid 发 Wake 并等待
+- **park / wake**:Lookup 不发送 Wake;通过有效鉴权策略的 Activate 才能对 pausing/paused sid 发 Wake 并等待
   共享表更新。starting 只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和
   当前 launch 的状态推进仍由 conductor 执行。
 - **stats stream**:任一 worker stream EOF、超时或协议错误都会停止该 worker;确认退出前

@@ -198,24 +198,25 @@ func TestResetStartingOwnershipForRecoveryPreservesAcceptedModeAndSource(t *test
 	}
 }
 
-func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *testing.T) {
+func TestCommitPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	sb := sandboxInsertFixture("pause-cas", 0)
+	sb.State = types.StatePausing
 	sb.ResumeSource = types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-old"}
 	if err := st.InsertSandbox(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 
 	staleSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-stale"}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", staleSource); err != nil || changed {
-		t.Fatalf("stale CommitRunningPaused = %v, %v; want CAS miss", changed, err)
+	if changed, err := st.CommitPaused(ctx, sb.ID, "run-stale", staleSource, ""); err != nil || changed {
+		t.Fatalf("stale CommitPaused = %v, %v; want CAS miss", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != types.StateRunning || got.ResumeSource != sb.ResumeSource {
+	if got.State != types.StatePausing || got.ResumeSource != sb.ResumeSource {
 		t.Fatalf("CAS miss partially changed pause: %+v", got)
 	}
 	if _, err := st.db.Exec(`
@@ -224,14 +225,14 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 		t.Fatal(err)
 	}
 	failedSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-failed"}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, failedSource); err == nil || changed {
-		t.Fatalf("failed CommitRunningPaused = %v, %v; want propagated error", changed, err)
+	if changed, err := st.CommitPaused(ctx, sb.ID, sb.RunID, failedSource, ""); err == nil || changed {
+		t.Fatalf("failed CommitPaused = %v, %v; want propagated error", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != types.StateRunning || got.ResumeSource != sb.ResumeSource {
+	if got.State != types.StatePausing || got.ResumeSource != sb.ResumeSource {
 		t.Fatalf("failed commit partially changed pause: %+v", got)
 	}
 	if _, err := st.db.Exec(`DROP TRIGGER fail_pause_commit`); err != nil {
@@ -239,8 +240,8 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 	}
 
 	currentSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, currentSource); err != nil || !changed {
-		t.Fatalf("CommitRunningPaused = %v, %v", changed, err)
+	if changed, err := st.CommitPaused(ctx, sb.ID, sb.RunID, currentSource, ""); err != nil || !changed {
+		t.Fatalf("CommitPaused = %v, %v", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)
 	if err != nil {
@@ -250,8 +251,8 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *test
 		t.Fatalf("committed pause = %+v", got)
 	}
 	lateSource := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-late"}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, lateSource); err != nil || changed {
-		t.Fatalf("late CommitRunningPaused = %v, %v; want CAS miss", changed, err)
+	if changed, err := st.CommitPaused(ctx, sb.ID, sb.RunID, lateSource, ""); err != nil || changed {
+		t.Fatalf("late CommitPaused = %v, %v; want CAS miss", changed, err)
 	}
 }
 

@@ -54,7 +54,8 @@ func TestPauseHookRunsOutsideLifecycleLockCanReadHostAndRejectsBeforeSnapshot(t 
 
 	done := make(chan error, 1)
 	go func() {
-		done <- o.Pause(context.Background(), sandbox.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+		_, err := o.Pause(context.Background(), sandbox.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+		done <- err
 	}()
 	select {
 	case err := <-done:
@@ -79,7 +80,7 @@ func TestPauseHookCannotChangeCaptureKindBeforeSideEffects(t *testing.T) {
 		operation.Pause.CaptureKind = conductorextension.CaptureKindSnapshot
 		return nil
 	}), nil)
-	err := o.Pause(context.Background(), sandbox.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox})
+	_, err := o.Pause(context.Background(), sandbox.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox})
 	if !errors.Is(err, api.ErrBadRequest) {
 		t.Fatalf("Pause error = %v, want bad request", err)
 	}

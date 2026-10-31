@@ -315,7 +315,7 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	if !m.availableLocked() {
 		return nil, api.ErrStatsUnavailable
 	}
-	if state != types.StateStarting && state != types.StateRunning && state != types.StatePaused {
+	if state != types.StateStarting && state != types.StateRunning && state != types.StatePaused && state != types.StatePausing {
 		return nil, api.ErrStatsConflict
 	}
 	services, ok := profileServices(profile)
