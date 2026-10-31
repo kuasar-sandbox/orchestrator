@@ -756,7 +756,9 @@ ready/pausing/paused/reserved -> dead/tombstone
 ```
 
 `pausing` 保留当前节点绑定. Router 将鉴权后的数据转发到该节点, 由 node Proxy park
-并请求 Wake; Pause/Resume 时序仍由 conductor 负责. 删除 checkpoint 转发其子资源
+并请求 Wake; Pause/Resume 时序仍由 conductor 负责. 相同 route key 的 Create 也向
+原 pausing owner 发送 Connect 并等待 running, 不重新 placement 或创建新 generation.
+删除 checkpoint 转发其子资源
 API 路径, 不调用删除 sandbox 的控制命令.
 
 实际整机清空、单沙箱 killed、重启后确实缺失的 sandbox 都经 dead route 清理收敛；下次显式

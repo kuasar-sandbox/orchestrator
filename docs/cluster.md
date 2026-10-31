@@ -613,7 +613,9 @@ ready/pausing/paused/reserved -> dead/tombstone
 
 `pausing` preserves the current node binding. Router forwards authenticated data to that node;
 node Proxy parks it and requests Wake. Pause/Resume sequencing remains conductor-owned.
-Checkpoint deletion forwards its child API path and never invokes sandbox deletion.
+Create for the same route key also connects to the existing pausing owner and waits for running,
+without placement or a new generation. Checkpoint deletion forwards its child API path and
+never invokes sandbox deletion.
 
 An actually emptied node, a killed sandbox, or a sandbox missing after restart converges through dead-route cleanup. A later explicit create/recovery Reserve can place it again. A host/conductor restart alone does not mean every durable paused or recovering sandbox is missing; the node's reconciled report and exact ownership determine cleanup.
 

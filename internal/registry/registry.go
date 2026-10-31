@@ -629,8 +629,12 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
 func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory bool) error {
-	// PAUSED: resume on the same node (no placement).
-	if found && rec.State == StatePaused && rec.NodeID != "" {
+	// PAUSING/PAUSED keep their current owner. Connect waits behind the node's
+	// Pause lifecycle lock; Registry must not replace a capture with a Create.
+	if found && rec.State == StatePausing && rec.NodeID == "" {
+		return ErrNodeGone
+	}
+	if found && (rec.State == StatePausing || rec.State == StatePaused) && rec.NodeID != "" {
 		_, stableID, err := replacementCredentials(rec)
 		if err != nil {
 			return err
@@ -639,21 +643,25 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			return ErrNodeGone
 		}
 		reserved := *rec
-		reserved.State = StateReserved
-		reservedRev, ok, err := r.stores.CASSandbox(ctx, &reserved, rev)
-		if err != nil || !ok {
-			return cas(err, ok)
-		}
-		r.setReserveRollbackFence(flightKey(group, routeKey), &reserved, reservedRev)
-		if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{
-			Group: group, RouteKey: routeKey, SandboxID: rec.SandboxID,
-			SandboxGeneration: rec.SandboxGeneration, NodeSandboxID: rec.NodeSandboxID,
-			Profile:              rec.Profile,
-			APISecretFingerprint: rec.APISecretFingerprint,
-		}); err != nil {
-			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
-			_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, dropCurrentRef)
-			return err
+		reservedRev := rev
+		if rec.State == StatePaused {
+			reserved.State = StateReserved
+			var ok bool
+			reservedRev, ok, err = r.stores.CASSandbox(ctx, &reserved, rev)
+			if err != nil || !ok {
+				return cas(err, ok)
+			}
+			r.setReserveRollbackFence(flightKey(group, routeKey), &reserved, reservedRev)
+			if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{
+				Group: group, RouteKey: routeKey, SandboxID: rec.SandboxID,
+				SandboxGeneration: rec.SandboxGeneration, NodeSandboxID: rec.NodeSandboxID,
+				Profile:              rec.Profile,
+				APISecretFingerprint: rec.APISecretFingerprint,
+			}); err != nil {
+				dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
+				_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, dropCurrentRef)
+				return err
+			}
 		}
 		ccmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.NodeSandboxID,
@@ -665,11 +673,15 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, ccmd, lifecycleAckTimeout)
 		if err != nil {
-			_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, true)
+			if rec.State == StatePaused {
+				_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, true)
+			}
 			return err
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, true)
+			if rec.State == StatePaused {
+				_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, true)
+			}
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -727,6 +739,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		cur, curRev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
 		if err != nil {
 			return err
+		}
+		if curFound && cur.State == StatePausing {
+			return r.startReserve(ctx, group, routeKey, cur, curRev, true, createConfig, createCredentials, autoPauseMemory)
 		}
 		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
 			return nil // a concurrent replacement already won; the running route finishes the Reserve
