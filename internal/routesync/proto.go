@@ -48,8 +48,9 @@ import (
 // Version 6 adds rebuildable Build upsert/delete events and an explicit Build
 // full-snapshot bracket on every node-link session. Version 7 adds the
 // presence-aware per-Sandbox max_inflight route projection. Version 8 separates
-// invalid persisted traffic policy from lifecycle state; mixed peers fail closed.
-const Version = 8
+// invalid persisted traffic policy from lifecycle state. Version 9 adds pausing
+// and synchronous Pause activity ACKs; mixed peers fail closed.
+const Version = 9
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -79,6 +80,7 @@ const (
 	StateStarting = "starting"
 	StateRunning  = "running"
 	StatePaused   = "paused"
+	StatePausing  = "pausing"
 	StateDead     = "dead"
 )
 
@@ -95,8 +97,10 @@ const (
 	// RouteBarrier follows one or more route mutations on the same ordered down
 	// stream. The subscriber ACKs it only after every preceding Upsert has been
 	// applied successfully to its serving view.
-	TypeRouteBarrier    = "route_barrier"     // orchestrator -> subscriber
-	TypeRouteBarrierAck = "route_barrier_ack" // subscriber -> orchestrator
+	TypeRouteBarrier    = "route_barrier" // orchestrator -> subscriber
+	TypeRouteBarrierAck = "route_barrier_ack"
+	TypePauseBarrier    = "pause_barrier"
+	TypePauseAck        = "pause_ack" // subscriber -> orchestrator
 )
 
 // RouteEntry is the per-sandbox routing + auth state the orchestrator distributes
@@ -233,6 +237,7 @@ type MMDSProxyPolicy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
+	PauseAck  *PauseAck   `json:"pause_ack,omitempty"`
 	Type      string      `json:"type"`
 	Hello     *Hello      `json:"hello,omitempty"`      // hello (orchestrator -> subscriber)
 	Register  *Register   `json:"register,omitempty"`   // register (subscriber -> orchestrator, first up-frame)

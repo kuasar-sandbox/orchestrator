@@ -201,7 +201,7 @@ func (r *Registry) reserveConnect(ctx context.Context, req SandboxReserveRequest
 			return nil, err
 		}
 		switch rec.State {
-		case StateReserved, StateReady, StatePaused:
+		case StateReserved, StateReady, StatePausing, StatePaused:
 		default:
 			return nil, ErrSandboxNotFound
 		}
@@ -331,7 +331,7 @@ func (r *Registry) reserveExecSession(ctx context.Context, req SandboxReserveReq
 			return nil, err
 		}
 		switch rec.State {
-		case StateReserved, StateReady, StatePaused:
+		case StateReserved, StateReady, StatePausing, StatePaused:
 		default:
 			return nil, ErrSandboxNotFound
 		}
@@ -511,7 +511,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 			return nil, ErrSandboxNotFound
 		}
 		if !sameSandboxGeneration(current, original) ||
-			(current.State != StateReserved && current.State != StateReady && current.State != StatePaused) {
+			(current.State != StateReserved && current.State != StateReady && current.State != StatePausing && current.State != StatePaused) {
 			return nil, clusterstate.ErrConflict
 		}
 		if current.NextSandboxGeneration == math.MaxUint64 {
@@ -665,7 +665,7 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 			return nil, ErrSandboxNotFound
 		}
 		if !sameSandboxGeneration(current, original) ||
-			(current.State != StateReserved && current.State != StateReady && current.State != StatePaused) {
+			(current.State != StateReserved && current.State != StateReady && current.State != StatePausing && current.State != StatePaused) {
 			return nil, clusterstate.ErrConflict
 		}
 		if current.NextSandboxGeneration == math.MaxUint64 {
@@ -755,7 +755,7 @@ func (r *Registry) reserveDataAttempt(ctx context.Context, req SandboxReserveReq
 		return nil, err
 	}
 	switch rec.State {
-	case StateReady:
+	case StateReady, StatePausing:
 		route, err := r.routeWithDataEndpoint(ctx, rec, rev)
 		if err != nil {
 			return nil, err
@@ -824,7 +824,7 @@ func (r *Registry) waitForLineageTransition(ctx context.Context, group, routeKey
 		if !found || rec.SandboxID != expectedSandboxID {
 			return nil, 0, ErrSandboxNotFound
 		}
-		if rec.State == StateReady || rec.State == StatePaused {
+		if rec.State == StateReady || rec.State == StatePausing || rec.State == StatePaused {
 			return rec, routeRev, nil
 		}
 		select {

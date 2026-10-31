@@ -93,7 +93,7 @@ func TestCheckpointCleanupExportFenceAndStaleSource(t *testing.T) {
 	checkpointCleanupTool(t, f.o, "touch '"+proof+"'\n")
 	_, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	attempt, ok := f.o.exports.Begin(f.sb.ID, f.sb.ResumeSource, true, cancel)
+	attempt, ok := f.o.exports.Begin(f.sb.ID, f.sb.ResumeSource, true, "", cancel)
 	if !ok {
 		t.Fatal("claim export")
 	}

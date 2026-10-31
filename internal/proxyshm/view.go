@@ -419,7 +419,7 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 	}
 	seenStarting := r.State == routesync.StateStarting
 	woke := false
-	if r.State == routesync.StatePaused && v.wake != nil {
+	if (r.State == routesync.StatePaused || r.State == routesync.StatePausing) && v.wake != nil {
 		v.wake(expected.SandboxID)
 		woke = true
 	}
@@ -427,7 +427,7 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 }
 
 func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.ConnectTarget) (proxy.RouteBinding, bool) {
-	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused && r.State != routesync.StatePausing) {
 		return proxy.RouteBinding{}, false
 	}
 	binding := proxy.BindRoute(
@@ -472,7 +472,7 @@ func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.Rout
 			return route, true, nil
 		case routesync.StateStarting:
 			seenStarting = true
-		case routesync.StatePaused:
+		case routesync.StatePaused, routesync.StatePausing:
 			if seenStarting || (woke && routeRev != initialRev) {
 				return proxy.Route{}, false, nil
 			}
@@ -552,7 +552,7 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	}
 	seenStarting := r.State == routesync.StateStarting
 	woke := false
-	if r.State == routesync.StatePaused && v.wake != nil {
+	if (r.State == routesync.StatePaused || r.State == routesync.StatePausing) && v.wake != nil {
 		v.wake(sid)
 		woke = true
 	}
@@ -560,7 +560,7 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 }
 
 func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity, bool) {
-	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused && r.State != routesync.StatePausing) {
 		return proxy.ExecIdentity{}, false
 	}
 	identity := proxy.ExecIdentity{
@@ -648,7 +648,7 @@ func (v *WorkerView) waitExecRunning(
 		} else if seenStarting || (woke && routeRev != initialRev) {
 			return proxy.ExecIdentity{}, false, nil
 		}
-		if !seenStarting && r.State == routesync.StatePaused && v.wake != nil && !time.Now().Before(nextWake) {
+		if !seenStarting && (r.State == routesync.StatePaused || r.State == routesync.StatePausing) && v.wake != nil && !time.Now().Before(nextWake) {
 			v.wake(sid)
 			woke = true
 			nextWake = time.Now().Add(time.Second)

@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // controlIdentity binds a private connection to one instance and worker epoch.
@@ -20,11 +22,15 @@ type controlIdentity struct {
 
 type controlMessage struct {
 	controlIdentity
-	Kind        string    `json:"kind"`
-	Deadline    time.Time `json:"deadline,omitempty"`
-	CanShutdown bool      `json:"can_shutdown,omitempty"`
-	Error       string    `json:"error,omitempty"`
-	Forced      bool      `json:"forced,omitempty"`
+	BarrierID   string                             `json:"barrier_id,omitempty"`
+	SID         string                             `json:"sid,omitempty"`
+	RunID       string                             `json:"run_id,omitempty"`
+	Activity    map[string]routesync.PauseActivity `json:"activity,omitempty"`
+	Kind        string                             `json:"kind"`
+	Deadline    time.Time                          `json:"deadline,omitempty"`
+	CanShutdown bool                               `json:"can_shutdown,omitempty"`
+	Error       string                             `json:"error,omitempty"`
+	Forced      bool                               `json:"forced,omitempty"`
 }
 
 type controlPeer struct {

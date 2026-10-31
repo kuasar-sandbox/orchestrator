@@ -115,8 +115,13 @@ func artifactLocation(ref string) string {
 // majority (rather than materializing it) keeps send-side memory bounded at high
 // sandbox density.
 func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
-	for _, st := range []types.State{types.StateStarting, types.StateRunning, types.StatePaused} {
+	for _, st := range []types.State{types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
+			o.pauseMu.RLock()
+			if pending := o.pausePreparing[sb.ID]; pending != nil && pending.RunID == sb.RunID {
+				sb = pending
+			}
+			o.pauseMu.RUnlock()
 			entry, err := o.routeEntryContext(ctx, sb)
 			if err != nil {
 				// Preserve lifecycle facts. Traffic validity and confidential
@@ -213,10 +218,11 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 		if _, _, err := o.ensureResumeAcceptedFrom(ctx, sid, nil, request, conductorextension.SandboxOriginProxy, nil); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
 		}
-	case types.StateStarting:
+	case types.StateStarting, types.StatePausing:
 		// Never claim or launch here. Re-announcing the authoritative starting
-		// entry closes a route-propagation race for a worker that woke from a
-		// previously missing view.
+		// entry closes a route-propagation race. Pausing can remain after an
+		// uncertain capture commit; keep its gate until reconciliation resolves
+		// ownership rather than withdrawing a still-owned sandbox.
 		o.cache(sb)
 		o.publishUpsert(sb)
 		unlock()

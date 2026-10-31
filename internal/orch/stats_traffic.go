@@ -70,7 +70,7 @@ func (o *Orchestrator) prepareTrafficReads(ctx context.Context, sandboxes []*typ
 	}
 	queries := make([]proxystats.TrafficQuery, len(sandboxes))
 	for i, sb := range sandboxes {
-		if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
+		if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused && sb.State != types.StatePausing {
 			return nil, nil, api.ErrStatsConflict
 		}
 		queries[i] = proxystats.TrafficQuery{SandboxID: sb.ID, RunID: sb.RunID, Profile: sb.Profile, State: sb.State}

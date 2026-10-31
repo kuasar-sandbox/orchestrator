@@ -53,6 +53,15 @@ func (i *Instance) workerEvent(index int, epoch uint64, message controlMessage) 
 	}
 	var start bool
 	switch message.Kind {
+	case "pause_ack":
+		if samples := i.pauseSamples[message.BarrierID]; samples != nil {
+			if _, exists := samples[index]; !exists {
+				samples[index] = message
+			}
+		}
+		i.notifyLocked()
+		i.mu.Unlock()
+		return nil
 	case "prepared":
 		if !w.prepared {
 			w.prepared = true

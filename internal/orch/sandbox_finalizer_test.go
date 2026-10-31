@@ -770,7 +770,7 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 		t.Fatalf("unexpected extra route event before repeated acceptance: %+v", event)
 	default:
 	}
-	if err := fixture.o.Pause(context.Background(), deleting.ID, fixture.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrNotFound) {
+	if _, err := fixture.o.Pause(context.Background(), deleting.ID, fixture.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("Pause deleting sandbox = %v", err)
 	}
 	oldDeadline := deleting.DeadlineUnix
@@ -1359,7 +1359,7 @@ func TestPauseStartsLiveRetryForRetainedRunDir(t *testing.T) {
 		}
 		return os.RemoveAll(path)
 	}
-	if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+	if _, err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
 		t.Fatal(err)
 	}
 	paused, err := o.st.Get(context.Background(), sb.ID)

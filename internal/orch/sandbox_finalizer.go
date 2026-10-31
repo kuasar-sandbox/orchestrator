@@ -235,7 +235,7 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 	if err := o.validateSandboxCleanupPaths(sb); err != nil {
 		return err
 	}
-	if sb.State != types.StateRunning && sb.State != types.StateDeleting {
+	if sb.State != types.StateRunning && sb.State != types.StatePausing && sb.State != types.StateDeleting {
 		return fmt.Errorf("orch: terminal cleanup requires running or deleting sandbox %s", sb.ID)
 	}
 	if sb.RunID != "" {
@@ -315,7 +315,7 @@ func (o *Orchestrator) finalizeSandboxResultOnce(ctx context.Context, sid, runID
 		return nil
 	}
 	switch sb.State {
-	case types.StateRunning:
+	case types.StateRunning, types.StatePausing:
 		return o.finalizeRunningSandboxDeadLocked(cleanupCtx, sb)
 	case types.StateStarting:
 		if attempt, ok := o.launches.Lookup(sid); ok && attempt.RunID() == runID {
@@ -357,13 +357,13 @@ func (o *Orchestrator) finalizeMissingRunningSandboxOnce(ctx context.Context, ob
 	if err != nil {
 		return err
 	}
-	if sb == nil || sb.State != types.StateRunning || sb.RunID != observed.RunID ||
+	if sb == nil || sb.State != observed.State || sb.RunID != observed.RunID ||
 		sb.CreatedUnix != observed.CreatedUnix || sb.APISecret != observed.APISecret ||
 		sb.TemplateID != observed.TemplateID || sb.BaseDir != observed.BaseDir ||
 		sb.RunDir != observed.RunDir || sb.ResumeSource != observed.ResumeSource {
 		return nil
 	}
-	if sb.ExecutionResult == nil && sb.RunID != "" {
+	if sb.State == types.StateRunning && sb.ExecutionResult == nil && sb.RunID != "" {
 		if o.runSessionActive(runKindSandbox, sb.RunID) {
 			o.cache(sb)
 			o.observeSandboxUpsert(sb)

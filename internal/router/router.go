@@ -416,6 +416,7 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 		}
 	}
 	var body struct {
+		MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
 		Metadata        map[string]string `json:"metadata"`
 		AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
 	}
@@ -437,6 +438,9 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 				return nil, fmt.Errorf("bad create body: %w", err)
 			}
 		}
+	}
+	if body.MaxCheckpoints != 0 && body.MaxCheckpoints != 1 {
+		return nil, fmt.Errorf("max_checkpoints must be 1")
 	}
 	if _, present := body.Metadata[sandboxcfg.NsIdentity]; present {
 		return nil, fmt.Errorf("%s is only supported by direct conductor Create", sandboxcfg.NsIdentity)
@@ -1168,7 +1172,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
-	if r.Method == http.MethodDelete {
+	if r.Method == http.MethodDelete && isSandboxResourcePath(r.URL.Path) {
 		status, msg, err := rt.routeLinkDelete(r.Context(), group, routeKey, sid)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)

@@ -50,7 +50,7 @@ func (v *WorkerView) transportRouteCurrent(expected proxy.RouteBinding, current 
 	// already owns its flow. Observe only the current target's authorization;
 	// unrelated service credentials, limits and arena generations may change.
 	// Re-activation still uses the existing full binding/admission validation.
-	return present && r.State == routesync.StateRunning &&
+	return present && (r.State == routesync.StateRunning || r.State == routesync.StatePausing) &&
 		binding.SandboxID == expected.SandboxID && binding.StableID == expected.StableID &&
 		binding.Profile == expected.Profile && binding.Target == expected.Target &&
 		binding.Kind == expected.Kind && binding.ExpectedAccessToken == expected.ExpectedAccessToken &&

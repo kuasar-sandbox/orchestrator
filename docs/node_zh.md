@@ -388,7 +388,7 @@ serve daemon **api 平面**的客户端(经本机控制 socket 调 `POST /sandbo
 与 `POST /sandboxes/import`),鉴权 `E2B_API_KEY` env(须属主)。语义见 §8.1。
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
+node-ctl export-sandbox <sid> [--checkpoint ID] [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
@@ -651,11 +651,11 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
 | metrics history | `GET /sandboxes/{SandboxID}/metrics?start=...&end=...` | 精确 SandboxID ownership、opaque live telemetry UDS 转发；不可用为 503，不 Wake/Resume；[E2B 契约](telemetry_zh.md#6-e2b-历史查询) |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/connected 与保守 `idleSince`;不 Wake/Resume |
-| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
+| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时列 running/pausing/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,在 allocation fence 内 detach 并 durable exact-clear network tuple,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
 | resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool\|null}`;`memory` 在本实现中 nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
-| pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;普通已暂停或正在 starting 回 409；缺省内存 Pause 可直接接管资源暂停，不再 capture |
+| pause | `POST /sandboxes/{id}/pause` → 204 或 200 | body 支持 `checkpoint`/`ifIdle` (默认 false, §8.1.1); `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;普通已暂停或正在 starting 回 409；缺省内存 Pause 可直接接管资源暂停，不再 capture |
 | timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL;starting 允许窄字段更新 |
 
 兼容范围以实际验证的上游 API/SDK 版本和测试为准。2026-09-07 核验的 E2B 官方
@@ -673,7 +673,7 @@ envd,不生成也不返回 Envd/Traffic token;两种 profile 都返回独立的
 `forwardAccessToken`。该 token 在创建时签发并随 Sandbox 记录持久化。
 
 Create 响应保持既有 body(不新增 `state` 字段),且与 cache 和后台 worker 使用不同的对象
-副本。GET 可观察 `starting` 或内部 cleanup-pending `deleting`;默认 List 仍只列 running/paused,
+副本。GET 可观察 `starting` 或内部 cleanup-pending `deleting`;默认 List 仍列 running/pausing/paused,
 显式 `state=starting|deleting|dead`
 用于诊断。Connect 已是 running 时保持幂等;已是 starting 时只应用显式 timeout 的窄更新,
 不重复启动。paused Connect 在返回前完成 durable resume acceptance,因此成功响应可以对应
@@ -830,7 +830,7 @@ Sandbox 的近似上限,`N` 个 worker 的短暂理论上界为 `M+N-1`,不是�
 e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec`,bare 是
 `forward/exec`。顶层 `inflight` 是各 service 求和。每个 service 仅在两项为零时附
 `idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
-starting/paused 返回 inflight 但不返回顶层 idle。接口不返回 idle bool/duration、last
+starting/pausing/paused 返回 inflight 但不返回顶层 idle。接口不返回 idle bool/duration、last
 open/close、累计连接数、速率/延迟/端口明细或 worker 信息。
 
 conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master cache,查询时不扇出 worker.master 未注册,
@@ -1867,7 +1867,7 @@ snp -> LaunchMemory -> sandbox-ctl run --restore <S>
 Create(img|sbx|snp)
   |
   v
-starting --success--> running --Pause/TTL--> paused(source=E|S)
+starting --success--> running --Proxy ACK--> pausing --capture--> paused(source=E|S)
   |                      |                       |
   |                      +--Kill--> deleting    | Resume(auto|memory|cold)
   |                                              v
@@ -1900,7 +1900,7 @@ hard-delete 后才发送 Extension/object terminal observation,不再发布第�
 route-applied barrier;失败在完成本地 cleanup 后以 exact owner CAS 收敛为零 ownership `dead`，
 并发布 Delete 撤销 route。
 
-Pause 的 `CommitRunningPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别只在
+Pause 的 `CommitPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别只在
 Stop/Reset fence、Detach、checkpoint 选择性清理及 RemoveAll 成功后 exact-clear；RunDir CAS 同时清除该目录拥有的 envd/ci
 UDS path。任一步失败都保留尚未完成的字段供当前进程或 startup Reconcile 重试。fully-cleaned paused
 row 保留含 checkpoint 数据及来源操作锁的 BaseDir 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
@@ -1955,6 +1955,38 @@ durable Sandbox row,不通过 metadata 隧道传递。
 副作用前返回 400。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
 `merge_ref`、`drop_caches`,不接受 `memory`。
 
+`checkpoint` 和 `ifIdle` 均默认为 false. `ifIdle=true` 要求握手参与 Proxy 的全部 worker
+在安装 pausing 门禁后同步返回的 parking/connected 都为零, 否则 409. 普通 Pause 也握手并
+收集相同统计, 但允许忙碌. 不持久化 Proxy 清单; 握手前已断链者不参与. 握手中断链、替换、
+新参与者加入或未收到完整 ACK 时拒绝本次 Pause, 返回 503, 并发布当前权威状态撤销临时门禁.
+因此 IfIdle 只认证本次在线参与者. 没有在线参与者时不等待离线 Proxy.
+
+门禁通过可发布的 `pausing` 路由生效, 新订阅的全量同步也包含它. Proxy 在 pausing/paused
+上按相同逻辑 park 已授权新请求并发送 Wake, 不再拨旧 backend. 已建立连接在握手期间保留,
+避免把主动断开连接造成的零值误当空闲. conductor 持有同一 SID lifecycle lock 完成 capture、
+暂停提交和清理, 再处理排队的 Wake. pausing→paused 是正常进度; starting→paused 才是恢复失败.
+崩溃后遗留的 durable pausing 没有已提交新来源, Reconcile fence 精确 runner 并按既有终止路径
+收敛, 不仅凭进程存活重新发布 running.
+
+`checkpoint=true` 保存一个长期保留的不可变 E 或 S/E 对, 与 paused/source 在同一事务提交,
+返回 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. 默认 Pause 仍返回 204. Sandbox 选项
+`max_checkpoints` 当前固定为 1, Create 仅接受省略或 1; 没有节点级保留上限配置. 配额在
+握手/capture 前检查, 已有未消费 checkpoint 时下一次指定 checkpoint 的 Pause 返回 409.
+普通 Pause 不占此配额, 也不覆盖保留来源. 正在导出的 checkpoint 仍占配额.
+
+默认 Resume 继续删除普通命名版本, Resume 后新发起的不带 ID Export 仍返回 400.
+保留 checkpoint 不随 Resume 删除. `POST /sandboxes/{id}/export` 可传
+`{"checkpointID":"<id>","toTemplate":true}`, CLI 使用 `export-sandbox <sid> --checkpoint <id>`.
+指定 ID 时选择该不可变来源, 不要求当前 runtime 为 paused; 并发 Resume 不抢占此导出.
+成功后消费 checkpoint, 失败保留, `keepSource=true` 与指定 ID 互斥. 导出不会删除 sandbox.
+调用方也可直接 `DELETE /sandboxes/{id}/checkpoints/{checkpointID}` (204, 不存在为 404).
+消费释放配额; 当前 ResumeSource 仍需要的文件保留, 其余文件/DIFF 由 sandbox 的既有清理路径回收.
+
+checkpoint 始终归属于 sandbox, 父对象删除时一并删除, 不建立独立生命周期. 终止保留数据的
+通用行为由 [#491](https://github.com/kuasar-sandbox/orchestrator/issues/491) 跟踪; 当前终止清理
+仍可能移除 BaseDir, 本特性不承诺终止后保留本地数据. 新 schema 直接替换旧设计, 旧数据库
+缺少 `max_checkpoints` 时拒绝启动, 不执行业务记录迁移.
+
 `checkpoint.mode` 只接受 `local|bundle`,两种 CaptureKind 都支持两种 carrier:
 
 ```text
@@ -1974,11 +2006,11 @@ capture 返回生产者的实际身份: `snapshot --json` 返回
 `{sandboxRef,removedRefs}`. capture 的差集为 `[]`. Snapshot Bundle 在同一物理文件
 中携带 S 和 E 两个 selector. 本地引用保留身份限定符, 只公开 basename; checkpoint
 目录属于执行上下文. 默认人类可读输出及 upload-key stdout 不变. 适配器先验证完整
-结构化结果, 再原子提交 running→paused; Snapshot 保存实际 S/E 对, E-only capture
+结构化结果, 再原子提交 pausing→paused; Snapshot 保存实际 S/E 对, E-only capture
 清除旧 Snapshot 及其关联. capture 失败绝不提交半对.
 
-Pause 的顺序固定为 resolve request -> accepted operation -> runtime capture ->
-`CommitRunningPaused(id, exactRunID, ResumeSource)` -> stop/reset exact runner -> detach exact network ->
+Pause 的顺序固定为 resolve request/quota -> accepted operation -> online Proxy handshake -> running→pausing -> runtime capture ->
+`CommitPaused(id, exactRunID, ResumeSource, checkpointID)` -> stop/reset exact runner -> detach exact network ->
 selective checkpoint cleanup -> RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
 RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
 exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 或 RunDir 清理失败不允许新的 Resume/Wake/Exec
@@ -2100,7 +2132,7 @@ selector；Bundle 输出继续使用既有成员复制发布路径。历史合�
 lifecycle fence。portable Export 继续只使用已存储的来源对，不读取制品。token、公开结果、
 base 格式和持久化 cleanup schema 均不改变。
 
-保留集合包含当前 S/E、历史内存载体、当前磁盘/upper/不可变 base 载体及复用文件。历史 S
+保留集合包含当前来源与显式保留 checkpoint 的全部 S/E、各自历史内存载体、磁盘/upper/不可变 base 载体及复用文件. 固定别名只由当前来源决定.历史 S
 的旧 E 不是磁盘依赖。Bundle 任一成员仍被使用就保留整个物理载体。比较 basename 前先解析
 source/location 绑定。选择只读取有界的当前小型元数据与 Bundle 索引，不读取旧候选 payload，
 不计算整镜像摘要；此操作无需 Snapshot 的 CPU/state body。kernel/runtime 的
@@ -2137,7 +2169,7 @@ checkpoint 清理和既有 paused 收尾均成功。既有 worker 在 SID lifecy
 没有终态执行结果、且没有仍在使用 checkpoint 的来源操作时才可释放。
 starting、恢复失败回退 paused、尚未恢复的 `keepSource` 都保留版本。
 
-检查使用 sandboxer 完整的 List 结果，删除其中精确的 `{DiffID, ID}` 引用。
+检查使用 sandboxer 完整的 List 结果, 排除长期保留 checkpointID 后, 删除其余精确的 `{DiffID, ID}` 引用.
 部分或结果不确定的 Delete 重试保持同一集合，不把旧选择交给另一个运行实例。
 若 List 明确返回 `checkpoint_unsupported`，本次检查正常结束，不发出 Delete 或重试。
 这不会按 SID 缓存能力；后续或并发的独立触发仍会重新检查。其他 List 错误、不完整列表和
@@ -2515,7 +2547,7 @@ node_list；首次注册和 draining 变化驱动低频目录投影。registry n
 
 ```text
 sandbox{
-  sid, profile, state(starting|running|paused|dead), artifact_location, template_id,
+  sid, profile, state(starting|running|pausing|paused|dead), artifact_location, template_id,
   stable_id, api_secret, api_secret_fingerprint,
   manifest_key_fingerprint, service_secret,
   envd_access_token, traffic_access_token, forward_access_token,
@@ -2539,7 +2571,7 @@ projection,也不在完成时发送第二个 route Delete.
 
 该 node route event 保留既有 `mmds_secret` 字段供节点 proxy/MMDS 路径使用;cluster Registry
 物化受保护 route 时不采纳该字段。starting 只表示 node-local launch 正在进行,Registry
-将它计入 full-sync seen set 但不改写 reserved/paused route;running/paused/delete 才驱动
+将它计入 full-sync seen set 但不改写 reserved/paused route;running/pausing/paused/delete 才驱动
 cluster route 状态收敛。节点事件按以上用途显式携带其余凭据。
 
 node 不在 sandbox event 中自报 Registry-owned 的 cluster context。nodelink owner 在任务下发前已维护
@@ -2705,7 +2737,7 @@ advanced Collector binding 隔离在 `app/telemetry/otel`；
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                profile, cluster_group, cluster_route_key, stable_id,
-               template_id, state(starting|running|paused|deleting|dead), deadline_unix, dead_unix,
+               template_id, state(starting|running|pausing|paused|deleting|dead), max_checkpoints, deadline_unix, dead_unix,
                run_id, run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
@@ -2782,7 +2814,7 @@ phase、network、runtime prepare/result owner。候选扫描后的并发变化�
 
 以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。Export 保持
 publish/finalize 两阶段竞争，move 复用相同的持久删除接纳与 finalizer（#348）；#205 的 Build resources、两级准入和 cgroup
-权威不变；当前 main 仍有 post-registration Build projection，故 routesync v8 沿用 v6 引入的 Build full sync +
+权威不变；当前 main 仍有 post-registration Build projection，故 routesync v9 沿用 v6 引入的 Build full sync +
 live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
 节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
 cleanup stage 或第二份路径权威。

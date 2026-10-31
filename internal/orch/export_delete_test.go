@@ -135,7 +135,7 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 							return os.RemoveAll(path)
 						}
 						if keepFirst {
-							kept, err := o.ExportSandbox(ctx, fixture.apiKey, sb.ID, template, true)
+							kept, err := o.ExportSandbox(ctx, fixture.apiKey, sb.ID, template, true, "")
 							if err != nil || kept.Validate() != nil {
 								t.Fatalf("keep-source result = %+v, %v", kept, err)
 							}
@@ -276,7 +276,7 @@ func TestExportMoveCleanupFailureKeepsDeletingAndRetries(t *testing.T) {
 			if phase == "hard-delete" {
 				installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_move_delete BEFORE DELETE ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced hard delete failure'); END`)
 			}
-			result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false)
+			result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false, "")
 			if err != nil || result.Validate() != nil {
 				t.Fatalf("accepted result = %+v, %v", result, err)
 			}
@@ -335,7 +335,7 @@ func TestExportRunDirCleanupFailureRejectsPublicationAndRetries(t *testing.T) {
 		}
 		return testPublicationReport(source.Kind, "manifest://"+strings.Repeat("d", 64)), nil
 	}
-	result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false)
+	result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false, "")
 	if !errors.Is(err, fault) || result.Result != "" || publishCalls != 0 {
 		t.Fatalf("failed cleanup reached publication: %+v, %v, calls=%d", result, err, publishCalls)
 	}
@@ -354,7 +354,7 @@ func TestExportRunDirCleanupFailureRejectsPublicationAndRetries(t *testing.T) {
 	waitForSandbox(t, o, context.Background(), sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StatePaused && !pausedCleanupPending(current)
 	}, "paused RunDir cleanup retry")
-	if result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false); err != nil || result.Validate() != nil || publishCalls != 1 {
+	if result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, false, false, ""); err != nil || result.Validate() != nil || publishCalls != 1 {
 		t.Fatalf("export after cleanup retry: %+v, %v, calls=%d", result, err, publishCalls)
 	}
 	waitForExportDeletion(t, o, sb.ID)
@@ -373,7 +373,7 @@ func TestExportMoveReconcilesAcceptedDeletionAfterRestart(t *testing.T) {
 		}
 		return errors.New("persistent BaseDir failure")
 	}
-	result, err := fixture.o.ExportSandbox(context.Background(), fixture.apiKey, fixture.sb.ID, true, false)
+	result, err := fixture.o.ExportSandbox(context.Background(), fixture.apiKey, fixture.sb.ID, true, false, "")
 	if err != nil || result.Validate() != nil {
 		t.Fatalf("Export = %+v, %v", result, err)
 	}
@@ -466,7 +466,7 @@ func TestExportMoveRejectsChangedSourceIdentity(t *testing.T) {
 					old := o.exports.active[sb.ID]
 					o.exports.mu.Unlock()
 					o.exports.Finish(old)
-					next, started := o.exports.Begin(sb.ID, source, false, func(error) {})
+					next, started := o.exports.Begin(sb.ID, source, false, "", func(error) {})
 					if !started {
 						return artifact.PublishReport{}, errors.New("could not install successor export attempt")
 					}
@@ -499,7 +499,7 @@ func TestExportMoveRejectsChangedSourceIdentity(t *testing.T) {
 				o.cache(current)
 				return testPublicationReport(source.Kind, "manifest://"+strings.Repeat("d", 64)), nil
 			}
-			result, err := o.ExportSandbox(fixture.ctx, fixture.apiKey, sb.ID, false, false)
+			result, err := o.ExportSandbox(fixture.ctx, fixture.apiKey, sb.ID, false, false, "")
 			if !errors.Is(err, api.ErrExportPreempted) || result.Result != "" {
 				t.Fatalf("changed %s accepted deletion: %+v, %v", change, result, err)
 			}
@@ -535,7 +535,7 @@ func TestExportMoveRejectsUnownedCleanupPathsBeforeAcceptance(t *testing.T) {
 			if err := o.st.Put(context.Background(), sb); err != nil {
 				t.Fatal(err)
 			}
-			result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, true, false)
+			result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, true, false, "")
 			if err == nil || result.Result != "" {
 				t.Fatalf("invalid %s accepted: %+v, %v", field, result, err)
 			}
@@ -568,7 +568,7 @@ func TestExportMoveDeleteAcceptanceFailurePreservesPreparedSource(t *testing.T) 
 					events, unsubscribe := o.Subscribe()
 					defer unsubscribe()
 					installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER reject_move BEFORE UPDATE OF state ON sandboxes WHEN NEW.state='deleting' BEGIN SELECT RAISE(ABORT, 'reject delete acceptance'); END`)
-					result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, template, false)
+					result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, template, false, "")
 					if err == nil || !strings.Contains(err.Error(), "reject delete acceptance") || result.Result != "" {
 						t.Fatalf("rejected acceptance = %+v, %v", result, err)
 					}
@@ -598,7 +598,7 @@ func TestExportMoveDeleteAcceptanceFailurePreservesPreparedSource(t *testing.T) 
 						}
 					}
 					installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER reject_move`)
-					if result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, template, false); err != nil || result.Validate() != nil {
+					if result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, template, false, ""); err != nil || result.Validate() != nil {
 						t.Fatalf("retry rejected export: %+v, %v", result, err)
 					}
 					waitForExportDeletion(t, o, sb.ID)
@@ -643,7 +643,7 @@ func TestExportMoveSameIDConflictUntilCleanupCompletes(t *testing.T) {
 					t.Errorf("drain pending move: %v", err)
 				}
 			})
-			result, err := o.ExportSandbox(ctx, fixture.apiKey, sb.ID, false, false)
+			result, err := o.ExportSandbox(ctx, fixture.apiKey, sb.ID, false, false, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -740,7 +740,7 @@ func TestExportMoveDeletesFullyCleanedPausedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.o.cache(sb)
-	if result, err := fixture.o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, true, false); err != nil || result.Validate() != nil {
+	if result, err := fixture.o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, true, false, ""); err != nil || result.Validate() != nil {
 		t.Fatalf("clean paused Export = %+v, %v", result, err)
 	}
 	waitForExportDeletion(t, fixture.o, sb.ID)

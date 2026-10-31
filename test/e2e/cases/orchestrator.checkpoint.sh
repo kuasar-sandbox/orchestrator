@@ -173,6 +173,93 @@ cmp "$WORK/checkpoint-original.hash" "$WORK/checkpoint-published.hash"
 delete_checkpoint_guest
 echo "==> PASS: named versions, same-directory reuse, export overlap, physical GC and source-independent cold restore"
 
+# Hold capture after the Proxy gate has ACKed. An authenticated native exec
+# arriving now must park, Wake, and run on the resumed incarnation.
+create_checkpoint_guest 8
+write_checkpoint_payload 8
+checkpoint_hash >"$WORK/retained-original.hash"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")"
+printf '%s\n' "$SID" >"$PAUSE_BARRIER_TARGET"
+rm -f "$PAUSE_BARRIER_REACHED" "$PAUSE_BARRIER_RELEASE"
+curl -sS --noproxy '*' --max-time 300 -o "$WORK/retained-pause.json" -w '%{http_code}' \
+    -X POST -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H 'Content-Type: application/json' \
+    --data '{"checkpoint":true,"ifIdle":true}' "http://127.0.0.1:$PORT/sandboxes/$SID/pause" \
+    >"$WORK/retained-pause.code" 2>"$WORK/retained-pause.log" &
+RETAIN_PAUSE_PID=$!
+PIDS+=("$RETAIN_PAUSE_PID")
+for _ in $(seq 1 1500); do
+    [ ! -e "$PAUSE_BARRIER_REACHED" ] || break
+    kill -0 "$RETAIN_PAUSE_PID" 2>/dev/null || fail "retained Pause failed before capture gate"
+    sleep 0.02
+done
+[ -e "$PAUSE_BARRIER_REACHED" ] || fail "retained Pause did not reach capture gate"
+[ "$(sandbox_state "$SID")" = pausing ] || fail "capture did not publish pausing"
+exec_through_connect "$SID" "$EXEC_TOKEN" "WAKE_DURING_PAUSE_$RANDOM" &
+PAUSING_EXEC_PID=$!
+PIDS+=("$PAUSING_EXEC_PID")
+PARKED=0
+for _ in $(seq 1 100); do
+    kill -0 "$PAUSING_EXEC_PID" 2>/dev/null || fail "pausing exec failed before capture completed"
+    code=$(req GET "/sandboxes/$SID/stats/traffic" "$AK")
+    if [ "$code" = 200 ] && python3 - "$WORK/resp.body" <<'PY_STATS'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+raise SystemExit(0 if stats['inflight']['parking'] > 0 else 1)
+PY_STATS
+    then PARKED=1; break; fi
+    sleep 0.1
+ done
+[ "$PARKED" = 1 ] || fail "request did not park while capture was held"
+: >"$PAUSE_BARRIER_RELEASE"
+wait "$RETAIN_PAUSE_PID" || fail "retained Pause request failed"
+[ "$(cat "$WORK/retained-pause.code")" = 200 ] || fail "retained Pause did not return checkpointID"
+RETAINED_ID=$(json_field "$WORK/retained-pause.json" checkpointID)
+wait "$PAUSING_EXEC_PID" || fail "pausing request did not survive Pause/Wake"
+for index in "${!PIDS[@]}"; do
+    if [ "${PIDS[$index]}" = "$RETAIN_PAUSE_PID" ] || [ "${PIDS[$index]}" = "$PAUSING_EXEC_PID" ]; then unset 'PIDS[index]'; fi
+done
+rm -f "$PAUSE_BARRIER_TARGET" "$PAUSE_BARRIER_REACHED" "$PAUSE_BARRIER_RELEASE"
+wait_sandbox_state "$SID" running 1200 || fail "pausing Wake did not resume sandbox"
+checkpoint_list "$SID" "$WORK/retained-after-resume.json"
+python3 - "$WORK/retained-after-resume.json" "$RETAINED_ID" <<'PY'
+import json, sys
+refs = json.load(open(sys.argv[1]))
+assert refs and all(ref['id'] == sys.argv[2] for ref in refs), refs
+PY
+code=$(req POST "/sandboxes/$SID/export" "$AK" '{"toTemplate":true}')
+[ "$code" = 400 ] || fail "default export after Resume=$code (want 400)"
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"checkpoint":true}')
+[ "$code" = 409 ] || fail "retained checkpoint quota=$code (want 409)"
+[ "$(sandbox_state "$SID")" = running ] || fail "quota rejection paused the sandbox"
+write_checkpoint_payload 8
+checkpoint_hash >"$WORK/retained-current.hash"
+if cmp -s "$WORK/retained-original.hash" "$WORK/retained-current.hash"; then fail "overwrite did not change guest data"; fi
+# Ordinary Pause still succeeds, and its offline cleanup must keep the old S/E.
+pause_checkpoint_guest sandbox 8
+resume_checkpoint_guest 8
+E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --checkpoint "$RETAINED_ID" \
+    --to-template --json --socket "$WORK/node-ctl.socket" >"$WORK/retained-export.json"
+[ "$(sandbox_state "$SID")" = running ] || fail "checkpoint export changed sandbox lifecycle"
+checkpoint_wait_released "$SID" || fail "consumed checkpoint versions were not released"
+code=$(req DELETE "/sandboxes/$SID/checkpoints/$RETAINED_ID" "$AK")
+[ "$code" = 404 ] || fail "exported checkpoint still exists"
+RETAINED_TEMPLATE=$(json_field "$WORK/retained-export.json" result)
+# Direct deletion releases quota, while parent deletion owns remaining data.
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false,"checkpoint":true}')
+[ "$code" = 200 ] || fail "second retained Pause=$code"
+DELETE_CHECKPOINT_ID=$(json_field "$WORK/resp.body" checkpointID)
+code=$(req DELETE "/sandboxes/$SID/checkpoints/$DELETE_CHECKPOINT_ID" "$AK")
+[ "$code" = 204 ] || fail "direct checkpoint delete=$code"
+resume_checkpoint_guest 8
+checkpoint_wait_released "$SID" || fail "direct deletion did not release versions"
+delete_checkpoint_guest
+TEMPLATE="$RETAINED_TEMPLATE"
+create_checkpoint_guest 8
+checkpoint_hash >"$WORK/retained-exported.hash"
+cmp "$WORK/retained-original.hash" "$WORK/retained-exported.hash"
+delete_checkpoint_guest
+echo "==> PASS: pausing Wake, retained capture across Resume/ordinary Pause, quota, export consumption and direct deletion"
+
 # Verify the actual business launches as well as the Build launches above.
 python3 - "$RUN_ARGV_LOG" <<'PY'
 import json, sys

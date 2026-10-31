@@ -121,7 +121,15 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 		if err != nil {
 			return fmt.Errorf("list disk checkpoints: %w", err)
 		}
-		selected.refs = append([]ctl.DiffCheckpointRef(nil), refs...)
+		retained, err := o.st.Checkpoint(ctx, sid)
+		if err != nil {
+			return err
+		}
+		for _, ref := range refs {
+			if retained == nil || ref.ID != retained.ID {
+				selected.refs = append(selected.refs, ref)
+			}
+		}
 		selected.runID, selected.baseDir, selected.createdUnix = sb.RunID, sb.BaseDir, sb.CreatedUnix
 		selected.listed = true
 	}

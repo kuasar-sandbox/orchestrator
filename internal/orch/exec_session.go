@@ -126,7 +126,7 @@ func validateExecSessionSandbox(sb *types.Sandbox) error {
 	if sb == nil {
 		return fmt.Errorf("exec session: sandbox is required")
 	}
-	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
+	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused && sb.State != types.StatePausing {
 		return fmt.Errorf("exec session: sandbox is unavailable: %w", api.ErrNotFound)
 	}
 	template, err := types.ParseTemplateID(sb.TemplateID)

@@ -561,7 +561,7 @@ func TestPauseStartingReturnsConflictWithoutSnapshotting(t *testing.T) {
 	if connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", api.ConnectOptions{}); err != nil || connected.State != types.StateStarting {
 		t.Fatalf("Connect = %+v, %v", connected, err)
 	}
-	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrSandboxStarting) {
+	if _, err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrSandboxStarting) {
 		t.Fatalf("Pause starting sandbox = %v, want ErrSandboxStarting", err)
 	}
 	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
