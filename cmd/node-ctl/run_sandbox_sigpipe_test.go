@@ -14,8 +14,8 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxsdk"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxsdk/journalio"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/journalio"
 )
 
 func TestRunAssignedSandboxSIGPIPE(t *testing.T) {
@@ -84,7 +84,7 @@ func runSandboxSIGPIPEChild(t *testing.T) {
 						fmt.Println("runtime cleanup")
 					}()
 					// Use the SDK's actual journal writer and process-stderr fallback.
-					writer, err := journalio.New(journalio.Target{Tag: "sigpipe-regression"}, os.Stderr, "")
+					writer, err := journalio.Open("journald=sigpipe-regression", os.Stderr)
 					if err != nil {
 						t.Fatal(err)
 					}

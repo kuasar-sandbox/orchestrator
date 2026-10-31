@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxsdk/journalio"
+	"github.com/kuasar-sandbox/sandboxer/pkg/journalio"
 )
 
 // node-ctl owns one assigned sandbox for its entire process lifetime. Its own
@@ -19,11 +19,7 @@ func diagnostics(target string) (io.Writer, func(), error) {
 	if target == "" || target == "default" {
 		return os.Stderr, func() {}, nil
 	}
-	parsed, err := journalio.Parse(target)
-	if err != nil {
-		return nil, nil, err
-	}
-	writer, err := journalio.New(parsed, os.Stderr, "")
+	writer, err := journalio.Open(target, os.Stderr)
 	if err != nil {
 		return nil, nil, err
 	}

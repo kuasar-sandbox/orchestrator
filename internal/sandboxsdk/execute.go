@@ -21,8 +21,8 @@ import (
 )
 
 // Execute blocks through VM cleanup and closure of all borrowed artifact
-// readers. Start and Restore retain the public SDK identity/readiness policy;
-// the adapter does not select a legacy CLI identity exception.
+// readers. Source Apply and shape derivation retain the shared CLI/SDK portable
+// identity policy. Start and Restore retain their SDK readiness contracts.
 func Execute(ctx context.Context, in *Input, cgroup *os.File, readiness *Readiness) (int, error) {
 	diagnostics, closeDiagnostics, err := diagnostics(in.LogTo)
 	if err != nil {
@@ -53,6 +53,7 @@ func executeWithDiagnostics(ctx context.Context, in *Input, cgroup *os.File, rea
 	}
 	defer storage.Close()
 	opts.NotifyReadiness = readiness.Notify
+	var launch sandbox.LaunchSpec
 	switch in.Source.Kind {
 	case types.ResumeSourceSnapshot:
 		if err := opts.Cfg.ValidateRestoreHostConfigWithPresence(presence); err != nil {
@@ -80,22 +81,21 @@ func executeWithDiagnostics(ctx context.Context, in *Input, cgroup *os.File, rea
 		if err != nil {
 			return 1, err
 		}
-		source, err := openSandboxRunSource(ctx, raw, storage, in.Locations)
+		source, err := sandbox.OpenRunSource(ctx, raw, storage, opts.RefLocations)
 		if err != nil {
 			return 1, err
 		}
 		defer source.Close()
-		applyDefaultArtifactBindings(opts.Cfg, source.Root.Portable, source.RelativeDir)
-		opts.Cfg, opts.PortableConfig, err = config.ApplyFromRules(source.Root.Portable, opts.Cfg, presence, config.ApplyFromOptions{})
+		opts.Cfg, launch, err = source.Apply(opts.Cfg, presence, config.ApplyFromOptions{})
 		if err != nil {
 			return 1, err
 		}
-		opts.SourceBinding = &sandbox.RunSourceBinding{SandboxRef: source.PortableRef, RuntimeRef: source.RuntimeRef, RelativeDir: source.RelativeDir, BundleSource: source.BundleSource}
-		opts.Fetcher = source.Fetcher
-		opts.BundleReader = source.BundleReader
-		opts.BundleFetcher = source.BundleFetcher
+	default:
+		launch = sandbox.LaunchSpecFromConfig(opts.Cfg)
+		launch.Storage = storage
+		launch.RefLocations = opts.RefLocations
 	}
-	spec, err := startSpec(ctx, opts, storage)
+	spec, err := startSpec(ctx, opts, launch)
 	if err != nil {
 		return 1, err
 	}
@@ -166,13 +166,17 @@ func (in *Input) options(cgroup *os.File) (sandbox.RunOptions, config.FieldPrese
 	if key == "" && opts.ManifestCfg != nil {
 		key = opts.ManifestCfg.Manifest.Key
 	}
-	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, func() ([32]byte, error) {
-		parsed, err := manifest.ParseHexKey(key)
-		if err != nil {
-			return [32]byte{}, errors.New("invalid manifest customer key")
+	var resolveKey func() ([32]byte, error)
+	if opts.ManifestCfg != nil || key != "" {
+		resolveKey = func() ([32]byte, error) {
+			parsed, err := manifest.ParseHexKey(key)
+			if err != nil {
+				return [32]byte{}, errors.New("invalid manifest customer key")
+			}
+			return [32]byte(parsed), nil
 		}
-		return [32]byte(parsed), nil
-	})
+	}
+	storage, err := artifact.NewProcessStorageWithCustomerKey(opts.ManifestCfg, resolveKey)
 	if err != nil {
 		return opts, presence, nil, err
 	}
