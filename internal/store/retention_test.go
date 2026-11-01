@@ -115,8 +115,8 @@ func TestTerminalRetentionBeforeAfterTTLAndOwnershipFences(t *testing.T) {
 	if deleted, err := st.DeleteDeadSandboxForRetention(ctx, dead[0], 150); err != nil || !deleted {
 		t.Fatalf("delete old dead Sandbox = %t, %v", deleted, err)
 	}
-	if got, err := st.Get(ctx, "dead-old"); err != nil || got != nil {
-		t.Fatalf("old dead Sandbox remained = %+v, %v", got, err)
+	if got, err := st.Get(ctx, "dead-old"); err != nil || got == nil || got.State != types.StateDeleting {
+		t.Fatalf("old dead Sandbox did not enter deleting = %+v, %v", got, err)
 	}
 	for _, id := range []string{"dead-fresh", "delete-cleanup-pending"} {
 		if got, err := st.Get(ctx, id); err != nil || got == nil {

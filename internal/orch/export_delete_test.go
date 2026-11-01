@@ -186,15 +186,15 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 						}
 						select {
 						case event := <-events:
-							if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
+							if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sb.ID || event.Route.State != routesync.StateDeleting {
 								t.Fatalf("acceptance event = %+v", event)
 							}
 						default:
 							t.Fatal("Export returned before withdrawing the live route")
 						}
 						if err := o.Range(ctx, func(entry routesync.RouteEntry) error {
-							if entry.SandboxID == sb.ID {
-								t.Error("deleting source remained in full route snapshot")
+							if entry.SandboxID == sb.ID && entry.State != routesync.StateDeleting {
+								t.Error("deleting source has routable projection")
 							}
 							return nil
 						}); err != nil {
@@ -226,8 +226,11 @@ func TestExportMoveAcceptsCommonDeletionForEveryArtifactAndResult(t *testing.T) 
 						}
 						select {
 						case event := <-events:
-							t.Fatalf("cleanup emitted another route event: %+v", event)
-						default:
+							if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
+								t.Fatalf("final deletion = %+v", event)
+							}
+						case <-time.After(time.Second):
+							t.Fatal("missing final Delete")
 						}
 						wantCalls := 0
 						if !portable {
@@ -433,7 +436,7 @@ func TestExportMoveCancellationAfterAcceptanceKeepsResult(t *testing.T) {
 	assertExportPausedCleanupPublished(t, o, preparedExportSource(sb), events, nil)
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sb.ID || event.Route.State != routesync.StateDeleting {
 			t.Fatalf("acceptance event = %+v", event)
 		}
 	case <-time.After(3 * time.Second):

@@ -156,7 +156,7 @@ func TestReconcileDefersBusySourceAndFinishesAfterRelease(t *testing.T) {
 	}
 }
 
-func TestReconcileMissingRunningSourceBusyRetainsResultlessDeadSemantics(t *testing.T) {
+func TestReconcileMissingRunningSourceBusyPreservesUnknownExit(t *testing.T) {
 	for _, noRunID := range []bool{false, true} {
 		name := "exact-run"
 		if noRunID {
@@ -190,14 +190,10 @@ func TestReconcileMissingRunningSourceBusyRetainsResultlessDeadSemantics(t *test
 			release()
 			drainRunEnds(t, restarted)
 			dead, err := restarted.st.Get(context.Background(), f.sb.ID)
-			if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult != nil || dead.RunID != "" || dead.RunDir != "" || dead.BaseDir != "" {
+			if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult != nil || dead.RunID != "" || dead.RunDir != "" || dead.BaseDir != f.sb.BaseDir {
 				t.Fatalf("missing-run retry changed dead/result semantics: %+v, %v", dead, err)
 			}
-			for _, path := range []string{f.sb.RunDir, f.sb.BaseDir} {
-				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("missing-run retry retained ownership %s: %v", path, err)
-				}
-			}
+			assertTerminatedDataRetained(t, f.sb)
 		})
 	}
 }
@@ -324,9 +320,5 @@ func TestAcceptedResultDuringCaptureWinsPauseCommit(t *testing.T) {
 	if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != f.sb.RunID || dead.ExecutionResult.ExitCode == nil || *dead.ExecutionResult.ExitCode != code {
 		t.Fatalf("accepted result did not win terminal cleanup: %+v, %v", dead, err)
 	}
-	for _, path := range []string{f.sb.RunDir, f.sb.BaseDir} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("terminal result retained capture ownership %s: %v", path, err)
-		}
-	}
+	assertTerminatedDataRetained(t, f.sb)
 }

@@ -600,7 +600,7 @@ func TestSandboxDeleteTransitionFailureLeavesOriginalOwner(t *testing.T) {
 	}
 }
 
-func TestCommitSandboxDeadAtomicallyClearsAllLocalOwnership(t *testing.T) {
+func TestCommitSandboxDeadAtomicallyReleasesRunAndRetainsData(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	sb := sandboxInsertFixture("dead-cleanup-commit", 0)
@@ -620,14 +620,14 @@ func TestCommitSandboxDeadAtomicallyClearsAllLocalOwnership(t *testing.T) {
 		t.Fatalf("dead row = %+v, %v", dead, err)
 	}
 	if dead.RunID != "" || dead.VswitchPort != "" || dead.FloatingIP != "" || dead.InnerIP != "" || dead.PortMAC != "" ||
-		dead.RunDir != "" || dead.BaseDir != "" || dead.EnvdUDS != "" || dead.CiUDS != "" || !dead.ResumeSource.Empty() {
+		dead.RunDir != "" || dead.BaseDir != sb.BaseDir || dead.EnvdUDS != "" || dead.CiUDS != "" || dead.ResumeSource != sb.ResumeSource {
 		t.Fatalf("dead row retained local ownership: %+v", dead)
 	}
 }
 
 func TestDeadSandboxRejectsCleanupOwnership(t *testing.T) {
 	st := testStore(t)
-	for _, field := range []string{"runner", "port", "run-dir", "base-dir", "artifact"} {
+	for _, field := range []string{"runner", "port", "run-dir"} {
 		t.Run(field, func(t *testing.T) {
 			sb := sandboxInsertFixture("dead-owner-"+field, 2)
 			sb.State = types.StateDead

@@ -22,6 +22,9 @@ func (o *Orchestrator) SetExtensionObserver(observer ExtensionObserver) {
 }
 
 func (o *Orchestrator) observeSandboxUpsert(sandbox *types.Sandbox) {
+	if sandbox != nil && sandbox.State == types.StateDead && sandbox.ResetState == "pending" {
+		o.startSandboxReset(sandbox, false)
+	}
 	o.observePressureSandbox(sandbox)
 	if o.extensionObserver != nil {
 		o.extensionObserver.SandboxUpsert(sandbox)

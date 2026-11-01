@@ -151,7 +151,7 @@ type sandboxFinalizerFixture struct {
 	vs     *sandboxFinalizerVS
 }
 
-func newSandboxFinalizerFixture(t *testing.T, id string) sandboxFinalizerFixture {
+func newSandboxFinalizerFixture(t *testing.T, id string, autoReset ...bool) sandboxFinalizerFixture {
 	t.Helper()
 	root := t.TempDir()
 	cfg := &config.Config{}
@@ -175,6 +175,9 @@ func newSandboxFinalizerFixture(t *testing.T, id string) sandboxFinalizerFixture
 		APISecret: apiSecret, ManifestKey: manifestKey, CreatedUnix: 287,
 	}
 	materializeTestSandboxCredentials(t, sb)
+	if len(autoReset) > 0 {
+		sb.AutoReset = autoReset[0]
+	}
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
@@ -360,11 +363,7 @@ func TestSandboxResultCleanupDurablyClearsNetworkBeforeDirectoryCleanup(t *testi
 	if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != fixture.sb.RunID {
 		t.Fatalf("dead result row = %+v, %v", dead, err)
 	}
-	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("result cleanup retained %s: %v", path, err)
-		}
-	}
+	assertTerminatedDataRetained(t, fixture.sb)
 }
 
 func TestSandboxResultCleanupRetainsRetryOwnershipAtEarlyFailures(t *testing.T) {
@@ -470,11 +469,7 @@ func TestSandboxResultCleanupDeadCommitFailureKeepsRetryOwner(t *testing.T) {
 	if err != nil || got == nil || got.State != types.StateRunning || got.RunID != fixture.sb.RunID || got.VswitchPort != "" || got.RunDir != fixture.sb.RunDir || got.BaseDir != fixture.sb.BaseDir || got.ExecutionResult == nil {
 		t.Fatalf("dead commit failure lost retry row: %+v, %v", got, err)
 	}
-	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("dead commit failure retained completed directory %s: %v", path, err)
-		}
-	}
+	assertTerminatedDataRetained(t, fixture.sb)
 	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_result_dead_commit`)
 	if err := fixture.o.finalizeSandboxResultOnce(context.Background(), fixture.sb.ID, fixture.sb.RunID); err != nil {
 		t.Fatalf("retry result cleanup after dead commit: %v", err)
@@ -710,10 +705,12 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 	}
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != fixture.sb.ID {
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != fixture.sb.ID || event.Route.State != routesync.StateDeleting {
 			t.Fatalf("delete acceptance route withdrawal = %+v", event)
 		}
-		proxyMaster.ApplyDelete(event.SID)
+		if err := proxyMaster.ApplyUpsert(event.Route); err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("delete acceptance did not withdraw the live route")
 	}
@@ -734,8 +731,8 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 	if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
 		t.Fatalf("terminal observer published before cleanup: %v", kinds)
 	}
-	if _, found := proxyWorkerTable.Lookup(deleting.ID); found {
-		t.Fatal("Proxy SHM retained deleting sandbox route")
+	if route, found := proxyWorkerTable.Lookup(deleting.ID); found && route.State != routesync.StateDeleting {
+		t.Fatalf("Proxy SHM retained active route: %+v", route)
 	}
 	if got, found, err := proxyWorker.LookupRoute(context.Background(), deleting.ID, target); err != nil || found {
 		t.Fatalf("Proxy LookupRoute after withdrawal = %+v, %t, %v", got, found, err)
@@ -751,8 +748,8 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 		t.Fatal(err)
 	}
 	for _, entry := range routed {
-		if entry.SandboxID == deleting.ID {
-			t.Fatalf("deleting sandbox remained in route snapshot: %+v", entry)
+		if entry.SandboxID == deleting.ID && entry.State != routesync.StateDeleting {
+			t.Fatalf("deleting management projection = %+v", entry)
 		}
 	}
 	if _, err := fixture.o.Connect(context.Background(), deleting.ID, fixture.apiKey, "", api.ConnectOptions{}); !errors.Is(err, api.ErrNotFound) {
@@ -767,7 +764,9 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 	}
 	select {
 	case event := <-events:
-		t.Fatalf("unexpected extra route event before repeated acceptance: %+v", event)
+		if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateDeleting {
+			t.Fatalf("Wake management projection = %+v", event)
+		}
 	default:
 	}
 	if _, err := fixture.o.Pause(context.Background(), deleting.ID, fixture.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrNotFound) {
@@ -789,7 +788,7 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 	}
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != fixture.sb.ID {
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != fixture.sb.ID || event.Route.State != routesync.StateDeleting {
 			t.Fatalf("repeated delete acceptance route withdrawal = %+v", event)
 		}
 	case <-time.After(time.Second):
@@ -803,7 +802,9 @@ func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *tes
 	}
 	select {
 	case event := <-events:
-		t.Fatalf("delete finalizer published a second route withdrawal: %+v", event)
+		if event.Kind != routesync.TypeDelete || event.SID != fixture.sb.ID {
+			t.Fatalf("final Delete=%+v", event)
+		}
 	default:
 	}
 	if kinds := recorder.sandboxKinds(); len(kinds) != 1 || kinds[0] != "delete" {
@@ -985,11 +986,7 @@ func TestReconcileRecoversAcceptedRunningSandboxResult(t *testing.T) {
 	if vs.calls != 1 {
 		t.Fatalf("reconcile result detach calls = %d, want 1", vs.calls)
 	}
-	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("accepted result recovery retained %s: %v", path, err)
-		}
-	}
+	assertTerminatedDataRetained(t, fixture.sb)
 }
 
 func TestReconcileRecoversAcceptedStartingSandboxResults(t *testing.T) {
@@ -1050,11 +1047,11 @@ func TestReconcileRecoversAcceptedStartingSandboxResults(t *testing.T) {
 					t.Fatalf("accepted resume result lost checkpoint: %v", err)
 				}
 			} else {
-				if got.State != types.StateDead || got.BaseDir != "" || !got.ResumeSource.Empty() {
+				if got.State != types.StateDead || got.BaseDir != fixture.sb.BaseDir || !got.ResumeSource.Empty() {
 					t.Fatalf("accepted fresh result did not become dead history: %+v", got)
 				}
-				if _, err := os.Stat(sb.BaseDir); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("accepted fresh result retained BaseDir: %v", err)
+				if _, err := os.Stat(sb.BaseDir); err != nil {
+					t.Fatalf("accepted fresh result lost current data: %v", err)
 				}
 			}
 		})

@@ -346,8 +346,8 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" {
 		routeKey = newRouteKey()
 	}
-	var autoPauseMemory *bool
-	createConfig, err := createSandboxMetadataWithAutoPauseMemory(w, r, &autoPauseMemory)
+	var autoPauseMemory, autoReset *bool
+	createConfig, err := createSandboxMetadataWithAutoPauseMemory(w, r, &autoPauseMemory, &autoReset)
 	if err != nil {
 		status := http.StatusBadRequest
 		var maxBytesErr *http.MaxBytesError
@@ -358,7 +358,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, nil, nil,
+		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, autoReset, nil, nil,
 		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
 	)
 	if err != nil {
@@ -400,7 +400,7 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 	return createSandboxMetadataWithAutoPauseMemory(w, r, nil)
 }
 
-func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool) (map[string]string, error) {
+func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, autoReset ...**bool) (map[string]string, error) {
 	if _, present := r.Header[http.CanonicalHeaderKey(HeaderIdentity)]; present {
 		return nil, fmt.Errorf("%s / %s is only supported by direct conductor Create", HeaderIdentity, sandboxcfg.NsIdentity)
 	}
@@ -419,6 +419,7 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 		MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
 		Metadata        map[string]string `json:"metadata"`
 		AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
+		AutoReset       *bool             `json:"autoReset,omitempty"`
 	}
 	if r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
@@ -447,6 +448,9 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 	}
 	if autoPauseMemory != nil {
 		*autoPauseMemory = sandboxcfg.CloneBool(body.AutoPauseMemory)
+	}
+	if len(autoReset) > 0 && autoReset[0] != nil {
+		*autoReset[0] = sandboxcfg.CloneBool(body.AutoReset)
 	}
 	selected := map[string]string{}
 	var bodyResource map[string]string
@@ -1045,7 +1049,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, nil, body.Memory, nil, headers,
+		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, nil, nil, body.Memory, nil, headers,
 	)
 	if err != nil {
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -1122,7 +1126,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, nil, nil, nil,
+		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, nil, nil, nil, nil,
 		&registry.SandboxReserveExecSessionReq{
 			TTLSeconds: request.TTLSeconds,
 			Conditions: request.Expressions(),
@@ -1550,7 +1554,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// verified above, so its protected token is used only for the outer CONNECT.
 	if !hasDirectNodeTarget(rr) && rr.Group != "" {
 		res, err := rt.routeLinkReserve(
-			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil, nil, nil,
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil, nil, nil, nil,
 			map[string]string{HeaderAccessTok: connectToken},
 		)
 		if err != nil {
@@ -1574,7 +1578,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// request was sent. ReserveData is the stale-route fallback and validates the
 	// same admitted credential against the Registry's current lineage.
 	res, err := rt.routeLinkReserve(
-		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil, nil, nil,
+		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil, nil, nil, nil,
 		map[string]string{HeaderAccessTok: connectToken},
 	)
 	if err != nil {
@@ -1661,7 +1665,7 @@ func (rt *Router) reserveExecDataRoute(
 	claims keys.ExecAccessClaims,
 ) (*routeResolve, error) {
 	result, err := rt.routeLinkReserve(
-		ctx, "data", stable.Group, stable.RouteKey, sandboxID, target.Port, 0, nil, nil, nil, nil,
+		ctx, "data", stable.Group, stable.RouteKey, sandboxID, target.Port, 0, nil, nil, nil, nil, nil,
 		map[string]string{
 			HeaderAccessTok:               token,
 			proxypkg.HeaderSandboxService: string(target.Service),
@@ -2001,7 +2005,7 @@ func (rt *Router) routeLinkReserve(
 	operation, group, routeKey, sandboxID string,
 	port, timeout int,
 	config map[string]string,
-	autoPauseMemory, memory *bool,
+	autoPauseMemory, autoReset, memory *bool,
 	execSession *registry.SandboxReserveExecSessionReq,
 	headers map[string]string,
 ) (*reserveResult, error) {
@@ -2022,7 +2026,7 @@ func (rt *Router) routeLinkReserve(
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte
 	if operation == "create" {
-		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory)})
+		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
 		if headers == nil {
 			headers = map[string]string{}
 		}

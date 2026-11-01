@@ -54,6 +54,7 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
 	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
 	e := routesync.RouteEntry{
+		InstanceID: sb.InstanceID, AutoReset: sb.AutoReset,
 		PauseReason: sb.PauseReason, ResourceObligation: sb.ResourceObligation,
 		PressureVersion: sb.PressureVersion, RunningSinceUnixNano: sb.RunningSinceUnixNano,
 		SandboxID:              sb.ID,
@@ -74,6 +75,12 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 		ArtifactLocation:       artifactLocation(sb.ResumeSource.Ref),
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 		RunID:                  sb.RunID,
+	}
+	if sb.BaseDir != "" && (sb.State == types.StateDead || sb.State == types.StateDeleting) {
+		e.ArtifactLocation = "local"
+	}
+	if (sb.ExecutionResult != nil || (sb.RunID != "" && sb.DeadRunID == sb.RunID)) && (sb.State == types.StateRunning || sb.State == types.StateStarting || sb.State == types.StatePausing) {
+		e.State = routesync.StateDead
 	}
 	if raw, present := sb.Metadata[sandboxcfg.NsTraffic]; present {
 		patch, err := sandboxcfg.ParseTrafficPatch(raw)
@@ -115,7 +122,7 @@ func artifactLocation(ref string) string {
 // majority (rather than materializing it) keeps send-side memory bounded at high
 // sandbox density.
 func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
-	for _, st := range []types.State{types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused} {
+	for _, st := range []types.State{types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused, types.StateDead, types.StateDeleting} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
 			o.pauseMu.RLock()
 			if pending := o.pausePreparing[sb.ID]; pending != nil && pending.RunID == sb.RunID {
@@ -226,15 +233,9 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 		o.cache(sb)
 		o.publishUpsert(sb)
 		unlock()
-	case types.StateDeleting:
-		// Delete acceptance already removed the local cache and published the
-		// route withdrawal. Physical cleanup and object observation remain with
-		// the durable finalizer.
+	default: // dead/deleting retain management identity without a business route
 		o.uncache(sid)
-		unlock()
-	default: // dead
-		o.uncache(sid)
-		o.publishDelete(sid)
+		o.publishUpsert(sb)
 		unlock()
 	}
 }

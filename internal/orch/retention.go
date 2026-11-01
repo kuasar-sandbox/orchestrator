@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// reapTerminalHistory deletes one bounded batch of owner-free terminal rows.
-// SQLite is the node lifecycle authority; live projections are notifications
-// emitted only after the exact durable delete commits.
+// reapTerminalHistory admits expired Sandbox parents to their deleting finalizer
+// and deletes owner-free Build history in bounded batches. SQLite is the lifecycle
+// authority; management projection remains until the exact parent delete commits.
 func (o *Orchestrator) reapTerminalHistory(ctx context.Context, now time.Time) error {
 	var errs []error
 	if err := o.reapRequestedBuilds(ctx); err != nil {
@@ -20,6 +21,16 @@ func (o *Orchestrator) reapTerminalHistory(ctx context.Context, now time.Time) e
 	if ttl := o.cfg.Sandbox.DeadTTLDur(); ttl <= 0 {
 		errs = append(errs, errors.New("sandbox.dead_ttl is not a positive duration"))
 	} else if err := o.reapDeadSandboxes(ctx, now.Add(-ttl).Unix()); err != nil {
+		errs = append(errs, err)
+	}
+	// Rebuild work from durable responsibility, including a dead commit whose
+	// publication or worker admission was interrupted. Never invent a new ID.
+	if err := o.st.RangeByState(ctx, types.StateDead, func(sb *types.Sandbox) error {
+		if sb.ResetState == "pending" {
+			o.startSandboxReset(sb, false)
+		}
+		return nil
+	}); err != nil {
 		errs = append(errs, err)
 	}
 	if ttl := o.cfg.Builder.TerminalTTLDur(); ttl <= 0 {
@@ -38,13 +49,20 @@ func (o *Orchestrator) reapDeadSandboxes(ctx context.Context, cutoffUnix int64) 
 	var errs []error
 	for _, sandbox := range candidates {
 		unlock := o.lifecycle.Lock(sandbox.ID)
-		deleted, deleteErr := o.st.DeleteDeadSandboxForRetention(ctx, sandbox, cutoffUnix)
+		guard, release, deleteErr := o.trySourceOperation(ctx, sandbox)
+		deleted := false
+		if deleteErr == nil {
+			deleted, deleteErr = o.st.DeleteDeadSandboxForRetention(guard, sandbox, cutoffUnix)
+			release()
+		}
 		if deleteErr != nil {
 			errs = append(errs, deleteErr)
 		} else if deleted {
 			o.uncache(sandbox.ID)
-			o.publishDelete(sandbox.ID)
-			o.observeSandboxDelete(sandbox)
+			if current, err := o.st.Get(ctx, sandbox.ID); err == nil && current != nil {
+				o.publishUpsert(current)
+			}
+			o.startSandboxDeleteFinalizer(sandbox.ID)
 		}
 		unlock()
 	}

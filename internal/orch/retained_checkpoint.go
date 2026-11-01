@@ -20,6 +20,9 @@ func (o *Orchestrator) DeleteCheckpoint(ctx context.Context, apiKey, sid, checkp
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
+	if sb.State == types.StateDeleting {
+		return api.ErrSandboxChanged
+	}
 	changed, err := o.st.DeleteCheckpoint(ctx, sid, checkpointID)
 	if err != nil {
 		return err

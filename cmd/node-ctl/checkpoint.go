@@ -31,6 +31,7 @@ func checkpointCleanupCmd(args []string) error {
 	retain := fs.String("retain", "[]", "additional immutable S/E pairs to retain (JSON)")
 	manifestPath := fs.String("manifest-config", "", "storage and crypto config")
 	parent := fs.String("ref-location-parent", "", "trusted named-location parent URI")
+	list := fs.Bool("list-versions", false, "report protected DIFF versions as JSON without cleanup")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -55,13 +56,22 @@ func checkpointCleanupCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	err = storage.CleanupCheckpoint(ctx, artifact.Checkpoint{
+	checkpoint := artifact.Checkpoint{
 		Directory: filepath.Join(sandbox.DefaultBaseDir(*base, leaf), "checkpoint"), SandboxID: *sid,
 		SandboxRef: *e, SnapshotRef: *s, Retain: retained,
 		ResolveLocation: func(name string) (string, error) {
 			loc, err := reflocation.Resolve(*parent, name)
 			return loc.Path, err
 		},
-	})
+	}
+	if *list {
+		var refs []artifact.DiffCheckpointRef
+		refs, err = storage.CheckpointVersions(ctx, checkpoint)
+		if err == nil {
+			err = json.NewEncoder(os.Stdout).Encode(refs)
+		}
+	} else {
+		err = storage.CleanupCheckpoint(ctx, checkpoint)
+	}
 	return errors.Join(err, storage.Close())
 }

@@ -627,25 +627,21 @@ RESERVED 行使旧 route 失去回滚锚点。sandbox 事件携带 NodeSandboxID
 SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
-`deleting` 只属于 node-local durable cleanup,不作为 sandbox upsert 投影.节点一旦把 exact owner
-持久转为 `deleting`,就立即从本地 cache 和后续 full sync route set 排除,并在既有 live node-link
-上发送 Delete 撤销 projection.该 Delete 不是 unit,network,RunDir/BaseDir cleanup 或 hard-delete
-的完成证明.若进程在 durable transition 与增量发布之间退出,旧 stream 随进程失效;下一代完整
-route snapshot 因该 SID 已被排除而撤下旧 projection.node 重启仍从 durable `deleting` row 中
-尚未完成的 owner 重试本地清理;已经 allocation-fenced Detach 并 exact-clear 的 network tuple
-直接跳过,不因目录故障重新取得.正确性不依赖 Registry 是否还保留 projection;finalizer 完成时
-不再发送第二个 route Delete.
+dead 与 deleting 保留受保护管理记录及精确节点归属。live update 和全量快照包含这些不可
+业务路由的状态、instance_id、状态版本与 auto_reset。节点接纳 Delete 发布 deleting，仅父记录
+最终硬删除才发布 Delete。重连、全量对账与节点目录 sweep 保留 group/route_key；Registry
+拒绝旧版本和错误对象实例。查询、Reset、按 checkpoint ID 导出/删除及 Sandbox Delete 解析
+当前 APIEndpoint；DataEndpoint 为空。节点不可用返回临时失败，不丢弃管理归属。
 
 node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert durable
 `starting,run_id=""` 并 cache/publish starting 后返回;Ack 是 node-local launch acceptance,
-不是 READY。后续资源准备/runner/runtime failure 以 matching Delete 驱动上述 reservation
-rollback。CmdConnect Ack 前则完成旧 runner/network/RunDir ownership cleanup，在 paused→starting
+不是 READY。后续资源准备/runner/runtime failure 发布保留数据的 dead，并阻止父对象删除前的替换。CmdConnect Ack 前则完成旧 runner/network/RunDir ownership cleanup，在 paused→starting
 原子 acceptance 中恢复 canonical RunDir/UDS 并提交 deadline，再发布 starting；其 restore failure
 发布 paused Upsert,不得进入 fresh-create Delete 分支。
 CmdDelete Ack 表示 node 已持久接纳 `deleting`,不等待 node-local finalizer 完成;
 pending 重放幂等.standalone 与 cluster Delete 使用同一 finalizer,node-link 不拥有另一套 cleanup
-或路径推导;Ack 返回前已发布 route Delete 撤销既有 projection,terminal object observation 仍只在
-hard-delete 后发送.
+或路径推导;Ack 返回前发布 deleting 管理 Upsert 撤销业务路由；最终 route Delete 与 terminal observation
+只在 hard-delete 后发送。
 
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
 以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
@@ -733,7 +729,9 @@ node_link 重建第二条事实传播路径。
 | `node_sandbox_id` | 当前 node-local 执行 ID |
 | `sandbox_generation` | 当前 NodeSandboxID 的 Registry-owned 代际 |
 | `next_sandbox_generation` | 下一可分配代际;只由 Registry 持久化,不下发 node |
-| `state` | `reserved` / `ready` / `pausing` / `paused` / `dead` |
+| `state` | `reserved` / `ready` / `pausing` / `paused` / `dead` / `deleting` |
+| `instance_id` / `state_version` | 节点父对象实例和单调生命周期投影版本 |
+| `auto_reset` | 不可变 Create 选择，旧缺省值为 false |
 | `node_id` | 当前承载节点 |
 | `profile` | 创建意图确定的 sandbox profile,与 node 归属及事件事实一致 |
 | `api_secret_fingerprint` | sandbox 业务记录绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
@@ -752,7 +750,9 @@ node_link 重建第二条事实传播路径。
 ```text
 none -> reserved -> ready
 ready -> pausing -> paused -> reserved -> ready
-ready/pausing/paused/reserved -> dead/tombstone
+ready/pausing/paused/reserved -> dead
+dead -> paused (Reset)
+any retained state -> deleting -> tombstone (final deletion)
 ```
 
 `pausing` 保留当前节点绑定. Router 将鉴权后的数据转发到该节点, 由 node Proxy park
@@ -761,9 +761,9 @@ ready/pausing/paused/reserved -> dead/tombstone
 删除 checkpoint 转发其子资源
 API 路径, 不调用删除 sandbox 的控制命令.
 
-实际整机清空、单沙箱 killed、重启后确实缺失的 sandbox 都经 dead route 清理收敛；下次显式
-create/恢复 Reserve 可重新放置。host/conductor 重启本身不代表所有 durable paused 或 recovering
-sandbox 都缺失，清理必须依据节点 reconcile 后的上报与 exact ownership。
+保留中的 dead/deleting 父对象占用 group/route_key，Create/reserve 不能覆盖。Reset 成功将
+同一管理记录更新为 paused，最终删除才释放定位。重连/全量快照恢复投影，旧实例/版本事件
+不能覆盖后续运行。本改动不增加跨节点磁盘恢复或节点失联替换策略。
 
 ### 8.3 Reserve
 
@@ -776,12 +776,12 @@ POST /route-link/reserve
 ```
 
 Reserve body 按 operation 使用独立 typed schema:create 携 create config,exec-session 携
-`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。create body 是可选 `config` map 与独立 `auto_pause_memory` bool，最多 16 MiB。四种 operation 的凭据和
+`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。create body 是可选 `config` map 与独立 `auto_pause_memory` 与 `auto_reset` bool（后者默认 false），最多 16 MiB。四种 operation 的凭据和
 完成条件不同;Registry 对 exec-session body 再做严格 schema/bounds 校验,不接受旧的
 `ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
 - `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.resource`、`kuasar-sandbox.traffic`、`kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
-  `kuasar-sandbox.checkpoint`；`auto_pause_memory` 是独立 typed body 字段，拒绝 `memory`。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+  `kuasar-sandbox.checkpoint`；`auto_pause_memory` 与 `auto_reset` 是独立 typed body 字段，拒绝 `memory`。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
   attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
   Registry 内合并。

@@ -39,7 +39,7 @@ def fence_state(database, sid, metadata):
     return {"artifact": str(path), "sha256": digest, "resume_source": row[1:]}
 
 
-def fence_refs(metadata, report_path, held_path, directory, identity):
+def fence_refs(metadata, report_path, held_path, directory, identity, baseline_path=None):
     checkpoint_id(identity)
     original, report, held = (json.loads(Path(path).read_text()) for path in (metadata, report_path, held_path))
     assert identity != original["checkpoint_id"]
@@ -54,7 +54,14 @@ def fence_refs(metadata, report_path, held_path, directory, identity):
     assert payload["root"] == original["root"] and (payload.get("disks") or []) == (original.get("disks") or []), payload
     ids = [disk["diff_id"] for disk in [original["root"], *(original.get("disks") or [])]]
     assert len(ids) == len(set(ids))
-    expected = {(diff_id, original["checkpoint_id"]) for diff_id in ids} | {(diff_id, identity) for diff_id in ids}
+    baseline = {(diff_id, original["checkpoint_id"]) for diff_id in ids}
+    if baseline_path is not None:
+        previous = json.loads(Path(baseline_path).read_text())
+        observed = {(ref["diff_id"], ref["id"]) for ref in previous}
+        assert len(observed) == len(previous) and baseline <= observed, previous
+        assert all(diff_id in ids and version != identity for diff_id, version in observed), previous
+        baseline = observed
+    expected = baseline | {(diff_id, identity) for diff_id in ids}
     assert len(held) == len(expected) and {(ref["diff_id"], ref["id"]) for ref in held} == expected, (held, expected)
     return [{"diff_id": diff_id, "id": identity} for diff_id in ids]
 
@@ -243,6 +250,7 @@ def main():
     refs = sub.add_parser("fence-refs")
     for field in ("metadata", "report", "held", "directory", "identity"):
         refs.add_argument(field)
+    refs.add_argument("--baseline")
     meta = sub.add_parser("metadata")
     meta.add_argument("database")
     meta.add_argument("sid")
@@ -265,7 +273,7 @@ def main():
     elif args.command == "fence-state":
         print(json.dumps(fence_state(args.database, args.sid, args.metadata), sort_keys=True))
     elif args.command == "fence-refs":
-        print(json.dumps(fence_refs(args.metadata, args.report, args.held, args.directory, args.identity), sort_keys=True))
+        print(json.dumps(fence_refs(args.metadata, args.report, args.held, args.directory, args.identity, args.baseline), sort_keys=True))
     elif args.command == "metadata":
         print(json.dumps(local_metadata(args.database, args.sid), sort_keys=True))
     elif args.command == "disks":

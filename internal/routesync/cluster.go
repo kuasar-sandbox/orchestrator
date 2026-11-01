@@ -236,6 +236,7 @@ type Command struct {
 	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect import when the exact target is absent
 	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
 	Memory               *bool                  `json:"memory,omitempty"`                 // connect: nil=auto, true=memory, false=cold
+	AutoReset            *bool                  `json:"auto_reset,omitempty"`             // create: nil defaults false
 	AutoPauseMemory      *bool                  `json:"auto_pause_memory,omitempty"`      // create: nil defaults true
 	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`            // exec_session: 0 is long-lived; positive is relative to node time
 	ExecConditions       []string               `json:"exec_conditions,omitempty"`        // exec_session: ordered CEL sources; empty is unrestricted

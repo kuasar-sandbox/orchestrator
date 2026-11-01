@@ -362,6 +362,8 @@ func TestWorkerActivateExecStartingRollbackReturnsAbsent(t *testing.T) {
 func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *testing.T) {
 	tbl := newExecTable(t)
 	route := execWorkerRoute("paused", routesync.StatePaused)
+	route.InstanceID = "retained-parent"
+	route.AutoReset = true
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
 	}

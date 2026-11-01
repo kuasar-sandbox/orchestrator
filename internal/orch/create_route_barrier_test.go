@@ -184,23 +184,23 @@ func TestCreateBarrierFailureCommitsZeroOwnerDeadHistory(t *testing.T) {
 			}
 			upsert := receiveCreateRouteEvent(t, events, routesync.TypeUpsert)
 			receiveCreateRouteEvent(t, events, routesync.TypeRouteBarrier)
-			deleted := receiveCreateRouteEvent(t, events, routesync.TypeDelete)
-			if deleted.SID != upsert.Route.SandboxID {
+			deleted := receiveCreateRouteEvent(t, events, routesync.TypeUpsert)
+			if deleted.Route.State != routesync.StateDead || deleted.Route.SandboxID != upsert.Route.SandboxID {
 				t.Fatalf("Delete = %+v, initial = %+v", deleted, upsert)
 			}
-			stored, getErr := o.st.Get(ctx, deleted.SID)
-			if getErr != nil || stored == nil || stored.State != types.StateDead || sandboxHasLocalOwnership(stored) || o.lookup(deleted.SID) != nil {
-				t.Fatalf("failed admission dead history: store=%+v cache=%+v err=%v", stored, o.lookup(deleted.SID), getErr)
+			stored, getErr := o.st.Get(ctx, deleted.Route.SandboxID)
+			if getErr != nil || stored == nil || stored.State != types.StateDead || stored.RunDir != "" || stored.RunID != "" || stored.VswitchPort != "" || o.lookup(deleted.Route.SandboxID) != nil {
+				t.Fatalf("failed admission dead history: store=%+v cache=%+v err=%v", stored, o.lookup(deleted.Route.SandboxID), getErr)
 			}
 			for _, path := range []string{
-				nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, deleted.SID),
-				nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, deleted.SID),
+				nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, deleted.Route.SandboxID),
+				nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, deleted.Route.SandboxID),
 			} {
 				if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 					t.Fatalf("failed admission retained local path %s: %v", path, statErr)
 				}
 			}
-			if _, found := o.launches.Lookup(deleted.SID); found {
+			if _, found := o.launches.Lookup(deleted.Route.SandboxID); found {
 				t.Fatal("failed admission retained launch claim")
 			}
 			select {
@@ -213,7 +213,10 @@ func TestCreateBarrierFailureCommitsZeroOwnerDeadHistory(t *testing.T) {
 }
 
 func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDeadCommit(t *testing.T) {
-	o := testOrch(t)
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = t.TempDir()
+	cfg.Paths.BaseRoot = t.TempDir()
+	o := testOrchCfg(t, cfg)
 	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID: "retry-pre-launch-delete", Profile: types.ProfileBare,
@@ -251,14 +254,10 @@ func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDeadCommit(t *testing
 		t.Fatalf("cleanup context attempts = %d, want 2", attempts)
 	}
 	stored, getErr := o.st.Get(context.Background(), sb.ID)
-	if getErr != nil || stored == nil || stored.State != types.StateDead || sandboxHasLocalOwnership(stored) || o.lookup(sb.ID) != nil {
+	if getErr != nil || stored == nil || stored.State != types.StateDead || stored.RunDir != "" || stored.RunID != "" || stored.VswitchPort != "" || o.lookup(sb.ID) != nil {
 		t.Fatalf("pre-launch rollback dead history: store=%+v cache=%+v err=%v", stored, o.lookup(sb.ID), getErr)
 	}
-	for _, path := range []string{sb.RunDir, sb.BaseDir} {
-		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("pre-launch rollback retained local path %s: %v", path, statErr)
-		}
-	}
+	assertTerminatedDataRetained(t, sb)
 }
 
 func TestCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
@@ -318,12 +317,12 @@ func TestCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("Create did not finish after barrier failure")
 			}
-			deleted := receiveCreateRouteEvent(t, events, routesync.TypeDelete)
-			if deleted.SID != upsert.Route.SandboxID {
+			deleted := receiveCreateRouteEvent(t, events, routesync.TypeUpsert)
+			if deleted.Route.State != routesync.StateDead || deleted.Route.SandboxID != upsert.Route.SandboxID {
 				t.Fatalf("Delete = %+v, initial = %+v", deleted, upsert)
 			}
-			stored, err := o.st.Get(context.Background(), deleted.SID)
-			if err != nil || stored == nil || stored.State != types.StateDead || sandboxHasLocalOwnership(stored) {
+			stored, err := o.st.Get(context.Background(), deleted.Route.SandboxID)
+			if err != nil || stored == nil || stored.State != types.StateDead || stored.RunDir != "" || stored.RunID != "" || stored.VswitchPort != "" {
 				t.Fatalf("barrier failure dead history = %+v, %v", stored, err)
 			}
 		})

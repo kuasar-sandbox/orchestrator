@@ -95,7 +95,7 @@ test-source:
 VERSION ?= v0.1.0
 ACCELERATOR_VERSION ?= v0.1.7
 CONNECTOR_VERSION ?= v0.1.2
-SANDBOXER_VERSION ?= v0.1.3
+SANDBOXER_VERSION ?= v0.1.11
 
 release: build
 	@mkdir -p build

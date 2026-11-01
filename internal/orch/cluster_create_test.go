@@ -156,7 +156,7 @@ func TestClusterCreatePreAssignmentFailurePublishesDelete(t *testing.T) {
 	if dead.RunID != "" || dead.VswitchPort != "" {
 		t.Fatalf("failed cluster create retained ownership: %+v", dead)
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.StateDead} {
 		select {
 		case event := <-events:
 			switch want {
@@ -320,7 +320,7 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	}
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != create.SID || event.Route.State != routesync.StateDeleting {
 			t.Fatalf("cluster delete acceptance route withdrawal = %+v", event)
 		}
 	case <-time.After(time.Second):
@@ -345,8 +345,11 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	waitForSandboxAbsent(t, o, ctx, create.SID, "cluster delete after late launch cleanup")
 	select {
 	case event := <-events:
-		t.Fatalf("cluster delete finalizer published a second route withdrawal: %+v", event)
-	default:
+		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
+			t.Fatalf("final deletion = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing final Delete")
 	}
 	next, err := o.launches.Claim(ctx, create.SID, launchCreate)
 	if err != nil {

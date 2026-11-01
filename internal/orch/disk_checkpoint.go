@@ -14,10 +14,10 @@ import (
 type diskCheckpointReleaseWork struct{ revision uint64 }
 
 type diskCheckpointSelection struct {
-	runID, baseDir string
-	createdUnix    int64
-	refs           []ctl.DiffCheckpointRef
-	listed         bool
+	runID, baseDir, instanceID string
+	createdUnix                int64
+	refs                       []ctl.DiffCheckpointRef
+	listed                     bool
 }
 
 // requestDiskCheckpointRelease is triggered by successful launch, actual export
@@ -93,7 +93,7 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 	if err != nil {
 		return err
 	}
-	if sb == nil || sb.State != types.StateRunning || sb.ExecutionResult != nil {
+	if sb == nil || sb.State != types.StateRunning || sb.ExecutionResult != nil || (sb.RunID != "" && sb.DeadRunID == sb.RunID) {
 		return nil
 	}
 	if sb.BaseDir == "" || sb.RunDir == "" || sb.RunID == "" {
@@ -102,7 +102,7 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 	if err := o.validateSandboxCleanupPaths(sb); err != nil {
 		return err
 	}
-	if selected.listed && (selected.runID != sb.RunID || selected.baseDir != sb.BaseDir || selected.createdUnix != sb.CreatedUnix) {
+	if selected.listed && (selected.instanceID != sb.InstanceID || selected.runID != sb.RunID || selected.baseDir != sb.BaseDir || selected.createdUnix != sb.CreatedUnix) {
 		return nil // A new launch must supply its own release trigger.
 	}
 	ctx, release, err := o.trySourceOperation(ctx, sb)
@@ -125,12 +125,23 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 		if err != nil {
 			return err
 		}
+		// ResumeSource remains parent-owned even after a successful launch. Its
+		// named versions must survive runner Close, rollback and future Reset.
+		protected, err := o.inspectOrCleanupCheckpoint(ctx, sb, true)
+		if err != nil {
+			return err
+		}
+		keep := map[ctl.DiffCheckpointRef]bool{}
+		for _, ref := range protected {
+			keep[ctl.DiffCheckpointRef{DiffID: ref.DiffID, ID: ref.ID}] = true
+		}
 		for _, ref := range refs {
-			if retained == nil || ref.ID != retained.ID {
+			if !keep[ref] && (retained == nil || ref.ID != retained.ID) {
 				selected.refs = append(selected.refs, ref)
 			}
 		}
 		selected.runID, selected.baseDir, selected.createdUnix = sb.RunID, sb.BaseDir, sb.CreatedUnix
+		selected.instanceID = sb.InstanceID
 		selected.listed = true
 	}
 	if err := ctl.DeleteDiffCheckpoints(ctx, socket, "", selected.refs); err != nil {

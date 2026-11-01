@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
@@ -370,7 +371,7 @@ func TestTemplateExportDeletesUnkeptSource(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.Kind != "delete" || event.SID != fixture.sb.ID {
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != fixture.sb.ID || event.Route.State != routesync.StateDeleting {
 			t.Fatalf("unkept template route event = %+v", event)
 		}
 	default:
@@ -583,11 +584,15 @@ func TestExportKeepThenDropRemovesSourceAndRetainedCheckpoint(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.Kind != "delete" || event.SID != fixture.sb.ID {
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != fixture.sb.ID || event.Route.State != routesync.StateDeleting {
 			t.Fatalf("drop route event = %+v", event)
 		}
 	default:
-		t.Fatal("drop export did not publish source deletion")
+		t.Fatal("drop export did not publish deleting management location")
+	}
+	final := receiveCreateRouteEvent(t, events, routesync.TypeDelete)
+	if final.SID != fixture.sb.ID {
+		t.Fatalf("final Delete=%+v", final)
 	}
 }
 

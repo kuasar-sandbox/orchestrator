@@ -163,7 +163,7 @@ func TestTableIdenticalUpsertKeepsLifecycleRevision(t *testing.T) {
 	}
 	defer tbl.Close()
 
-	route := routesync.RouteEntry{SandboxID: "duplicate-paused", State: routesync.StatePaused}
+	route := routesync.RouteEntry{SandboxID: "duplicate-paused", State: routesync.StatePaused, InstanceID: "retained-parent", AutoReset: true}
 	tbl.BeginSync()
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
@@ -192,7 +192,9 @@ func TestTableIdenticalUpsertKeepsLifecycleRevision(t *testing.T) {
 			found, got, tbl.Rev(), routeRev, globalRev)
 	}
 	tbl.Bookmark()
-	if got, found := tbl.Lookup(route.SandboxID); !found || got != route {
+	business := route
+	business.InstanceID, business.AutoReset = "", false
+	if got, found := tbl.Lookup(route.SandboxID); !found || got != business {
 		t.Fatalf("identical replay was swept at Bookmark: %+v found=%v", got, found)
 	}
 }

@@ -80,6 +80,10 @@ with open(path,"w") as stream: json.dump(record,stream,indent=2)
 print("runner-lifecycle measurement",json.dumps({k:record[k] for k in ("resource_mode","killed_role","ready_ms","cleanup_ms","parent_measurement")}))
 PY
     echo "==> PASS: $mode $role SIGKILL auto-cleaned without DELETE or conductor restart"
+    code=$(req DELETE "/sandboxes/$sid" "$AK")
+    [ "$code" = 204 ] || fail "delete retained dead=$code"
+    wait_sandbox_state "$sid" missing 1200 || fail "dead parent deletion did not finish"
+    [ ! -e "$CHECKPOINT_ROOT/$sid" ] || fail "deleted terminal data remains"
 }
 
 

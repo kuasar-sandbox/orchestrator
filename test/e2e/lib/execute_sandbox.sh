@@ -16,7 +16,7 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 print(row[0] if row else "missing")
 PY
 }
-assert_dead_no_ownership() { # $1=sandbox id
+assert_dead_no_ownership() { # $1=sandbox id; runtime ownership only, parent retains data
     python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
@@ -26,8 +26,8 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
                resume_source_kind, resume_source_ref, resume_sandbox_ref
           from sandboxes where id=?
     """, (sys.argv[2],)).fetchone()
-if row is None or row[0] != "dead" or any(row[1:]):
-    raise SystemExit(f"dead sandbox retained local ownership: {row!r}")
+if row is None or row[0] != "dead" or any(row[1:7]) or any(row[8:10]):
+    raise SystemExit(f"dead sandbox retained runtime ownership: {row!r}")
 PY
 }
 # Capture identity is a complete content-identified pair; directory ownership is

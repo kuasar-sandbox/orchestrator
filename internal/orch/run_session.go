@@ -303,6 +303,9 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 	if sb.ExecutionResult != nil {
 		return o.finalizeSandboxResultOnce(ctx, sid, runID)
 	}
+	if sb.State == types.StateRunning && sb.DeadRunID == runID {
+		return o.finalizeMissingRunningSandboxOnce(checkCtx, sb)
+	}
 	if o.runSessionActive(kind, runID) {
 		return nil
 	}

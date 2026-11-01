@@ -16,8 +16,8 @@ import (
 
 // acceptSandboxDeleteLocked commits the only durable delete acceptance point.
 // The caller holds the sandbox lifecycle lock. The local cache is withdrawn
-// after the transition, Range excludes deleting rows, and the live route
-// withdrawal is published before the request returns. Physical cleanup and
+// after the transition, while Range and Upsert retain management location with
+// a non-routable deleting state. Physical cleanup and
 // terminal object observation remain the common finalizer's responsibility.
 func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.Sandbox) (bool, error) {
 	if sb == nil {
@@ -36,16 +36,16 @@ func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.
 		return false, fmt.Errorf("orch: sandbox %s changed before delete acceptance", sb.ID)
 	}
 
-	deleting := cloneSandbox(sb)
-	deleting.State = types.StateDeleting
-	deleting.ResourceObligation = false
-	deleting.PauseReason = ""
-	deleting.PressureVersion++
+	deleting, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		o.startSandboxDeleteFinalizer(sb.ID)
+		return true, err
+	}
 	o.observePressureSandbox(deleting)
 	o.launches.Cancel(sb.ID)
 	o.clearDeadlineIntent(sb.ID)
 	o.uncache(sb.ID)
-	o.publishDelete(sb.ID)
+	o.publishUpsert(deleting)
 	o.startSandboxDeleteFinalizer(sb.ID)
 	return true, nil
 }
@@ -267,7 +267,7 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 	if removeBaseDir == nil {
 		removeBaseDir = os.RemoveAll
 	}
-	if sb.BaseDir != "" {
+	if sb.State == types.StateDeleting && sb.BaseDir != "" {
 		if err := removeBaseDir(sb.BaseDir); err != nil {
 			return fmt.Errorf("remove sandbox BaseDir %s: %w", sb.BaseDir, err)
 		}
@@ -358,12 +358,12 @@ func (o *Orchestrator) finalizeMissingRunningSandboxOnce(ctx context.Context, ob
 		return err
 	}
 	if sb == nil || sb.State != observed.State || sb.RunID != observed.RunID ||
-		sb.CreatedUnix != observed.CreatedUnix || sb.APISecret != observed.APISecret ||
+		sb.InstanceID != observed.InstanceID || sb.CreatedUnix != observed.CreatedUnix || sb.APISecret != observed.APISecret ||
 		sb.TemplateID != observed.TemplateID || sb.BaseDir != observed.BaseDir ||
 		sb.RunDir != observed.RunDir || sb.ResumeSource != observed.ResumeSource {
 		return nil
 	}
-	if sb.State == types.StateRunning && sb.ExecutionResult == nil && sb.RunID != "" {
+	if sb.State == types.StateRunning && sb.ExecutionResult == nil && sb.RunID != "" && sb.DeadRunID != sb.RunID {
 		if o.runSessionActive(runKindSandbox, sb.RunID) {
 			o.cache(sb)
 			o.observeSandboxUpsert(sb)
@@ -393,6 +393,23 @@ func (o *Orchestrator) finalizeMissingRunningSandboxOnce(ctx context.Context, ob
 // Caller holds the SID lifecycle lock. Keep the source grant through the dead
 // commit so physical source removal and its durable owner retire together.
 func (o *Orchestrator) finalizeRunningSandboxDeadLocked(ctx context.Context, sb *types.Sandbox) error {
+	if sb.State == types.StateRunning && sb.ExecutionResult == nil && sb.RunID != "" {
+		// Reaching this path means exact-unit absence has already been confirmed.
+		// Persist the known end fact separately from the unknown result so reconnect
+		// snapshots cannot advertise a healthy run while cleanup is retrying.
+		changed, err := o.st.MarkSandboxRunEnded(ctx, sb)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return nil
+		}
+		sb.DeadRunID = sb.RunID
+	}
+	o.uncache(sb.ID)
+	ended := cloneSandbox(sb)
+	ended.State = types.StateDead
+	o.publishUpsert(ended)
 	ctx, release, err := o.trySourceOperation(ctx, sb)
 	if err != nil {
 		return err
@@ -411,12 +428,12 @@ func (o *Orchestrator) finalizeRunningSandboxDeadLocked(ctx context.Context, sb 
 	o.runs.forget(sb.RunID)
 	o.releaseDetachedPortFence(sb.VswitchPort)
 	o.uncache(sb.ID)
-	o.publishDelete(sb.ID)
 	updated, err := o.st.Get(ctx, sb.ID)
 	if err != nil {
 		return err
 	}
 	if updated != nil {
+		o.publishUpsert(updated)
 		o.observeSandboxUpsert(updated)
 	}
 	return nil
@@ -552,6 +569,7 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 	o.runs.forget(sb.RunID)
 	o.clearDeadlineIntent(sid)
 	o.uncache(sid)
+	o.publishDelete(sid)
 	o.observeSandboxDelete(sb)
 	return nil
 }

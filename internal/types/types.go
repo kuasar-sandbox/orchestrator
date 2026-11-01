@@ -370,7 +370,16 @@ type SandboxCheckpoint struct {
 
 // Sandbox pressure fields are node-owned lifecycle state, never user metadata.
 type Sandbox struct {
-	MaxCheckpoints int // sandbox option, currently fixed at 1
+	MaxCheckpoints int    // sandbox option, currently fixed at 1
+	InstanceID     string // immutable parent incarnation; never a timestamp
+	AutoReset      bool
+	DeadRunID      string // confirmed ended run; retained through cleanup and dead
+	DeadToken      string // unique terminal instance, independent of deadAt precision
+	ResetID        string // durable logical operation; partial outputs belong to parent
+	ResetState     string // empty, pending, failed, or succeeded
+	ResetAutomatic bool
+	ResetError     string
+	AutoResetError string
 
 	PauseReason           string
 	ResourceObligation    bool
@@ -405,7 +414,7 @@ type Sandbox struct {
 	Metadata              map[string]string
 	Env                   map[string]string
 	CreatedUnix           int64
-	DeadUnix              int64 // diagnostic dead commit time; 0 for every non-dead state
+	DeadUnix              int64 // first durable dead commit; retries never extend retention
 	ExecutionResult       *SandboxExecutionResult
 }
 

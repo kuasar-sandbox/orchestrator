@@ -408,6 +408,10 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	in.MMDSRoutes = ""
 	in.MMDSRouteSecretValues = nil
 	in.MaxInflightPatch = nil
+	// Parent identity and Reset policy belong to management projections. They
+	// are not part of the fixed business route or its activation revision.
+	in.InstanceID = ""
+	in.AutoReset = false
 	startHeaderWrite(&t.header.TableSeq)
 	defer finishHeaderWrite(&t.header.TableSeq)
 	idx, ok := t.findSlot(in.SandboxID, true)

@@ -24,7 +24,8 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		ResumeSandboxRef: sandbox.ResumeSource.SandboxRef,
 		ArtifactLocation: artifactLocation(sandbox.ResumeSource.Ref),
 		AutoPauseMemory:  sandbox.AutoPauseMemory,
-		LaunchMode:       conductorextension.LaunchMode(sandbox.LaunchMode),
+		AutoReset:        sandbox.AutoReset, DeadUnix: sandbox.DeadUnix, AutoResetError: sandbox.AutoResetError,
+		LaunchMode: conductorextension.LaunchMode(sandbox.LaunchMode),
 	}
 	if sandbox.Cluster != nil {
 		view.Cluster = &conductorextension.SandboxClusterView{Group: sandbox.Cluster.Group, RouteKey: sandbox.Cluster.RouteKey}

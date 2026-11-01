@@ -35,6 +35,15 @@ type Store struct {
 const schema = `
 CREATE TABLE IF NOT EXISTS sandboxes (
   id                   TEXT PRIMARY KEY,
+  instance_id          TEXT NOT NULL DEFAULT '',
+  auto_reset           INTEGER NOT NULL DEFAULT 0,
+  dead_run_id          TEXT NOT NULL DEFAULT '',
+  dead_token           TEXT NOT NULL DEFAULT '',
+  reset_id             TEXT NOT NULL DEFAULT '',
+  reset_state          TEXT NOT NULL DEFAULT '',
+  reset_automatic      INTEGER NOT NULL DEFAULT 0,
+  reset_error          TEXT NOT NULL DEFAULT '',
+  auto_reset_error     TEXT NOT NULL DEFAULT '',
   pause_reason TEXT NOT NULL DEFAULT '',
   resource_obligation INTEGER NOT NULL DEFAULT 0,
   pressure_version INTEGER NOT NULL DEFAULT 0,
@@ -244,6 +253,26 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		return nil, err
 	}
 	if err := ensureColumn(ctx, db, "sandboxes", "dead_unix", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for _, name := range []string{"instance_id", "dead_run_id", "dead_token", "reset_id", "reset_state", "reset_error", "auto_reset_error"} {
+		if err := ensureColumn(ctx, db, "sandboxes", name, "TEXT NOT NULL DEFAULT ''"); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	for _, name := range []string{"auto_reset", "reset_automatic"} {
+		if err := ensureColumn(ctx, db, "sandboxes", name, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET instance_id=lower(hex(randomblob(16))) WHERE instance_id=''`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: initialize parent identities: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET dead_token=lower(hex(randomblob(16))) WHERE state='dead' AND dead_token=''`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -547,8 +576,9 @@ const sandboxInsertSQL = `
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
 	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,max_checkpoints,launch_mode,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,
-	  sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
+	  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -561,7 +591,10 @@ ON CONFLICT(id) DO UPDATE SET
   metadata_json=excluded.metadata_json, env_json=excluded.env_json,
   dead_unix=excluded.dead_unix, sandbox_result_run_id=excluded.sandbox_result_run_id,
   sandbox_result_json=excluded.sandbox_result_json,
- pause_reason=excluded.pause_reason, resource_obligation=excluded.resource_obligation, pressure_version=excluded.pressure_version, running_since_ns=excluded.running_since_ns, pressure_since_ns=excluded.pressure_since_ns`
+ pause_reason=excluded.pause_reason, resource_obligation=excluded.resource_obligation, pressure_version=excluded.pressure_version, running_since_ns=excluded.running_since_ns, pressure_since_ns=excluded.pressure_since_ns,
+ dead_run_id=excluded.dead_run_id,dead_token=excluded.dead_token,reset_id=excluded.reset_id,reset_state=excluded.reset_state,
+ reset_automatic=excluded.reset_automatic,reset_error=excluded.reset_error,auto_reset_error=excluded.auto_reset_error
+ WHERE sandboxes.instance_id=excluded.instance_id`
 
 const sandboxInsertOnlySQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO NOTHING`
@@ -572,6 +605,12 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	}
 	if !types.ValidLocalSandboxID(sb.ID) {
 		return nil, errors.New("invalid sandbox id")
+	}
+	if sb.InstanceID == "" {
+		sb.InstanceID = randomLifecycleID()
+	}
+	if sb.State == types.StateDead && sb.DeadToken == "" {
+		sb.DeadToken = randomLifecycleID()
 	}
 	if sb.MaxCheckpoints == 0 {
 		sb.MaxCheckpoints = 1
@@ -632,6 +671,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
 		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix, resultRunID, resultJSON,
 		sb.PauseReason, sb.ResourceObligation, sb.PressureVersion, sb.RunningSinceUnixNano, sb.PressureSinceUnixNano,
+		sb.InstanceID, sb.AutoReset, sb.DeadRunID, sb.DeadToken, sb.ResetID, sb.ResetState, sb.ResetAutomatic, sb.ResetError, sb.AutoResetError,
 	}, nil
 }
 
@@ -683,14 +723,39 @@ func validateSandboxLifecycle(sb *types.Sandbox) error {
 			return errors.New("dead sandbox must not have a launch mode")
 		}
 		if sb.RunID != "" || sb.VswitchPort != "" || sb.FloatingIP != "" || sb.InnerIP != "" || sb.PortMAC != "" ||
-			sb.RunDir != "" || sb.BaseDir != "" || sb.EnvdUDS != "" || sb.CiUDS != "" || !sb.ResumeSource.Empty() {
-			return errors.New("dead sandbox must not retain runtime, path, network, or artifact ownership")
+			sb.RunDir != "" || sb.EnvdUDS != "" || sb.CiUDS != "" {
+			return errors.New("dead sandbox must not retain runner or network ownership")
 		}
 	default:
 		return fmt.Errorf("invalid sandbox state %q", sb.State)
 	}
 	if sb.State != types.StateDead && sb.DeadUnix != 0 {
 		return fmt.Errorf("%s sandbox must not have a terminal timestamp", sb.State)
+	}
+	if sb.InstanceID == "" {
+		return errors.New("sandbox requires a parent instance identity")
+	}
+	if sb.State == types.StateDead && sb.DeadToken == "" {
+		return errors.New("dead sandbox requires terminal identity")
+	}
+	switch sb.ResetState {
+	case "":
+		if sb.ResetID != "" || sb.ResetAutomatic || sb.ResetError != "" {
+			return errors.New("Reset metadata without operation")
+		}
+	case "pending", "failed":
+		if sb.ResetID == "" || sb.DeadToken == "" || (sb.State != types.StateDead && sb.State != types.StateDeleting) {
+			return errors.New("Reset operation lost terminal owner")
+		}
+		if (sb.ResetState == "failed") != (sb.ResetError != "") {
+			return errors.New("Reset failure metadata mismatch")
+		}
+	case "succeeded":
+		if sb.ResetID == "" || sb.ResetError != "" || sb.ResetAutomatic || sb.State == types.StateDead {
+			return errors.New("invalid Reset success metadata")
+		}
+	default:
+		return errors.New("unknown Reset operation state")
 	}
 	return nil
 }
@@ -706,6 +771,12 @@ func sandboxWriteError(operation string, sb *types.Sandbox, err error) error {
 // tenant credential pair, and sandbox service credentials are written only by
 // the initial insert; later lifecycle updates cannot rebind an existing sandbox.
 func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
+	if sb != nil && sb.InstanceID == "" {
+		err := s.db.QueryRowContext(ctx, `SELECT instance_id FROM sandboxes WHERE id=?`, sb.ID).Scan(&sb.InstanceID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
 	args, err := s.prepareSandboxInsert(sb)
 	if err != nil {
 		return sandboxWriteError("put", sb, err)
@@ -1166,15 +1237,15 @@ func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool
 		return false, errors.New("store: begin sandbox delete requires a sandbox")
 	}
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes SET resource_obligation=0, pause_reason='', pressure_version=pressure_version+1, state=?, launch_mode='', dead_unix=0
+		UPDATE sandboxes SET resource_obligation=0, pause_reason='', pressure_version=pressure_version+CASE WHEN state='deleting' THEN 0 ELSE 1 END, state=?, launch_mode='', dead_unix=0
 		 WHERE id=? AND state=? AND launch_mode=?
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
-		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=? AND pressure_version=?`,
+		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=? AND pressure_version=? AND instance_id=? AND dead_token=? AND dead_unix=?`,
 		string(types.StateDeleting), sb.ID, string(sb.State), string(sb.LaunchMode),
 		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
 		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
-		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix, sb.PressureVersion)
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix, sb.PressureVersion, sb.InstanceID, sb.DeadToken, sb.DeadUnix)
 	if err != nil {
 		return false, fmt.Errorf("store: begin sandbox delete %s: %w", sb.ID, err)
 	}
@@ -1243,11 +1314,11 @@ func (s *Store) DeleteFinalizedSandbox(ctx context.Context, sb *types.Sandbox) (
 		 WHERE id=? AND state=? AND launch_mode=?
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
-		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=?`,
+		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=? AND instance_id=? AND pressure_version=?`,
 		sb.ID, string(types.StateDeleting), string(sb.LaunchMode),
 		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
 		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
-		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix)
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix, sb.InstanceID, sb.PressureVersion)
 	if err != nil {
 		return false, fmt.Errorf("store: finalize sandbox delete %s: %w", sb.ID, err)
 	}
@@ -1261,10 +1332,9 @@ func (s *Store) RollbackStartingDead(ctx context.Context, sb *types.Sandbox) (bo
 	return s.CommitSandboxDead(ctx, sb)
 }
 
-// CommitSandboxDead records non-delete terminal history only after the caller
-// has fenced and removed every local resource. It accepts a starting launch
-// failure or a running sandbox found without a live unit and clears all
-// ownership atomically.
+// CommitSandboxDead separates execution ownership from parent-owned data. The
+// exact runner/network/RunDir must already be fenced. The terminal identity and
+// automatic Reset responsibility are committed together before any preparation.
 func (s *Store) CommitSandboxDead(ctx context.Context, sb *types.Sandbox) (bool, error) {
 	if sb == nil || sb.ID == "" {
 		return false, errors.New("store: commit sandbox dead requires a sandbox")
@@ -1278,16 +1348,18 @@ func (s *Store) CommitSandboxDead(ctx context.Context, sb *types.Sandbox) (bool,
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET resource_obligation=0, pause_reason='', pressure_version=pressure_version+1, state=?, launch_mode='', run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac='',
-		       run_dir='', base_dir='', envd_uds='', ci_uds='', resume_source_kind='', resume_source_ref='', resume_sandbox_ref='',
-		       dead_unix=unixepoch()
+		       run_dir='', envd_uds='', ci_uds='', dead_unix=unixepoch(), dead_run_id=?, dead_token=?,
+		       reset_id=CASE WHEN auto_reset=1 THEN ? ELSE '' END,
+		       reset_state=CASE WHEN auto_reset=1 THEN 'pending' ELSE '' END,
+		       reset_automatic=auto_reset,reset_error='',auto_reset_error=''
 		 WHERE id=? AND state=? AND launch_mode=?
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
-		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=?`,
-		string(types.StateDead), sb.ID, string(sb.State), string(sb.LaunchMode),
+		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=? AND instance_id=? AND pressure_version=?`,
+		string(types.StateDead), sb.RunID, randomLifecycleID(), randomLifecycleID(), sb.ID, string(sb.State), string(sb.LaunchMode),
 		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
 		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
-		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix)
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix, sb.InstanceID, sb.PressureVersion)
 	if err != nil {
 		return false, fmt.Errorf("store: commit sandbox %s dead: %w", sb.ID, err)
 	}
@@ -1323,7 +1395,8 @@ func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (
 var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,max_checkpoints,launch_mode,
-  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns`
+  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
+  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
@@ -1337,7 +1410,8 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc,
 		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.MaxCheckpoints, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
-		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano); err != nil {
+		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano,
+		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError); err != nil {
 		return nil, err
 	}
 	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)

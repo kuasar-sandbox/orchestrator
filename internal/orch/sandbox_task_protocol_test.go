@@ -443,11 +443,7 @@ func TestRestoreYAMLFailureAfterNetworkCommitRollsBackExactOwnership(t *testing.
 	if got := vs.detaches.Load(); got != 1 {
 		t.Fatalf("network detaches = %d, want 1", got)
 	}
-	for _, dir := range []string{created.RunDir, created.BaseDir} {
-		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("rollback retained %s: %v", dir, err)
-		}
-	}
+	assertTerminatedDataRetained(t, created)
 }
 
 func TestRestoreInvalidInheritedNetworkFailsClosed(t *testing.T) {

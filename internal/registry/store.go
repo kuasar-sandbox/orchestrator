@@ -24,8 +24,8 @@ import (
 
 const nodeListTombstoneRetention = time.Hour
 
-// SandboxState mirrors cluster.md route state. A missing/dead sandbox is
-// represented by no route row.
+// SandboxState retains management location until node finalization. Only a
+// missing/deleted sandbox is represented by no route row.
 type SandboxState string
 
 const (
@@ -34,6 +34,8 @@ const (
 	StateReady    SandboxState = "ready"
 	StatePaused   SandboxState = "paused"
 	StatePausing  SandboxState = "pausing"
+	StateDead     SandboxState = "dead"
+	StateDeleting SandboxState = "deleting"
 )
 
 // NodeRecord is the registry-facing node_link view.
@@ -68,6 +70,8 @@ type NodeRecord struct {
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
+	InstanceID             string                    `json:"instance_id,omitempty"`
+	StateVersion           uint64                    `json:"state_version,omitempty"`
 	Group                  string                    `json:"group"`
 	RouteKey               string                    `json:"route_key"`
 	SandboxID              string                    `json:"sandbox_id,omitempty"`
@@ -96,6 +100,7 @@ type SandboxRecord struct {
 	BuildReason            string                    `json:"build_reason,omitempty"`
 	CreatedU               int64                     `json:"created_unix,omitempty"`
 	AutoPauseMemory        bool                      `json:"auto_pause_memory"`
+	AutoReset              bool                      `json:"auto_reset"`
 }
 
 type WatchEventType int

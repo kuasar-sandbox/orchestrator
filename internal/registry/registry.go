@@ -36,6 +36,7 @@ var (
 	errInvalidSandboxConfig     = errors.New("registry: invalid sandbox config")
 	errStaleImportSourceLease   = errors.New("registry: stale import source lease")
 	ErrReserveBadRequest        = errors.New("registry: invalid reserve request")
+	ErrReserveConflict          = errors.New("registry: retained sandbox occupies this route key")
 	ErrReserveUnauthorized      = errors.New("registry: reserve credential is required")
 	ErrReserveForbidden         = errors.New("registry: reserve credential is invalid")
 	ErrSandboxNotFound          = errors.New("registry: sandbox not found")
@@ -466,7 +467,7 @@ func flightKey(group, routeKey string) string { return group + "\x00" + routeKey
 // reserveCreate resolves (group, route_key) to a running sandbox, placing +
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
 // report it running, single-flight per key (cluster.md).
-func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, autoPauseMemory bool) (*ReserveResult, error) {
+func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, autoPauseMemory, autoReset bool) (*ReserveResult, error) {
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
 	}
@@ -477,6 +478,9 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 	rec, rev, found, err := r.getSandboxForReserve(ctx, group, routeKey)
 	if err != nil {
 		return nil, err
+	}
+	if found && (rec.State == StateDead || rec.State == StateDeleting) {
+		return nil, ErrReserveConflict
 	}
 	if found && rec.State == StateReady {
 		profile, err := types.ParseProfile(rec.Profile)
@@ -514,7 +518,7 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		r.mu.Unlock()
 	}()
 
-	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory); err != nil {
+	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory, autoReset); err != nil {
 		r.finish(key, nil, err)
 		if fence, ok := r.reserveRollbackFence(key); ok {
 			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
@@ -628,7 +632,10 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 // startReserve drives the placement + command for the leader of a single-flight.
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
-func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory bool) error {
+func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory, autoReset bool) error {
+	if found && (rec.State == StateDead || rec.State == StateDeleting) {
+		return ErrReserveConflict
+	}
 	// PAUSING/PAUSED keep their current owner. Connect waits behind the node's
 	// Pause lifecycle lock; Registry must not replace a capture with a Create.
 	if found && rec.State == StatePausing && rec.NodeID == "" {
@@ -697,14 +704,14 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		copy := *rec
 		replaceReady = &copy
 	}
-	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady, autoPauseMemory)
+	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady, autoPauseMemory, autoReset)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. node_list is only a catalog: the selected node owner validates its
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord, autoPauseMemory bool) error {
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord, autoPauseMemory, autoReset bool) error {
 	if _, found := createConfig[sandboxcfg.NsCredentials]; found {
 		return errors.New("registry: create credentials were not separated from config")
 	}
@@ -728,6 +735,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		// original TTL capture policy together with its stable identity and
 		// materialized credentials instead of adopting a retrying Create body.
 		autoPauseMemory = replaceReady.AutoPauseMemory
+		autoReset = replaceReady.AutoReset
 	}
 	excluded := placementExclusions{}
 	casConflicts := 0
@@ -740,8 +748,11 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return err
 		}
+		if curFound && (cur.State == StateDead || cur.State == StateDeleting) {
+			return ErrReserveConflict
+		}
 		if curFound && cur.State == StatePausing {
-			return r.startReserve(ctx, group, routeKey, cur, curRev, true, createConfig, createCredentials, autoPauseMemory)
+			return r.startReserve(ctx, group, routeKey, cur, curRev, true, createConfig, createCredentials, autoPauseMemory, autoReset)
 		}
 		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
 			return nil // a concurrent replacement already won; the running route finishes the Reserve
@@ -767,6 +778,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			// not adopt either value from its own request after that point.
 			binding = cur
 			autoPauseMemory = cur.AutoPauseMemory
+			autoReset = cur.AutoReset
 			if hasRouteCredentials(cur) {
 				selectedCredentials, _, err = replacementCredentials(cur)
 				if err != nil {
@@ -857,6 +869,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			CreateCredentials:    cloneCreateCredentials(selectedCredentials),
 			TargetPort:           placement.TargetPort,
 			AutoPauseMemory:      autoPauseMemory,
+			AutoReset:            autoReset,
 		}
 		copyRouteCredentials(reserved, selectedReplacement)
 		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
@@ -907,6 +920,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			},
 			APISecretFingerprint: placement.APISecretFingerprint,
 			AutoPauseMemory:      cloneOptionalBool(&autoPauseMemory),
+			AutoReset:            cloneOptionalBool(&autoReset),
 		}
 		if r.nodeOwner == nil {
 			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
@@ -1123,13 +1137,8 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		// route facts for the cluster state machine.
 		return
 	}
-	if e.State == routesync.StateDead {
-		if r.applyDelete(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
-			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.SandboxID)
-		}
-		return
-	}
 	rec := &SandboxRecord{
+		InstanceID: e.InstanceID, StateVersion: e.PressureVersion,
 		Group: ref.Group, RouteKey: ref.RouteKey,
 		SandboxID: ref.SandboxID, NodeSandboxID: ref.NodeSandboxID,
 		SandboxGeneration: ref.SandboxGeneration, NodeID: nodeID,
@@ -1151,6 +1160,10 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		rec.State = StatePausing
 	case routesync.StatePaused:
 		rec.State = StatePaused
+	case routesync.StateDead:
+		rec.State = StateDead
+	case routesync.StateDeleting:
+		rec.State = StateDeleting
 	default:
 		r.log.Warn("registry: ignored unknown route state", "node", nodeID, "sid", e.SandboxID, "state", e.State)
 		return
@@ -1277,6 +1290,14 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		r.log.Warn("registry: ignored route with invalid credentials", "node", nodeID, "sid", e.SandboxID, "err", err)
 		return true
 	}
+	// Full snapshots and retried projections cannot roll a newer lifecycle back.
+	// A reused node-local SID must first acquire a new registry generation.
+	if cur.InstanceID != "" && (rec.InstanceID != cur.InstanceID || rec.StateVersion < cur.StateVersion) {
+		return true
+	}
+	if cur.InstanceID != "" && rec.StateVersion == cur.StateVersion && (cur.State == StateDead || cur.State == StateDeleting) && rec.State != cur.State {
+		return true
+	}
 	if rec.TemplateID == "" {
 		rec.TemplateID = cur.TemplateID
 	}
@@ -1288,6 +1309,7 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		rec.TargetPort = cur.TargetPort
 	}
 	rec.AutoPauseMemory = cur.AutoPauseMemory
+	rec.AutoReset = cur.AutoReset
 	rec.NextSandboxGeneration = cur.NextSandboxGeneration
 	committedRev, ok, err := r.stores.CASSandbox(ctx, rec, rev)
 	if err != nil || !ok {
@@ -1307,6 +1329,8 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		} else {
 			r.finish(flightKey(rec.Group, rec.RouteKey), &ReserveResult{Route: *route}, nil)
 		}
+	} else if rec.State == StateDead || rec.State == StateDeleting {
+		r.finish(flightKey(rec.Group, rec.RouteKey), nil, ErrReserveConflict)
 	}
 	return true
 }
@@ -1593,9 +1617,15 @@ func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sand
 		return false, nil
 	}
 	if r.nodeOwner == nil || rec.NodeID == "" {
+		if rec.State == StateDead || rec.State == StateDeleting {
+			return false, ErrNodeGone
+		}
 		return r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
 	}
 	if err := r.nodeOwner.DeleteSandbox(ctx, rec.NodeID, rec.NodeSandboxID, rec.APISecretFingerprint); err != nil {
+		if rec.State == StateDead || rec.State == StateDeleting {
+			return false, err
+		}
 		if !errors.Is(err, ErrNodeGone) {
 			return false, err
 		}
@@ -2104,6 +2134,11 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			s.Profile != ref.Profile ||
 			s.APISecretFingerprint != ref.APISecretFingerprint {
 			sandboxPlans = append(sandboxPlans, plan)
+			continue
+		}
+		// Retained terminal storage remains on this exact node. A reconnect must
+		// recover its management binding, not turn the route into a new Create.
+		if s.State == StateDead || s.State == StateDeleting {
 			continue
 		}
 		shouldReset := s.State == StateReady || s.State == StatePausing || s.State == StatePaused

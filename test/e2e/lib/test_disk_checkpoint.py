@@ -214,6 +214,22 @@ class DiskCheckpoint(unittest.TestCase):
 
         prepare()
         self.assertEqual(validate(), fresh)
+        baseline_path = self.root / "baseline.json"
+        retained = [{"diff_id": diff_id, "id": disk_checkpoint.fresh_checkpoint_id()} for diff_id in ("root", "data")]
+        baseline = held[:-len(fresh)] + retained
+        baseline_path.write_text(json.dumps(baseline))
+        held_path.write_text(json.dumps(baseline + fresh))
+        self.assertEqual(disk_checkpoint.fence_refs(metadata, report_path, held_path, self.checkpoint, identity, baseline_path), fresh)
+        for changed in (held, baseline + fresh + [retained[0]]):
+            held_path.write_text(json.dumps(changed))
+            with self.subTest(retained=changed), self.assertRaises(AssertionError):
+                disk_checkpoint.fence_refs(metadata, report_path, held_path, self.checkpoint, identity, baseline_path)
+        for changed in (retained, baseline + [fresh[0]], baseline + [{"diff_id": "other", "id": IDENTITY}]):
+            baseline_path.write_text(json.dumps(changed))
+            held_path.write_text(json.dumps(changed + fresh))
+            with self.subTest(baseline=changed), self.assertRaises(AssertionError):
+                disk_checkpoint.fence_refs(metadata, report_path, held_path, self.checkpoint, identity, baseline_path)
+        prepare()
         for changed in (held[1:], held + [held[0]], [*held[:-1], {"diff_id": "other", "id": identity}]):
             held_path.write_text(json.dumps(changed))
             with self.subTest(held=changed), self.assertRaises(AssertionError):

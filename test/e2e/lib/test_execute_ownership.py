@@ -314,7 +314,7 @@ class RunnerLifecycleIdentity(unittest.TestCase):
 
     def test_exit_matrix_is_wired_without_delete_or_manual_stop(self):
         run=function("run_runner_exit_case")
-        after_signal=run.split('runner_lifecycle_check signal',1)[1]
+        after_signal=run.split('runner_lifecycle_check signal',1)[1].split('echo "==> PASS:',1)[0]
         self.assertNotIn('req DELETE',after_signal)
         self.assertNotIn('systemctl stop',after_signal)
         self.assertNotIn('stop_orchestrator',after_signal)

@@ -339,6 +339,7 @@ type BuildLogEntry struct {
 
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
+	AutoReset       bool              `json:"autoReset,omitempty"`
 	MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
 	TemplateID      string            `json:"templateID"`
 	TimeoutSec      int               `json:"timeout"`
@@ -383,6 +384,7 @@ type Core interface {
 	Connect(ctx context.Context, id, apiKey, migrationToken string, options ConnectOptions) (*types.Sandbox, error)
 	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error)
 	Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) (string, error) // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
+	Reset(ctx context.Context, id, apiKey string) error
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
 	TrafficStats(ctx context.Context, id, apiKey string) (*TrafficStats, error)
@@ -479,6 +481,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
 	mux.HandleFunc("POST /sandboxes/{id}/exec-sessions", a.authAPIKey(a.execSession))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", a.auth(a.pause))
+	mux.HandleFunc("POST /sandboxes/{id}/reset", a.auth(a.reset))
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", a.auth(a.timeout))
 	// Template build (e2b v3). The CLI authenticates with a Bearer access token;
 	// treated identically to X-API-KEY (both derive the tenant via apikey).
@@ -826,6 +829,20 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(204)
 	}
+}
+
+var ErrResetFailed = errors.New("current disk Reset failed")
+
+func (a *API) reset(w http.ResponseWriter, r *http.Request) {
+	if err := a.core.Reset(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context())); err != nil {
+		if errors.Is(err, ErrResetFailed) {
+			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		} else {
+			a.fail(w, err)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type pauseRequestPresence struct {
@@ -1383,6 +1400,7 @@ func (a *API) sandboxBaseResp(sb *types.Sandbox) map[string]any {
 		"domain":      a.domain,
 		"envdVersion": a.envdVersion(sb),
 		"alias":       "",
+		"autoReset":   sb.AutoReset,
 	}
 }
 
@@ -1395,6 +1413,7 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d["startedAt"] = isoUnix(sb.CreatedUnix)
 	d["endAt"] = isoUnix(sandboxEndUnix(sb))
 	d["metadata"] = sb.Metadata
+	addSandboxTerminalFields(d, sb)
 	return d
 }
 
@@ -1405,7 +1424,7 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 // running/paused, matching the SDK's SandboxState enum; explicit internal-state
 // filters remain a diagnostic surface.
 func (a *API) listed(sb *types.Sandbox) map[string]any {
-	return map[string]any{
+	d := map[string]any{
 		"sandboxID":   sb.ID,
 		"templateID":  sb.TemplateID,
 		"clientID":    "orchestrator",
@@ -1417,6 +1436,21 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 		"startedAt":   isoUnix(sb.CreatedUnix),
 		"endAt":       isoUnix(sandboxEndUnix(sb)),
 		"metadata":    sb.Metadata,
+	}
+	addSandboxTerminalFields(d, sb)
+	return d
+}
+
+func addSandboxTerminalFields(d map[string]any, sb *types.Sandbox) {
+	d["autoReset"] = sb.AutoReset
+	if sb.DeadUnix > 0 {
+		d["deadAt"] = isoUnix(sb.DeadUnix)
+	}
+	if sb.ExecutionResult != nil {
+		d["executionResult"] = sb.ExecutionResult
+	}
+	if sb.AutoResetError != "" {
+		d["autoResetError"] = sb.AutoResetError
 	}
 }
 

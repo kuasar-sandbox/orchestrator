@@ -77,11 +77,15 @@ checkpoint_same_disks "$WORK/checkpoint-original.disks" "$WORK/checkpoint-cold-r
 checkpoint_hash >"$WORK/checkpoint-cold-resume.hash"
 cmp "$WORK/checkpoint-original.hash" "$WORK/checkpoint-cold-resume.hash"
 checkpoint_list "$SID" "$WORK/checkpoint-held.json"
-python3 - "$WORK/checkpoint-second.json" "$WORK/checkpoint-held.json" <<'PY'
+python3 - "$WORK/checkpoint-first.json" "$WORK/checkpoint-second.json" "$WORK/checkpoint-held.json" <<'PY'
 import json, sys
-meta, refs = (json.load(open(path)) for path in sys.argv[1:])
-want = {(disk['diff_id'], meta['checkpoint_id']) for disk in [meta['root'], *(meta.get('disks') or [])]}
-assert {(ref['diff_id'], ref['id']) for ref in refs} == want, (refs, want)
+first, second, refs = (json.load(open(path)) for path in sys.argv[1:])
+def versions(meta):
+    return {(disk['diff_id'], meta['checkpoint_id']) for disk in [meta['root'], *(meta.get('disks') or [])]}
+# The prior run's durable current-disk description protects A until the new
+# binding replaces it. The admitted publisher can defer that collection.
+actual = {(ref['diff_id'], ref['id']) for ref in refs}
+assert len(actual) == len(refs) and versions(second) <= actual <= versions(first) | versions(second), refs
 PY
 write_checkpoint_payload 8
 checkpoint_hash >"$WORK/checkpoint-active.hash"
@@ -101,6 +105,7 @@ checkpoint_guest /bin/true
 checkpoint_list "$SID" "$WORK/checkpoint-fence.held.json"
 python3 "$SCRIPT_DIR/disk_checkpoint.py" fence-refs "$WORK/checkpoint-second.json" \
     "$WORK/checkpoint-fence.export.json" "$WORK/checkpoint-fence.held.json" "$CHECKPOINT_ROOT/$SID/checkpoint" "$FENCE_ID" \
+    --baseline "$WORK/checkpoint-held.json" \
     >"$WORK/checkpoint-fence.refs.json"
 mapfile -t FENCE_DIFF_IDS < <(python3 - "$WORK/checkpoint-fence.refs.json" <<'PY'
 import json, sys
@@ -137,8 +142,14 @@ rm -f "$PUBLISH_BARRIER_TARGET" "$PUBLISH_BARRIER_REACHED" "$PUBLISH_BARRIER_REL
 checkpoint_measure publish_including_test_barrier "$PUBLISH_STARTED" 8
 checkpoint_wait_released "$SID" || fail "publisher completion did not release versions"
 
+# The original ResumeSource remains owned after Resume. Replace it with a new
+# complete E containing the overwrite before expecting its old version to GC.
+pause_checkpoint_guest sandbox 8
+resume_checkpoint_guest 8 current-source
+checkpoint_wait_released "$SID" || fail "obsolete source versions were not released"
+
 # Background GC is bounded. Require actual allocated-byte reduction, allowing
-# up to three minutes for reclamation; List=[] alone cannot pass this check.
+# up to three minutes for reclamation; a version-list assertion alone cannot pass.
 GC_STARTED=$(checkpoint_clock)
 RECLAIMED=0
 for _ in $(seq 1 180); do
