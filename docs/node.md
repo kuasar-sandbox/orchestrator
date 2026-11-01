@@ -79,7 +79,7 @@ The complete topology, failure and identity contracts are in [Telemetry](telemet
               sandbox backend
 ```
 
-Synchronous Create performs request validation and pure parsing, selects the requested or generated identity and materializes tokens, claims in-process launch ownership, then inserts `starting, run_id=""` with empty network fields and caches/publishes starting. It sends `route_barrier` on that same ordered routesync stream, waits for the current Proxy master to apply the preceding Upsert and ACK, and revalidates the registration lease before scheduling launch and returning HTTP 201. This means durable acceptance plus enough applied Proxy identity data to authenticate and park traffic. It does not mean a runner is assigned, runtime/backend is ready, or e2b `/init` completed. No Proxy, disconnection, apply failure or timeout returns 503. Before starting resources, cleanup removes this object's RunDir/BaseDir, then exact-owner CAS converts `starting,run_id=""` into owner-free `dead` history and publishes route Delete.
+Synchronous Create performs request validation and pure parsing, selects the requested or generated identity and materializes tokens, claims in-process launch ownership, then inserts `starting, run_id=""` with empty network fields and caches/publishes starting. It sends `route_barrier` on that same ordered routesync stream, waits for the current Proxy master to apply the preceding Upsert and ACK, and revalidates the registration lease before scheduling launch and returning HTTP 201. This means durable acceptance plus enough applied Proxy identity data to authenticate and park traffic. It does not mean a runner is assigned, runtime/backend is ready, or e2b `/init` completed. No Proxy, disconnection, apply failure or timeout returns 503. Before starting resources, cleanup removes this object's RunDir while retaining BaseDir and any formed data, then exact-owner CAS commits dead plus automatic responsibility and publishes a non-routable dead management Upsert.
 
 The cold-image background path retains its single-stage fast path: prepare resources/network/YAML, then allocate a RunID from the runner pool. Artifact launch first creates directories and binds `ready.sock`; the pool commit callback binds an exact RunID with `starting AND run_id=''` CAS. The assigned parent immediately connects readiness and obtains bootstrap using its already-locked RunID pidfile. After authentication, ManifestKey overrides its environment. Based on E/S kind and LaunchMode, the task opens the root, selects PreparedSource and submits a non-secret capacity/network/ref-closure summary. The sole launch worker then resolves resources/network, attaches networking, persists ownership with `starting AND run_id=<exact>` CAS, writes root-credential-free YAML and returns the final LaunchSpec. The resident runner appends its retained ref-locations and starts `sandbox-ctl run` as a direct child. While the parent waits for that child, conductor independently consumes the strict runtime readiness wire, performs e2b `POST /init` for environment/default user and commits `running` with an exact-RunID CAS before opening traffic. Only when the child later exits does the parent's single Wait return and its bounded result report begin.
 
@@ -323,7 +323,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `units.install` | `true` | False delegates unit installation to operations |
 | `sandbox.timeout_sec` | `300` | Default sandbox TTL in seconds |
 | `sandbox.usage.enabled` / `.sample_interval` / `.flush_interval` | `false` / `1s` / `5m` | Native lifecycle accounting policy for image cold, `run --from` and `run --restore`; strict validation, excluded from portable artifacts and independent of telemetry. See [Native usage policy](#33-native-usage-policy) |
-| `sandbox.dead_ttl` | `24h` | Positive Go duration retaining completely cleaned, owner-free dead diagnostic rows |
+| `sandbox.dead_ttl` | `24h` | Positive Go duration retaining a dead parent and all its owned data, from its first durable dead commit (§8.1.5) |
 | `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | Guest-visible VM ceiling/SKU; E2B cpuCount/memoryMB still mean capacity. img cold starts accept create/group overrides; artifact capacity constrains restore |
 | `sandbox.resources.allocatable.cpu` / `.memory` | Final capacity CPU / inherited `256MiB` when absent | CPU is relative scheduling weight, not a hard fractional-core guarantee; memory is settled guest headroom, not total Budget. Omitted node memory can clamp to final capacity, but explicit operator/custom values, even `256MiB`, must not silently clamp. Out-of-range values fail; request pointer semantics are unchanged |
 | `sandbox.resources.startup.memory` | Final capacity memory | Headroom before the first trusted cold report, in static and dynamic modes; independent of settled headroom and unused for initial restore Budget |
@@ -495,14 +495,15 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
-| Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata |
+| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory/autoReset/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
+| Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata, autoReset, optional deadAt/executionResult/autoResetError (§8.1.5) |
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
 | Metrics history | GET /sandboxes/{SandboxID}/metrics?start=...&end=... | Exact SandboxID ownership, opaque live telemetry UDS forwarding; 503 when unavailable, no Wake/Resume; [E2B contract](telemetry.md#6-e2b-history-query) |
 | Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/connected and conservative idleSince; no Wake/Resume |
 | List | GET /v2/sandboxes | Tenant-scoped state/limit/nextToken query. Omitted state lists running/pausing/paused; explicit states support diagnosis. x-next-token pagination; items include cpuCount/memoryMB/diskSizeMB and ISO-8601 startedAt/endAt. CPU/memory retain capacity/SKU meaning, not headroom |
-| Kill | DELETE /sandboxes/{id} → 204 | Non-owner returns 404. Atomically transfer complete ownership into deleting, exclude from cache/full snapshots and publish route Delete before response. Finalizer cancels launch, fences runner, detaches under allocation fence, exactly clears durable network ownership, removes RunDir/BaseDir and hard-deletes row. Route Delete only withdraws projection; pending repeats are idempotent |
+| Kill | DELETE /sandboxes/{id} → 204 | Non-owner returns 404. Atomically transfer complete ownership into deleting, withdraw business routing and publish a deleting management projection before response. Finalizer cancels launch, fences runner/source users, detaches under allocation fence, removes all owned RunDir/BaseDir data, then hard-deletes the parent and management location. Pending repeats are idempotent |
+| Reset | POST /sandboxes/{id}/reset → 204 | Wait for durable E-only paused; already E-only paused is idempotent. Other non-dead states conflict (409), owner mismatch is 404, unavailable/invalid current disks fail with 422 and retain dead. No VM launch (§8.1.5) |
 | Resume | POST /sandboxes/{id}/connect | Body timeout in seconds and optional bool/null memory. Kuasar maps nil to auto, true to memory, false to cold. Paused atomically becomes starting with durable launch_mode before response. Missing targets may synchronously import paused state from X-Kuasar-Migration-Token, then use the same admission. Response does not wait for launch |
 | Exec session | POST /sandboxes/{id}/exec-sessions → 201 | X-API-KEY only. Mint execAccessToken; optional ttlSeconds, CEL conditions and X-Kuasar-Migration-Token. Does not create a guest process |
 | Pause | POST /sandboxes/{id}/pause → 204 or 200 with checkpointID | checkpoint/ifIdle default to false (§8.1.1). Omitted/null/true memory saves Snapshot S; false saves Sandbox E. False with snapshot-only merge/drop fields returns 400; ordinary already-paused or starting returns 409; default memory Pause adopts resource-paused state without recapture |
@@ -892,7 +893,7 @@ Authority port 443 is a transport placeholder, not a guest port. Even an accompa
 - API keys are `e2b_` plus 72 hex digits, 76 characters total. SDK syntax checking uses `/^e2b_[0-9a-f]+$/`; server separately checks MAC (§7).
 - Envd is pinned through e2b-dev/infra release tarball ENVD_TARBALL in guest-runtime/native-deps, default tag 2026.22 and envd 0.6.x. The recorded SDK compatibility baseline is JavaScript e2b 2.27.x and Python 2.25.x; this is not a claim about every later version.
 - X-Access-Token carries envdAccessToken. Secure Sandbox behavior is enabled by default from SDK v2.0.0, which attaches it to data requests.
-- Routesync for Proxy/observers is version 8: four-byte little-endian length followed by JSON. Messages include register/hello/upsert/delete/bookmark/wake/route_barrier/route_barrier_ack, over PUT /internal/plugin/{id}/register on config-socket's plugin plane (§6; node-proxy §4).
+- Routesync for Proxy/observers is version 10: four-byte little-endian length followed by JSON. Messages include register/hello/upsert/delete/bookmark/wake/route_barrier/route_barrier_ack, over PUT /internal/plugin/{id}/register on config-socket's plugin plane (§6; node-proxy §4).
 
 ### 4.4 Sandbox configuration propagation
 
@@ -1098,7 +1099,7 @@ Runner assignment budget begins at pool Assign and covers queuing, on-demand Sta
 
 
 
-- **Kill:** under the SID fence, exact-CAS full ownership into deleting, cancel active launch, withdraw cache and publish route Delete. Asynchronous finalization stops the unit and all CH descendants, resets failed state, releases TAPFD or detaches vswitch, removes directories and hard-deletes row. Route withdrawal does not await cleanup. The old launch claim remains until its attempt finishes local cleanup, preventing late CAS resurrection or an early same-SID successor. Guest restart policy cannot block host unit termination.
+- **Kill:** under the SID fence, exact-CAS full ownership into deleting, cancel active launch, withdraw runtime cache and publish deleting management Upsert. Asynchronous finalization stops the unit and all CH descendants, resets failed state, releases TAPFD or detaches vswitch, removes directories and hard-deletes row before final route Delete. Business-route withdrawal does not await cleanup. The old launch claim remains until its attempt finishes local cleanup, preventing late CAS resurrection or an early same-SID successor. Guest restart policy cannot block host unit termination.
 - **Readiness:** before assigning a runner, conductor binds `<RunDir>/ready.sock` with directory 0700/socket 0600. Runner immediately connects. Conductor waits for artifact completion, readiness EOF, cancellation and absolute deadline together, so a task exiting during root reads fails immediately. The one-shot stream must be `control_ready\nready\nEOF`. Bare is ready then; e2b next sends mandatory POST /init as the first envd request, without /health as a startup gate. Health is for external checks after initialization. Artifact and cold launches follow the accepted attempt owner through preparation, child Start, readiness and /init. An explicitly supplied positive absolute deadline spans these phases without reset; ordinary launches add no overall deadline. /init starts immediately, retries only connection/transport errors at 1ms/2ms/4ms/capped-5ms backoff, under the shared launch context, without a separate 50ms request limit. Only 204 succeeds; other statuses expose the status code without potentially sensitive response body. Protocol errors, early EOF, cancellation or total timeout fail launch: fresh starting becomes dead; resume returns paused. After durable acceptance but before runner assignment, failure uses the empty-RunID fence. Only /init success commits starting→running with the exact RunID and publishes running route.
 - **Liveness authority:** ListUnitsByPatterns over distinct configured runner templates obtains the authoritative active RunID set for reconciliation with stored sandboxes.run_id (§14).
 - Host Restart=no and guest envd restart=always under sandbox-init are separate layers.
@@ -1433,9 +1434,9 @@ starting|paused|dead --explicit Delete--> deleting --finalizer success--> absent
 
 Starting is durable and spans admission, artifact preparation, resources/network, pool assignment, runtime readiness and mandatory e2b /init. Fresh Create stores image/cold/memory launch_mode. Paused resume stores cold/memory in the same atomic paused→starting update. Running/paused/deleting/dead clear launch_mode. Running may retain latest ResumeSource to track local artifact ownership; a successful Pause atomically replaces it.
 
-Create/Connect/Wake/route activation/native exec/exec-session/migration import share one SID launch group. Under its lifecycle lock, admission rereads durable state, authorizes, resolves mode and performs Store CAS, then creates/joins an attempt. Attempt mode only caches durable launch_mode. Kill/Delete exact-CAS into deleting under that lock, retaining RunID/unit/port/RunDir/BaseDir/artifact ownership, cancels attempt, excludes it from cache/future snapshots and publishes route Delete. Withdrawal is not proof of cleanup.
+Create/Connect/Wake/route activation/native exec/exec-session/migration import share one SID launch group. Under its lifecycle lock, admission rereads durable state, authorizes, resolves mode and performs Store CAS, then creates/joins an attempt. Attempt mode only caches durable launch_mode. Kill/Delete exact-CAS into deleting under that lock, retaining RunID/unit/port/RunDir/BaseDir/artifact ownership, cancels attempt, excludes it from the runtime cache and publishes deleting in live/full management projections. Business-route withdrawal is not proof of cleanup.
 
-After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation, without another route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans locally, then exactly creates owner-free dead history and withdraws route.
+After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation and the final route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans runtime ownership while retaining formed data, then exactly commits dead with automatic responsibility and publishes its management projection.
 
 CommitPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
@@ -1513,7 +1514,7 @@ HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Sandb
 setting. A retained capture, including one being exported, rejects the next checkpoint Pause
 with 409 before handshake/capture. Ordinary Pause neither occupies this quota nor replaces it.
 
-Default Resume still releases ordinary named versions, and a new no-ID Export after Resume
+Resume releases only obsolete versions not protected by the retained ResumeSource or a user checkpoint; a new no-ID Export after Resume
 returns 400. A retained checkpoint survives Resume. Export accepts `checkpointID` in
 `POST /sandboxes/{id}/export`; CLI uses `export-sandbox <sid> --checkpoint <id>`.
 This selects the immutable capture independently of current runtime state. Concurrent Resume
@@ -1523,11 +1524,10 @@ does not preempt it. Successful export consumes the checkpoint, failure retains 
 Consumption releases quota; files still required by the current ResumeSource remain, while
 existing sandbox cleanup collects obsolete files and DIFF versions.
 
-Checkpoints always belong to their sandbox and disappear with parent deletion. Generic
-terminal data retention is tracked separately in [#491](https://github.com/kuasar-sandbox/orchestrator/issues/491);
-current terminal cleanup can still remove BaseDir. This feature does not promise local data
-survival after termination. The new schema replaces the old design directly: databases missing
-`max_checkpoints` are rejected without migrating business records.
+Checkpoints always belong to their sandbox and disappear with parent deletion.
+Termination retains current disks, dependencies, the original ResumeSource and user checkpoints (§8.1.5).
+The existing checkpoint schema still rejects databases missing `max_checkpoints`;
+the Reset metadata upgrade is additive and defaults existing objects to autoReset=false (§14.1).
 
 checkpoint.mode accepts local/bundle for both CaptureKinds:
 
@@ -1763,7 +1763,8 @@ ownership, and only a running sandbox without a terminal execution result or a
 source operation still using its checkpoint may release versions. Starting,
 failed resume rolled back to paused, and an unresumed `keepSource` retain them.
 
-The check uses sandboxer's complete List result, excludes retained checkpoint IDs, and deletes
+The check uses sandboxer's complete List result and shared SDK CheckpointVersions graph validation,
+excludes the complete ResumeSource version set and retained checkpoint IDs, and deletes
 the remaining exact `{DiffID, ID}` references. Partial or uncertain Delete retries keep the same set;
 a different runtime cannot inherit that selection. If List explicitly reports
 `checkpoint_unsupported`, the current check ends successfully without Delete or
@@ -1774,8 +1775,8 @@ with bounded calls and backoff, without rolling back a successful launch or
 publication. This does not run `checkpoint-cleanup`, remove the DIFF directory or
 delete memory dependencies. Delete makes old versions reclaimable; physical space
 returns through sandboxer's subsequent GC rather than synchronously. A retained
-`ResumeSource` field in a running row therefore does not guarantee that a later
-failed capture can return to that old pause point.
+`ResumeSource` and all versions it needs remain available for failed Resume rollback
+and terminal retention. A graph validation error prevents version deletion.
 
 #### 8.1.2 Resume admission, Connect and Wake
 
@@ -1909,6 +1910,8 @@ snp: manifest ref,or located .snapshot/.bundle
 
 Paused E promotes to sbx, S to snp; E is not rejected for lacking memory. Build Snapshot also yields snp, publishing through the same sandbox-ctl publish rather than a special Snapshot-only publisher.
 
+The authenticated KMT V1 payload carries optional `autoReset` when true. Import restores this policy. Existing tokens omit it and import with the default false. An older strict reader rejects tokens carrying the new field.
+
 KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Target expectations compare both S and E. Import performs no artifact access and atomically restores the complete pair, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
 
 Export admission completes outstanding paused cleanup before registering the
@@ -1938,8 +1941,8 @@ retained source uses the same deletion path as any other move.
 Without `keepSource`, Export validates local path ownership and calls the normal
 lock-held delete acceptance entry. Success means a valid token/template result
 and a durable `deleting` row; it may precede physical cleanup. The source is
-removed from cache and full route snapshots, and a live route Delete is published
-before Export returns. The existing finalizer fences the runner, releases the
+removed from the runtime cache, and a non-routable deleting management Upsert is
+published before Export returns. Full snapshots retain it until hard deletion. The existing finalizer fences the runner, releases the
 network, removes RunDir and BaseDir (including all owned checkpoint files), then
 hard-deletes the row and emits the terminal observer notification. This applies
 to local and portable S/E sources alike, including portable sources with stale
@@ -1960,6 +1963,58 @@ under a different node-local ID.
 Standalone import defaults to source NodeSandboxID; an explicit target changes only local ID while retaining StableID/service credentials. Atomic insert-only conflicts with 409. Connect can synchronously import a missing target from X-Kuasar-Migration-Token; existing targets ignore it. Paused routes project only kind-independent artifact_location local/remote for trusted migration consumers. Proxy does not inspect artifact kind; migration tokens are sensitive Sandbox credentials and never route-broadcast.
 
 Running means runtime readiness and mandatory e2b /init, not application-port health. Generic backend health/dial retry is separate work. Cluster Create/Connect reuse node primitives. Secrets-only CONNECT import remains standalone-only; node-link carries no MMDS route-value plaintext.
+
+#### 8.1.5 Termination, Reset and retained data
+
+Create accepts `autoReset: boolean` (default false). It is immutable parent state, preserved across
+subsequent runs and projected by Get/List; pre-upgrade objects also default to false. `deadAt` is
+optional and marks the current first durable terminal commit. `executionResult` retains the original
+known result; unknown exits remain absent, never synthetic exit code zero. `autoResetError` records
+only automatic preparation failure, separately from that result. `endAt` remains the run deadline.
+
+Normal/abnormal termination, fresh Create failure and confirmed missing runs fence the exact runner,
+release network/reservations and unneeded RunDir, retain the parent/current disks/dependencies/original
+ResumeSource/user checkpoints, then commit dead. Creating E is not a prerequisite for terminal cleanup.
+Normal Pause owns its exit. Failed Resume returns to its original paused source. Accepted Delete/Kill
+continues deletion without autoReset; delayed old-run events cannot clean or overwrite a new run.
+
+Before guest access, shared sandboxer startup persists portable C0, actual complete disk graph and
+source binding, root/named disk-to-active-DIFF identities and dependencies in BaseDir/checkpoint,
+bound to parent instance and RunID. Every run refreshes that binding, including DIFF reuse. The SDK
+retains local materialized lowers; callers that did not opt into retention keep temporary cleanup.
+
+`POST /sandboxes/{id}/reset` uses existing authentication/ownership. It returns 204 only after E-only
+paused is committed; repeat E-only paused returns 204. Memory-bearing paused, starting, running,
+pausing and deleting return 409; foreign/missing parents return 404. Unavailable/incomplete current
+disks fail with 422 and retain dead. Reset never substitutes an empty disk, template, old checkpoint
+or previous run description, and never waits for an exited runtime to initialize storage.
+
+The parent persists one Reset operation ID per automatic terminal opportunity in the same dead
+transaction. The worker uses the shared SDK through `sandbox-ctl reset --checkpoint-dir ...
+--sandbox-id ... --instance-id ... --run-id ... --operation-id ... --json`. Under exclusive source
+ownership it validates every disk's identity/capacity/readiness/dependencies, fixes all versions with
+one operation identity, validates/replays partial output and creates standard Sandbox E. Only an
+exact parent/terminal/operation commit publishes E-only ResumeSource and paused. Outputs always
+belong to the parent; Reset neither consumes a user checkpoint nor occupies its long-term quota.
+The configured sandbox-ctl must come from the declared sandboxer dependency version.
+
+Manual requests join pending automatic work. Definitive failure durably marks failed and keeps original
+deadAt/result/data; automatic operations also record autoResetError. Duplicates, scans and restart never automatically retry
+it. A later manual request may create a new operation. Unknown interruption resumes the same operation,
+including after partial multi-disk capture or E creation. Recovery recognizes an already committed
+paused result. Success clears deadAt/current result/automatic error. Only a new run ending grants a new
+automatic opportunity. Reset launches no VM; subsequent Connect/Wake cold-starts the same SandboxID
+with a new RunID. Explicit memory restore from E-only fails; failed cold Resume retains E-only paused.
+
+Reset columns are an additive SQLite upgrade: immutable instance_id, auto_reset=false, dead_run_id,
+dead_token and reset_id/state/automatic/error plus auto_reset_error. Existing retained dead rows get
+an identity token but no retroactive automatic operation. Missing current disks fail clearly; their
+parents can still be deleted or expire. In running state dead_run_id may first record a confirmed end
+before cleanup without fabricating executionResult. The same transaction/CAS boundaries and inherited
+source lock protect Reset, checkpoint export, deletion and TTL across conductor process restart.
+
+This retains the existing guest FLUSH/capture durability contract. It adds no cross-node storage
+recovery, automatic VM restart loop, paused TTL, run archive or remote artifact ownership.
 
 ## 9. Data-plane boundaries
 
@@ -1987,7 +2042,7 @@ Conductor serve is this node's route and lifecycle authority. Create/resume/paus
 Server-side projection precedes broadcast. Trusted MMDS proxies receive mmds_routes and mmds_route_secret_values in the same Upsert for atomic replacement. Ordinary observers receive neither, and cluster/node-link never receives secret values. Conductor-owned mmds.services appears only in trusted proxies' Hello policy. Master atomically replaces that service registry; workers obtain resolved Unix-socket endpoints through local MMDS RPC instead of reading a second copy from proxy.yaml.
 
 - **Auto-resume launch owner:** requests reaching paused Sandboxes send routesync Wake upstream. Connect, Proxy Wake, ExecSession and other launch entries for one SID share one attempt (§8).
-- **Starting projection:** broadcast immediately after durable insertion of `starting,run_id=""`, before any FloatingIP or usable endpoint exists. Publish enriched starting after network ownership is durably CAS-written and YAML/ready.sock are prepared, allowing Proxy MMDS to support envd /init. Starting permits neither ordinary data access nor Wake. Each Create follows its initial Upsert with an ordered route barrier. Master validates and merges node defaults with explicit patches, then transactionally publishes admission bindings and route SHM before ACK. The barrier does not wait for worker readiness, statistics or a healthy-worker count: successful master apply can ACK with no serving workers. Admission/route apply failure neither ACKs nor leaves half-published state. Only successful apply+ACK and a lease recheck permit 201 and launch. Thus the first valid request after 201 should see starting and park, without treating the normal propagation gap as missing. Launch success broadcasts running; failed Create broadcasts Delete, while failed Resume broadcasts paused.
+- **Starting projection:** broadcast immediately after durable insertion of `starting,run_id=""`, before any FloatingIP or usable endpoint exists. Publish enriched starting after network ownership is durably CAS-written and YAML/ready.sock are prepared, allowing Proxy MMDS to support envd /init. Starting permits neither ordinary data access nor Wake. Each Create follows its initial Upsert with an ordered route barrier. Master validates and merges node defaults with explicit patches, then transactionally publishes admission bindings and route SHM before ACK. The barrier does not wait for worker readiness, statistics or a healthy-worker count: successful master apply can ACK with no serving workers. Admission/route apply failure neither ACKs nor leaves half-published state. Only successful apply+ACK and a lease recheck permit 201 and launch. Thus the first valid request after 201 should see starting and park, without treating the normal propagation gap as missing. Launch success broadcasts running; failed Create broadcasts retained dead, while failed Resume broadcasts paused.
 - **Envd authentication posture (`mmds.enabled`):** determines whether Create supplies an envd token and Proxy hosts MMDS. False means non-secure envd and one proxy gate, with `proxy.auth=enforce` required. True enables FC MMDS v2 inside Proxy and re-keys a fresh token per identity through /init, making snapshot fan-out data access possible. See node-proxy.md §7 for the posture comparison and two-stage MMDS protocol.
 
 ## 10. Cluster integration (node-link)
@@ -2049,7 +2104,7 @@ Node reports authoritative local execution state:
 
 ```text
 sandbox{
-  sid, profile, state(starting|running|pausing|paused|dead), artifact_location, template_id,
+  sid, profile, state(starting|running|pausing|paused|dead|deleting), instance_id, pressure_version, auto_reset, artifact_location, template_id,
   stable_id, api_secret, api_secret_fingerprint,
   manifest_key_fingerprint, service_secret,
   envd_access_token, traffic_access_token, forward_access_token,
@@ -2063,9 +2118,15 @@ build_sync_end{}
 bookmark{full_sync}
 ```
 
-Deleting is local cleanup-pending state and is never projected as a Sandbox upsert. Durable Delete acceptance immediately excludes the SID from local cache and future full route snapshots and sends delete{sid} on existing live links. This withdraws routing, without proving unit/network/path cleanup or hard-delete. If the process exits between durable transition and incremental publication, its old stream expires; the next full snapshot excludes the SID and removes the old projection. Restart retries owners still present in the durable deleting row and never reacquires an exact-cleared network tuple. Local finalizer correctness does not depend on Registry projection; completion sends no second route Delete.
+Dead and deleting are non-routable management projections. They retain the exact node/Sandbox
+location, credentials, instance_id, state version and auto_reset in live updates and full snapshots.
+Delete acceptance publishes deleting; only successful parent hard deletion publishes delete{sid}.
+Thus a lost incremental update is recovered by the next full snapshot, and the same group/route_key
+cannot be overwritten while retained data or cleanup responsibility exists. Registry rejects
+older state versions and mismatched object instances. Restart retries durable deleting ownership;
+an exact-cleared network tuple is never reacquired.
 
-Node route events retain mmds_secret for local proxy/MMDS use; Registry excludes it when materializing protected cluster routes. Starting means local launch is in progress. Registry includes it in the full-sync seen set without overwriting reserved/paused routes; running/pausing/paused/delete drive cluster convergence. Events explicitly carry the remaining credentials required for those purposes.
+Node route events retain mmds_secret for local proxy/MMDS use; Registry excludes it when materializing protected cluster routes. Starting means local launch is in progress. Registry includes it in the full-sync seen set without overwriting reserved/paused routes; running/pausing/paused/dead/deleting/delete drive cluster convergence. Events explicitly carry the remaining credentials required for those purposes.
 
 Sandbox events do not self-report Registry-owned cluster context. Before dispatch, the node-link owner maintains the node's complete Sandbox/Build ownership table. It looks up `(node_id,sid)` or `(node_id,build_id)` to recover group/route_key. Event sid is the local NodeSandboxID, allocated by Registry as `<stable-sandbox-id>-g<N>`. Node neither receives SandboxGeneration nor parses this ID. Registry's ownership table recovers stable SandboxID and generation; there is no cross-group SandboxID index.
 
@@ -2081,16 +2142,20 @@ Registry sends commands to serve, which reuses e2b lifecycle primitives (§8/§8
 
 | Command | Node action |
 |---|---|
-| `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | Cold-launch template_ref and retain/merge config (§8; snp means snapshot restoration for fresh Create). Full APISecret fingerprint selects an installed credential pair. Persist cluster={group,route_key,stable_id?} and profile as separate system fields; resolve and strip credentials namespace before the business insert. Before ACK, state is starting with empty run_id, an active attempt and the successful route/lease barrier. |
+| `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster, auto_reset?}` | Cold-launch template_ref and retain/merge config (§8; snp means snapshot restoration for fresh Create). Full APISecret fingerprint selects an installed credential pair. Persist cluster={group,route_key,stable_id?} and profile as separate system fields; resolve and strip credentials namespace before the business insert. Before ACK, state is starting with empty run_id, an active attempt and the successful route/lease barrier. |
 | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?, memory?}` | SID is NodeSandboxID. Existing targets ignore migration tokens and validate full fingerprint, profile and cluster context. Missing targets with KMT1 synchronously verify the matching local pair and insert paused with command SID/context. Before ACK, clean old owners and atomically restore canonical RunDir/UDS, resolved launch mode and deadline. Optional memory retains absent/null/false/true semantics through ResumeMode (§8.1.2). ACK carries ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}, without root/fingerprint. Restore is asynchronous; missing targets without tokens are rejected. |
 | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | Reuse Connect's exact target, optional synchronous import and profile/context/full-fingerprint checks; raw API keys never enter node-link. Node authoritatively compiles conditions, generates UUIDv7 session ID and optional exp from actual issuance time. ACK contains only ExecSessionResult{ExecAccessToken}. Resume remains asynchronous without waiting for READY. Conditions never enter Sandbox rows/routes/events/metadata. |
-| `delete{cmd_id, sid, api_secret_fingerprint}` | Full fingerprint must match the existing row. ACK means the exact owner durably entered deleting, without awaiting finalizer completion. Publish route Delete before ACK; withdrawal is not cleanup proof. Pending replay is idempotent (§5 kill). |
+| `delete{cmd_id, sid, api_secret_fingerprint}` | Full fingerprint must match the existing row. ACK means the exact owner durably entered deleting, without awaiting finalizer completion. Publish deleting management Upsert before ACK; business-route withdrawal is not cleanup proof. Pending replay is idempotent (§5 kill). |
 | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | Atomically validate/install or renew the complete pair; both fingerprints are 64-hex SHA-256. Key_drop best-effort removes by full APISecret fingerprint; TTL eviction supplies correctness (§7). Cluster.md specifies distribution. |
 | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | Config.builder.target is the canonical register-only requested target and participates in replay digest/node validation. Node transactionally performs final registration admission against the same canonical Build.Resources. Persist final Sandbox Create config/resources, build-only options and cluster group separately; never derive A/B resources from target Sandbox resources. Only definitive rejection without side effects permits reselection; ambiguous outcomes retry the same node/BuildID. |
 
 There is no drain command. Resource drain (node-resource.md §2) or local maintenance originates at the node; the cluster merely stops assigning it work.
 
-Post-ACK CmdCreate launch failure rolls fresh starting back to dead and sends Delete. CmdConnect/ExecSession failure rolls back to paused and sends paused Upsert, never taking Create's replacement-Delete path. Registry retains the replacement-reservation rollback fence: only Delete matching this Create restores the pre-Reserve route. Premature reservation deletion would lose rollback evidence. Concurrent cluster create/connect/delete cannot acquire a second local launch owner.
+Post-ACK CmdCreate launch failure rolls fresh starting back to retained dead and sends a dead Upsert.
+CmdConnect/ExecSession failure returns to the original paused source and sends paused Upsert.
+A terminal management row fences replacement reservations until final hard deletion; it is not
+a transient placement failure. Concurrent cluster create/connect/delete cannot acquire a second
+local launch owner. Node and cluster Create carry the same frozen autoReset choice (default false).
 
 Standalone and cluster Delete share the same local finalizer. Node-link has no alternative cleanup or path derivation. Finalizer failure neither reports deleting as ready/paused/starting nor delays/repeats route withdrawal. Terminal object observation waits for hard-delete.
 
@@ -2152,7 +2217,9 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                resume_source_kind, resume_source_ref, resume_sandbox_ref, auto_pause_memory, launch_mode,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
-               created_unix, sandbox_result_run_id, sandbox_result_json
+               created_unix, sandbox_result_run_id, sandbox_result_json,
+               instance_id, auto_reset, dead_run_id, dead_token, reset_id,
+               reset_state, reset_automatic, reset_error, auto_reset_error
 sandbox_mmds_route_secret_values
                sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
@@ -2162,7 +2229,7 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
 
 Build schema, admission and record authority are in [Build §6](node-build.md#6-persistence-recovery-and-retention). Resume_source_kind/ref is paused E/S's typed root and resume_sandbox_ref is Snapshot's exact associated E; auto_pause_memory selects only TTL CaptureKind, and launch_mode records accepted image/cold/memory in starting. This lifecycle schema replaces the old single-string model without dual reading/writing or a migration shim; incompatible development databases must be rebuilt.
 
-The additive `sandbox_result_run_id`/`sandbox_result_json` columns retain the original execution identity and bounded result through dead history and database reopen. Beginning a new run resets the previous result. Dead-history retention removes it with its existing Sandbox row; no second result table or task history is introduced.
+The additive `sandbox_result_run_id`/`sandbox_result_json` columns retain the original execution identity and bounded result through dead history and database reopen. Successful Reset and beginning a new run clear the previous result. Unknown results remain absent. Dead-history retention removes it with its existing Sandbox row; no second result table or task history is introduced.
 
 Root/service credentials in *_enc use AES-256-GCM; both *_hash values are full SHA-256. The first 24 hash characters only index candidate preselection (§7).
 
@@ -2182,19 +2249,29 @@ hot deletion and drain are outside this contract.
 Before opening APIs, config-socket routesync or node-link, conductor reconciles the
 configured runner unit set:
 
-- **Deleting:** already accepted explicit deletion with unfinished cleanup. Cancel the SID's launch owner and fence its exact unit. Under allocation fence, detach a nonempty exact network tuple and exact-clear all four fields; an empty tuple skips Detach. Remove canonical RunDir, BaseDir, then exact hard-delete. Any failure blocks startup and retains unfinished ownership. Directory retries never reacquire a durably cleared network owner. Deleting is excluded from full routes, Wake/Resume/Exec and all activation.
-- **Starting:** never adopt directly as running. Fresh Create first stops/resets exact runner, detaches and removes both directories, then exact-run CASes to dead. A valid ResumeSource identifies accepted Resume: release old ownership while retaining starting, source and durable launch_mode; remove only RunDir, retain BaseDir/checkpoint, clear runtime owner and enqueue recovery using the original cold/memory choice. Any stop/reset/detach/directory failure blocks startup without clearing unfinished fields or exposing APIs.
+- **Deleting:** already accepted explicit deletion with unfinished cleanup. Cancel the SID's launch owner and fence its exact unit. Under allocation fence, detach a nonempty exact network tuple and exact-clear all four fields; an empty tuple skips Detach. Remove canonical RunDir, BaseDir, then exact hard-delete. Any failure blocks startup and retains unfinished ownership. Directory retries never reacquire a durably cleared network owner. Deleting remains in full management routes but rejects Wake/Resume/Exec and all activation.
+- **Starting:** never adopt directly as running. Fresh Create first stops/resets exact runner, detaches and removes RunDir while retaining formed current disks and BaseDir, then exact-run CASes to dead and records automatic responsibility. A valid ResumeSource identifies accepted Resume: release old ownership while retaining starting, source and durable launch_mode; remove only RunDir, retain BaseDir/checkpoint, clear runtime owner and enqueue recovery using the original cold/memory choice. Any stop/reset/detach/directory failure blocks startup without clearing unfinished fields or exposing APIs.
 - **Accepted execution result:** takes precedence over apparent unit liveness. Finalize a running owner instead of adopting it; an accepted failed starting result returns a fresh Create to dead, or a resume to paused while preserving its checkpoint.
-- **Running with active/activating unit:** adopt, restore in-memory route, preserve TTL, resend the snapshot to Proxy and report through node-link in clusters.
-- **Running without live unit:** fence unit, detach, remove both directories, then atomically exact-owner-CAS clear paths/runtime/network/artifact and mark dead. Dead is resource-free history.
+- **Running with active/activating unit and no accepted end:** adopt, restore in-memory route, preserve TTL, resend the snapshot to Proxy and report through node-link in clusters.
+- **Running without live unit:** persist the exact-run end fact (dead_run_id) without inventing an execution result, fence unit, detach and remove RunDir, then atomically commit dead and any automatic Reset operation. Retain BaseDir, original ResumeSource and user checkpoints. Systemd query errors never prove absence; an accepted end fact cannot be adopted back into running.
+- **Dead:** recover pending automatic operations, including a crash after dead commit but before work starts. Failed operations stay failed; expired dead objects enter deleting without late automatic preparation. Already committed paused never rolls back.
 - **Runner units without running rows:** old-pool idle/orphan run IDs are stopped/reset; the new pool replenishes configured idle capacity.
 - **Paused:** retry complete stop/reset/inactive fencing, detach, exact CAS, selective checkpoint cleanup and RunDir removal even if RunID/port already cleared. Preserve source and BaseDir/checkpoint. Resume/Wake/Exec use the same admission gate and cannot enter starting before old cleanup completes. Run_root is tmpfs: host reboot makes lost running instances dead, while paused E/S and sbx/snp templates survive and can Connect/Wake from persistent BaseDir/checkpoint.
 
 The same startup gate reconstructs Builder ownership under [Build recovery](node-build.md#6-persistence-recovery-and-retention) before allowing bootstrap/results. Builds remain subject to the shared reaper and failure-domain rules below.
 
-The same conductor reaper runs terminal retention every five seconds, without another timer/unit. Dead and ready/error transitions atomically write dead_unix/finished_unix. Each pass processes at most 128 rows of each type. Exact-delete only after dead_ttl/terminal_ttl and complete owner release. Sandbox must have no unit, network, RunDir/BaseDir, UDS, ResumeSource or launch owner. Build must have no execution claim, unit/cgroup, phase, network, prepare/result owner. Concurrent changes after candidate scanning fail the delete CAS and preserve the row. Restart resumes using database timestamps. No automatic VACUUM or remote-artifact mutation occurs.
+The same conductor reaper runs retention every five seconds, at most 128 rows per type.
+Sandbox dead_ttl starts at the first durable dead commit for that terminal instance. Reads, failed
+Reset, cleanup retries and conductor downtime do not extend it. An exact parent instance/dead token/
+state-version CAS transfers expired dead into the same persistent deleting finalizer as explicit
+Delete. Reset committing first invalidates the old TTL candidate; Delete committing first prevents
+Reset publication. Source users must finish or be fenced before removing current disks, dependencies,
+user checkpoints, Reset partial output and versions. Cleanup failure retains deleting and retries;
+only then are the parent row and management location removed. Paused gains no TTL.
+Build terminal_ttl keeps its existing finished_unix and owner-free exact-delete rules. No automatic
+VACUUM or remote artifact GC is introduced.
 
-These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v9 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
+These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v10 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 
@@ -2266,6 +2343,8 @@ for aggregation and release acceptance.
 | [`orchestrator.lifecycle.sh`](../test/e2e/cases/orchestrator.lifecycle.sh) | WaitAssignment/readiness/init failures, starting SetTimeout/Pause/Kill, Create parking, RunDir/BaseDir ownership, resource/lease observations, list/detail and finalization preserving node files; real runner/runtime/VMM exit convergence and live controller restart preserve exact run and StateSync identity. |
 | [`orchestrator.exec.sh`](../test/e2e/cases/orchestrator.exec.sh) | Explicit KAT issuance and conditions (empty, exact, OR, cwd/user/TTY), PTY resize/stdin/stdout/stderr/exit, envd initialization/hostname, marker and real FloatingIP HTTP. |
 | [`orchestrator.pause-wake.sh`](../test/e2e/cases/orchestrator.pause-wake.sh) | Guest /app delegation and frozen process/listener/counter state; accepted Pause cancellation with SIGTERM/143 barrier; same-token waking request; memory-policy node/body/header false/null precedence, cold E, repeated cleanup, native usage and TTL/reaper behavior. |
+| [`orchestrator.reset.sh`](../test/e2e/cases/orchestrator.reset.sh) | Real current-disk manual/automatic Reset, live-run adoption, conductor interruption recovery, historical checkpoint data, first-launch failures and final deletion. |
+| [`orchestrator.cluster-reset.sh`](../test/e2e/cases/orchestrator.cluster-reset.sh) | Dead management after node reconnect, route-key Create conflicts, checkpoint ID operations, Reset followed by immediate Wake, autoReset propagation and exact parent deletion through the cluster entry point. |
 | [`orchestrator.snapshot.sh`](../test/e2e/cases/orchestrator.snapshot.sh) | Local baseline/delta memory restore, disk-layer separation, portable keep/move export, noWake denial, self-only prefetch and cleanup. Real Bundle A/B/C closed graphs preserve historical memory; Store publication, retained local resume and E-only export/import preserve canonical references. |
 | [`orchestrator.resource-startup.sh`](../test/e2e/cases/orchestrator.resource-startup.sh); [`orchestrator.resource-admission.sh`](../test/e2e/cases/orchestrator.resource-admission.sh) | Repeated 8GiB/low-allocation startup and finite VMM versus unbounded parent/ctl limits; default and small-capacity headroom across exec/pause/resume; bounded shutdown. Hardware capacity, explicit 512MiB cold reservation/balloon, Python execution and connected/settled admission precede red-zone rejection. |
 | [`orchestrator.resource-control.sh`](../test/e2e/cases/orchestrator.resource-control.sh); [`orchestrator.resource-recovery.sh`](../test/e2e/cases/orchestrator.resource-recovery.sh); [`orchestrator.resource-reservation.sh`](../test/e2e/cases/orchestrator.resource-reservation.sh) | Real sandbox-local pressure/grow and CH balloon delivery without OOM, controller restart/inventory convergence and reservation lifecycle. |

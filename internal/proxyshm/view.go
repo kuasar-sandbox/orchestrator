@@ -86,8 +86,17 @@ func (v *MasterView) BeginSync() {
 }
 
 func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
+	if r.SandboxID == "" {
+		return errors.New("proxyshm: empty sandbox id")
+	}
 	if err := validateRouteFields(r); err != nil {
 		return err
+	}
+	if r.State == routesync.StateDead || r.State == routesync.StateDeleting {
+		// The Registry retains this management entry. Proxy workers only need
+		// its bounded terminal revision to release waiters and revoke access.
+		v.ApplyDelete(r.SandboxID)
+		return nil
 	}
 	if r.TrafficPolicyInvalid && r.MaxInflightPatch != nil {
 		return errors.New("proxyshm: invalid traffic policy cannot carry a max_inflight patch")

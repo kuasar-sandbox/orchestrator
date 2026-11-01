@@ -54,6 +54,7 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
 	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
 	e := routesync.RouteEntry{
+		InstanceID: sb.InstanceID, AutoReset: sb.AutoReset,
 		PauseReason: sb.PauseReason, ResourceObligation: sb.ResourceObligation,
 		PressureVersion: sb.PressureVersion, RunningSinceUnixNano: sb.RunningSinceUnixNano,
 		SandboxID:              sb.ID,
@@ -75,6 +76,12 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 		RunID:                  sb.RunID,
 	}
+	if sb.BaseDir != "" && (sb.State == types.StateDead || sb.State == types.StateDeleting) {
+		e.ArtifactLocation = "local"
+	}
+	if (sb.ExecutionResult != nil || (sb.RunID != "" && sb.DeadRunID == sb.RunID)) && (sb.State == types.StateRunning || sb.State == types.StateStarting || sb.State == types.StatePausing) {
+		e.State = routesync.StateDead
+	}
 	if raw, present := sb.Metadata[sandboxcfg.NsTraffic]; present {
 		patch, err := sandboxcfg.ParseTrafficPatch(raw)
 		if err == nil {
@@ -82,8 +89,8 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 		}
 		if err != nil {
 			// Inputs are validated before persistence. A corrupted policy must
-			// not fabricate a lifecycle terminal (Registry treats dead as a
-			// deletion), weaken limits, disable MMDS, or poison other routes.
+			// not fabricate a lifecycle terminal, weaken limits, disable MMDS,
+			// or poison other routes.
 			e.TrafficPolicyInvalid = true
 			return e, fmt.Errorf("project traffic metadata for %s: %w", sb.ID, err)
 		}
@@ -108,14 +115,16 @@ func artifactLocation(ref string) string {
 
 // --- routesync.Source ---
 
-// Range streams the full current sandbox route set (starting + running + paused)
+// Range streams the full current sandbox route and management set
 // and active synthetic builder routes one entry at a time. Durable rows remain
 // in id order within each state. Starting entries carry the identity needed by
 // MMDS but remain non-routable until a running update. Streaming the durable
 // majority (rather than materializing it) keeps send-side memory bounded at high
 // sandbox density.
 func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
-	for _, st := range []types.State{types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused} {
+	// Revoke retained terminal business routes before replaying active rows.
+	// A reconnecting Proxy may still have their slots from an earlier run.
+	for _, st := range []types.State{types.StateDead, types.StateDeleting, types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
 			o.pauseMu.RLock()
 			if pending := o.pausePreparing[sb.ID]; pending != nil && pending.RunID == sb.RunID {
@@ -226,15 +235,9 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 		o.cache(sb)
 		o.publishUpsert(sb)
 		unlock()
-	case types.StateDeleting:
-		// Delete acceptance already removed the local cache and published the
-		// route withdrawal. Physical cleanup and object observation remain with
-		// the durable finalizer.
+	default: // dead/deleting retain management identity without a business route
 		o.uncache(sid)
-		unlock()
-	default: // dead
-		o.uncache(sid)
-		o.publishDelete(sid)
+		o.publishUpsert(sb)
 		unlock()
 	}
 }

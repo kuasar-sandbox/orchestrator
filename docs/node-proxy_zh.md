@@ -164,7 +164,7 @@ master 把下行路由流投影到共享内存:
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
-Pause 使用 routesync v9 的 `pause_barrier{barrier_id,route}` 和
+Pause 使用 routesync v10 的 `pause_barrier{barrier_id,route}` 和
 `pause_ack{barrier_id,pause_ack}`. Conductor 固定本次开始时在线且 ready 的 Proxy 集合,
 忽略此前已断链的 Proxy, 不持久化清单; 空参与集允许继续. 各 master 先应用 `pausing`
 路由, 再通过私有控制通道同步采样所有 worker, 包括正在 drain 的 worker. Worker 在
@@ -258,7 +258,9 @@ node-local ID。若外部系统显式把刚删除的 NodeSandboxID 立即分配�
 凭据投影和同名运行目录.节点不得主动执行这种跨逻辑沙箱的即时 ID 复用;
 为不同逻辑沙箱显式指定迁移 target 时应使用新的 NodeSandboxID,或先确认路由视图已经收敛。
 
-受保护 `RouteEntry` 的 state 为 `starting|running|pausing|paused|dead`,并显式携带
+收到 dead 或 deleting Upsert 时，Proxy 释放主路由槽、准入绑定和 MMDS 数据，并在有界终态缓存中登记不含凭据的修订。全量同步先撤销保留对象的终态路由。主表已满时，新业务路由等到快照 Bookmark 后再入表，此时可以回收断连期间已删除父对象的槽位。两次快照中持续存在的路由保留已占用的请求额度。Reset 后的 paused 投影可重新取得主路由槽。
+
+受保护 `RouteEntry` 的 state 为 `starting|running|pausing|paused|dead|deleting`,并显式携带
 `StableID`、`APISecret`、`APISecretFingerprint`、
 `ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
 `ForwardAccessToken`。
@@ -270,7 +272,7 @@ MMDS token 签名,不等于 route secret values;后者仅经上述可信投影�
 `MaxInflightPatch` 只在 routesync wire 上携带 Sandbox 显式叶子;master 将目标节点
 `proxy.yaml` 默认值与该 patch 合并后,把 fixed effective value 及
 `{admission slot,generation}` 写入 route SHM,不会把 pointer 写入 SHM 或用于 route equality。
-当前内部兼容边界为 routesync version 8、route SHM schema 9、worker bootstrap/config/FD
+当前内部兼容边界为 routesync version 10、route SHM schema 9、worker bootstrap/config/FD
 protocol version 3，以及 admission arena version 2。这些都是内部 hard cut；协议版本不匹配的
 conductor/proxy/registry/router 或旧 SHM/bootstrap 不兼容且 fail closed。
 

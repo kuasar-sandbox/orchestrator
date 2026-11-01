@@ -350,6 +350,7 @@ func TestReserveExecSessionReplacesLostNodeWithMigrationToken(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "stable", "gone", StatePaused)
+	original.InstanceID, original.StateVersion = "source-parent", 45
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
@@ -405,6 +406,7 @@ func TestReserveExecSessionReplacesLostNodeWithMigrationToken(t *testing.T) {
 		stored.NextSandboxGeneration != 2 || stored.State != StateReserved || !sameRouteCredentials(stored, original) {
 		t.Fatalf("replacement record = %+v, found=%v, err=%v", stored, found, err)
 	}
+	checkMigratedParentProjection(t, reg, original, stored)
 }
 
 func TestReserveExecSessionReplacementRetriesRejectedCandidate(t *testing.T) {

@@ -553,7 +553,7 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	if lc.stops.Load() == 0 {
 		t.Fatal("failed create did not stop its runner")
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.StateStarting, routesync.StateStarting, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.StateStarting, routesync.StateStarting, routesync.StateDead} {
 		select {
 		case event := <-events:
 			switch want {
@@ -581,8 +581,8 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(ranged) != 0 {
-		t.Fatalf("dead failed create remained in route snapshot: %v", ranged)
+	if len(ranged) != 1 || ranged[0] != sb.ID {
+		t.Fatalf("dead failed create lost management projection: %v", ranged)
 	}
 }
 

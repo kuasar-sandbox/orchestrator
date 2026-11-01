@@ -88,6 +88,10 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			unlock()
 			return types.ExportResult{}, api.ErrNotFound
 		}
+		if sb.State == types.StateDeleting {
+			unlock()
+			return types.ExportResult{}, api.ErrSandboxChanged
+		}
 		savedSource := sb.ResumeSource
 		if checkpointID != "" {
 			checkpoint, err := o.st.Checkpoint(opCtx, sid)
@@ -271,7 +275,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		return types.ExportResult{}, err
 	}
 	if checkpointID != "" {
-		if current == nil || current.CreatedUnix != source.CreatedUnix || current.BaseDir != source.BaseDir {
+		if current == nil || current.InstanceID != source.InstanceID || current.State == types.StateDeleting || current.CreatedUnix != source.CreatedUnix || current.BaseDir != source.BaseDir {
 			return types.ExportResult{}, api.ErrNotFound
 		}
 		changed, err := o.st.DeleteCheckpoint(finalizeCtx, sid, checkpointID)
@@ -424,6 +428,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 			CreatedUnix:            sb.CreatedUnix,
 			DeadlineUnix:           sb.DeadlineUnix,
 			AutoPauseMemory:        sb.AutoPauseMemory,
+			AutoReset:              sb.AutoReset,
 			ServiceSecret:          sb.ServiceSecret,
 			EnvdAccessToken:        sb.EnvdAccessToken,
 			TrafficAccessToken:     sb.TrafficAccessToken,
@@ -576,6 +581,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 			SandboxRef: payload.ResumeSandboxRef,
 		},
 		AutoPauseMemory:    payload.AutoPauseMemory,
+		AutoReset:          payload.AutoReset,
 		ServiceSecret:      payload.ServiceSecret,
 		EnvdAccessToken:    payload.EnvdAccessToken,
 		TrafficAccessToken: payload.TrafficAccessToken,

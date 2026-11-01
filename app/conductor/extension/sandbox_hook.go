@@ -51,6 +51,7 @@ type SandboxCreateRequest struct {
 	Env             map[string]string
 	Secure          bool
 	AutoPauseMemory *bool
+	AutoReset       bool
 	MMDS            *string
 }
 

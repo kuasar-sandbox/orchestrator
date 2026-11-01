@@ -24,10 +24,10 @@ type sourceOperationKey struct{}
 // cached by SID: after contention the caller reloads the row and opens the
 // current directory again. The inode lives until terminal BaseDir cleanup.
 type sourceOperationGrant struct {
-	sid, baseDir string
-	createdUnix  int64
-	file         *os.File
-	closed       atomic.Bool
+	sid, baseDir, instanceID string
+	createdUnix              int64
+	file                     *os.File
+	closed                   atomic.Bool
 }
 
 func sourceGrant(ctx context.Context) *sourceOperationGrant {
@@ -67,7 +67,7 @@ func (o *Orchestrator) trySourceOperation(ctx context.Context, sb *types.Sandbox
 	if want != "" && want != nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sb.ID) {
 		return ctx, nil, fmt.Errorf("orch: noncanonical source BaseDir %q", sb.BaseDir)
 	}
-	if g := sourceGrant(ctx); g != nil && g.sid == sb.ID && g.baseDir == want && g.createdUnix == sb.CreatedUnix {
+	if g := sourceGrant(ctx); g != nil && g.sid == sb.ID && g.baseDir == want && g.createdUnix == sb.CreatedUnix && g.instanceID == sb.InstanceID {
 		return ctx, noop, nil
 	}
 	if o.exports.ActiveDone(sb.ID) != nil {
@@ -76,14 +76,14 @@ func (o *Orchestrator) trySourceOperation(ctx context.Context, sb *types.Sandbox
 	// Even a portable source with no local directory needs a scoped logical
 	// grant for its own export finalizer. Other admissions still see ActiveDone.
 	if want == "" {
-		next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: sb.ID, createdUnix: sb.CreatedUnix})
+		next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: sb.ID, instanceID: sb.InstanceID, createdUnix: sb.CreatedUnix})
 		return next, release, nil
 	}
 	dirFD, err := unix.Open(want, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
 		// Already removed or not prepared yet. Do not recreate a directory
 		// during cleanup; there is no source inode to protect here.
-		next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: sb.ID, baseDir: want, createdUnix: sb.CreatedUnix})
+		next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: sb.ID, instanceID: sb.InstanceID, baseDir: want, createdUnix: sb.CreatedUnix})
 		return next, release, nil
 	}
 	if err != nil {
@@ -109,7 +109,7 @@ func (o *Orchestrator) trySourceOperation(ctx context.Context, sb *types.Sandbox
 		}
 		return ctx, nil, fmt.Errorf("orch: lock source operation: %w", err)
 	}
-	guardCtx, release := withSourceGrant(ctx, &sourceOperationGrant{sid: sb.ID, baseDir: want, createdUnix: sb.CreatedUnix, file: file})
+	guardCtx, release := withSourceGrant(ctx, &sourceOperationGrant{sid: sb.ID, instanceID: sb.InstanceID, baseDir: want, createdUnix: sb.CreatedUnix, file: file})
 	return guardCtx, release, nil
 }
 
@@ -121,14 +121,14 @@ func retainSourceOperation(ctx context.Context) (context.Context, func(), error)
 		return ctx, func() {}, nil
 	}
 	if g.file == nil {
-		next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: g.sid, baseDir: g.baseDir, createdUnix: g.createdUnix})
+		next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: g.sid, instanceID: g.instanceID, baseDir: g.baseDir, createdUnix: g.createdUnix})
 		return next, release, nil
 	}
 	fd, err := unix.FcntlInt(g.file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return ctx, nil, err
 	}
-	next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: g.sid, baseDir: g.baseDir, createdUnix: g.createdUnix, file: os.NewFile(uintptr(fd), g.file.Name())})
+	next, release := withSourceGrant(ctx, &sourceOperationGrant{sid: g.sid, instanceID: g.instanceID, baseDir: g.baseDir, createdUnix: g.createdUnix, file: os.NewFile(uintptr(fd), g.file.Name())})
 	return next, release, nil
 }
 

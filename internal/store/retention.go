@@ -28,10 +28,6 @@ func (s *Store) DeadSandboxesForRetention(ctx context.Context, cutoffUnix int64,
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+cols+` FROM sandboxes
 		WHERE state=? AND dead_unix>0 AND dead_unix<=?
-		  AND launch_mode='' AND run_id=''
-		  AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
-		  AND run_dir='' AND base_dir='' AND envd_uds='' AND ci_uds=''
-		  AND resume_source_kind='' AND resume_source_ref='' AND resume_sandbox_ref=''
 		ORDER BY dead_unix ASC,id ASC LIMIT ?`,
 		string(types.StateDead), cutoffUnix, retentionBatchLimit(limit))
 	if err != nil {
@@ -57,28 +53,16 @@ func (s *Store) DeadSandboxesForRetention(ctx context.Context, cutoffUnix int64,
 	return candidates, nil
 }
 
-// DeleteDeadSandboxForRetention removes the exact candidate only if it is still
-// due and owner-free. Every cleanup ownership column remains in the predicate,
-// so a changed or corrupt row fails closed instead of losing a local owner.
+// DeleteDeadSandboxForRetention accepts the same durable deleting finalizer as
+// explicit Delete. Physical parent data must be removed before the row is lost.
 func (s *Store) DeleteDeadSandboxForRetention(ctx context.Context, sandbox *types.Sandbox, cutoffUnix int64) (bool, error) {
 	if sandbox == nil || sandbox.ID == "" || cutoffUnix <= 0 {
 		return false, nil
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes
-		WHERE id=? AND state=? AND dead_unix=? AND dead_unix<=?
-		  AND launch_mode='' AND run_id=''
-		  AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
-		  AND run_dir='' AND base_dir='' AND envd_uds='' AND ci_uds=''
-		  AND resume_source_kind='' AND resume_source_ref='' AND resume_sandbox_ref=''`,
-		sandbox.ID, string(types.StateDead), sandbox.DeadUnix, cutoffUnix)
-	if err != nil {
-		return false, fmt.Errorf("store: prune dead sandbox %s: %w", sandbox.ID, err)
+	if sandbox.State != types.StateDead || sandbox.DeadUnix <= 0 || sandbox.DeadUnix > cutoffUnix {
+		return false, nil
 	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("store: prune dead sandbox %s rows: %w", sandbox.ID, err)
-	}
-	return changed == 1, nil
+	return s.BeginSandboxDelete(ctx, sandbox)
 }
 
 // TerminalBuildsForRetention returns at most limit fully-finalized ready/error

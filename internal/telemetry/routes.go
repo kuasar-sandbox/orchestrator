@@ -81,6 +81,10 @@ func (v *View) ApplyUpsert(route routesync.RouteEntry) error {
 	if route.SandboxID == "" || len(route.SandboxID) > 128 || len(route.StableID) > 128 || len(route.EnvdUDS) > 107 || len(route.EnvdAccessToken) > 4096 {
 		return errors.New("telemetry: invalid route fields")
 	}
+	if route.State == routesync.StateDead || route.State == routesync.StateDeleting {
+		v.ApplyDelete(route.SandboxID)
+		return nil
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	old := v.byID[route.SandboxID]

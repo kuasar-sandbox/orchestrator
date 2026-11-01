@@ -56,7 +56,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginDirect, sid, &conductorextension.SandboxCreateRequest{
 			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: req.TimeoutSec,
 			Metadata: cloneStringMap(req.Metadata), Env: cloneStringMap(req.EnvVars), Secure: req.Secure,
-			AutoPauseMemory: cloneBool(req.AutoPauseMemory), MMDS: cloneString(req.MMDSHeader),
+			AutoPauseMemory: cloneBool(req.AutoPauseMemory), AutoReset: req.AutoReset, MMDS: cloneString(req.MMDSHeader),
 		})
 		if err != nil {
 			return nil, err
@@ -76,11 +76,12 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		}
 		tmpl, normalized, mmdsDoc = finalTemplate, finalConfig, finalMMDS
 		req.TimeoutSec, req.EnvVars, req.AutoPauseMemory = candidate.TimeoutSeconds, cloneStringMap(candidate.Env), cloneBool(candidate.AutoPauseMemory)
+		req.AutoReset = candidate.AutoReset
 	}
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
 		ID: sid, StableID: identity.StableID, Template: tmpl, Pair: pair,
 		Config: normalized, Env: req.EnvVars, TimeoutSeconds: req.TimeoutSec,
-		AutoPauseMemory: req.AutoPauseMemory, InitialMMDS: initialMMDSRouteSecretValues(mmdsDoc),
+		AutoPauseMemory: req.AutoPauseMemory, AutoReset: req.AutoReset, InitialMMDS: initialMMDSRouteSecretValues(mmdsDoc),
 	})
 	if err != nil {
 		return nil, err
@@ -178,6 +179,7 @@ type sandboxCreateSpec struct {
 	Env             map[string]string
 	TimeoutSeconds  int
 	AutoPauseMemory *bool
+	AutoReset       bool
 	InitialMMDS     *mmdsInitialRouteSecretValues
 }
 
@@ -197,7 +199,7 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 	sb := &types.Sandbox{
 		ID: spec.ID, StableIDValue: spec.StableID,
 		Profile: spec.Template.Profile, TemplateID: spec.Template.String(),
-		State: types.StateStarting, LaunchMode: launchMode, AutoPauseMemory: autoPauseMemory,
+		State: types.StateStarting, LaunchMode: launchMode, AutoPauseMemory: autoPauseMemory, AutoReset: spec.AutoReset,
 		RunDir:    nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, spec.ID),
 		BaseDir:   nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, spec.ID),
 		APISecret: spec.Pair.APISecret, ManifestKey: spec.Pair.ManifestKey,

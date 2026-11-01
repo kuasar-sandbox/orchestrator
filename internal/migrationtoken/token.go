@@ -84,6 +84,7 @@ type MigrationTokenPayloadV1 struct {
 	CreatedUnix     int64 `json:"createdUnix"`
 	DeadlineUnix    int64 `json:"deadlineUnix"`
 	AutoPauseMemory bool  `json:"autoPauseMemory"`
+	AutoReset       bool  `json:"autoReset,omitempty"`
 
 	ServiceSecret      string `json:"serviceSecret"`
 	EnvdAccessToken    string `json:"envdAccessToken"`

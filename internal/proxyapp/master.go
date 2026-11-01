@@ -248,7 +248,9 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		dial = runtime.candidateDial
 	}
 	startMasterTask(func() {
-		routesync.NewSubscriber(dial, instance.status.InstanceID, registration, routeSink, view, logger).Run(masterCtx)
+		subscriber := routesync.NewSubscriber(dial, instance.status.InstanceID, registration, routeSink, view, logger)
+		subscriber.SnapshotSlots = table.SnapshotSlots
+		subscriber.Run(masterCtx)
 	})
 
 	var mmdsListener net.Listener

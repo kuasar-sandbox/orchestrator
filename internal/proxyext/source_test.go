@@ -78,6 +78,26 @@ func testRoute(sandboxID, runID string) routesync.RouteEntry {
 	}
 }
 
+func TestObservingSinkRevokesRetainedTerminalRoute(t *testing.T) {
+	table, err := proxyshm.Create(filepath.Join(t.TempDir(), "routes.shm"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	host, sink := New(proxyshm.NewMasterView(table, time.Second, nil), table, nil)
+	route := testRoute("sandbox", "run")
+	if err := sink.ApplyUpsert(route); err != nil {
+		t.Fatal(err)
+	}
+	route.State = routesync.StateDead
+	if err := sink.ApplyUpsert(route); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := host.Routes().Get(context.Background(), route.SandboxID); err != nil || found {
+		t.Fatalf("terminal extension route found=%v err=%v", found, err)
+	}
+}
+
 func TestObservingSinkPublishesOnlyAfterCoreApply(t *testing.T) {
 	host, sink, core := newTestHost(t, 8, nil)
 	core.beforeApply = func(route routesync.RouteEntry) {

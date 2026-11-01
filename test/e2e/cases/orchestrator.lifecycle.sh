@@ -3,6 +3,9 @@
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/execute_env.sh"
 write_orchestrator_config unset controller
+# The initial serial template build needs 6 GiB of startup reservation. Admit
+# it on 12 GiB developer hosts; later controller scenarios use their defaults.
+sed -i '/^resource_listen:$/a\  watermarks: { startup_factor: 0.8 }' "$WORK/config.yaml"
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
@@ -80,6 +83,10 @@ with open(path,"w") as stream: json.dump(record,stream,indent=2)
 print("runner-lifecycle measurement",json.dumps({k:record[k] for k in ("resource_mode","killed_role","ready_ms","cleanup_ms","parent_measurement")}))
 PY
     echo "==> PASS: $mode $role SIGKILL auto-cleaned without DELETE or conductor restart"
+    code=$(req DELETE "/sandboxes/$sid" "$AK")
+    [ "$code" = 204 ] || fail "delete retained dead=$code"
+    wait_sandbox_state "$sid" missing 1200 || fail "dead parent deletion did not finish"
+    [ ! -e "$CHECKPOINT_ROOT/$sid" ] || fail "deleted terminal data remains"
 }
 
 

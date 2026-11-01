@@ -49,8 +49,9 @@ import (
 // full-snapshot bracket on every node-link session. Version 7 adds the
 // presence-aware per-Sandbox max_inflight route projection. Version 8 separates
 // invalid persisted traffic policy from lifecycle state. Version 9 adds pausing
-// and synchronous Pause activity ACKs; mixed peers fail closed.
-const Version = 9
+// and synchronous Pause activity ACKs. Version 10 retains dead/deleting management
+// entries with parent identity/state versions; mixed peers fail closed.
+const Version = 10
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -82,6 +83,7 @@ const (
 	StatePaused   = "paused"
 	StatePausing  = "pausing"
 	StateDead     = "dead"
+	StateDeleting = "deleting"
 )
 
 // Message types.
@@ -108,6 +110,8 @@ const (
 // A credential-authorized "paused" route may make the proxy send a Wake;
 // "starting" waits passively and "running" lets it forward.
 type RouteEntry struct {
+	InstanceID           string `json:"instance_id,omitempty"`
+	AutoReset            bool   `json:"auto_reset,omitempty"`
 	PauseReason          string `json:"pause_reason,omitempty"`
 	ResourceObligation   bool   `json:"resource_obligation,omitempty"`
 	PressureVersion      uint64 `json:"pressure_version,omitempty"`

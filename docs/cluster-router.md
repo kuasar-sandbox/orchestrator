@@ -400,3 +400,5 @@ header propagation, target_port, DNS/TLS and the Proxy internal endpoint. Stop o
 identity mismatch. Kill only test-owned instances; removing a provider file is
 not instance cleanup or immediate revocation of credentials already bound to rows.
 Retain shared templates/keys until the retention policy permits deletion.
+
+Dead/deleting Sandboxes keep their management location. ID-based query, Reset, checkpoint Export/Delete and parent Delete use the node APIEndpoint and existing ownership checks. They expose no business DataEndpoint. Create with an occupied group/route_key conflicts until final parent deletion. Node and cluster Create preserve autoReset (default false); Reset success does not start a VM.

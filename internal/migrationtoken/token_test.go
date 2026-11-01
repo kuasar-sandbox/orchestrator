@@ -208,6 +208,7 @@ func TestOpenStrictJSON(t *testing.T) {
 		"trailing scalar":        string(canonical) + ` 1`,
 		"null field":             strings.Replace(string(canonical), `"nodeSandboxID":"sandbox-01-g7"`, `"nodeSandboxID":null`, 1),
 		"wrong field type":       strings.Replace(string(canonical), `"nodeSandboxID":"sandbox-01-g7"`, `"nodeSandboxID":7`, 1),
+		"invalid autoReset":      strings.Replace(string(canonical), `"v":1`, `"v":1,"autoReset":"true"`, 1),
 		"duplicate env key":      strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":"C.UTF-8","LANG":"other"}`, 1),
 		"null env":               strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":null`, 1),
 		"null env value":         strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":null}`, 1),

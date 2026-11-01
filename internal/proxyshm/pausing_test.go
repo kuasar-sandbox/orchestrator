@@ -36,6 +36,7 @@ func TestPausingParksHTTPAcrossCaptureAndResumesNewBackend(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", next.Listener.Addr().String())
 	}, "").WithTrafficTracker(f.stats)
 	pausing := f.entry
+	pausing.InstanceID, pausing.AutoReset = "retained-parent", true
 	pausing.State = routesync.StatePausing
 	f.apply(t, pausing)
 	response, done := startHTTPRouteRequest(t, context.Background(), px)
@@ -75,6 +76,7 @@ func TestPausingPreservesBusyTransportAndFailedResumeRevision(t *testing.T) {
 	}
 	route := workerDialRoute(f.entry, binding)
 	pausing := f.entry
+	pausing.InstanceID, pausing.AutoReset = "retained-parent", true
 	pausing.State = routesync.StatePausing
 	f.apply(t, pausing)
 	if !f.view.transportRouteCurrent(binding, route) {

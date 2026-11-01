@@ -352,11 +352,7 @@ func TestRunSessionDisconnectInactiveRunningAcceptsResultAndCleansDead(t *testin
 	if dead.ExecutionResult.RunID != fixture.sb.RunID || dead.ExecutionResult.Stage != types.SandboxResultRun || dead.ExecutionResult.Error == "" {
 		t.Fatalf("disconnect result = %+v", dead.ExecutionResult)
 	}
-	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("disconnect cleanup retained %s: %v", path, err)
-		}
-	}
+	assertTerminatedDataRetained(t, fixture.sb)
 }
 
 func TestRunSessionDisconnectStartingPreservesHealthyActiveUnit(t *testing.T) {

@@ -310,7 +310,7 @@ func TestCreateBackgroundFailureReturnsAcceptedThenPublishesDelete(t *testing.T)
 	if dead.RunID != "" || dead.VswitchPort != "" {
 		t.Fatalf("failed create retained ownership: %+v", dead)
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.StateDead} {
 		select {
 		case event := <-events:
 			switch want {

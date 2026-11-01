@@ -415,7 +415,7 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	})}
 
 	config := map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}
-	if _, err := rt.routeLinkReserve(context.Background(), "create", "/g", "rk", "", 0, 0, config, nil, nil, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
+	if _, err := rt.routeLinkReserve(context.Background(), "create", "/g", "rk", "", 0, 0, config, nil, nil, nil, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
 		t.Fatal(err)
 	}
 	if got.Config["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
@@ -469,7 +469,7 @@ func TestRouteLinkReserveCarriesTypedLifecycleBooleans(t *testing.T) {
 				memory = &value
 			}
 			if _, err := rt.routeLinkReserve(context.Background(), test.operation, "/g", "rk", "s1", 0, 0,
-				nil, autoPauseMemory, memory, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
+				nil, autoPauseMemory, nil, memory, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -543,7 +543,7 @@ func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
 				return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
 			})}
 			if _, err := rt.routeLinkReserve(
-				context.Background(), tc.operation, "/g", "rk", "s1", tc.port, tc.timeout, nil, nil, nil, nil, tc.headers,
+				context.Background(), tc.operation, "/g", "rk", "s1", tc.port, tc.timeout, nil, nil, nil, nil, nil, tc.headers,
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -572,7 +572,7 @@ func TestRouteLinkReserveConnectDoesNotRetryConflict(t *testing.T) {
 		}, nil
 	})}
 
-	_, err := rt.routeLinkReserve(context.Background(), "connect", "/g", "rk", "s1", 0, 0, nil, nil, nil, nil, map[string]string{HeaderAPIKey: "api-key"})
+	_, err := rt.routeLinkReserve(context.Background(), "connect", "/g", "rk", "s1", 0, 0, nil, nil, nil, nil, nil, map[string]string{HeaderAPIKey: "api-key"})
 	var routeErr *routeLinkCallError
 	if !errors.As(err, &routeErr) || routeErr.status != http.StatusConflict {
 		t.Fatalf("connect reserve error=%v, want route-link 409", err)

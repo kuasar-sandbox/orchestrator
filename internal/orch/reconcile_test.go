@@ -281,8 +281,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		}
 	}
 	for _, fresh := range []*types.Sandbox{&createStarting, &createEmpty} {
-		if _, err := os.Stat(fresh.BaseDir); !os.IsNotExist(err) {
-			t.Fatalf("fresh-create base directory %s remains: %v", fresh.BaseDir, err)
+		if _, err := os.Stat(fresh.BaseDir); err != nil {
+			t.Fatalf("fresh-create current data %s was removed: %v", fresh.BaseDir, err)
 		}
 	}
 	for _, resume := range []*types.Sandbox{&resumeStarting, &resumeEmpty} {

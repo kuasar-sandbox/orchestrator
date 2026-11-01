@@ -153,16 +153,18 @@ def verify_lease(work, observed):
 def assert_dead(work, observed, run_root=None):
     run_root = runtime_root(work, run_root)
     state = row(work, observed["sid"])
-    fields = ("run_id", "run_dir", "base_dir", "vswitch_port", "floatingip", "inner_ip", "port_mac",
-              "envd_uds", "ci_uds", "resume_source_kind", "resume_source_ref", "resume_sandbox_ref")
+    fields = ("run_id", "run_dir", "vswitch_port", "floatingip", "inner_ip", "port_mac",
+              "envd_uds", "ci_uds")
     if state["state"] != "dead" or any(state[name] for name in fields):
-        raise ValueError("automatic exit cleanup has not committed resource-free dead history")
+        raise ValueError("automatic exit cleanup has not released runtime ownership")
     result = json.loads(state["sandbox_result_json"])
     if state["sandbox_result_run_id"] != observed["run_id"] or result["run_id"] != observed["run_id"] or result["sid"] != observed["sid"] or result["stage"] != "run":
         raise ValueError("dead history lost the original execution result identity")
-    for subtree in (run_root / "sandboxes", work / "lib/sandboxes"):
-        if (subtree / observed["sid"]).exists():
-            raise ValueError("completed cleanup retained an object directory")
+    if (run_root / "sandboxes" / observed["sid"]).exists():
+        raise ValueError("completed cleanup retained a run directory")
+    base = work / "lib/sandboxes" / observed["sid"]
+    if state["base_dir"] != str(base) or not base.is_dir():
+        raise ValueError("terminal cleanup lost parent-owned current data")
     if (Path("/sys/fs/cgroup") / observed["cgroup"].lstrip("/")).exists():
         raise ValueError("completed cleanup retained the delegated unit subtree")
     for expected in observed["processes"].values():

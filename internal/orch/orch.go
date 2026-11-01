@@ -157,6 +157,10 @@ type Orchestrator struct {
 	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error)
 	removeSandboxRunDir              func(string) error
 	removeSandboxBaseDir             func(string) error
+	resetMu                          sync.Mutex
+	resetActive                      map[string]*sandboxResetWork
+	prepareReset                     func(context.Context, *types.Sandbox) (types.ResumeSource, error)
+	resetNow                         func() time.Time
 	removeBuildRunDir                func(string) error
 	removeBuildBaseDir               func(string) error
 	// extensionObserver is nil in the built-in path. The one nil branch at each
@@ -295,6 +299,9 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if sb.RunID != "" || sb.FloatingIP != "" || sb.VswitchPort != "" || sb.InnerIP != "" || sb.PortMAC != "" {
 		return nil, nil, fmt.Errorf("orch: fresh launch admission requires empty runner and network ownership")
 	}
+	if sb.InstanceID == "" {
+		sb.InstanceID = uuid.NewString()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -403,7 +410,7 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 			return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact fresh starting ownership for %s", sid))
 		}
 		if err == nil {
-			err = o.teardownPersistedOwnership(ctx, sb, true)
+			err = o.teardownPersistedOwnership(ctx, sb, false)
 		}
 		if err == nil {
 			var changed bool
@@ -416,13 +423,10 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 				o.runs.forget(sb.RunID)
 				o.releaseDetachedPortFence(sb.VswitchPort)
 				o.uncache(sid)
-				o.publishDelete(sid)
-				dead := cloneSandbox(sb)
-				dead.State, dead.LaunchMode = types.StateDead, ""
-				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
-				dead.RunDir, dead.BaseDir, dead.EnvdUDS, dead.CiUDS = "", "", "", ""
-				dead.ResumeSource = types.ResumeSource{}
-				o.observeSandboxUpsert(dead)
+				if dead, getErr := o.st.Get(ctx, sid); getErr == nil && dead != nil {
+					o.publishUpsert(dead)
+					o.observeSandboxUpsert(dead)
+				}
 				cancel()
 				return firstErr
 			}
@@ -806,9 +810,6 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 	if p.runDir == "" {
 		p.runDir = sb.RunDir
 	}
-	if p.baseDir == "" && attempt.Kind() == launchCreate {
-		p.baseDir = sb.BaseDir
-	}
 }
 
 func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, includeLocal bool) error {
@@ -912,7 +913,7 @@ func sameStartingLaunchIncarnation(attempt *launchAttempt, expected, current *ty
 	if attempt == nil || expected == nil || current == nil ||
 		current.ID != expected.ID || current.State != types.StateStarting ||
 		current.RunID != expectedRunID || current.LaunchMode != expected.LaunchMode ||
-		current.CreatedUnix != expected.CreatedUnix || current.Profile != expected.Profile ||
+		current.InstanceID != expected.InstanceID || current.CreatedUnix != expected.CreatedUnix || current.Profile != expected.Profile ||
 		current.StableIDValue != expected.StableIDValue || current.TemplateID != expected.TemplateID ||
 		current.RunDir != expected.RunDir || current.BaseDir != expected.BaseDir ||
 		current.EnvdUDS != expected.EnvdUDS || current.CiUDS != expected.CiUDS ||
@@ -1035,7 +1036,7 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 			cancel()
 			for {
 				cleanupCtx, cleanupCancel := cleanupContext()
-				cleanupErr := o.teardownPersistedOwnership(cleanupCtx, adopted, attempt.Kind() == launchCreate)
+				cleanupErr := o.teardownPersistedOwnership(cleanupCtx, adopted, false)
 				cleanupCancel()
 				if cleanupErr == nil {
 					break
@@ -1061,15 +1062,10 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 				o.log.Error("reload rolled-back sandbox failed", "sid", sb.ID, "err", getErr)
 			}
 			o.uncache(sb.ID)
-			o.publishDelete(sb.ID)
-			if dead == nil {
-				dead = cloneSandbox(sb)
-				dead.State = types.StateDead
-				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
-				dead.RunDir, dead.BaseDir, dead.EnvdUDS, dead.CiUDS = "", "", "", ""
-				dead.ResumeSource = types.ResumeSource{}
+			if dead != nil {
+				o.publishUpsert(dead)
+				o.observeSandboxUpsert(dead)
 			}
-			o.observeSandboxUpsert(dead)
 			unlock()
 			cancel()
 			return errors.Join(firstCleanupErr, firstStoreErr)
@@ -2518,6 +2514,8 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 	args := []string{
 		"run", "--sandbox-id", sb.ID,
 		"--enable-checkpoint",
+		"--retain-instance", sb.InstanceID,
+		"--run-id", sb.RunID,
 		"--path-id", sb.ID,
 		"--config", o.sandboxConfigPath(sb),
 		"--manifest-config", o.cfg.ManifestConfig,
@@ -2544,8 +2542,8 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 // --- reaper / reconcile ---
 
 // Reaper enforces active idle TTLs and bounded terminal-history retention:
-// idle past deadline -> auto-suspend, then owner-free dead/ready/error rows
-// past their configured diagnostic window -> exact durable delete.
+// idle past deadline -> auto-suspend; expired dead parents -> durable deleting;
+// owner-free ready/error Build history -> exact record deletion.
 func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -2591,7 +2589,7 @@ func (o *Orchestrator) queueMissingRunSessionChecks(ctx context.Context) error {
 		if sb.RunID == "" {
 			return nil
 		}
-		if sb.ExecutionResult != nil || !o.runSessionActive(runKindSandbox, sb.RunID) {
+		if sb.ExecutionResult != nil || sb.DeadRunID == sb.RunID || !o.runSessionActive(runKindSandbox, sb.RunID) {
 			runIDs = append(runIDs, sb.RunID)
 		}
 		return nil
@@ -2689,7 +2687,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		}
 		if sb.ExecutionResult != nil {
 			acceptedRunning = append(acceptedRunning, sb)
-		} else if sb.RunID != "" && alive[sb.RunID] {
+		} else if sb.RunID != "" && sb.DeadRunID != sb.RunID && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
 			o.observeSandboxUpsert(sb)
 			adopted = append(adopted, sb.ID)
@@ -2758,7 +2756,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			target = types.StateStarting
 		}
 		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target, "launch_mode", sb.LaunchMode)
-		if err := o.teardownPersistedOwnership(ctx, sb, !resume); err != nil {
+		if err := o.teardownPersistedOwnership(ctx, sb, false); err != nil {
 			return fmt.Errorf("reconcile: cleanup interrupted sandbox %s: %w", sb.ID, err)
 		}
 		if resume {
@@ -2858,7 +2856,7 @@ func (o *Orchestrator) recoverAcceptedStartingResult(ctx context.Context, observ
 		return nil
 	}
 	resume := current.ResumeSource.Valid()
-	if err := o.teardownPersistedOwnership(ctx, current, !resume); err != nil {
+	if err := o.teardownPersistedOwnership(ctx, current, false); err != nil {
 		return err
 	}
 	var changed bool

@@ -92,6 +92,41 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	}
 }
 
+func TestMasterRetainedTerminalRoutesReleasePrimaryCapacity(t *testing.T) {
+	table, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	view := NewMasterView(table, time.Second, nil)
+	apply := func(sid, state string) {
+		t.Helper()
+		if err := view.ApplyUpsert(routesync.RouteEntry{SandboxID: sid, State: state}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply("old", routesync.StateRunning)
+	before := table.RouteRev("old")
+	view.BeginSync()
+	apply("old", routesync.StateDead)
+	if _, found, rev := table.LookupRevision("old"); found || rev <= before {
+		t.Fatalf("dead route found=%v rev=%d, live revision=%d", found, rev, before)
+	}
+	for i := 0; i < 8; i++ {
+		apply(fmt.Sprintf("retained-%d", i), routesync.StateDeleting)
+	}
+	apply("new", routesync.StateStarting)
+	view.Bookmark()
+	if _, found := table.Lookup("new"); !found {
+		t.Fatal("full sync lost the new live route")
+	}
+	apply("new", routesync.StateDeleting)
+	apply("old", routesync.StatePaused)
+	if route, found := table.Lookup("old"); !found || route.State != routesync.StatePaused {
+		t.Fatal("Reset did not restore the paused route after terminal eviction")
+	}
+}
+
 func TestMasterViewApplyUpsertReturnsTableFailure(t *testing.T) {
 	table, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 1)
 	if err != nil {
@@ -163,7 +198,7 @@ func TestTableIdenticalUpsertKeepsLifecycleRevision(t *testing.T) {
 	}
 	defer tbl.Close()
 
-	route := routesync.RouteEntry{SandboxID: "duplicate-paused", State: routesync.StatePaused}
+	route := routesync.RouteEntry{SandboxID: "duplicate-paused", State: routesync.StatePaused, InstanceID: "retained-parent", AutoReset: true}
 	tbl.BeginSync()
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
@@ -192,7 +227,9 @@ func TestTableIdenticalUpsertKeepsLifecycleRevision(t *testing.T) {
 			found, got, tbl.Rev(), routeRev, globalRev)
 	}
 	tbl.Bookmark()
-	if got, found := tbl.Lookup(route.SandboxID); !found || got != route {
+	business := route
+	business.InstanceID, business.AutoReset = "", false
+	if got, found := tbl.Lookup(route.SandboxID); !found || got != business {
 		t.Fatalf("identical replay was swept at Bookmark: %+v found=%v", got, found)
 	}
 }

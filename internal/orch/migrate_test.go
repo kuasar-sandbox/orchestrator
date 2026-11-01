@@ -356,6 +356,7 @@ func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := migrationSandbox(t, dir, "logical-g0", mk, "manifest://"+strings.Repeat("b", 64))
+	source.AutoReset = true
 	source.StableIDValue = "logical"
 	source.Metadata = map[string]string{
 		"ordinary":               "preserved",
@@ -383,6 +384,9 @@ func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 	}
 	if got.StableID() != source.StableID() || got.ID == source.ID {
 		t.Fatal("explicit target changed the stable ID or retained the source node ID")
+	}
+	if !got.AutoReset {
+		t.Fatal("import lost the parent autoReset setting")
 	}
 	if got.Metadata["ordinary"] != "preserved" {
 		t.Fatal("standalone import lost ordinary metadata")

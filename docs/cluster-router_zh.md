@@ -515,3 +515,5 @@ route key 时可获得新生成的 key；缺少 route key 的拒绝应在需要�
 而数据失败时查头、target_port、DNS/TLS、Proxy 内部入口。身份不符立即停止。
 只 kill 测试所属实例；移除 provider 文件不是实例清理，也不会立即撤销已绑定行
 的凭据。共享模板/密钥应保留至保留策略允许删除。
+
+dead/deleting Sandbox 保留管理定位。按 ID 查询、Reset、checkpoint 导出/删除及父对象 Delete 使用节点 APIEndpoint 与既有归属校验，不提供业务 DataEndpoint。仍占用的 group/route_key 在父对象最终删除前拒绝 Create。节点与集群 Create 同样保留 autoReset（默认 false）；Reset 成功不启动 VM。

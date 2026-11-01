@@ -306,8 +306,19 @@ func (t *Table) Close() error {
 }
 
 func (t *Table) Capacity() int { return int(atomic.LoadUint32(&t.header.Capacity)) }
-func (t *Table) Rev() uint64   { return atomic.LoadUint64(&t.header.GlobalRev) }
-func (t *Table) Synced() bool  { return atomic.LoadUint32(&t.header.Synced) == 1 }
+
+// SnapshotSlots is sampled by the sole subscriber writer before full replay.
+func (t *Table) SnapshotSlots() ([]string, int) {
+	var ids []string
+	for i := range t.records {
+		if snapshot, ok := readRecordSnapshot(&t.records[i]); ok && snapshot.status == statusPresent {
+			ids = append(ids, snapshot.entry.SandboxID)
+		}
+	}
+	return ids, t.Capacity()
+}
+func (t *Table) Rev() uint64  { return atomic.LoadUint64(&t.header.GlobalRev) }
+func (t *Table) Synced() bool { return atomic.LoadUint32(&t.header.Synced) == 1 }
 
 // MMDSSynced is independent of the generic data-plane sync bit. The generic
 // table deliberately remains usable while route-sync reconnects, but MMDS must
@@ -408,6 +419,10 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	in.MMDSRoutes = ""
 	in.MMDSRouteSecretValues = nil
 	in.MaxInflightPatch = nil
+	// Parent identity and Reset policy belong to management projections. They
+	// are not part of the fixed business route or its activation revision.
+	in.InstanceID = ""
+	in.AutoReset = false
 	startHeaderWrite(&t.header.TableSeq)
 	defer finishHeaderWrite(&t.header.TableSeq)
 	idx, ok := t.findSlot(in.SandboxID, true)

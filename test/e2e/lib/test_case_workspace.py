@@ -143,7 +143,7 @@ class SplitExecuteWorkspace(unittest.TestCase):
             sandbox_result_json=json.dumps(dict(run_id=self.rid, sid=self.sid, stage='run')))
         kwargs = {'run_root': self.run_root} if 'run_root' in inspect.signature(self.helper.assert_dead).parameters else {}
         with mock.patch.object(self.helper, 'row', return_value=state), \
-             self.assertRaisesRegex(ValueError, 'retained an object directory'):
+             self.assertRaisesRegex(ValueError, 'retained a run directory'):
             self.helper.assert_dead(self.work, observed, **kwargs)
 
     def test_signal_revalidates_the_same_declared_runtime_root(self):

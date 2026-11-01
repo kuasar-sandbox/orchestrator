@@ -66,6 +66,7 @@ type RouteResolve struct {
 type SandboxReserveReq struct {
 	Config          map[string]string `json:"config,omitempty"`
 	AutoPauseMemory *bool             `json:"auto_pause_memory,omitempty"`
+	AutoReset       *bool             `json:"auto_reset,omitempty"`
 	Memory          *bool             `json:"memory,omitempty"`
 }
 
@@ -270,7 +271,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "create reserve cannot select resume memory", http.StatusBadRequest)
 		return
 	}
-	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil) {
+	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil || body.AutoReset != nil) {
 		http.Error(w, "connect reserve contains create fields", http.StatusBadRequest)
 		return
 	}
@@ -289,6 +290,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
 		Config:            body.Config,
 		AutoPauseMemory:   cloneOptionalBool(body.AutoPauseMemory),
+		AutoReset:         cloneOptionalBool(body.AutoReset),
 		Memory:            cloneOptionalBool(body.Memory),
 	})
 	if err != nil {
@@ -381,10 +383,14 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 			return nil, false, err
 		}
 	}
+	dataEndpoint := r.nodeDataEndpoint(ctx, rec.NodeID)
+	if rec.State == StateDead || rec.State == StateDeleting {
+		dataEndpoint = ""
+	}
 	return &RouteResolve{
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID), DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID),
+		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID), DataEndpoint: dataEndpoint,
 		Profile: rec.Profile, TemplateID: rec.TemplateID,
 		StableID: rec.StableID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
@@ -406,6 +412,8 @@ func routeLinkStatus(err error) int {
 		return rejected.status
 	}
 	switch {
+	case errors.Is(err, ErrReserveConflict):
+		return http.StatusConflict
 	case errors.Is(err, ErrReserveBadRequest), errors.Is(err, errInvalidSandboxConfig):
 		return http.StatusBadRequest
 	case errors.Is(err, ErrReserveUnauthorized):

@@ -340,6 +340,8 @@ func TestSourceOperationConductorProcess(t *testing.T) {
 		_, err = o.snapshotLocal(ctx, in.Sandbox, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox})
 	case "checkpoint-cleanup":
 		err = o.cleanupCheckpoint(ctx, in.Sandbox)
+	case "reset":
+		_, err = o.prepareCurrentDisks(ctx, in.Sandbox)
 	default:
 		t.Fatalf("unknown command %q", in.Command)
 	}
@@ -347,7 +349,7 @@ func TestSourceOperationConductorProcess(t *testing.T) {
 }
 
 func TestSourceOperationCommandsSurviveConductorSIGKILL(t *testing.T) {
-	for _, command := range []string{"publish", "snapshot", "export", "checkpoint-cleanup"} {
+	for _, command := range []string{"publish", "snapshot", "export", "checkpoint-cleanup", "reset"} {
 		t.Run(command, func(t *testing.T) {
 			f := localPausedCheckpoint(t, "source-orphan")
 			barrier := newSourceOperationCommandBarrier(t)

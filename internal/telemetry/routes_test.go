@@ -175,6 +175,22 @@ func TestScrapeScheduleReplacementDoesNotCompleteSuccessor(t *testing.T) {
 	}
 }
 
+func TestTerminalManagementRowsReleaseTelemetryCapacity(t *testing.T) {
+	v := NewView(1)
+	entry := upsert(t, v, testRoute("old"))
+	for _, state := range []string{routesync.StateDead, routesync.StateDeleting} {
+		terminal := testRoute("old")
+		terminal.State = state
+		if err := v.ApplyUpsert(terminal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if entry.ctx.Err() == nil {
+		t.Fatal("terminal route left the old scrape active")
+	}
+	upsert(t, v, testRoute("new"))
+}
+
 func TestViewScrapeEligibilityAndCapacity(t *testing.T) {
 	for _, change := range []func(*routesync.RouteEntry){func(r *routesync.RouteEntry) { r.Profile = "custom" }, func(r *routesync.RouteEntry) { r.State = routesync.StateStarting }, func(r *routesync.RouteEntry) { r.EnvdUDS = "" }, func(r *routesync.RouteEntry) { r.StableID = "" }} {
 		v := NewView(1)

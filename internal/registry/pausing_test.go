@@ -59,7 +59,7 @@ func TestReservePausingPreservesOwner(t *testing.T) {
 				if placementEntry {
 					// The initial Reserve read can become stale before the placement
 					// loop rereads the route; this entry must also preserve pausing.
-					err = reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true)
+					err = reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false)
 				} else {
 					var result *ReserveResult
 					result, err = reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))

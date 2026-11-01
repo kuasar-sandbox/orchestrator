@@ -78,6 +78,9 @@ func TestReapTerminalHistoryHonorsTTLAndPublishesDeletes(t *testing.T) {
 	if err := o.reapTerminalHistory(ctx, now); err != nil {
 		t.Fatal(err)
 	}
+	if err := o.DrainSandboxDeletes(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if got, err := o.st.Get(ctx, oldDead.ID); err != nil || got != nil || o.lookup(oldDead.ID) != nil {
 		t.Fatalf("old dead Sandbox retained: row=%+v cache=%+v err=%v", got, o.lookup(oldDead.ID), err)
 	}
@@ -93,6 +96,10 @@ func TestReapTerminalHistoryHonorsTTLAndPublishesDeletes(t *testing.T) {
 		t.Fatalf("fresh terminal Build removed: %+v, %v", got, err)
 	}
 
+	accepted := receiveCreateRouteEvent(t, routeEvents, routesync.TypeUpsert)
+	if accepted.Route.State != routesync.StateDeleting {
+		t.Fatalf("TTL admission=%+v", accepted)
+	}
 	select {
 	case event := <-routeEvents:
 		if event.Kind != routesync.TypeDelete || event.SID != oldDead.ID {

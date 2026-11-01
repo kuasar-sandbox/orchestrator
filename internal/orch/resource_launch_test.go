@@ -246,9 +246,5 @@ func assertAsyncFreshRestoreFailure(t *testing.T, o *Orchestrator, ctx context.C
 	if vs.attaches.Load() != 0 || lc.starts.Load() != 1 || lc.stops.Load() != 1 {
 		t.Fatalf("async restore cleanup: attaches=%d starts=%d stops=%d", vs.attaches.Load(), lc.starts.Load(), lc.stops.Load())
 	}
-	for _, dir := range []string{created.RunDir, created.BaseDir} {
-		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("async restore cleanup retained %s: %v", dir, err)
-		}
-	}
+	assertTerminatedDataRetained(t, created)
 }

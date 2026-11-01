@@ -590,11 +590,7 @@ func TestLaunchCleanupRetriesInOwnershipOrder(t *testing.T) {
 	if err := o.stepLaunchCleanup(context.Background(), attempt, sb, true); err != nil {
 		t.Fatalf("final cleanup: %v", err)
 	}
-	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
-		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("cleanup retained %s: %v", dir, err)
-		}
-	}
+	assertTerminatedDataRetained(t, sb)
 	if lc.stopCalls.Load() != 2 || lc.resetCalls.Load() != 2 || vs.detachCalls.Load() != 2 {
 		t.Fatalf("cleanup calls stop=%d reset=%d detach=%d, want two each",
 			lc.stopCalls.Load(), lc.resetCalls.Load(), vs.detachCalls.Load())

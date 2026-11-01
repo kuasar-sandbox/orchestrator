@@ -76,6 +76,9 @@ type SandboxView struct {
 	ResumeSandboxRef       string
 	ArtifactLocation       ArtifactLocation
 	AutoPauseMemory        bool
+	AutoReset              bool
+	DeadUnix               int64
+	AutoResetError         string
 	LaunchMode             LaunchMode
 	APISecretFingerprint   string
 	ManifestKeyFingerprint string
