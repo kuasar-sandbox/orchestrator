@@ -3,6 +3,9 @@
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/execute_env.sh"
 write_orchestrator_config unset controller
+# The initial serial template build needs 6 GiB of startup reservation. Admit
+# it on 12 GiB developer hosts; later controller scenarios use their defaults.
+sed -i '/^resource_listen:$/a\  watermarks: { startup_factor: 0.8 }' "$WORK/config.yaml"
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
