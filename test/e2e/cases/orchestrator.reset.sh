@@ -183,11 +183,13 @@ wait_sandbox_state "$SID" dead 1200 || fail "second termination"
 reset_manual
 resume_reset
 read_value current-after-A B
+checkpoint_wait_released "$SID" || fail "post-Reset Resume did not reconcile retained versions"
 # Export by the original ID after Reset and the new run's version collection.
 # This proves both the retained parent record and its historical disks survive.
 E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --checkpoint "$CP_A" \
     --to-template --json --socket "$WORK/node-ctl.socket" >"$WORK/export-A.json"
 HISTORY_TEMPLATE=$(json_field "$WORK/export-A.json" result)
+checkpoint_wait_released "$SID" || fail "historical Export did not reconcile retained versions"
 read_value current-after-history-export B
 assert_deleted
 TEMPLATE=$HISTORY_TEMPLATE
