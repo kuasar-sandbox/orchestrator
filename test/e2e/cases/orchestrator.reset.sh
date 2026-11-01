@@ -62,7 +62,11 @@ childargs = list(args)
 for i, arg in enumerate(childargs):
     if arg.startswith('--ready-fd='): childargs[i] = '--ready-fd='+str(writefd)
     elif arg == '--ready-fd': childargs[i+1] = str(writefd)
-child = subprocess.Popen([binary, *childargs], pass_fds=(writefd,))
+# Preserve the runner's validated cgroup directory while replacing only the
+# readiness pipe. Popen otherwise closes that inherited runtime prerequisite.
+cgroup = value('--cgroup-path')
+assert cgroup.startswith('fd='), cgroup
+child = subprocess.Popen([binary, *childargs], pass_fds=(writefd, int(cgroup[3:])))
 os.close(writefd)
 with os.fdopen(readfd,'rb') as events:
     assert events.readline()==b'control_ready\n'
