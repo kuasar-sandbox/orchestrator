@@ -627,6 +627,8 @@ RESERVED 行使旧 route 失去回滚锚点。sandbox 事件携带 NodeSandboxID
 SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
+Connect 或 ExecSession 在已有迁移路径上提交新节点 generation 时，清除源节点的实例 ID 和状态版本。新节点首次获授权的投影建立本地实例身份，原节点的迟到报告仍受 generation 约束。
+
 dead 与 deleting 保留受保护管理记录及精确节点归属。live update 和全量快照包含这些不可
 业务路由的状态、instance_id、状态版本与 auto_reset。节点接纳 Delete 发布 deleting，仅父记录
 最终硬删除才发布 Delete。重连、全量对账与节点目录 sweep 保留 group/route_key；Registry

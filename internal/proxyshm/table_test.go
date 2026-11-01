@@ -92,6 +92,41 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	}
 }
 
+func TestMasterRetainedTerminalRoutesReleasePrimaryCapacity(t *testing.T) {
+	table, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	view := NewMasterView(table, time.Second, nil)
+	apply := func(sid, state string) {
+		t.Helper()
+		if err := view.ApplyUpsert(routesync.RouteEntry{SandboxID: sid, State: state}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply("old", routesync.StateRunning)
+	before := table.RouteRev("old")
+	view.BeginSync()
+	apply("old", routesync.StateDead)
+	if _, found, rev := table.LookupRevision("old"); found || rev <= before {
+		t.Fatalf("dead route found=%v rev=%d, live revision=%d", found, rev, before)
+	}
+	for i := 0; i < 8; i++ {
+		apply(fmt.Sprintf("retained-%d", i), routesync.StateDeleting)
+	}
+	apply("new", routesync.StateStarting)
+	view.Bookmark()
+	if _, found := table.Lookup("new"); !found {
+		t.Fatal("full sync lost the new live route")
+	}
+	apply("new", routesync.StateDeleting)
+	apply("old", routesync.StatePaused)
+	if route, found := table.Lookup("old"); !found || route.State != routesync.StatePaused {
+		t.Fatal("Reset did not restore the paused route after terminal eviction")
+	}
+}
+
 func TestMasterViewApplyUpsertReturnsTableFailure(t *testing.T) {
 	table, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 1)
 	if err != nil {

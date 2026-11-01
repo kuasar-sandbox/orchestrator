@@ -2357,6 +2357,8 @@ paused E 转模板得到 `KindSbx`;paused S 得到 `KindSnp`。两者均可 publ
 build pipeline 的 Snapshot 输出仍是 `snp`,但 publication 同样调用 `sandbox-ctl publish`,不依赖
 单独的 Snapshot publication 命令。
 
+启用 `autoReset` 的父对象会在经过认证的 KMT V1 payload 中携带该字段，Import 恢复此设置。已有 token 未携带该字段，导入时取默认值 false。旧版严格解析器会拒绝携带新字段的 token。
+
 KMT V1 payload 直接携 `resumeSourceKind`、`resumeSourceRef`、`resumeSandboxRef` 和
 `autoPauseMemory`。Snapshot 必须在 `resumeSandboxRef` 中携带关联 E；E-only 的该字段必须
 为空。缺失字段、重复或未知 JSON 字段以及错误组合均被拒绝，包括缺少 E 的旧 Snapshot

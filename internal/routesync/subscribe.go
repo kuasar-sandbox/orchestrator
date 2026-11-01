@@ -49,12 +49,15 @@ type WakeSource interface {
 // (PUT /internal/plugin/{id}/register) with its caps, and keeps its Sink in sync over
 // a persistent, auto-reconnecting bidi h2c stream — forwarding Wakes up for route_wake.
 type Subscriber struct {
-	dial  func(ctx context.Context) (net.Conn, error)
-	id    string
-	reg   Register
-	sink  Sink
-	wakes WakeSource // nil if this subscriber issues no wakes
-	log   *slog.Logger
+	// SnapshotSlots supplies the existing business route IDs and fixed capacity
+	// when this consumer requests a full snapshot. Other sinks stream directly.
+	SnapshotSlots func() ([]string, int)
+	dial          func(ctx context.Context) (net.Conn, error)
+	id            string
+	reg           Register
+	sink          Sink
+	wakes         WakeSource // nil if this subscriber issues no wakes
+	log           *slog.Logger
 }
 
 // NewSubscriber builds a Subscriber. dial returns a fresh connection to the
@@ -137,6 +140,14 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 		sink.SetProxyCapabilities(hello.Hello.ProxyCapabilities)
 	}
 	s.sink.SetPolicy(hello.Hello.Policy)
+	if s.SnapshotSlots != nil && s.reg.ResumeFrom == "" {
+		ids, capacity := s.SnapshotSlots()
+		if len(ids) > 0 {
+			if err := s.reconcileSnapshot(sctx, resp.Body, up, ids, capacity); err != nil {
+				return err
+			}
+		}
+	}
 	for {
 		m, err := ReadMsg(resp.Body)
 		if err != nil {

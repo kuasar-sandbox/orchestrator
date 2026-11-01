@@ -122,6 +122,8 @@ func decodePayloadField(payload *MigrationTokenPayloadV1, field string, raw json
 		return decodeStrict(raw, &payload.DeadlineUnix)
 	case "autoPauseMemory":
 		return decodeStrict(raw, &payload.AutoPauseMemory)
+	case "autoReset":
+		return decodeStrict(raw, &payload.AutoReset)
 	case "serviceSecret":
 		return decodeStrict(raw, &payload.ServiceSecret)
 	case "envdAccessToken":

@@ -1910,6 +1910,8 @@ snp: manifest ref,or located .snapshot/.bundle
 
 Paused E promotes to sbx, S to snp; E is not rejected for lacking memory. Build Snapshot also yields snp, publishing through the same sandbox-ctl publish rather than a special Snapshot-only publisher.
 
+The authenticated KMT V1 payload carries optional `autoReset` when true. Import restores this policy. Existing tokens omit it and import with the default false. An older strict reader rejects tokens carrying the new field.
+
 KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Target expectations compare both S and E. Import performs no artifact access and atomically restores the complete pair, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
 
 Export admission completes outstanding paused cleanup before registering the

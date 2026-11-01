@@ -49,6 +49,10 @@ func (s *ObservingSink) ApplyUpsert(route routesync.RouteEntry) error {
 		return err
 	}
 	applied, found, revision := s.table.LookupRevision(route.SandboxID)
+	if !found && (route.State == routesync.StateDead || route.State == routesync.StateDeleting) {
+		s.routes.delete(route.SandboxID, revision)
+		return nil
+	}
 	if !found {
 		return fmt.Errorf("proxy extension: applied route %q missing from core table", route.SandboxID)
 	}

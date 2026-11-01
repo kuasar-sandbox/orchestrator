@@ -524,6 +524,8 @@ Node_link processes streams by event importance:
 
 Reserve's READY report is therefore not blocked by heartbeat persistence. A node-local `starting` upsert exposes launch identity only to the node proxy/MMDS. The node_link owner includes it in the seen set during full sync, but does not add a route_link business state or overwrite existing RESERVED/PAUSED. Later READY/PAUSED/Delete advances route_link. If a failed create candidate's Delete still matches the current in-flight RESERVED fence, Registry uses that fence to restore the pre-Reserve route, or deletes the reservation for a new create. It must not delete RESERVED first and destroy the old route's rollback anchor. Sandbox events carry NodeSandboxID, profile and node-owned execution state. The nodelink owner looks up `(node_id,NodeSandboxID)` in that node's ownership map to recover stable SandboxID, SandboxGeneration and group/route_key, then updates route_link. A READY arriving after park timeout finds no ownership entry, is classified as orphaned, and triggers cleanup of the orphan sandbox on the node.
 
+When Connect or ExecSession commits a new node generation during an existing migration, it clears the source instance ID and state version. The first authorized destination projection establishes the imported instance. The generation check fences late source reports.
+
 Dead and deleting retain protected management records and exact node ownership. Live updates and
 full snapshots include these non-routable states with instance_id, state version and auto_reset.
 Node Delete acceptance publishes deleting; final parent hard deletion alone publishes Delete.

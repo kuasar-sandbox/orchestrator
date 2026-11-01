@@ -313,6 +313,7 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 	ctx := context.Background()
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "sb-migrate", "gone", StatePaused)
+	original.InstanceID, original.StateVersion = "source-parent", 45
 	initialRevision, err := reg.stores.PutSandbox(ctx, original)
 	if err != nil {
 		t.Fatal(err)
@@ -389,6 +390,25 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 	if err != nil || !found || stored.State != StateReserved || stored.SandboxGeneration != 2 ||
 		stored.NextSandboxGeneration != 3 || stored.NodeSandboxID != n2.SID || !sameRouteCredentials(stored, original) {
 		t.Fatalf("migration route=%+v found=%v err=%v", stored, found, err)
+	}
+	checkMigratedParentProjection(t, reg, original, stored)
+}
+
+func checkMigratedParentProjection(t *testing.T, reg *Registry, original, target *SandboxRecord) {
+	t.Helper()
+	if target.InstanceID != "" || target.StateVersion != 0 {
+		t.Fatal("new placement retained the previous node's instance fence")
+	}
+	ctx := context.Background()
+	running := testRouteFromRecord(target, target.NodeSandboxID, routesync.StateRunning)
+	running.InstanceID, running.PressureVersion = "imported-parent", 1
+	reg.applyRoute(ctx, target.NodeID, &running)
+	late := testRouteFromRecord(original, original.NodeSandboxID, routesync.StateDead)
+	late.InstanceID, late.PressureVersion = original.InstanceID, original.StateVersion+1
+	reg.applyRoute(ctx, original.NodeID, &late)
+	stored, _, found, err := reg.stores.GetSandbox(ctx, target.Group, target.RouteKey)
+	if err != nil || !found || stored.State != StateReady || stored.InstanceID != running.InstanceID || stored.StateVersion != 1 {
+		t.Fatalf("destination projection state=%+v found=%v err=%v", stored, found, err)
 	}
 }
 

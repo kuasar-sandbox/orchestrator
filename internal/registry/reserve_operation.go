@@ -522,6 +522,8 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		generation := current.NextSandboxGeneration
 		target := *current
 		target.NodeID = placement.NodeID
+		target.InstanceID = ""
+		target.StateVersion = 0
 		target.NodeSandboxID = EncodeNodeSandboxID(target.SandboxID, generation)
 		target.SandboxGeneration = generation
 		target.NextSandboxGeneration = generation + 1
@@ -676,6 +678,8 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 		generation := current.NextSandboxGeneration
 		target := *current
 		target.NodeID = placement.NodeID
+		target.InstanceID = ""
+		target.StateVersion = 0
 		target.NodeSandboxID = EncodeNodeSandboxID(target.SandboxID, generation)
 		target.SandboxGeneration = generation
 		target.NextSandboxGeneration = generation + 1
