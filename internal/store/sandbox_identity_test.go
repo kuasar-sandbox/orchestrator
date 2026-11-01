@@ -174,7 +174,7 @@ func TestCASRunStateFencesStaleRunner(t *testing.T) {
 	pair := testKeyPair("5", "6")
 	sb := &types.Sandbox{
 		ID: "stable-g0", Profile: types.ProfileBare,
-		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StateRunning,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StatePausing,
 		RunID: "sandbox-current", APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
 	}
 	setTestSandboxServiceCredentials(sb)
@@ -182,10 +182,10 @@ func TestCASRunStateFencesStaleRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "sandbox-stale", source); err != nil || changed {
+	if changed, err := st.CommitPaused(ctx, sb.ID, "sandbox-stale", source, ""); err != nil || changed {
 		t.Fatalf("stale runner state change = %v, %v", changed, err)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, source); err != nil || !changed {
+	if changed, err := st.CommitPaused(ctx, sb.ID, sb.RunID, source, ""); err != nil || !changed {
 		t.Fatalf("current runner state change = %v, %v", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)

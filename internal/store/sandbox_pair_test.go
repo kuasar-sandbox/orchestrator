@@ -15,7 +15,7 @@ func TestSnapshotPairAtomicPauseReopenAndColdMemoryCAS(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	sb := sandboxInsertFixture("pair-owner", 0)
-	sb.State = types.StateRunning
+	sb.State = types.StatePausing
 	sb.LaunchMode = ""
 	sb.RunID = "producer"
 	sb.RunDir = ""
@@ -32,20 +32,20 @@ func TestSnapshotPairAtomicPauseReopenAndColdMemoryCAS(t *testing.T) {
 	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_pair BEFORE UPDATE OF resume_sandbox_ref ON sandboxes BEGIN SELECT RAISE(ABORT,'pair rollback'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, pair); err == nil || changed {
+	if changed, err := st.CommitPaused(ctx, sb.ID, sb.RunID, pair, ""); err == nil || changed {
 		t.Fatalf("failed transaction=%t %v", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
-	if err != nil || got.State != types.StateRunning || got.ResumeSource != sb.ResumeSource {
+	if err != nil || got.State != types.StatePausing || got.ResumeSource != sb.ResumeSource {
 		t.Fatalf("torn rollback=%+v %v", got, err)
 	}
 	if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_pair`); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "stale", pair); err != nil || changed {
+	if changed, err := st.CommitPaused(ctx, sb.ID, "stale", pair, ""); err != nil || changed {
 		t.Fatalf("stale capture=%t %v", changed, err)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, pair); err != nil || !changed {
+	if changed, err := st.CommitPaused(ctx, sb.ID, sb.RunID, pair, ""); err != nil || !changed {
 		t.Fatalf("commit=%t %v", changed, err)
 	}
 	var seq int
@@ -106,13 +106,13 @@ func TestSnapshotPairAtomicPauseReopenAndColdMemoryCAS(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got.State = types.StateRunning
+	got.State = types.StatePausing
 	got.RunID = "cold-capture"
 	if err := st.Put(ctx, got); err != nil {
 		t.Fatal(err)
 	}
 	e := types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("4", 64)}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, got.RunID, e); err != nil || !changed {
+	if changed, err := st.CommitPaused(ctx, sb.ID, got.RunID, e, ""); err != nil || !changed {
 		t.Fatalf("E capture=%t %v", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)

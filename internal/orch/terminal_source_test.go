@@ -298,7 +298,8 @@ func TestAcceptedResultDuringCaptureWinsPauseCommit(t *testing.T) {
 	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
 	paused := make(chan error, 1)
 	go func() {
-		paused <- f.o.Pause(context.Background(), f.sb.ID, f.apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox})
+		_, err := f.o.Pause(context.Background(), f.sb.ID, f.apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox})
+		paused <- err
 	}()
 	waitForCheckpointFile(t, started)
 	code := 17
@@ -309,7 +310,7 @@ func TestAcceptedResultDuringCaptureWinsPauseCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, err := f.o.st.Get(context.Background(), f.sb.ID)
-	if err != nil || current.State != types.StateRunning || current.ExecutionResult == nil {
+	if err != nil || current.State != types.StatePausing || current.ExecutionResult == nil {
 		t.Fatalf("capture hid accepted result: %+v, %v", current, err)
 	}
 	if err := os.WriteFile(release, nil, 0o600); err != nil {

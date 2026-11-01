@@ -83,6 +83,7 @@ type workerState struct {
 // cross-generation actions; stopping this instance never stops its replacement.
 type Instance struct {
 	mu                sync.Mutex
+	pauseSamples      map[string]map[int]controlMessage
 	identity          controlIdentity
 	status            InstanceStatus
 	workers           []workerState

@@ -75,7 +75,7 @@ func TestExportPausedCleanupPublishesOwnershipAndPressure(t *testing.T) {
 				}
 				return testPublicationReport(artifactSource.Kind, "manifest://"+strings.Repeat("d", 64)), nil
 			}
-			result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, true, true)
+			result, err := o.ExportSandbox(context.Background(), fixture.apiKey, sb.ID, true, true, "")
 			if outcome == "publication-failure" || outcome == "partial-cleanup" {
 				if !errors.Is(err, fault) || result.Result != "" {
 					t.Fatalf("failed export = %+v, %v", result, err)

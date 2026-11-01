@@ -127,7 +127,7 @@ func TestResourceStatsAuthenticatesAndCombinesNativeWithReservation(t *testing.T
 }
 
 func TestResourceStatsMissingRuntimeAndPaused(t *testing.T) {
-	for _, state := range []types.State{types.StateStarting, types.StateRunning, types.StatePaused} {
+	for _, state := range []types.State{types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused} {
 		t.Run(string(state), func(t *testing.T) {
 			o := testOrch(t)
 			sb := &types.Sandbox{ID: "resource-" + string(state), Profile: types.ProfileBare, State: state,

@@ -364,9 +364,9 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	}
 }
 
-func TestNodeLinkRejectsVersion7BeforeCommands(t *testing.T) {
-	if routesync.Version != 8 {
-		t.Fatalf("routesync.Version=%d, want 8", routesync.Version)
+func TestNodeLinkRejectsVersion8BeforeCommands(t *testing.T) {
+	if routesync.Version != 9 {
+		t.Fatalf("routesync.Version=%d, want 9", routesync.Version)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
@@ -376,7 +376,7 @@ func TestNodeLinkRejectsVersion7BeforeCommands(t *testing.T) {
 			return
 		}
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
-			Version: 7,
+			Version: 8,
 		}})
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: &routesync.Command{
 			CmdID: "must-not-run", Kind: routesync.CmdKeyPut,

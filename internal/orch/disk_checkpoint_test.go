@@ -191,6 +191,45 @@ func TestDiskCheckpointReleaseUnsupportedStopsWorker(t *testing.T) {
 	}
 }
 
+func TestDiskCheckpointReleasePreservesRetainedCaptureUntilConsumption(t *testing.T) {
+	f := newDiskCheckpointFixture(t, "retained-disk")
+	ctx := context.Background()
+	source := types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "file://retained.sandbox"}
+	if ok, err := f.o.st.SetPausing(ctx, f.sb.ID, f.sb.RunID, true); err != nil || !ok {
+		t.Fatalf("gate=%v %v", ok, err)
+	}
+	if ok, err := f.o.st.CommitPaused(ctx, f.sb.ID, f.sb.RunID, source, "retained"); err != nil || !ok {
+		t.Fatalf("retain=%v %v", ok, err)
+	}
+	if err := f.o.st.Put(ctx, f.sb); err != nil {
+		t.Fatal(err)
+	}
+	peer := serveDiskCheckpointPeer(t, f.sb)
+	retained := []ctl.DiffCheckpointRef{{DiffID: "root", ID: "retained"}, {DiffID: "data", ID: "retained"}}
+	ordinary := ctl.DiffCheckpointRef{DiffID: "root", ID: "ordinary"}
+	peer.setup(append(append([]ctl.DiffCheckpointRef{}, retained...), ordinary), false, false)
+	if err := f.o.releaseDiskCheckpointsOnce(ctx, f.sb.ID, &diskCheckpointSelection{}); err != nil {
+		t.Fatal(err)
+	}
+	peer.mu.Lock()
+	kept := append([]ctl.DiffCheckpointRef{}, peer.refs...)
+	peer.mu.Unlock()
+	if !reflect.DeepEqual(kept, retained) {
+		t.Fatalf("retained versions deleted: %+v", kept)
+	}
+	if ok, err := f.o.st.DeleteCheckpoint(ctx, f.sb.ID, "retained"); err != nil || !ok {
+		t.Fatalf("consume=%v %v", ok, err)
+	}
+	if err := f.o.releaseDiskCheckpointsOnce(ctx, f.sb.ID, &diskCheckpointSelection{}); err != nil {
+		t.Fatal(err)
+	}
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if len(peer.refs) != 0 {
+		t.Fatalf("consumed capture remains: %+v", peer.refs)
+	}
+}
+
 func TestDiskCheckpointReleaseUnsupportedPreservesConcurrentTrigger(t *testing.T) {
 	f := newDiskCheckpointFixture(t, "disk-unsupported-trigger")
 	p := serveDiskCheckpointPeer(t, f.sb)
@@ -294,7 +333,7 @@ func TestDiskCheckpointReleaseBothCompletionOrders(t *testing.T) {
 			release := holdTerminalSource(t, f.o, f.sb)
 			_, cancelUpload := context.WithCancelCause(context.Background())
 			defer cancelUpload(nil)
-			attempt, ok := f.o.exports.Begin(f.sb.ID, f.sb.ResumeSource, true, cancelUpload)
+			attempt, ok := f.o.exports.Begin(f.sb.ID, f.sb.ResumeSource, true, "", cancelUpload)
 			if !ok {
 				t.Fatal("export admission")
 			}

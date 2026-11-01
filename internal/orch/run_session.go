@@ -309,6 +309,8 @@ func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID
 	switch sb.State {
 	case types.StateStarting:
 		return o.checkDisconnectedStartingSandbox(checkCtx, sb)
+	case types.StatePausing:
+		return o.finalizeMissingRunningSandboxOnce(checkCtx, sb)
 	case types.StateRunning:
 		return o.checkDisconnectedRunningSandbox(checkCtx, sb)
 	case types.StatePaused:

@@ -25,7 +25,10 @@ func TestResourcePauseAdoptionPreservesSourceAndCleanup(t *testing.T) {
 	if !intent.ResourceObligation || intent.PauseReason != types.PauseReasonResource {
 		t.Fatal("intent was not durable")
 	}
-	if ok, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, sb.ResumeSource); err != nil || !ok {
+	if ok, err := st.SetPausing(ctx, sb.ID, sb.RunID, true); err != nil || !ok {
+		t.Fatalf("gate: %v %v", ok, err)
+	}
+	if ok, err := st.CommitPaused(ctx, sb.ID, sb.RunID, sb.ResumeSource, ""); err != nil || !ok {
 		t.Fatalf("capture: %v %v", ok, err)
 	}
 	if ok, err := st.CancelResourcePause(ctx, intent); err != nil || ok {

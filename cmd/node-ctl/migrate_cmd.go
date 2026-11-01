@@ -4,17 +4,19 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
-	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // exportSandboxCmd implements `node-ctl export-sandbox <sid>` as a client of
 // the running serve daemon's api plane (POST /sandboxes/{id}/export over the local
-// control socket). With --to-template it publishes the paused sandbox's snapshot as
+// control socket). --checkpoint selects a retained capture in any runtime state.
+// With --to-template it publishes the selected sandbox capture as
 // a portable ref and prints the reusable template id (usable via `e2b sandbox
 // create`). Otherwise it prints a one-line opaque kmt1 migration token for
 // `import-sandbox` on another node (the import reuses the source node-local id by
@@ -23,6 +25,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	sid, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("export-sandbox", flag.ContinueOnError)
 	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
+	checkpointID := fs.String("checkpoint", "", "export this retained checkpoint and consume it after success")
 	toTemplate := fs.Bool("to-template", false, "publish + print a reusable snapshot template id instead of a migration token")
 	asJSON := fs.Bool("json", false, "print the complete export result and publication references")
 	keepSource := fs.Bool("keep-source", false, "retain the paused source after successful export finalization (default: delete it)")
@@ -34,7 +37,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 		sid = fs.Arg(0)
 	}
 	if sid == "" {
-		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]")
+		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--checkpoint ID] [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]")
 	}
 	if *requestTimeout <= 0 {
 		return fmt.Errorf("export-sandbox: --timeout must be positive")
@@ -44,6 +47,9 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 		return fmt.Errorf("export-sandbox: E2B_API_KEY is required")
 	}
 	body := map[string]any{"toTemplate": *toTemplate, "keepSource": *keepSource}
+	if *checkpointID != "" {
+		body["checkpointID"] = *checkpointID
+	}
 	// Publishing a local Checkpoint materializes its fixed disk view and may
 	// legitimately exceed the short administrative request timeout.
 	code, resp, err := udsDoWithTimeout(resolveSocket(*socket), http.MethodPost,

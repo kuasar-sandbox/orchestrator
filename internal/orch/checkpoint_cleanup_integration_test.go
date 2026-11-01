@@ -165,7 +165,7 @@ func TestCheckpointCleanupCLICommitAndRetry(t *testing.T) {
 						}
 						result.err = ctl.WriteMessage(conn, &result.response)
 					}()
-					pauseErr := f.o.Pause(ctx, f.sb.ID, f.apiKey, sandboxcfg.CaptureRequest{Kind: kind})
+					_, pauseErr := f.o.Pause(ctx, f.sb.ID, f.apiKey, sandboxcfg.CaptureRequest{Kind: kind})
 					produced := <-done
 					if produced.err != nil {
 						t.Fatal(produced.err)

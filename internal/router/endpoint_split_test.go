@@ -23,6 +23,9 @@ func TestSandboxControlUsesOnlyAPIEndpoint(t *testing.T) {
 	var apiHits, dataHits atomic.Int32
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiHits.Add(1)
+		if r.Method == http.MethodDelete && r.URL.Path != "/sandboxes/sb-1-g0/checkpoints/capture-1" {
+			t.Errorf("checkpoint delete path=%s", r.URL.Path)
+		}
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{"sandboxID": "sb-1-g0"})
@@ -51,6 +54,7 @@ func TestSandboxControlUsesOnlyAPIEndpoint(t *testing.T) {
 		{method: http.MethodGet, path: "/sandboxes/sb-1"},
 		{method: http.MethodPost, path: "/sandboxes/sb-1/pause"},
 		{method: http.MethodPost, path: "/sandboxes/sb-1/timeout"},
+		{method: http.MethodDelete, path: "/sandboxes/sb-1/checkpoints/capture-1"},
 	}
 	for _, test := range requests {
 		req, _ := http.NewRequest(test.method, front.URL+test.path, nil)

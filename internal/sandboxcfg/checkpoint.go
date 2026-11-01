@@ -18,12 +18,15 @@ type SnapshotPolicy struct {
 }
 
 type CaptureRequest struct {
+	Checkpoint     bool
+	IfIdle         bool
 	Kind           types.CaptureKind
 	SnapshotPolicy SnapshotPolicy
 }
 
 type CaptureResult struct {
-	Source types.ResumeSource
+	CheckpointID string
+	Source       types.ResumeSource
 }
 
 // Empty reports whether neither checkpoint field is specified.

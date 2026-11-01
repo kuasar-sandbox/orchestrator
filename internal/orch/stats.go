@@ -48,7 +48,7 @@ func (o *Orchestrator) ResourceStats(ctx context.Context, id, apiKey string) (*a
 }
 
 func (o *Orchestrator) readResourceStats(ctx context.Context, sb *types.Sandbox) (*api.ResourceStats, error) {
-	if sb.State != types.StateStarting && sb.State != types.StateRunning {
+	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePausing {
 		return nil, api.ErrStatsConflict
 	}
 	if sb.RunDir == "" {

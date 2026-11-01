@@ -210,6 +210,10 @@ func decodeBuildRequest(r io.Reader, out any) error {
 // ErrAlreadyPaused is returned by Core.Pause when the sandbox is already paused.
 var ErrAlreadyPaused = errors.New("already paused")
 
+var ErrSandboxBusy = errors.New("sandbox is not idle")
+
+var ErrCheckpointLimit = errors.New("max_checkpoints=1 reached; export or delete the retained checkpoint first")
+
 // ErrSandboxStarting is returned when an operation such as Pause cannot run
 // until the accepted asynchronous launch reaches a terminal state.
 var ErrSandboxStarting = errors.New("sandbox starting")
@@ -335,6 +339,7 @@ type BuildLogEntry struct {
 
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
+	MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
 	TemplateID      string            `json:"templateID"`
 	TimeoutSec      int               `json:"timeout"`
 	Metadata        map[string]string `json:"metadata"`
@@ -348,6 +353,8 @@ type CreateReq struct {
 // PauseRequest carries the E2B capture selector and action-scoped Snapshot-only
 // policy. A nil Memory value has the E2B default true.
 type PauseRequest struct {
+	Checkpoint           bool  `json:"checkpoint,omitempty"`
+	IfIdle               bool  `json:"ifIdle,omitempty"`
 	Memory               *bool `json:"memory,omitempty"`
 	CheckpointMergeRef   *bool `json:"checkpoint_merge_ref,omitempty"`
 	CheckpointDropCaches *bool `json:"checkpoint_drop_caches,omitempty"`
@@ -375,7 +382,7 @@ type Core interface {
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
 	Connect(ctx context.Context, id, apiKey, migrationToken string, options ConnectOptions) (*types.Sandbox, error)
 	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error)
-	Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
+	Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) (string, error) // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
 	TrafficStats(ctx context.Context, id, apiKey string) (*TrafficStats, error)
@@ -405,7 +412,10 @@ type Core interface {
 	// (toTemplate) or an opaque kmt1 migration token; keepSource independently
 	// controls source finalization. A move succeeds once deletion is durably
 	// accepted; physical cleanup may finish after the response.
-	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error)
+	// A checkpoint ID selects a retained capture independently of runtime state;
+	// successful export consumes that capture and leaves the parent intact.
+	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool, checkpointID string) (types.ExportResult, error)
+	DeleteCheckpoint(ctx context.Context, apiKey, sid, checkpointID string) error
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
 }
 
@@ -483,6 +493,7 @@ func (a *API) Handler() http.Handler {
 	// so it scopes to the caller's own sandboxes). Reached over both the TLS api
 	// listener and the local control socket's api plane.
 	mux.HandleFunc("POST /sandboxes/{id}/export", a.auth(a.exportSandbox))
+	mux.HandleFunc("DELETE /sandboxes/{id}/checkpoints/{checkpointID}", a.auth(a.deleteCheckpoint))
 	mux.HandleFunc("POST /sandboxes/import", a.auth(a.importSandbox))
 	return mux
 }
@@ -794,10 +805,14 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "snapshot-only checkpoint options require memory=true")
 		return
 	}
-	err = a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), sandboxcfg.CaptureRequest{
-		Kind: kind, SnapshotPolicy: override,
+	checkpointID, err := a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), sandboxcfg.CaptureRequest{
+		Kind: kind, SnapshotPolicy: override, Checkpoint: req.Checkpoint, IfIdle: req.IfIdle,
 	})
 	switch {
+	case errors.Is(err, ErrSandboxBusy):
+		writeErr(w, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrCheckpointLimit):
+		writeErr(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrAlreadyPaused):
 		w.WriteHeader(409)
 	case errors.Is(err, ErrSandboxStarting):
@@ -805,6 +820,10 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		a.fail(w, err)
 	default:
+		if checkpointID != "" {
+			writeJSON(w, http.StatusOK, map[string]string{"checkpointID": checkpointID})
+			return
+		}
 		w.WriteHeader(204)
 	}
 }
@@ -1225,16 +1244,28 @@ const (
 
 func (a *API) exportSandbox(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ToTemplate bool `json:"toTemplate"`
-		KeepSource bool `json:"keepSource"`
+		ToTemplate   bool   `json:"toTemplate"`
+		KeepSource   bool   `json:"keepSource"`
+		CheckpointID string `json:"checkpointID,omitempty"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	out, err := a.core.ExportSandbox(r.Context(), apiKeyFrom(r.Context()), r.PathValue("id"), body.ToTemplate, body.KeepSource)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
+	out, err := a.core.ExportSandbox(r.Context(), apiKeyFrom(r.Context()), r.PathValue("id"), body.ToTemplate, body.KeepSource, body.CheckpointID)
 	if err != nil {
 		a.failMigrate(w, err)
 		return
 	}
 	writeJSON(w, 200, out)
+}
+
+func (a *API) deleteCheckpoint(w http.ResponseWriter, r *http.Request) {
+	if err := a.core.DeleteCheckpoint(r.Context(), apiKeyFrom(r.Context()), r.PathValue("id"), r.PathValue("checkpointID")); err != nil {
+		a.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {

@@ -17,6 +17,10 @@ import (
 )
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
+	if req.MaxCheckpoints != 0 && req.MaxCheckpoints != 1 {
+		return nil, fmt.Errorf("%w: max_checkpoints must be 1", api.ErrBadRequest)
+	}
+
 	admissionStarted := time.Now()
 	if req.TimeoutSec <= 0 {
 		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec

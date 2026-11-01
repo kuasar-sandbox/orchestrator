@@ -123,7 +123,7 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 	}
 	out := []ListItem{}
 	if err := r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
-		if s.State == StateReady || s.State == StatePaused {
+		if s.State == StateReady || s.State == StatePausing || s.State == StatePaused {
 			out = append(out, ListItem{SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
 		}
 		return nil
@@ -376,7 +376,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	if rec.SandboxID != sid {
 		return nil, false, nil
 	}
-	if rec.State == StateReady || rec.State == StatePaused || hasRouteCredentials(rec) {
+	if rec.State == StateReady || rec.State == StatePausing || rec.State == StatePaused || hasRouteCredentials(rec) {
 		if _, _, err := replacementCredentials(rec); err != nil {
 			return nil, false, err
 		}

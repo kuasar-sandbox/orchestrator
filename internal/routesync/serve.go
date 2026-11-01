@@ -67,6 +67,7 @@ type StreamHooks struct {
 	// callback is therefore buffered behind the snapshot rather than lost.
 	RouteStreamReady func()
 	RouteBarrierAck  func(barrierID string)
+	PauseAck         func(barrierID string, ack PauseAck)
 }
 
 // ReadRegister reads the subscriber's first up-frame (its Register caps). The
@@ -99,6 +100,8 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 			// A wake's resume can be slow; handle it off the read loop
 			// (single-flight in the source dedupes duplicate sids).
 			go src.OnWake(uctx, m.SID)
+		case m.Type == TypePauseAck && m.BarrierID != "" && m.PauseAck != nil && hooks != nil && hooks.PauseAck != nil:
+			hooks.PauseAck(m.BarrierID, *m.PauseAck)
 		case m.Type == TypeRouteBarrierAck && m.BarrierID != "" && hooks != nil && hooks.RouteBarrierAck != nil:
 			hooks.RouteBarrierAck(m.BarrierID)
 		}
@@ -377,6 +380,10 @@ func writeEvent(w io.Writer, ev Event, includeMMDS bool) error {
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID
+	case TypePauseBarrier:
+		r := ev.Route
+		projectMMDSRoute(&r, includeMMDS)
+		m.Route, m.BarrierID = &r, ev.BarrierID
 	case TypeRouteBarrier:
 		if ev.BarrierID == "" {
 			return errors.New("routesync: empty route barrier id")

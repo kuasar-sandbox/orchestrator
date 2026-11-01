@@ -108,7 +108,10 @@ type Orchestrator struct {
 	subSeq int
 	// routeBarriers is wired before any API or node-link listener starts. It is
 	// consulted for every fresh Create admission and standalone Connect response.
-	routeBarriers routesync.RouteBarrierCoordinator
+	routeBarriers  routesync.RouteBarrierCoordinator
+	pauseBarriers  routesync.PauseBarrierCoordinator
+	pauseMu        sync.RWMutex
+	pausePreparing map[string]*types.Sandbox
 
 	routeLogMu sync.Mutex
 	routeFP    string
@@ -216,6 +219,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, files *filestore.Store, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
+		pauseBarriers:        configsock.NewRegistry(),
 		sandboxReadyTimeout:  0,
 		reg:                  map[string]*types.Sandbox{},
 		lifecycleCtx:         context.Background(),
@@ -268,6 +272,9 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 // registry into Create and standalone Connect. Wiring is immutable after serve starts.
 func (o *Orchestrator) SetProxyRouteBarrierCoordinator(c routesync.RouteBarrierCoordinator) {
 	o.routeBarriers = c
+	if pause, ok := c.(routesync.PauseBarrierCoordinator); ok {
+		o.pauseBarriers = pause
+	}
 }
 
 // SetResourceControllerSocketIdentity wires the canonical controller/lease
@@ -1211,135 +1218,162 @@ func (o *Orchestrator) killSandboxLocked(ctx context.Context, sb *types.Sandbox)
 	return o.acceptSandboxDeleteLocked(ctx, sb)
 }
 
-func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
+func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) (string, error) {
 	if err := validateCaptureRequest(request); err != nil {
-		return err
+		return "", err
+	}
+	if request.Checkpoint {
+		unlock := o.lifecycle.Lock(id)
+		sb, err := o.st.Get(ctx, id)
+		if err == nil && !ownsSandbox(sb, apiKey) {
+			err = api.ErrNotFound
+		}
+		if err == nil {
+			checkpoint, getErr := o.st.Checkpoint(ctx, id)
+			err = getErr
+			if checkpoint != nil {
+				err = api.ErrCheckpointLimit
+			}
+		}
+		unlock()
+		if err != nil {
+			return "", err
+		}
 	}
 	if o.extensionSandboxHook != nil {
 		return o.pauseWithExtension(ctx, id, apiKey, request)
 	}
 	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer unlock()
 
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !ownsSandbox(sb, apiKey) {
-		return api.ErrNotFound
+		return "", api.ErrNotFound
 	}
 	switch sb.State {
 	case types.StateStarting:
-		return api.ErrSandboxStarting
+		return "", api.ErrSandboxStarting
 	case types.StatePaused:
-		return o.adoptResourcePauseLocked(ctx, sb, request)
+		if request.Checkpoint {
+			return "", api.ErrAlreadyPaused
+		}
+		return "", o.adoptResourcePauseLocked(ctx, sb, request)
 	case types.StateRunning:
 	default:
-		return api.ErrNotFound
+		return "", api.ErrNotFound
 	}
 	if request.Kind == types.CaptureSnapshot {
 		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(sb.Metadata, request.SnapshotPolicy)
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	return o.pauseSandboxLocked(ctx, sb, request)
 }
 
-func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
+func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) (string, error) {
 	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	sandbox, err := o.st.Get(ctx, id)
 	if err != nil {
 		unlock()
-		return err
+		return "", err
 	}
 	if !ownsSandbox(sandbox, apiKey) {
 		unlock()
-		return api.ErrNotFound
+		return "", api.ErrNotFound
 	}
 	switch sandbox.State {
 	case types.StateStarting:
 		unlock()
-		return api.ErrSandboxStarting
+		return "", api.ErrSandboxStarting
 	case types.StatePaused:
+		if request.Checkpoint {
+			unlock()
+			return "", api.ErrAlreadyPaused
+		}
 		if !sandbox.ResourceObligation || sandbox.PauseReason != types.PauseReasonResource {
 			unlock()
-			return api.ErrAlreadyPaused
+			return "", api.ErrAlreadyPaused
 		}
 	case types.StateRunning:
 	default:
 		unlock()
-		return api.ErrNotFound
+		return "", api.ErrNotFound
 	}
 	if sandbox.State != types.StatePaused && request.Kind == types.CaptureSnapshot {
 		if _, err := o.resolveSnapshotPolicy(sandbox.Metadata, request.SnapshotPolicy); err != nil {
 			unlock()
-			return err
+			return "", err
 		}
 	}
 	precondition := sandboxPrecondition(sandbox)
 	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Pause = &conductorextension.SandboxPauseRequest{
-		CaptureKind:        conductorextension.CaptureKind(request.Kind),
+		CaptureKind: conductorextension.CaptureKind(request.Kind),
+		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle,
 		CheckpointMergeRef: cloneBool(request.SnapshotPolicy.MergeRef), CheckpointDropCaches: cloneBool(request.SnapshotPolicy.DropCaches),
 	}
 	operationID := operation.ID
 	unlock()
 
 	if err := o.callSandboxHook(ctx, operation); err != nil {
-		return err
+		return "", err
 	}
 	if err := validateSandboxOperationEnvelope(operation, operationID, conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id); err != nil {
-		return err
+		return "", err
 	}
 	candidate := cloneSandboxPauseRequest(operation.Pause)
 	if candidate == nil {
-		return fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
+		return "", fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
 	}
-	if types.CaptureKind(candidate.CaptureKind) != request.Kind {
-		return fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
+	if types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle {
+		return "", fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
 	ctx, unlock, err = o.lockLifecycleMutation(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer unlock()
 	current, err := o.st.Get(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !ownsSandbox(current, apiKey) {
-		return api.ErrNotFound
+		return "", api.ErrNotFound
 	}
 	if !sandboxPreconditionMatches(precondition, current) {
-		return api.ErrSandboxChanged
+		return "", api.ErrSandboxChanged
 	}
 	finalRequest := sandboxcfg.CaptureRequest{
-		Kind: types.CaptureKind(candidate.CaptureKind),
+		Kind:       types.CaptureKind(candidate.CaptureKind),
+		Checkpoint: candidate.Checkpoint, IfIdle: candidate.IfIdle,
 		SnapshotPolicy: sandboxcfg.SnapshotPolicy{
 			MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
 		},
 	}
 	if err := validateCaptureRequest(finalRequest); err != nil {
-		return err
+		return "", err
 	}
 	if current.State == types.StatePaused {
 		if request.Kind != types.CaptureSnapshot || !request.SnapshotPolicy.Empty() {
-			return fmt.Errorf("%w: explicit capture options require a new capture", api.ErrBadRequest)
+			return "", fmt.Errorf("%w: explicit capture options require a new capture", api.ErrBadRequest)
 		}
-		return o.adoptResourcePauseLocked(ctx, current, finalRequest)
+		return "", o.adoptResourcePauseLocked(ctx, current, finalRequest)
 	}
 	if finalRequest.Kind == types.CaptureSnapshot {
 		finalRequest.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, finalRequest.SnapshotPolicy)
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	return o.pauseSandboxLocked(ctx, current, finalRequest)
@@ -1378,7 +1412,8 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 			return err
 		}
 	}
-	return o.pauseSandboxLocked(ctx, current, request)
+	_, err = o.pauseSandboxLocked(ctx, current, request)
+	return err
 }
 
 func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
@@ -1391,24 +1426,33 @@ func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
 	return nil
 }
 
-func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) error {
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (string, error) {
 	if sb.State == types.StatePaused {
-		return api.ErrAlreadyPaused
+		return "", api.ErrAlreadyPaused
 	}
 	if sb.State == types.StateStarting {
-		return api.ErrSandboxStarting
+		return "", api.ErrSandboxStarting
 	}
 	if sb.State != types.StateRunning {
-		return api.ErrNotFound
+		return "", api.ErrNotFound
+	}
+	if request.Checkpoint {
+		retained, err := o.st.Checkpoint(ctx, sb.ID)
+		if err != nil {
+			return "", err
+		}
+		if retained != nil {
+			return "", api.ErrCheckpointLimit
+		}
 	}
 	ctx, release, err := o.trySourceOperation(ctx, sb)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer release()
 	opCtx, finish, err := o.beginPauseOperation(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer finish()
 	o.log.Info("pause capture resolved",
@@ -1417,16 +1461,20 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		"mode", o.cfg.Checkpoint.Mode,
 		"merge_ref", checkpointPolicyValue(request.SnapshotPolicy.MergeRef),
 		"drop_caches", checkpointPolicyValue(request.SnapshotPolicy.DropCaches))
+	if err := o.preparePause(opCtx, sb, request.IfIdle); err != nil {
+		return "", err
+	}
 	result, err := o.capture(opCtx, sb, request)
 	if err != nil {
-		return err
+		o.rollbackPause(opCtx, sb)
+		return "", err
 	}
-	changed, err := o.st.CommitRunningPaused(opCtx, sb.ID, sb.RunID, result.Source)
+	changed, err := o.st.CommitPaused(opCtx, sb.ID, sb.RunID, result.Source, result.CheckpointID)
 	if err != nil {
-		return fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
+		return "", fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
 	}
 	if !changed {
-		return fmt.Errorf("orch: commit pause %s: running sandbox is no longer owned by runner %s", sb.ID, sb.RunID)
+		return "", fmt.Errorf("orch: commit pause %s: running sandbox is no longer owned by runner %s", sb.ID, sb.RunID)
 	}
 	paused := cloneSandbox(sb)
 	paused.ResumeSource = result.Source
@@ -1450,7 +1498,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
 	o.observeSandboxUpsert(paused)
-	return nil
+	return result.CheckpointID, nil
 }
 
 // cleanupPausedOwnership releases ownership in the canonical dependency order.
@@ -1861,7 +1909,7 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			}
 			return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, request, origin, validate, prepare)
 		}
-		// A crash or partial cleanup after CommitRunningPaused may leave exact
+		// A crash or partial cleanup after CommitPaused may leave exact
 		// runner/network/RunDir ownership on the durable paused row. Reconcile it
 		// before BeginResume restores paths and acquires a new runtime owner.
 		beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
@@ -2045,7 +2093,7 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		return false, nil
 	}
 	switch sb.State {
-	case types.StateStarting, types.StateRunning, types.StatePaused:
+	case types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused:
 	default:
 		return false, nil
 	}
@@ -2548,7 +2596,7 @@ func (o *Orchestrator) queueMissingRunSessionChecks(ctx context.Context) error {
 		}
 		return nil
 	}
-	for _, state := range []types.State{types.StateStarting, types.StateRunning, types.StatePaused, types.StateDeleting} {
+	for _, state := range []types.State{types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused, types.StateDeleting} {
 		if err := o.st.RangeByState(ctx, state, collect); err != nil {
 			return err
 		}
@@ -2609,6 +2657,15 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			knownRuns[sb.RunID] = true
 		}
 		paused = append(paused, sb)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := o.st.RangeByState(ctx, types.StatePausing, func(sb *types.Sandbox) error {
+		if sb.RunID != "" {
+			knownRuns[sb.RunID] = true
+		}
+		dead = append(dead, sb)
 		return nil
 	}); err != nil {
 		return err
@@ -3041,11 +3098,18 @@ func (o *Orchestrator) capture(ctx context.Context, sb *types.Sandbox, request s
 	if err := validateCaptureRequest(request); err != nil {
 		return sandboxcfg.CaptureResult{}, err
 	}
-	source, err := o.snapshotLocal(ctx, sb, request)
+	var checkpointID string
+	source, err := o.snapshotLocalWithCheckpointID(ctx, sb, request, func() (uuid.UUID, error) {
+		id, err := uuid.NewV7()
+		if err == nil && request.Checkpoint {
+			checkpointID = id.String()
+		}
+		return id, err
+	})
 	if err != nil {
 		return sandboxcfg.CaptureResult{}, err
 	}
-	return sandboxcfg.CaptureResult{Source: source}, nil
+	return sandboxcfg.CaptureResult{Source: source, CheckpointID: checkpointID}, nil
 }
 
 func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (types.ResumeSource, error) {

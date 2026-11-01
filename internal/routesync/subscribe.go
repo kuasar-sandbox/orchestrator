@@ -204,6 +204,21 @@ func (s *Subscriber) apply(ctx context.Context, m *Msg, up chan<- *Msg) error {
 		s.sink.ApplyDelete(m.SID)
 	case TypeBookmark:
 		s.sink.Bookmark()
+	case TypePauseBarrier:
+		if m.BarrierID == "" || m.Route == nil || m.Route.State != StatePausing {
+			return fmt.Errorf("routesync: invalid pause barrier")
+		}
+		if !s.reg.handlesWake() || s.reg.Proxy == nil {
+			return nil
+		}
+		sink, ok := s.sink.(PauseSink)
+		if !ok {
+			return fmt.Errorf("routesync: proxy cannot handshake pause")
+		}
+		ack := sink.PreparePause(ctx, m.BarrierID, *m.Route)
+		if !enqueueUp(ctx, up, &Msg{Type: TypePauseAck, BarrierID: m.BarrierID, PauseAck: &ack}) {
+			return ctx.Err()
+		}
 	case TypeRouteBarrier:
 		if m.BarrierID == "" {
 			return fmt.Errorf("routesync: empty route barrier id")

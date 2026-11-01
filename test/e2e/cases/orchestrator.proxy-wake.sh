@@ -497,7 +497,7 @@ with (work / "pressure-policy.log").open("w") as output:
         assert p["reserved_memory"] <= p["pool_memory"], p
         with sqlite3.connect((work / "lib/node-ctl.db").resolve().as_uri()+"?mode=ro", uri=True, timeout=2) as db:
             rows = {r[0]: r[1:] for r in db.execute("select id,state,run_id,running_since_ns from sandboxes where id in (?,?)", (first,second))}
-        assert len(rows)==2 and all(r[0] in ("running","paused","starting") for r in rows.values()), rows
+        assert len(rows)==2 and all(r[0] in ("running","pausing","paused","starting") for r in rows.values()), rows
         output.write(json.dumps(dict(at=time.time(), pressure=p, lifecycle=rows))+"\n"); output.flush()
         by_sid = {r["sandbox_id"]: r for r in p["sandboxes"]}
         ready = (rows[second][0]=="running" and rows[first][0] in ("paused","starting")

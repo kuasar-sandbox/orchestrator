@@ -33,6 +33,7 @@ const (
 	StateReserved SandboxState = "reserved"
 	StateReady    SandboxState = "ready"
 	StatePaused   SandboxState = "paused"
+	StatePausing  SandboxState = "pausing"
 )
 
 // NodeRecord is the registry-facing node_link view.

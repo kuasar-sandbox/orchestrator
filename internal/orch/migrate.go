@@ -33,7 +33,10 @@ import (
 // reusable template id or an opaque kmt1 migration token. Publish does not hold
 // the source lifecycle lock: an accepted resume may preempt a KMT export or
 // detach a template export before the short source finalizer begins.
-func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error) {
+func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool, checkpointID string) (types.ExportResult, error) {
+	if checkpointID != "" && keepSource {
+		return types.ExportResult{}, fmt.Errorf("%w: checkpoint export always consumes the checkpoint", api.ErrBadRequest)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -85,7 +88,19 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			unlock()
 			return types.ExportResult{}, api.ErrNotFound
 		}
-		if sb.State != types.StatePaused || !sb.ResumeSource.Valid() || sb.ExecutionResult != nil {
+		savedSource := sb.ResumeSource
+		if checkpointID != "" {
+			checkpoint, err := o.st.Checkpoint(opCtx, sid)
+			if err != nil {
+				unlock()
+				return types.ExportResult{}, err
+			}
+			if checkpoint == nil || checkpoint.ID != checkpointID {
+				unlock()
+				return types.ExportResult{}, api.ErrNotFound
+			}
+			savedSource = checkpoint.Source
+		} else if sb.State != types.StatePaused || !sb.ResumeSource.Valid() || sb.ExecutionResult != nil {
 			unlock()
 			return types.ExportResult{}, fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
@@ -98,8 +113,8 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			unlock()
 			return types.ExportResult{}, fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
 		}
-		if !types.IsPortableRef(sb.ResumeSource.Ref) {
-			if _, err := o.ownedLocalArtifactDir(sb, sb.ResumeSource); err != nil {
+		if !types.IsPortableRef(savedSource.Ref) {
+			if _, err := o.ownedLocalArtifactDir(sb, savedSource); err != nil {
 				unlock()
 				return types.ExportResult{}, err
 			}
@@ -111,22 +126,25 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 
 		// Retire paused runner/artifact ownership before publication owns the
 		// source. Resume can then proceed without waiting for this upload.
-		beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
-		cleanupErr := o.cleanupPausedOwnership(guardCtx, sb)
-		o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
-		if cleanupErr != nil {
-			o.startPausedCleanupRetry(sid)
-			unlock()
-			return types.ExportResult{}, fmt.Errorf("export-sandbox: paused source cleanup: %w", cleanupErr)
+		if sb.State == types.StatePaused {
+			beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
+			cleanupErr := o.cleanupPausedOwnership(guardCtx, sb)
+			o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
+			if cleanupErr != nil {
+				o.startPausedCleanupRetry(sid)
+				unlock()
+				return types.ExportResult{}, fmt.Errorf("export-sandbox: paused source cleanup: %w", cleanupErr)
+			}
 		}
 		source = cloneSandbox(sb)
+		source.ResumeSource = savedSource
 		opCtx, releaseSource, err = retainSourceOperation(guardCtx)
 		if err != nil {
 			unlock()
 			return types.ExportResult{}, err
 		}
 		var started bool
-		attempt, started = o.exports.Begin(sid, source.ResumeSource, toTemplate, cancelUpload)
+		attempt, started = o.exports.Begin(sid, source.ResumeSource, toTemplate, checkpointID, cancelUpload)
 		unlock()
 		if started {
 			break
@@ -251,6 +269,20 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	current, err := o.st.Get(finalizeCtx, sid)
 	if err != nil {
 		return types.ExportResult{}, err
+	}
+	if checkpointID != "" {
+		if current == nil || current.CreatedUnix != source.CreatedUnix || current.BaseDir != source.BaseDir {
+			return types.ExportResult{}, api.ErrNotFound
+		}
+		changed, err := o.st.DeleteCheckpoint(finalizeCtx, sid, checkpointID)
+		if err != nil {
+			return types.ExportResult{}, err
+		}
+		if !changed {
+			return types.ExportResult{}, api.ErrNotFound
+		}
+		o.cleanupConsumedCheckpoint(finalizeCtx, current)
+		return response, nil
 	}
 	if current == nil || current.State != types.StatePaused || current.ExecutionResult != nil || current.ResumeSource != attempt.source ||
 		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||

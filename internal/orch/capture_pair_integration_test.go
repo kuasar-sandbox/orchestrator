@@ -95,7 +95,7 @@ func TestCapturePairCLIToPausedDatabase(t *testing.T) {
 						}
 						done <- ctl.WriteMessage(c, &response)
 					}()
-					err = o.Pause(context.Background(), sb.ID, key, sandboxcfg.CaptureRequest{Kind: kind})
+					_, err = o.Pause(context.Background(), sb.ID, key, sandboxcfg.CaptureRequest{Kind: kind})
 					if serverErr := <-done; serverErr != nil {
 						t.Fatal(serverErr)
 					}
@@ -283,7 +283,10 @@ func TestUploadCaptureCLIToPausedDatabase(t *testing.T) {
 				if source != want {
 					t.Fatalf("source=%+v want=%+v", source, want)
 				}
-				changed, err := o.st.CommitRunningPaused(ctx, sb.ID, sb.RunID, source)
+				if changed, err := o.st.SetPausing(ctx, sb.ID, sb.RunID, true); err != nil || !changed {
+					t.Fatalf("gate=%t: %v", changed, err)
+				}
+				changed, err := o.st.CommitPaused(ctx, sb.ID, sb.RunID, source, "")
 				if err != nil || !changed {
 					t.Fatalf("pause=%t: %v", changed, err)
 				}

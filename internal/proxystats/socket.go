@@ -115,7 +115,7 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 	for _, query := range request.Sandboxes {
 		if !validSandboxID(query.SandboxID) ||
 			(query.Profile != types.ProfileE2B && query.Profile != types.ProfileBare) ||
-			(query.State != types.StateStarting && query.State != types.StateRunning && query.State != types.StatePaused) {
+			(query.State != types.StateStarting && query.State != types.StateRunning && query.State != types.StatePaused && query.State != types.StatePausing) {
 			writeSocketError(w, http.StatusBadRequest, "invalid traffic query")
 			return
 		}

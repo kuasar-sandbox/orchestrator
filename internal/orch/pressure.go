@@ -173,7 +173,7 @@ func (o *Orchestrator) observePressureSandbox(sb *types.Sandbox) {
 	phase := ""
 	if sb.ResourceObligation && sb.PauseReason == types.PauseReasonResource {
 		switch sb.State {
-		case types.StateRunning:
+		case types.StateRunning, types.StatePausing:
 			phase = "capturing"
 		case types.StatePaused:
 			phase = "paused"
@@ -293,7 +293,7 @@ func (o *Orchestrator) pauseForPressure(ctx context.Context, candidate *types.Sa
 	} // persisted obligation remains for restart
 	o.cache(sb)
 	o.observePressureSandbox(sb)
-	if err = o.pauseSandboxLocked(ctx, sb, request); err != nil {
+	if _, err = o.pauseSandboxLocked(ctx, sb, request); err != nil {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		changed, cancelErr := o.st.CancelResourcePause(cleanupCtx, sb)

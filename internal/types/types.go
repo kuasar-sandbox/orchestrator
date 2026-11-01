@@ -220,6 +220,7 @@ const (
 	StateStarting State = "starting"
 	StateRunning  State = "running"
 	StatePaused   State = "paused"
+	StatePausing  State = "pausing"
 	StateDeleting State = "deleting"
 	StateDead     State = "dead"
 )
@@ -360,8 +361,17 @@ type SandboxExecutionResult struct {
 const PauseReasonResource = "resource-pressure"
 const PauseReasonExplicit = "explicit"
 
+// SandboxCheckpoint is an immutable capture owned by its sandbox.
+type SandboxCheckpoint struct {
+	ID        string
+	SandboxID string
+	Source    ResumeSource
+}
+
 // Sandbox pressure fields are node-owned lifecycle state, never user metadata.
 type Sandbox struct {
+	MaxCheckpoints int // sandbox option, currently fixed at 1
+
 	PauseReason           string
 	ResourceObligation    bool
 	PressureVersion       uint64

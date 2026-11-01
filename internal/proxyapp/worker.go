@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // PreparedWorker owns inherited descriptors after bootstrap verification. The
@@ -30,6 +31,7 @@ import (
 // Run sends stats readiness, waits for initial route sync, then serves traffic.
 type PreparedWorker struct {
 	control   *controlPeer
+	stats     *proxystats.WorkerStats
 	effective *EffectiveConfig
 	process   Process
 	table     *proxyshm.Table
@@ -208,6 +210,7 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) (return
 	}
 	defer func() { returnErr = errors.Join(returnErr, endExtension(time.Now().Add(cfg.ShutdownTimeoutDur()))) }()
 	workerStats := proxystats.NewWorkerStatsWithAdmission(worker.admission)
+	worker.stats = workerStats
 	var proxyHandler *proxy.Proxy
 	var extensionHost proxyextension.WorkerHost
 	if runtime.WorkerExtension != nil {
@@ -506,6 +509,18 @@ func (worker *PreparedWorker) serveControlled(ctx context.Context, stopRequested
 				return fmt.Errorf("proxy worker control: %w", e.err)
 			}
 			switch e.message.Kind {
+			case "pause_stats":
+				sample, err := worker.stats.PauseActivity(e.message.SID, func() bool {
+					route, found := worker.table.Lookup(e.message.SID)
+					return found && route.State == routesync.StatePausing && route.RunID == e.message.RunID
+				})
+				response := controlMessage{Kind: "pause_ack", BarrierID: e.message.BarrierID, SID: e.message.SID, RunID: e.message.RunID, Activity: sample}
+				if err != nil {
+					response.Error = err.Error()
+				}
+				if err := worker.control.send(response); err != nil {
+					return err
+				}
 			case "start":
 				if started || dataDraining {
 					continue

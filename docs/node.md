@@ -262,7 +262,7 @@ node-ctl manifest-key list   [--socket S]
 These clients use conductor's local **API plane** for `POST /sandboxes/{id}/export` and `POST /sandboxes/import`. `E2B_API_KEY` must authenticate the owner. See §8.1.
 
 ```
-node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
+node-ctl export-sandbox <sid> [--checkpoint ID] [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
@@ -495,24 +495,24 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
+| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata |
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
 | Metrics history | GET /sandboxes/{SandboxID}/metrics?start=...&end=... | Exact SandboxID ownership, opaque live telemetry UDS forwarding; 503 when unavailable, no Wake/Resume; [E2B contract](telemetry.md#6-e2b-history-query) |
 | Traffic stats | GET /sandboxes/{id}/stats/traffic | Final node Proxy's current parking/connected and conservative idleSince; no Wake/Resume |
-| List | GET /v2/sandboxes | Tenant-scoped state/limit/nextToken query. Omitted state lists running/paused; explicit states support diagnosis. x-next-token pagination; items include cpuCount/memoryMB/diskSizeMB and ISO-8601 startedAt/endAt. CPU/memory retain capacity/SKU meaning, not headroom |
+| List | GET /v2/sandboxes | Tenant-scoped state/limit/nextToken query. Omitted state lists running/pausing/paused; explicit states support diagnosis. x-next-token pagination; items include cpuCount/memoryMB/diskSizeMB and ISO-8601 startedAt/endAt. CPU/memory retain capacity/SKU meaning, not headroom |
 | Kill | DELETE /sandboxes/{id} → 204 | Non-owner returns 404. Atomically transfer complete ownership into deleting, exclude from cache/full snapshots and publish route Delete before response. Finalizer cancels launch, fences runner, detaches under allocation fence, exactly clears durable network ownership, removes RunDir/BaseDir and hard-deletes row. Route Delete only withdraws projection; pending repeats are idempotent |
 | Resume | POST /sandboxes/{id}/connect | Body timeout in seconds and optional bool/null memory. Kuasar maps nil to auto, true to memory, false to cold. Paused atomically becomes starting with durable launch_mode before response. Missing targets may synchronously import paused state from X-Kuasar-Migration-Token, then use the same admission. Response does not wait for launch |
 | Exec session | POST /sandboxes/{id}/exec-sessions → 201 | X-API-KEY only. Mint execAccessToken; optional ttlSeconds, CEL conditions and X-Kuasar-Migration-Token. Does not create a guest process |
-| Pause | POST /sandboxes/{id}/pause → 204 | Omitted/null/true memory saves Snapshot S; false saves Sandbox E. False with snapshot-only merge/drop fields returns 400; ordinary already-paused or starting returns 409; default memory Pause adopts resource-paused state without recapture |
+| Pause | POST /sandboxes/{id}/pause → 204 or 200 with checkpointID | checkpoint/ifIdle default to false (§8.1.1). Omitted/null/true memory saves Snapshot S; false saves Sandbox E. False with snapshot-only merge/drop fields returns 400; ordinary already-paused or starting returns 409; default memory Pause adopts resource-paused state without recapture |
 | Timeout | POST /sandboxes/{id}/timeout | Body timeout in seconds resets TTL; starting permits a narrow-field update |
 
 Compatibility is bounded by the upstream API/SDK versions and actual tests. The upstream [Create](https://docs.e2b.dev/api-reference/sandboxes/create-sandbox), [Pause](https://docs.e2b.dev/api-reference/sandboxes/pause-sandbox) and [Connect](https://docs.e2b.dev/api-reference/sandboxes/connect-to-sandbox) references checked on 2026-09-07 document autoPauseMemory and memory selection, including Connect memory=false. Thus the field is not exclusively a Kuasar extension. Kuasar's nil→source-dependent auto behavior and its existing authorized-traffic Wake of both E and S are specific local semantics; upstream documents restrictions on traffic-triggered resume of filesystem-only snapshots. Kuasar does not claim the complete E2B autoResume policy.
 
 Create templateID accepts a persistent ID ([Build §2](node-build.md#2-template-ids-and-artifact-authority)), registration-time transient ID, or a ready Build's name/alias. The latter two resolve to persistent ID before the common path. envdVersion is `0.6.1` for e2b and compatibility stub `0.1.0` for bare (SDKs require at least 0.1.0). Bare has no envd or Envd/Traffic tokens. Both profiles return a separate forwardAccessToken signed at creation and persisted with the Sandbox.
 
-Create preserves the existing response body without adding state; response/cache/background worker use distinct copies. Get can show starting or cleanup-pending deleting. Default List still selects running/paused; explicit starting/deleting/dead supports diagnosis. Running Connect is idempotent. Starting Connect applies only explicit timeout updates and starts no duplicate attempt. Paused Connect durably accepts resume before returning, so success may correspond to starting but never the old paused state.
+Create preserves the existing response body without adding state; response/cache/background worker use distinct copies. Get can show starting or cleanup-pending deleting. Default List selects running/pausing/paused; explicit starting/deleting/dead supports diagnosis. Running Connect is idempotent. Starting Connect applies only explicit timeout updates and starts no duplicate attempt. Paused Connect durably accepts resume before returning, so success may correspond to starting but never the old paused state.
 
 Every successful standalone Connect, including Running, Starting and imported targets, waits for the current Proxy registrations to apply the preceding route updates and acknowledge an ordered barrier. It does not wait for runtime or envd readiness; the first data request can park on Starting. The existing park timeout, caller cancellation and node shutdown bound this wait. A route-barrier failure returns 503 without undoing timeout updates or resume acceptance that already committed; accepted launch work continues independently. This response fence does not change the cluster CmdConnect acceptance/ownership protocol.
 
@@ -568,7 +568,7 @@ Resource stats read the current sandbox-ctl owner's effective resource specifica
 
 `memoryUsed` reads `memory.current` and `cpuSeconds` reads `cpu.stat.usage_usec / 1e6` from the same pinned host VMM cgroup. These values do not add the ctl process or guest CPU, subtract inactive file/balloon memory, or cap host memory at guest capacity. CPU seconds are cumulative for that current source and can reset when it is rebuilt; lifecycle accumulation belongs to native usage. The native JSON preserves integer bytes and emits CPU seconds as an exact decimal with microsecond precision. Consumers converting these numbers to binary floating point may lose precision.
 
-Each host observation has independent validity: a valid zero is returned, while missing memory or CPU observations are omitted. `timestampUnix` is the actual read time and is omitted if neither host value exists. It is not a refreshed heartbeat/cache timestamp. Effective specifications remain readable from an owner without a live VMM, but no current host observation is fabricated. Starting/running without a reachable owner returns 503; paused and other states without a current runtime return 409. Concurrent runtime or binding replacement invalidates the read.
+Each host observation has independent validity: a valid zero is returned, while missing memory or CPU observations are omitted. `timestampUnix` is the actual read time and is omitted if neither host value exists. It is not a refreshed heartbeat/cache timestamp. Effective specifications remain readable from an owner without a live VMM, but no current host observation is fabricated. Starting/running/pausing without a reachable owner returns 503; paused and other states without a current runtime return 409. Concurrent runtime or binding replacement invalidates the read.
 
 This works with static or dynamic resource control, with usage disabled and with telemetry stopped. Reading does not Wake, sample/save usage, call the guest or Cloud Hypervisor, or change control policy. It creates no resource history. The former native `cpuCount`, `memTotal`, `memAllocatable` and `memUsed` fields are removed; the old reservation-valued `memAllocatable` is replaced by `memoryReserved`, while `memoryHeadroom` is a separate explicit concept. E2B `/metrics` and list/SKU compatibility fields retain their existing meanings.
 
@@ -625,7 +625,7 @@ connected  = Final node proxy→Sandbox backend is established and not finally c
 
 maxInflight comes from master’s currently applied route and destination-node effective policy, not conductor's row. An all-zero object means unlimited. Configured M is an approximate whole-node per-Sandbox ceiling; with N workers the transient theoretical bound is M+N-1, not M per worker.
 
-e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/exec. Top-level inflight sums services. Each service includes idleSince only when both counters are zero. Top-level idleSince appears only for running with all-zero counts and is the maximum of all applicable service idle times. Starting/paused returns inflight but no top-level idle. The API omits idle boolean/duration, last open/close, cumulative connection counts, rates, latency, port details and worker information.
+e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/exec. Top-level inflight sums services. Each service includes idleSince only when both counters are zero. Top-level idleSince appears only for running with all-zero counts and is the maximum of all applicable service idle times. Starting/pausing/paused returns inflight but no top-level idle. The API omits idle boolean/duration, last open/close, cumulative connection counts, rates, latency, port details and worker information.
 
 Conductor queries the current trusted Proxy registration's stats_socket master cache, without worker fan-out. Unregistered master, unsynchronized route, mismatched RunID/profile/state, failed worker stream or unready replacement returns 503. This stats window does not alter master route/admission authority or Create barrier. The complete shared-admission algorithm, error proof, worker state machine, absolute snapshots and failure windows are in [node-proxy.md](node-proxy.md) §8.
 
@@ -1419,7 +1419,7 @@ The state machine is:
 Create(img|sbx|snp)
   |
   v
-starting --success--> running --Pause/TTL--> paused(source=E|S)
+starting --success--> running --Proxy ACK--> pausing --capture--> paused(source=E|S)
   |                      |                       |
   |                      +--Kill--> deleting    | Resume(auto|memory|cold)
   |                                              v
@@ -1437,7 +1437,7 @@ Create/Connect/Wake/route activation/native exec/exec-session/migration import s
 
 After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation, without another route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans locally, then exactly creates owner-free dead history and withdraws route.
 
-CommitRunningPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
+CommitPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
 When `resource_listen` is enabled, the node uses the source-independent
 [effective-zone matrix](node-resource.md#42-rawzone-and-effective-zone).
@@ -1490,6 +1490,45 @@ Explicit Pause body may be empty or:
 
 Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field returns 400 before freeze/capture/lifecycle side effects. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
 
+`checkpoint` and `ifIdle` default to false. Every Pause first gates new traffic at the online
+Proxy registrations and synchronously samples parking/connected counts from every worker.
+IfIdle requires all reported counts to be zero (409 otherwise); ordinary Pause permits busy
+traffic. No Proxy inventory is persisted. Registrations disconnected before the handshake
+are ignored; disconnect/replacement/join during it or an incomplete ACK rejects Pause with
+503 and republishes the authoritative state. The idle guarantee covers only these participants;
+an empty online set does not wait for disconnected proxies.
+
+The publishable `pausing` route also appears in full synchronization during preparation.
+Proxy parks authenticated requests and sends Wake for both pausing and paused. Existing
+transports remain valid during the handshake so canceling them cannot fabricate idle.
+Conductor holds the SID lifecycle lock through capture, atomic pause/checkpoint commit and
+cleanup before processing queued Wake. pausing→paused is normal progress, whereas
+starting→paused remains a failed Resume. Restart never adopts an interrupted durable pausing
+row merely because its runner is live: it fences that exact runner and uses existing terminal
+cleanup because no new source was committed.
+
+`checkpoint=true` atomically retains the immutable E or S/E pair with paused/source and returns
+HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Sandbox option
+`max_checkpoints` is currently fixed at 1; Create accepts omission or 1. There is no node retention
+setting. A retained capture, including one being exported, rejects the next checkpoint Pause
+with 409 before handshake/capture. Ordinary Pause neither occupies this quota nor replaces it.
+
+Default Resume still releases ordinary named versions, and a new no-ID Export after Resume
+returns 400. A retained checkpoint survives Resume. Export accepts `checkpointID` in
+`POST /sandboxes/{id}/export`; CLI uses `export-sandbox <sid> --checkpoint <id>`.
+This selects the immutable capture independently of current runtime state. Concurrent Resume
+does not preempt it. Successful export consumes the checkpoint, failure retains it, and
+`keepSource=true` is invalid with an ID. Export leaves the sandbox intact. Alternatively,
+`DELETE /sandboxes/{id}/checkpoints/{checkpointID}` consumes it directly (204; missing ID 404).
+Consumption releases quota; files still required by the current ResumeSource remain, while
+existing sandbox cleanup collects obsolete files and DIFF versions.
+
+Checkpoints always belong to their sandbox and disappear with parent deletion. Generic
+terminal data retention is tracked separately in [#491](https://github.com/kuasar-sandbox/orchestrator/issues/491);
+current terminal cleanup can still remove BaseDir. This feature does not promise local data
+survival after termination. The new schema replaces the old design directly: databases missing
+`max_checkpoints` are rejected without migrating business records.
+
 checkpoint.mode accepts local/bundle for both CaptureKinds:
 
 ```text
@@ -1510,11 +1549,11 @@ Capture returns the producer's actual identities: `snapshot --json` returns
 the S and E selectors in the same physical file. Local refs retain their identity
 qualifiers but expose only basenames; the checkpoint directory is execution
 context. Default human output and upload-key stdout are unchanged. The adapter
-validates the complete structured result before committing running→paused;
+validates the complete structured result before committing pausing→paused;
 Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
 and its association. Capture failure never commits a partial pair.
 
-Ordering is resolve request → accept operation → capture runtime → CommitRunningPaused(id, exact RunID, source) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
+Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
 
 ##### Local disk Checkpoints
 
@@ -1673,7 +1712,7 @@ short-lived `node-ctl checkpoint-cleanup` tool. Portable Export continues to use
 its stored pair without reading artifacts. No token, public result, base format,
 or persistent cleanup schema changes.
 
-The keep set contains current S/E, memory-history carriers, and current disk,
+The keep set unions current and explicitly retained S/E roots, their memory-history carriers, and disk,
 upper and immutable-base carriers, including reused files. A historical S's old
 E is not a disk dependency. Any needed Bundle member retains its whole physical
 carrier. Source/location binding precedes basename comparison. Selection reads
@@ -1724,8 +1763,8 @@ ownership, and only a running sandbox without a terminal execution result or a
 source operation still using its checkpoint may release versions. Starting,
 failed resume rolled back to paused, and an unresumed `keepSource` retain them.
 
-The check uses sandboxer's complete List result and deletes those exact
-`{DiffID, ID}` references. Partial or uncertain Delete retries keep the same set;
+The check uses sandboxer's complete List result, excludes retained checkpoint IDs, and deletes
+the remaining exact `{DiffID, ID}` references. Partial or uncertain Delete retries keep the same set;
 a different runtime cannot inherit that selection. If List explicitly reports
 `checkpoint_unsupported`, the current check ends successfully without Delete or
 retry. This does not cache capability by SID: an independent later or concurrent
@@ -2010,7 +2049,7 @@ Node reports authoritative local execution state:
 
 ```text
 sandbox{
-  sid, profile, state(starting|running|paused|dead), artifact_location, template_id,
+  sid, profile, state(starting|running|pausing|paused|dead), artifact_location, template_id,
   stable_id, api_secret, api_secret_fingerprint,
   manifest_key_fingerprint, service_secret,
   envd_access_token, traffic_access_token, forward_access_token,
@@ -2026,7 +2065,7 @@ bookmark{full_sync}
 
 Deleting is local cleanup-pending state and is never projected as a Sandbox upsert. Durable Delete acceptance immediately excludes the SID from local cache and future full route snapshots and sends delete{sid} on existing live links. This withdraws routing, without proving unit/network/path cleanup or hard-delete. If the process exits between durable transition and incremental publication, its old stream expires; the next full snapshot excludes the SID and removes the old projection. Restart retries owners still present in the durable deleting row and never reacquires an exact-cleared network tuple. Local finalizer correctness does not depend on Registry projection; completion sends no second route Delete.
 
-Node route events retain mmds_secret for local proxy/MMDS use; Registry excludes it when materializing protected cluster routes. Starting means local launch is in progress. Registry includes it in the full-sync seen set without overwriting reserved/paused routes; running/paused/delete drive cluster convergence. Events explicitly carry the remaining credentials required for those purposes.
+Node route events retain mmds_secret for local proxy/MMDS use; Registry excludes it when materializing protected cluster routes. Starting means local launch is in progress. Registry includes it in the full-sync seen set without overwriting reserved/paused routes; running/pausing/paused/delete drive cluster convergence. Events explicitly carry the remaining credentials required for those purposes.
 
 Sandbox events do not self-report Registry-owned cluster context. Before dispatch, the node-link owner maintains the node's complete Sandbox/Build ownership table. It looks up `(node_id,sid)` or `(node_id,build_id)` to recover group/route_key. Event sid is the local NodeSandboxID, allocated by Registry as `<stable-sandbox-id>-g<N>`. Node neither receives SandboxGeneration nor parses this ID. Registry's ownership table recovers stable SandboxID and generation; there is no cross-group SandboxID index.
 
@@ -2106,7 +2145,7 @@ One SQLite file at paths.db_path uses WAL, mode 0600 and a pure-Go driver. Core 
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                profile, cluster_group, cluster_route_key, stable_id,
-               template_id, state(starting|running|paused|deleting|dead), deadline_unix, dead_unix,
+               template_id, state(starting|running|pausing|paused|deleting|dead), max_checkpoints, deadline_unix, dead_unix,
                run_id, run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
@@ -2155,7 +2194,7 @@ The same startup gate reconstructs Builder ownership under [Build recovery](node
 
 The same conductor reaper runs terminal retention every five seconds, without another timer/unit. Dead and ready/error transitions atomically write dead_unix/finished_unix. Each pass processes at most 128 rows of each type. Exact-delete only after dead_ttl/terminal_ttl and complete owner release. Sandbox must have no unit, network, RunDir/BaseDir, UDS, ResumeSource or launch owner. Build must have no execution claim, unit/cgroup, phase, network, prepare/result owner. Concurrent changes after candidate scanning fail the delete CAS and preserve the row. Restart resumes using database timestamps. No automatic VACUUM or remote-artifact mutation occurs.
 
-These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v8 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
+These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v9 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 

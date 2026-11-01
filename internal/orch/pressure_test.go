@@ -65,7 +65,7 @@ func TestResourcePauseAdoptionPreservesIdentityAndPublishesAllSubscribers(t *tes
 	defer unsub1()
 	second, unsub2 := o.Subscribe()
 	defer unsub2()
-	if err := o.Pause(context.Background(), sb.ID, key, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+	if _, err := o.Pause(context.Background(), sb.ID, key, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
 		t.Fatal(err)
 	}
 	got, err := o.st.Get(context.Background(), sb.ID)
@@ -99,7 +99,7 @@ func TestResourcePauseAdoptionPreservesIdentityAndPublishesAllSubscribers(t *tes
 	if p := s.PressureSnapshot(); p.Pending != 0 {
 		t.Fatalf("stale event resurrected Q: %+v", p)
 	}
-	if err := o.Pause(context.Background(), sb.ID, key, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrAlreadyPaused) {
+	if _, err := o.Pause(context.Background(), sb.ID, key, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrAlreadyPaused) {
 		t.Fatalf("ordinary repeat=%v", err)
 	}
 	// Reload from the same durable rows before service/admission. Historical
@@ -133,7 +133,7 @@ func TestResourcePauseAdoptionRejectsUnauthenticatedAndCaptureSpecificRequests(t
 			if tc.key != "" {
 				key = tc.key
 			}
-			if err := o.Pause(context.Background(), sb.ID, key, tc.request); !errors.Is(err, tc.want) {
+			if _, err := o.Pause(context.Background(), sb.ID, key, tc.request); !errors.Is(err, tc.want) {
 				t.Fatalf("Pause=%v want %v", err, tc.want)
 			}
 			got, _ := o.st.Get(context.Background(), sb.ID)
@@ -172,7 +172,7 @@ func TestResourcePauseAdoptionHookRevalidatesReasonAndSource(t *testing.T) {
 				o.observePressureSandbox(current)
 				return nil
 			}), nil)
-			err := o.Pause(context.Background(), sb.ID, key, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+			_, err := o.Pause(context.Background(), sb.ID, key, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
 			want := api.ErrSandboxChanged
 			if change == "reject" {
 				want = conductorextension.ErrRejected

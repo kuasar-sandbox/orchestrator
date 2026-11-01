@@ -127,7 +127,7 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						}
 						o.cache(sb)
 						if portable {
-							initial, err := o.ExportSandbox(ctx, apiKey, sid, false, true)
+							initial, err := o.ExportSandbox(ctx, apiKey, sid, false, true, "")
 							if err != nil {
 								t.Fatal(err)
 							}

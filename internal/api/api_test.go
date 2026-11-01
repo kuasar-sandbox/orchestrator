@@ -708,6 +708,9 @@ func TestPauseRequestPolicyAndStatus(t *testing.T) {
 			want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, SnapshotPolicy: sandboxcfg.SnapshotPolicy{MergeRef: boolPtr(false), DropCaches: boolPtr(true)}}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "body null inherits", body: `{"checkpoint_merge_ref":null,"checkpoint_drop_caches":false}`,
 			want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, SnapshotPolicy: sandboxcfg.SnapshotPolicy{DropCaches: boolPtr(false)}}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "if idle", body: `{"ifIdle":true}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true}, wantStatus: 204, wantCalls: 1},
+		{name: "busy", body: `{"ifIdle":true}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true}, coreErr: ErrSandboxBusy, wantStatus: 409, wantCalls: 1},
+		{name: "checkpoint quota", body: `{"checkpoint":true}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, Checkpoint: true}, coreErr: ErrCheckpointLimit, wantStatus: 409, wantCalls: 1},
 		{name: "already paused", body: `{}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, coreErr: ErrAlreadyPaused, wantStatus: http.StatusConflict, wantCalls: 1},
 		{name: "starting", body: `{}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, coreErr: ErrSandboxStarting, wantStatus: http.StatusConflict, wantCalls: 1},
 	}
@@ -1525,8 +1528,9 @@ type execSessionCoreStub struct {
 
 type checkpointCoreStub struct {
 	Core
-	create func(context.Context, CreateReq) (*types.Sandbox, error)
-	pause  func(context.Context, string, string, sandboxcfg.CaptureRequest) error
+	checkpointID string
+	create       func(context.Context, CreateReq) (*types.Sandbox, error)
+	pause        func(context.Context, string, string, sandboxcfg.CaptureRequest) error
 }
 
 type buildMMDSCoreStub struct {
@@ -1646,8 +1650,8 @@ func (c *checkpointCoreStub) Create(ctx context.Context, req CreateReq) (*types.
 	return c.create(ctx, req)
 }
 
-func (c *checkpointCoreStub) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
-	return c.pause(ctx, id, apiKey, request)
+func (c *checkpointCoreStub) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) (string, error) {
+	return c.checkpointID, c.pause(ctx, id, apiKey, request)
 }
 
 func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error) {
@@ -1869,7 +1873,7 @@ func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, ta
 	return c.importSandbox(ctx, apiKey, token, targetID)
 }
 
-func (c *migrationCoreStub) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (types.ExportResult, error) {
+func (c *migrationCoreStub) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool, checkpointID string) (types.ExportResult, error) {
 	return c.exportSandbox(ctx, apiKey, sid, toTemplate, keepSource)
 }
 

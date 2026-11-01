@@ -13,7 +13,7 @@ import (
 )
 
 func (o *Orchestrator) exportSandboxTokenForTest(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
-	result, err := o.ExportSandbox(ctx, apiKey, sid, toTemplate, keepSource)
+	result, err := o.ExportSandbox(ctx, apiKey, sid, toTemplate, keepSource, "")
 	if err != nil {
 		return "", err
 	}
@@ -60,7 +60,7 @@ func TestInvalidPublicationReportPreservesMoveSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, false, false)
+			result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, false, false, "")
 			if err == nil || result.Result != "" {
 				t.Fatalf("invalid success=%+v err=%v", result, err)
 			}
@@ -91,7 +91,7 @@ func TestPortableSnapshotUsesStoredPairWithoutArtifacts(t *testing.T) {
 		return artifact.PublishReport{}, nil
 	}
 	for _, template := range []bool{false, true} {
-		result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, template, true)
+		result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, template, true, "")
 		if err != nil || result.SnapshotRef != source.Ref || result.SandboxRef != source.SandboxRef || len(result.RemovedRefs) != 0 {
 			t.Fatalf("portable result=%+v err=%v", result, err)
 		}

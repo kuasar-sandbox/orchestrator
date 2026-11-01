@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   resume_source_ref    TEXT NOT NULL DEFAULT '',
   resume_sandbox_ref   TEXT NOT NULL DEFAULT '',
   auto_pause_memory    INTEGER NOT NULL DEFAULT 1,
+  max_checkpoints      INTEGER NOT NULL DEFAULT 1 CHECK(max_checkpoints=1),
   launch_mode          TEXT NOT NULL DEFAULT '',
   service_secret_enc       TEXT NOT NULL,
   envd_access_token_enc    TEXT NOT NULL,
@@ -80,6 +81,14 @@ CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_ashash ON sandboxes(api_secret_hash);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_ascandidate ON sandboxes(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_sandboxes_mkhash ON sandboxes(manifest_key_hash);
+
+CREATE TABLE IF NOT EXISTS sandbox_checkpoints (
+ sandbox_id TEXT PRIMARY KEY REFERENCES sandboxes(id) ON DELETE CASCADE,
+ checkpoint_id TEXT NOT NULL,
+ source_kind TEXT NOT NULL,
+ source_ref TEXT NOT NULL,
+ sandbox_ref TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS builds (
   build_id          TEXT PRIMARY KEY,
@@ -196,6 +205,10 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	// RFC-142 is a schema cut. Operators must clear the old database before
 	// upgrading; never migrate, backfill, or delete their sandbox records here.
 	if err := requireColumn(ctx, db, "sandboxes", "resume_sandbox_ref"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := requireColumn(ctx, db, "sandboxes", "max_checkpoints"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -532,10 +545,10 @@ type buildInstanceConfig struct {
 const sandboxInsertSQL = `
 	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
-	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,launch_mode,
+	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,max_checkpoints,launch_mode,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,
 	  sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -559,6 +572,12 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	}
 	if !types.ValidLocalSandboxID(sb.ID) {
 		return nil, errors.New("invalid sandbox id")
+	}
+	if sb.MaxCheckpoints == 0 {
+		sb.MaxCheckpoints = 1
+	}
+	if sb.MaxCheckpoints != 1 {
+		return nil, errors.New("max_checkpoints must be 1")
 	}
 	if sb.State == types.StateDead && sb.DeadUnix == 0 {
 		sb.DeadUnix = time.Now().Unix()
@@ -609,7 +628,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.StableIDValue,
 		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc,
-		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.AutoPauseMemory, string(sb.LaunchMode),
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.AutoPauseMemory, sb.MaxCheckpoints, string(sb.LaunchMode),
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
 		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix, resultRunID, resultJSON,
 		sb.PauseReason, sb.ResourceObligation, sb.PressureVersion, sb.RunningSinceUnixNano, sb.PressureSinceUnixNano,
@@ -652,7 +671,7 @@ func validateSandboxLifecycle(sb *types.Sandbox) error {
 		if sb.LaunchMode != want {
 			return fmt.Errorf("fresh starting sandbox launch mode %q does not match template kind %q", sb.LaunchMode, tmpl.Kind)
 		}
-	case types.StateRunning, types.StateDeleting:
+	case types.StateRunning, types.StatePausing, types.StateDeleting:
 		if sb.LaunchMode != "" {
 			return fmt.Errorf("%s sandbox must not have a launch mode", sb.State)
 		}
@@ -842,8 +861,8 @@ func (s *Store) GetSandboxIDByCurrentRunID(ctx context.Context, runID string) (s
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id FROM sandboxes
-		 WHERE run_id=? AND state IN (?,?,?,?)`,
-		runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePaused), string(types.StateDeleting))
+		 WHERE run_id=? AND state IN (?,?,?,?,?)`,
+		runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePausing), string(types.StatePaused), string(types.StateDeleting))
 	if err != nil {
 		return "", false, fmt.Errorf("store: find current sandbox by run id %s: %w", runID, err)
 	}
@@ -984,8 +1003,8 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 	return sandboxUpdateChanged("commit prepared running", expected.ID, result)
 }
 
-// CommitRunningPaused publishes a completed artifact only while the exact
-// runner that produced it still owns a running row. State and resume source are
+// CommitPaused publishes a completed artifact only while the exact
+// runner that produced it still owns a pausing row. State and resume source are
 // one atomic update so readers can never observe a partially committed pause.
 // AcceptSandboxExecutionResult durably records the exact runner result before
 // lifecycle cleanup. Identical replays are idempotent, including after a later
@@ -1023,14 +1042,14 @@ func (s *Store) AcceptSandboxExecutionResult(ctx context.Context, id, runID stri
 		}
 		return false, ErrSandboxResultConflict
 	}
-	if currentRunID != runID || (state != string(types.StateStarting) && state != string(types.StateRunning)) {
+	if currentRunID != runID || (state != string(types.StateStarting) && state != string(types.StateRunning) && state != string(types.StatePausing)) {
 		return false, ErrSandboxExecutionOwnership
 	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET sandbox_result_run_id=?, sandbox_result_json=?
 		 WHERE id=? AND run_id=? AND sandbox_result_run_id=''
-		   AND state IN (?,?)`, runID, encoded, id, runID, string(types.StateStarting), string(types.StateRunning))
+		   AND state IN (?,?,?)`, runID, encoded, id, runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePausing))
 	if err != nil {
 		return false, fmt.Errorf("store: accept sandbox result %s: %w", id, err)
 	}
@@ -1047,26 +1066,43 @@ func (s *Store) AcceptSandboxExecutionResult(ctx context.Context, id, runID stri
 	return true, nil
 }
 
-func (s *Store) CommitRunningPaused(ctx context.Context, id, runID string, source types.ResumeSource) (bool, error) {
+func (s *Store) CommitPaused(ctx context.Context, id, runID string, source types.ResumeSource, checkpointID string) (bool, error) {
 	if !source.Valid() {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: invalid resume source", id)
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
 	// Result receipt does not wait for the lifecycle lock held by capture. An
 	// accepted terminal result must win even when capture started earlier.
-	result, err := s.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET state=?, resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?, launch_mode='', running_since_ns=0, pause_reason=CASE WHEN resource_obligation=1 THEN 'resource-pressure' ELSE 'explicit' END, pressure_version=pressure_version+1
 		 WHERE id=? AND state=? AND run_id=? AND sandbox_result_run_id=''`,
-		string(types.StatePaused), string(source.Kind), source.Ref, source.SandboxRef, id, string(types.StateRunning), runID)
+		string(types.StatePaused), string(source.Kind), source.Ref, source.SandboxRef, id, string(types.StatePausing), runID)
 	if err != nil {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: %w", id, err)
 	}
-	return sandboxUpdateChanged("commit running paused", id, result)
+	changed, err := sandboxUpdateChanged("commit running paused", id, result)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if checkpointID != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sandbox_checkpoints(sandbox_id,checkpoint_id,source_kind,source_ref,sandbox_ref) VALUES(?,?,?,?,?)`, id, checkpointID, string(source.Kind), source.Ref, source.SandboxRef); err != nil {
+			return false, fmt.Errorf("store: retain checkpoint: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ClearPausedRunner records successful stop/reset cleanup without discarding
 // the exact runner identity before that cleanup has completed. A crash between
-// CommitRunningPaused and this CAS therefore leaves enough durable ownership
+// CommitPaused and this CAS therefore leaves enough durable ownership
 // for restart reconciliation to retry safely.
 func (s *Store) ClearPausedRunner(ctx context.Context, id, expectedRunID string) (bool, error) {
 	if expectedRunID == "" {
@@ -1150,7 +1186,7 @@ func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool
 // field is cleared in the same full-owner CAS so a stale result finalizer cannot
 // clear a successor's port.
 func (s *Store) ClearRunningNetwork(ctx context.Context, sb *types.Sandbox) (bool, error) {
-	if sb == nil || sb.ID == "" || sb.State != types.StateRunning || sb.VswitchPort == "" {
+	if sb == nil || sb.ID == "" || (sb.State != types.StateRunning && sb.State != types.StatePausing) || sb.VswitchPort == "" {
 		return false, errors.New("store: clear running network requires a running sandbox with a port")
 	}
 	result, err := s.db.ExecContext(ctx, `
@@ -1160,7 +1196,7 @@ func (s *Store) ClearRunningNetwork(ctx context.Context, sb *types.Sandbox) (boo
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
 		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=? AND created_unix=?`,
-		sb.ID, string(types.StateRunning), string(sb.LaunchMode),
+		sb.ID, string(sb.State), string(sb.LaunchMode),
 		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
 		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
 		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.CreatedUnix)
@@ -1233,7 +1269,7 @@ func (s *Store) CommitSandboxDead(ctx context.Context, sb *types.Sandbox) (bool,
 	if sb == nil || sb.ID == "" {
 		return false, errors.New("store: commit sandbox dead requires a sandbox")
 	}
-	if sb.State != types.StateStarting && sb.State != types.StateRunning {
+	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePausing {
 		return false, fmt.Errorf("store: commit sandbox %s dead from invalid state %q", sb.ID, sb.State)
 	}
 	if sb.State == types.StateStarting && !sb.ResumeSource.Empty() {
@@ -1286,7 +1322,7 @@ func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (
 
 var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
-  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,launch_mode,
+  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,max_checkpoints,launch_mode,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
@@ -1299,7 +1335,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc,
-		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &launchMode,
+		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.MaxCheckpoints, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano); err != nil {
 		return nil, err
@@ -1463,10 +1499,10 @@ func (s *Store) List(ctx context.Context, state, ownerCandidateHash string, limi
 		conds = append(conds, "state=?")
 		args = append(args, state)
 	} else {
-		// Match the upstream E2B list contract: an omitted state means the two
-		// public states, not internal starting/deleting/dead lifecycle records.
-		conds = append(conds, "state IN (?,?)")
-		args = append(args, string(types.StateRunning), string(types.StatePaused))
+		// Include the published pausing transition in the default live list.
+		// Starting/deleting/dead remain explicit diagnostic selections.
+		conds = append(conds, "state IN (?,?,?)")
+		args = append(args, string(types.StateRunning), string(types.StatePausing), string(types.StatePaused))
 	}
 	if ownerCandidateHash != "" {
 		conds = append(conds, "substr(api_secret_hash,1,24)=?")
@@ -1572,7 +1608,7 @@ func (s *Store) SetDeadline(ctx context.Context, id string, unix int64) error {
 // predicate remains the durable fence if another writer bypasses that lock.
 func (s *Store) SetDeadlineIfState(ctx context.Context, id string, expected types.State, unix int64) (bool, error) {
 	switch expected {
-	case types.StateStarting, types.StateRunning, types.StatePaused:
+	case types.StateStarting, types.StateRunning, types.StatePausing, types.StatePaused:
 	default:
 		return false, fmt.Errorf("store: set deadline sandbox %s: invalid state %q", id, expected)
 	}

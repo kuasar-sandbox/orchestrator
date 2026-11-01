@@ -1018,7 +1018,7 @@ func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
 
 	// First pause from running, then resume and pause again: the durable
 	// source is the fresh local checkpoint at the same node-local path.
-	if err := o.Pause(ctx, sid, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+	if _, err := o.Pause(ctx, sid, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := o.Connect(ctx, sid, apiKey, "", api.ConnectOptions{}); err != nil {
@@ -1027,7 +1027,7 @@ func TestExportKeepSourceAfterResumePauseCycle(t *testing.T) {
 	waitForSandbox(t, o, ctx, sid, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning
 	}, "running after resume")
-	if err := o.Pause(ctx, sid, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+	if _, err := o.Pause(ctx, sid, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := o.st.Get(ctx, sid)

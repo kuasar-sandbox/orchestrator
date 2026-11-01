@@ -572,7 +572,7 @@ func TestSourceOperationPortableMissingDirectoryCanFinalizeOwnExport(t *testing.
 				t.Error("portable export invoked publisher")
 				return artifact.PublishReport{}, errors.New("unexpected publication")
 			}
-			result, err := f.o.ExportSandbox(f.ctx, f.apiKey, f.sb.ID, toTemplate, false)
+			result, err := f.o.ExportSandbox(f.ctx, f.apiKey, f.sb.ID, toTemplate, false, "")
 			if err != nil || result.Validate() != nil {
 				t.Fatalf("portable source could not finalize its own export: %+v, %v", result, err)
 			}
@@ -601,7 +601,7 @@ func TestSourceOperationLogicalGrantDoesNotAuthorizeAnotherDelete(t *testing.T) 
 	defer closeRetained()
 	_, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	attempt, started := f.o.exports.Begin(f.sb.ID, f.sb.ResumeSource, true, cancel)
+	attempt, started := f.o.exports.Begin(f.sb.ID, f.sb.ResumeSource, true, "", cancel)
 	if !started {
 		t.Fatal("export admission failed")
 	}
@@ -665,7 +665,7 @@ func TestSourceOperationInvalidExportOwnerRejectedBeforePublisher(t *testing.T) 
 				called = true
 				return artifact.PublishReport{}, errors.New("unexpected publication")
 			}
-			if _, err := f.o.ExportSandbox(f.ctx, f.apiKey, f.sb.ID, true, false); err == nil {
+			if _, err := f.o.ExportSandbox(f.ctx, f.apiKey, f.sb.ID, true, false, ""); err == nil {
 				t.Fatal("invalid export source was admitted")
 			}
 			if called || f.o.exports.ActiveDone(f.sb.ID) != nil {

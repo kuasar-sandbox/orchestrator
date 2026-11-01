@@ -733,7 +733,7 @@ node_link 重建第二条事实传播路径。
 | `node_sandbox_id` | 当前 node-local 执行 ID |
 | `sandbox_generation` | 当前 NodeSandboxID 的 Registry-owned 代际 |
 | `next_sandbox_generation` | 下一可分配代际;只由 Registry 持久化,不下发 node |
-| `state` | `reserved` / `ready` / `paused` / `dead` |
+| `state` | `reserved` / `ready` / `pausing` / `paused` / `dead` |
 | `node_id` | 当前承载节点 |
 | `profile` | 创建意图确定的 sandbox profile,与 node 归属及事件事实一致 |
 | `api_secret_fingerprint` | sandbox 业务记录绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
@@ -751,9 +751,15 @@ node_link 重建第二条事实传播路径。
 
 ```text
 none -> reserved -> ready
-ready -> paused -> reserved -> ready
-ready/paused/reserved -> dead/tombstone
+ready -> pausing -> paused -> reserved -> ready
+ready/pausing/paused/reserved -> dead/tombstone
 ```
+
+`pausing` 保留当前节点绑定. Router 将鉴权后的数据转发到该节点, 由 node Proxy park
+并请求 Wake; Pause/Resume 时序仍由 conductor 负责. 相同 route key 的 Create 也向
+原 pausing owner 发送 Connect 并等待 running, 不重新 placement 或创建新 generation.
+删除 checkpoint 转发其子资源
+API 路径, 不调用删除 sandbox 的控制命令.
 
 实际整机清空、单沙箱 killed、重启后确实缺失的 sandbox 都经 dead route 清理收敛；下次显式
 create/恢复 Reserve 可重新放置。host/conductor 重启本身不代表所有 durable paused 或 recovering
@@ -901,7 +907,7 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbo
 
 Router 是无状态的北向 E2B 控制/数据统一入口。Registry 经本篇协议提供已认证且按 group 分区的路由与 Build 状态，节点仍是生命周期和资源权威。客户端保留稳定 SandboxID，选中的节点目标可以变化。受保护路由凭据不得经公共观察或普通 watch/list 响应暴露（§11）。
 
-完整 [Router 契约](cluster-router_zh.md) 统一定义缓存 key/revision、成员发现、按操作转换请求、API/数据端点选择、native exec token 与首帧准入、重试边界和转发。即使 paused/starting，只要节点目标完整也可以转发，parking/activation 由节点负责。Registry Reserve/Resolve schema 仍在 [§8](#8-route_link) 定义，不在 Router 实现指南复制。
+完整 [Router 契约](cluster-router_zh.md) 统一定义缓存 key/revision、成员发现、按操作转换请求、API/数据端点选择、native exec token 与首帧准入、重试边界和转发。即使 pausing/paused/starting，只要节点目标完整也可以转发，parking/activation 由节点负责。Registry Reserve/Resolve schema 仍在 [§8](#8-route_link) 定义，不在 Router 实现指南复制。
 
 两篇分别描述协议两端：本篇定义 Registry 接受、持久化及返回的内容，Router 指南定义调用方如何使用结果。普通数据查询或 stale-route 重试都不允许创建未知 Sandbox、跳过鉴权或重放已准入 exec 字节。
 
@@ -1092,7 +1098,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 
 ## 15. 性能
 
-- 数据面热路径:router 命中完整 node target 后直转 node,包括 paused/starting,不访问 registry。
+- 数据面热路径:router 命中完整 node target 后直转 node,包括 pausing/paused/starting,不访问 registry。
 - Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner 当前连接/usage 检查 -> node 权威准入；明确失败的候选排除后重选，ambiguous Build dispatch 保持原绑定。
 - 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
 - 海量 node:node_link 按 node_id 分片;node_list 只承载低频目录,不承载高频水位。
