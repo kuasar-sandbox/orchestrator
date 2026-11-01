@@ -180,12 +180,15 @@ resume_checkpoint_guest 0 checkpoint
 write_value B
 stop_run
 wait_sandbox_state "$SID" dead 1200 || fail "second termination"
-E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --checkpoint "$CP_A" \
-    --to-template --json --socket "$WORK/node-ctl.socket" >"$WORK/export-A.json"
-HISTORY_TEMPLATE=$(json_field "$WORK/export-A.json" result)
 reset_manual
 resume_reset
 read_value current-after-A B
+# Export by the original ID after Reset and the new run's version collection.
+# This proves both the retained parent record and its historical disks survive.
+E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" --checkpoint "$CP_A" \
+    --to-template --json --socket "$WORK/node-ctl.socket" >"$WORK/export-A.json"
+HISTORY_TEMPLATE=$(json_field "$WORK/export-A.json" result)
+read_value current-after-history-export B
 assert_deleted
 TEMPLATE=$HISTORY_TEMPLATE
 create_reset_guest false
