@@ -178,6 +178,7 @@ sandbox:
     startup: { memory: 2GiB }
     overhead: { memory: 32MiB }
     watermark_high: { ratio: 0.875 }
+    diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
 ```
 
 - `capacity.memory` 是 Capacity。
@@ -202,6 +203,9 @@ located来源mapping,但不会打开或递归扫描refs Bundle。task把 Capacit
 异步 `resource_resolve` failure。失败发生在 network Attach、sandbox YAML、controller Admit
 和 VM 启动前,并且绝不回退 node default。`BudgetAtSnapshot` 仍由 sandboxer 从 CH
 snapshot target/current 计算,不由 orchestrator probe 或推导。
+
+
+`diff_cow` 配置 host sandbox-ctl 的 COW 缓存预算，同一实例的可写磁盘共享；脏缓存包含在总缓存内。API metadata `kuasar-sandbox.resource` 支持 `{"diff_cow":{"cache_size":"128MiB","max_dirty_size":"64MiB"}}`。request leaf 优先于节点配置，节点缺省 leaf 使用 sandbox-ctl 默认值（总缓存 32MiB、脏缓存 16MiB）。显式空串/null leaf 会被拒绝。大小必须为正的 4KiB 整数倍且适合 host 地址空间，解析后要求 `max_dirty_size <= cache_size`。当前 host 策略传入 cold、from-Sandbox 及内存快照恢复实例，不写入 portable artifact，也不热更新运行中的实例。
 
 ### 3.2 resource_listen
 

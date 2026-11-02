@@ -87,14 +87,14 @@ wait_resource_status() { # $1=sid, $2=expected status
     return 1
 }
 
-assert_resolved_resource_yaml() { # $1=config, $2=capacity, $3=startup, $4=controller|-, $5=headroom(default 256MiB), $6=deflate(default true)|-
+assert_resolved_resource_yaml() { # $1=config, $2=capacity, $3=startup, $4=controller|-, $5=headroom(default 256MiB), $6=deflate(default true)|-, $7/$8=optional COW cache/dirty sizes
     local headroom_memory="${5:-256MiB}"
     local deflate="${6:-true}"
-    python3 - "$1" "$2" "$3" "$4" "$headroom_memory" "$deflate" <<'PY'
+    python3 - "$1" "$2" "$3" "$4" "$headroom_memory" "$deflate" "${7:-}" "${8:-}" <<'PY'
 import re
 import sys
 
-path, capacity_memory, startup_memory, controller, headroom_memory, deflate = sys.argv[1:]
+path, capacity_memory, startup_memory, controller, headroom_memory, deflate, cow_cache, cow_dirty = sys.argv[1:]
 values = {}
 stack = []
 for raw in open(path, encoding="utf-8"):
@@ -138,6 +138,11 @@ memory_expected = {
     "resources.allocatable.memory": headroom_memory,
     "resources.overhead.memory": "32MiB",
 }
+if cow_cache:
+    memory_expected["resources.diff_cow.cache_size"] = cow_cache
+if cow_dirty:
+    memory_expected["resources.diff_cow.max_dirty_size"] = cow_dirty
+
 for key, want in memory_expected.items():
     got = values.get(key)
     if size_bytes(key, got) != size_bytes(key, want):

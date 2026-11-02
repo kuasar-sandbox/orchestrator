@@ -168,6 +168,7 @@ sandbox:
     startup: { memory: 2GiB }
     overhead: { memory: 32MiB }
     watermark_high: { ratio: 0.875 }
+    diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
 ```
 
 - `capacity.memory` is Capacity.
@@ -181,6 +182,9 @@ sandbox:
 Restore obtains Capacity from the snapshot. StartupHeadroom does not participate in restore admission: sandboxer's BudgetAtSnapshot is the sole initial reservation.
 
 A synchronous restore request validates only the portable patch structure. After the runner binds the exact run-id, its task reads the root snapshot.cfg in-process. For a Manifest Bundle root, it first reads only the metadata prefix and supplements located-source mappings from flat bundle/refs metadata; it does not open or recursively scan refs Bundles. The task returns Capacity as a nonsecret summary to the unique launch worker; conductor does not open the snapshot. Explicit request Capacity can act as an assertion. A mismatch or unreadable snapshot becomes an asynchronous `resource_resolve` failure, before network Attach, sandbox YAML, controller Admit or VM startup, with no fallback to node defaults. Sandboxer still computes BudgetAtSnapshot from CH snapshot target/current; orchestrator does not probe or derive it.
+
+
+`diff_cow` sets the host sandbox-ctl COW cache budget, shared across all active writable disks. Dirty memory is part of the total cache. API metadata `kuasar-sandbox.resource` accepts `{"diff_cow":{"cache_size":"128MiB","max_dirty_size":"64MiB"}}`. Request leaves take precedence over node defaults; omitted node leaves use sandbox-ctl defaults (32MiB total, 16MiB dirty). Explicit empty/null leaves are rejected. Sizes must be positive 4KiB multiples fitting host address space, with `max_dirty_size <= cache_size` after resolution. This host policy is carried into cold, from-Sandbox and memory-snapshot restore invocations; it is not persisted in portable artifacts and does not update running instances.
 
 ### 3.2 resource_listen
 

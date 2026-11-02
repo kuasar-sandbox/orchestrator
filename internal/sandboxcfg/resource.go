@@ -19,10 +19,16 @@ const resourceFieldPath = NsResource
 // snapshot. HTTP and cluster boundaries map it to a request rejection.
 var ErrInvalidResourceRequest = errors.New("invalid sandbox resource request")
 
-// ResourcePatch is the complete tenant-configurable resource surface. Every
-// leaf is a pointer so an omitted value remains distinguishable from an
-// explicitly invalid zero or empty value.
+// DiffCOWPatch carries explicit request leaves for host COW cache policy.
+type DiffCOWPatch struct {
+	CacheSize    *string `json:"cache_size,omitempty" yaml:"cache_size,omitempty"`
+	MaxDirtySize *string `json:"max_dirty_size,omitempty" yaml:"max_dirty_size,omitempty"`
+}
+
+// ResourcePatch is the complete tenant-configurable resource surface. Pointer
+// leaves distinguish omission from explicitly invalid zero or empty values.
 type ResourcePatch struct {
+	DiffCOW     *DiffCOWPatch     `json:"diff_cow,omitempty" yaml:"diff_cow,omitempty"`
 	Capacity    *CapacityPatch    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *AllocatablePatch `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
 	Startup     *StartupPatch     `json:"startup,omitempty" yaml:"startup,omitempty"`
@@ -47,6 +53,7 @@ type StartupPatch struct {
 // WatermarkHigh, and neither request surface exposes control, sensor, or
 // deflate policy.
 type NodeResourcePolicy struct {
+	DiffCOW       rtconfig.DiffCOWConfig   `yaml:"diff_cow,omitempty" json:"diff_cow,omitempty"`
 	Capacity      NodeCapacityPolicy       `yaml:"capacity" json:"capacity"`
 	Allocatable   NodeAllocatablePolicy    `yaml:"allocatable" json:"allocatable"`
 	Startup       *NodeStartupPolicy       `yaml:"startup,omitempty" json:"startup,omitempty"`
@@ -117,6 +124,9 @@ func MaterializedNodeResourcePolicy(policy NodeResourcePolicy) NodeResourcePolic
 // ValidateNodeResourcePolicy rejects malformed conductor policy before the
 // daemon creates sockets, cgroups, networks, or runners.
 func ValidateNodeResourcePolicy(policy NodeResourcePolicy, dynamic bool) error {
+	if _, _, err := policy.DiffCOW.Bytes(); err != nil {
+		return err
+	}
 	policy.ApplyDefaults()
 	if policy.Capacity.CPU <= 0 {
 		return errors.New("sandbox.resources.capacity.cpu must be > 0")
@@ -175,6 +185,12 @@ func ParseResourcePatch(raw string) (ResourcePatch, error) {
 	for field, value := range object {
 		path := resourceFieldPath + "." + field
 		switch field {
+		case "diff_cow":
+			parsed, err := parseDiffCOWPatch(path, value)
+			if err != nil {
+				return patch, err
+			}
+			patch.DiffCOW = parsed
 		case "capacity":
 			parsed, err := parseCapacityPatch(path, value)
 			if err != nil {
@@ -364,6 +380,11 @@ func positiveFinite(value float64) bool {
 // template may be built with a snapshot capacity that differs from the node's
 // cold-boot default, and restore validation owns that final constraint.
 func ValidateResourcePatch(patch ResourcePatch) error {
+	if patch.DiffCOW != nil {
+		if err := validateDiffCOWPatch(patch.DiffCOW); err != nil {
+			return err
+		}
+	}
 	var capacityMemory, allocatableMemory, startupMemory uint64
 	var hasCapacityMemory, hasAllocatableMemory, hasStartupMemory bool
 	if patch.Capacity != nil {
@@ -429,6 +450,7 @@ func MarshalResourcePatch(patch ResourcePatch) (string, error) {
 // relationships introduced across layers.
 func MergeResourcePatch(base, over ResourcePatch) (ResourcePatch, error) {
 	out := cloneResourcePatch(base)
+	out.DiffCOW = mergeDiffCOWPatch(base.DiffCOW, over.DiffCOW)
 	if over.Capacity != nil {
 		if out.Capacity == nil {
 			out.Capacity = &CapacityPatch{}
@@ -467,6 +489,7 @@ func MergeResourcePatch(base, over ResourcePatch) (ResourcePatch, error) {
 
 func cloneResourcePatch(in ResourcePatch) ResourcePatch {
 	var out ResourcePatch
+	out.DiffCOW = mergeDiffCOWPatch(nil, in.DiffCOW)
 	if in.Capacity != nil {
 		out.Capacity = &CapacityPatch{}
 		if in.Capacity.CPU != nil {
@@ -557,7 +580,7 @@ func ApplyCapacity(meta map[string]string, cpu, memoryMiB int) (map[string]strin
 		}
 		patch = merged
 	}
-	if !resourcePresent && patch.Capacity == nil && patch.Allocatable == nil && patch.Startup == nil {
+	if !resourcePresent && patch.Capacity == nil && patch.Allocatable == nil && patch.Startup == nil && patch.DiffCOW == nil {
 		return cloneStringMap(meta), nil
 	}
 	canonical, err := MarshalResourcePatch(patch)
@@ -672,7 +695,20 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 		allocMemory, allocMem = capacity.Memory, capMem
 	}
 
+	cow := policy.DiffCOW
+	if input.Patch.DiffCOW != nil {
+		if input.Patch.DiffCOW.CacheSize != nil {
+			cow.CacheSize = *input.Patch.DiffCOW.CacheSize
+		}
+		if input.Patch.DiffCOW.MaxDirtySize != nil {
+			cow.MaxDirtySize = *input.Patch.DiffCOW.MaxDirtySize
+		}
+	}
+	if _, _, err := cow.Bytes(); err != nil {
+		return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: %v", ErrInvalidResourceRequest, err)
+	}
 	resources := rtconfig.ResourcesConfig{
+		DiffCOW:  cow,
 		Capacity: capacity,
 		Allocatable: rtconfig.AllocatableConfig{
 			CPU: allocCPU, Memory: allocMemory,
@@ -786,4 +822,70 @@ func ValidateResolvedResources(resources rtconfig.ResourcesConfig, dynamic bool)
 		return errors.New("resources.allocatable.deflate_on_oom must be true when ballooning is enabled")
 	}
 	return nil
+}
+
+func parseDiffCOWPatch(path string, raw json.RawMessage) (*DiffCOWPatch, error) {
+	object, err := decodeJSONObject(path, raw)
+	if err != nil {
+		return nil, err
+	}
+	out := &DiffCOWPatch{}
+	for field, value := range object {
+		var v string
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return nil, fmt.Errorf("%s.%s must be a size", path, field)
+		}
+		if err := json.Unmarshal(value, &v); err != nil {
+			return nil, fmt.Errorf("%s.%s must be a size", path, field)
+		}
+		switch field {
+		case "cache_size":
+			out.CacheSize = &v
+		case "max_dirty_size":
+			out.MaxDirtySize = &v
+		default:
+			return nil, fmt.Errorf("%s contains unknown field %q", path, field)
+		}
+	}
+	return out, validateDiffCOWPatch(out)
+}
+func validateDiffCOWPatch(p *DiffCOWPatch) error {
+	for _, leaf := range []struct {
+		field string
+		value *string
+	}{
+		{"cache_size", p.CacheSize}, {"max_dirty_size", p.MaxDirtySize},
+	} {
+		if leaf.value == nil {
+			continue
+		}
+		n, err := rtutil.ParseSize(*leaf.value)
+		if err != nil || n == 0 || n%4096 != 0 || n > uint64(int(^uint(0)>>1)) {
+			return fmt.Errorf("%s.diff_cow.%s must be a positive 4 KiB multiple fitting host address space (got %q)", resourceFieldPath, leaf.field, *leaf.value)
+		}
+	}
+	if p.CacheSize != nil && p.MaxDirtySize != nil {
+		_, _, err := (rtconfig.DiffCOWConfig{CacheSize: *p.CacheSize, MaxDirtySize: *p.MaxDirtySize}).Bytes()
+		return err
+	}
+	return nil
+}
+
+func mergeDiffCOWPatch(base, over *DiffCOWPatch) *DiffCOWPatch {
+	if base == nil && over == nil {
+		return nil
+	}
+	out := &DiffCOWPatch{}
+	for _, p := range []*DiffCOWPatch{base, over} {
+		if p == nil {
+			continue
+		}
+		if p.CacheSize != nil {
+			out.CacheSize = stringPtr(*p.CacheSize)
+		}
+		if p.MaxDirtySize != nil {
+			out.MaxDirtySize = stringPtr(*p.MaxDirtySize)
+		}
+	}
+	return out
 }

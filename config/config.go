@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -441,15 +442,46 @@ func (s SandboxConfig) DeadTTLDur() time.Duration {
 	return d
 }
 
-// ResourcesConfig is the conductor-owned sandbox resource policy. It is a
-// public value schema and deliberately omits sandbox runtime control, deflate,
-// and sensor fields.
+// ResourceDiffCOW exposes the host-owned COW cache policy. Missing leaves use
+// sandbox-ctl defaults; explicitly empty or invalid sizes are rejected.
+type ResourceDiffCOW struct {
+	CacheSize    string `yaml:"cache_size,omitempty" json:"cache_size,omitempty"`
+	MaxDirtySize string `yaml:"max_dirty_size,omitempty" json:"max_dirty_size,omitempty"`
+}
+
+// ResourcesConfig is the conductor-owned sandbox resource policy. It omits
+// runtime control, deflate, and sensor fields. DiffCOW is an intentional
+// host-policy exception: operators can configure the sandbox-ctl cache budget.
 type ResourcesConfig struct {
+	DiffCOW       ResourceDiffCOW        `yaml:"diff_cow,omitempty" json:"diff_cow,omitempty"`
 	Capacity      ResourceCapacity       `yaml:"capacity" json:"capacity"`
 	Allocatable   ResourceAllocatable    `yaml:"allocatable" json:"allocatable"`
 	Startup       *ResourceStartup       `yaml:"startup,omitempty" json:"startup,omitempty"`
 	Overhead      ResourceOverhead       `yaml:"overhead" json:"overhead"`
 	WatermarkHigh *ResourceWatermarkHigh `yaml:"watermark_high,omitempty" json:"watermark_high,omitempty"`
+}
+
+// UnmarshalYAML shares sandbox-ctl's strict leaf decoding, including explicit
+// empty/null sizes, unknown fields, duplicate keys, and alignment checks.
+func (c *ResourceDiffCOW) UnmarshalYAML(node *yaml.Node) error {
+	var decoded rtconfig.DiffCOWConfig
+	if err := decoded.UnmarshalYAML(node); err != nil {
+		return err
+	}
+	*c = ResourceDiffCOW{CacheSize: decoded.CacheSize, MaxDirtySize: decoded.MaxDirtySize}
+	return nil
+}
+
+// UnmarshalJSON uses the same explicit-value rules as conductor YAML.
+func (c *ResourceDiffCOW) UnmarshalJSON(raw []byte) error {
+	if !json.Valid(raw) {
+		return fmt.Errorf("resources.diff_cow must be a valid JSON object")
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	return c.UnmarshalYAML(doc.Content[0])
 }
 
 // UnmarshalJSON preserves the public schema's strict nested JSON decoding.
@@ -512,6 +544,7 @@ func (r *ResourcesConfig) applyDefaults() {
 
 func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 	policy := sandboxcfg.NodeResourcePolicy{
+		DiffCOW: rtconfig.DiffCOWConfig{CacheSize: r.DiffCOW.CacheSize, MaxDirtySize: r.DiffCOW.MaxDirtySize},
 		Capacity: sandboxcfg.NodeCapacityPolicy{
 			CPU: r.Capacity.CPU, Memory: r.Capacity.Memory,
 		},
@@ -536,6 +569,7 @@ func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 }
 
 func (r *ResourcesConfig) setNodeResourcePolicy(policy sandboxcfg.NodeResourcePolicy) {
+	r.DiffCOW = ResourceDiffCOW{CacheSize: policy.DiffCOW.CacheSize, MaxDirtySize: policy.DiffCOW.MaxDirtySize}
 	r.Capacity = ResourceCapacity{CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory}
 	r.Allocatable = ResourceAllocatable{
 		CPU: clonePtr(policy.Allocatable.CPU), Memory: clonePtr(policy.Allocatable.Memory),

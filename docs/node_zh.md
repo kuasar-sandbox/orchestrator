@@ -483,6 +483,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `sandbox.resources.startup.memory` | 最终 `capacity.memory` | cold 首份可信 report 前的 headroom,static/dynamic 均有效,与 settled headroom 独立;restore 不使用 |
 | `sandbox.resources.overhead.memory` | `32MiB` | node-owned host VMM overhead;sandbox-ctl 不在 VMM cgroup 内;request/template 不可覆盖 |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | node-owned sandbox `memory.high` pressure ratio,必须在 `(0,1)`;request/template 不可覆盖 |
+| `sandbox.resources.diff_cow` | `cache_size: 32MiB`, `max_dirty_size: 16MiB` | Host COW 缓存策略，也支持通过 resource API metadata 配置；见[资源配置](node-resource_zh.md#31-sandbox-resource-policy)。 |
 | `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
@@ -1114,7 +1115,8 @@ JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定�
 {
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
-  "startup": {"memory": "1GiB"}
+  "startup": {"memory": "1GiB"},
+  "diff_cow": {"cache_size": "128MiB", "max_dirty_size": "64MiB"}
 }
 ```
 
@@ -1136,7 +1138,7 @@ node resource policy
   < portable artifact capacity constraint
 ```
 
-五个 leaf 独立 overlay；group 只设 `capacity.memory`、create 只设
+各 resource leaf 独立 overlay；group 只设 `capacity.memory`、create 只设
 `allocatable.memory` 时两者同时保留。Build row metadata 不是 Create overlay 层。其它
 namespace 遵循下文各自的合并规则，多数采用 whole-namespace 覆盖。每一层都先
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build

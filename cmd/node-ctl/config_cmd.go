@@ -196,6 +196,7 @@ sandbox:                                          # sandbox-instance defaults
     sample_interval: 1s
     flush_interval: 5m                            # native append schedule; no fsync
   resources:
+    diff_cow: { cache_size: 32MiB, max_dirty_size: 16MiB }
     capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B SKU
     allocatable:
       # cpu: 2                                    # omitted => follows final capacity.cpu

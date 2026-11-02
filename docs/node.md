@@ -329,6 +329,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `sandbox.resources.startup.memory` | Final capacity memory | Headroom before the first trusted cold report, in static and dynamic modes; independent of settled headroom and unused for initial restore Budget |
 | `sandbox.resources.overhead.memory` | `32MiB` | Node-owned host VMM overhead; sandbox-ctl is outside VMM cgroup. Requests/templates cannot override |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | Node-owned memory.high pressure ratio in `(0,1)`; requests/templates cannot override |
+| `sandbox.resources.diff_cow` | `cache_size: 32MiB`, `max_dirty_size: 16MiB` | Host COW cache policy; also configurable through resource API metadata. See [resource configuration](node-resource.md#31-sandbox-resource-policy). |
 | `sandbox.network.switch` | `sw0` | Vswitch name |
 | `sandbox.network.hostname` | `sandbox` | Guest sethostname and `/etc/hosts` entry (§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | Guest `/etc/resolv.conf` nameserver; deployment must route it to actual DNS |
@@ -920,7 +921,8 @@ Resource and traffic merge by leaf. Public resource JSON permits only:
 {
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
-  "startup": {"memory": "1GiB"}
+  "startup": {"memory": "1GiB"},
+  "diff_cow": {"cache_size": "128MiB", "max_dirty_size": "64MiB"}
 }
 ```
 
@@ -937,7 +939,7 @@ node resource policy
   < portable artifact capacity constraint
 ```
 
-The five leaves overlay independently: group capacity.memory and Create allocatable.memory both survive. Build-row metadata is not another Create layer. Other namespaces follow their own rules below, generally whole-namespace replacement. Every layer is parsed strictly before merging, so a valid higher layer cannot hide an invalid lower one. Group/reserve, standalone/cluster and Build registration share the helper.
+The resource leaves overlay independently: group capacity.memory and Create allocatable.memory both survive. Build-row metadata is not another Create layer. Other namespaces follow their own rules below, generally whole-namespace replacement. Every layer is parsed strictly before merging, so a valid higher layer cannot hide an invalid lower one. Group/reserve, standalone/cluster and Build registration share the helper.
 
 Build traffic is request-scoped to the Build runtime and its synthetic route; it is not inherited by Sandboxes created from the output artifact. Canonical TemplateID Create never queries retained Build metadata, a Template catalog, or artifact metadata for traffic defaults. Traffic leaf priority is:
 

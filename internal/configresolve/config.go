@@ -6,6 +6,7 @@ package configresolve
 import (
 	"encoding/json"
 	"fmt"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"os"
 	"path/filepath"
 
@@ -81,6 +82,7 @@ func EncryptionKeySpec(cfg *publicconfig.Conductor) string {
 // resolver input while preserving pointer presence.
 func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePolicy {
 	out := sandboxcfg.NodeResourcePolicy{
+		DiffCOW: rtconfig.DiffCOWConfig{CacheSize: in.DiffCOW.CacheSize, MaxDirtySize: in.DiffCOW.MaxDirtySize},
 		Capacity: sandboxcfg.NodeCapacityPolicy{
 			CPU: in.Capacity.CPU, Memory: in.Capacity.Memory,
 		},
@@ -103,6 +105,7 @@ func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePo
 // direction from the public schema into SandboxResources.
 func PublicSandboxResources(policy sandboxcfg.NodeResourcePolicy) publicconfig.ResourcesConfig {
 	out := publicconfig.ResourcesConfig{
+		DiffCOW: publicconfig.ResourceDiffCOW{CacheSize: policy.DiffCOW.CacheSize, MaxDirtySize: policy.DiffCOW.MaxDirtySize},
 		Capacity: publicconfig.ResourceCapacity{
 			CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory,
 		},

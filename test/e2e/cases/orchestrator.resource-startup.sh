@@ -3,6 +3,12 @@
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/execute_env.sh"
 write_orchestrator_config unset static
+# Host cache policy is checked here only at the generated-config boundary.
+# Runtime cache behavior belongs to sandboxer tests, not this node test.
+sed -i '/^sandbox:$/,/^builder:$/s/^  resources:$/  resources:\n    diff_cow: {cache_size: 4MiB, max_dirty_size: 2MiB}/' "$WORK/config.yaml"
+sed -n '/^sandbox:$/,/^builder:$/p' "$WORK/config.yaml" \
+    | grep -Fq 'diff_cow: {cache_size: 4MiB, max_dirty_size: 2MiB}' \
+    || fail "sandbox COW policy missing from prepared config"
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
@@ -64,6 +70,7 @@ print(json.dumps({
         "kuasar-sandbox.resource": json.dumps({
             "capacity": {"cpu": 2, "memory": "8GiB"},
             "allocatable": {"cpu": 2, "memory": "256MiB"},
+            "diff_cow": {"cache_size": "8MiB", "max_dirty_size": "4MiB"},
         }),
     },
 }))
@@ -92,7 +99,7 @@ run_low_allocatable_case() { # $1=iteration
     LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
     [ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable[$iteration] startup took ${LOW_ELAPSED_MS}ms"
     wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable[$iteration] sandbox not running"
-    assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$LOW_SID/$LOW_SID.yaml" 8GiB 8GiB - \
+    assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$LOW_SID/$LOW_SID.yaml" 8GiB 8GiB - 256MiB true 8MiB 4MiB \
         || fail "low-allocatable[$iteration] static resolved resource YAML"
     LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
     [ -n "$LOW_RUN_ID" ] || fail "low-allocatable[$iteration] sandbox has no run_id"
@@ -173,6 +180,10 @@ echo "==> PASS: repeated 8GiB/256MiB startup $LOW_ALLOC_REPEATS times"
 # controller for reservation stats and restore coverage below.
 stop_orchestrator
 write_orchestrator_config unset controller
+sed -i '/^sandbox:$/,/^builder:$/s/^  resources:$/  resources:\n    diff_cow: {cache_size: 4MiB, max_dirty_size: 2MiB}/' "$WORK/config.yaml"
+sed -n '/^sandbox:$/,/^builder:$/p' "$WORK/config.yaml" \
+    | grep -Fq 'diff_cow: {cache_size: 4MiB, max_dirty_size: 2MiB}' \
+    || fail "sandbox COW policy missing from prepared config"
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 echo "==> PASS: conductor restarted with the resource controller after static cgroup validation"
@@ -196,7 +207,7 @@ code=$(DP_MAX_TIME=65 dp "49983-$DEFAULT_SID" /health "$DEFAULT_TOKEN" || true)
 wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy cold sandbox not running"
 assert_native_usage "$DEFAULT_SID" live
 assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$DEFAULT_SID/$DEFAULT_SID.yaml" \
-    2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy dynamic resolved resource YAML"
+    2GiB 2GiB "$WORK/sandbox-resource.sock" 256MiB true 4MiB 2MiB || fail "default-policy dynamic resolved resource YAML"
 wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing"
 assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
     || fail "default-policy lease did not match generated YAML"
@@ -217,7 +228,7 @@ done
 [ -n "$default_resumed" ] || fail "default-policy envd did not recover after resume"
 wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy resumed sandbox not running"
 assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$DEFAULT_SID/$DEFAULT_SID.yaml" \
-    2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy restore resource YAML"
+    2GiB 2GiB "$WORK/sandbox-resource.sock" 256MiB true 4MiB 2MiB || fail "default-policy restore resource YAML"
 wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing after resume"
 assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
     || fail "default-policy restored lease did not match generated YAML"
@@ -232,7 +243,7 @@ print(json.dumps({
     "templateID": sys.argv[1],
     "timeout": 120,
     "metadata": {
-        "kuasar-sandbox.resource": json.dumps({"capacity": {"memory": "192MiB"}}),
+        "kuasar-sandbox.resource": json.dumps({"capacity": {"memory": "192MiB"}, "diff_cow": {"cache_size": "8MiB"}}),
     },
 }))
 PY
@@ -245,7 +256,7 @@ wait_sandbox_state "$SMALL_SID" running 600 || {
     fail "small-capacity bare sandbox did not reach running"
 }
 assert_resolved_resource_yaml "$EXECUTE_RUN_ROOT/sandboxes/$SMALL_SID/$SMALL_SID.yaml" \
-    192MiB 192MiB "$WORK/sandbox-resource.sock" 192MiB - \
+    192MiB 192MiB "$WORK/sandbox-resource.sock" 192MiB - 8MiB 2MiB \
     || fail "capacity<256MiB did not normalize inherited headroom"
 assert_resource_lease "$SMALL_SID" 201326592 201326592 201326592 \
     || fail "small-capacity lease did not match normalized YAML"

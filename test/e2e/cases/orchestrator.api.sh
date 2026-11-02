@@ -85,4 +85,36 @@ req() {
 "$NODE" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
 [ "$(req POST /v3/templates "$AK" '{"name":"allowed","cpuCount":1,"memoryMB":1024}')" = 202 ] || { cat "$WORK/resp.body"; fail "allowlisted register"; }
 
+
+# Validate the public error contract without a VM or a registered Proxy. The
+# template reference is structurally valid; the resource patch must be rejected
+# before launch admission rather than failing on an unrelated template error.
+INVALID_TEMPLATE=$(python3 - <<'PY_TEMPLATE'
+import base64
+print('bare-img-' + base64.urlsafe_b64encode(b'manifest://' + b'0' * 64).decode().rstrip('='))
+PY_TEMPLATE
+)
+assert_invalid_diff_cow() { # JSON patch, expected error leaf
+    local patch="$1" field="$2" body code
+    body=$(python3 - "$INVALID_TEMPLATE" "$patch" <<'PY_BODY'
+import json, sys
+print(json.dumps({'templateID': sys.argv[1], 'metadata': {'kuasar-sandbox.resource': sys.argv[2]}}))
+PY_BODY
+)
+    code=$(req POST /sandboxes "$AK" "$body")
+    [ "$code" = 400 ] || { cat "$WORK/resp.body"; fail "invalid diff_cow accepted or failed elsewhere: HTTP $code"; }
+    python3 - "$WORK/resp.body" "$field" <<'PY_ERROR'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as source:
+    body = json.load(source)
+message = body.get('message', '')
+assert sys.argv[2] in message, (sys.argv[2], body)
+PY_ERROR
+}
+assert_invalid_diff_cow '{"diff_cow":{"cache_size":"1KiB"}}' diff_cow.cache_size
+assert_invalid_diff_cow '{"diff_cow":{"cache_size":""}}' diff_cow.cache_size
+assert_invalid_diff_cow '{"diff_cow":{"cache_size":null}}' diff_cow.cache_size
+assert_invalid_diff_cow '{"diff_cow":{"cache_size":"4KiB","max_dirty_size":"8KiB"}}' diff_cow.max_dirty_size
+assert_invalid_diff_cow '{"diff_cow":{"max_dirty_size":null}}' diff_cow.max_dirty_size
+
 echo "PASS orchestrator.api.sh"
