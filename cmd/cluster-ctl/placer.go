@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,6 +17,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/placer"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // runPlacer starts the standalone placer: it uses registry membership as the
@@ -28,6 +32,34 @@ func runPlacer(args []string, log *slog.Logger) error {
 	cfg, err := clustercfg.LoadPlacer(*cfgPath)
 	if err != nil {
 		return err
+	}
+	// Validate local address syntax without binding or resolving a remote host.
+	if !strings.HasPrefix(cfg.Placer.Listen, "/") {
+		_, port, err := net.SplitHostPort(cfg.Placer.Listen)
+		if err != nil {
+			return fmt.Errorf("placer listen: %w", err)
+		}
+		if _, err := net.DefaultResolver.LookupPort(context.Background(), "tcp", port); err != nil {
+			return fmt.Errorf("placer listen: %w", err)
+		}
+	}
+	if len(cfg.ImportGroups) == 0 {
+		return fmt.Errorf("placer: standalone mode requires at least one import_groups source")
+	}
+	groupInputs, err := placer.NewConfiguredGroupInputs(cfg.ImportGroups)
+	if err != nil {
+		return err
+	}
+	memberlistTLS, err := membergroupTLSConfig(cfg.Placer.TLS)
+	if err != nil {
+		return fmt.Errorf("placer memberlist tls: %w", err)
+	}
+	var serverTLS *tls.Config
+	if cfg.Placer.TLS.Enabled() && !strings.HasPrefix(cfg.Placer.Listen, "/") {
+		serverTLS, err = cfg.Placer.TLS.ServerConfig()
+		if err != nil {
+			return fmt.Errorf("placer server tls: %w", err)
+		}
 	}
 	registryAddr := cfg.Registry.Bootstrap
 
@@ -45,15 +77,15 @@ func runPlacer(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	eps, err := regClient.OwnerEndpoints(ctx)
+	eps, err := waitPlacerMembership(ctx, regClient, log, 2*time.Second, 200*time.Millisecond, 5*time.Second)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	if len(eps) == 0 {
 		return fmt.Errorf("placer: registry membership has no members")
-	}
-	if len(cfg.ImportGroups) == 0 {
-		return fmt.Errorf("placer: standalone mode requires at least one import_groups source")
 	}
 	nodeListEps, err := regClient.NodeListEndpoints(ctx)
 	if err != nil {
@@ -64,19 +96,11 @@ func runPlacer(args []string, log *slog.Logger) error {
 		return err
 	}
 	links := registryLinks(eps)
-	groupInputs, err := placer.NewConfiguredGroupInputs(cfg.ImportGroups)
-	if err != nil {
-		return err
-	}
 	svc := placer.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, log)
 	svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), activeLabel)
 	svc.SetPlacerLinkResolver(newPlacerLinkResolver(regClient))
 	svc.SetPlacerLinkRefresher(regClient.Refresh)
 	memberHub := membergroup.NewHub()
-	memberlistTLS, err := membergroupTLSConfig(cfg.Placer.TLS)
-	if err != nil {
-		return fmt.Errorf("placer memberlist tls: %w", err)
-	}
 	placerGroup, err := membergroup.New(membergroup.Options{
 		Label: cfg.Placer.MemberlistLabel, Name: cfg.Placer.ID, Hub: memberHub, Log: log,
 		TLSConfig: memberlistTLS,
@@ -111,10 +135,16 @@ func runPlacer(args []string, log *slog.Logger) error {
 	mux := http.NewServeMux()
 	memberHub.Mount(mux)
 	svc.ServePlacerLink(mux)
-	httpServer, err := newClusterHTTPServer("placer", cfg.Placer.Listen, cfg.Placer.TLS, mux)
+	// Bind only after bootstrap succeeds; use the materials loaded before waiting.
+	ln, err := listenLink(cfg.Placer.Listen)
 	if err != nil {
-		return err
+		return fmt.Errorf("cluster: placer listen %s: %w", cfg.Placer.Listen, err)
 	}
+	server := &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
+	if serverTLS != nil {
+		server = &http.Server{Handler: mux, TLSConfig: serverTLS}
+	}
+	httpServer := &clusterHTTPServer{name: "placer", addr: cfg.Placer.Listen, useTLS: serverTLS != nil, server: server, listener: ln}
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- httpServer.Serve(ctx, log)
