@@ -29,6 +29,7 @@ func TestConductorConfigTemplateUsesNestedSandboxResourcePolicy(t *testing.T) {
 		"memory: 256MiB",
 		"startup: { memory: 512MiB }",
 		"overhead: { memory: 32MiB }",
+		"diff_cow:", "cache_size: 32MiB", "max_dirty_size: 16MiB",
 	} {
 		if !strings.Contains(sandboxBlock, want) {
 			t.Errorf("sandbox template does not contain %q:\n%s", want, sandboxBlock)
@@ -237,6 +238,7 @@ func TestRenderConductorConfigNormalizesNestedResourceDefaults(t *testing.T) {
 api: { domain: config.test }
 encryption_key: test-key
 sandbox:
+  resources: { diff_cow: { cache_size: 64MiB } }
   boot: { kernel: /kernel, runtime: /runtime }
 `)
 	out, err := renderConductorConfig(false, false, path)
@@ -250,6 +252,13 @@ sandbox:
 		t.Fatalf("normalized config has no sandbox block:\n%s", text)
 	}
 	sandboxBlock := text[start : start+end]
+	decoded, err := config.DecodeConductor(strings.NewReader(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cow := decoded.Sandbox.Resources.DiffCOW; cow == nil || cow.CacheSize == nil || *cow.CacheSize != "64MiB" || cow.MaxDirtySize != nil {
+		t.Fatalf("render/read changed DiffCOW presence: %+v", cow)
+	}
 	for _, want := range []string{
 		"capacity:\n            cpu: 2\n            memory: 2GiB",
 		"allocatable: {}",

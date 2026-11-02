@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
@@ -26,6 +27,7 @@ type ResourcePatch struct {
 	Capacity    *CapacityPatch    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *AllocatablePatch `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
 	Startup     *StartupPatch     `json:"startup,omitempty" yaml:"startup,omitempty"`
+	DiffCOW     *DiffCOWPatch     `json:"diff_cow,omitempty" yaml:"diff_cow,omitempty"`
 }
 
 type CapacityPatch struct {
@@ -42,6 +44,13 @@ type StartupPatch struct {
 	Memory *string `json:"memory,omitempty" yaml:"memory,omitempty"`
 }
 
+// DiffCOWPatch preserves only the host cache limits explicitly configured by
+// the operator or tenant. Derived limits belong to the final runtime config.
+type DiffCOWPatch struct {
+	CacheSize    *string `json:"cache_size,omitempty" yaml:"cache_size,omitempty"`
+	MaxDirtySize *string `json:"max_dirty_size,omitempty" yaml:"max_dirty_size,omitempty"`
+}
+
 // NodeResourcePolicy is conductor-owned policy, deliberately narrower than
 // sandboxer's runtime ResourcesConfig. Tenant metadata never sees Overhead or
 // WatermarkHigh, and neither request surface exposes control, sensor, or
@@ -52,6 +61,7 @@ type NodeResourcePolicy struct {
 	Startup       *NodeStartupPolicy       `yaml:"startup,omitempty" json:"startup,omitempty"`
 	Overhead      NodeOverheadPolicy       `yaml:"overhead" json:"overhead"`
 	WatermarkHigh *NodeWatermarkHighPolicy `yaml:"watermark_high,omitempty" json:"watermark_high,omitempty"`
+	DiffCOW       *DiffCOWPatch            `yaml:"diff_cow,omitempty" json:"diff_cow,omitempty"`
 }
 
 type NodeCapacityPolicy struct {
@@ -97,12 +107,9 @@ func (p *NodeResourcePolicy) ApplyDefaults() {
 	if p.Overhead.Memory == "" {
 		p.Overhead.Memory = "32MiB"
 	}
-	if p.WatermarkHigh == nil {
-		p.WatermarkHigh = &NodeWatermarkHighPolicy{}
-	}
-	if p.WatermarkHigh.Ratio == nil {
+	if p.WatermarkHigh == nil || p.WatermarkHigh.Ratio == nil {
 		ratio := 0.875
-		p.WatermarkHigh.Ratio = &ratio
+		p.WatermarkHigh = &NodeWatermarkHighPolicy{Ratio: &ratio}
 	}
 }
 
@@ -118,6 +125,9 @@ func MaterializedNodeResourcePolicy(policy NodeResourcePolicy) NodeResourcePolic
 // daemon creates sockets, cgroups, networks, or runners.
 func ValidateNodeResourcePolicy(policy NodeResourcePolicy, dynamic bool) error {
 	policy.ApplyDefaults()
+	if _, err := resolveDiffCOW(policy.DiffCOW, "sandbox.resources"); err != nil {
+		return err
+	}
 	if policy.Capacity.CPU <= 0 {
 		return errors.New("sandbox.resources.capacity.cpu must be > 0")
 	}
@@ -193,6 +203,12 @@ func ParseResourcePatch(raw string) (ResourcePatch, error) {
 				return patch, err
 			}
 			patch.Startup = parsed
+		case "diff_cow":
+			parsed, err := parseDiffCOWPatch(path, value)
+			if err != nil {
+				return patch, err
+			}
+			patch.DiffCOW = parsed
 		case "control":
 			return patch, fmt.Errorf("%s is node-managed", path)
 		case "overhead":
@@ -297,6 +313,85 @@ func parseStartupPatch(path string, raw json.RawMessage) (*StartupPatch, error) 
 	return out, nil
 }
 
+func parseDiffCOWPatch(path string, raw json.RawMessage) (*DiffCOWPatch, error) {
+	object, err := decodeJSONObject(path, raw)
+	if err != nil {
+		return nil, err
+	}
+	out := &DiffCOWPatch{}
+	for field, raw := range object {
+		var value string
+		switch field {
+		case "cache_size":
+			out.CacheSize = &value
+		case "max_dirty_size":
+			out.MaxDirtySize = &value
+		default:
+			return nil, fmt.Errorf("%s contains unknown field %q", path, field)
+		}
+		if err := decodeLeaf(path+"."+field, raw, &value); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (p *DiffCOWPatch) runtimeConfig(root string) (rtconfig.DiffCOWConfig, error) {
+	var cfg rtconfig.DiffCOWConfig
+	if p == nil {
+		return cfg, nil
+	}
+	if p.CacheSize != nil {
+		if *p.CacheSize == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.cache_size must not be empty", root)
+		}
+		cfg.CacheSize = *p.CacheSize
+	}
+	if p.MaxDirtySize != nil {
+		if *p.MaxDirtySize == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.max_dirty_size must not be empty", root)
+		}
+		cfg.MaxDirtySize = *p.MaxDirtySize
+	}
+	return cfg, nil
+}
+
+// Rebase sandboxer's resource error onto the node or metadata field path.
+func diffCOWError(root string, err error) error {
+	return fmt.Errorf("%s.%s", root, strings.TrimPrefix(err.Error(), "resources."))
+}
+
+func resolveDiffCOW(p *DiffCOWPatch, root string) (rtconfig.DiffCOWConfig, error) {
+	cfg, err := p.runtimeConfig(root)
+	if err != nil {
+		return cfg, err
+	}
+	resolved, err := cfg.Resolve()
+	if err != nil {
+		return resolved, diffCOWError(root, err)
+	}
+	return resolved, nil
+}
+
+func mergeDiffCOW(base, over *DiffCOWPatch) *DiffCOWPatch {
+	if base == nil && over == nil {
+		return nil
+	}
+	out := &DiffCOWPatch{}
+	for _, layer := range []*DiffCOWPatch{base, over} {
+		if layer == nil {
+			continue
+		}
+		if layer.CacheSize != nil {
+			out.CacheSize = stringPtr(*layer.CacheSize)
+		}
+		if layer.MaxDirtySize != nil {
+			out.MaxDirtySize = stringPtr(*layer.MaxDirtySize)
+		}
+	}
+	return out
+}
+
 func decodeJSONObject(path string, raw []byte) (map[string]json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
@@ -364,6 +459,13 @@ func positiveFinite(value float64) bool {
 // template may be built with a snapshot capacity that differs from the node's
 // cold-boot default, and restore validation owns that final constraint.
 func ValidateResourcePatch(patch ResourcePatch) error {
+	cfg, err := patch.DiffCOW.runtimeConfig(resourceFieldPath)
+	if err != nil {
+		return err
+	}
+	if err := cfg.ValidateExplicit(); err != nil {
+		return diffCOWError(resourceFieldPath, err)
+	}
 	var capacityMemory, allocatableMemory, startupMemory uint64
 	var hasCapacityMemory, hasAllocatableMemory, hasStartupMemory bool
 	if patch.Capacity != nil {
@@ -428,7 +530,16 @@ func MarshalResourcePatch(patch ResourcePatch) (string, error) {
 // MergeResourcePatch overlays only leaves present in over onto base and checks
 // relationships introduced across layers.
 func MergeResourcePatch(base, over ResourcePatch) (ResourcePatch, error) {
+	if err := ValidateResourcePatch(base); err != nil {
+		return ResourcePatch{}, err
+	}
+	if err := ValidateResourcePatch(over); err != nil {
+		return ResourcePatch{}, err
+	}
 	out := cloneResourcePatch(base)
+	if over.DiffCOW != nil {
+		out.DiffCOW = mergeDiffCOW(base.DiffCOW, over.DiffCOW)
+	}
 	if over.Capacity != nil {
 		if out.Capacity == nil {
 			out.Capacity = &CapacityPatch{}
@@ -467,6 +578,7 @@ func MergeResourcePatch(base, over ResourcePatch) (ResourcePatch, error) {
 
 func cloneResourcePatch(in ResourcePatch) ResourcePatch {
 	var out ResourcePatch
+	out.DiffCOW = mergeDiffCOW(in.DiffCOW, nil)
 	if in.Capacity != nil {
 		out.Capacity = &CapacityPatch{}
 		if in.Capacity.CPU != nil {
@@ -557,7 +669,7 @@ func ApplyCapacity(meta map[string]string, cpu, memoryMiB int) (map[string]strin
 		}
 		patch = merged
 	}
-	if !resourcePresent && patch.Capacity == nil && patch.Allocatable == nil && patch.Startup == nil {
+	if !resourcePresent && patch == (ResourcePatch{}) {
 		return cloneStringMap(meta), nil
 	}
 	canonical, err := MarshalResourcePatch(patch)
@@ -672,7 +784,12 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 		allocMemory, allocMem = capacity.Memory, capMem
 	}
 
+	diffCOW, err := resolveDiffCOW(mergeDiffCOW(policy.DiffCOW, input.Patch.DiffCOW), resourceFieldPath)
+	if err != nil {
+		return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: %v", ErrInvalidResourceRequest, err)
+	}
 	resources := rtconfig.ResourcesConfig{
+		DiffCOW:  diffCOW,
 		Capacity: capacity,
 		Allocatable: rtconfig.AllocatableConfig{
 			CPU: allocCPU, Memory: allocMemory,
@@ -728,6 +845,9 @@ func nodeAllocatableMemory(policy NodeResourcePolicy) string {
 // ValidateResolvedResources checks the pure resource relationships without
 // requiring the node-owned cgroup FD, which run-sandbox injects later.
 func ValidateResolvedResources(resources rtconfig.ResourcesConfig, dynamic bool) error {
+	if _, _, err := resources.DiffCOW.Bytes(); err != nil {
+		return err
+	}
 	if resources.Capacity.CPU <= 0 {
 		return errors.New("resources.capacity.cpu must be > 0")
 	}

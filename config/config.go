@@ -88,6 +88,11 @@ func (c *Conductor) Clone() *Conductor {
 	out.Sandbox.Network.DNS = cloneSlice(c.Sandbox.Network.DNS)
 	out.Sandbox.Resources.Allocatable.CPU = clonePtr(c.Sandbox.Resources.Allocatable.CPU)
 	out.Sandbox.Resources.Allocatable.Memory = clonePtr(c.Sandbox.Resources.Allocatable.Memory)
+	if cow := c.Sandbox.Resources.DiffCOW; cow != nil {
+		out.Sandbox.Resources.DiffCOW = &ResourceDiffCOW{
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+		}
+	}
 	if c.Sandbox.Resources.Startup != nil {
 		startup := *c.Sandbox.Resources.Startup
 		out.Sandbox.Resources.Startup = &startup
@@ -450,6 +455,14 @@ type ResourcesConfig struct {
 	Startup       *ResourceStartup       `yaml:"startup,omitempty" json:"startup,omitempty"`
 	Overhead      ResourceOverhead       `yaml:"overhead" json:"overhead"`
 	WatermarkHigh *ResourceWatermarkHigh `yaml:"watermark_high,omitempty" json:"watermark_high,omitempty"`
+	DiffCOW       *ResourceDiffCOW       `yaml:"diff_cow,omitempty" json:"diff_cow,omitempty"`
+}
+
+// ResourceDiffCOW configures the host cache shared by a sandbox's writable disks.
+// An omitted dirty limit follows the final cache size after request overrides.
+type ResourceDiffCOW struct {
+	CacheSize    *string `yaml:"cache_size,omitempty" json:"cache_size,omitempty"`
+	MaxDirtySize *string `yaml:"max_dirty_size,omitempty" json:"max_dirty_size,omitempty"`
 }
 
 // UnmarshalJSON preserves the public schema's strict nested JSON decoding.
@@ -532,10 +545,21 @@ func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 			return &sandboxcfg.NodeWatermarkHighPolicy{Ratio: r.WatermarkHigh.Ratio}
 		}(),
 	}
+	if cow := r.DiffCOW; cow != nil {
+		policy.DiffCOW = &sandboxcfg.DiffCOWPatch{
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+		}
+	}
 	return policy
 }
 
 func (r *ResourcesConfig) setNodeResourcePolicy(policy sandboxcfg.NodeResourcePolicy) {
+	r.DiffCOW = nil
+	if cow := policy.DiffCOW; cow != nil {
+		r.DiffCOW = &ResourceDiffCOW{
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+		}
+	}
 	r.Capacity = ResourceCapacity{CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory}
 	r.Allocatable = ResourceAllocatable{
 		CPU: clonePtr(policy.Allocatable.CPU), Memory: clonePtr(policy.Allocatable.Memory),

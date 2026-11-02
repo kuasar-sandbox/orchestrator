@@ -143,9 +143,11 @@ func TestBuildRuntimePreparationRoundTripFreezesResolvedInputs(t *testing.T) {
 		},
 		Resources: rtconfig.ResourcesConfig{
 			Capacity: rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
+			DiffCOW:  rtconfig.DiffCOWConfig{CacheSize: "128MiB", MaxDirtySize: "67108864"},
 		},
 		SandboxResources: rtconfig.ResourcesConfig{
 			Capacity: rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
+			DiffCOW:  rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"},
 		},
 		CheckpointPolicy: sandboxcfg.SnapshotPolicy{
 			MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true),

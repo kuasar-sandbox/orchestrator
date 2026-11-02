@@ -8,10 +8,85 @@ import (
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
+func TestDiffCOWResourceResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name, nodeCache, nodeDirty, request, cache, dirty string
+		reject                                            bool
+	}{
+		{"defaults", "", "", `{}`, "32MiB", "16777216", false},
+		{"partial dirty", "128MiB", "", `{"diff_cow":{"max_dirty_size":"64MiB"}}`, "128MiB", "64MiB", false},
+		{"final cache", "128MiB", "", `{"diff_cow":{"cache_size":"64MiB"}}`, "64MiB", "33554432", false},
+		{"inherited explicit dirty", "128MiB", "64MiB", `{"diff_cow":{"cache_size":"32MiB"}}`, "", "", true},
+		{"dirty without node cache", "", "", `{"diff_cow":{"max_dirty_size":"64MiB"}}`, "", "", true},
+		{"round down", "", "", `{"diff_cow":{"cache_size":"12KiB"}}`, "12KiB", "4096", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := NodeResourcePolicy{DiffCOW: &DiffCOWPatch{}}
+			if tc.nodeCache != "" {
+				node.DiffCOW.CacheSize = &tc.nodeCache
+			}
+			if tc.nodeDirty != "" {
+				node.DiffCOW.MaxDirtySize = &tc.nodeDirty
+			}
+			patch, err := ParseResourcePatch(tc.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resources, err := ResolveResources(ResourceResolveInput{Node: node, Patch: patch})
+			if tc.reject {
+				if !errors.Is(err, ErrInvalidResourceRequest) {
+					t.Fatalf("resolve error = %v", err)
+				}
+			} else if err != nil || resources.DiffCOW.CacheSize != tc.cache || resources.DiffCOW.MaxDirtySize != tc.dirty {
+				t.Fatalf("resolved DiffCOW = %+v, %v", resources.DiffCOW, err)
+			}
+			if tc.nodeDirty == "" && node.DiffCOW.MaxDirtySize != nil {
+				t.Fatalf("node dirty became explicit: %+v", node.DiffCOW)
+			}
+			if canonical, err := MarshalResourcePatch(patch); err != nil || canonical != tc.request {
+				t.Fatalf("stored request = %q, %v", canonical, err)
+			}
+		})
+	}
+}
+
+func TestDiffCOWPresenceAndProgrammaticValidation(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"diff_cow":{}}`, `{"diff_cow":{"cache_size":"12KiB"}}`} {
+		got, err := MergeMetadata(map[string]string{NsResource: raw}, nil)
+		if err != nil || got[NsResource] != raw {
+			t.Errorf("persist %s = %v, %v", raw, got, err)
+		}
+	}
+	for _, cow := range []*DiffCOWPatch{
+		{CacheSize: stringPtr("")}, {MaxDirtySize: stringPtr("")},
+	} {
+		if err := ValidateNodeResourcePolicy(NodeResourcePolicy{DiffCOW: cow}, false); err == nil {
+			t.Errorf("node accepted %+v", cow)
+		}
+		if _, err := MergeResourcePatch(ResourcePatch{DiffCOW: cow}, ResourcePatch{DiffCOW: &DiffCOWPatch{
+			CacheSize: stringPtr("64MiB"), MaxDirtySize: stringPtr("32MiB"),
+		}}); err == nil {
+			t.Errorf("merge hid explicit empty leaf in %+v", cow)
+		}
+	}
+	base := ResourcePatch{DiffCOW: &DiffCOWPatch{CacheSize: stringPtr("128MiB")}}
+	over := ResourcePatch{DiffCOW: &DiffCOWPatch{MaxDirtySize: stringPtr("64MiB")}}
+	merged, err := MergeResourcePatch(base, over)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*merged.DiffCOW.CacheSize, *merged.DiffCOW.MaxDirtySize = "8MiB", "4MiB"
+	if *base.DiffCOW.CacheSize != "128MiB" || *over.DiffCOW.MaxDirtySize != "64MiB" || base.DiffCOW.MaxDirtySize != nil {
+		t.Fatal("merged DiffCOW shares input leaves")
+	}
+}
+
 func TestParseResourcePatchStrictSchema(t *testing.T) {
 	valid := []string{
 		`{}`,
 		`{"capacity":{}}`,
+		`{"diff_cow":{}}`,
+		`{"diff_cow":{"max_dirty_size":"64MiB"}}`,
 		`{"capacity":{"cpu":2}}`,
 		`{"capacity":{"memory":"2GiB"}}`,
 		`{"allocatable":{"cpu":0.5,"memory":"256MiB"}}`,
@@ -38,6 +113,17 @@ func TestParseResourcePatchStrictSchema(t *testing.T) {
 		"escaped duplicate":   {`{"capacity":{},"\u0063apacity":{"cpu":2}}`, NsResource + " must be a valid JSON object"},
 		"duplicate leaf":      {`{"capacity":{"cpu":1,"cpu":2}}`, NsResource + " must be a valid JSON object"},
 		"unknown root":        {`{"future":{}}`, NsResource},
+		"cow unknown":         {`{"diff_cow":{"future":"4KiB"}}`, NsResource + ".diff_cow"},
+		"cow null":            {`{"diff_cow":null}`, NsResource + ".diff_cow"},
+		"cow duplicate":       {`{"diff_cow":{"cache_size":"4KiB","cache_size":"8KiB"}}`, NsResource},
+		"cow wrong type":      {`{"diff_cow":{"cache_size":4096}}`, NsResource + ".diff_cow.cache_size"},
+		"cow leaf null":       {`{"diff_cow":{"max_dirty_size":null}}`, NsResource + ".diff_cow.max_dirty_size"},
+		"cow empty":           {`{"diff_cow":{"max_dirty_size":""}}`, NsResource + ".diff_cow.max_dirty_size"},
+		"cow zero":            {`{"diff_cow":{"cache_size":"0"}}`, NsResource + ".diff_cow.cache_size"},
+		"cow unit":            {`{"diff_cow":{"max_dirty_size":"4bits"}}`, NsResource + ".diff_cow.max_dirty_size"},
+		"cow alignment":       {`{"diff_cow":{"cache_size":"7KiB"}}`, NsResource + ".diff_cow.cache_size"},
+		"cow overflow":        {`{"diff_cow":{"cache_size":"9223372036854775808"}}`, NsResource + ".diff_cow.cache_size"},
+		"cow invalid pair":    {`{"diff_cow":{"cache_size":"16MiB","max_dirty_size":"32MiB"}}`, NsResource + ".diff_cow.max_dirty_size"},
 		"control":             {`{"control":{}}`, NsResource + ".control is node-managed"},
 		"overhead":            {`{"overhead":{"memory":"1MiB"}}`, NsResource + ".overhead is not request-configurable"},
 		"watermark":           {`{"watermark_high":{}}`, NsResource + ".watermark_high is node-managed"},

@@ -92,6 +92,11 @@ func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePo
 	if in.Startup != nil {
 		out.Startup = &sandboxcfg.NodeStartupPolicy{Memory: in.Startup.Memory}
 	}
+	if cow := in.DiffCOW; cow != nil {
+		out.DiffCOW = &sandboxcfg.DiffCOWPatch{
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+		}
+	}
 	if in.WatermarkHigh != nil {
 		out.WatermarkHigh = &sandboxcfg.NodeWatermarkHighPolicy{Ratio: clonePtr(in.WatermarkHigh.Ratio)}
 	}
@@ -113,6 +118,11 @@ func PublicSandboxResources(policy sandboxcfg.NodeResourcePolicy) publicconfig.R
 	}
 	if policy.Startup != nil {
 		out.Startup = &publicconfig.ResourceStartup{Memory: policy.Startup.Memory}
+	}
+	if cow := policy.DiffCOW; cow != nil {
+		out.DiffCOW = &publicconfig.ResourceDiffCOW{
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+		}
 	}
 	if policy.WatermarkHigh != nil {
 		out.WatermarkHigh = &publicconfig.ResourceWatermarkHigh{Ratio: clonePtr(policy.WatermarkHigh.Ratio)}

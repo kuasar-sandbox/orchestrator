@@ -329,6 +329,8 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `sandbox.resources.startup.memory` | Final capacity memory | Headroom before the first trusted cold report, in static and dynamic modes; independent of settled headroom and unused for initial restore Budget |
 | `sandbox.resources.overhead.memory` | `32MiB` | Node-owned host VMM overhead; sandbox-ctl is outside VMM cgroup. Requests/templates cannot override |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | Node-owned memory.high pressure ratio in `(0,1)`; requests/templates cannot override |
+| `sandbox.resources.diff_cow.cache_size` | `32MiB` | Host cache shared by the sandbox's writable disks |
+| `sandbox.resources.diff_cow.max_dirty_size` | Half the final cache size, rounded down to 4 KiB, minimum 4 KiB | An explicit limit must fit within the cache |
 | `sandbox.network.switch` | `sw0` | Vswitch name |
 | `sandbox.network.hostname` | `sandbox` | Guest sethostname and `/etc/hosts` entry (§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | Guest `/etc/resolv.conf` nameserver; deployment must route it to actual DNS |
@@ -901,7 +903,7 @@ Each instance receives configuration through reserved e2b metadata namespaces `k
 
 | Namespace | Destination |
 |---|---|
-| resource | Strict partial resources patch: capacity CPU/memory, allocatable CPU/memory and startup memory |
+| resource | Strict partial patch for capacity, allocatable, startup and DiffCOW cache limits |
 | traffic | Host-only explicit per-Sandbox max_inflight total/forward/e2b:envd/e2b:code-interpreter/exec; never guest configuration |
 | network | hostname/nexthop to guest; inner_ip/transit_* to vswitch Attach; dns to resolv.conf |
 | launch | exec/args/env/workdir/restart/user/stop_signal/plugin/cgroup_control; bare only, since e2b reserves launch for envd |
@@ -920,7 +922,8 @@ Resource and traffic merge by leaf. Public resource JSON permits only:
 {
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
-  "startup": {"memory": "1GiB"}
+  "startup": {"memory": "1GiB"},
+  "diff_cow": {"cache_size": "64MiB"}
 }
 ```
 
@@ -937,7 +940,9 @@ node resource policy
   < portable artifact capacity constraint
 ```
 
-The five leaves overlay independently: group capacity.memory and Create allocatable.memory both survive. Build-row metadata is not another Create layer. Other namespaces follow their own rules below, generally whole-namespace replacement. Every layer is parsed strictly before merging, so a valid higher layer cannot hide an invalid lower one. Group/reserve, standalone/cluster and Build registration share the helper.
+Each resource leaf overlays independently. For example, group capacity.memory and Create allocatable.memory both survive. Every layer is validated before merging. Group/reserve, standalone/cluster and Build registration share the helper. Other namespaces follow their own rules below.
+
+`X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` gives the sandbox a 32 MiB dirty limit when the node has omitted it. Use `"max_dirty_size":"16MiB"` inside `diff_cow` to set it explicitly. Sizes must be positive multiples of 4 KiB. Raw policy, request metadata and migration tokens retain only configured leaves. Restore resolves them on the target node independently of portable artifact capacity. Build execution inherits the node limits, and the target Sandbox also applies the target request.
 
 Build traffic is request-scoped to the Build runtime and its synthetic route; it is not inherited by Sandboxes created from the output artifact. Canonical TemplateID Create never queries retained Build metadata, a Template catalog, or artifact metadata for traffic defaults. Traffic leaf priority is:
 

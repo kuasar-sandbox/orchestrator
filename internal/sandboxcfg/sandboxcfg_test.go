@@ -197,6 +197,7 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 	}
 	host := &rtconfig.SandboxConfig{
 		Resources: rtconfig.ResourcesConfig{
+			DiffCOW:     rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"},
 			Capacity:    rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
 			Allocatable: rtconfig.AllocatableConfig{CPU: 2, Memory: "2GiB"},
 		},
@@ -228,6 +229,7 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 		"launch.cgroup_control", "launch.placeholder", "launch.pid_namespace",
 		"launch.plugin", "launch.user", "launch.stop_signal",
 		"launch.stop_grace_period", "resources.allocatable.deflate_on_oom",
+		"resources.diff_cow.cache_size", "resources.diff_cow.max_dirty_size",
 		"mounts", "files", "init", "metadata",
 	} {
 		if !presence.Has(path) {
@@ -253,6 +255,9 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 	}
 	if runtime.Resources.Allocatable.DeflateOnOOM != nil {
 		t.Fatalf("source deflate_on_oom survived explicit null: %#v", runtime.Resources.Allocatable)
+	}
+	if runtime.Resources.DiffCOW != host.Resources.DiffCOW {
+		t.Fatalf("build lost host DiffCOW: %+v", runtime.Resources.DiffCOW)
 	}
 	if len(runtime.Mounts) != 0 || len(runtime.Files) != 0 || len(runtime.Init) != 0 ||
 		len(runtime.Metadata) != 0 {
@@ -553,6 +558,7 @@ func rendererPortableConfig() *rtconfig.PortableSandboxConfig {
 
 func artifactRendererParams(mode types.LaunchMode) Params {
 	p := baseParams(types.ProfileBare)
+	p.Resources.DiffCOW = rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}
 	p.Sandbox.LaunchMode = mode
 	p.Sandbox.ResumeSource = types.ResumeSource{
 		Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("c", 64),
@@ -602,6 +608,9 @@ func TestGeneratedSandboxHostConfigSatisfiesApplyFromRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyFromRules rejected generated config: %v\n%s", err, body)
 	}
+	if runtime.Resources.DiffCOW != p.Resources.DiffCOW {
+		t.Fatalf("from E lost host DiffCOW: %+v", runtime.Resources.DiffCOW)
+	}
 	if runtime.Launch.Env["ARTIFACT"] != "yes" || c0.Metadata["owner"] != "artifact" {
 		t.Fatalf("Sandbox C0 was not authoritative: runtime=%+v c0=%+v", runtime.Launch, c0.Metadata)
 	}
@@ -635,6 +644,9 @@ func TestGeneratedSnapshotHostConfigSatisfiesApplyRestoreRules(t *testing.T) {
 	runtime, c0, err := rtconfig.ApplyRestoreRules(rendererPortableConfig(), host, presence)
 	if err != nil {
 		t.Fatalf("ApplyRestoreRules rejected generated config: %v\n%s", err, body)
+	}
+	if runtime.Resources.DiffCOW != p.Resources.DiffCOW {
+		t.Fatalf("restore S lost host DiffCOW: %+v", runtime.Resources.DiffCOW)
 	}
 	if runtime.Launch.Env["ARTIFACT"] != "yes" || c0.Metadata["owner"] != "artifact" {
 		t.Fatalf("Snapshot restore changed C0: runtime=%+v c0=%+v", runtime.Launch, c0.Metadata)

@@ -178,6 +178,7 @@ sandbox:
     startup: { memory: 2GiB }
     overhead: { memory: 32MiB }
     watermark_high: { ratio: 0.875 }
+    diff_cow: { cache_size: 64MiB }
 ```
 
 - `capacity.memory` 是 Capacity。
@@ -259,7 +260,9 @@ sandbox YAML,runner 仍通过继承 cgroup FD 注入该 host capability。
 
 ### 3.3 request/template 所有权
 
-tenant resource patch 只允许 `capacity`、`allocatable`、`startup`。`control`、
+同一 Sandbox 的可写盘共享一份宿主机 DiffCOW 缓存。`cache_size` 缺省为 32 MiB，省略的 `max_dirty_size` 按最终缓存的一半向下对齐到 4 KiB，至少为 4 KiB。上例得到 64 MiB 缓存与 32 MiB 脏数据上限。显式大小须为 4 KiB 的正整数倍，脏数据上限不得超过缓存。
+
+tenant resource patch 支持 `capacity`、`allocatable`、`startup` 和 `diff_cow` 的两个叶子。`control`、
 `overhead`、`watermark_high`、sensor 和 `deflate_on_oom` 均由 node resolver 管理。
 parser 对未知字段和这些越权字段直接报错,不会静默忽略。
 

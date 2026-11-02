@@ -324,9 +324,11 @@ sandbox:
 		resources      string
 		path           string
 	}{
-		"bad capacity memory": {resources: "    capacity:\n      memory: nope", path: "capacity.memory"},
-		"empty alloc memory":  {resources: "    allocatable:\n      memory: \"\"", path: "allocatable.memory"},
-		"zero alloc memory":   {resources: "    allocatable:\n      memory: 0", path: "allocatable.memory"},
+		"bad capacity memory":         {resources: "    capacity:\n      memory: nope", path: "capacity.memory"},
+		"dirty exceeds default cache": {resources: "    diff_cow: { max_dirty_size: 64MiB }", path: "sandbox.resources.diff_cow.max_dirty_size"},
+		"empty cache":                 {resources: "    diff_cow: { cache_size: \"\" }", path: "sandbox.resources.diff_cow.cache_size"},
+		"empty alloc memory":          {resources: "    allocatable:\n      memory: \"\"", path: "allocatable.memory"},
+		"zero alloc memory":           {resources: "    allocatable:\n      memory: 0", path: "allocatable.memory"},
 		"alloc memory above capacity": {
 			resources: "    capacity:\n      memory: 128MiB\n    allocatable:\n      memory: 256MiB", path: "allocatable.memory",
 		},

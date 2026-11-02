@@ -168,9 +168,11 @@ sandbox:
     startup: { memory: 2GiB }
     overhead: { memory: 32MiB }
     watermark_high: { ratio: 0.875 }
+    diff_cow: { cache_size: 64MiB }
 ```
 
 - `capacity.memory` is Capacity.
+- `diff_cow` budgets one host cache across the sandbox's writable disks. An omitted cache size defaults to 32 MiB. An omitted dirty limit follows half the final cache size, rounded down to 4 KiB with a 4 KiB minimum. The example resolves to 64 MiB of cache and a 32 MiB dirty limit. Explicit limits must be positive 4 KiB multiples and dirty must fit in cache.
 - `allocatable.memory` is settled headroom, default `256MiB`. If an inherited default exceeds final Capacity, the resolver clamps it to Capacity. Explicit out-of-range request values are rejected.
 - `startup.memory` is cold-start headroom, defaulting to final Capacity in both static and dynamic modes. It is independent of settled headroom and need not be greater or smaller.
 - `overhead.memory` is node-owned host VMM overhead. Sandbox-ctl occupies a separate control cgroup and does not consume that allowance. `watermark_high.ratio` also belongs to node policy. Neither may be set by requests/templates.
@@ -228,7 +230,7 @@ Preflight requires `host_reserved.memory < physical_memory` and validates `0 <= 
 
 ### 3.3 Request/template ownership
 
-Tenant resource patches allow only `capacity`, `allocatable` and `startup`. The node resolver owns `control`, `overhead`, `watermark_high`, sensors and deflate_on_oom. The parser rejects unknown or unauthorized fields instead of silently ignoring them.
+Tenant resource patches allow `capacity`, `allocatable`, `startup` and the two `diff_cow` leaves. The node resolver owns `control`, `overhead`, `watermark_high`, sensors and deflate_on_oom. The parser rejects unknown or unauthorized fields.
 
 ## 4. Node reservation model
 

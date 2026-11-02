@@ -487,6 +487,7 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 func TestBuildAndTargetResourcesRemainSeparate(t *testing.T) {
 	deflate := true
 	resources := rtconfig.ResourcesConfig{
+		DiffCOW:  rtconfig.DiffCOWConfig{CacheSize: "128MiB", MaxDirtySize: "67108864"},
 		Capacity: rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
 		Allocatable: rtconfig.AllocatableConfig{
 			CPU: 1.5, Memory: "256MiB", DeflateOnOOM: &deflate,
@@ -497,6 +498,7 @@ func TestBuildAndTargetResourcesRemainSeparate(t *testing.T) {
 	}
 	targetResources := resources
 	targetResources.Capacity.CPU = 2
+	targetResources.DiffCOW = rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}
 	p := &buildPipeline{
 		profile: types.ProfileBare, baseRef: "manifest://" + strings.Repeat("a", 64),
 		spec: &configsock.BuildSpec{

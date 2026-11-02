@@ -109,6 +109,11 @@ func TestMergeConfigUsesResourceLeavesAndDoesNotHideInvalidGroup(t *testing.T) {
 	if _, err := mergeConfig(group, create); err == nil || !strings.Contains(err.Error(), "node-managed") {
 		t.Fatalf("valid create config hid invalid group resource: %v", err)
 	}
+	group[sandboxcfg.NsResource] = `{"diff_cow":{"cache_size":"16MiB","max_dirty_size":"32MiB"}}`
+	create[sandboxcfg.NsResource] = `{"diff_cow":{"cache_size":"64MiB"}}`
+	if _, err := mergeConfig(group, create); err == nil || !strings.Contains(err.Error(), sandboxcfg.NsResource+".diff_cow.max_dirty_size") {
+		t.Fatalf("create masked invalid group DiffCOW: %v", err)
+	}
 }
 
 func TestGroupTrafficConfigCanonicalizesAndMergesLeaves(t *testing.T) {

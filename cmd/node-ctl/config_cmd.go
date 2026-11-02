@@ -203,6 +203,9 @@ sandbox:                                          # sandbox-instance defaults
     # startup: { memory: 512MiB }                 # cold headroom in static/dynamic mode; omitted => capacity.memory
     overhead: { memory: 32MiB }                   # node-owned host VMM overhead
     watermark_high: { ratio: 0.875 }              # node-owned memory.high pressure ratio
+    # diff_cow:                                   # host cache shared across writable disks
+    #   cache_size: 32MiB
+    #   max_dirty_size: 16MiB                     # omit to derive from the final cache size
   network:
     switch: sw0
     # tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock # persistent TAPFD/1 PREPARE/OPEN/RELEASE; connector: vswitch serve --tapfd-listen <same path>
