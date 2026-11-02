@@ -62,6 +62,9 @@ func runPlacer(args []string, log *slog.Logger) error {
 		}
 	}
 	registryAddr := cfg.Registry.Bootstrap
+	if !strings.HasPrefix(registryAddr, "/") && strings.Contains(registryAddr, "://") && !strings.HasPrefix(registryAddr, "http://") && !strings.HasPrefix(registryAddr, "https://") {
+		return fmt.Errorf("placer: unsupported registry bootstrap scheme")
+	}
 
 	// registry mTLS to dial when remote; a UDS endpoint stays plain.
 	var registryTLS *tls.Config

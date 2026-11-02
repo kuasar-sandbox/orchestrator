@@ -269,10 +269,14 @@ func TestPlacerLocalErrorsBeforeNetwork(t *testing.T) {
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(503) }))
 	defer srv.Close()
-	for _, mode := range []string{"groups", "directory", "not-directory", "registry-tls", "placer-tls", "listen", "port"} {
+	for _, mode := range []string{"groups", "directory", "not-directory", "registry-tls", "placer-tls", "listen", "port", "scheme", "url"} {
 		t.Run(mode, func(t *testing.T) {
 			path := writeStartupConfig(t, srv.URL, func(c *clustercfg.PlacerConfig) {
 				switch mode {
+				case "scheme":
+					c.Registry.Bootstrap = "ftp://registry"
+				case "url":
+					c.Registry.Bootstrap = "http://"
 				case "listen":
 					c.Placer.Listen = "bad address"
 				case "port":
