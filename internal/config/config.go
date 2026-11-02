@@ -45,6 +45,7 @@ type ResourcesConfig = publicconfig.ResourcesConfig
 type ResourceCapacity = publicconfig.ResourceCapacity
 type ResourceAllocatable = publicconfig.ResourceAllocatable
 type ResourceStartup = publicconfig.ResourceStartup
+type ResourceDiffCOW = publicconfig.ResourceDiffCOW
 type ResourceOverhead = publicconfig.ResourceOverhead
 type ResourceWatermarkHigh = publicconfig.ResourceWatermarkHigh
 type NetworkConfig = publicconfig.NetworkConfig

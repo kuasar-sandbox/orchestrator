@@ -177,7 +177,7 @@ func TestMigrationTokenCarriesStrictPortableResourceAndTrafficMetadata(t *testin
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	sb := migrationSandbox(t, dir, "portable-resource", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
 	sb.Metadata = map[string]string{
-		sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" } } `,
+		sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" }, "diff_cow": {"cache_size":"12KiB"} } `,
 		sandboxcfg.NsTraffic:  ` { "max_inflight" : { "total" : 9, "forward" : 0 } } `,
 		"ordinary":            "preserved",
 	}
@@ -192,7 +192,7 @@ func TestMigrationTokenCarriesStrictPortableResourceAndTrafficMetadata(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := payload.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"startup":{"memory":"1GiB"}}`; got != want {
+	if got, want := payload.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"startup":{"memory":"1GiB"},"diff_cow":{"cache_size":"12KiB"}}`; got != want {
 		t.Fatalf("portable resource metadata = %q, want %q", got, want)
 	}
 	if payload.Metadata["ordinary"] != "preserved" {
@@ -269,7 +269,9 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	o.cfg.ResourceListen = &config.ResourceListenConfig{Enabled: true}
 	allocatableMemory := "128MiB"
+	sourceCache := "128MiB"
 	o.cfg.Sandbox.Resources = configresolve.PublicSandboxResources(sandboxcfg.NodeResourcePolicy{
+		DiffCOW:     &sandboxcfg.DiffCOWPatch{CacheSize: &sourceCache},
 		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: &allocatableMemory},
 		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "64MiB"},
 	})
@@ -288,10 +290,21 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	source.Metadata = map[string]string{
 		sandboxcfg.NsResource: `{"capacity":{"cpu":2,"memory":"8GiB"},"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`,
 	}
+	capacity := rtconfig.CapacityConfig{CPU: 2, Memory: "8GiB"}
+	sourceSpec, err := sandboxcfg.ParseSpec(source.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceResources, err := o.resolveArtifactResources(sourceSpec, capacity)
+	if err != nil || sourceResources.DiffCOW.MaxDirtySize != "67108864" {
+		t.Fatalf("source DiffCOW = %+v, %v", sourceResources.DiffCOW, err)
+	}
 	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
+	targetCache := "64MiB"
+	o.cfg.Sandbox.Resources.DiffCOW = &config.ResourceDiffCOW{CacheSize: &targetCache}
 	targetID, err := o.ImportSandbox(context.Background(), apiKey, token, "target-resource")
 	if err != nil {
 		t.Fatal(err)
@@ -299,6 +312,9 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	target, err := o.st.Get(context.Background(), targetID)
 	if err != nil || target == nil {
 		t.Fatalf("imported target = %+v, err=%v", target, err)
+	}
+	if got := target.Metadata[sandboxcfg.NsResource]; got != source.Metadata[sandboxcfg.NsResource] {
+		t.Fatalf("import changed request leaves: %s", got)
 	}
 	template, err := types.ParseTemplateID(target.TemplateID)
 	if err != nil {
@@ -308,11 +324,12 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resources, err := o.resolveArtifactResources(preparation.Spec, rtconfig.CapacityConfig{CPU: 2, Memory: "8GiB"})
+	resources, err := o.resolveArtifactResources(preparation.Spec, capacity)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resources.Capacity.CPU != 2 || resources.Capacity.Memory != "8GiB" ||
+		resources.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}) ||
 		resources.Allocatable.CPU != 2 || resources.Allocatable.Memory != "512MiB" ||
 		resources.Startup == nil || resources.Startup.Memory != "1GiB" ||
 		resources.Overhead == nil || resources.Overhead.Memory != "64MiB" ||

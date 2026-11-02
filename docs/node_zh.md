@@ -483,6 +483,8 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `sandbox.resources.startup.memory` | 最终 `capacity.memory` | cold 首份可信 report 前的 headroom,static/dynamic 均有效,与 settled headroom 独立;restore 不使用 |
 | `sandbox.resources.overhead.memory` | `32MiB` | node-owned host VMM overhead;sandbox-ctl 不在 VMM cgroup 内;request/template 不可覆盖 |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | node-owned sandbox `memory.high` pressure ratio,必须在 `(0,1)`;request/template 不可覆盖 |
+| `sandbox.resources.diff_cow.cache_size` | `32MiB` | 同一 Sandbox 的可写磁盘共享的宿主机缓存 |
+| `sandbox.resources.diff_cow.max_dirty_size` | 最终缓存的一半，向下对齐到 4 KiB，至少 4 KiB | 显式脏数据上限不得超过缓存 |
 | `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
@@ -1095,7 +1097,7 @@ JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定�
 
 | 命名空间 | 去向 |
 |---|---|
-| `resource` | 严格 partial patch:`resources.{capacity.{cpu,memory},allocatable.{cpu,memory},startup.memory}` |
+| `resource` | 按叶子合并的严格资源 patch，支持 capacity、allocatable、startup 和 DiffCOW 缓存限制 |
 | `traffic` | host-only 的 per-Sandbox `max_inflight.{total,forward,e2b:envd,e2b:code-interpreter,exec}` 显式 patch;不进入 guest |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
@@ -1114,7 +1116,8 @@ JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定�
 {
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
-  "startup": {"memory": "1GiB"}
+  "startup": {"memory": "1GiB"},
+  "diff_cow": {"cache_size": "64MiB"}
 }
 ```
 
@@ -1136,11 +1139,13 @@ node resource policy
   < portable artifact capacity constraint
 ```
 
-五个 leaf 独立 overlay；group 只设 `capacity.memory`、create 只设
+各个叶子独立合并。group 只设 `capacity.memory`、create 只设
 `allocatable.memory` 时两者同时保留。Build row metadata 不是 Create overlay 层。其它
 namespace 遵循下文各自的合并规则，多数采用 whole-namespace 覆盖。每一层都先
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
+
+例如节点省略脏数据上限时，请求头 `X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` 会得到 32 MiB 的脏数据上限。在 `diff_cow` 内提供 `"max_dirty_size":"16MiB"` 可显式设置上限。两项大小均须为 4 KiB 的正整数倍。原始策略、请求 metadata 和迁移 token 只保存显式叶子，恢复时由目标节点重新解析，独立于制品 capacity。Build 执行继承节点配置，目标 Sandbox 再叠加其请求配置。
 
 Build traffic 仅作用于本次 Build runtime 及其 synthetic route，不会被输出制品后续创建的
 Sandbox 继承。canonical TemplateID Create 不查询保留的 Build metadata、Template catalog

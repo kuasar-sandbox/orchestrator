@@ -211,14 +211,13 @@ func MarshalBuildColdConfig(cfg *rtconfig.SandboxConfig) ([]byte, error) {
 	// DeflateOnOOM is the sole optional portable resource leaf. An explicit null
 	// clears a source value when the shared projection has no settled value,
 	// while sandboxer's host policy fields remain untouched.
-	document["resources"] = map[string]any{
-		"capacity": cfg.Resources.Capacity,
-		"allocatable": map[string]any{
-			"cpu": cfg.Resources.Allocatable.CPU, "memory": cfg.Resources.Allocatable.Memory,
-			"deflate_on_oom": cfg.Resources.Allocatable.DeflateOnOOM,
-		},
-		"control": cfg.Resources.Control, "overhead": cfg.Resources.Overhead,
-		"watermark_high": cfg.Resources.WatermarkHigh, "startup": cfg.Resources.Startup,
+	if cfg.Resources.Allocatable.DeflateOnOOM == nil {
+		resources, _ := document["resources"].(map[string]any)
+		allocatable, ok := resources["allocatable"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("sandboxcfg: generated build config lacks resources.allocatable mapping")
+		}
+		allocatable["deflate_on_oom"] = nil
 	}
 	document["mounts"] = cfg.Mounts
 	document["files"] = cfg.Files

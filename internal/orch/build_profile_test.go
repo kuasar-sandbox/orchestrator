@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKey, fingerprint string) {
@@ -197,8 +198,10 @@ func TestBuildRegisterRejectsE2BLaunchOverrideBeforePersistence(t *testing.T) {
 }
 
 func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing.T) {
+	cacheSize := "128MiB"
 	policy := sandboxcfg.NodeResourcePolicy{
 		Capacity: sandboxcfg.NodeCapacityPolicy{CPU: 2, Memory: "2GiB"},
+		DiffCOW:  &sandboxcfg.DiffCOWPatch{CacheSize: &cacheSize},
 	}
 	policy.ApplyDefaults()
 	o := testOrchCfg(t, &config.Config{
@@ -207,17 +210,21 @@ func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing
 	b := &types.Build{
 		Resources: testBuildResources(),
 		Metadata: map[string]string{
-			sandboxcfg.NsResource: `{"startup":{"memory":"4GiB"}}`,
+			sandboxcfg.NsResource: `{"startup":{"memory":"4GiB"},"diff_cow":{"cache_size":"64MiB"}}`,
 		},
 		Builder: types.BuildOptions{Target: &types.BuildTarget{Kind: types.BuildTargetSandbox}},
 	}
 
-	spec, _, unresolved, err := o.resolveBuildRequestInputs(b, true)
+	spec, execution, unresolved, err := o.resolveBuildRequestInputs(b, true)
 	if err != nil {
 		t.Fatalf("resolveBuildRequestInputs rejected request before source capacity arrived: %v", err)
 	}
 	if unresolved.Capacity.CPU != 0 || unresolved.Capacity.Memory != "" || unresolved.Startup != nil {
 		t.Fatalf("source target resources resolved against node defaults: %+v", unresolved)
+	}
+	if execution.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "128MiB", MaxDirtySize: "67108864"}) ||
+		unresolved.DiffCOW != (rtconfig.DiffCOWConfig{}) {
+		t.Fatalf("execution/target DiffCOW = %+v/%+v", execution.DiffCOW, unresolved.DiffCOW)
 	}
 
 	resolved, err := o.resolveBuildTargetResources(spec, &configsock.ArtifactCapacity{
@@ -227,6 +234,7 @@ func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing
 		t.Fatalf("resolveBuildTargetResources with source capacity: %v", err)
 	}
 	if resolved.Capacity.CPU != 4 || resolved.Capacity.Memory != "8GiB" ||
+		resolved.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}) ||
 		resolved.Allocatable.CPU != 4 || resolved.Allocatable.Memory != "8GiB" ||
 		resolved.Startup == nil || resolved.Startup.Memory != "4GiB" {
 		t.Fatalf("resolved source target resources = %+v", resolved)

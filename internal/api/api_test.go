@@ -19,9 +19,11 @@ import (
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestRequestedBuildProfile(t *testing.T) {
@@ -109,14 +111,14 @@ func TestMergeConfigHeaders(t *testing.T) {
 
 func TestMergeConfigHeadersMergesOnlyResourceLeaves(t *testing.T) {
 	metadata := map[string]string{
-		sandboxcfg.NsResource: `{"capacity":{"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"256MiB"},"startup":{"memory":"1GiB"}}`,
+		sandboxcfg.NsResource: `{"capacity":{"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"256MiB"},"startup":{"memory":"1GiB"},"diff_cow":{"cache_size":"128MiB"}}`,
 		sandboxcfg.NsNetwork:  `{"hostname":"metadata"}`,
 	}
 	headers := http.Header{}
-	headers.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4},"allocatable":{"memory":"512MiB"}}`)
+	headers.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4},"allocatable":{"memory":"512MiB"},"diff_cow":{"max_dirty_size":"64MiB"}}`)
 	headers.Set("X-Kuasar-Sandbox-Network", `{"hostname":"header"}`)
 	got := mustMergeConfigHeaders(t, metadata, headers)
-	want := `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`
+	want := `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"},"diff_cow":{"cache_size":"128MiB","max_dirty_size":"64MiB"}}`
 	if got[sandboxcfg.NsResource] != want {
 		t.Fatalf("resource header merge = %s, want %s", got[sandboxcfg.NsResource], want)
 	}
@@ -128,6 +130,57 @@ func TestMergeConfigHeadersMergesOnlyResourceLeaves(t *testing.T) {
 		header("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4}}`),
 	); err == nil || !strings.Contains(err.Error(), "control") {
 		t.Fatalf("valid header hid invalid metadata resource: %v", err)
+	}
+	if _, err := mergeConfigHeaders(
+		map[string]string{sandboxcfg.NsResource: `{"diff_cow":{"cache_size":"16MiB","max_dirty_size":"32MiB"}}`},
+		header("X-Kuasar-Sandbox-Resource", `{"diff_cow":{"cache_size":"64MiB"}}`),
+	); err == nil || !strings.Contains(err.Error(), sandboxcfg.NsResource+".diff_cow.max_dirty_size") {
+		t.Fatalf("header masked invalid DiffCOW metadata: %v", err)
+	}
+}
+
+func TestCreateDiffCOWHeaderToColdConfig(t *testing.T) {
+	var request CreateReq
+	core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
+		request = req
+		return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	id := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}
+	body := fmt.Sprintf(`{"templateID":%q,"metadata":{"kuasar-sandbox.resource":"{\"diff_cow\":{\"cache_size\":\"96MiB\"}}"}}`, id.String())
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(body),
+		header("X-Kuasar-Sandbox-Resource", `{"diff_cow":{"cache_size":"64MiB"}}`))
+	if response.Code != http.StatusCreated || request.Metadata[sandboxcfg.NsResource] != `{"diff_cow":{"cache_size":"64MiB"}}` {
+		t.Fatalf("create status=%d, metadata=%v, body=%s", response.Code, request.Metadata, response.Body.String())
+	}
+	spec, err := sandboxcfg.ParseSpec(request.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeCache := "128MiB"
+	node := configresolve.SandboxResources(publicconfig.ResourcesConfig{DiffCOW: &publicconfig.ResourceDiffCOW{CacheSize: &nodeCache}})
+	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{Node: node, Patch: spec.Resource})
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := types.ParseTemplateID(request.TemplateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := sandboxcfg.Params{
+		Sandbox:  &types.Sandbox{ID: "created", LaunchMode: types.LaunchImage},
+		Template: template, Spec: spec, Resources: resources, Kernel: "/kernel", Runtime: "/runtime",
+	}
+	raw, err := params.BuildYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := rtconfig.LoadConfigBytesWithPresence(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Resources.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}) || node.DiffCOW.MaxDirtySize != nil {
+		t.Fatalf("node=%+v, runtime=%+v", node.DiffCOW, cfg.Resources.DiffCOW)
 	}
 }
 
