@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -225,7 +226,12 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						}
 						// Published artifacts must remain readable after source cleanup.
 						if !portable {
-							storage, _ := artifact.NewProcessStorage(nil)
+							storage, err := artifact.NewProcessStorageWithCustomerKey(nil, func() ([32]byte, error) {
+								return manifest.ParseHexKey(mk)
+							})
+							if err != nil {
+								t.Fatal(err)
+							}
 							location, err := reflocation.Resolve(o.cfg.Checkpoint.Remote.RefLocationParent, sid)
 							if err != nil {
 								t.Fatal(err)

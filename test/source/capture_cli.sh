@@ -22,7 +22,16 @@ trap 'rm -rf "$WORK"' EXIT
     GOOS=linux CGO_ENABLED=0 go build -trimpath -o "$WORK/sandbox-ctl" ./cmd/sandbox-ctl
 )
 RESULTS="$WORK/results.jsonl"
-KUASAR_TEST_SANDBOX_CTL="$WORK/sandbox-ctl"     go test -json -count=1 -timeout=5m ./internal/orch     -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$'     >"$RESULTS"
+if KUASAR_TEST_SANDBOX_CTL="$WORK/sandbox-ctl" \
+    go test -json -count=1 -timeout=5m ./internal/orch \
+    -run '^(TestCapturePairCLIToPausedDatabase|TestUploadCaptureCLIToPausedDatabase|TestExportPublicationCLIAPI)$' \
+    >"$RESULTS"; then
+    :
+else
+    status=$?
+    cat "$RESULTS" >&2
+    exit "$status"
+fi
 
 python3 - "$RESULTS" <<'PY'
 import json
