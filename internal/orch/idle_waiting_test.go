@@ -4,6 +4,10 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestIdleWaitingDoesNotReadStore(t *testing.T) {
@@ -59,6 +63,55 @@ func TestIdleDueAttemptRechecksPersistedEligibility(t *testing.T) {
 			case <-b.requests:
 				t.Fatal("stale cache bypassed the authoritative eligibility check")
 			default:
+			}
+		})
+	}
+}
+
+func TestIdleBusyRejectionRequiresAuthoritativeRetryState(t *testing.T) {
+	for _, change := range []string{"store-error", "paused", "new-run", "running"} {
+		t.Run(change, func(t *testing.T) {
+			o, sb, _, _ := idleFixture(t)
+			observeIdle(o, sb, 1)
+			candidate := o.idleCandidates[sb.ID]
+			if change == "store-error" {
+				if err := o.st.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if change == "paused" {
+					sb.State = types.StatePaused
+					sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox,
+						Ref: "manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+				} else if change == "new-run" {
+					sb.RunID = "successor"
+				}
+				if err := o.st.Put(context.Background(), sb); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rejection := &idlePauseRejection{cause: api.ErrSandboxBusy,
+				activity: routesync.PauseAck{Activity: map[string]routesync.PauseActivity{
+					"forward": {Connected: 1},
+				}}}
+			o.finishIdleAttempt(context.Background(), sb.ID, candidate, rejection)
+			if change == "running" {
+				retry := o.idleRetries[sb.ID]
+				if !retry.busy || retry.source != candidate.source || !sameIdle(retry.observation, candidate.observation) {
+					t.Fatal("busy retry lost its authoritative observation")
+				}
+				observeIdle(o, sb, 1)
+				if o.idleCandidates[sb.ID] != nil {
+					t.Fatal("rejected observation immediately retried")
+				}
+				observeIdle(o, sb, 2)
+				if o.idleCandidates[sb.ID] == nil {
+					t.Fatal("new idle observation did not recover")
+				}
+				return
+			}
+			if o.idleCandidates[sb.ID] != nil || len(o.idleRetries) != 0 {
+				t.Fatal("rejection retained a retry without an authoritative running owner")
 			}
 		})
 	}

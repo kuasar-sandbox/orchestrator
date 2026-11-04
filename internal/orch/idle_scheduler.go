@@ -241,23 +241,20 @@ func (o *Orchestrator) finishIdleAttempt(ctx context.Context, sid string, c *idl
 	// but never overwrite a newer idle edge or another source/RunID.
 	current := o.idleCandidates[sid]
 	same := current == nil || (current.source == c.source && sameIdle(current.observation, c.observation))
+	var rejection *idlePauseRejection
+	errors.As(attemptErr, &rejection)
 	if attemptErr != nil && err == nil && sb != nil && sb.State == types.StateRunning && sb.RunID == c.observation.RunID && same {
 		failures := c.failures + 1
 		until := now.BootNS + int64(idleBackoff(failures))
 		if o.idleRetries == nil {
 			o.idleRetries = make(map[string]idleRetry)
 		}
-		o.idleRetries[sid] = idleRetry{observation: c.observation, source: c.source, failures: failures, until: until}
+		o.idleRetries[sid] = idleRetry{observation: c.observation, source: c.source, failures: failures, until: until,
+			busy: rejection != nil && !rejection.activity.Idle()}
 		if current != nil {
 			current.retryAt = until
 			current.failures = failures
 		}
-	}
-	var rejection *idlePauseRejection
-	if same && errors.As(attemptErr, &rejection) && !rejection.activity.Idle() {
-		retry := o.idleRetries[sid]
-		retry.busy = true
-		o.idleRetries[sid] = retry
 	}
 
 	if current != c {
@@ -269,7 +266,7 @@ func (o *Orchestrator) finishIdleAttempt(ctx context.Context, sid string, c *idl
 		return
 	}
 	c.armed = false
-	if errors.As(attemptErr, &rejection) && rejection.activity.Idle() && errors.Is(attemptErr, api.ErrSandboxBusy) {
+	if rejection != nil && rejection.activity.Idle() && errors.Is(attemptErr, api.ErrSandboxBusy) {
 		c.t0 = rejection.received
 		for _, e := range rejection.activity.Evidence {
 			c.observation.SinceBootNS = max(c.observation.SinceBootNS, e.SinceBootNS)
