@@ -1510,6 +1510,8 @@ new observations replace the candidate without adding waiters, and are evaluated
 after the old attempt retires. Duplicate idle notifications do not extend the
 deadline; new idle, source changes,
 missing statistics and restarts rebuild it. The timer holds no lifecycle lock.
+While waiting it reads the immutable lifecycle cache; a due attempt rereads
+authoritative policy and state from the Store under the SID lock.
 The final synchronous Worker check catches short requests hidden by delayed
 statistics. Rejected attempts can rearm without another business request; repeated
 failures use bounded internal backoff. An unresolved durable pausing state remains

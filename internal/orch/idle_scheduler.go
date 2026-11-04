@@ -125,7 +125,9 @@ func (o *Orchestrator) scheduleIdle(ctx context.Context) {
 	}
 	o.idleMu.Unlock()
 	for sid, c := range list {
-		sb, err := o.st.Get(ctx, sid)
+		// Waiting uses the immutable lifecycle cache; the due attempt reads
+		// authoritative state again under the SID lock before installing a gate.
+		sb := o.lookup(sid)
 		now := o.idleTime()
 		valid := o.validIdleSource(c.source)
 		o.idleMu.Lock()
@@ -133,7 +135,7 @@ func (o *Orchestrator) scheduleIdle(ctx context.Context) {
 			o.idleMu.Unlock()
 			continue
 		}
-		if err != nil || sb == nil || !valid || sb.RunID != c.observation.RunID || sb.State != types.StateRunning || sb.IdleTimeout == nil || types.ValidateIdleTimeout(sb.IdleTimeout) != nil {
+		if sb == nil || !valid || sb.RunID != c.observation.RunID || sb.State != types.StateRunning || sb.IdleTimeout == nil || types.ValidateIdleTimeout(sb.IdleTimeout) != nil {
 			delete(o.idleCandidates, sid)
 			o.idleMu.Unlock()
 			continue
@@ -196,9 +198,6 @@ func (o *Orchestrator) pauseIdleCandidate(ctx context.Context, sid string, c *id
 	current := o.idleCandidates[sid] == c
 	now := o.idleTime()
 	due := now.BootNS >= c.retryAt && sb != nil && sb.IdleTimeout != nil && types.ValidateIdleTimeout(sb.IdleTimeout) == nil && now.BootNS-c.t0.BootNS >= int64(time.Duration(*sb.IdleTimeout)*time.Second)
-	if current && !due {
-		c.inflight = false
-	}
 	o.idleMu.Unlock()
 	if current && !due {
 		return
@@ -219,7 +218,6 @@ func (o *Orchestrator) pauseIdleCandidate(ctx context.Context, sid string, c *id
 	} else if err == nil { // Eligibility changed while this callback waited for SID.
 		o.idleMu.Lock()
 		if o.idleCandidates[sid] == c {
-			c.inflight = false
 			c.armed = false
 			c.deferred = true
 		}
@@ -270,7 +268,6 @@ func (o *Orchestrator) finishIdleAttempt(ctx context.Context, sid string, c *idl
 		delete(o.idleRetries, sid)
 		return
 	}
-	c.inflight = false
 	c.armed = false
 	if errors.As(attemptErr, &rejection) && rejection.activity.Idle() && errors.Is(attemptErr, api.ErrSandboxBusy) {
 		c.t0 = rejection.received

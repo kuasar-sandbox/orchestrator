@@ -33,6 +33,7 @@ func idleFixture(t *testing.T) (*Orchestrator, *types.Sandbox, *idleTestCoordina
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
+	o.cache(sb)
 	b := &idleTestCoordinator{requests: make(chan *fakePauseBarrier, 8)}
 	o.pauseBarriers = b
 	clock := &atomic.Int64{}
@@ -119,6 +120,7 @@ func TestIdleResourceObligationReobserves(t *testing.T) {
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
+	o.cache(sb)
 	observeIdle(o, sb, 1)
 	o.scheduleIdle(context.Background())
 	select {
@@ -133,6 +135,7 @@ func TestIdleResourceObligationReobserves(t *testing.T) {
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
+	o.cache(sb)
 	clock.Store(int64(4 * time.Second))
 	o.scheduleIdle(context.Background())
 	if c := o.idleCandidates[sb.ID]; c.t0.BootNS != clock.Load() {
