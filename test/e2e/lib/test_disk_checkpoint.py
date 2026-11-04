@@ -8,6 +8,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 import disk_checkpoint
@@ -39,10 +40,11 @@ class DiskCheckpoint(unittest.TestCase):
                           "root": {"diff_id": "root"}, "disks": [{"name": "data", "diff_id": "data"}]}
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:
-            archive.writestr("sandbox.runtime.cfg", b"fixture runtime config")
-            archive.writestr("checkpoint.json", json.dumps(checkpoint))
+            # ZipInfo's fixed default timestamp keeps rebuilt fixture bytes identical.
+            archive.writestr(zipfile.ZipInfo("sandbox.runtime.cfg"), b"fixture runtime config")
+            archive.writestr(zipfile.ZipInfo("checkpoint.json"), json.dumps(checkpoint))
             for name in extra:
-                archive.writestr(name, b"unexpected")
+                archive.writestr(zipfile.ZipInfo(name), b"unexpected")
         body = payload.getvalue()
         with tarfile.open(self.artifact, "w") as carrier:
             member = tarfile.TarInfo("sandbox")
@@ -82,6 +84,14 @@ class DiskCheckpoint(unittest.TestCase):
             for name in carrier_extra:
                 carrier.addfile(tarfile.TarInfo(name))
         return checkpoint
+
+    def test_artifact_payload_is_stable_across_zip_clock_boundary(self):
+        with mock.patch("zipfile.time.localtime", return_value=(2026, 1, 1, 0, 0, 0, 3, 1, -1)):
+            self.artifact_payload()
+        before = self.artifact.read_bytes()
+        with mock.patch("zipfile.time.localtime", return_value=(2026, 1, 1, 0, 0, 2, 3, 1, -1)):
+            self.artifact_payload()
+        self.assertEqual(before, self.artifact.read_bytes())
 
     def test_reads_sparse_carrier_with_physical_pax_size_and_digest_tail(self):
         for prefix in (0, 16384, 8 << 30):
