@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
+	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -53,6 +54,12 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
+	idleNow        func() idleclock.Point
+	idleMu         sync.Mutex
+	idleCandidates map[string]*idleCandidate
+	idleInFlight   map[string]*idleCandidate
+	idleGeneration uint64
+	idleRetries    map[string]idleRetry
 	memoryPressure atomic.Pointer[nodePressureController]
 	cfg            *config.Config
 	st             *store.Store
@@ -1218,6 +1225,9 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 	if err := validateCaptureRequest(request); err != nil {
 		return "", err
 	}
+	if request.IfIdleSince != nil && request.IfIdleSince.After(sandboxcfg.PauseReceipt(ctx)) {
+		return "", fmt.Errorf("%w: ifIdleSince is in the future", api.ErrBadRequest)
+	}
 	if request.Checkpoint {
 		unlock := o.lifecycle.Lock(id)
 		sb, err := o.st.Get(ctx, id)
@@ -1256,7 +1266,7 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 	case types.StateStarting:
 		return "", api.ErrSandboxStarting
 	case types.StatePaused:
-		if request.Checkpoint {
+		if request.Checkpoint || request.IfIdleSince != nil || request.IdleSinceBootNS != 0 {
 			return "", api.ErrAlreadyPaused
 		}
 		return "", o.adoptResourcePauseLocked(ctx, sb, request)
@@ -1292,7 +1302,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 		unlock()
 		return "", api.ErrSandboxStarting
 	case types.StatePaused:
-		if request.Checkpoint {
+		if request.Checkpoint || request.IfIdleSince != nil || request.IdleSinceBootNS != 0 {
 			unlock()
 			return "", api.ErrAlreadyPaused
 		}
@@ -1315,7 +1325,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Pause = &conductorextension.SandboxPauseRequest{
 		CaptureKind: conductorextension.CaptureKind(request.Kind),
-		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle,
+		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
 		CheckpointMergeRef: cloneBool(request.SnapshotPolicy.MergeRef), CheckpointDropCaches: cloneBool(request.SnapshotPolicy.DropCaches),
 	}
 	operationID := operation.ID
@@ -1331,7 +1341,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	if candidate == nil {
 		return "", fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
 	}
-	if types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle {
+	if types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
 		return "", fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
@@ -1352,7 +1362,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	}
 	finalRequest := sandboxcfg.CaptureRequest{
 		Kind:       types.CaptureKind(candidate.CaptureKind),
-		Checkpoint: candidate.Checkpoint, IfIdle: candidate.IfIdle,
+		Checkpoint: candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
 		SnapshotPolicy: sandboxcfg.SnapshotPolicy{
 			MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
 		},
@@ -1413,6 +1423,12 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 }
 
 func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
+	if request.IdleSinceBootNS < 0 {
+		return fmt.Errorf("%w: invalid idle anchor", api.ErrBadRequest)
+	}
+	if (request.IfIdleSince != nil || request.IdleSinceBootNS != 0) && !request.IfIdle {
+		return fmt.Errorf("%w: ifIdleSince requires ifIdle", api.ErrBadRequest)
+	}
 	if !request.Kind.Valid() {
 		return fmt.Errorf("%w: invalid capture kind %q", api.ErrBadRequest, request.Kind)
 	}
@@ -1457,10 +1473,12 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		"mode", o.cfg.Checkpoint.Mode,
 		"merge_ref", checkpointPolicyValue(request.SnapshotPolicy.MergeRef),
 		"drop_caches", checkpointPolicyValue(request.SnapshotPolicy.DropCaches))
-	if err := o.preparePause(opCtx, sb, request.IfIdle); err != nil {
+	if err := o.preparePause(opCtx, sb, request); err != nil {
 		return "", err
 	}
+	captureStarted := time.Now()
 	result, err := o.capture(opCtx, sb, request)
+	o.log.Info("pause capture completed", "sid", sb.ID, "capture_ms", float64(time.Since(captureStarted))/1e6, "err", err)
 	if err != nil {
 		o.rollbackPause(opCtx, sb)
 		return "", err
@@ -2016,6 +2034,8 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			return nil, nil, errLaunchOwnershipLost
 		}
 		starting := cloneSandbox(sb)
+		// Match BeginResume: the previous runner result is not a result for this launch.
+		starting.ExecutionResult = nil
 		starting.State = types.StateStarting
 		starting.PressureVersion++
 		starting.LaunchMode = launchMode
@@ -3005,6 +3025,7 @@ func cloneSandbox(sb *types.Sandbox) *types.Sandbox {
 		return nil
 	}
 	nb := *sb
+	nb.IdleTimeout = types.CloneIdleTimeout(sb.IdleTimeout)
 	if sb.Cluster != nil {
 		cluster := *sb.Cluster
 		nb.Cluster = &cluster

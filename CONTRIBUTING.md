@@ -69,6 +69,31 @@ to the trusted platform configuration, not cases. See the
 [capability contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/test/README.md#static-execution-requirements)
 for supported names, checks and historical-input compatibility.
 
+### Continuous idle regression coverage
+
+The maintained `orchestrator.idle-timeout.sh` and `orchestrator.idle-condition.sh` cases run in the public prepared
+E2E runner on each supported VM architecture. They exercise never-used Sandboxes,
+`idleTimeout=0` and a positive timeout, HTTP and Native Exec memory preservation,
+concurrent/streaming traffic, a post-capture barrier that requires the old runner
+result to be durable before the paused commit, park/Wake, the unchanged park
+deadline, and public UTC conditional Pause. Select both with
+`--include orchestrator.idle-timeout.sh --include orchestrator.idle-condition.sh`
+during `prepare` and `run`. The UTC case establishes a new Proxy observation
+after its setup traffic ends; a clock step during its condition still fails closed.
+
+Each policy emits `idle-timeout-<seconds>.json` under the case output directory:
+raw end-to-paused and wake-response samples, state transitions, per-process
+CPU/RSS observations, handshake/capture timing and attempt/retry counts.
+`pause-exit-facts.jsonl` records each forced exit-before-commit observation. The wake-response
+measurement includes client overhead and business execution; starting-to-running
+is a 100 ms polling estimate of the Resume interval. These are measurements of
+that run, not performance promises. Capture timings at the two deliberately held
+barriers include artificial waiting and must be excluded from ordinary capture
+latency distributions. Source tests separately
+use controlled clocks and barriers for stale async statistics, old RunID/lease
+notifications, clock steps and failure recovery. A simulated or skipped case and
+an ARM cross-build do not establish real VM acceptance.
+
 ## Licensing of contributions
 
 By submitting a contribution, you agree that it is licensed under the license

@@ -1,6 +1,10 @@
 package routesync
 
-import "context"
+import (
+	"context"
+	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
+	"time"
+)
 
 // RouteBarrier is one ephemeral completion fence for the proxy route stream.
 // ID is sent after the route Upsert on the same ordered down stream. Wait only
@@ -22,13 +26,25 @@ type RouteBarrierCoordinator interface {
 // PauseActivity is sampled synchronously by each serving worker after its
 // pausing gate is visible. Async statistics caches cannot certify idle.
 type PauseActivity struct {
-	Parking   uint64 `json:"parking"`
-	Connected uint64 `json:"connected"`
+	Parking         uint64     `json:"parking"`
+	Connected       uint64     `json:"connected"`
+	Sampled         bool       `json:"sampled"`
+	NeverActive     bool       `json:"never_active"`
+	IdleSince       *time.Time `json:"idle_since,omitempty"`
+	IdleSinceBootNS int64      `json:"idle_since_boot_ns,omitempty"`
+}
+
+type IdleEvidence struct {
+	Points      []idleclock.Point `json:"points"`
+	SinceBootNS int64             `json:"since_boot_ns"`
+	Clock       idleclock.Proof   `json:"clock"`
 }
 
 type PauseAck struct {
-	Activity map[string]PauseActivity `json:"activity"`
-	Error    string                   `json:"error,omitempty"`
+	AutomaticSafe bool                     `json:"automatic_safe"`
+	Evidence      []IdleEvidence           `json:"evidence,omitempty"`
+	Activity      map[string]PauseActivity `json:"activity"`
+	Error         string                   `json:"error,omitempty"`
 }
 
 func (a PauseAck) Idle() bool {
@@ -52,4 +68,17 @@ type PauseBarrierCoordinator interface {
 // PauseSink gates new traffic before synchronously sampling every worker.
 type PauseSink interface {
 	PreparePause(context.Context, string, RouteEntry) PauseAck
+}
+
+func (a PauseActivity) ValidTimeSample() bool {
+	if !a.Sampled {
+		return false
+	}
+	if a.NeverActive {
+		return a.Parking == 0 && a.Connected == 0 && a.IdleSince == nil && a.IdleSinceBootNS == 0
+	}
+	if a.Parking != 0 || a.Connected != 0 {
+		return a.IdleSince == nil && a.IdleSinceBootNS == 0
+	}
+	return a.IdleSince != nil && !a.IdleSince.IsZero() && a.IdleSinceBootNS > 0
 }

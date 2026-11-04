@@ -65,6 +65,7 @@ type RouteResolve struct {
 // checkpoint namespaces into it.
 type SandboxReserveReq struct {
 	Config          map[string]string `json:"config,omitempty"`
+	IdleTimeout     *int64            `json:"idle_timeout,omitempty"`
 	AutoPauseMemory *bool             `json:"auto_pause_memory,omitempty"`
 	AutoReset       *bool             `json:"auto_reset,omitempty"`
 	Memory          *bool             `json:"memory,omitempty"`
@@ -110,10 +111,11 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 // ListItem is one row of a group's sandbox listing (cluster-router.md: list is
 // served from the group's SandboxStore shard, no cross-group).
 type ListItem struct {
-	SandboxID  string `json:"sandboxID"`
-	State      string `json:"state"`
-	TemplateID string `json:"templateID,omitempty"`
-	ClientID   string `json:"clientID,omitempty"`
+	IdleTimeout *int64 `json:"idleTimeout"`
+	SandboxID   string `json:"sandboxID"`
+	State       string `json:"state"`
+	TemplateID  string `json:"templateID,omitempty"`
+	ClientID    string `json:"clientID,omitempty"`
 }
 
 func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
@@ -125,7 +127,7 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 	out := []ListItem{}
 	if err := r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
 		if s.State == StateReady || s.State == StatePausing || s.State == StatePaused {
-			out = append(out, ListItem{SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
+			out = append(out, ListItem{IdleTimeout: types.CloneIdleTimeout(s.IdleTimeout), SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
 		}
 		return nil
 	}); err != nil {
@@ -271,7 +273,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "create reserve cannot select resume memory", http.StatusBadRequest)
 		return
 	}
-	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil || body.AutoReset != nil) {
+	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil || body.AutoReset != nil || body.IdleTimeout != nil) {
 		http.Error(w, "connect reserve contains create fields", http.StatusBadRequest)
 		return
 	}
@@ -289,9 +291,9 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		Service:           req.Header.Get("E2b-Sandbox-Service"),
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
 		Config:            body.Config,
-		AutoPauseMemory:   cloneOptionalBool(body.AutoPauseMemory),
-		AutoReset:         cloneOptionalBool(body.AutoReset),
-		Memory:            cloneOptionalBool(body.Memory),
+		AutoPauseMemory:   cloneOptionalBool(body.AutoPauseMemory), IdleTimeout: types.CloneIdleTimeout(body.IdleTimeout),
+		AutoReset: cloneOptionalBool(body.AutoReset),
+		Memory:    cloneOptionalBool(body.Memory),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), routeLinkStatus(err))

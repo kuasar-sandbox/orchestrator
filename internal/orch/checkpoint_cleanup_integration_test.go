@@ -175,7 +175,13 @@ func TestCheckpointCleanupCLICommitAndRetry(t *testing.T) {
 						t.Fatal(err)
 					}
 					if outcome == "sink-failure" || outcome == "database-failure" {
-						if pauseErr == nil || row.State != types.StateRunning || row.ResumeSource != f.sb.ResumeSource || row.RunDir != f.sb.RunDir || row.RunID != f.sb.RunID || row.VswitchPort != f.sb.VswitchPort {
+						wantState := types.StateRunning
+						if outcome == "database-failure" {
+							// Capture already succeeded; an uncommitted Pause cannot
+							// claim that the old VM is still running.
+							wantState = types.StatePausing
+						}
+						if pauseErr == nil || row.State != wantState || row.ResumeSource != f.sb.ResumeSource || row.RunDir != f.sb.RunDir || row.RunID != f.sb.RunID || row.VswitchPort != f.sb.VswitchPort {
 							t.Fatalf("uncommitted source changed owner: %+v pause=%v", row, pauseErr)
 						}
 						for _, raw := range []string{previous.SnapshotRef, previous.SandboxRef} {

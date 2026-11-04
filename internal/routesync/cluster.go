@@ -237,9 +237,10 @@ type Command struct {
 	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
 	Memory               *bool                  `json:"memory,omitempty"`                 // connect: nil=auto, true=memory, false=cold
 	AutoReset            *bool                  `json:"auto_reset,omitempty"`             // create: nil defaults false
-	AutoPauseMemory      *bool                  `json:"auto_pause_memory,omitempty"`      // create: nil defaults true
-	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`            // exec_session: 0 is long-lived; positive is relative to node time
-	ExecConditions       []string               `json:"exec_conditions,omitempty"`        // exec_session: ordered CEL sources; empty is unrestricted
+	IdleTimeout          *int64                 `json:"idle_timeout,omitempty"`
+	AutoPauseMemory      *bool                  `json:"auto_pause_memory,omitempty"` // create: nil defaults true
+	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`       // exec_session: 0 is long-lived; positive is relative to node time
+	ExecConditions       []string               `json:"exec_conditions,omitempty"`   // exec_session: ordered CEL sources; empty is unrestricted
 	// key_put / key_drop
 	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
 	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put

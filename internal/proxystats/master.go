@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -56,9 +57,13 @@ type MasterStats struct {
 	workers  map[string]*workerContribution
 	traffic  map[string]aggregateTraffic
 
-	now        func() timePoint
-	trustSince timePoint
-	runSince   map[string]runMarker
+	clock            idleclock.Proof
+	clockWatch       clockWatcher
+	clockUnavailable bool
+	now              func() timePoint
+	trustSince       timePoint
+	runSince         map[string]runMarker // lazy query cache
+	routeSince       map[string]runMarker // written only by route observations
 }
 
 func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
@@ -72,10 +77,12 @@ func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
 		}
 	}
 	now := currentTimePoint()
+	watch, watchErr := idleclock.NewWatch()
 	return &MasterStats{
+		clockWatch: watch, clockUnavailable: watchErr != nil,
 		metrics: mx, expected: expected, workers: make(map[string]*workerContribution),
 		traffic: make(map[string]aggregateTraffic), now: currentTimePoint,
-		trustSince: now, runSince: make(map[string]runMarker),
+		trustSince: now, runSince: make(map[string]runMarker), routeSince: make(map[string]runMarker),
 	}
 }
 
@@ -113,6 +120,7 @@ func (m *MasterStats) Receive(workerID string, epoch uint64, frame Frame) error 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	wasAvailable := m.availableLocked()
 	worker := m.workers[workerID]
 	if worker == nil || worker.epoch != epoch || frame.Epoch != epoch {
 		return fmt.Errorf("proxystats: worker %q epoch mismatch", workerID)
@@ -209,6 +217,9 @@ func (m *MasterStats) Receive(workerID string, epoch uint64, frame Frame) error 
 			return err
 		}
 	}
+	if !wasAvailable && m.availableLocked() {
+		m.trustSince = laterPoint(m.trustSince, m.now())
+	}
 	return nil
 }
 
@@ -246,7 +257,6 @@ func (m *MasterStats) recomputeLocked(sandboxID string) error {
 	}
 	if !found {
 		delete(m.traffic, sandboxID)
-		delete(m.runSince, sandboxID)
 		return nil
 	}
 	m.traffic[sandboxID] = aggregate
@@ -324,6 +334,9 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	}
 	now := m.now()
 	marker := m.runSince[sandboxID]
+	if observed := m.routeSince[sandboxID]; observed.runID == runID && observed.since.bootNS > 0 {
+		marker = observed
+	}
 	if state == types.StateRunning {
 		if marker.runID != runID || marker.since.bootNS == 0 {
 			marker = runMarker{runID: runID, since: now}

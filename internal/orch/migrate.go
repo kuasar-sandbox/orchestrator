@@ -104,7 +104,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 				return types.ExportResult{}, api.ErrNotFound
 			}
 			savedSource = checkpoint.Source
-		} else if sb.State != types.StatePaused || !sb.ResumeSource.Valid() || sb.ExecutionResult != nil {
+		} else if sb.State != types.StatePaused || !sb.ResumeSource.Valid() {
 			unlock()
 			return types.ExportResult{}, fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
@@ -288,7 +288,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		o.cleanupConsumedCheckpoint(finalizeCtx, current)
 		return response, nil
 	}
-	if current == nil || current.State != types.StatePaused || current.ExecutionResult != nil || current.ResumeSource != attempt.source ||
+	if current == nil || current.State != types.StatePaused || current.ResumeSource != attempt.source ||
 		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||
 		current.StableID() != source.StableID() {
 		return types.ExportResult{}, exportPreemptedError(sid)
@@ -427,12 +427,12 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 			Metadata:               metadata,
 			CreatedUnix:            sb.CreatedUnix,
 			DeadlineUnix:           sb.DeadlineUnix,
-			AutoPauseMemory:        sb.AutoPauseMemory,
-			AutoReset:              sb.AutoReset,
-			ServiceSecret:          sb.ServiceSecret,
-			EnvdAccessToken:        sb.EnvdAccessToken,
-			TrafficAccessToken:     sb.TrafficAccessToken,
-			ForwardAccessToken:     sb.ForwardAccessToken,
+			AutoPauseMemory:        sb.AutoPauseMemory, IdleTimeout: types.CloneIdleTimeout(sb.IdleTimeout),
+			AutoReset:          sb.AutoReset,
+			ServiceSecret:      sb.ServiceSecret,
+			EnvdAccessToken:    sb.EnvdAccessToken,
+			TrafficAccessToken: sb.TrafficAccessToken,
+			ForwardAccessToken: sb.ForwardAccessToken,
 		},
 	)
 }
@@ -580,7 +580,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 			Ref:        payload.ResumeSourceRef,
 			SandboxRef: payload.ResumeSandboxRef,
 		},
-		AutoPauseMemory:    payload.AutoPauseMemory,
+		AutoPauseMemory: payload.AutoPauseMemory, IdleTimeout: types.CloneIdleTimeout(payload.IdleTimeout),
 		AutoReset:          payload.AutoReset,
 		ServiceSecret:      payload.ServiceSecret,
 		EnvdAccessToken:    payload.EnvdAccessToken,

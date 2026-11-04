@@ -39,6 +39,12 @@ func TestPausingParksHTTPAcrossCaptureAndResumesNewBackend(t *testing.T) {
 	pausing.InstanceID, pausing.AutoReset = "retained-parent", true
 	pausing.State = routesync.StatePausing
 	f.apply(t, pausing)
+	// This is the acceptance cut: a later request must park, not cancel or
+	// retroactively invalidate this zero-activity sample.
+	sample, err := f.stats.PauseActivity(pausing.SandboxID, func() bool { return true })
+	if err != nil || sample["forward"].Parking != 0 || !sample["forward"].Sampled {
+		t.Fatal(sample, err)
+	}
 	response, done := startHTTPRouteRequest(t, context.Background(), px)
 	select {
 	case <-wakes:

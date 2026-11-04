@@ -192,7 +192,11 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         explicit = os.environ.get("GOROOT")
         go = str(Path(explicit) / "bin/go") if explicit else shutil.which("go")
         self.assertTrue(go, "a real Go installation is required")
-        root = subprocess.check_output([go, "env", "GOROOT"], cwd=self.root, text=True).strip()
+        # This temporary fixture is outside the selected source workspace.
+        root = subprocess.check_output(
+            [go, "env", "GOROOT"], cwd=self.root, text=True,
+            env={**os.environ, "GOWORK": "off"},
+        ).strip()
         alternate = self.root / "alternate"
         self.fake_go(alternate, "wrong-driver", 47)
         main = self.source / "examples/custom-proxy/main.go"

@@ -54,6 +54,7 @@ type SandboxReserveRequest struct {
 	Service           string
 	MigrationToken    string
 	Config            map[string]string
+	IdleTimeout       *int64
 	AutoPauseMemory   *bool
 	AutoReset         *bool
 	Memory            *bool
@@ -62,6 +63,9 @@ type SandboxReserveRequest struct {
 // ReserveSandbox performs exactly one operation. Authentication precedes every
 // lifecycle mutation and command dispatch.
 func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
+	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrReserveBadRequest, err)
+	}
 	if !req.Operation.Valid() || req.Group == "" || req.RouteKey == "" ||
 		req.Port < 0 || req.Port > 65535 || req.TimeoutSeconds < 0 ||
 		int64(req.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds || req.TTLSeconds < 0 {
@@ -89,23 +93,23 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 			autoPauseMemory = *req.AutoPauseMemory
 		}
 		autoReset := req.AutoReset != nil && *req.AutoReset
-		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config, autoPauseMemory, autoReset)
+		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config, autoPauseMemory, autoReset, req.IdleTimeout)
 	case ReserveConnect:
 		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TTLSeconds != 0 ||
-			len(req.ExecConditions) != 0 || req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 || req.AutoPauseMemory != nil || req.AutoReset != nil {
+			len(req.ExecConditions) != 0 || req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 || req.AutoPauseMemory != nil || req.AutoReset != nil || req.IdleTimeout != nil {
 			return nil, fmt.Errorf("%w: connect contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveConnect(ctx, req)
 	case ReserveExecSession:
 		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
-			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 || req.AutoPauseMemory != nil || req.AutoReset != nil || req.Memory != nil {
+			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 || req.AutoPauseMemory != nil || req.AutoReset != nil || req.IdleTimeout != nil || req.Memory != nil {
 			return nil, fmt.Errorf("%w: exec-session contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveExecSession(ctx, req)
 	case ReserveData:
 		if req.ExpectedSandboxID == "" || req.TimeoutSeconds != 0 || req.APIKey != "" ||
 			req.TTLSeconds != 0 || len(req.ExecConditions) != 0 || req.MigrationToken != "" || len(req.Config) != 0 ||
-			(req.Service != "" && req.Service != reserveDataServiceExec) || req.AutoPauseMemory != nil || req.AutoReset != nil || req.Memory != nil {
+			(req.Service != "" && req.Service != reserveDataServiceExec) || req.AutoPauseMemory != nil || req.AutoReset != nil || req.IdleTimeout != nil || req.Memory != nil {
 			return nil, fmt.Errorf("%w: data contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveData(ctx, req)

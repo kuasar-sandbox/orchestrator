@@ -145,6 +145,8 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	metricSet := metrics.New()
 	masterStats := proxystats.NewMasterStats(metricSet, workerIDs)
 	masterStats.InplaceRestart = runtime.inplaceRestart
+	instance.stats = masterStats
+	startMasterTask(func() { masterStats.RunClock(masterCtx) })
 
 	var routeSink routesync.Sink = view
 	var managementWrapper proxyextension.ManagementWrapper

@@ -51,7 +51,8 @@ import (
 // invalid persisted traffic policy from lifecycle state. Version 9 adds pausing
 // and synchronous Pause activity ACKs. Version 10 retains dead/deleting management
 // entries with parent identity/state versions; mixed peers fail closed.
-const Version = 10
+// Version 11 adds historical idle evidence and activity observations.
+const Version = 11
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -110,6 +111,7 @@ const (
 // A credential-authorized "paused" route may make the proxy send a Wake;
 // "starting" waits passively and "running" lets it forward.
 type RouteEntry struct {
+	IdleTimeout          *int64 `json:"idle_timeout,omitempty"`
 	InstanceID           string `json:"instance_id,omitempty"`
 	AutoReset            bool   `json:"auto_reset,omitempty"`
 	PauseReason          string `json:"pause_reason,omitempty"`
@@ -241,6 +243,7 @@ type MMDSProxyPolicy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
+	Activity  *Activity   `json:"activity,omitempty"`
 	PauseAck  *PauseAck   `json:"pause_ack,omitempty"`
 	Type      string      `json:"type"`
 	Hello     *Hello      `json:"hello,omitempty"`      // hello (orchestrator -> subscriber)

@@ -75,6 +75,7 @@ type SandboxView struct {
 	ResumeSourceRef        string
 	ResumeSandboxRef       string
 	ArtifactLocation       ArtifactLocation
+	IdleTimeout            *int64
 	AutoPauseMemory        bool
 	AutoReset              bool
 	DeadUnix               int64

@@ -42,7 +42,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	if cmd != nil && cmd.Kind != routesync.CmdExecSession && cmd.ExecConditionsSpecified() {
 		return reject(cmd, fmt.Errorf("cluster command contains exec conditions: %w", api.ErrBadRequest))
 	}
-	if cmd != nil && cmd.Kind != routesync.CmdCreate && (cmd.AutoPauseMemory != nil || cmd.AutoReset != nil) {
+	if cmd != nil && cmd.Kind != routesync.CmdCreate && (cmd.AutoPauseMemory != nil || cmd.AutoReset != nil || cmd.IdleTimeout != nil) {
 		return reject(cmd, fmt.Errorf("cluster command auto_pause_memory is create-only: %w", api.ErrBadRequest))
 	}
 	if cmd != nil && cmd.Kind != routesync.CmdConnect && cmd.Memory != nil {

@@ -497,7 +497,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory/autoReset/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
+| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional idleTimeout/autoPauseMemory/autoReset/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata, autoReset, optional deadAt/executionResult/autoResetError (§8.1.5) |
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
@@ -1488,6 +1488,50 @@ false        -> false
 
 The independent durable auto_pause_memory field selects TTL CaptureKind only; it does not enter checkpoint namespace or snapshot.cfg. Standalone and cluster share a typed chain: public Router → route-link reserve → Registry reservation → node-link command → node CreateReq → Sandbox row, without metadata tunneling.
 
+Create `idleTimeout` is a nullable instance policy, in integer seconds. Omission
+or `null` disables it; `0` schedules immediately after a trusted idle observation;
+a positive value waits from Conductor receipt. Negative, fractional, or values
+above 9223372036 seconds return 400. For example:
+
+```json
+{"templateID":"<template-id>","idleTimeout":5}
+```
+
+Get/List and extension views expose the effective nullable value. Store, cluster
+reservation/create, Resume, Reset and migration preserve it, including zero.
+There is no runtime policy-update API. Each new RunID starts fresh observation,
+including a newly running Sandbox that has never received a business request.
+
+The automatic path requires complete, normal single-Proxy observation. It records
+receipt t0 with BOOTTIME, waits the policy duration, then uses the common Pause
+path with `memory=true`, `checkpoint=false`, `ifIdle=true`, `ifIdleSince=t0`.
+At most one automatic Pause attempt per SID may wait for lifecycle/source access;
+new observations replace the candidate without adding waiters, and are evaluated
+after the old attempt retires. Duplicate idle notifications do not extend the
+deadline; new idle, source changes,
+missing statistics and restarts rebuild it. The timer holds no lifecycle lock.
+While waiting it reads the immutable lifecycle cache; a due attempt rereads
+authoritative policy and state from the Store under the SID lock.
+The final synchronous Worker check catches short requests hidden by delayed
+statistics. Rejected attempts can rearm without another business request; repeated
+failures use bounded internal backoff. An unresolved durable pausing state remains
+owned by the existing lifecycle recovery.
+
+A later request uses existing park/Wake. Requests arriving after the Worker sample
+may wait through capture and Resume, subject to the original `park_timeout`;
+delivered business is never replayed. Streams, WebSockets and Native Exec remain
+busy until final relay closure. Guest background work and traffic bypassing Proxy
+are outside this definition and can be frozen with the VM.
+
+`idleTimeout` does not refresh `DeadlineUnix`, change TTL's `autoPauseMemory`, create
+a retained checkpoint, or acquire resource recovery responsibility. A running
+Sandbox with `ResourceObligation` is deferred until that responsibility converges,
+then receives a fresh idle interval. TTL, resource pressure and explicit Pause
+retain their own behavior. Upgrade Conductor, Proxy and cluster peers together
+(routesync v11) before enabling this policy. Migration tokens with non-null
+`idleTimeout` require a receiver that supports the field; omitted/null policy
+keeps the existing token shape.
+
 Explicit Pause body may be empty or:
 
 ```json
@@ -1495,6 +1539,20 @@ Explicit Pause body may be empty or:
 ```
 
 Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field returns 400 before freeze/capture/lifecycle side effects. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
+
+`ifIdleSince` optionally adds a continuous-idle threshold to `ifIdle=true`.
+Use an RFC 3339 timestamp with a timezone (subsecond precision is retained).
+Omitted/null keeps the existing behavior. A missing `ifIdle=true`, malformed
+value, or timestamp later than receipt at the final Conductor returns 400 before
+installing the gate. This condition is evaluated only for running instances;
+starting/paused, including resource-paused, returns 409 without adoption.
+
+The gate's synchronous Worker samples must prove zero parking and connected,
+and `effectiveIdleSince <= ifIdleSince`. Busy or a later known idle baseline
+returns 409; missing samples, empty participants, failed ACKs or indeterminate
+historical clock evidence return 503. Rejection withdraws the temporary gate
+without capture or durable pausing. Extension hooks cannot change this condition.
+The cluster Router forwards the timestamp unchanged to the executing node.
 
 `checkpoint` and `ifIdle` default to false. Every Pause first gates new traffic at the online
 Proxy registrations and synchronously samples parking/connected counts from every worker.
@@ -1509,7 +1567,19 @@ Proxy parks authenticated requests and sends Wake for both pausing and paused. E
 transports remain valid during the handshake so canceling them cannot fabricate idle.
 Conductor holds the SID lifecycle lock through capture, atomic pause/checkpoint commit and
 cleanup before processing queued Wake. pausing→paused is normal progress, whereas
-starting→paused remains a failed Resume. Restart never adopts an interrupted durable pausing
+starting→paused remains a failed Resume.
+
+Runner exit and Pause completion are independent facts. An exit report for the
+current RunID is persisted and acknowledged immediately, including during
+pausing or while paused cleanup still owns that RunID. It does not turn an
+admitted Pause route into dead or veto a successful capture/paused commit.
+The paused row retains the exit diagnostic; the finalizer rechecks state and
+RunID under the SID lock and only finishes paused cleanup. Resume retires the
+old result in both storage and live views, and a valid paused source remains
+exportable. Reports from a retired RunID cannot change a subsequent run.
+If capture succeeds but the paused transaction fails, the uncommitted operation
+remains pausing for existing recovery; it must not be advertised as running.
+Restart never adopts an interrupted durable pausing
 row merely because its runner is live: it fences that exact runner and uses existing terminal
 cleanup because no new source was committed.
 
@@ -1558,7 +1628,7 @@ validates the complete structured result before committing pausing→paused;
 Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
 and its association. Capture failure never commits a partial pair.
 
-Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
+Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure restores running only while the same RunID still owns the pausing row and no exit result has been accepted; an accepted exit follows existing terminal cleanup. Failed attempts retain the old source and create no success alias, never downgrading S to E.
 
 ##### Local disk Checkpoints
 
