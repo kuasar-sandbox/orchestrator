@@ -25,8 +25,14 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
+
+// A matching name and shape outside net/http must not imply a shutdown error.
+type http2GoAwayError struct{ ErrCode uint32 }
+
+func (http2GoAwayError) Error() string { return "HTTP/2 shutdown" }
 
 func startupMembership() clustercfg.MembershipConfig {
 	return clustercfg.MembershipConfig{Active: 1, Versions: []clustercfg.MembershipVersion{{Version: 1, Members: []clustercfg.MembershipMember{{ID: "r"}}}}, Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, NodeList: 1, PlacerLink: 1}}
@@ -50,6 +56,14 @@ func TestBootstrapErrorClassification(t *testing.T) {
 		{"cert", x509.UnknownAuthorityError{}, false}, {"hostname", x509.HostnameError{}, false}, {"verify", &tls.CertificateVerificationError{Err: context.DeadlineExceeded}, false},
 		{"address", &net.AddrError{Err: "bad", Addr: "bad"}, false}, {"json", &json.SyntaxError{}, false}, {"complete truncated JSON", &clusterclient.MembershipJSONError{Err: io.ErrUnexpectedEOF}, false}, {"type", &json.UnmarshalTypeError{}, false}, {"cancel", context.Canceled, false}, {"unknown", errors.New("unknown"), false},
 		{"mixed", errors.Join(syscall.ECONNREFUSED, errors.New("permanent")), false},
+		{"HTTP2 shutdown", http2.GoAwayError{ErrCode: http2.ErrCodeNo}, true},
+		{"HTTP2 shutdown pointer", &http2.GoAwayError{ErrCode: http2.ErrCodeNo}, true},
+		{"HTTP2 protocol pointer", &http2.GoAwayError{ErrCode: http2.ErrCodeProtocol}, false},
+		{"HTTP2 protocol", http2.GoAwayError{ErrCode: http2.ErrCodeProtocol}, false},
+		{"HTTP2 security", http2.GoAwayError{ErrCode: http2.ErrCodeInadequateSecurity}, false},
+		{"HTTP2 lookalike", http2GoAwayError{}, false},
+		{"HTTP2 text only", errors.New(http2.GoAwayError{}.Error()), false},
+		{"HTTP2 mixed", errors.Join(http2.GoAwayError{}, errors.New("permanent")), false},
 	}
 	for _, status := range []int{408, 429, 500, 502, 503, 504, 401, 403, 404, 400, 501} {
 		tests = append(tests, struct {
@@ -64,6 +78,56 @@ func TestBootstrapErrorClassification(t *testing.T) {
 				if got := retryPlacerBootstrap(err); got != tt.retry {
 					t.Fatalf("%T => %v want %v", err, got, tt.retry)
 				}
+			}
+		})
+	}
+}
+
+func TestBootstrapHTTP2GoAway(t *testing.T) {
+	for _, code := range []http2.ErrCode{http2.ErrCodeNo, http2.ErrCodeProtocol, http2.ErrCodeInadequateSecurity} {
+		t.Run(code.String(), func(t *testing.T) {
+			type connectionKey struct{}
+			var hits atomic.Int64
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != 2 {
+					t.Errorf("protocol = %s, want HTTP/2", r.Proto)
+				}
+				if hits.Add(1) == 1 {
+					w.Header().Set("Content-Length", "1000")
+					fmt.Fprint(w, `{"active":`)
+					w.(http.Flusher).Flush()
+					conn := r.Context().Value(connectionKey{}).(net.Conn)
+					// The first stream is still in flight. Write one complete frame
+					// through the TLS connection, then interrupt its response body.
+					if err := http2.NewFramer(conn, nil).WriteGoAway(1, code, nil); err != nil {
+						t.Error(err)
+					}
+					conn.Close()
+					return
+				}
+				json.NewEncoder(w).Encode(startupMembership())
+			}))
+			srv.Config.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+				return context.WithValue(ctx, connectionKey{}, conn)
+			}
+			srv.EnableHTTP2 = true
+			srv.StartTLS()
+			defer srv.Close()
+			roots := x509.NewCertPool()
+			roots.AddCert(srv.Certificate())
+			reg, err := clusterclient.NewRegistry(srv.URL, &tls.Config{RootCAs: roots})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			_, err = waitPlacerMembership(ctx, reg, startupLog(), time.Second, time.Millisecond, 5*time.Millisecond)
+			if code == http2.ErrCodeNo {
+				if err != nil || hits.Load() != 2 {
+					t.Fatalf("shutdown recovery: err=%v hits=%d", err, hits.Load())
+				}
+			} else if err == nil || errors.Is(err, context.DeadlineExceeded) || hits.Load() != 1 {
+				t.Fatalf("protocol failure: err=%v hits=%d", err, hits.Load())
 			}
 		})
 	}

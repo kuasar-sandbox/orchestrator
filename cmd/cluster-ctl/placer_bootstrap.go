@@ -11,10 +11,12 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"reflect"
 	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"golang.org/x/net/http2"
 )
 
 // Only the first membership read is retried. Registration, listeners and readiness
@@ -116,6 +118,9 @@ func retryPlacerBootstrap(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
+	if retryHTTP2Shutdown(err) {
+		return true
+	}
 	switch err {
 	case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.ENETDOWN, syscall.EHOSTDOWN, syscall.ETIMEDOUT, syscall.EPIPE:
 		return true
@@ -123,4 +128,23 @@ func retryPlacerBootstrap(err error) bool {
 	// Only an actual timeout is recognized, never a blanket net.Error match.
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func retryHTTP2Shutdown(err error) bool {
+	switch e := err.(type) {
+	case http2.GoAwayError:
+		return e.ErrCode == http2.ErrCodeNo
+	case *http2.GoAwayError:
+		return e != nil && e.ErrCode == http2.ErrCodeNo
+	}
+	// net/http's bundled HTTP/2 uses a private GoAwayError with no public
+	// marker or As method. Check its exact type identity and code, never its
+	// message. Keep the existing Transport/ALPN configuration; unknown shapes
+	// fail closed, and the real HTTP/2 regression guards toolchain changes.
+	v := reflect.ValueOf(err)
+	if v.Kind() != reflect.Struct || v.Type().PkgPath() != "net/http" || v.Type().Name() != "http2GoAwayError" {
+		return false
+	}
+	code := v.FieldByName("ErrCode")
+	return code.IsValid() && code.Kind() == reflect.Uint32 && code.Uint() == uint64(http2.ErrCodeNo)
 }
