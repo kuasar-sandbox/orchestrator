@@ -241,6 +241,8 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 ## 发布模型
 
+Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包名、原生资产 ID、大小、摘要与上传状态判断；历史单 x86_64 包和完整双架构包均受保护，缺失或歧义元数据保留并报错。删除前复核实际 Tag 与 Release，部分删除可重试；只有明确 404 视为不存在。保留范围与期限由项目发行清理规则决定。
+
 所选 owner 源码在 `release/helper-inputs.json` 声明完整的编译型 E2E helper 清单。配方 `scripts/build-e2e-helpers.sh` 接收目标架构和全新的输出目录，仅在源码构建阶段使用已准入的依赖工作区执行；打包 prepare 和用例执行消费经校验的二进制。内部构建目标和包路径由本仓维护。
 
 使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
