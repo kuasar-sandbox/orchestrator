@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -192,11 +193,11 @@ func (r *Registry) FetchMembership(ctx context.Context) (clustercfg.MembershipCo
 	targets := r.membershipFetchTargets()
 	var out clustercfg.MembershipConfig
 	var got bool
-	var errs []string
+	var errs []error
 	for _, target := range targets {
 		next, err := fetchMembershipFrom(ctx, target)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", target.MemberID, err))
+			errs = append(errs, fmt.Errorf("%s: %w", target.MemberID, err))
 			continue
 		}
 		next = next.WithComputedLabels()
@@ -209,12 +210,42 @@ func (r *Registry) FetchMembership(ctx context.Context) (clustercfg.MembershipCo
 		if len(errs) == 0 {
 			return clustercfg.MembershipConfig{}, fmt.Errorf("clusterclient: no membership endpoints")
 		}
-		return clustercfg.MembershipConfig{}, fmt.Errorf("clusterclient: membership refresh failed: %s", strings.Join(errs, "; "))
+		return clustercfg.MembershipConfig{}, fmt.Errorf("clusterclient: membership refresh failed: %w", errors.Join(errs...))
 	}
 	r.mu.Lock()
 	r.membership = out
 	r.mu.Unlock()
 	return out, nil
+}
+
+// MembershipStatusError preserves the HTTP status for startup retry decisions.
+// It is internal to orchestrator and does not define a wire error protocol.
+type MembershipStatusError struct{ StatusCode int }
+
+func (e *MembershipStatusError) Error() string {
+	return fmt.Sprintf("membership HTTP %d", e.StatusCode)
+}
+
+// MembershipJSONError distinguishes incomplete JSON in a fully received body
+// from a body interrupted by the transport, while preserving the decoder cause.
+type MembershipJSONError struct{ Err error }
+
+func (e *MembershipJSONError) Error() string {
+	return fmt.Sprintf("invalid membership JSON: %v", e.Err)
+}
+func (e *MembershipJSONError) Unwrap() error { return e.Err }
+
+type membershipBody struct {
+	io.ReadCloser
+	complete bool
+}
+
+func (b *membershipBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.complete = true
+	}
+	return n, err
 }
 
 func fetchMembershipFrom(ctx context.Context, ep Endpoint) (clustercfg.MembershipConfig, error) {
@@ -231,10 +262,32 @@ func fetchMembershipFrom(ctx context.Context, ep Endpoint) (clustercfg.Membershi
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return clustercfg.MembershipConfig{}, fmt.Errorf("membership %s", resp.Status)
+		return clustercfg.MembershipConfig{}, &MembershipStatusError{StatusCode: resp.StatusCode}
 	}
+	body := &membershipBody{ReadCloser: resp.Body}
 	var out clustercfg.MembershipConfig
-	if err := DecodeResponse(resp.Body, &out); err != nil {
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(&out); err != nil {
+		if body.complete && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+			return clustercfg.MembershipConfig{}, &MembershipJSONError{Err: err}
+		}
+		return clustercfg.MembershipConfig{}, err
+	}
+	// Validate a bounded tail as well as consuming the chunk terminator. A second
+	// JSON value or partial trailing value is a protocol error, not a dial failure.
+	tail := &io.LimitedReader{R: io.MultiReader(decoder.Buffered(), body), N: 64 << 10}
+	var extra any
+	err = json.NewDecoder(tail).Decode(&extra)
+	if tail.N == 0 {
+		return clustercfg.MembershipConfig{}, fmt.Errorf("membership JSON trailing data exceeds read budget")
+	}
+	if err == nil {
+		return clustercfg.MembershipConfig{}, fmt.Errorf("membership contains multiple JSON values")
+	}
+	if err != io.EOF {
+		if (body.complete || tail.N == 0) && errors.Is(err, io.ErrUnexpectedEOF) {
+			err = &MembershipJSONError{Err: err}
+		}
 		return clustercfg.MembershipConfig{}, err
 	}
 	return out, nil
