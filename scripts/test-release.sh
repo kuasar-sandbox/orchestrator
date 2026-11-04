@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+# This suite compiles private synthetic modules; product source gates select
+# their own verified workspace outside these standalone packaging fixtures.
+export GOWORK=off
+
 # Archive fixtures target x86_64 even when this gate runs on an ARM host.
 # Validators run natively; payload fixtures are inspected, never executed.
 # Archive fixtures prescribe 0755 directories regardless of the caller's umask.
@@ -26,6 +30,13 @@ source "$ROOT/scripts/release-materials.sh"
 bash "$ROOT/scripts/test-release-materials.sh"
 bash "$ROOT/scripts/test-release-go-notices.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-selected-go-materials.py"
+# Cross-repository integration is opt-in; the CI source wrapper supplies its
+# selected platform explicitly. Standalone packaging needs no sibling checkout.
+if [[ -n "${KUASAR_PLATFORM_DIR:-${KUASAR_PLATFORM_ROOT:-}}" ]]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-workspace.py"
+else
+  echo 'test-release: workspace integration not selected (set KUASAR_PLATFORM_DIR to run)'
+fi
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
@@ -279,7 +290,7 @@ if (release_materials_require_go_revision "$TMP/go-fixture" \
   0000000000000000000000000000000000000000 >/dev/null 2>&1); then
   fail "release accepted a binary built from another commit"
 fi
-GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/cmd/node-ctl/main.go"
+GOWORK=off GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/cmd/node-ctl/main.go"
 if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary without source stamping"
 fi

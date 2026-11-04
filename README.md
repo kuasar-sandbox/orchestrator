@@ -183,15 +183,20 @@ to its maintained focused case.
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
-Source builds require Go 1.26.1 or newer and sibling checkouts of `accelerator`,
-`connector` and `sandboxer`, even for a change confined to this repository. The
-internal `require` versions identify each dependency's target formal release;
-Daily Preview development uses the same target without its preview suffix. A
-target tag need not exist yet because the tracked local `replace` directives
-select the actual sibling sources. `GOWORK=off` does not disable those directives.
-Do not infer which source revision was tested from the version label: record the
-exact sibling SHAs. Runtime/Kernel artifacts are additional prerequisites for
-real sandbox tests, not Go-only compilation.
+Source builds require Go 1.26.1 or newer. Standalone builds resolve the obtainable
+versions committed in `go.mod`. Coordinated Preview builds use the selected local
+`orchestrator`, `sandboxer`, `accelerator` and `connector` modules:
+
+```bash
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator)" || exit 1
+export GOWORK
+make build
+```
+
+The workspace verifies module paths and uses exactly this closure without redundant
+`replace` directives or changes to `go.mod`/`go.sum`. Product, helper and source tests
+share the selected modules. Runtime/Kernel artifacts remain additional prerequisites
+for real sandbox tests.
 
 The source `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh` flow starts real control-plane processes
 but no MicroVMs. Its run directory is private. Failure output reports diagnostic
@@ -278,26 +283,11 @@ normal Go cache and routing; downloaded module checksums must match the binaries
 Only explicitly collected internal sibling dependencies use their own source
 materials; an organization namespace alone does not exempt other modules.
 Unsupported third-party local replacements need versioned module inputs for
-the official package. Existing Kuasar local `replace` directives remain in use.
+the official package. Selected Kuasar sources are provided through the explicit Go workspace.
 
-Materials live under `share/licenses/<component>` and
-`share/sources/<component>`. The latter contains `SOURCES.tsv`,
-`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
-Collection fails on missing notices, unreadable subtrees or partial traversals.
-Independent validation checks the shipped inventory, checksums, required files,
-source-record consistency, payload identities and archive paths/types/modes.
-It does not fetch source checkouts or Go modules, compare notices with remote
-source trees, or download/authenticate compiler distributions. Checksums and
-VCS records are consistency checks, not proof of an arbitrary producer's identity.
+Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. Packages and Releases do not carry source or historical test records, or independent `SHA256SUMS`.
 
-The archive name identifies the requested release target. Project and internal
-dependency records use a release version when its local tag matches the selected
-commit, otherwise `git:<commit>`; packaging does not require creating future
-target tags. The publisher passes the selected project SHA to validation before
-Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
-existing source/Preview markers. Trusted source selection, build/publish permission
-separation and the refusal to replace published assets remain required.
-Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
+`make release` verifies `ACCELERATOR_VERSION`, `CONNECTOR_VERSION` and `SANDBOXER_VERSION` against clean sibling checkouts, generates the four-module Go workspace, then builds and packages the same outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. The publisher uses human release notes and refuses to replace an existing asset with different bytes.
 
 The four official Go executables must identify their own Orchestrator command
 main packages and target the selected Linux architecture (amd64 for x86_64,

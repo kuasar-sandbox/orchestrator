@@ -10,17 +10,17 @@ e2e_go() {
 }
 
 build_custom_proxy() {
-    (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off e2e_go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
+    (cd "$CUSTOM_PROXY_SOURCE_ROOT" && e2e_go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
         || skip "failed to build examples/custom-proxy"
 }
 
 
 build_telemetry_netns() {
-    (cd "$telemetry_source" && GOWORK=off CGO_ENABLED=0 e2e_go test -c -o "$WORK/telemetry.test" ./internal/telemetry)
+    (cd "$telemetry_source" && CGO_ENABLED=0 e2e_go test -c -o "$WORK/telemetry.test" ./internal/telemetry)
 }
 
 build_telemetry_grpc() {
-    GOWORK=off CGO_ENABLED=0 e2e_go build -trimpath -o "$WORK/telemetry-grpc-probe" "$SCRIPT_DIR/telemetryprobe/main.go"
+    CGO_ENABLED=0 e2e_go build -trimpath -o "$WORK/telemetry-grpc-probe" "$SCRIPT_DIR/telemetryprobe/main.go"
 }
 
 main() {

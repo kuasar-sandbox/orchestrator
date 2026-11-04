@@ -53,6 +53,7 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         env = {
             **os.environ,
             "PATH": str(path),
+            "GOWORK": "off",  # Private synthetic module, independent of the enclosing CI closure.
             "CUSTOM_PROXY_SOURCE_ROOT": str(self.source),
             "CUSTOM_PROXY_BIN": str(self.output),
             "REQUIRE_PROXY": required,
@@ -101,6 +102,15 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
             lines[2:], ["build", "-o", str(self.output), "./examples/custom-proxy"]
         )
         self.assertNotEqual(selected, root_path / "go")
+
+    def test_explicit_workspace_is_preserved_for_custom_proxy(self):
+        selected = self.root / "selected"
+        self.fake_go(selected / "bin", "selected-driver")
+        workspace = str(self.root / "selected.work")
+        result = self.run_build(path=self.root / "empty-path", goroot_marker=selected,
+                                extra={"GOWORK": workspace})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().splitlines()[:2], ["selected-driver", workspace])
 
     def test_unset_or_empty_goroot_falls_back_to_path(self):
         root_path = self.root / "root-path"
@@ -236,7 +246,7 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
                 self.assertEqual(result.returncode,0,result.stderr)
                 rows = [json.loads(line) for line in log.read_text().splitlines()]
                 self.assertEqual(len(rows),7)
-                self.assertEqual([r['env']['GOWORK'] for r in rows],['off','off']+[env['GOWORK']]*5)
+                self.assertEqual([r['env']['GOWORK'] for r in rows],[env['GOWORK']]*7)
                 for row in rows:
                     self.assertEqual(row['env'],dict(GOWORK=row['env']['GOWORK'],GOARCH=goarch,GOOS='linux',
                                                      CGO_ENABLED='0',GOTOOLCHAIN='local',CC='preserved-cc'))

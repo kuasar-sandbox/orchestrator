@@ -14,9 +14,9 @@ require (
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
-	github.com/kuasar-sandbox/accelerator v0.1.7
-	github.com/kuasar-sandbox/connector v0.1.2
-	github.com/kuasar-sandbox/sandboxer v0.1.11
+	github.com/kuasar-sandbox/accelerator v0.1.10
+	github.com/kuasar-sandbox/connector v0.1.6
+	github.com/kuasar-sandbox/sandboxer v0.1.13-preview.20261104.1
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector v0.145.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter v0.145.0
@@ -60,15 +60,6 @@ require (
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.40.1
-)
-
-// Cross-repo local resolution (single-repo offline build; go.work covers the
-// workspace). orchestrator imports sandboxer/pkg/config to build sandbox.yaml
-// from one source of truth; that transitively needs accelerator.
-replace (
-	github.com/kuasar-sandbox/accelerator => ../accelerator
-	github.com/kuasar-sandbox/connector => ../connector
-	github.com/kuasar-sandbox/sandboxer => ../sandboxer
 )
 
 require (
