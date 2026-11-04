@@ -4,11 +4,14 @@ set -euo pipefail
 umask 022
 
 NAME=orchestrator
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TOOL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${RELEASE_SOURCE_ROOT:-$TOOL_ROOT}"
+[ -d "$ROOT" ] && [ ! -L "$ROOT" ] || { echo "release: invalid selected source root" >&2; exit 1; }
+ROOT="$(cd "$ROOT" && pwd -P)"
 WORK="$(mktemp -d)"
 trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
 # shellcheck source=scripts/release-materials.sh
-source "$ROOT/scripts/release-materials.sh"
+source "${TOOL_ROOT:-$ROOT}/scripts/release-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -106,7 +109,7 @@ validate_archive_paths() {
   fi
   # This standard-library-only host parser is independent of the product module.
   GO111MODULE=off GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
-    GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "${TOOL_ROOT:-$ROOT}/scripts/release-archive-validator.go" "$archive" \
     || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
 }
 
@@ -133,21 +136,13 @@ validate_bundle() {
   [ -d "$bundle/assets" ] || fail "assets directory is missing"
 
   local expected="$WORK/expected-assets" actual="$WORK/actual-assets"
-  printf '%s\n' "$archive" SHA256SUMS | LC_ALL=C sort > "$expected"
-  find "$bundle/assets" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > "$actual"
+  printf '%s\n' "$archive" | LC_ALL=C sort > "$expected"
+  find "$bundle/assets" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$actual"
   cmp -s "$expected" "$actual" \
     || { diff -u "$expected" "$actual" >&2 || true; fail "bundle contains an unexpected asset set"; }
-  [ "$(grep -cve '^[[:space:]]*$' "$bundle/assets/SHA256SUMS")" -eq 1 ] \
-    || fail "SHA256SUMS must contain exactly one entry"
-  local digest listed extra
-  read -r digest listed extra < "$bundle/assets/SHA256SUMS"
-  listed="${listed#\*}"
-  if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]] \
-    || [ "$listed" != "$archive" ] || [ -n "${extra:-}" ]; then
-    fail "SHA256SUMS does not describe the expected archive"
-  fi
-  (cd "$bundle/assets" && sha256sum --quiet -c SHA256SUMS) \
-    || fail "SHA256SUMS validation failed"
+  [ -s "$bundle/assets/$archive" ] && [ ! -L "$bundle/assets/$archive" ] \
+    || fail "release archive must be a nonempty regular file"
+
 
   validate_archive_paths "$bundle/assets/$archive"
   local extract="$WORK/extract"
@@ -263,11 +258,10 @@ package_release() {
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
     --pax-option=delete=atime,delete=ctime -czf "$output/assets/$archive" -C "$STAGE" .
-  (cd "$output/assets" && sha256sum "$archive" > SHA256SUMS)
   cat > "$output/release-notes.md" <<EOF
-$NAME $version for Linux $arch.
+$NAME $version for Linux.
 
-Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. Documentation and E2E suites from this exact tag are collected by the aggregate platform release.
+Download the archive for your architecture, verify its native GitHub asset size and digest, then extract it into a Kuasar Sandbox deployment root. Documentation and E2E suites from this exact tag are collected by the aggregate platform release.
 EOF
   validate_bundle "$version" "$arch" "$output"
   echo "==> prepared $output for $version"

@@ -114,7 +114,9 @@ class EnvironmentTools(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools = root / "tools"
-            scripts = root / "orchestrator/scripts"
+            scripts = root / "tooling/scripts"
+            (root / "orchestrator").mkdir()
+            selected_program=program.replace("/inputs/release/.ci/component-packaging/scripts/release.sh",str(scripts/"release.sh"))
             tools.mkdir()
             scripts.mkdir(parents=True)
             commands = {
@@ -127,7 +129,7 @@ class EnvironmentTools(unittest.TestCase):
                 path.write_text(contents)
                 path.chmod(0o755)
             (scripts / "release.sh").write_text(
-                'set -eu\nprintf "%s|%s|%s|%s|%s|%s\\n" "$1" "$2" "$3" '
+                'set -eu\ntest "$RELEASE_SOURCE_ROOT" = "$HOME/orchestrator"\nprintf "%s|%s|%s|%s|%s|%s\\n" "$1" "$2" "$3" '
                 '"$ACCELERATOR_VERSION" "$CONNECTOR_VERSION" "$SANDBOXER_VERSION" >> "$OBSERVED"\n')
             observed = root / "observed"
             for arch in ("x86_64", "aarch64"):
@@ -136,7 +138,7 @@ class EnvironmentTools(unittest.TestCase):
                     # Workbench does not inherit the release job's host env.
                     environment = {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
                                    "HOME": str(root), "TARGET_ARCH": arch, "OBSERVED": str(observed)}
-                    result = subprocess.run([shutil.which("bash"), "-euo", "pipefail", "-c", program],
+                    result = subprocess.run([shutil.which("bash"), "-euo", "pipefail", "-c", selected_program],
                                             cwd=root, env=environment, text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(observed.read_text().splitlines(), [

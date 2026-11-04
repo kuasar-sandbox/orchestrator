@@ -315,7 +315,7 @@ release_materials_go_license_source() {
   local module="$1" version="$2" directory="$3" notice digest
   case "$module@$version" in
     github.com/rootless-containers/proto/go-proto@v0.0.0-20230421021042-4cd87ebadd67)
-      notice="$ROOT/scripts/release-notices/rootless-containers-proto"
+      notice="${TOOL_ROOT:-$ROOT}/scripts/release-notices/rootless-containers-proto"
       [ -f "$notice/COPYING" ] && [ ! -L "$notice/COPYING" ] \
         || fail "pinned rootless-containers/proto COPYING is missing"
       digest="$(sha256sum "$notice/COPYING" | awk '{print $1}')"
