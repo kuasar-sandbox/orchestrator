@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+# This suite compiles private synthetic modules; product source gates select
+# their own verified workspace outside these standalone packaging fixtures.
+export GOWORK=off
+
 # Archive fixtures target x86_64 even when this gate runs on an ARM host.
 # Validators run natively; payload fixtures are inspected, never executed.
 # Archive fixtures prescribe 0755 directories regardless of the caller's umask.
