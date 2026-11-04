@@ -25,6 +25,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -820,7 +821,7 @@ func (s *Service) acquireImportSourceLease(ctx context.Context, link RegistryLin
 		return registry.ImportSourceLeaseResponse{}, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var out registry.ImportSourceLeaseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := clusterclient.DecodeResponse(resp.Body, &out); err != nil {
 		return registry.ImportSourceLeaseResponse{}, err
 	}
 	return out, nil
@@ -991,7 +992,7 @@ func (s *Service) postJSON(ctx context.Context, link RegistryLink, path string, 
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
-	return nil
+	return clusterclient.DrainResponse(resp.Body)
 }
 
 func selectorPatchTargets(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, []string) {

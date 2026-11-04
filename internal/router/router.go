@@ -2076,7 +2076,7 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 		}
 	}
 	var res buildReserveResult
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := clusterclient.DecodeResponse(resp.Body, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -2125,7 +2125,7 @@ func (rt *Router) routeLinkCallWithConflictRetry(ctx context.Context, group, met
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return &routeLinkCallError{status: resp.StatusCode, path: path, response: resp.Status, body: strings.TrimSpace(string(b))}
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return clusterclient.DecodeResponse(resp.Body, out)
 }
 
 type routeLinkCallError struct {

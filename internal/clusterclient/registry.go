@@ -5,8 +5,10 @@ package clusterclient
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +21,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
+const idleConnTimeout = 90 * time.Second
+
 const MembershipPath = "/cluster/membership"
 
 type Endpoint struct {
@@ -28,21 +32,27 @@ type Endpoint struct {
 }
 
 type Registry struct {
-	bootstrap string
-	baseURL   string
-	tlsConfig *tls.Config
-	client    *http.Client
+	bootstrap     string
+	baseURL       string
+	tlsConfig     *tls.Config
+	client        *http.Client
+	poolsOnce     sync.Once
+	httpClient    *http.Client
+	httpsClient   *http.Client
+	unixTransport *http.Transport
 
 	mu         sync.RWMutex
 	membership clustercfg.MembershipConfig
 }
 
 func NewRegistry(bootstrap string, tlsConfig *tls.Config) (*Registry, error) {
-	base, client, err := HTTPBase(bootstrap, tlsConfig)
+	r := &Registry{bootstrap: bootstrap, tlsConfig: tlsConfig}
+	base, client, err := r.httpBase(bootstrap)
 	if err != nil {
 		return nil, err
 	}
-	return &Registry{bootstrap: bootstrap, baseURL: base, tlsConfig: tlsConfig, client: client}, nil
+	r.baseURL, r.client = base, client
+	return r, nil
 }
 
 func NewRegistryWithClient(baseURL string, client *http.Client) *Registry {
@@ -60,7 +70,7 @@ func HTTPBase(endpoint string, tlsConfig *tls.Config) (string, *http.Client, err
 		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", endpoint)
 		}
-		return "http://registry", &http.Client{Transport: &http.Transport{DialContext: dial}}, nil
+		return "http://registry", &http.Client{Transport: &http.Transport{DialContext: dial, IdleConnTimeout: idleConnTimeout}}, nil
 	}
 	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
 		u, err := url.Parse(endpoint)
@@ -77,9 +87,105 @@ func HTTPBase(endpoint string, tlsConfig *tls.Config) (string, *http.Client, err
 
 func clientForScheme(scheme string, tlsConfig *tls.Config) *http.Client {
 	if scheme == "https" {
-		return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true}}
+		return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true, IdleConnTimeout: idleConnTimeout}}
 	}
-	return &http.Client{Transport: &http.Transport{}}
+	return &http.Client{Transport: &http.Transport{IdleConnTimeout: idleConnTimeout}}
+}
+
+// httpBase shares a fixed set of transports. No member-address cache is retained.
+// The caller-owned bootstrap client is deliberately separate from these pools.
+func (r *Registry) httpBase(endpoint string) (string, *http.Client, error) {
+	r.poolsOnce.Do(func() {
+		r.httpClient = clientForScheme("http", nil)
+		r.httpsClient = clientForScheme("https", r.tlsConfig)
+		r.unixTransport = &http.Transport{IdleConnTimeout: idleConnTimeout, DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			path, err := hex.DecodeString(host)
+			if err != nil {
+				return nil, err
+			}
+			return (&net.Dialer{}).DialContext(ctx, "unix", string(path))
+		}}
+	})
+	if strings.HasPrefix(endpoint, "/") {
+		return "http://registry", &http.Client{Transport: unixRoundTripper{r.unixTransport, endpoint}}, nil
+	}
+	if endpoint == "" {
+		return "", nil, fmt.Errorf("clusterclient: registry bootstrap is required")
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		if r.tlsConfig != nil {
+			endpoint = "https://" + endpoint
+		} else {
+			endpoint = "http://" + endpoint
+		}
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return "", nil, fmt.Errorf("clusterclient: invalid endpoint %q", endpoint)
+	}
+	client := r.httpClient
+	if u.Scheme == "https" {
+		client = r.httpsClient
+	}
+	return strings.TrimRight(endpoint, "/"), client, nil
+}
+
+// A private authority lets Transport key Unix pools by socket path while callers
+// and servers retain the existing http://registry URL and Host header.
+type unixRoundTripper struct {
+	transport *http.Transport
+	path      string
+}
+
+func (u unixRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	if clone.Host == "" {
+		clone.Host = req.URL.Host
+	}
+	clone.URL.Host = hex.EncodeToString([]byte(u.path))
+	return u.transport.RoundTrip(clone)
+}
+
+func (r *Registry) endpointKey(endpoint string) string {
+	if strings.HasPrefix(endpoint, "/") {
+		return endpoint
+	}
+	if endpoint == "" {
+		return r.endpointKey(r.bootstrap)
+	}
+	if !strings.Contains(endpoint, "://") {
+		if r.tlsConfig != nil {
+			endpoint = "https://" + endpoint
+		} else {
+			endpoint = "http://" + endpoint
+		}
+	}
+	return strings.TrimRight(endpoint, "/")
+}
+
+// DecodeResponse consumes the bounded tail of a successful finite JSON response
+// so HTTP/1 chunk terminators reach Transport. Invalid or excessive tails are not
+// drained indefinitely; request contexts still bound network reads.
+func DecodeResponse(body io.ReadCloser, out any) error {
+	if err := json.NewDecoder(body).Decode(out); err != nil {
+		return err
+	}
+	return DrainResponse(body)
+}
+
+// DrainResponse spends a bounded byte budget on connection reuse.
+// The request context controls cancellation and network deadlines.
+// It is for finite control responses, never WATCH_LIST or other streams.
+func DrainResponse(body io.ReadCloser) error {
+	_, err := io.CopyN(io.Discard, body, 64<<10)
+	if err == io.EOF {
+		return nil
+	}
+	return err
 }
 
 func (r *Registry) FetchMembership(ctx context.Context) (clustercfg.MembershipConfig, error) {
@@ -128,7 +234,7 @@ func fetchMembershipFrom(ctx context.Context, ep Endpoint) (clustercfg.Membershi
 		return clustercfg.MembershipConfig{}, fmt.Errorf("membership %s", resp.Status)
 	}
 	var out clustercfg.MembershipConfig
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := DecodeResponse(resp.Body, &out); err != nil {
 		return clustercfg.MembershipConfig{}, err
 	}
 	return out, nil
@@ -149,17 +255,17 @@ func (r *Registry) membershipFetchTargets() []Endpoint {
 	if len(m.Versions) == 0 {
 		return out
 	}
-	seen := map[string]bool{r.baseURL: true}
+	seen := map[string]bool{r.endpointKey(r.bootstrap): true}
 	for _, v := range m.MemberVersions() {
 		for _, member := range v.Members {
 			if member.ID == "" {
 				continue
 			}
 			ep, err := r.endpointForMember(v, member)
-			if err != nil || ep.BaseURL == "" || seen[ep.BaseURL] {
+			if err != nil || ep.BaseURL == "" || seen[r.endpointKey(member.Advertise)] {
 				continue
 			}
-			seen[ep.BaseURL] = true
+			seen[r.endpointKey(member.Advertise)] = true
 			out = append(out, ep)
 		}
 	}
@@ -355,7 +461,7 @@ func (r *Registry) endpointForMember(v clustercfg.MembershipVersion, member clus
 		base, client = r.baseURL, r.client
 	} else {
 		var err error
-		base, client, err = HTTPBase(base, r.tlsConfig)
+		base, client, err = r.httpBase(base)
 		if err != nil {
 			return Endpoint{}, fmt.Errorf("clusterclient: member %q: %w", member.ID, err)
 		}
