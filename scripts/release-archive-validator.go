@@ -19,34 +19,30 @@ type entryContract struct {
 }
 
 var archiveContract = map[string]entryContract{
-	"./":                                             {typeflag: tar.TypeDir, mode: 0o755},
-	"./bin/":                                         {typeflag: tar.TypeDir, mode: 0o755},
-	"./deploy/":                                      {typeflag: tar.TypeDir, mode: 0o755},
-	"./bin/node-ctl":                                 {typeflag: tar.TypeReg, mode: 0o755},
-	"./bin/cluster-ctl":                              {typeflag: tar.TypeReg, mode: 0o755},
-	"./bin/node-stub-ctl":                            {typeflag: tar.TypeReg, mode: 0o755},
-	"./bin/e2b-key-ctl":                              {typeflag: tar.TypeReg, mode: 0o755},
-	"./deploy/node-ctl.service":                      {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/node-proxy.service":                    {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/node-telemetry.service":                {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/cluster-registry.service":              {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/cluster-router.service":                {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/cluster-placer.service":                {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/conductor.example.yaml":                {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/proxy.example.yaml":                    {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/telemetry.example.yaml":                {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/telemetry-fanout.example.yaml":         {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/telemetry-prometheus.example.yaml":     {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/telemetry-clickhouse.example.yaml":     {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/telemetry-query-only.example.yaml":     {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/registry.example.yaml":                 {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/router.example.yaml":                   {typeflag: tar.TypeReg, mode: 0o644},
-	"./deploy/placer.example.yaml":                   {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/licenses/orchestrator/project/LICENSE":  {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/orchestrator/GO-BUILD-INFO.tsv": {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/orchestrator/GO-MODULES.tsv":    {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/orchestrator/MATERIALS.sha256":  {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/orchestrator/SOURCES.tsv":       {typeflag: tar.TypeReg, mode: 0o644},
+	"./":                                            {typeflag: tar.TypeDir, mode: 0o755},
+	"./bin/":                                        {typeflag: tar.TypeDir, mode: 0o755},
+	"./deploy/":                                     {typeflag: tar.TypeDir, mode: 0o755},
+	"./bin/node-ctl":                                {typeflag: tar.TypeReg, mode: 0o755},
+	"./bin/cluster-ctl":                             {typeflag: tar.TypeReg, mode: 0o755},
+	"./bin/node-stub-ctl":                           {typeflag: tar.TypeReg, mode: 0o755},
+	"./bin/e2b-key-ctl":                             {typeflag: tar.TypeReg, mode: 0o755},
+	"./deploy/node-ctl.service":                     {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/node-proxy.service":                   {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/node-telemetry.service":               {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/cluster-registry.service":             {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/cluster-router.service":               {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/cluster-placer.service":               {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/conductor.example.yaml":               {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/proxy.example.yaml":                   {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/telemetry.example.yaml":               {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/telemetry-fanout.example.yaml":        {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/telemetry-prometheus.example.yaml":    {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/telemetry-clickhouse.example.yaml":    {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/telemetry-query-only.example.yaml":    {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/registry.example.yaml":                {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/router.example.yaml":                  {typeflag: tar.TypeReg, mode: 0o644},
+	"./deploy/placer.example.yaml":                  {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/project/LICENSE": {typeflag: tar.TypeReg, mode: 0o644},
 }
 
 func materialContract(name string) (entryContract, bool) {
@@ -54,15 +50,12 @@ func materialContract(name string) (entryContract, bool) {
 		"./share/",
 		"./share/licenses/",
 		"./share/licenses/orchestrator/",
-		"./share/sources/",
-		"./share/sources/orchestrator/",
 	} {
 		if name == directory {
 			return entryContract{typeflag: tar.TypeDir, mode: 0o755}, true
 		}
 	}
-	if !strings.HasPrefix(name, "./share/licenses/orchestrator/") &&
-		!strings.HasPrefix(name, "./share/sources/orchestrator/") {
+	if !strings.HasPrefix(name, "./share/licenses/orchestrator/") {
 		return entryContract{}, false
 	}
 	clean := path.Clean(strings.TrimPrefix(name, "./"))

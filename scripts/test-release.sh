@@ -42,9 +42,7 @@ init_fixture_repo() {
   git -C "$directory" rev-parse HEAD
 }
 
-mkdir -p "$TMP/git-source" \
-  "$TMP/material-hash/share/licenses/hash-test/LICENSES" \
-  "$TMP/material-hash/share/sources/hash-test"
+mkdir -p "$TMP/git-source"
 printf 'fixture license\n' > "$TMP/git-source/LICENSE"
 fixture_git_sha="$(init_fixture_repo "$TMP/git-source" LICENSE)"
 [ "$(release_materials_git_version "$TMP/git-source" v1.2.3 "$fixture_git_sha")" = "git:$fixture_git_sha" ] \
@@ -74,112 +72,34 @@ if (
 ); then
   fail "license collection accepted material absent from the selected commit"
 fi
-printf 'nested license manifest\n' \
-  > "$TMP/material-hash/share/licenses/hash-test/LICENSES/MATERIALS.sha256"
-printf 'generated inventory\n' \
-  > "$TMP/material-hash/share/sources/hash-test/MATERIALS.sha256"
-release_materials_hash_tree "$TMP/material-hash" hash-test "$TMP/material-hash-actual"
-grep -Fq 'share/licenses/hash-test/LICENSES/MATERIALS.sha256' "$TMP/material-hash-actual" \
-  || fail "license file named MATERIALS.sha256 was omitted from the material inventory"
-if grep -Fq 'share/sources/hash-test/MATERIALS.sha256' "$TMP/material-hash-actual"; then
-  fail "generated material inventory included itself"
-fi
-
+# Package validation checks actual paths, permissions, notices and payloads.
 material_root="$TMP/material-validation"
 material_unit=validation
-mkdir -p "$material_root/bin"
-printf 'payload\n' > "$material_root/bin/tool"
-mkdir -p "$material_root/share/licenses/$material_unit/project" \
-  "$material_root/share/sources/$material_unit" "$TMP/material-validation-work"
+mkdir -p "$material_root/share/licenses/$material_unit/project" "$TMP/material-validation-work"
 printf 'fixture license\n' > "$material_root/share/licenses/$material_unit/project/LICENSE"
-{
-  printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
-  printf 'bin/tool\tfixture\tv1.0.0\thttps://example.invalid/source.tar.gz\tsha256:fixture\tshare/licenses/%s/project\n' \
-    "$material_unit"
-} > "$material_root/share/sources/$material_unit/SOURCES.tsv"
-printf 'payload\trecord\tname\tversion_or_value\tchecksum\n' \
-  > "$material_root/share/sources/$material_unit/GO-BUILD-INFO.tsv"
-printf 'module\tversion\tchecksum\n' \
-  > "$material_root/share/sources/$material_unit/GO-MODULES.tsv"
-release_materials_hash_tree "$material_root" "$material_unit" \
-  "$material_root/share/sources/$material_unit/MATERIALS.sha256"
 find "$material_root/share" -type d -exec chmod 0755 {} +
 find "$material_root/share" -type f -exec chmod 0644 {} +
-(
-  WORK="$TMP/material-validation-work"
-  release_materials_validate "$material_root" "$material_unit"
-)
-
-cp -a "$material_root" "$TMP/material-unsafe-license-path"
-{
-  printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
-  printf 'bin/tool\tfixture\tv1.0.0\thttps://example.invalid/source.tar.gz\tsha256:fixture\t../../../etc\n'
-} > "$TMP/material-unsafe-license-path/share/sources/$material_unit/SOURCES.tsv"
-release_materials_hash_tree "$TMP/material-unsafe-license-path" "$material_unit" \
-  "$TMP/material-unsafe-license-path/share/sources/$material_unit/MATERIALS.sha256"
-chmod 0644 "$TMP/material-unsafe-license-path/share/sources/$material_unit/MATERIALS.sha256"
-if (
-  WORK="$TMP/material-validation-work"
-  release_materials_validate "$TMP/material-unsafe-license-path" "$material_unit" \
-    >/dev/null 2>&1
-); then
-  fail "release material validator accepted a license directory outside its unit"
-fi
-
-cp -a "$material_root" "$TMP/material-invalid-record"
-{
-  printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
-  printf 'bin/tool\tfixture\tv1.0.0\thttps://example.invalid/source.tar.gz\tsha256:fixture\n'
-} > "$TMP/material-invalid-record/share/sources/$material_unit/SOURCES.tsv"
-release_materials_hash_tree "$TMP/material-invalid-record" "$material_unit" \
-  "$TMP/material-invalid-record/share/sources/$material_unit/MATERIALS.sha256"
-chmod 0644 "$TMP/material-invalid-record/share/sources/$material_unit/MATERIALS.sha256"
-if (
-  WORK="$TMP/material-validation-work"
-  release_materials_validate "$TMP/material-invalid-record" "$material_unit" \
-    >/dev/null 2>&1
-); then
-  fail "release material validator accepted a SOURCES.tsv row with fewer than six fields"
-fi
-
-cp -a "$material_root" "$TMP/material-unsafe-parent-mode"
-chmod 0777 "$TMP/material-unsafe-parent-mode/share"
-if (
-  WORK="$TMP/material-validation-work"
-  release_materials_validate "$TMP/material-unsafe-parent-mode" "$material_unit" \
-    >/dev/null 2>&1
-); then
-  fail "release material validator accepted an unsafe parent directory mode"
-fi
-
-cp -a "$material_root" "$TMP/material-empty-license"
-rm "$TMP/material-empty-license/share/licenses/$material_unit/project/LICENSE"
-release_materials_hash_tree "$TMP/material-empty-license" "$material_unit" \
-  "$TMP/material-empty-license/share/sources/$material_unit/MATERIALS.sha256"
-if (
-  WORK="$TMP/material-validation-work"
-  release_materials_validate "$TMP/material-empty-license" "$material_unit" >/dev/null 2>&1
-); then
-  fail "release material validator accepted an empty license directory"
-fi
-if (
-  release_materials_require_source "$material_root" "$material_unit" bin/tool fixture v2.0.0 \
-    >/dev/null 2>&1
-); then
-  fail "release material validator accepted a different release version"
-fi
-if (
-  release_materials_require_go "$material_root" "$material_unit" bin/tool >/dev/null 2>&1
-); then
-  fail "release material validator accepted missing Go build records"
-fi
-cp -a "$material_root" "$TMP/material-missing-payload"
-rm "$TMP/material-missing-payload/bin/tool"
-if (
-  WORK="$TMP/material-validation-work"
-  release_materials_validate "$TMP/material-missing-payload" "$material_unit" >/dev/null 2>&1
-); then
-  fail "release material validator accepted a record for an unshipped payload"
+WORK="$TMP/material-validation-work" release_materials_validate "$material_root" "$material_unit"
+for mutation in parent-mode file-mode link fifo empty missing unsafe-path source-record; do
+  altered="$TMP/material-$mutation"
+  cp -a "$material_root" "$altered"
+  license="$altered/share/licenses/$material_unit/project/LICENSE"
+  case "$mutation" in
+    parent-mode) chmod 0777 "$altered/share" ;;
+    file-mode) chmod 0666 "$license" ;;
+    link) rm "$license"; ln -s /etc/passwd "$license" ;;
+    fifo) rm "$license"; mkfifo "$license" ;;
+    empty) : > "$license" ;;
+    missing) rm "$license" ;;
+    unsafe-path) mv "$license" "${license} unsafe" ;;
+    source-record) mkdir -p "$altered/share/sources/$material_unit"; printf 'retired\n' > "$altered/share/sources/$material_unit/SOURCES.tsv" ;;
+  esac
+  if (WORK="$TMP/material-validation-work" release_materials_validate "$altered" "$material_unit" >/dev/null 2>&1); then
+    fail "license validator accepted $mutation"
+  fi
+done
+if (WORK="$TMP/material-validation-work" release_materials_validate_go "$material_root" "$material_unit" bin/missing >/dev/null 2>&1); then
+  fail "validator accepted missing Go binary"
 fi
 
 bash "$ROOT/scripts/test-preview-line.sh"
@@ -387,30 +307,6 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
-for dependency in accelerator connector sandboxer; do
-  for column in 4 5; do
-    candidate="$TMP/dependency-source-$dependency-$column"
-    cp -a "$TMP/bundle" "$candidate"
-    mkdir "$candidate/root"
-    tar -xzf "$archive" -C "$candidate/root"
-    source_table="$candidate/root/share/sources/orchestrator/SOURCES.tsv"
-    awk -F '\t' -v OFS='\t' -v name="$dependency" -v column="$column" '
-      NR > 1 && $2 == name { $column = (column == 4 ? "https://example.invalid/unselected-source" : "git:0000000000000000000000000000000000000000") }
-      { print }
-    ' "$source_table" > "$candidate/sources.changed"
-    install -m 0644 "$candidate/sources.changed" "$source_table"
-    release_materials_hash_tree "$candidate/root" orchestrator \
-      "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
-    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
-      -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-    if RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
-      "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
-      fail "validator accepted changed $dependency source column $column"
-    fi
-    grep -Fq "missing or inconsistent source record for $dependency" "$candidate/result.log" \
-      || { cat "$candidate/result.log" >&2; fail "dependency source mutation failed for an unrelated reason"; }
-  done
-done
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
   "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 go_toolchain="$(go version | awk '{print $3}')"
@@ -425,16 +321,12 @@ for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
   ./share/licenses/orchestrator/connector/LICENSE \
   ./share/licenses/orchestrator/project/LICENSE \
   ./share/licenses/orchestrator/sandboxer/LICENSE \
-  ./share/licenses/orchestrator/go-toolchain/"$go_toolchain"/LICENSE \
-  ./share/sources/orchestrator/SOURCES.tsv \
-  ./share/sources/orchestrator/GO-BUILD-INFO.tsv \
-  ./share/sources/orchestrator/GO-MODULES.tsv \
-  ./share/sources/orchestrator/MATERIALS.sha256; do
+  ./share/licenses/orchestrator/go-toolchain/"$go_toolchain"/LICENSE; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
-tar -xOf "$archive" ./share/sources/orchestrator/SOURCES.tsv \
-  | grep -Fq $'\tGo toolchain\t'"$go_toolchain"$'\t' \
-  || fail "archive does not associate its Go toolchain with license material"
+if tar -tzf "$archive" | grep -E '(^|/)sources/|SOURCES[.]tsv|GO-BUILD-INFO[.]tsv|GO-MODULES[.]tsv|MATERIALS[.]sha256|CLOUD-HYPERVISOR-Cargo.lock' >/dev/null; then
+  fail "new archive includes historical source or build records"
+fi
 if tar -tzf "$archive" | grep -E '^\./(docs|test/e2e|test/orchestrator)(/|$)' >/dev/null; then
   fail "component archive contains documentation or E2E sources"
 fi
@@ -456,21 +348,9 @@ SOURCE_DATE_EPOCH=1700000000 \
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
-# Refresh actual binary metadata and both local inventories, so rejections below
-# prove payload/source identity rather than relying on stale bundle checksums.
+# Repack altered payloads and validate their actual identity and architecture.
 repack_candidate() (
   local candidate="$1" binary
-  release_materials_init "$candidate/metadata-stage" "$candidate/materials" orchestrator
-  for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
-    release_materials_add_go_binary "$candidate/root/bin/$binary" "bin/$binary"
-  done
-  [ ! -s "$candidate/materials/go-modules" ] || fail "unexpected fixture dependency"
-  {
-    printf 'payload\trecord\tname\tversion_or_value\tchecksum\n'
-    LC_ALL=C sort -u "$candidate/materials/go-build-info"
-  } > "$candidate/root/share/sources/orchestrator/GO-BUILD-INFO.tsv"
-  release_materials_hash_tree "$candidate/root" orchestrator \
-    "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
 )
@@ -509,27 +389,6 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     fail "validator accepted a CGO_ENABLED=1 payload with regenerated metadata and checksums: $binary"
   fi
   grep -Fq 'with CGO_ENABLED=0' "$candidate/result.log" || fail "CGO fixture failed for an unrelated reason"
-done
-
-for attribution in unknown-project unknown-toolchain wrong-project-payload extra-dependency; do
-  candidate="$TMP/undeclared-source-$attribution"
-  cp -a "$TMP/bundle" "$candidate"
-  mkdir "$candidate/root"
-  tar -xzf "$archive" -C "$candidate/root"
-  case "$attribution" in
-    unknown-project) payload=bin/node-ctl; name=undeclared-project ;;
-    unknown-toolchain) payload=bin/node-ctl; name=undeclared-toolchain ;;
-    wrong-project-payload) payload=bin/node-ctl; name=orchestrator ;;
-    extra-dependency) payload=bin/cluster-ctl; name=connector ;;
-  esac
-  printf '%s\t%s\tv1.2.3\thttps://example.invalid/unverified\tsha256:fixture\tshare/licenses/orchestrator/project\n' \
-    "$payload" "$name" >> "$candidate/root/share/sources/orchestrator/SOURCES.tsv"
-  repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
-    fail "validator accepted an undeclared source attribution: $attribution"
-  fi
-  grep -Fq 'source inventory contains an undeclared payload attribution' "$candidate/result.log" \
-    || fail "undeclared attribution failed for an unrelated reason: $attribution"
 done
 
 for extra in bin/unexpected-tool deploy/unexpected.service bin/extra/; do
