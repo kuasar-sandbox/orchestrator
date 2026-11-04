@@ -590,13 +590,13 @@ resources. Retained extension work is canceled even when startup fails. Keep the
 storage path persistent and do not make conductor/Proxy systemd dependencies
 require telemetry; telemetry failure must not change sandbox lifecycle.
 
-Reproducible checks (from a source checkout with sibling dependencies):
+Reproducible checks (initialize the selected sibling workspace as described in [Building from source](../README.md#build-and-test)):
 
 ```sh
-GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api ./app/telemetry ./config ./cmd/node-ctl
-GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
-GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
-GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
+go test ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api ./app/telemetry ./config ./cmd/node-ctl
+go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
+go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
+go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
 bash test/source/telemetry_backends.sh # compiler-capable source contracts
 make test vet build
 ORG=/path/to/exact/sources make test-source

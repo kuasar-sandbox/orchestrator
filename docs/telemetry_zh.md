@@ -499,13 +499,13 @@ Collector receivers/processors/exporters，然后 extension, 最后 query backen
 Storage path 应持久化；不要让 conductor/Proxy 的 systemd dependency require telemetry，
 telemetry 故障不得改变 sandbox lifecycle。
 
-可重复验证（源码目录需有 sibling dependencies）：
+可重复验证（先按 [源码构建](../README_zh.md#构建与测试) 初始化选定兄弟仓的 workspace）：
 
 ```sh
-GOWORK=off go test ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api ./app/telemetry ./config ./cmd/node-ctl
-GOWORK=off go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
-GOWORK=off go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
-GOWORK=off go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
+go test ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api ./app/telemetry ./config ./cmd/node-ctl
+go test -race ./internal/telemetry ./internal/telemetryapp ./internal/configsock ./internal/api
+go test ./internal/telemetry -run '^$' -bench BenchmarkEnvdDensity -benchtime=2x -benchmem
+go test ./internal/telemetry -run '^$' -bench 'Benchmark(Local|Scrape)' -benchtime=100x -benchmem
 bash test/source/telemetry_backends.sh # compiler-capable source contracts
 make test vet build
 ORG=/path/to/exact/sources make test-source

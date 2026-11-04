@@ -154,7 +154,7 @@ curl --noproxy '*' --silent --show-error --fail --get --data-urlencode 'query=SE
     "$TELEMETRY_CLICKHOUSE_TEST_URL" >"$TELEMETRY_BACKEND_OUT_DIR/clickhouse-version.txt"
 (
     cd "$TELEMETRY_SOURCE_ROOT"
-    env -u GOTMPDIR GOWORK=off CGO_ENABLED=0 REQUIRE_TELEMETRY_BACKENDS=1 go test -json -count=1 -timeout=3m \
+    env -u GOTMPDIR CGO_ENABLED=0 REQUIRE_TELEMETRY_BACKENDS=1 go test -json -count=1 -timeout=3m \
         ./internal/telemetry -run '^Test(Prometheus.*Integration|ClickHouse.*Integration|RemoteDeploymentExamplesIntegration)$'
 ) >"$TELEMETRY_BACKEND_OUT_DIR/tests.jsonl" 2>"$TELEMETRY_BACKEND_OUT_DIR/build.log" \
     || { cat "$TELEMETRY_BACKEND_OUT_DIR/build.log" "$TELEMETRY_BACKEND_OUT_DIR/tests.jsonl"; exit 1; }
@@ -165,15 +165,15 @@ export TELEMETRY_NODE_TEST_BIN="$telemetry_bin/node-ctl"
 export TELEMETRY_CUSTOM_TEST_BIN="$telemetry_bin/custom-telemetry"
 (
     cd "$TELEMETRY_SOURCE_ROOT"
-    GOWORK=off CGO_ENABLED=0 go build -o "$TELEMETRY_NODE_TEST_BIN" ./cmd/node-ctl
-    GOWORK=off CGO_ENABLED=0 go build -o "$TELEMETRY_CUSTOM_TEST_BIN" ./examples/custom-telemetry
+    CGO_ENABLED=0 go build -o "$TELEMETRY_NODE_TEST_BIN" ./cmd/node-ctl
+    CGO_ENABLED=0 go build -o "$TELEMETRY_CUSTOM_TEST_BIN" ./examples/custom-telemetry
     go version -m "$TELEMETRY_NODE_TEST_BIN" "$TELEMETRY_CUSTOM_TEST_BIN" >"$TELEMETRY_BACKEND_OUT_DIR/executables.txt"
     sha256sum "$TELEMETRY_NODE_TEST_BIN" "$TELEMETRY_CUSTOM_TEST_BIN" >>"$TELEMETRY_BACKEND_OUT_DIR/executables.txt"
 ) >"$TELEMETRY_BACKEND_OUT_DIR/executable-build.log" 2>&1 \
     || { cat "$TELEMETRY_BACKEND_OUT_DIR/executable-build.log"; exit 1; }
 (
     cd "$TELEMETRY_SOURCE_ROOT"
-    env -u GOTMPDIR GOWORK=off CGO_ENABLED=0 REQUIRE_TELEMETRY_BACKENDS=1 go test -json -count=1 -timeout=90s \
+    env -u GOTMPDIR CGO_ENABLED=0 REQUIRE_TELEMETRY_BACKENDS=1 go test -json -count=1 -timeout=90s \
         ./internal/telemetryapp -run '^TestCustomExecutableIntegration$'
 ) >>"$TELEMETRY_BACKEND_OUT_DIR/tests.jsonl" 2>>"$TELEMETRY_BACKEND_OUT_DIR/build.log" \
     || { cat "$TELEMETRY_BACKEND_OUT_DIR/build.log" "$TELEMETRY_BACKEND_OUT_DIR/tests.jsonl"; exit 1; }

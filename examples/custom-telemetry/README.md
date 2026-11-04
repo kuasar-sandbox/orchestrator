@@ -5,7 +5,7 @@
 Build the trusted statically linked App:
 
 ```sh
-GOWORK=off CGO_ENABLED=0 go build -o /opt/kuasar/bin/custom-telemetry ./examples/custom-telemetry
+CGO_ENABLED=0 go build -o /opt/kuasar/bin/custom-telemetry ./examples/custom-telemetry
 ```
 
 Protect the executable against group/world writes. Root dispatch requires root

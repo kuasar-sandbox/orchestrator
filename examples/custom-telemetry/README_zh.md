@@ -5,7 +5,7 @@
 构建受信、静态链接的 App：
 
 ```sh
-GOWORK=off CGO_ENABLED=0 go build -o /opt/kuasar/bin/custom-telemetry ./examples/custom-telemetry
+CGO_ENABLED=0 go build -o /opt/kuasar/bin/custom-telemetry ./examples/custom-telemetry
 ```
 
 保护 executable，禁止 group/world 写入。root 启动要求 root 属主；非 root 启动接受

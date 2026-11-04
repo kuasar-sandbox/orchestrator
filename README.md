@@ -183,15 +183,20 @@ to its maintained focused case.
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
-Source builds require Go 1.26.1 or newer and sibling checkouts of `accelerator`,
-`connector` and `sandboxer`, even for a change confined to this repository. The
-internal `require` versions identify each dependency's target formal release;
-Daily Preview development uses the same target without its preview suffix. A
-target tag need not exist yet because the tracked local `replace` directives
-select the actual sibling sources. `GOWORK=off` does not disable those directives.
-Do not infer which source revision was tested from the version label: record the
-exact sibling SHAs. Runtime/Kernel artifacts are additional prerequisites for
-real sandbox tests, not Go-only compilation.
+Source builds require Go 1.26.1 or newer. Standalone builds resolve the obtainable
+versions committed in `go.mod`. Coordinated Preview builds use the selected local
+`orchestrator`, `sandboxer`, `accelerator` and `connector` modules:
+
+```bash
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator)" || exit 1
+export GOWORK
+make build
+```
+
+The workspace verifies module paths and uses exactly this closure without redundant
+`replace` directives or changes to `go.mod`/`go.sum`. Product, helper and source tests
+share the selected modules. Runtime/Kernel artifacts remain additional prerequisites
+for real sandbox tests.
 
 The source `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh` flow starts real control-plane processes
 but no MicroVMs. Its run directory is private. Failure output reports diagnostic
@@ -278,7 +283,7 @@ normal Go cache and routing; downloaded module checksums must match the binaries
 Only explicitly collected internal sibling dependencies use their own source
 materials; an organization namespace alone does not exempt other modules.
 Unsupported third-party local replacements need versioned module inputs for
-the official package. Existing Kuasar local `replace` directives remain in use.
+the official package. Selected Kuasar sources are provided through the explicit Go workspace.
 
 Materials live under `share/licenses/<component>` and
 `share/sources/<component>`. The latter contains `SOURCES.tsv`,

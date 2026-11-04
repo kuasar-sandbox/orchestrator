@@ -112,7 +112,16 @@ telemetry backend、network namespace 检查, 保留全部能力要求与断言.
 Publisher 的归档校验器在独立 Workbench 调用中从受信发布源码编译, 该调用禁用缓存
 恢复和保存. 组装与发布执行同一校验器, 不再次编译.
 
-Go 源码构建需要 Go 1.26.1+，并将 `accelerator`、`connector`、`sandboxer` 放在本仓的兄弟目录；修改范围仅在本仓也不免除构建依赖。内部 `require` 使用各组件目标正式版本（Daily Preview 去掉预发布后缀），目标 Tag 可以尚不存在，因为实际构建由本地 `replace` 选择兄弟仓源码。`GOWORK=off` 不会禁用这些替换。验证必须记录实际源码 SHA，不能把版本标签当作已编译提交。运行真实沙箱还需 Runtime/Kernel 等运行工件，不能与 Go 编译前置混同。
+Go 源码构建需要 Go 1.26.1+。独立构建解析 `go.mod` 中真实可获取的版本；协调 Preview 构建使用选定的本地 `orchestrator`、`sandboxer`、`accelerator`、`connector` 模块：
+
+```bash
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator)" || exit 1
+export GOWORK
+make build
+```
+
+工作区验证 module path，并通过 `use` 精确选择该闭包，不重复添加 `replace`，不改写 `go.mod`/`go.sum`。产品、helper 和源码测试使用同一组模块；真实沙箱测试另需 Runtime/Kernel 制品。
+
 
 Go 二进制使用 `CGO_ENABLED=0` 构建。
 
@@ -254,7 +263,7 @@ Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包�
 编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
 下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
 源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
-需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
+需要改用带版本的 module 输入。选定的 Kuasar 源码通过显式 Go workspace 提供。
 
 材料放在 `share/licenses/<component>` 和 `share/sources/<component>`。
 后者包含 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv` 与
