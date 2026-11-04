@@ -58,7 +58,7 @@ class GoSourceEnvironment(unittest.TestCase):
             with self.subTest(ambient=ambient):
                 result = subprocess.run(["bash", "-c", 'set -euo pipefail\nTMP="$1"\n' + prelude
                                          + '\n[ "$GOENV" = off ]\ngo env -json ' + " ".join(expected), "_", str(self.root)],
-                                        env=environment, capture_output=True, text=True, timeout=15)
+                                        env=environment, cwd=self.root, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
 
