@@ -13,7 +13,7 @@ export GOWORK=off
 umask 022
 
 # Keep this offline fixture's checksum routing and local-only Go isolation.
-export GOSUMDB=sum.golang.google.cn GOTOOLCHAIN=local
+export GOSUMDB=sum.golang.google.cn GOTOOLCHAIN=local GOWORK=off
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"

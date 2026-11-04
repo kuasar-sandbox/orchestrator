@@ -201,6 +201,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		return fmt.Errorf("reconcile builds: %w", err)
 	}
 	go core.Reaper(ctx, 5*time.Second)
+	go core.RunIdleScheduler(ctx)
 	if err := core.StartRunPools(ctx); err != nil {
 		return err
 	}

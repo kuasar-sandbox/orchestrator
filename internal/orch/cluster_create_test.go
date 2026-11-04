@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -573,5 +575,52 @@ func TestHandleClusterConnectRejectsContextMismatch(t *testing.T) {
 	})
 	if ack.Status != routesync.AckRejected || !strings.Contains(ack.Reason, "context mismatch") {
 		t.Fatalf("mismatched connect ack = %+v", ack)
+	}
+}
+
+func TestIdlePolicyClusterCreateAndHook(t *testing.T) {
+	for _, policy := range []*int64{nil, new(int64(0)), new(int64(5))} {
+		gate := make(chan struct{})
+		o, ctx := newAsyncConnectTestOrchestrator(t, &config.Config{}, &countingLauncher{startGate: gate})
+		defer close(gate)
+		_, _, fingerprint := allowlistedBuildIdentity(t, o)
+		cmd := clusterCreateCommand(fingerprint, "idle-policy")
+		cmd.IdleTimeout = policy
+		ack := o.HandleCommand(ctx, cmd)
+		if ack.Status != routesync.AckAccepted {
+			t.Fatal(ack)
+		}
+		sb, err := o.st.Get(ctx, cmd.SID)
+		if err != nil || !reflect.DeepEqual(sb.IdleTimeout, policy) {
+			t.Fatal(sb, err)
+		}
+	}
+}
+
+func TestIdlePolicyClusterHookOwnsEffectiveValue(t *testing.T) {
+	gate := make(chan struct{})
+	defer close(gate)
+	o, ctx := newAsyncConnectTestOrchestrator(t, &config.Config{}, &countingLauncher{startGate: gate})
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterCreateCommand(fingerprint, "idle-hook")
+	cmd.IdleTimeout = new(int64(0))
+	o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, operation *conductorextension.SandboxOperation) error {
+		if operation.Create.IdleTimeout == nil || *operation.Create.IdleTimeout != 0 {
+			t.Fatal("hook lost incoming zero")
+		}
+		*operation.Create.IdleTimeout = 5
+		operation.Create.TimeoutSeconds = 120
+		return nil
+	}), nil)
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatal(ack)
+	}
+	sb, _ := o.st.Get(ctx, cmd.SID)
+	if sb.IdleTimeout == nil || *sb.IdleTimeout != 5 || *cmd.IdleTimeout != 0 {
+		t.Fatal("effective policy or input clone changed", sb.IdleTimeout, cmd.IdleTimeout)
+	}
+	route := o.routeEntry(sb)
+	if route.IdleTimeout == nil || *route.IdleTimeout != 5 {
+		t.Fatal("route omitted hook policy")
 	}
 }

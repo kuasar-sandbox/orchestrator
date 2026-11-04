@@ -15,7 +15,7 @@ func currentTimePoint() timePoint {
 	wall := time.Now().UTC()
 	var ts unix.Timespec
 	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
-		return timePoint{wall: wall, bootNS: wall.UnixNano()}
+		return timePoint{wall: wall}
 	}
 	return timePoint{wall: wall, bootNS: ts.Nano()}
 }

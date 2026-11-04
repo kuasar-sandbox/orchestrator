@@ -68,6 +68,7 @@ type StreamHooks struct {
 	RouteStreamReady func()
 	RouteBarrierAck  func(barrierID string)
 	PauseAck         func(barrierID string, ack PauseAck)
+	Activity         func(Activity)
 }
 
 // ReadRegister reads the subscriber's first up-frame (its Register caps). The
@@ -100,6 +101,8 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 			// A wake's resume can be slow; handle it off the read loop
 			// (single-flight in the source dedupes duplicate sids).
 			go src.OnWake(uctx, m.SID)
+		case m.Type == TypeActivity && m.Activity != nil && hooks != nil && hooks.Activity != nil:
+			hooks.Activity(*m.Activity)
 		case m.Type == TypePauseAck && m.BarrierID != "" && m.PauseAck != nil && hooks != nil && hooks.PauseAck != nil:
 			hooks.PauseAck(m.BarrierID, *m.PauseAck)
 		case m.Type == TypeRouteBarrierAck && m.BarrierID != "" && hooks != nil && hooks.RouteBarrierAck != nil:

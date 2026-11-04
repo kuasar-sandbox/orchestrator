@@ -1107,6 +1107,10 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		route.AutoReset = true
+		if cmd.IdleTimeout == nil || *cmd.IdleTimeout != 0 {
+			t.Errorf("idle policy not forwarded: %v", cmd.IdleTimeout)
+		}
+		route.IdleTimeout = new(int64(5)) // effective create hook policy
 		go reg.applyRoute(context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
@@ -1116,11 +1120,12 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 	request.AutoPauseMemory = &value
 	autoReset := true
 	request.AutoReset = &autoReset
+	request.IdleTimeout = new(int64(0))
 	if _, err := reg.ReserveSandbox(ctx, request); err != nil {
 		t.Fatal(err)
 	}
 	record, _, found, err := reg.stores.GetSandbox(ctx, "/g", "auto-pause-false")
-	if err != nil || !found || record.State != StateReady || record.AutoPauseMemory || !record.AutoReset {
+	if err != nil || !found || record.State != StateReady || record.AutoPauseMemory || !record.AutoReset || record.IdleTimeout == nil || *record.IdleTimeout != 5 {
 		t.Fatalf("stored explicit false record = %+v, found=%t, err=%v", record, found, err)
 	}
 }

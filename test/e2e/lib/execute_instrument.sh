@@ -5,6 +5,7 @@ SNAPSHOT_ARGV_LOG="$WORK/snapshot-argv.jsonl"
 EXPORT_ARGV_LOG="$WORK/export-argv.jsonl"
 RUN_ARGV_LOG="$WORK/run-argv.jsonl"
 PAUSE_BARRIER_TARGET="$WORK/pause-barrier-target"
+PAUSE_BARRIER_AFTER_CAPTURE="$WORK/pause-barrier-after-capture"
 PAUSE_BARRIER_REACHED="$WORK/pause-barrier-reached"
 PAUSE_BARRIER_RELEASE="$WORK/pause-barrier-release"
 PUBLISH_BARRIER_TARGET="$WORK/publish-barrier-target"
@@ -45,6 +46,12 @@ if [ "\${1:-}" = "snapshot" ] && [ -f "$PAUSE_BARRIER_TARGET" ]; then
         previous="\$arg"
     done
     if [ "\$path_id" = "\$(cat "$PAUSE_BARRIER_TARGET")" ]; then
+        if [ -f "$PAUSE_BARRIER_AFTER_CAPTURE" ]; then
+            "$BIN/sandbox-ctl" "\$@"
+            : > "$PAUSE_BARRIER_REACHED"
+            while [ ! -e "$PAUSE_BARRIER_RELEASE" ]; do sleep 0.02; done
+            exit 0
+        fi
         : > "$PAUSE_BARRIER_REACHED"
         while [ ! -e "$PAUSE_BARRIER_RELEASE" ]; do sleep 0.02; done
     fi

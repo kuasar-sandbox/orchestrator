@@ -680,3 +680,12 @@ Conductor、Telemetry、Proxy master 或 worker 扩展为 nil 时保留内置启
 此 API 没有 namespace、固定 extension URI、动态加载、热更新或 component compatibility version。WebSocket 属于共享 core transport，不增加扩展专用 API。
 
 可构建程序见 [`examples/custom-conductor`](../examples/custom-conductor)、[`examples/custom-proxy`](../examples/custom-proxy) 与 [`examples/custom-telemetry`](../examples/custom-telemetry)。
+
+### idle 实例策略与 Pause 条件
+
+`SandboxCreateRequest.IdleTimeout *int64` 与 `SandboxView.IdleTimeout *int64` 保留
+nil（关闭）和 0（立即）的区别，正数为整数秒。Create hook 可修改该策略，最终值由核心
+重新校验并沿 standalone/cluster 的类型化创建链持久化。它不属于模板或 metadata。
+`SandboxPauseRequest.IfIdleSince *time.Time` 与 `IfIdle`、`CaptureKind` 一样由核心拥有；
+hook 修改、删除或通过指针原地改写时间均拒绝。携条件的 resource-paused 实例返回冲突，
+不通过扩展接管绕过终检。完整合同见 [节点 Pause](node_zh.md#811-capture-与-pause)。

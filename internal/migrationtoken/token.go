@@ -81,10 +81,11 @@ type MigrationTokenPayloadV1 struct {
 	Env      map[string]string `json:"env,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
 
-	CreatedUnix     int64 `json:"createdUnix"`
-	DeadlineUnix    int64 `json:"deadlineUnix"`
-	AutoPauseMemory bool  `json:"autoPauseMemory"`
-	AutoReset       bool  `json:"autoReset,omitempty"`
+	CreatedUnix     int64  `json:"createdUnix"`
+	DeadlineUnix    int64  `json:"deadlineUnix"`
+	IdleTimeout     *int64 `json:"idleTimeout,omitempty"`
+	AutoPauseMemory bool   `json:"autoPauseMemory"`
+	AutoReset       bool   `json:"autoReset,omitempty"`
 
 	ServiceSecret      string `json:"serviceSecret"`
 	EnvdAccessToken    string `json:"envdAccessToken"`
@@ -221,6 +222,9 @@ func ValidateExpectations(payload MigrationTokenPayloadV1, expected Expectations
 }
 
 func validatePayload(payload MigrationTokenPayloadV1) error {
+	if err := types.ValidateIdleTimeout(payload.IdleTimeout); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPayload, err)
+	}
 	if payload.Version != 1 {
 		return invalidPayload("version")
 	}

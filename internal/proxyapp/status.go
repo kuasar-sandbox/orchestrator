@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/proxydrain"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -84,6 +85,8 @@ type workerState struct {
 type Instance struct {
 	mu                sync.Mutex
 	pauseSamples      map[string]map[int]controlMessage
+	stats             *proxystats.MasterStats
+	activityRoutes    map[string]routesync.RouteEntry
 	identity          controlIdentity
 	status            InstanceStatus
 	workers           []workerState
@@ -293,8 +296,32 @@ func (s *readinessSink) syncState(ready bool) {
 	s.instance.recalculateLocked()
 	s.instance.notifyLocked()
 }
-func (s *readinessSink) BeginSync() { s.Sink.BeginSync(); s.syncState(false) }
-func (s *readinessSink) Bookmark()  { s.Sink.Bookmark(); s.syncState(true) }
+func (s *readinessSink) BeginSync() {
+	s.instance.mu.Lock()
+	s.instance.activityRoutes = make(map[string]routesync.RouteEntry)
+	s.instance.mu.Unlock()
+	if s.instance.stats != nil {
+		s.instance.stats.ResetObservation()
+	}
+	s.Sink.BeginSync()
+	s.syncState(false)
+}
+func (s *readinessSink) ApplyUpsert(r routesync.RouteEntry) error {
+	if err := s.Sink.ApplyUpsert(r); err != nil {
+		return err
+	}
+	if s.instance.stats != nil {
+		s.instance.stats.ObserveRoute(r)
+		s.instance.mu.Lock()
+		if s.instance.activityRoutes == nil {
+			s.instance.activityRoutes = make(map[string]routesync.RouteEntry)
+		}
+		s.instance.activityRoutes[r.SandboxID] = r
+		s.instance.mu.Unlock()
+	}
+	return nil
+}
+func (s *readinessSink) Bookmark() { s.Sink.Bookmark(); s.syncState(true) }
 func (s *readinessSink) InvalidateSync() {
 	if sink, ok := s.Sink.(routesync.InvalidatableSink); ok {
 		sink.InvalidateSync()

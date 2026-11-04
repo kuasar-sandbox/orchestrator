@@ -647,7 +647,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?, autoReset?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
@@ -1948,6 +1948,38 @@ false        -> false
 public Router -> route-link reserve -> Registry reserve state -> node-link command -> node CreateReq ->
 durable Sandbox row,不通过 metadata 隧道传递。
 
+Create 的 `idleTimeout` 是实例级可空整数秒策略。缺省或 `null` 关闭；`0` 在可信 idle
+通知到达后立即调度；正整数从 Conductor 接收时刻起等待。负数、非整数或大于
+9223372036 秒返回 400。例如：
+
+```json
+{"templateID":"<template-id>","idleTimeout":5}
+```
+
+Get/List 和扩展视图展示有效可空值。Store、集群 reserve/create、Resume、Reset 和迁移
+完整保留该值，包括 0；不新增运行中修改策略 API。新 RunID 重新建立观察，从未收到
+业务请求的新 running Sandbox 也会形成首次 idle 候选。
+
+自动路径仅使用完整、正常的单 Proxy 观察。接收时记录 t0 及 BOOTTIME 锚，等待策略
+时长后调用共同 Pause 路径，固定 `memory=true`、`checkpoint=false`、`ifIdle=true`、
+`ifIdleSince=t0`。同一 SID 最多有一个自动 Pause 尝试等待生命周期或来源访问；新观察更新候选但不增加
+等待任务，旧尝试结束后再评价当前候选。重复 idle 通知不延长 deadline；新 idle、来源变化、统计不完整和重启
+使候选重建。计时期间不持有生命周期锁，仅读取不可变生命周期缓存；到期后在 SID 锁内
+从 Store 重新读取权威策略和状态。最终 Worker 同步检查能够发现异步统计遗漏的
+短请求。拒绝后即使没有新业务也能重新计时；持续失败使用内部有界退避。未收敛的
+持久化 pausing 继续由原生命周期恢复机制处理。
+
+下一请求沿既有 park/Wake 恢复。Worker 采样后到达的请求可等待 capture 与 Resume，
+仍受原 `park_timeout` 约束；已交付业务不会重放。流式请求、WebSocket、Native Exec
+直到完整 relay 关闭才释放 busy。Guest 后台工作和绕过 Proxy 的流量不属于该观察范围，
+会随整机一起冻结。
+
+`idleTimeout` 不刷新 `DeadlineUnix`、不改变 TTL 的 `autoPauseMemory`、不创建保留
+checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceObligation`，先等待
+既有责任收敛，再等待一轮新的 idle 时长。TTL、资源压力和显式 Pause 保留各自语义。
+启用前协调升级 Conductor、Proxy 和集群端点（routesync v11）。携非 null `idleTimeout`
+的迁移 token 需要接收端支持该字段；关闭策略时保持原 token 结构。
+
 显式 `POST /sandboxes/{id}/pause` 的 body 可为空或为:
 
 ```json
@@ -1961,6 +1993,16 @@ durable Sandbox row,不通过 metadata 隧道传递。
 副作用前返回 400。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
 `merge_ref`、`drop_caches`,不接受 `memory`。
 
+`ifIdleSince` 可为 `ifIdle=true` 增加持续空闲时间阈值。格式为带时区的
+RFC 3339 时间，保留亚秒精度；缺省/null 保持原行为。未指定 `ifIdle=true`、
+格式非法或晚于最终 Conductor 接收时刻的时间，在安装 gate 前返回 400。
+该条件只对 running 实例评价；starting/paused（包括资源暂停）返回 409，不接管。
+
+同步 Worker 样本必须证明 parking/connected 均为零，且
+`effectiveIdleSince <= ifIdleSince`。busy 或已知空闲基线较晚返回 409；
+缺样本、空参与者、ACK 失败或历史时钟依据不可判定返回 503。失败撤回临时 gate，
+不 capture、不持久化 pausing。扩展 hook 不能修改该条件；集群 Router 原样转发时间。
+
 `checkpoint` 和 `ifIdle` 均默认为 false. `ifIdle=true` 要求握手参与 Proxy 的全部 worker
 在安装 pausing 门禁后同步返回的 parking/connected 都为零, 否则 409. 普通 Pause 也握手并
 收集相同统计, 但允许忙碌. 不持久化 Proxy 清单; 握手前已断链者不参与. 握手中断链、替换、
@@ -1971,6 +2013,13 @@ durable Sandbox row,不通过 metadata 隧道传递。
 上按相同逻辑 park 已授权新请求并发送 Wake, 不再拨旧 backend. 已建立连接在握手期间保留,
 避免把主动断开连接造成的零值误当空闲. conductor 持有同一 SID lifecycle lock 完成 capture、
 暂停提交和清理, 再处理排队的 Wake. pausing→paused 是正常进度; starting→paused 才是恢复失败.
+runner 退出与 Pause 完成是两个独立事实。当前 RunID 的退出报告立即持久化并 ACK，
+包括 pausing 期间，以及 paused 清理仍持有该 RunID 时。报告不会把已接纳 Pause 的
+路由改成 dead，也不否决成功 capture 后的 paused 提交。paused 行保留退出诊断；
+finalizer 在 SID 锁内重读状态和 RunID，只完成剩余暂停清理。Resume 在存储和实时
+视图中同时清除旧结果，有效 paused 来源仍可导出；已退休 RunID 的报告不能修改后继运行。
+capture 成功但 paused 事务失败时，未提交操作保持 pausing，交由既有恢复路径处理，
+不能宣称旧实例仍在 running。
 崩溃后遗留的 durable pausing 没有已提交新来源, Reconcile fence 精确 runner 并按既有终止路径
 收敛, 不仅凭进程存活重新发布 running.
 
@@ -2020,8 +2069,8 @@ Pause 的顺序固定为 resolve request/quota -> accepted operation -> online P
 selective checkpoint cleanup -> RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
 RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
 exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 或 RunDir 清理失败不允许新的 Resume/Wake/Exec
-取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败保持 state=running、旧 source、runner 和 network 不变,不创建
-成功 alias,也不从 S 降级为 E。
+取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败仅在相同 RunID 仍持有 pausing 行且未接纳退出结果时恢复 running；
+已接纳的退出沿既有终态路径清理。失败尝试保留旧 source，不创建成功 alias，也不从 S 降级为 E。
 
 ##### 本地磁盘 Checkpoint
 

@@ -192,15 +192,16 @@ func (r *Registry) failBarriersLocked(p *Plugin, err error) {
 }
 
 type proxyRouteBarrier struct {
-	registry *Registry
-	id       string
-	required map[uint64]*Plugin
-	acked    map[uint64]struct{}
-	done     chan struct{}
-	signaled bool
-	err      error
-	pause    bool
-	activity routesync.PauseAck
+	registry    *Registry
+	id          string
+	required    map[uint64]*Plugin
+	acked       map[uint64]struct{}
+	done        chan struct{}
+	signaled    bool
+	err         error
+	pause       bool
+	singleProxy bool
+	activity    routesync.PauseAck
 }
 
 func (b *proxyRouteBarrier) ID() string { return b.id }
@@ -241,6 +242,10 @@ func (b *proxyRouteBarrier) Commit() error {
 	}
 	if len(b.acked) != len(b.required) {
 		return ErrProxyRouteUnavailable
+	}
+	if b.singleProxy && !b.singleProxyLocked() {
+		delete(r.barriers, b.id)
+		return ErrProxyRouteLeaseChanged
 	}
 	for epoch, p := range b.required {
 		if p.epoch != epoch || !proxyRouteParticipantReady(p) || r.m[p.ID] != p {
@@ -343,9 +348,38 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	p := &Plugin{ID: id, Caps: reg, peerPID: peer, cancel: cancel, lease: ctx}
 	s.deps.Plugins.Add(p)
-	defer s.deps.Plugins.Remove(p)
+	receiver, _ := s.deps.RouteSource.(routesync.ActivityReceiver)
+	source := activitySource(p)
+	isProxy := reg.SubscribeKind() == routesync.KindRouteWake && reg.Proxy != nil
+	if receiver != nil && isProxy {
+		s.deps.Plugins.deliverActivity(p, func(bool) { receiver.OnProxyActivity(ctx, "", nil) })
+	}
+	defer func() {
+		s.deps.Plugins.Remove(p)
+		if receiver != nil && isProxy {
+			receiver.OnProxyActivity(context.WithoutCancel(ctx), source, nil)
+		}
+	}()
+	var activitySequence uint64
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
 	hooks := &routesync.StreamHooks{
+		Activity: func(a routesync.Activity) {
+			if !isProxy || receiver == nil {
+				return
+			}
+			if a.Sequence != activitySequence+1 {
+				cancel()
+				receiver.OnProxyActivity(ctx, source, nil)
+				return
+			}
+			activitySequence = a.Sequence
+			s.deps.Plugins.deliverActivity(p, func(valid bool) {
+				if !valid {
+					a.State = "unknown"
+				}
+				receiver.OnProxyActivity(ctx, source, &a)
+			})
+		},
 		ProxyCapabilities: []string{routesync.InplaceRestartV1},
 		RouteStreamReady:  func() { s.deps.Plugins.markRouteStreamReady(p) },
 		RouteBarrierAck:   func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },

@@ -17,6 +17,9 @@ import (
 )
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
+	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if req.MaxCheckpoints != 0 && req.MaxCheckpoints != 1 {
 		return nil, fmt.Errorf("%w: max_checkpoints must be 1", api.ErrBadRequest)
 	}
@@ -56,7 +59,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginDirect, sid, &conductorextension.SandboxCreateRequest{
 			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: req.TimeoutSec,
 			Metadata: cloneStringMap(req.Metadata), Env: cloneStringMap(req.EnvVars), Secure: req.Secure,
-			AutoPauseMemory: cloneBool(req.AutoPauseMemory), AutoReset: req.AutoReset, MMDS: cloneString(req.MMDSHeader),
+			IdleTimeout: types.CloneIdleTimeout(req.IdleTimeout), AutoPauseMemory: cloneBool(req.AutoPauseMemory), AutoReset: req.AutoReset, MMDS: cloneString(req.MMDSHeader),
 		})
 		if err != nil {
 			return nil, err
@@ -77,11 +80,12 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		tmpl, normalized, mmdsDoc = finalTemplate, finalConfig, finalMMDS
 		req.TimeoutSec, req.EnvVars, req.AutoPauseMemory = candidate.TimeoutSeconds, cloneStringMap(candidate.Env), cloneBool(candidate.AutoPauseMemory)
 		req.AutoReset = candidate.AutoReset
+		req.IdleTimeout = types.CloneIdleTimeout(candidate.IdleTimeout)
 	}
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
 		ID: sid, StableID: identity.StableID, Template: tmpl, Pair: pair,
 		Config: normalized, Env: req.EnvVars, TimeoutSeconds: req.TimeoutSec,
-		AutoPauseMemory: req.AutoPauseMemory, AutoReset: req.AutoReset, InitialMMDS: initialMMDSRouteSecretValues(mmdsDoc),
+		IdleTimeout: types.CloneIdleTimeout(req.IdleTimeout), AutoPauseMemory: req.AutoPauseMemory, AutoReset: req.AutoReset, InitialMMDS: initialMMDSRouteSecretValues(mmdsDoc),
 	})
 	if err != nil {
 		return nil, err
@@ -178,6 +182,7 @@ type sandboxCreateSpec struct {
 	Config          sandboxCreateConfig
 	Env             map[string]string
 	TimeoutSeconds  int
+	IdleTimeout     *int64
 	AutoPauseMemory *bool
 	AutoReset       bool
 	InitialMMDS     *mmdsInitialRouteSecretValues
@@ -187,6 +192,9 @@ type sandboxCreateSpec struct {
 // and node-link Create. Source-specific authentication and Hook restrictions
 // stay in the adapters; launch ownership and rollback stay in acceptFreshLaunch.
 func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCreateSpec) (*types.Sandbox, *launchAttempt, error) {
+	if err := types.ValidateIdleTimeout(spec.IdleTimeout); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	launchMode, err := types.LaunchModeForTemplate(spec.Template.Kind)
 	if err != nil {
 		return nil, nil, err
@@ -197,7 +205,7 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 	}
 	now := time.Now()
 	sb := &types.Sandbox{
-		ID: spec.ID, StableIDValue: spec.StableID,
+		ID: spec.ID, StableIDValue: spec.StableID, IdleTimeout: types.CloneIdleTimeout(spec.IdleTimeout),
 		Profile: spec.Template.Profile, TemplateID: spec.Template.String(),
 		State: types.StateStarting, LaunchMode: launchMode, AutoPauseMemory: autoPauseMemory, AutoReset: spec.AutoReset,
 		RunDir:    nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, spec.ID),

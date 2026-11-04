@@ -18,7 +18,9 @@ func (w *WorkerStats) PauseActivity(sid string, gated func() bool) (map[string]r
 	out := make(map[string]routesync.PauseActivity, len(allServices))
 	for _, service := range allServices {
 		state := entry.services[service]
-		out[service] = routesync.PauseActivity{Parking: state.parking, Connected: state.egress}
+		wall, boot := snapshotIdle(state.idle)
+		_, active := entry.services[service]
+		out[service] = routesync.PauseActivity{Parking: state.parking, Connected: state.egress, Sampled: true, NeverActive: !active, IdleSince: wall, IdleSinceBootNS: boot}
 	}
 	if gated == nil || !gated() {
 		return out, fmt.Errorf("pause gate is not current")

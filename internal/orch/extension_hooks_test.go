@@ -149,6 +149,7 @@ func TestCreateHookMutationIsRenormalizedAndPersisted(t *testing.T) {
 	request := createRequestFixture(t, o, "9")
 	o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, operation *conductorextension.SandboxOperation) error {
 		operation.Create.TimeoutSeconds = 120
+		operation.Create.IdleTimeout = new(int64(0))
 		operation.Create.Metadata["extension"] = "normalized"
 		operation.Create.Env["EXTENSION_ENV"] = "set"
 		return nil
@@ -162,7 +163,7 @@ func TestCreateHookMutationIsRenormalizedAndPersisted(t *testing.T) {
 	if err != nil || stored == nil {
 		t.Fatalf("Get = %+v, %v", stored, err)
 	}
-	if stored.Metadata["extension"] != "normalized" || stored.Env["EXTENSION_ENV"] != "set" || stored.DeadlineUnix-stored.CreatedUnix != 120 {
+	if stored.IdleTimeout == nil || *stored.IdleTimeout != 0 || stored.Metadata["extension"] != "normalized" || stored.Env["EXTENSION_ENV"] != "set" || stored.DeadlineUnix-stored.CreatedUnix != 120 {
 		t.Fatalf("Hook mutation was not normalized into durable state: %+v", stored)
 	}
 	select {
@@ -715,4 +716,63 @@ func TestBuildTriggerResolvesCredentialsFromHookFinalSource(t *testing.T) {
 
 func fmtRejected(_ string) error {
 	return conductorextension.ErrRejected
+}
+
+func TestPauseHookCannotWeakenIdleSince(t *testing.T) {
+	for _, mutation := range []string{"remove", "change", "pointed-value"} {
+		t.Run(mutation, func(t *testing.T) {
+			o, sb, key, _, _, capture := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
+			x := time.Now().Add(-time.Second)
+			original := x
+			o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, op *conductorextension.SandboxOperation) error {
+				switch mutation {
+				case "remove":
+					op.Pause.IfIdleSince = nil
+				case "change":
+					v := x.Add(-time.Second)
+					op.Pause.IfIdleSince = &v
+				case "pointed-value":
+					*op.Pause.IfIdleSince = x.Add(-time.Second)
+				}
+				return nil
+			}), nil)
+			_, err := o.Pause(context.Background(), sb.ID, key, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true, IfIdleSince: &x})
+			if !errors.Is(err, api.ErrBadRequest) {
+				t.Fatal(err)
+			}
+			if !x.Equal(original) {
+				t.Fatal("hook aliased caller timestamp")
+			}
+			if _, err := os.Stat(capture); !os.IsNotExist(err) {
+				t.Fatal("capture ran", err)
+			}
+		})
+	}
+}
+func TestConditionalPauseNeverAdoptsResourcePause(t *testing.T) {
+	for _, hook := range []bool{false, true} {
+		o, sb, key, _, _, _ := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
+		sb.State = types.StatePaused
+		sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "file:///base/current.sandbox"}
+		sb.ResourceObligation = true
+		sb.PauseReason = types.PauseReasonResource
+		if err := o.st.Put(context.Background(), sb); err != nil {
+			t.Fatal(err)
+		}
+		if hook {
+			o.SetExtensionHooks(sandboxHookFunc(func(context.Context, *conductorextension.SandboxOperation) error {
+				t.Fatal("hook ran for rejected paused condition")
+				return nil
+			}), nil)
+		}
+		x := time.Now().Add(-time.Second)
+		_, err := o.Pause(context.Background(), sb.ID, key, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true, IfIdleSince: &x})
+		if !errors.Is(err, api.ErrAlreadyPaused) {
+			t.Fatal(err)
+		}
+		got, _ := o.st.Get(context.Background(), sb.ID)
+		if !got.ResourceObligation || got.PauseReason != types.PauseReasonResource {
+			t.Fatal("resource pause adopted")
+		}
+	}
 }

@@ -19,6 +19,8 @@ type fakePauseBarrier struct {
 	activity routesync.PauseAck
 }
 
+func (b *fakePauseBarrier) RequireSingleProxy() error { return nil }
+
 func (b *fakePauseBarrier) Activity() routesync.PauseAck                            { return b.activity }
 func (b *fakePauseBarrier) BeginProxyPauseBarrier() (routesync.PauseBarrier, error) { return b, nil }
 
@@ -105,5 +107,42 @@ func TestWakePreservesUnresolvedPausingGate(t *testing.T) {
 		}
 	default:
 		t.Fatal("missing authoritative pausing route")
+	}
+}
+
+func TestContinuousIdleRejectionWithdrawsGate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		since int64
+		want  error
+	}{{"short request after t0", 200, api.ErrSandboxBusy}, {"missing participant", 0, api.ErrProxyUnavailable}} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, sb, key, _, _, args := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
+			b := &fakePauseBarrier{fakeRouteBarrier: newFakeRouteBarrier(nil, nil), activity: routesync.PauseAck{AutomaticSafe: true, Evidence: []routesync.IdleEvidence{{SinceBootNS: tc.since}}}}
+			o.pauseBarriers = b
+			done := make(chan error, 1)
+			go func() {
+				_, err := o.Pause(context.Background(), sb.ID, key, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true, IdleSinceBootNS: 150})
+				done <- err
+			}()
+			<-b.waiting
+			b.release()
+			if err := <-done; !errors.Is(err, tc.want) {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(args); !os.IsNotExist(err) {
+				t.Fatal("rejected condition captured", err)
+			}
+			current, err := o.st.Get(context.Background(), sb.ID)
+			if err != nil || current.State != types.StateRunning {
+				t.Fatal(current, err)
+			}
+			o.pauseMu.Lock()
+			_, gated := o.pausePreparing[sb.ID]
+			o.pauseMu.Unlock()
+			if gated {
+				t.Fatal("gate retained")
+			}
+		})
 	}
 }

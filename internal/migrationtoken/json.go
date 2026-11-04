@@ -120,6 +120,8 @@ func decodePayloadField(payload *MigrationTokenPayloadV1, field string, raw json
 		return decodeStrict(raw, &payload.CreatedUnix)
 	case "deadlineUnix":
 		return decodeStrict(raw, &payload.DeadlineUnix)
+	case "idleTimeout":
+		return decodeStrict(raw, &payload.IdleTimeout)
 	case "autoPauseMemory":
 		return decodeStrict(raw, &payload.AutoPauseMemory)
 	case "autoReset":

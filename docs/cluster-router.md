@@ -402,3 +402,9 @@ not instance cleanup or immediate revocation of credentials already bound to row
 Retain shared templates/keys until the retention policy permits deletion.
 
 Dead/deleting Sandboxes keep their management location. ID-based query, Reset, checkpoint Export/Delete and parent Delete use the node APIEndpoint and existing ownership checks. They expose no business DataEndpoint. Create with an occupied group/route_key conflicts until final parent deletion. Node and cluster Create preserve autoReset (default false); Reset success does not start a VM.
+
+Create preserves nullable `idleTimeout` through route-link reserve, Registry's
+durable reservation, node-link create and effective route/list views. Zero is
+retained as an enabled immediate policy. Pause keeps using HTTP forwarding:
+`ifIdleSince` is forwarded unchanged and only the final Conductor validates it
+against its receipt clock. No node-link Pause command is added.

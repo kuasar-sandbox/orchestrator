@@ -197,6 +197,7 @@ func cloneSandboxCreateRequest(request *conductorextension.SandboxCreateRequest)
 	out.Env = cloneStringMap(request.Env)
 	out.MMDS = cloneString(request.MMDS)
 	out.AutoPauseMemory = cloneBool(request.AutoPauseMemory)
+	out.IdleTimeout = cloneInt64(request.IdleTimeout)
 	return &out
 }
 
@@ -206,7 +207,7 @@ func cloneSandboxPauseRequest(request *conductorextension.SandboxPauseRequest) *
 	}
 	return &conductorextension.SandboxPauseRequest{
 		CaptureKind: request.CaptureKind,
-		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle,
+		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
 		CheckpointMergeRef:   cloneBool(request.CheckpointMergeRef),
 		CheckpointDropCaches: cloneBool(request.CheckpointDropCaches),
 	}
