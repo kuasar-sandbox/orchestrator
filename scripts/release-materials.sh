@@ -348,6 +348,18 @@ release_materials_require_license() {
 release_materials_validate_go() (
   local root="$1" unit="$2" payload="$3" binary="${4:-$1/$3}" validation
   local toolchain module version checksum label
+  # Bind only this publication's own freshly built Go payloads when its
+  # caller supplies an expected commit. Reused dependency binaries and ordinary
+  # archive consumers have no historical source qualification requirement.
+  if [ -n "${SOURCE_SHA:-}" ]; then
+    case "$unit:$payload" in
+      accelerator:bin/manifest-ctl|accelerator:bin/store-ctl|accelerator:bin/cache-ctl|\
+      connector:bin/connector-ctl|sandboxer:bin/sandbox-ctl|sandboxer:bin/sandbox-init|\
+      orchestrator:bin/node-ctl|orchestrator:bin/cluster-ctl|orchestrator:bin/node-stub-ctl|orchestrator:bin/e2b-key-ctl|\
+      runtime:bin/flatten-ctl)
+        release_materials_require_go_revision "$binary" "$SOURCE_SHA" ;;
+    esac
+  fi
   validation="$(mktemp -d "$WORK/go-notices.XXXXXX")"
   release_materials_init "$validation/stage" "$validation/materials" "$unit"
   release_materials_add_go_binary "$binary" "$payload"

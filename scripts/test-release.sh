@@ -299,6 +299,14 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
   RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+# A current publication may bind its own binaries to its selected commit;
+# standalone validation above does not require or query historical sources.
+if SOURCE_SHA=0000000000000000000000000000000000000000 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle" > "$TMP/publication-source.log" 2>&1; then
+  fail "publication accepted an owner binary built at another commit"
+fi
+grep -Fq 'Go payload must be built from the clean selected commit' "$TMP/publication-source.log" \
+  || fail "publication source mismatch failed for an unrelated reason"
+
 "$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
   "$fixture_project_sha" main
