@@ -46,28 +46,28 @@ build: node-ctl cluster-ctl node-stub-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/e2b-key-ctl ./cmd/e2b-key-ctl
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/e2b-key-ctl" ./cmd/e2b-key-ctl
 	$(call link_bin,e2b-key-ctl)
 
 # node-ctl: the node executable — e2b-compatible conductor (serve), independent
 # data plane (proxy), telemetry, sandbox/build runners, and resource controller.
 node-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/node-ctl ./cmd/node-ctl
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-ctl" ./cmd/node-ctl
 	$(call link_bin,node-ctl)
 
 # cluster-ctl: the cluster control plane (registry / router / placer, cluster.md).
 cluster-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/cluster-ctl ./cmd/cluster-ctl
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/cluster-ctl" ./cmd/cluster-ctl
 	$(call link_bin,cluster-ctl)
 
 # node-stub-ctl: controllable node-link stubs for cluster e2e. It simulates node
 # control-plane behavior without launching microVMs.
 node-stub-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/node-stub-ctl ./cmd/node-stub-ctl
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-stub-ctl" ./cmd/node-stub-ctl
 	$(call link_bin,node-stub-ctl)
 
 test:
@@ -93,18 +93,26 @@ test-source:
 	bash scripts/ci-source-checks.sh
 
 VERSION ?= v0.1.0
-ACCELERATOR_VERSION ?= v0.1.7
-CONNECTOR_VERSION ?= v0.1.2
-SANDBOXER_VERSION ?= v0.1.11
+KUASAR_PLATFORM_DIR ?= ../kuasar-sandbox
+ACCELERATOR_VERSION ?= v0.1.10
+CONNECTOR_VERSION ?= v0.1.6
+SANDBOXER_VERSION ?= v0.1.13-preview.20261104.1
 
-release: build
-	@mkdir -p build
-	rm -rf build/release-bundle
+release:
+	@set -e; workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
+		--root .. --owners orchestrator --dependency-tag "accelerator=$(ACCELERATOR_VERSION)" --dependency-tag "connector=$(CONNECTOR_VERSION)" --dependency-tag "sandboxer=$(SANDBOXER_VERSION)")"; \
+	$(MAKE) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
+	rm -rf "build/release-bundle"; \
+	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
+	RELEASE_SOURCE_ROOT="$(CURDIR)" \
+	RELEASE_ACCELERATOR_SOURCE_DIR="$(abspath ../accelerator)" \
+	RELEASE_CONNECTOR_SOURCE_DIR="$(abspath ../connector)" \
+	RELEASE_SANDBOXER_SOURCE_DIR="$(abspath ../sandboxer)" \
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 	RELEASE_ACCELERATOR_VERSION="$(ACCELERATOR_VERSION)" \
 	RELEASE_CONNECTOR_VERSION="$(CONNECTOR_VERSION)" \
 	RELEASE_SANDBOXER_VERSION="$(SANDBOXER_VERSION)" \
-		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
+		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" "build/release-bundle"
 
 test-release:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
