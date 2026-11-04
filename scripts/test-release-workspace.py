@@ -9,10 +9,23 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER = 'orchestrator'
-PLATFORM = Path(os.environ.get('KUASAR_PLATFORM_ROOT', ROOT.parent/'kuasar-sandbox'))
+def selected_platform():
+    directory = os.environ.get('KUASAR_PLATFORM_DIR')
+    selected_root = os.environ.get('KUASAR_PLATFORM_ROOT')
+    if directory and selected_root and Path(directory).resolve() != Path(selected_root).resolve():
+        raise SystemExit('KUASAR_PLATFORM_DIR and KUASAR_PLATFORM_ROOT select different platforms')
+    return Path(directory or selected_root or ROOT.parent/'kuasar-sandbox').resolve()
+
+
+PLATFORM = selected_platform()
 
 
 class ReleaseWorkspaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not (PLATFORM/'ci/integration/go_workspace.py').is_file():
+            raise RuntimeError('selected platform workspace tooling is missing: ' + str(PLATFORM))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='release workspace ')
         self.addCleanup(self.temp.cleanup)

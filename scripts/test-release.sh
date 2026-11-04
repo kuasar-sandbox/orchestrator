@@ -30,7 +30,13 @@ source "$ROOT/scripts/release-materials.sh"
 bash "$ROOT/scripts/test-release-materials.sh"
 bash "$ROOT/scripts/test-release-go-notices.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-selected-go-materials.py"
-PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-workspace.py"
+# Cross-repository integration is opt-in; the CI source wrapper supplies its
+# selected platform explicitly. Standalone packaging needs no sibling checkout.
+if [[ -n "${KUASAR_PLATFORM_DIR:-${KUASAR_PLATFORM_ROOT:-}}" ]]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-workspace.py"
+else
+  echo 'test-release: workspace integration not selected (set KUASAR_PLATFORM_DIR to run)'
+fi
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
