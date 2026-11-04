@@ -1123,14 +1123,14 @@ func (s *Store) AcceptSandboxExecutionResult(ctx context.Context, id, runID stri
 		}
 		return false, ErrSandboxResultConflict
 	}
-	if currentRunID != runID || (state != string(types.StateStarting) && state != string(types.StateRunning) && state != string(types.StatePausing)) {
+	if currentRunID != runID || (state != string(types.StateStarting) && state != string(types.StateRunning) && state != string(types.StatePausing) && state != string(types.StatePaused)) {
 		return false, ErrSandboxExecutionOwnership
 	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET sandbox_result_run_id=?, sandbox_result_json=?
 		 WHERE id=? AND run_id=? AND sandbox_result_run_id=''
-		   AND state IN (?,?,?)`, runID, encoded, id, runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePausing))
+		   AND state IN (?,?,?,?)`, runID, encoded, id, runID, string(types.StateStarting), string(types.StateRunning), string(types.StatePausing), string(types.StatePaused))
 	if err != nil {
 		return false, fmt.Errorf("store: accept sandbox result %s: %w", id, err)
 	}
@@ -1156,12 +1156,13 @@ func (s *Store) CommitPaused(ctx context.Context, id, runID string, source types
 		return false, err
 	}
 	defer tx.Rollback()
-	// Result receipt does not wait for the lifecycle lock held by capture. An
-	// accepted terminal result must win even when capture started earlier.
+	// Result receipt does not wait for the lifecycle lock held by capture.
+	// A process result and a successful capture are independent facts. Keep the
+	// diagnostic result while committing the source for this admitted Pause.
 	result, err := tx.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET state=?, resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?, launch_mode='', running_since_ns=0, pause_reason=CASE WHEN resource_obligation=1 THEN 'resource-pressure' ELSE 'explicit' END, pressure_version=pressure_version+1
-		 WHERE id=? AND state=? AND run_id=? AND sandbox_result_run_id=''`,
+		 WHERE id=? AND state=? AND run_id=?`,
 		string(types.StatePaused), string(source.Kind), source.Ref, source.SandboxRef, id, string(types.StatePausing), runID)
 	if err != nil {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: %w", id, err)

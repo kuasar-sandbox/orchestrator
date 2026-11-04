@@ -1962,7 +1962,8 @@ Get/List 和扩展视图展示有效可空值。Store、集群 reserve/create、
 
 自动路径仅使用完整、正常的单 Proxy 观察。接收时记录 t0 及 BOOTTIME 锚，等待策略
 时长后调用共同 Pause 路径，固定 `memory=true`、`checkpoint=false`、`ifIdle=true`、
-`ifIdleSince=t0`。重复 idle 通知不延长 deadline；新 idle、来源变化、统计不完整和重启
+`ifIdleSince=t0`。同一 SID 最多有一个自动 Pause 尝试等待生命周期或来源访问；新观察更新候选但不增加
+等待任务，旧尝试结束后再评价当前候选。重复 idle 通知不延长 deadline；新 idle、来源变化、统计不完整和重启
 使候选重建。计时期间不持有生命周期锁，最终 Worker 同步检查能够发现异步统计遗漏的
 短请求。拒绝后即使没有新业务也能重新计时；持续失败使用内部有界退避。未收敛的
 持久化 pausing 继续由原生命周期恢复机制处理。
@@ -2011,6 +2012,13 @@ RFC 3339 时间，保留亚秒精度；缺省/null 保持原行为。未指定 `
 上按相同逻辑 park 已授权新请求并发送 Wake, 不再拨旧 backend. 已建立连接在握手期间保留,
 避免把主动断开连接造成的零值误当空闲. conductor 持有同一 SID lifecycle lock 完成 capture、
 暂停提交和清理, 再处理排队的 Wake. pausing→paused 是正常进度; starting→paused 才是恢复失败.
+runner 退出与 Pause 完成是两个独立事实。当前 RunID 的退出报告立即持久化并 ACK，
+包括 pausing 期间，以及 paused 清理仍持有该 RunID 时。报告不会把已接纳 Pause 的
+路由改成 dead，也不否决成功 capture 后的 paused 提交。paused 行保留退出诊断；
+finalizer 在 SID 锁内重读状态和 RunID，只完成剩余暂停清理。Resume 在存储和实时
+视图中同时清除旧结果，有效 paused 来源仍可导出；已退休 RunID 的报告不能修改后继运行。
+capture 成功但 paused 事务失败时，未提交操作保持 pausing，交由既有恢复路径处理，
+不能宣称旧实例仍在 running。
 崩溃后遗留的 durable pausing 没有已提交新来源, Reconcile fence 精确 runner 并按既有终止路径
 收敛, 不仅凭进程存活重新发布 running.
 
@@ -2060,8 +2068,8 @@ Pause 的顺序固定为 resolve request/quota -> accepted operation -> online P
 selective checkpoint cleanup -> RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
 RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
 exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 或 RunDir 清理失败不允许新的 Resume/Wake/Exec
-取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败保持 state=running、旧 source、runner 和 network 不变,不创建
-成功 alias,也不从 S 降级为 E。
+取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败仅在相同 RunID 仍持有 pausing 行且未接纳退出结果时恢复 running；
+已接纳的退出沿既有终态路径清理。失败尝试保留旧 source，不创建成功 alias，也不从 S 降级为 E。
 
 ##### 本地磁盘 Checkpoint
 

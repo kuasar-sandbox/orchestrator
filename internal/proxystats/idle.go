@@ -62,18 +62,19 @@ func (m *MasterStats) ObserveRoute(r routesync.RouteEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clockLocked()
-	old := m.runSince[r.SandboxID]
+	old := m.routeSince[r.SandboxID]
 	if r.State == routesync.StateRunning {
 		if old.runID != r.RunID || old.since.bootNS == 0 {
-			m.runSince[r.SandboxID] = runMarker{runID: r.RunID, since: m.now()}
+			m.routeSince[r.SandboxID] = runMarker{runID: r.RunID, since: m.now()}
 		}
 	} else if r.State != routesync.StatePausing || old.runID != r.RunID {
-		delete(m.runSince, r.SandboxID)
+		delete(m.routeSince, r.SandboxID)
 	}
 }
 func (m *MasterStats) ResetObservation() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.routeSince = make(map[string]runMarker)
 	m.runSince = make(map[string]runMarker)
 	m.trustSince = m.now()
 }
@@ -84,7 +85,7 @@ func (m *MasterStats) PauseEvidence(sid, run string) routesync.IdleEvidence {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clockLocked()
-	marker := m.runSince[sid]
+	marker := m.routeSince[sid]
 	if !m.availableLocked() || marker.runID != run || marker.since.bootNS <= 0 {
 		return routesync.IdleEvidence{}
 	}

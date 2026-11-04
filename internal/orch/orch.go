@@ -57,6 +57,7 @@ type Orchestrator struct {
 	idleNow        func() idleclock.Point
 	idleMu         sync.Mutex
 	idleCandidates map[string]*idleCandidate
+	idleInFlight   map[string]*idleCandidate
 	idleGeneration uint64
 	idleRetries    map[string]idleRetry
 	memoryPressure atomic.Pointer[nodePressureController]
@@ -2033,6 +2034,8 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			return nil, nil, errLaunchOwnershipLost
 		}
 		starting := cloneSandbox(sb)
+		// Match BeginResume: the previous runner result is not a result for this launch.
+		starting.ExecutionResult = nil
 		starting.State = types.StateStarting
 		starting.PressureVersion++
 		starting.LaunchMode = launchMode

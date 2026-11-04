@@ -62,7 +62,8 @@ type MasterStats struct {
 	clockUnavailable bool
 	now              func() timePoint
 	trustSince       timePoint
-	runSince         map[string]runMarker
+	runSince         map[string]runMarker // lazy query cache
+	routeSince       map[string]runMarker // written only by route observations
 }
 
 func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
@@ -81,7 +82,7 @@ func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
 		clockWatch: watch, clockUnavailable: watchErr != nil,
 		metrics: mx, expected: expected, workers: make(map[string]*workerContribution),
 		traffic: make(map[string]aggregateTraffic), now: currentTimePoint,
-		trustSince: now, runSince: make(map[string]runMarker),
+		trustSince: now, runSince: make(map[string]runMarker), routeSince: make(map[string]runMarker),
 	}
 }
 
@@ -333,6 +334,9 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	}
 	now := m.now()
 	marker := m.runSince[sandboxID]
+	if observed := m.routeSince[sandboxID]; observed.runID == runID && observed.since.bootNS > 0 {
+		marker = observed
+	}
 	if state == types.StateRunning {
 		if marker.runID != runID || marker.since.bootNS == 0 {
 			marker = runMarker{runID: runID, since: now}

@@ -74,7 +74,8 @@ for supported names, checks and historical-input compatibility.
 The maintained `orchestrator.idle-timeout.sh` and `orchestrator.idle-condition.sh` cases run in the public prepared
 E2E runner on each supported VM architecture. They exercise never-used Sandboxes,
 `idleTimeout=0` and a positive timeout, HTTP and Native Exec memory preservation,
-concurrent/streaming traffic, a capture barrier with park/Wake, the unchanged park
+concurrent/streaming traffic, a post-capture barrier that requires the old runner
+result to be durable before the paused commit, park/Wake, the unchanged park
 deadline, and public UTC conditional Pause. Select both with
 `--include orchestrator.idle-timeout.sh --include orchestrator.idle-condition.sh`
 during `prepare` and `run`. The UTC case establishes a new Proxy observation
@@ -82,7 +83,8 @@ after its setup traffic ends; a clock step during its condition still fails clos
 
 Each policy emits `idle-timeout-<seconds>.json` under the case output directory:
 raw end-to-paused and wake-response samples, state transitions, per-process
-CPU/RSS observations, handshake/capture timing and attempt/retry counts. The wake-response
+CPU/RSS observations, handshake/capture timing and attempt/retry counts.
+`pause-exit-facts.jsonl` records each forced exit-before-commit observation. The wake-response
 measurement includes client overhead and business execution; starting-to-running
 is a 100 ms polling estimate of the Resume interval. These are measurements of
 that run, not performance promises. Capture timings at the two deliberately held

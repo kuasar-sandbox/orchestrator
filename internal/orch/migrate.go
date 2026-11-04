@@ -104,7 +104,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 				return types.ExportResult{}, api.ErrNotFound
 			}
 			savedSource = checkpoint.Source
-		} else if sb.State != types.StatePaused || !sb.ResumeSource.Valid() || sb.ExecutionResult != nil {
+		} else if sb.State != types.StatePaused || !sb.ResumeSource.Valid() {
 			unlock()
 			return types.ExportResult{}, fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
@@ -288,7 +288,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		o.cleanupConsumedCheckpoint(finalizeCtx, current)
 		return response, nil
 	}
-	if current == nil || current.State != types.StatePaused || current.ExecutionResult != nil || current.ResumeSource != attempt.source ||
+	if current == nil || current.State != types.StatePaused || current.ResumeSource != attempt.source ||
 		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||
 		current.StableID() != source.StableID() {
 		return types.ExportResult{}, exportPreemptedError(sid)

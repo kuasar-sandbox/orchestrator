@@ -79,7 +79,10 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	if sb.BaseDir != "" && (sb.State == types.StateDead || sb.State == types.StateDeleting) {
 		e.ArtifactLocation = "local"
 	}
-	if (sb.ExecutionResult != nil || (sb.RunID != "" && sb.DeadRunID == sb.RunID)) && (sb.State == types.StateRunning || sb.State == types.StateStarting || sb.State == types.StatePausing) {
+	// An admitted Pause owns its outcome until capture/commit completes. A
+	// previous runner result also cannot terminate a subsequent launch.
+	currentExited := sb.RunID != "" && ((sb.ExecutionResult != nil && sb.ExecutionResult.RunID == sb.RunID) || sb.DeadRunID == sb.RunID)
+	if currentExited && (sb.State == types.StateRunning || sb.State == types.StateStarting) {
 		e.State = routesync.StateDead
 	}
 	if raw, present := sb.Metadata[sandboxcfg.NsTraffic]; present {

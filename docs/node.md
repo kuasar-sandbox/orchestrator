@@ -1505,7 +1505,10 @@ including a newly running Sandbox that has never received a business request.
 The automatic path requires complete, normal single-Proxy observation. It records
 receipt t0 with BOOTTIME, waits the policy duration, then uses the common Pause
 path with `memory=true`, `checkpoint=false`, `ifIdle=true`, `ifIdleSince=t0`.
-Duplicate idle notifications do not extend the deadline; new idle, source changes,
+At most one automatic Pause attempt per SID may wait for lifecycle/source access;
+new observations replace the candidate without adding waiters, and are evaluated
+after the old attempt retires. Duplicate idle notifications do not extend the
+deadline; new idle, source changes,
 missing statistics and restarts rebuild it. The timer holds no lifecycle lock.
 The final synchronous Worker check catches short requests hidden by delayed
 statistics. Rejected attempts can rearm without another business request; repeated
@@ -1562,7 +1565,19 @@ Proxy parks authenticated requests and sends Wake for both pausing and paused. E
 transports remain valid during the handshake so canceling them cannot fabricate idle.
 Conductor holds the SID lifecycle lock through capture, atomic pause/checkpoint commit and
 cleanup before processing queued Wake. pausing→paused is normal progress, whereas
-starting→paused remains a failed Resume. Restart never adopts an interrupted durable pausing
+starting→paused remains a failed Resume.
+
+Runner exit and Pause completion are independent facts. An exit report for the
+current RunID is persisted and acknowledged immediately, including during
+pausing or while paused cleanup still owns that RunID. It does not turn an
+admitted Pause route into dead or veto a successful capture/paused commit.
+The paused row retains the exit diagnostic; the finalizer rechecks state and
+RunID under the SID lock and only finishes paused cleanup. Resume retires the
+old result in both storage and live views, and a valid paused source remains
+exportable. Reports from a retired RunID cannot change a subsequent run.
+If capture succeeds but the paused transaction fails, the uncommitted operation
+remains pausing for existing recovery; it must not be advertised as running.
+Restart never adopts an interrupted durable pausing
 row merely because its runner is live: it fences that exact runner and uses existing terminal
 cleanup because no new source was committed.
 
@@ -1611,7 +1626,7 @@ validates the complete structured result before committing pausing→paused;
 Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
 and its association. Capture failure never commits a partial pair.
 
-Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure keeps running state, old source, runner/network and creates no success alias; it never downgrades S to E.
+Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure restores running only while the same RunID still owns the pausing row and no exit result has been accepted; an accepted exit follows existing terminal cleanup. Failed attempts retain the old source and create no success alias, never downgrading S to E.
 
 ##### Local disk Checkpoints
 

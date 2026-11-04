@@ -451,7 +451,10 @@ func TestWatchersReceiveIndependentLiveViewsAndPublishDoesNotRunCallbacks(t *tes
 	readyA, readyB := make(chan struct{}), make(chan struct{})
 	mutated := make(chan struct{})
 	seen := make(chan string, 1)
+	seenIdle := make(chan int64, 1)
 	block := make(chan struct{})
+	release := sync.OnceFunc(func() { close(block) })
+	defer release()
 	var readyAOnce, readyBOnce, mutateOnce sync.Once
 	doneA, doneB := make(chan error, 1), make(chan error, 1)
 	go func() {
@@ -461,6 +464,7 @@ func TestWatchersReceiveIndependentLiveViewsAndPublishDoesNotRunCallbacks(t *tes
 			}
 			if event.SandboxID == "sandbox-independent" && event.View != nil {
 				event.View.Metadata["key"] = "watcher-a"
+				*event.View.IdleTimeout = 99
 				mutateOnce.Do(func() { close(mutated) })
 				<-block
 			}
@@ -473,7 +477,9 @@ func TestWatchersReceiveIndependentLiveViewsAndPublishDoesNotRunCallbacks(t *tes
 				readyBOnce.Do(func() { close(readyB) })
 			}
 			if event.SandboxID == "sandbox-independent" && event.View != nil {
+				<-mutated
 				seen <- event.View.Metadata["key"]
+				seenIdle <- *event.View.IdleTimeout
 			}
 			return nil
 		})
@@ -481,6 +487,8 @@ func TestWatchersReceiveIndependentLiveViewsAndPublishDoesNotRunCallbacks(t *tes
 	waitSignal(t, readyA)
 	waitSignal(t, readyB)
 	sandbox := testSandbox("sandbox-independent", 1)
+	idle := int64(7)
+	sandbox.IdleTimeout = &idle
 	returned := make(chan struct{})
 	go func() {
 		observer.SandboxUpsert(sandbox)
@@ -491,7 +499,10 @@ func TestWatchersReceiveIndependentLiveViewsAndPublishDoesNotRunCallbacks(t *tes
 	if got := waitResult(t, seen); got != "sandbox" {
 		t.Fatalf("watcher B observed watcher A mutation %q", got)
 	}
-	close(block)
+	if got := waitResult(t, seenIdle); got != 7 {
+		t.Fatalf("watcher B observed watcher A idleTimeout mutation %d", got)
+	}
+	release()
 	cancel()
 	if err := waitResult(t, doneA); !errors.Is(err, context.Canceled) {
 		t.Fatalf("watcher A error=%v", err)

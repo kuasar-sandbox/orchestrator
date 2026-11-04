@@ -284,7 +284,7 @@ func TestMissingRunningRetryConsumesNewObservationForEmptyRunID(t *testing.T) {
 	}
 }
 
-func TestAcceptedResultDuringCaptureWinsPauseCommit(t *testing.T) {
+func TestAcceptedResultDuringCaptureCoexistsWithPauseCommit(t *testing.T) {
 	installCheckpointSandboxCtl(t)
 	f := newSandboxFinalizerFixture(t, "terminal-capture-result")
 	f.o.cfg.Checkpoint.Mode = config.CheckpointLocal
@@ -312,13 +312,15 @@ func TestAcceptedResultDuringCaptureWinsPauseCommit(t *testing.T) {
 	if err := os.WriteFile(release, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitCheckpointResult(t, paused); err == nil {
-		t.Fatal("late capture replaced the accepted terminal result with paused state")
+	if err := waitCheckpointResult(t, paused); err != nil {
+		t.Fatalf("successful capture failed to commit: %v", err)
 	}
 	drainRunEnds(t, f.o)
 	dead, err := f.o.st.Get(context.Background(), f.sb.ID)
-	if err != nil || dead == nil || dead.State != types.StateDead || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != f.sb.RunID || dead.ExecutionResult.ExitCode == nil || *dead.ExecutionResult.ExitCode != code {
-		t.Fatalf("accepted result did not win terminal cleanup: %+v, %v", dead, err)
+	if err != nil || dead == nil || dead.State != types.StatePaused || !dead.ResumeSource.Valid() || dead.ExecutionResult == nil || dead.ExecutionResult.RunID != f.sb.RunID || dead.ExecutionResult.ExitCode == nil || *dead.ExecutionResult.ExitCode != code {
+		t.Fatalf("pause lost the independent runner result: %+v, %v", dead, err)
 	}
-	assertTerminatedDataRetained(t, f.sb)
+	if _, err := os.Stat(f.sb.BaseDir); err != nil {
+		t.Fatalf("paused base dir: %v", err)
+	}
 }

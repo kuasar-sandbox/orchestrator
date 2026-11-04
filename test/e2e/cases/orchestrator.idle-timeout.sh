@@ -20,7 +20,7 @@ for IDLE_TIMEOUT in 0 2; do
     # No business call: the initial complete observation must schedule Pause.
     wait_sandbox_state "$SID" paused 1200 || fail "never-used Sandbox did not auto-pause"
     EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")"
-    export IDLE_TIMEOUT SID AK EXEC_TOKEN FORWARD_TOKEN DOMAIN PORT PROXY_PORT BIN WORK CASE_OUT CONDUCTOR_PID PROXY_MASTER_PID EXECUTE_RUN_ROOT PAUSE_BARRIER_TARGET PAUSE_BARRIER_REACHED PAUSE_BARRIER_RELEASE
+    export IDLE_TIMEOUT SID AK EXEC_TOKEN FORWARD_TOKEN DOMAIN PORT PROXY_PORT BIN WORK CASE_OUT CONDUCTOR_PID PROXY_MASTER_PID EXECUTE_RUN_ROOT PAUSE_BARRIER_TARGET PAUSE_BARRIER_REACHED PAUSE_BARRIER_RELEASE PAUSE_BARRIER_AFTER_CAPTURE
     python3 "$SCRIPT_DIR/idle_timeout.py"
     code=$(req DELETE "/sandboxes/$SID" "$AK")
     [ "$code" = 204 ] || fail "delete=$code"

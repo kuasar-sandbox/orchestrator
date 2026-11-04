@@ -124,6 +124,7 @@ func projectBuildOptions(options types.BuildOptions) conductorextension.BuildOpt
 }
 
 func cloneSandboxView(view conductorextension.SandboxView) conductorextension.SandboxView {
+	view.IdleTimeout = types.CloneIdleTimeout(view.IdleTimeout)
 	view.Metadata = cloneMap(view.Metadata)
 	if view.Cluster != nil {
 		cluster := *view.Cluster

@@ -191,6 +191,8 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
         await_paused(time.monotonic())
         assert counter == 13
         target, reached, release = (Path(env[k]) for k in ('PAUSE_BARRIER_TARGET','PAUSE_BARRIER_REACHED','PAUSE_BARRIER_RELEASE'))
+        after_capture = Path(env['PAUSE_BARRIER_AFTER_CAPTURE'])
+        after_capture.touch()
         def hold_capture():
             reached.unlink(missing_ok=True); release.unlink(missing_ok=True)
             target.write_text(sid+'\n')
@@ -200,6 +202,20 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
                 assert time.monotonic()<deadline, 'automatic capture barrier not reached'
                 time.sleep(.02)
             assert state()[0]=='pausing'
+            # The snapshot is committed by Sandboxer, but Conductor has not
+            # received the helper's completion. Require the old runner result
+            # to be durable first; neither message order may destroy the source.
+            deadline=time.monotonic()+30
+            while True:
+                with sqlite3.connect(db_path,timeout=5) as db:
+                    fact=db.execute('select state,run_id,sandbox_result_run_id,sandbox_result_json from sandboxes where id=?',(sid,)).fetchone()
+                assert fact[0]=='pausing', fact[0]
+                if fact[1] and fact[1]==fact[2] and fact[3]:
+                    with (Path(env['CASE_OUT'])/'pause-exit-facts.jsonl').open('a') as stream:
+                        stream.write(json.dumps(dict(idle_timeout=timeout,state=fact[0],run_id=fact[1],result=json.loads(fact[3]),snapshot_succeeded=True,pause_commit_held=True))+'\n')
+                    break
+                assert time.monotonic()<deadline, 'runner result did not arrive before Pause commit'
+                time.sleep(.02)
         try:
             hold_capture()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -221,7 +237,7 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
             assert counter == 17
             business_passed = True
         finally:
-            target.unlink(missing_ok=True); release.touch()
+            target.unlink(missing_ok=True); release.touch(); after_capture.unlink(missing_ok=True)
     finally:
         stop.set();thread.join(timeout=2)
         result = dict(business_passed=business_passed, capture_timing_includes_test_barriers=True, idle_timeout=timeout, samples=samples, resources=resources, transitions=transitions, verified_requests=counter)

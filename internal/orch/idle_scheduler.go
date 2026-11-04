@@ -119,7 +119,7 @@ func (o *Orchestrator) scheduleIdle(ctx context.Context) {
 	}
 	list := make(map[string]*idleCandidate, len(o.idleCandidates))
 	for sid, c := range o.idleCandidates {
-		if !c.inflight {
+		if !c.inflight && o.idleInFlight[sid] == nil {
 			list[sid] = c
 		}
 	}
@@ -129,7 +129,7 @@ func (o *Orchestrator) scheduleIdle(ctx context.Context) {
 		now := o.idleTime()
 		valid := o.validIdleSource(c.source)
 		o.idleMu.Lock()
-		if o.idleCandidates[sid] != c || c.inflight {
+		if o.idleCandidates[sid] != c || c.inflight || o.idleInFlight[sid] != nil {
 			o.idleMu.Unlock()
 			continue
 		}
@@ -165,6 +165,10 @@ func (o *Orchestrator) scheduleIdle(ctx context.Context) {
 			continue
 		}
 		c.inflight = true
+		if o.idleInFlight == nil {
+			o.idleInFlight = make(map[string]*idleCandidate)
+		}
+		o.idleInFlight[sid] = c
 		o.idleMu.Unlock()
 		go o.pauseIdleCandidate(ctx, sid, c)
 	}
@@ -173,6 +177,14 @@ func (o *Orchestrator) scheduleIdle(ctx context.Context) {
 // pauseIdleCandidate is deliberately separate from the TTL wrapper. It holds
 // the same SID lock through verification, capture and commit as ordinary Pause.
 func (o *Orchestrator) pauseIdleCandidate(ctx context.Context, sid string, c *idleCandidate) {
+	defer func() {
+		o.idleMu.Lock()
+		defer o.idleMu.Unlock()
+		if o.idleInFlight[sid] == c {
+			delete(o.idleInFlight, sid)
+		}
+		c.inflight = false
+	}()
 	ctx, unlock, err := o.lockLifecycleMutation(ctx, sid)
 	if err != nil {
 		o.finishIdleAttempt(ctx, sid, c, err)

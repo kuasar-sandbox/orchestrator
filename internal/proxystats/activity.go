@@ -9,7 +9,7 @@ func (m *MasterStats) Activity(r routesync.RouteEntry) routesync.Activity {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	marker := m.runSince[r.SandboxID]
+	marker := m.routeSince[r.SandboxID]
 	if r.State != routesync.StateRunning || r.TrafficPolicyInvalid || !m.availableLocked() || marker.runID != r.RunID || marker.since.bootNS <= 0 {
 		return a
 	}
