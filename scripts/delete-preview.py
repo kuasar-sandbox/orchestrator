@@ -83,6 +83,12 @@ def delete(endpoint, read_endpoint=None):
     require(api(read_endpoint or endpoint, optional=True) is None, 'deleted object remains visible')
 
 
+def asset_identity(release):
+    fields = ('id', 'name', 'size', 'digest', 'state')
+    return sorted((json.dumps({key: row.get(key) for key in fields}, sort_keys=True)
+                   for row in release.get('assets', [])))
+
+
 def collect(repository, unit, tag, sha, mode):
     require(unit in ('accelerator', 'connector', 'sandboxer', 'orchestrator', 'runtime', 'vmlinux'),
             'unknown release unit')
@@ -110,10 +116,11 @@ def collect(repository, unit, tag, sha, mode):
         require(type(release.get('id')) is int and release['id'] > 0, 'invalid Release ID')
         is_complete = complete(release, package_names(unit, tag))
         require(mode != 'incomplete' or not is_complete, 'refusing incomplete recovery for a complete preview')
-    fields = ('id', 'tag_name', 'draft', 'prerelease', 'immutable', 'target_commitish', 'assets')
+    fields = ('id', 'tag_name', 'draft', 'prerelease', 'immutable', 'target_commitish')
     current = release_for(repository, tag)
     require((current is None and release is None) or (current is not None and release is not None
-            and all(current.get(key) == release.get(key) for key in fields)), 'Release changed before deletion')
+            and all(current.get(key) == release.get(key) for key in fields)
+            and asset_identity(current) == asset_identity(release)), 'Release changed before deletion')
     require(api(ref_endpoint, optional=True) == original_ref, 'tag changed before deletion')
     deleted = []
     if release is not None:
