@@ -35,15 +35,16 @@ type PauseActivity struct {
 }
 
 type IdleEvidence struct {
-	SinceUTC    time.Time       `json:"since_utc"`
-	SinceBootNS int64           `json:"since_boot_ns"`
-	Clock       idleclock.Proof `json:"clock"`
+	Points      []idleclock.Point `json:"points"`
+	SinceBootNS int64             `json:"since_boot_ns"`
+	Clock       idleclock.Proof   `json:"clock"`
 }
 
 type PauseAck struct {
-	Evidence []IdleEvidence           `json:"evidence,omitempty"`
-	Activity map[string]PauseActivity `json:"activity"`
-	Error    string                   `json:"error,omitempty"`
+	AutomaticSafe bool                     `json:"automatic_safe"`
+	Evidence      []IdleEvidence           `json:"evidence,omitempty"`
+	Activity      map[string]PauseActivity `json:"activity"`
+	Error         string                   `json:"error,omitempty"`
 }
 
 func (a PauseAck) Idle() bool {
@@ -67,4 +68,17 @@ type PauseBarrierCoordinator interface {
 // PauseSink gates new traffic before synchronously sampling every worker.
 type PauseSink interface {
 	PreparePause(context.Context, string, RouteEntry) PauseAck
+}
+
+func (a PauseActivity) ValidTimeSample() bool {
+	if !a.Sampled {
+		return false
+	}
+	if a.NeverActive {
+		return a.Parking == 0 && a.Connected == 0 && a.IdleSince == nil && a.IdleSinceBootNS == 0
+	}
+	if a.Parking != 0 || a.Connected != 0 {
+		return a.IdleSince == nil && a.IdleSinceBootNS == 0
+	}
+	return a.IdleSince != nil && !a.IdleSince.IsZero() && a.IdleSinceBootNS > 0
 }

@@ -1,10 +1,11 @@
 package proxystats
 
 import (
-	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func TestPauseLastZeroSurvivesBlockedAsyncStats(t *testing.T) {

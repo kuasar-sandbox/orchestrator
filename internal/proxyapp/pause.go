@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -19,6 +20,7 @@ func (s *readinessSink) PreparePause(ctx context.Context, id string, route route
 
 func (i *Instance) pauseActivity(ctx context.Context, id string, route routesync.RouteEntry) (out routesync.PauseAck) {
 	out.Activity = make(map[string]routesync.PauseActivity)
+	out.AutomaticSafe = i.stats != nil && (i.stats.InplaceRestart == nil || !i.stats.InplaceRestart()) && i.Snapshot().Ready
 	evidence := routesync.IdleEvidence{}
 	if i.stats != nil {
 		evidence = i.stats.PauseEvidence(route.SandboxID, route.RunID)
@@ -32,6 +34,7 @@ func (i *Instance) pauseActivity(ctx context.Context, id string, route routesync
 	i.pauseSamples[id] = make(map[int]controlMessage)
 	i.mu.Unlock()
 	defer func() {
+		normal := i.stats != nil && (i.stats.InplaceRestart == nil || !i.stats.InplaceRestart())
 		i.mu.Lock()
 		defer i.mu.Unlock()
 		// Include every sample actually received, even if another worker failed
@@ -53,12 +56,12 @@ func (i *Instance) pauseActivity(ctx context.Context, id string, route routesync
 				completeTimes = false
 			}
 			for service, activity := range sample.Activity {
-				if !activity.Sampled || (!activity.NeverActive && activity.Parking == 0 && activity.Connected == 0 && (activity.IdleSince == nil || activity.IdleSinceBootNS <= 0)) {
+				if !activity.ValidTimeSample() {
 					completeTimes = false
 				}
 				evidence.SinceBootNS = max(evidence.SinceBootNS, activity.IdleSinceBootNS)
-				if activity.IdleSince != nil && activity.IdleSince.After(evidence.SinceUTC) {
-					evidence.SinceUTC = *activity.IdleSince
+				if activity.IdleSince != nil {
+					evidence.Points = append(evidence.Points, idleclock.Point{Wall: *activity.IdleSince, BootNS: activity.IdleSinceBootNS})
 				}
 				total := out.Activity[service]
 				total.Parking += activity.Parking
@@ -70,9 +73,7 @@ func (i *Instance) pauseActivity(ctx context.Context, id string, route routesync
 			final := i.stats.PauseEvidence(route.SandboxID, route.RunID)
 			evidence.Clock = final.Clock
 			evidence.SinceBootNS = max(evidence.SinceBootNS, final.SinceBootNS)
-			if final.SinceUTC.After(evidence.SinceUTC) {
-				evidence.SinceUTC = final.SinceUTC
-			}
+			evidence.Points = append(evidence.Points, final.Points...)
 			completeTimes = completeTimes && final.SinceBootNS > 0
 		}
 		for index, w := range participants {
@@ -85,6 +86,7 @@ func (i *Instance) pauseActivity(ctx context.Context, id string, route routesync
 		if completeTimes && len(i.pauseSamples[id]) == len(participants) {
 			out.Evidence = []routesync.IdleEvidence{evidence}
 		}
+		out.AutomaticSafe = out.AutomaticSafe && completeTimes && normal
 		delete(i.pauseSamples, id)
 	}()
 	if len(participants) == 0 {

@@ -2,13 +2,15 @@ package orch
 
 import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
-	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func checkIdleEvidence(a routesync.PauseAck, r sandboxcfg.CaptureRequest) error {
 	if a.Error != "" || len(a.Evidence) == 0 {
+		return api.ErrProxyUnavailable
+	}
+	if r.IdleSinceBootNS > 0 && !a.AutomaticSafe {
 		return api.ErrProxyUnavailable
 	}
 	if !a.Idle() {
@@ -24,12 +26,17 @@ func checkIdleEvidence(a routesync.PauseAck, r sandboxcfg.CaptureRequest) error 
 			}
 			continue
 		}
-		ok, known := e.Clock.Compare(idleclock.Point{Wall: e.SinceUTC, BootNS: e.SinceBootNS}, *r.IfIdleSince)
-		if !known {
+		if len(e.Points) == 0 {
 			return api.ErrProxyUnavailable
 		}
-		if !ok {
-			return api.ErrSandboxBusy
+		for _, point := range e.Points {
+			ok, known := e.Clock.Compare(point, *r.IfIdleSince)
+			if !known {
+				return api.ErrProxyUnavailable
+			}
+			if !ok {
+				return api.ErrSandboxBusy
+			}
 		}
 	}
 	return nil

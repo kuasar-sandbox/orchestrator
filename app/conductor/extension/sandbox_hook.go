@@ -52,6 +52,7 @@ type SandboxCreateRequest struct {
 	Metadata        map[string]string
 	Env             map[string]string
 	Secure          bool
+	IdleTimeout     *int64
 	AutoPauseMemory *bool
 	AutoReset       bool
 	MMDS            *string

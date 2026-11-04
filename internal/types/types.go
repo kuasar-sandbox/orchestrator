@@ -405,6 +405,7 @@ type Sandbox struct {
 	APISecret             string // per-tenant API authentication root (hex); never written to env/yaml
 	ManifestKey           string // per-tenant manifest encryption root (hex); never written to env/yaml
 	ResumeSource          ResumeSource
+	IdleTimeout           *int64
 	AutoPauseMemory       bool
 	LaunchMode            LaunchMode
 	ServiceSecret         string // per-sandbox service authentication root (hex); never exposed publicly

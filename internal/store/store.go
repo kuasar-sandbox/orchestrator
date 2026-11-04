@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   resume_source_ref    TEXT NOT NULL DEFAULT '',
   resume_sandbox_ref   TEXT NOT NULL DEFAULT '',
   auto_pause_memory    INTEGER NOT NULL DEFAULT 1,
+ idle_timeout INTEGER,
   max_checkpoints      INTEGER NOT NULL DEFAULT 1 CHECK(max_checkpoints=1),
   launch_mode          TEXT NOT NULL DEFAULT '',
   service_secret_enc       TEXT NOT NULL,
@@ -226,6 +227,10 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	// independent additive migrations: there is no safe plaintext backfill for
 	// instance_config_enc and no legacy Build reader/writer path.
 	if err := requireColumn(ctx, db, "builds", "instance_config_enc"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "sandboxes", "idle_timeout", "INTEGER"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -574,11 +579,11 @@ type buildInstanceConfig struct {
 const sandboxInsertSQL = `
 	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
-	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,max_checkpoints,launch_mode,
+	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,
 	  sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
 	  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -587,7 +592,7 @@ ON CONFLICT(id) DO UPDATE SET
   ci_uds=excluded.ci_uds, floatingip=excluded.floatingip, vswitch_port=excluded.vswitch_port,
   inner_ip=excluded.inner_ip, port_mac=excluded.port_mac,
   resume_source_kind=excluded.resume_source_kind, resume_source_ref=excluded.resume_source_ref, resume_sandbox_ref=excluded.resume_sandbox_ref,
-  auto_pause_memory=excluded.auto_pause_memory, launch_mode=excluded.launch_mode,
+  idle_timeout=excluded.idle_timeout, auto_pause_memory=excluded.auto_pause_memory, launch_mode=excluded.launch_mode,
   metadata_json=excluded.metadata_json, env_json=excluded.env_json,
   dead_unix=excluded.dead_unix, sandbox_result_run_id=excluded.sandbox_result_run_id,
   sandbox_result_json=excluded.sandbox_result_json,
@@ -600,6 +605,11 @@ const sandboxInsertOnlySQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO NOTHING`
 
 func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
+	if sb != nil {
+		if err := types.ValidateIdleTimeout(sb.IdleTimeout); err != nil {
+			return nil, err
+		}
+	}
 	if sb == nil {
 		return nil, errors.New("sandbox is required")
 	}
@@ -667,7 +677,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.StableIDValue,
 		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc,
-		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.AutoPauseMemory, sb.MaxCheckpoints, string(sb.LaunchMode),
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.ResumeSource.SandboxRef, sb.AutoPauseMemory, sb.IdleTimeout, sb.MaxCheckpoints, string(sb.LaunchMode),
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
 		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix, resultRunID, resultJSON,
 		sb.PauseReason, sb.ResourceObligation, sb.PressureVersion, sb.RunningSinceUnixNano, sb.PressureSinceUnixNano,
@@ -1394,7 +1404,7 @@ func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (
 
 var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
-  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,max_checkpoints,launch_mode,
+  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
   instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error`
 
@@ -1408,7 +1418,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc,
-		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.MaxCheckpoints, &launchMode,
+		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.IdleTimeout, &sb.MaxCheckpoints, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano,
 		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError); err != nil {

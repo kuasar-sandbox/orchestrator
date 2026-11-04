@@ -136,6 +136,7 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	// Reader: preserve the established BeginSync-before-policy callback order,
 	// then apply route frames until EOF/error.
 	s.sink.BeginSync()
+	go s.forwardActivity(sctx, up)
 	if sink, ok := s.sink.(CapabilitySink); ok {
 		sink.SetProxyCapabilities(hello.Hello.ProxyCapabilities)
 	}

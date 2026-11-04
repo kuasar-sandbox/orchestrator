@@ -23,8 +23,8 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		ResumeSourceRef:  sandbox.ResumeSource.Ref,
 		ResumeSandboxRef: sandbox.ResumeSource.SandboxRef,
 		ArtifactLocation: artifactLocation(sandbox.ResumeSource.Ref),
-		AutoPauseMemory:  sandbox.AutoPauseMemory,
-		AutoReset:        sandbox.AutoReset, DeadUnix: sandbox.DeadUnix, AutoResetError: sandbox.AutoResetError,
+		AutoPauseMemory:  sandbox.AutoPauseMemory, IdleTimeout: types.CloneIdleTimeout(sandbox.IdleTimeout),
+		AutoReset: sandbox.AutoReset, DeadUnix: sandbox.DeadUnix, AutoResetError: sandbox.AutoResetError,
 		LaunchMode: conductorextension.LaunchMode(sandbox.LaunchMode),
 	}
 	if sandbox.Cluster != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -18,11 +19,21 @@ func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, requ
 	if o.pauseBarriers == nil {
 		return api.ErrProxyUnavailable
 	}
+	started := time.Now()
 	barrier, err := o.pauseBarriers.BeginProxyPauseBarrier()
 	if err != nil {
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
 	defer barrier.Cancel()
+	if request.IdleSinceBootNS > 0 {
+		single, ok := barrier.(interface{ RequireSingleProxy() error })
+		if !ok {
+			return api.ErrProxyUnavailable
+		}
+		if err := single.RequireSingleProxy(); err != nil {
+			return errors.Join(api.ErrProxyUnavailable, err)
+		}
+	}
 	pending := cloneSandbox(sb)
 	pending.State = types.StatePausing
 	o.pauseMu.Lock()
@@ -55,15 +66,18 @@ func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, requ
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
 	activity := barrier.Activity()
-	o.log.Info("pause proxy activity", "sid", sb.ID, "if_idle", request.IfIdle, "activity", activity.Activity)
-	if request.IfIdle && !activity.Idle() {
-		return api.ErrSandboxBusy
-	}
+	o.log.Info("pause proxy activity", "sid", sb.ID, "if_idle", request.IfIdle, "activity", activity.Activity, "handshake_ms", float64(time.Since(started))/1e6)
 	if request.IfIdleSince != nil || request.IdleSinceBootNS != 0 {
 		if err := checkIdleEvidence(activity, request); err != nil {
-			return err
+			if request.IdleSinceBootNS == 0 && errors.Is(err, api.ErrProxyUnavailable) {
+				o.log.Warn("pause continuous idle unavailable", "sid", sb.ID, "if_idle_since", request.IfIdleSince, "evidence", activity.Evidence)
+			}
+			return &idlePauseRejection{cause: err, activity: activity, received: o.idleTime()}
 		}
+	} else if request.IfIdle && !activity.Idle() {
+		return api.ErrSandboxBusy
 	}
+
 	if err := barrier.Commit(); err != nil {
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
@@ -94,3 +108,14 @@ func (o *Orchestrator) rollbackPause(ctx context.Context, sb *types.Sandbox) {
 	o.publishUpsert(sb)
 	o.observeSandboxUpsert(sb)
 }
+
+// Kept internal: the automatic scheduler can distinguish a synchronously busy
+// sample from an idle sample whose last-zero time changed while stats lagged.
+type idlePauseRejection struct {
+	cause    error
+	activity routesync.PauseAck
+	received idleclock.Point
+}
+
+func (e *idlePauseRejection) Error() string { return e.cause.Error() }
+func (e *idlePauseRejection) Unwrap() error { return e.cause }

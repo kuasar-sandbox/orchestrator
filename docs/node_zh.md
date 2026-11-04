@@ -647,7 +647,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?, autoReset?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
@@ -1947,6 +1947,36 @@ false        -> false
 `kuasar-sandbox.checkpoint` 或 `snapshot.cfg`。standalone 和 cluster 使用同一 typed 字段链:
 public Router -> route-link reserve -> Registry reserve state -> node-link command -> node CreateReq ->
 durable Sandbox row,不通过 metadata 隧道传递。
+
+Create 的 `idleTimeout` 是实例级可空整数秒策略。缺省或 `null` 关闭；`0` 在可信 idle
+通知到达后立即调度；正整数从 Conductor 接收时刻起等待。负数、非整数或大于
+9223372036 秒返回 400。例如：
+
+```json
+{"templateID":"<template-id>","idleTimeout":5}
+```
+
+Get/List 和扩展视图展示有效可空值。Store、集群 reserve/create、Resume、Reset 和迁移
+完整保留该值，包括 0；不新增运行中修改策略 API。新 RunID 重新建立观察，从未收到
+业务请求的新 running Sandbox 也会形成首次 idle 候选。
+
+自动路径仅使用完整、正常的单 Proxy 观察。接收时记录 t0 及 BOOTTIME 锚，等待策略
+时长后调用共同 Pause 路径，固定 `memory=true`、`checkpoint=false`、`ifIdle=true`、
+`ifIdleSince=t0`。重复 idle 通知不延长 deadline；新 idle、来源变化、统计不完整和重启
+使候选重建。计时期间不持有生命周期锁，最终 Worker 同步检查能够发现异步统计遗漏的
+短请求。拒绝后即使没有新业务也能重新计时；持续失败使用内部有界退避。未收敛的
+持久化 pausing 继续由原生命周期恢复机制处理。
+
+下一请求沿既有 park/Wake 恢复。Worker 采样后到达的请求可等待 capture 与 Resume，
+仍受原 `park_timeout` 约束；已交付业务不会重放。流式请求、WebSocket、Native Exec
+直到完整 relay 关闭才释放 busy。Guest 后台工作和绕过 Proxy 的流量不属于该观察范围，
+会随整机一起冻结。
+
+`idleTimeout` 不刷新 `DeadlineUnix`、不改变 TTL 的 `autoPauseMemory`、不创建保留
+checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceObligation`，先等待
+既有责任收敛，再等待一轮新的 idle 时长。TTL、资源压力和显式 Pause 保留各自语义。
+启用前协调升级 Conductor、Proxy 和集群端点（routesync v11）。携非 null `idleTimeout`
+的迁移 token 需要接收端支持该字段；关闭策略时保持原 token 结构。
 
 显式 `POST /sandboxes/{id}/pause` 的 body 可为空或为:
 

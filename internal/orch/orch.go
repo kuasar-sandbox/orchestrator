@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
+	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -53,6 +54,11 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
+	idleNow        func() idleclock.Point
+	idleMu         sync.Mutex
+	idleCandidates map[string]*idleCandidate
+	idleGeneration uint64
+	idleRetries    map[string]idleRetry
 	memoryPressure atomic.Pointer[nodePressureController]
 	cfg            *config.Config
 	st             *store.Store
@@ -1469,7 +1475,9 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if err := o.preparePause(opCtx, sb, request); err != nil {
 		return "", err
 	}
+	captureStarted := time.Now()
 	result, err := o.capture(opCtx, sb, request)
+	o.log.Info("pause capture completed", "sid", sb.ID, "capture_ms", float64(time.Since(captureStarted))/1e6, "err", err)
 	if err != nil {
 		o.rollbackPause(opCtx, sb)
 		return "", err
@@ -3014,6 +3022,7 @@ func cloneSandbox(sb *types.Sandbox) *types.Sandbox {
 		return nil
 	}
 	nb := *sb
+	nb.IdleTimeout = types.CloneIdleTimeout(sb.IdleTimeout)
 	if sb.Cluster != nil {
 		cluster := *sb.Cluster
 		nb.Cluster = &cluster

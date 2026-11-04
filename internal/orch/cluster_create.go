@@ -57,6 +57,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 	timeoutSeconds := o.cfg.Sandbox.TimeoutSec
 	var environment map[string]string
 	autoPauseMemory := cloneBool(cmd.AutoPauseMemory)
+	idleTimeout := types.CloneIdleTimeout(cmd.IdleTimeout)
 	autoReset := cmd.AutoReset != nil && *cmd.AutoReset
 	if o.extensionSandboxHook != nil {
 		metadata := cloneStringMap(normalized.Metadata)
@@ -75,7 +76,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		clusterMetadata, clusterMetadataPresent := metadata[clusterstate.ObjectMetadataKey]
 		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginCluster, cmd.SID, &conductorextension.SandboxCreateRequest{
 			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: timeoutSeconds,
-			Metadata: metadata, AutoPauseMemory: cloneBool(cmd.AutoPauseMemory), AutoReset: autoReset,
+			Metadata: metadata, IdleTimeout: types.CloneIdleTimeout(idleTimeout), AutoPauseMemory: cloneBool(cmd.AutoPauseMemory), AutoReset: autoReset,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -98,6 +99,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 			return nil, nil, fmt.Errorf("cluster create: %w", err)
 		}
 		timeoutSeconds, environment, autoPauseMemory = candidate.TimeoutSeconds, cloneStringMap(candidate.Env), cloneBool(candidate.AutoPauseMemory)
+		idleTimeout = types.CloneIdleTimeout(candidate.IdleTimeout)
 		if candidate.AutoReset != autoReset {
 			return nil, nil, fmt.Errorf("%w: extension changed cluster-owned autoReset policy", api.ErrBadRequest)
 		}
@@ -107,7 +109,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		ID: cmd.SID, StableID: cmd.Cluster.StableID,
 		Cluster:  &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
 		Template: tmpl, Pair: pair, Config: normalized, Env: environment,
-		TimeoutSeconds: timeoutSeconds, AutoPauseMemory: autoPauseMemory,
+		TimeoutSeconds: timeoutSeconds, IdleTimeout: idleTimeout, AutoPauseMemory: autoPauseMemory,
 		AutoReset: autoReset,
 	})
 	if err != nil {

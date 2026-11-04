@@ -497,7 +497,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional autoPauseMemory/autoReset/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
+| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional idleTimeout/autoPauseMemory/autoReset/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata, autoReset, optional deadAt/executionResult/autoResetError (§8.1.5) |
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
@@ -1487,6 +1487,45 @@ false        -> false
 ```
 
 The independent durable auto_pause_memory field selects TTL CaptureKind only; it does not enter checkpoint namespace or snapshot.cfg. Standalone and cluster share a typed chain: public Router → route-link reserve → Registry reservation → node-link command → node CreateReq → Sandbox row, without metadata tunneling.
+
+Create `idleTimeout` is a nullable instance policy, in integer seconds. Omission
+or `null` disables it; `0` schedules immediately after a trusted idle observation;
+a positive value waits from Conductor receipt. Negative, fractional, or values
+above 9223372036 seconds return 400. For example:
+
+```json
+{"templateID":"<template-id>","idleTimeout":5}
+```
+
+Get/List and extension views expose the effective nullable value. Store, cluster
+reservation/create, Resume, Reset and migration preserve it, including zero.
+There is no runtime policy-update API. Each new RunID starts fresh observation,
+including a newly running Sandbox that has never received a business request.
+
+The automatic path requires complete, normal single-Proxy observation. It records
+receipt t0 with BOOTTIME, waits the policy duration, then uses the common Pause
+path with `memory=true`, `checkpoint=false`, `ifIdle=true`, `ifIdleSince=t0`.
+Duplicate idle notifications do not extend the deadline; new idle, source changes,
+missing statistics and restarts rebuild it. The timer holds no lifecycle lock.
+The final synchronous Worker check catches short requests hidden by delayed
+statistics. Rejected attempts can rearm without another business request; repeated
+failures use bounded internal backoff. An unresolved durable pausing state remains
+owned by the existing lifecycle recovery.
+
+A later request uses existing park/Wake. Requests arriving after the Worker sample
+may wait through capture and Resume, subject to the original `park_timeout`;
+delivered business is never replayed. Streams, WebSockets and Native Exec remain
+busy until final relay closure. Guest background work and traffic bypassing Proxy
+are outside this definition and can be frozen with the VM.
+
+`idleTimeout` does not refresh `DeadlineUnix`, change TTL's `autoPauseMemory`, create
+a retained checkpoint, or acquire resource recovery responsibility. A running
+Sandbox with `ResourceObligation` is deferred until that responsibility converges,
+then receives a fresh idle interval. TTL, resource pressure and explicit Pause
+retain their own behavior. Upgrade Conductor, Proxy and cluster peers together
+(routesync v11) before enabling this policy. Migration tokens with non-null
+`idleTimeout` require a receiver that supports the field; omitted/null policy
+keeps the existing token shape.
 
 Explicit Pause body may be empty or:
 

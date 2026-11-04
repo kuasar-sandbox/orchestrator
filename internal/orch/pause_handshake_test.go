@@ -19,6 +19,8 @@ type fakePauseBarrier struct {
 	activity routesync.PauseAck
 }
 
+func (b *fakePauseBarrier) RequireSingleProxy() error { return nil }
+
 func (b *fakePauseBarrier) Activity() routesync.PauseAck                            { return b.activity }
 func (b *fakePauseBarrier) BeginProxyPauseBarrier() (routesync.PauseBarrier, error) { return b, nil }
 
@@ -116,7 +118,7 @@ func TestContinuousIdleRejectionWithdrawsGate(t *testing.T) {
 	}{{"short request after t0", 200, api.ErrSandboxBusy}, {"missing participant", 0, api.ErrProxyUnavailable}} {
 		t.Run(tc.name, func(t *testing.T) {
 			o, sb, key, _, _, args := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
-			b := &fakePauseBarrier{fakeRouteBarrier: newFakeRouteBarrier(nil, nil), activity: routesync.PauseAck{Evidence: []routesync.IdleEvidence{{SinceBootNS: tc.since}}}}
+			b := &fakePauseBarrier{fakeRouteBarrier: newFakeRouteBarrier(nil, nil), activity: routesync.PauseAck{AutomaticSafe: true, Evidence: []routesync.IdleEvidence{{SinceBootNS: tc.since}}}}
 			o.pauseBarriers = b
 			done := make(chan error, 1)
 			go func() {

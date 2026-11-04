@@ -197,6 +197,7 @@ func cloneSandboxCreateRequest(request *conductorextension.SandboxCreateRequest)
 	out.Env = cloneStringMap(request.Env)
 	out.MMDS = cloneString(request.MMDS)
 	out.AutoPauseMemory = cloneBool(request.AutoPauseMemory)
+	out.IdleTimeout = cloneInt64(request.IdleTimeout)
 	return &out
 }
 

@@ -86,6 +86,7 @@ type Instance struct {
 	mu                sync.Mutex
 	pauseSamples      map[string]map[int]controlMessage
 	stats             *proxystats.MasterStats
+	activityRoutes    map[string]routesync.RouteEntry
 	identity          controlIdentity
 	status            InstanceStatus
 	workers           []workerState
@@ -296,6 +297,9 @@ func (s *readinessSink) syncState(ready bool) {
 	s.instance.notifyLocked()
 }
 func (s *readinessSink) BeginSync() {
+	s.instance.mu.Lock()
+	s.instance.activityRoutes = make(map[string]routesync.RouteEntry)
+	s.instance.mu.Unlock()
 	if s.instance.stats != nil {
 		s.instance.stats.ResetObservation()
 	}
@@ -308,6 +312,12 @@ func (s *readinessSink) ApplyUpsert(r routesync.RouteEntry) error {
 	}
 	if s.instance.stats != nil {
 		s.instance.stats.ObserveRoute(r)
+		s.instance.mu.Lock()
+		if s.instance.activityRoutes == nil {
+			s.instance.activityRoutes = make(map[string]routesync.RouteEntry)
+		}
+		s.instance.activityRoutes[r.SandboxID] = r
+		s.instance.mu.Unlock()
 	}
 	return nil
 }

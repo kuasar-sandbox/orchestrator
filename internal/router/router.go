@@ -347,7 +347,8 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		routeKey = newRouteKey()
 	}
 	var autoPauseMemory, autoReset *bool
-	createConfig, err := createSandboxMetadataWithAutoPauseMemory(w, r, &autoPauseMemory, &autoReset)
+	var idleTimeout *int64
+	createConfig, err := createSandboxPolicies(w, r, &autoPauseMemory, &idleTimeout, &autoReset)
 	if err != nil {
 		status := http.StatusBadRequest
 		var maxBytesErr *http.MaxBytesError
@@ -359,7 +360,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := rt.routeLinkReserve(
 		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, autoReset, nil, nil,
-		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
+		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, idleTimeout,
 	)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
@@ -401,6 +402,9 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 }
 
 func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, autoReset ...**bool) (map[string]string, error) {
+	return createSandboxPolicies(w, r, autoPauseMemory, nil, autoReset...)
+}
+func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, idleTimeout **int64, autoReset ...**bool) (map[string]string, error) {
 	if _, present := r.Header[http.CanonicalHeaderKey(HeaderIdentity)]; present {
 		return nil, fmt.Errorf("%s / %s is only supported by direct conductor Create", HeaderIdentity, sandboxcfg.NsIdentity)
 	}
@@ -419,6 +423,7 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 		MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
 		Metadata        map[string]string `json:"metadata"`
 		AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
+		IdleTimeout     *int64            `json:"idleTimeout,omitempty"`
 		AutoReset       *bool             `json:"autoReset,omitempty"`
 	}
 	if r.Body != nil {
@@ -439,6 +444,12 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 				return nil, fmt.Errorf("bad create body: %w", err)
 			}
 		}
+	}
+	if err := types.ValidateIdleTimeout(body.IdleTimeout); err != nil {
+		return nil, err
+	}
+	if idleTimeout != nil {
+		*idleTimeout = types.CloneIdleTimeout(body.IdleTimeout)
 	}
 	if body.MaxCheckpoints != 0 && body.MaxCheckpoints != 1 {
 		return nil, fmt.Errorf("max_checkpoints must be 1")
@@ -2008,6 +2019,7 @@ func (rt *Router) routeLinkReserve(
 	autoPauseMemory, autoReset, memory *bool,
 	execSession *registry.SandboxReserveExecSessionReq,
 	headers map[string]string,
+	idlePolicy ...*int64,
 ) (*reserveResult, error) {
 	query := url.Values{
 		"operation": []string{operation},
@@ -2025,8 +2037,12 @@ func (rt *Router) routeLinkReserve(
 	}
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte
+	var idleTimeout *int64
+	if len(idlePolicy) > 0 {
+		idleTimeout = types.CloneIdleTimeout(idlePolicy[0])
+	}
 	if operation == "create" {
-		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
+		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, IdleTimeout: idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
 		if headers == nil {
 			headers = map[string]string{}
 		}

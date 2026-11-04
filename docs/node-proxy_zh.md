@@ -164,7 +164,7 @@ master 把下行路由流投影到共享内存:
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
-Pause 使用 routesync v10 的 `pause_barrier{barrier_id,route}` 和
+Pause 使用 routesync v11 的 `pause_barrier{barrier_id,route}` 和
 `pause_ack{barrier_id,pause_ack}`. Conductor 固定本次开始时在线且 ready 的 Proxy 集合,
 忽略此前已断链的 Proxy, 不持久化清单; 空参与集允许继续. 各 master 先应用 `pausing`
 路由, 再通过私有控制通道同步采样所有 worker, 包括正在 drain 的 worker. Worker 在
@@ -655,7 +655,17 @@ Worker 在流量锁内同步采样计数、最后归零 BOOTTIME，并显式区�
 Master 异步统计不能替代终检。公开 UTC 条件使用历史 UTC/BOOTTIME 可信区间；
 realtime timerfd 在时钟设置时使区间失效，包括两次采样之间的跳变。时钟能力缺失时
 公开时间证明返回不可用；内部 idle 调度保留原 BOOTTIME 锚。路由协议版本 11
-需要协调升级，混合版本拒绝连接。
+需要协调升级，混合版本拒绝连接。timerfd 的时钟设置取消无法提供中间 UTC 跳变的高水位，
+因此本轮 Master 观察生命周期内公开时间证明保持不可用；等待墙钟追平不能修复历史。
+新的 Proxy Master 进程从新的观察生命周期与保守基线开始；同一 Master 的
+重连或 Worker/RunID 重建不清除该失效标志。内部自动条件继续使用 BOOTTIME。
+
+启用 `idleTimeout` 时，Master 沿现有控制流发送绝对 `activity` 帧，绑定 SID、RunID、
+可信 Worker 代次和注册会话内连续序号。覆盖首次 running/同步、Worker 恢复和活动变化；
+每秒刷新一次，使恢复不依赖新的业务边沿。来源替换、断链、unknown、多 Proxy/热重启
+重叠时取消候选。Conductor 重启不继承 timer。策略仅留在路由堆内存，不参与 SHM 激活
+标识。自动暂停日志记录通知延迟、idle 等待、握手/capture 耗时、结果和重试次数，
+不新增 node-link Pause 命令。
 
 service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
 bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial

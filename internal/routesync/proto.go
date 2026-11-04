@@ -111,6 +111,7 @@ const (
 // A credential-authorized "paused" route may make the proxy send a Wake;
 // "starting" waits passively and "running" lets it forward.
 type RouteEntry struct {
+	IdleTimeout          *int64 `json:"idle_timeout,omitempty"`
 	InstanceID           string `json:"instance_id,omitempty"`
 	AutoReset            bool   `json:"auto_reset,omitempty"`
 	PauseReason          string `json:"pause_reason,omitempty"`
@@ -242,6 +243,7 @@ type MMDSProxyPolicy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
+	Activity  *Activity   `json:"activity,omitempty"`
 	PauseAck  *PauseAck   `json:"pause_ack,omitempty"`
 	Type      string      `json:"type"`
 	Hello     *Hello      `json:"hello,omitempty"`      // hello (orchestrator -> subscriber)

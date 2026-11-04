@@ -356,7 +356,7 @@ otherwise access.
 
 `SandboxView` exposes the typed lifecycle projection directly:
 `ResumeSourceKind`, `ResumeSourceRef`, `ResumeSandboxRef`, `ArtifactLocation`,
-`AutoPauseMemory`, and `LaunchMode`. `ArtifactLocation` is orthogonal to E/S
+`AutoPauseMemory`, nullable `IdleTimeout *int64`, and `LaunchMode`. `ArtifactLocation` is orthogonal to E/S
 kind, and a running row may retain a source for node-local artifact ownership.
 `LaunchMode` is non-empty only while `starting`; it is the durable, already
 resolved launch decision rather than the trigger that requested it. The
@@ -463,8 +463,8 @@ The public [Sandbox request types and enums](../app/conductor/extension/sandbox_
 
 | Request | Fields and constraints |
 |---|---|
-| `SandboxCreateRequest` | `TemplateID string`, immutable `Profile Profile`, `TimeoutSeconds int`, `Metadata`/`Env map[string]string`, `Secure bool`, `AutoPauseMemory *bool`, `MMDS *string`; MMDS preserves top-level input presence. Request-scoped MMDS/metadata may contain secrets or credentials: do not log them as an object-source projection |
-| `SandboxPauseRequest` | Immutable `CaptureKind CaptureKind` (`snapshot`/`sandbox`); `CheckpointMergeRef`/`CheckpointDropCaches *bool`, where nil inherits Sandbox/node policy |
+| `SandboxCreateRequest` | `TemplateID string`, immutable `Profile Profile`, `TimeoutSeconds int`, `Metadata`/`Env map[string]string`, `Secure bool`, `AutoPauseMemory *bool`, `IdleTimeout *int64` (nil disables; zero is immediate; nonnegative integer seconds), `MMDS *string`; MMDS preserves top-level input presence. Request-scoped MMDS/metadata may contain secrets or credentials: do not log them as an object-source projection |
+| `SandboxPauseRequest` | Immutable `CaptureKind CaptureKind` (`snapshot`/`sandbox`), `IfIdle bool`, and `IfIdleSince *time.Time` (hooks cannot remove or change the timestamp); `CheckpointMergeRef`/`CheckpointDropCaches *bool`, where nil inherits Sandbox/node policy |
 | `SandboxResumeRequest` | `RequestedDeadlineUnix *int64`, where nil uses core resume-deadline policy; immutable `Mode ResumeMode` (`auto`/`memory`/`cold`) and `Trigger ResumeTrigger` (`connect`/`wake`/`route`/`exec`/`exec-session`) |
 | `SandboxDeleteRequest` | `Reason string` is diagnostic; editing it does not alter cleanup behavior |
 

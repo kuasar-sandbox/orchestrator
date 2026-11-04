@@ -346,6 +346,7 @@ type CreateReq struct {
 	Metadata        map[string]string `json:"metadata"`
 	EnvVars         map[string]string `json:"envVars"`
 	Secure          bool              `json:"secure"`
+	IdleTimeout     *int64            `json:"idleTimeout,omitempty"`
 	AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
 	APIKey          string            `json:"-"` // injected from X-API-KEY
 	MMDSHeader      *string           `json:"-"` // nil = header absent; preserves top-level merge presence
@@ -576,6 +577,10 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	// metadata (header wins) so the orchestrator sees one uniform carrier.
 	req.Metadata, err = mergeCreateConfigHeaders(req.Metadata, r.Header)
 	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1414,6 +1419,7 @@ func (a *API) sandboxBaseResp(sb *types.Sandbox) map[string]any {
 		"envdVersion": a.envdVersion(sb),
 		"alias":       "",
 		"autoReset":   sb.AutoReset,
+		"idleTimeout": sb.IdleTimeout,
 	}
 }
 
@@ -1456,6 +1462,7 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 
 func addSandboxTerminalFields(d map[string]any, sb *types.Sandbox) {
 	d["autoReset"] = sb.AutoReset
+	d["idleTimeout"] = sb.IdleTimeout
 	if sb.DeadUnix > 0 {
 		d["deadAt"] = isoUnix(sb.DeadUnix)
 	}

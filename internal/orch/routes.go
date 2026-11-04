@@ -54,7 +54,7 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
 	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
 	e := routesync.RouteEntry{
-		InstanceID: sb.InstanceID, AutoReset: sb.AutoReset,
+		InstanceID: sb.InstanceID, AutoReset: sb.AutoReset, IdleTimeout: types.CloneIdleTimeout(sb.IdleTimeout),
 		PauseReason: sb.PauseReason, ResourceObligation: sb.ResourceObligation,
 		PressureVersion: sb.PressureVersion, RunningSinceUnixNano: sb.RunningSinceUnixNano,
 		SandboxID:              sb.ID,

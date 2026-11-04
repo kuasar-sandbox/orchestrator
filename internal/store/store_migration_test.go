@@ -47,6 +47,7 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		`DROP INDEX idx_sandboxes_dead_retention`,
 		`DROP INDEX idx_builds_terminal_retention`,
 		`ALTER TABLE sandboxes DROP COLUMN dead_unix`,
+		`ALTER TABLE sandboxes DROP COLUMN idle_timeout`,
 		`ALTER TABLE builds DROP COLUMN finished_unix`,
 	} {
 		if _, err := db.ExecContext(context.Background(), statement); err != nil {
@@ -72,6 +73,10 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("%s columns = %d, want 1", column, count)
 		}
+	}
+	legacy, err := upgraded.Get(context.Background(), "legacy-dead")
+	if err != nil || legacy == nil || legacy.IdleTimeout != nil {
+		t.Fatal("legacy idle policy", legacy, err)
 	}
 	var deadColumns int
 	if err := upgraded.db.QueryRowContext(context.Background(), `

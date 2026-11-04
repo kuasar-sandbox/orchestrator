@@ -125,7 +125,7 @@ The master projects the downstream route stream into shared memory:
 - `Bookmark` removes old records absent from this generation and marks initial sync complete.
 - `Policy` writes the shared header. Each worker request reads current `auth_mode` and `park_timeout_ms`.
 
-Pause uses routesync v10 `pause_barrier{barrier_id,route}` and `pause_ack{barrier_id,pause_ack}`.
+Pause uses routesync v11 `pause_barrier{barrier_id,route}` and `pause_ack{barrier_id,pause_ack}`.
 The conductor snapshots currently online ready registrations, ignoring those already disconnected.
 There is no persistent Proxy inventory; zero participants is permitted. Each master applies the
 `pausing` route before synchronously sampling every live worker, including draining workers,
@@ -425,7 +425,22 @@ Public UTC thresholds use a historical UTC/BOOTTIME interval; realtime timerfd
 cancellation invalidates proof across clock steps, including steps between
 periodic samples. Missing clock support fails public time proof closed. Internal
 idle scheduling retains the original BOOTTIME anchor. Route protocol version 11
-requires coordinated upgrades and rejects mixed peers.
+requires coordinated upgrades and rejects mixed peers. A timerfd clock-set cancellation cannot reveal an intermediate UTC excursion,
+so public time proof remains unavailable for that Master observation lifetime;
+waiting for wall time to catch up does not repair it. A new Proxy Master process
+starts a new conservative observation lifetime and baseline; reconnecting or
+rebuilding a Worker/RunID in the same Master does not clear this invalidation. The internal automatic condition continues
+using BOOTTIME.
+
+For enabled `idleTimeout` policies, Master sends absolute `activity` frames on the
+existing control stream, bound to SID, RunID, trusted Worker generation and a
+registration-local consecutive sequence. Initial running/sync, Worker recovery
+and activity changes are covered; a one-second refresh permits recovery without
+another business edge. The Conductor invalidates observations on source replacement,
+disconnection, unknown state or multi-Proxy/hot-restart overlap. No timers survive
+Conductor restart. The policy is heap-only route data, not part of SHM activation
+identity. Automatic Pause logs receipt lag, idle wait, handshake/capture duration,
+result and retry count for diagnosis; it creates no node-link Pause command.
 
 Services are fixed to `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b returns all four; bare returns only forward/exec. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
 

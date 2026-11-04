@@ -3,6 +3,7 @@ package configsock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -73,6 +74,36 @@ func TestPauseHandshakeNeverShrinksParticipants(t *testing.T) {
 			}
 			if err := barrier.Commit(); err == nil {
 				t.Fatal("membership change committed")
+			}
+		})
+	}
+}
+
+func TestAutomaticPauseRejectsUnreadyProxy(t *testing.T) {
+	for _, joinAfter := range []bool{false, true} {
+		t.Run(fmt.Sprint(joinAfter), func(t *testing.T) {
+			r := NewRegistry()
+			p := addReadyPlugin(r, "a")
+			b, err := r.BeginProxyPauseBarrier()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.Cancel()
+			barrier := b.(*proxyRouteBarrier)
+			if joinAfter {
+				if err := barrier.RequireSingleProxy(); err != nil {
+					t.Fatal(err)
+				}
+				r.pauseAck(p, b.ID(), routesync.PauseAck{Activity: map[string]routesync.PauseActivity{}})
+			}
+			other := &Plugin{ID: "b", Caps: proxyCaps(), cancel: func() {}}
+			r.Add(other)
+			if joinAfter {
+				if err := b.Commit(); err == nil {
+					t.Fatal("unready join committed automatic pause")
+				}
+			} else if err := barrier.RequireSingleProxy(); err == nil {
+				t.Fatal("unready registration admitted automatic pause")
 			}
 		})
 	}
