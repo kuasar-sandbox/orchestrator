@@ -68,8 +68,7 @@ mkdir -p "$TMP/proxy/$module/@v" "$TMP/consumer" "$TMP/material-work"
   release_materials_init "$TMP/no-go-stage" "$TMP/no-go-work" fixture
   release_materials_finish
 )
-[ "$(wc -l < "$TMP/no-go-stage/share/sources/fixture/GO-MODULES.tsv")" -eq 1 ] \
-  || fail "no-Go materials unexpectedly contain module records"
+[ ! -e "$TMP/no-go-stage/share/sources" ] || fail "no-Go package contains source records"
 RELEASE_MATERIALS_WORK="$TMP/material-work"
 printf 'module %s\n\ngo 1.24\n' "$module" > "$TMP/proxy/$module/@v/$version.mod"
 printf '{"Version":"%s","Time":"2020-01-01T00:00:00Z"}\n' "$version" \
@@ -155,118 +154,34 @@ release_materials_finish
 cmp "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/go/$module@$version/LICENSE"
 mkdir -p "$TMP/replacement-stage/bin" "$TMP/validation"
 install -m 0755 "$TMP/replaced-tool" "$TMP/replacement-stage/bin/tool"
+mkdir -p "$TMP/replacement-stage/share/licenses/fixture/project"
+install -m 0644 "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/project/LICENSE"
 WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
-for extra in file empty-directory; do
-  altered="$TMP/unclaimed-$extra"
+WORK="$TMP/validation" release_materials_validate_go "$TMP/replacement-stage" fixture bin/tool
+[ ! -e "$TMP/replacement-stage/share/sources" ] || fail "source records were published"
+# Derive effective dependencies from the actual binary, without module downloads
+# or a historical inventory. Organization membership does not exempt notices.
+for missing in "go/$module@$version" "go-toolchain/$(go env GOVERSION)"; do
+  altered="$TMP/missing-$(basename "$missing")"
   cp -a "$TMP/replacement-stage" "$altered"
-  mkdir -p "$altered/share/licenses/fixture/unclaimed"
-  if [ "$extra" = file ]; then
-    printf 'unclaimed bytes\n' > "$altered/share/licenses/fixture/unclaimed/payload"
+  rm -rf "$altered/share/licenses/fixture/$missing"
+  if (WORK="$TMP/validation" release_materials_validate_go "$altered" fixture bin/tool > "$TMP/missing-license.log" 2>&1); then
+    fail "validator accepted missing notices: $missing"
   fi
-  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/unclaimed-$extra.log" 2>&1); then
-    fail "validator accepted unclaimed license $extra"
-  fi
-  grep -Fq 'unclaimed release license material' "$TMP/unclaimed-$extra.log" \
-    || fail "unclaimed license $extra failed for an unrelated reason"
+  grep -Fq 'license material is missing' "$TMP/missing-license.log" || fail "missing notices failed for an unrelated reason"
 done
-# A valid row cannot conceal a second contradictory row for that same source.
-for mismatch in duplicate version source integrity license; do
-  altered="$TMP/source-record-$mismatch"
-  cp -a "$TMP/replacement-stage" "$altered"
-  awk -F '\t' -v mismatch="$mismatch" 'BEGIN { OFS=FS }
-    { print }
-    $2 == "Go toolchain" {
-      if (mismatch == "version") $3="go0.0.0"
-      if (mismatch == "source") $4="https://example.invalid/other-source"
-      if (mismatch == "integrity") $5="other-integrity"
-      if (mismatch == "license") $6="share/licenses/fixture/project"
-      print
-    }' "$TMP/replacement-stage/share/sources/fixture/SOURCES.tsv" \
-    > "$altered/share/sources/fixture/SOURCES.tsv"
-  mkdir -p "$altered/share/licenses/fixture/project"
-  install -m 0644 "$directory/LICENSE" "$altered/share/licenses/fixture/project/LICENSE"
-  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/source-$mismatch.log" 2>&1); then
-    fail "validator accepted an ambiguous source record: $mismatch"
-  fi
-  expected_error='missing or inconsistent source record for Go toolchain'
-  [ "$mismatch" != duplicate ] || expected_error='invalid SOURCES.tsv records'
-  grep -Fq "$expected_error" "$TMP/source-$mismatch.log" \
-    || fail "ambiguous source failed for an unrelated reason"
-done
-
-
-# Replacing a single source field must also disagree with the emitted contract.
-for mismatch in source integrity; do
-  altered="$TMP/single-source-$mismatch"
-  cp -a "$TMP/replacement-stage" "$altered"
-  awk -F '\t' -v mismatch="$mismatch" 'BEGIN { OFS=FS }
-    $2 == "Go toolchain" {
-      if (mismatch == "source") $4="https://example.invalid/other-source"
-      if (mismatch == "integrity") $5="other-integrity"
-    }
-    { print }' "$TMP/replacement-stage/share/sources/fixture/SOURCES.tsv" \
-    > "$altered/share/sources/fixture/SOURCES.tsv"
-  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/single-source-$mismatch.log" 2>&1); then
-    fail "validator accepted a changed Go source $mismatch field"
-  fi
-  grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/single-source-$mismatch.log" \
-    || fail "Go source $mismatch failed for an unrelated reason"
-done
-
-altered="$TMP/missing-published-license"
-cp -a "$TMP/replacement-stage" "$altered"
-rm "$altered/share/licenses/fixture/go/$module@$version/LICENSE"
-release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/missing-license.log" 2>&1); then
-  fail "validator accepted missing organization module notices with regenerated checksums"
-fi
-grep -Fq 'Go module license material is missing' "$TMP/missing-license.log" \
-  || fail "missing organization module notices failed for an unrelated reason"
-
-# Standalone validation checks the shipped material inventory offline.
-# It does not refetch source archives to authenticate license prose.
 (
-  go() { command go "$@"; }
   release_materials_go_source() { fail 'standalone validation attempted a source download'; }
-  WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
+  WORK="$TMP/validation" release_materials_validate_go "$TMP/replacement-stage" fixture bin/tool
 )
-# Recomputing the material hashes must not allow an inventory to revert to
-# the original (unbuilt) module or advertise another replacement checksum.
-for mismatch in original checksum; do
-  altered="$TMP/replacement-$mismatch"
-  cp -a "$TMP/replacement-stage" "$altered"
-  {
-    printf 'module\tversion\tchecksum\n'
-    if [ "$mismatch" = original ]; then
-      printf 'example.invalid/original-fixture\tv0.0.0\t-\n'
-    else
-      printf '%s\t%s\th1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n' "$module" "$version"
-    fi
-  } > "$altered/share/sources/fixture/GO-MODULES.tsv"
-  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/$mismatch.log" 2>&1); then
-    fail "validator accepted a mismatched effective module inventory: $mismatch"
-  fi
-  grep -Fq 'Go module inventory differs from the build records' "$TMP/$mismatch.log" \
-    || fail "effective module inventory mismatch failed for an unrelated reason"
-done
-
-altered="$TMP/replacement-license-redirect"
+altered="$TMP/original-module-notices"
 cp -a "$TMP/replacement-stage" "$altered"
-mkdir -p "$altered/share/licenses/fixture/project"
-install -m 0644 "$directory/LICENSE" "$altered/share/licenses/fixture/project/LICENSE"
-awk -F '\t' 'BEGIN { OFS=FS } $2 == "Go toolchain" { $6="share/licenses/fixture/project" } { print }' \
-  "$altered/share/sources/fixture/SOURCES.tsv" > "$TMP/redirected-sources"
-mv "$TMP/redirected-sources" "$altered/share/sources/fixture/SOURCES.tsv"
-release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
-if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/redirect.log" 2>&1); then
-  fail "validator accepted a Go toolchain license redirected to the project"
+mkdir -p "$altered/share/licenses/fixture/go/example.invalid/original-fixture@v0.0.0"
+mv "$altered/share/licenses/fixture/go/$module@$version/LICENSE" \
+  "$altered/share/licenses/fixture/go/example.invalid/original-fixture@v0.0.0/LICENSE"
+if (WORK="$TMP/validation" release_materials_validate_go "$altered" fixture bin/tool >/dev/null 2>&1); then
+  fail "validator accepted original-module notices instead of the effective replacement"
 fi
-grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/redirect.log" \
-  || { sed -n '1,$p' "$TMP/redirect.log" >&2; fail "Go toolchain license redirect failed for an unrelated reason"; }
 
 (cd "$TMP/consumer" && GOEXPERIMENT=arenas go build -o "$TMP/experimental-tool" .)
 release_materials_init "$TMP/experiment-stage" "$TMP/experiment-work" fixture

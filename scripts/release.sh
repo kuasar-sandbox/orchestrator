@@ -113,19 +113,6 @@ validate_archive_paths() {
     || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
 }
 
-validate_source_record_keys() {
-  # Other fields and uniqueness are checked by the existing required-row
-  # checks. Do not accept extra attributions merely because those rows exist.
-  awk -F '\t' '
-    NR == 1 { next }
-    $1 == "bin/*,deploy/*" && $2 == "orchestrator" { next }
-    $1 == "bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl" && ($2 == "accelerator" || $2 == "sandboxer") { next }
-    $1 == "bin/node-ctl" && $2 == "connector" { next }
-    $1 ~ /^bin\/(node-ctl|cluster-ctl|node-stub-ctl|e2b-key-ctl)$/ && $2 == "Go toolchain" { next }
-    { exit 1 }
-  ' "$1/share/sources/orchestrator/SOURCES.tsv" \
-    || fail "source inventory contains an undeclared payload attribution"
-}
 
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
@@ -154,17 +141,10 @@ validate_bundle() {
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file" "$arch"
   done
-  release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
-    bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' accelerator ""
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' connector ""
-  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' sandboxer ""
-  validate_source_record_keys "$extract"
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_go_key "$extract" "$NAME" 'bin/node-ctl'
-  release_materials_require_go_key "$extract" "$NAME" 'bin/cluster-ctl'
-  release_materials_require_go_key "$extract" "$NAME" 'bin/node-stub-ctl'
-  release_materials_require_go_key "$extract" "$NAME" 'bin/e2b-key-ctl'
+  for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+    release_materials_validate_go "$extract" "$NAME" "bin/$file"
+  done
 }
 
 package_release() {
