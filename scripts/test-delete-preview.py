@@ -130,6 +130,27 @@ class DeletionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Release changed'): self.collect()
         self.assertEqual(self.deleted, [])
 
+    def test_asset_download_activity_does_not_change_identity(self):
+        self.packages()
+        first = copy.deepcopy(self.release)
+        current = copy.deepcopy(first)
+        current['assets'].reverse()
+        current['assets'][0]['download_count'] = 10
+        self.release_for.side_effect = [first, current, None]
+        self.assertEqual(self.collect('gc'), ['release', 'tag'])
+
+    def test_asset_identity_changes_prevent_deletion(self):
+        self.packages()
+        for field, value in [('id', 99), ('name', 'renamed'), ('size', 99),
+                             ('digest', 'sha256:'+'f'*64), ('state', 'starter')]:
+            first = copy.deepcopy(self.release)
+            current = copy.deepcopy(first)
+            current['assets'][0][field] = value
+            self.release_for.side_effect = [first, current]
+            with self.assertRaisesRegex(ValueError, 'Release changed'):
+                self.collect('gc')
+            self.assertEqual(self.deleted, [])
+
     def test_recreated_release_protects_tag(self):
         initial = copy.deepcopy(self.release)
         self.release_for.side_effect = [initial, initial, dict(initial, id=2)]

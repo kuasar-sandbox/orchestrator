@@ -217,33 +217,14 @@ bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source
 WORKFLOW="$ROOT/.github/workflows/component-release.yml"
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}]' \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
-grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}' \
-  "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 workflow="$ROOT/.github/workflows/component-release.yml"
-grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
-  || fail "Preview publisher does not record its build binding"
 for workflow in component-release.yml delete-preview.yml; do
   [ "$(grep -Fc 'group: component-mutation-${{ github.repository }}-${{ inputs.version }}' \
     "$ROOT/.github/workflows/$workflow")" -eq 1 ] \
     || fail "$workflow does not hold exactly one full-workflow mutation lock"
 done
-grep -Fq 'kuasar-release-source' "$ROOT/scripts/publish-release.sh" \
-  || fail "publisher does not record Stable source provenance"
-grep -Fq 'reconcile_main_latest' "$ROOT/scripts/publish-release.sh" \
-  || fail "publisher does not reconcile component main Latest by source commit"
-RECONCILE_WORKFLOW="$ROOT/.github/workflows/reconcile-latest.yml"
-grep -Fq 'group: component-latest-reconciliation-${{ github.repository }}' \
-  "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation is not serialized across component versions"
-grep -Fq 'workflow_run:' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation is not triggered after release completion"
-grep -Fq 'schedule:' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation has no automatic recovery schedule"
-grep -Fq 'publish-release.sh reconcile' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation does not use the idempotent entrypoint"
-if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
-  fail "workflows use the unsupported concurrency queue key"
-fi
+[ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
@@ -341,6 +322,7 @@ printf 'fixture project attribution\n' > "$fixture_root/NOTICE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
+install -m 0644 "$ROOT/scripts/release-publisher.py" "$fixture_root/scripts/release-publisher.py"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 printf 'module github.com/kuasar-sandbox/orchestrator\n\ngo 1.24\n' > "$fixture_root/go.mod"
@@ -395,7 +377,7 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
   RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+  RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
@@ -421,7 +403,6 @@ for dependency in accelerator connector sandboxer; do
       "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
     tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
       -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-    (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
     if RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
       "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
       fail "validator accepted changed $dependency source column $column"
@@ -471,7 +452,7 @@ SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
   RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
+  RELEASE_SOURCE_ROOT="$fixture_root" "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
@@ -492,7 +473,6 @@ repack_candidate() (
     "$candidate/root/share/sources/orchestrator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
 )
 
 git clone --quiet --no-local "$fixture_root" "$TMP/target-source"
@@ -611,11 +591,11 @@ if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/
   fail "validator accepted an extra asset"
 fi
 
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
   fail "packager accepted x86_64 payloads as aarch64"
 fi
@@ -633,7 +613,6 @@ for mutation in setuid setgid writable-directory writable-binary; do
   esac
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted $mutation with regenerated checksums"
   fi
@@ -646,7 +625,6 @@ mkdir "$TMP/nonroot-owner/root"
 tar -xzf "$archive" -C "$TMP/nonroot-owner/root"
 tar --sort=name --owner=1234 --group=0 --numeric-owner --mtime=@1700000000 \
   -czf "$TMP/nonroot-owner/assets/$(basename "$archive")" -C "$TMP/nonroot-owner/root" .
-(cd "$TMP/nonroot-owner/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
 if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/nonroot-owner" >/dev/null 2>&1; then
   fail "validator accepted non-root numeric ownership with regenerated checksums"
 fi
