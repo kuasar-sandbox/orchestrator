@@ -2,8 +2,9 @@ package idleclock
 
 import (
 	"errors"
-	"golang.org/x/sys/unix"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Watch detects even a forward-and-back realtime step between observations.
@@ -40,8 +41,10 @@ func (w *Watch) Poll() (changed bool, err error) {
 		return false, nil
 	}
 	if err == nil || errors.Is(err, unix.ECANCELED) {
+		// A successful read is ordinary expiry, not a realtime clock step.
+		changed = errors.Is(err, unix.ECANCELED)
 		w.failed = w.arm()
-		return true, w.failed
+		return changed || w.failed != nil, w.failed
 	}
 	w.failed = err
 	return true, err
