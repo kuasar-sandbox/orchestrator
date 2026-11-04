@@ -8,12 +8,13 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // The caller holds the SID lifecycle lock. Wake is queued behind this entire
 // operation, including atomic publication of a retained checkpoint ID.
-func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, ifIdle bool) (retErr error) {
+func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (retErr error) {
 	if o.pauseBarriers == nil {
 		return api.ErrProxyUnavailable
 	}
@@ -54,9 +55,14 @@ func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, ifId
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
 	activity := barrier.Activity()
-	o.log.Info("pause proxy activity", "sid", sb.ID, "if_idle", ifIdle, "activity", activity.Activity)
-	if ifIdle && !activity.Idle() {
+	o.log.Info("pause proxy activity", "sid", sb.ID, "if_idle", request.IfIdle, "activity", activity.Activity)
+	if request.IfIdle && !activity.Idle() {
 		return api.ErrSandboxBusy
+	}
+	if request.IfIdleSince != nil || request.IdleSinceBootNS != 0 {
+		if err := checkIdleEvidence(activity, request); err != nil {
+			return err
+		}
 	}
 	if err := barrier.Commit(); err != nil {
 		return errors.Join(api.ErrProxyUnavailable, err)

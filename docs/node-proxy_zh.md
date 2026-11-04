@@ -650,6 +650,13 @@ parking: 有效鉴权策略和 ExecRequest admission 通过后,ActivateRoute/Act
 connected:  最终 node proxy → sandbox backend 已建立且尚未最终 Close
 ```
 
+条件 Pause 保留当前 running RunID 与可信 Worker 集合的基线，临时 gate 不重置基线。
+Worker 在流量锁内同步采样计数、最后归零 BOOTTIME，并显式区分从未有流量与缺样本。
+Master 异步统计不能替代终检。公开 UTC 条件使用历史 UTC/BOOTTIME 可信区间；
+realtime timerfd 在时钟设置时使区间失效，包括两次采样之间的跳变。时钟能力缺失时
+公开时间证明返回不可用；内部 idle 调度保留原 BOOTTIME 锚。路由协议版本 11
+需要协调升级，混合版本拒绝连接。
+
 service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
 bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
 成功时在同一 worker-local entry lock 中原子执行 `parking--/connected++`;activation 或 dial

@@ -417,6 +417,16 @@ parking: after authentication-policy and ExecRequest admission; ActivateRoute/Ac
 connected:  final node proxy → sandbox backend is established and has not reached final Close
 ```
 
+Conditional Pause retains the running RunID and trusted Worker-set baselines
+across its temporary gate. Each Worker samples counts and last-zero BOOTTIME
+under the traffic mutex; an explicit never-active sample uses those baselines.
+The Master never substitutes its asynchronous counters for this final check.
+Public UTC thresholds use a historical UTC/BOOTTIME interval; realtime timerfd
+cancellation invalidates proof across clock steps, including steps between
+periodic samples. Missing clock support fails public time proof closed. Internal
+idle scheduling retains the original BOOTTIME anchor. Route protocol version 11
+requires coordinated upgrades and rejects mixed peers.
+
 Services are fixed to `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b returns all four; bare returns only forward/exec. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
 
 Example idle response for a bare sandbox (inapplicable e2b limits are zero):

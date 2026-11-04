@@ -1,5 +1,7 @@
 package extension
 
+import "time"
+
 // SandboxOperationKind identifies one hookable lifecycle admission.
 type SandboxOperationKind string
 
@@ -68,6 +70,7 @@ const (
 type SandboxPauseRequest struct {
 	Checkpoint           bool
 	IfIdle               bool
+	IfIdleSince          *time.Time
 	CaptureKind          CaptureKind
 	CheckpointMergeRef   *bool
 	CheckpointDropCaches *bool

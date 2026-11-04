@@ -35,6 +35,11 @@ func (r *Registry) pauseAck(p *Plugin, id string, ack routesync.PauseAck) {
 	if _, ok := b.acked[p.epoch]; ok {
 		return
 	}
+	if len(ack.Evidence) == 0 {
+		b.activity.Evidence = append(b.activity.Evidence, routesync.IdleEvidence{})
+	} else {
+		b.activity.Evidence = append(b.activity.Evidence, ack.Evidence...)
+	}
 	for service, sample := range ack.Activity {
 		total := b.activity.Activity[service]
 		total.Parking += sample.Parking
@@ -55,7 +60,7 @@ func (r *Registry) pauseAck(p *Plugin, id string, ack routesync.PauseAck) {
 func (b *proxyRouteBarrier) Activity() routesync.PauseAck {
 	b.registry.mu.Lock()
 	defer b.registry.mu.Unlock()
-	out := routesync.PauseAck{Error: b.activity.Error, Activity: make(map[string]routesync.PauseActivity)}
+	out := routesync.PauseAck{Evidence: append([]routesync.IdleEvidence(nil), b.activity.Evidence...), Error: b.activity.Error, Activity: make(map[string]routesync.PauseActivity)}
 	for service, sample := range b.activity.Activity {
 		out.Activity[service] = sample
 	}

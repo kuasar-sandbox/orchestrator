@@ -1961,6 +1961,16 @@ durable Sandbox row,不通过 metadata 隧道传递。
 副作用前返回 400。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
 `merge_ref`、`drop_caches`,不接受 `memory`。
 
+`ifIdleSince` 可为 `ifIdle=true` 增加持续空闲时间阈值。格式为带时区的
+RFC 3339 时间，保留亚秒精度；缺省/null 保持原行为。未指定 `ifIdle=true`、
+格式非法或晚于最终 Conductor 接收时刻的时间，在安装 gate 前返回 400。
+该条件只对 running 实例评价；starting/paused（包括资源暂停）返回 409，不接管。
+
+同步 Worker 样本必须证明 parking/connected 均为零，且
+`effectiveIdleSince <= ifIdleSince`。busy 或已知空闲基线较晚返回 409；
+缺样本、空参与者、ACK 失败或历史时钟依据不可判定返回 503。失败撤回临时 gate，
+不 capture、不持久化 pausing。扩展 hook 不能修改该条件；集群 Router 原样转发时间。
+
 `checkpoint` 和 `ifIdle` 均默认为 false. `ifIdle=true` 要求握手参与 Proxy 的全部 worker
 在安装 pausing 门禁后同步返回的 parking/connected 都为零, 否则 409. 普通 Pause 也握手并
 收集相同统计, 但允许忙碌. 不持久化 Proxy 清单; 握手前已断链者不参与. 握手中断链、替换、

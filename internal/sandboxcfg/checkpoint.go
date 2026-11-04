@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -18,10 +19,13 @@ type SnapshotPolicy struct {
 }
 
 type CaptureRequest struct {
-	Checkpoint     bool
-	IfIdle         bool
-	Kind           types.CaptureKind
-	SnapshotPolicy SnapshotPolicy
+	Checkpoint  bool
+	IfIdle      bool
+	IfIdleSince *time.Time
+	// IdleSinceBootNS is an internal same-host anchor, never decoded from JSON.
+	IdleSinceBootNS int64
+	Kind            types.CaptureKind
+	SnapshotPolicy  SnapshotPolicy
 }
 
 type CaptureResult struct {

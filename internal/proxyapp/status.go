@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/proxydrain"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -84,6 +85,7 @@ type workerState struct {
 type Instance struct {
 	mu                sync.Mutex
 	pauseSamples      map[string]map[int]controlMessage
+	stats             *proxystats.MasterStats
 	identity          controlIdentity
 	status            InstanceStatus
 	workers           []workerState
@@ -293,8 +295,23 @@ func (s *readinessSink) syncState(ready bool) {
 	s.instance.recalculateLocked()
 	s.instance.notifyLocked()
 }
-func (s *readinessSink) BeginSync() { s.Sink.BeginSync(); s.syncState(false) }
-func (s *readinessSink) Bookmark()  { s.Sink.Bookmark(); s.syncState(true) }
+func (s *readinessSink) BeginSync() {
+	if s.instance.stats != nil {
+		s.instance.stats.ResetObservation()
+	}
+	s.Sink.BeginSync()
+	s.syncState(false)
+}
+func (s *readinessSink) ApplyUpsert(r routesync.RouteEntry) error {
+	if err := s.Sink.ApplyUpsert(r); err != nil {
+		return err
+	}
+	if s.instance.stats != nil {
+		s.instance.stats.ObserveRoute(r)
+	}
+	return nil
+}
+func (s *readinessSink) Bookmark() { s.Sink.Bookmark(); s.syncState(true) }
 func (s *readinessSink) InvalidateSync() {
 	if sink, ok := s.Sink.(routesync.InvalidatableSink); ok {
 		sink.InvalidateSync()

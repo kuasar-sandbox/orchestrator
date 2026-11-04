@@ -354,11 +354,12 @@ type CreateReq struct {
 // PauseRequest carries the E2B capture selector and action-scoped Snapshot-only
 // policy. A nil Memory value has the E2B default true.
 type PauseRequest struct {
-	Checkpoint           bool  `json:"checkpoint,omitempty"`
-	IfIdle               bool  `json:"ifIdle,omitempty"`
-	Memory               *bool `json:"memory,omitempty"`
-	CheckpointMergeRef   *bool `json:"checkpoint_merge_ref,omitempty"`
-	CheckpointDropCaches *bool `json:"checkpoint_drop_caches,omitempty"`
+	Checkpoint           bool       `json:"checkpoint,omitempty"`
+	IfIdle               bool       `json:"ifIdle,omitempty"`
+	IfIdleSince          *time.Time `json:"ifIdleSince,omitempty"`
+	Memory               *bool      `json:"memory,omitempty"`
+	CheckpointMergeRef   *bool      `json:"checkpoint_merge_ref,omitempty"`
+	CheckpointDropCaches *bool      `json:"checkpoint_drop_caches,omitempty"`
 }
 
 type ConnectOptions struct {
@@ -768,6 +769,7 @@ func (a *API) failExecSession(w http.ResponseWriter, err error) {
 }
 
 func (a *API) pause(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(sandboxcfg.WithPauseReceipt(r.Context(), time.Now()))
 	if r.ContentLength > maxPauseRequestBytes {
 		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
@@ -809,7 +811,7 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checkpointID, err := a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), sandboxcfg.CaptureRequest{
-		Kind: kind, SnapshotPolicy: override, Checkpoint: req.Checkpoint, IfIdle: req.IfIdle,
+		Kind: kind, SnapshotPolicy: override, Checkpoint: req.Checkpoint, IfIdle: req.IfIdle, IfIdleSince: req.IfIdleSince,
 	})
 	switch {
 	case errors.Is(err, ErrSandboxBusy):
@@ -867,9 +869,20 @@ func decodePauseRequest(body io.Reader) (PauseRequest, pauseRequestPresence, err
 	if err := strictjson.DecodeAllowNull(trimmed, &req); err != nil {
 		return PauseRequest{}, pauseRequestPresence{}, err
 	}
+	if req.IfIdleSince != nil && !req.IfIdle {
+		return PauseRequest{}, pauseRequestPresence{}, ErrBadRequest
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &fields); err != nil {
 		return PauseRequest{}, pauseRequestPresence{}, err
+	}
+	for name := range fields {
+		if strings.EqualFold(name, "ifIdleSince") && name != "ifIdleSince" {
+			return PauseRequest{}, pauseRequestPresence{}, ErrBadRequest
+		}
+	}
+	if !validIdleTimestamp(fields["ifIdleSince"]) {
+		return PauseRequest{}, pauseRequestPresence{}, ErrBadRequest
 	}
 	_, mergeRef := fields["checkpoint_merge_ref"]
 	_, dropCaches := fields["checkpoint_drop_caches"]

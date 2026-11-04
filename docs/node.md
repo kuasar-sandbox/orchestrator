@@ -1496,6 +1496,20 @@ Explicit Pause body may be empty or:
 
 Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field returns 400 before freeze/capture/lifecycle side effects. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
 
+`ifIdleSince` optionally adds a continuous-idle threshold to `ifIdle=true`.
+Use an RFC 3339 timestamp with a timezone (subsecond precision is retained).
+Omitted/null keeps the existing behavior. A missing `ifIdle=true`, malformed
+value, or timestamp later than receipt at the final Conductor returns 400 before
+installing the gate. This condition is evaluated only for running instances;
+starting/paused, including resource-paused, returns 409 without adoption.
+
+The gate's synchronous Worker samples must prove zero parking and connected,
+and `effectiveIdleSince <= ifIdleSince`. Busy or a later known idle baseline
+returns 409; missing samples, empty participants, failed ACKs or indeterminate
+historical clock evidence return 503. Rejection withdraws the temporary gate
+without capture or durable pausing. Extension hooks cannot change this condition.
+The cluster Router forwards the timestamp unchanged to the executing node.
+
 `checkpoint` and `ifIdle` default to false. Every Pause first gates new traffic at the online
 Proxy registrations and synchronously samples parking/connected counts from every worker.
 IfIdle requires all reported counts to be zero (409 otherwise); ordinary Pause permits busy
