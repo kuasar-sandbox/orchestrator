@@ -445,7 +445,13 @@ run-builder 对每阶段调用
   `/bin/bash -l -c <cmd>`、按操作用户经 `Authorization: Basic`、`Connect-Timeout-Ms`
   带 step 预算(guest 侧也会到点杀)——上下文为宿主累积的 ENV/WORKDIR/USER,**初值
   灌自 base 镜像 config**(RUN 所见与 docker build 一致;`ARG` 仅做 `${k}` 替换,
-  不入镜像;**bash 因此是带 steps/startCmd 构建的镜像契约**,e2b 同款)。步完后宿主
+  不入镜像;**bash 因此是带 steps/startCmd 构建的镜像契约**,e2b 同款)。USER step
+  若为账户名,先在构建沙箱内解析(root 以**非登录 shell + 固定可信 PATH** 跑
+  `getent passwd`),缺失则以 `useradd --create-home --shell /bin/bash` 创建(密码
+  锁定,e2b 同款命令)——对齐 e2b set_user 的执行语义,保证固化的
+  config User 必有 passwd 记录背书;`user[:group]` 身份只取冒号前的账户部分参与
+  校验/创建,组后缀仅入最终镜像 config(e2b 对 user:group 形式直接失败、
+  Docker 从不创建组),`uid[:gid]` 数字形式与非可移植名仍为纯身份切换。步完后宿主
   把累积上下文叠回 base config 写回 guest,`flatten-ctl mountpoint /.kuasar-build`
   (自绑挂载点)+ `export --skip-mounts --runtime-config … --tmpdir /.kuasar-build
   --output - /` 导出新镜像工件流回——挂载点自身与 `/opt/sandbox-runtime` 投影都是

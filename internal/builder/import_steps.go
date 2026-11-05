@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -464,7 +466,11 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 		}
 	case "USER":
 		if len(st.Args) > 0 {
-			c.user = sub(st.Args[0])
+			user := sub(st.Args[0])
+			if err := p.ensureStepUser(sess, c, i, user); err != nil {
+				return err
+			}
+			c.user = user
 			p.progress("step %d: USER %s", i, c.user)
 		}
 	case "COPY", "ADD":
@@ -476,6 +482,94 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 	}
 	return nil
 }
+
+// ensureStepUser realizes the e2b set_user execution semantics inside the
+// build sandbox: the account a USER step names is resolved there and created
+// (home + bash, password locked — e2b's exact command) when missing, so a
+// USER step cannot pin a config User that no passwd entry backs and later
+// RUN steps see the account they are asked to run as. Only the account part
+// of a "user[:group]" identity participates — getent and useradd take a
+// login name, while the full identity stays in the accumulated context and
+// the final config; the group suffix is deliberately config-only (e2b's
+// set_user fails on user:group forms outright, Docker's USER never creates
+// groups, and the exec channel's Basic auth cannot transport a group).
+// Numeric uid references and names outside the portable account charset
+// stay pure identity switches (resolved at exec time, or rejected by RUN
+// exactly as before this path existed), so no build input is ever
+// shell-interpreted here. Root runs both probes in a non-login shell with
+// a fixed trusted PATH (neither the accumulated ENV nor image-owned
+// profiles may shadow account maintenance); an existing account changes
+// nothing.
+func (p *buildPipeline) ensureStepUser(sess *envdExec, c *stepCtx, i int, user string) error {
+	account, ok := stepUserAccount(user)
+	if !ok {
+		return nil
+	}
+	// One shared wall-clock budget covers probe + creation, so a slow probe
+	// cannot double the step's time.
+	deadline := time.Now().Add(time.Duration(p.spec.Timeouts.StepSec) * time.Second)
+	budget := func() (time.Duration, error) {
+		if d := time.Until(deadline); d > 0 {
+			return d, nil
+		}
+		return 0, fmt.Errorf("step %d (USER %s): account maintenance consumed the step budget", i, account)
+	}
+	probeBudget, err := budget()
+	if err != nil {
+		return err
+	}
+	probeErr := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv, "getent passwd '"+account+"'", probeBudget, true)
+	if probeErr == nil {
+		return nil
+	}
+	// Create only on a definite lookup miss: getent exits 2 exactly for a
+	// key absent from the passwd database, and 0 when present. Transport,
+	// deadline, and stream failures leave the outcome unknown, and other
+	// exits (127 command not found, NSS operational errors, signals) mean
+	// the lookup itself is broken — neither may turn into a passwd
+	// mutation.
+	var probeExit *exitError
+	if !errors.As(probeErr, &probeExit) {
+		return fmt.Errorf("step %d (USER %s): account probe inconclusive: %w", i, account, probeErr)
+	}
+	if probeExit.code != 2 {
+		return fmt.Errorf("step %d (USER %s): account probe failed: %w", i, account, probeErr)
+	}
+	createBudget, err := budget()
+	if err != nil {
+		return err
+	}
+	p.progress("step %d: USER %s (missing, creating)", i, account)
+	if err := sess.runNoLogin(p.ctx, "root", "/", stepAccountEnv,
+		"useradd --create-home --shell /bin/bash -- '"+account+"'", createBudget, false); err != nil {
+		return fmt.Errorf("step %d (USER %s): create missing user: %w", i, account, err)
+	}
+	return nil
+}
+
+// stepAccountEnv is the fixed environment account maintenance runs with:
+// the accumulated build ENV (an image-supplied PATH in particular) must not
+// influence which id/useradd the probes execute.
+var stepAccountEnv = map[string]string{
+	"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
+
+// stepUserAccount extracts the login a USER step must guarantee from its
+// identity argument: the part before the first ":" of a "user[:group]"
+// form, when that part names an account — it must start with a letter or
+// underscore and use only the portable charset getent/useradd accept, which
+// also rules out shell metacharacters and option-looking operands. ok=false
+// marks every identity that stays a pure switch: numeric uid references
+// ("uid[:gid]") and non-portable names.
+func stepUserAccount(user string) (string, bool) {
+	account, _, _ := strings.Cut(user, ":")
+	if account == "" || !stepAccountPattern.MatchString(account) {
+		return "", false
+	}
+	return account, true
+}
+
+var stepAccountPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
 
 // applyCopy realizes a COPY/ADD step: fetch the context tar (presigned GET,
 // platform plumbing — host-side, no guest), then stream it through

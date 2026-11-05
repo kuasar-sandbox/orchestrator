@@ -40,9 +40,21 @@ type envdExec struct {
 // Connect-Timeout-Ms (guest-side kill at the deadline); 0 = unbounded
 // (start commands must outlive the build).
 func (e *envdExec) request(ctx context.Context, user, cwd string, env map[string]string, cmd string, timeout time.Duration) (*http.Response, error) {
+	return e.requestMode(ctx, user, cwd, env, cmd, timeout, true)
+}
+
+// requestMode is request with a login-mode switch: login shells source the
+// image's profiles (the RUN contract); non-login runs bash
+// --noprofile --norc for internal account maintenance, whose tool lookup
+// must not be influenced by image-owned startup files.
+func (e *envdExec) requestMode(ctx context.Context, user, cwd string, env map[string]string, cmd string, timeout time.Duration, login bool) (*http.Response, error) {
+	shellArgs := []string{"-l", "-c", cmd}
+	if !login {
+		shellArgs = []string{"--noprofile", "--norc", "-c", cmd}
+	}
 	proc := map[string]any{
 		"cmd":  "/bin/bash",
-		"args": []string{"-l", "-c", cmd},
+		"args": shellArgs,
 	}
 	if cwd != "" {
 		proc["cwd"] = cwd
@@ -155,6 +167,17 @@ func readFrame(r io.Reader) (envdFrame, error) {
 // exit (or a stream error) returns an error carrying the output tail.
 // quiet suppresses live output forwarding (readiness polls).
 func (e *envdExec) run(ctx context.Context, user, cwd string, env map[string]string, cmd string, timeout time.Duration, quiet bool) error {
+	return e.runMode(ctx, user, cwd, env, cmd, timeout, quiet, true)
+}
+
+// runNoLogin is run without login profile sourcing — for internal account
+// maintenance, whose probe and creation must not be shadowed by
+// image-owned startup files.
+func (e *envdExec) runNoLogin(ctx context.Context, user, cwd string, env map[string]string, cmd string, timeout time.Duration, quiet bool) error {
+	return e.runMode(ctx, user, cwd, env, cmd, timeout, quiet, false)
+}
+
+func (e *envdExec) runMode(ctx context.Context, user, cwd string, env map[string]string, cmd string, timeout time.Duration, quiet, login bool) error {
 	if timeout > 0 {
 		// Host-side guard slightly beyond the guest-side deadline, so the
 		// end event (guest kill) normally wins and carries the better error.
@@ -162,7 +185,7 @@ func (e *envdExec) run(ctx context.Context, user, cwd string, env map[string]str
 		ctx, cancel = context.WithTimeout(ctx, timeout+15*time.Second)
 		defer cancel()
 	}
-	resp, err := e.request(ctx, user, cwd, env, cmd, timeout)
+	resp, err := e.requestMode(ctx, user, cwd, env, cmd, timeout, login)
 	if err != nil {
 		return err
 	}
@@ -205,9 +228,20 @@ func (e *envdExec) run(ctx context.Context, user, cwd string, env map[string]str
 		return fmt.Errorf("envd: stream ended before the command exited")
 	}
 	if exit != 0 {
-		return fmt.Errorf("exit status %d (%s)", exit, lastLine(tail.Bytes()))
+		return &exitError{code: int(exit), tail: lastLine(tail.Bytes())}
 	}
 	return nil
+}
+
+// exitError marks a command that ran to a definite non-zero exit, as opposed
+// to transport/stream/deadline failures that leave the outcome unknown.
+type exitError struct {
+	code int
+	tail string
+}
+
+func (e *exitError) Error() string {
+	return fmt.Sprintf("exit status %d (%s)", e.code, e.tail)
 }
 
 // startedCmd is a start command held open the way e2b's template build
