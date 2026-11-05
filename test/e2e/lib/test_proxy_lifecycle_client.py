@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from proxy_lifecycle_client import (Probe, cgroup_processes, owned_process_observations,
+                                    wait_candidate_shutdown_journal,
                                     wait_exec_shutdown_observations)
 
 
@@ -77,6 +78,112 @@ class ExecShutdownObservationTest(unittest.TestCase):
             with self.assertRaises(PermissionError) as raised:
                 wait_exec_shutdown_observations(Path('/fixture'), Mock(), ['12'], 100)
         self.assertIs(raised.exception, error)
+
+
+class CandidateShutdownJournalTest(unittest.TestCase):
+    invocation = '1234567890abcdef1234567890abcdef12'
+
+    def setUp(self):
+        self.now = 100
+        self.query = self.enterContext(patch('proxy_lifecycle_client.subprocess.check_output'))
+        self.enterContext(patch('proxy_lifecycle_client.time.monotonic', side_effect=lambda: self.now))
+        self.sleep = self.enterContext(patch('proxy_lifecycle_client.time.sleep', side_effect=self.advance))
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def record(self, result):
+        return f'level=INFO msg="proxy candidate shutdown" result={result}\n'
+
+    def test_initially_missing_then_visible_for_each_outcome(self):
+        for forced, outcome in ((False, 'completed'), (True, 'completed_with_forced_close')):
+            with self.subTest(forced=forced):
+                self.query.reset_mock()
+                self.sleep.reset_mock()
+                record = self.record(outcome)
+                self.query.side_effect = ['worker stopped\n', record]
+                self.assertEqual(wait_candidate_shutdown_journal(self.invocation, forced), record.strip())
+                self.sleep.assert_called_once_with(.02)
+                self.assertEqual(self.query.call_count, 2)
+                for call in self.query.call_args_list:
+                    self.assertEqual(call.args[0], ['journalctl', '--no-pager', '-o', 'cat',
+                                                   '_SYSTEMD_INVOCATION_ID=' + self.invocation])
+                    self.assertTrue(call.kwargs['text'])
+                self.assertAlmostEqual(self.query.call_args_list[0].kwargs['timeout'], 5)
+                self.assertAlmostEqual(self.query.call_args_list[1].kwargs['timeout'], 4.98)
+
+    def test_visible_result_does_not_sleep(self):
+        self.query.return_value = self.record('completed')
+        self.assertEqual(wait_candidate_shutdown_journal(self.invocation, False),
+                         self.record('completed').strip())
+        self.query.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_permanently_missing_fails_with_last_journal_at_deadline(self):
+        self.query.return_value = 'worker stopped\n'
+        with self.assertRaisesRegex(AssertionError, 'journal timeout for ' + self.invocation + ': worker stopped'):
+            wait_candidate_shutdown_journal(self.invocation, False, timeout=.05)
+        self.assertEqual(self.query.call_count, 3)
+        self.assertAlmostEqual(self.now, 100.05)
+        self.assertAlmostEqual(self.sleep.call_args.args[0], .01)
+
+    def test_query_time_consumes_visibility_budget(self):
+        def query(*args, **kwargs):
+            self.advance(.05)
+            return ''
+        self.query.side_effect = query
+        with self.assertRaisesRegex(AssertionError, 'journal timeout'):
+            wait_candidate_shutdown_journal(self.invocation, False, timeout=.05)
+        self.query.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_wrong_outcome_fails_without_retry(self):
+        for forced, wrong in ((False, 'failed'), (True, 'failed'),
+                              (False, 'completed_with_forced_close'), (True, 'completed')):
+            with self.subTest(forced=forced, wrong=wrong):
+                self.query.reset_mock()
+                # A later correct record must not turn the wrong result green.
+                self.query.side_effect = [self.record(wrong), self.record(
+                    'completed_with_forced_close' if forced else 'completed')]
+                with self.assertRaises(AssertionError):
+                    wait_candidate_shutdown_journal(self.invocation, forced)
+                self.query.assert_called_once()
+                self.sleep.assert_not_called()
+
+    def test_duplicate_outcomes_fail_even_after_initial_absence(self):
+        for forced, outcome in ((False, 'completed'), (True, 'completed_with_forced_close')):
+            for other in (outcome, 'failed'):
+                with self.subTest(forced=forced, other=other):
+                    self.query.reset_mock()
+                    self.sleep.reset_mock()
+                    self.query.side_effect = ['', self.record(outcome) + self.record(other),
+                                              self.record(outcome)]
+                    with self.assertRaises(AssertionError):
+                        wait_candidate_shutdown_journal(self.invocation, forced)
+                    self.assertEqual(self.query.call_count, 2)
+                    self.sleep.assert_called_once_with(.02)
+
+    def test_systemd_timeout_is_still_a_failure(self):
+        for record in ('', self.record('completed')):
+            with self.subTest(record=record):
+                self.query.reset_mock()
+                self.query.return_value = record + "State 'stop-sigterm' timed out\n"
+                with self.assertRaisesRegex(AssertionError, 'stop-sigterm'):
+                    wait_candidate_shutdown_journal(self.invocation, False)
+                self.query.assert_called_once()
+                self.sleep.assert_not_called()
+
+    def test_query_failures_are_not_retried(self):
+        for error in (FileNotFoundError('journalctl'), subprocess.CalledProcessError(1, 'journalctl'),
+                      subprocess.TimeoutExpired('journalctl', 5)):
+            with self.subTest(error=type(error).__name__):
+                self.query.reset_mock()
+                self.query.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    wait_candidate_shutdown_journal(self.invocation, False)
+                self.assertIs(raised.exception, error)
+                self.query.assert_called_once()
+                self.sleep.assert_not_called()
 
 
 class OwnedProcessObservationTest(unittest.TestCase):

@@ -53,6 +53,29 @@ def wait_exec_shutdown_observations(cgroup, exit_record, owned, started):
         time.sleep(.02)
 
 
+def wait_candidate_shutdown_journal(invocation, forced, timeout=5):
+    # Process exit and ExecStopPost can precede journal visibility. Only retry
+    # an absent record; a visible wrong or duplicate outcome is a real failure.
+    deadline = time.monotonic() + timeout
+    journal = ''
+    while True:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f'candidate shutdown journal timeout for {invocation}: {journal}'
+        journal = subprocess.check_output(['journalctl', '--no-pager', '-o', 'cat',
+            '_SYSTEMD_INVOCATION_ID=' + invocation], text=True, timeout=remaining)
+        assert "State 'stop-sigterm' timed out" not in journal, journal
+        lines = [line for line in journal.splitlines() if 'proxy candidate shutdown' in line]
+        if lines:
+            outcome = 'completed_with_forced_close' if forced else 'completed'
+            assert len(lines) == 1 and outcome in lines[0], journal
+            if not forced:
+                assert 'completed_with_forced_close' not in lines[0], lines
+            return lines[0]
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(.02, remaining))
+
+
 def owned_process_observations(owned):
     result = {}
     for pid in owned:
@@ -601,19 +624,12 @@ class Probe:
             result = json.loads(exit_record.read_text())
             assert result == dict(SERVICE_RESULT='success', EXIT_CODE='killed',
                                   EXIT_STATUS='TERM', INVOCATION_ID=invocation), result
-            journal = subprocess.check_output(['journalctl', '--no-pager', '-o', 'cat',
-                '_SYSTEMD_INVOCATION_ID=' + invocation], text=True)
-            outcome = 'completed_with_forced_close' if forced else 'completed'
-            lines = [line for line in journal.splitlines() if 'proxy candidate shutdown' in line]
-            assert len(lines) == 1 and outcome in lines[0], journal
-            if not forced:
-                assert 'completed_with_forced_close' not in lines[0], lines
-            assert "State 'stop-sigterm' timed out" not in journal, journal
+            candidate_outcome = wait_candidate_shutdown_journal(invocation, forced)
             assert not Path(self.stats).exists()
             assert not Path(self.stats).with_name('proxy-routes.shm').exists()
             assert not list(Path(self.stats).parent.glob('.proxy-*'))
             self.log(kind='exec_stop_complete', forced=forced, elapsed=time.monotonic()-started,
-                     result=result, candidate_outcome=lines[0], owned_pids=owned,
+                     result=result, candidate_outcome=candidate_outcome, owned_pids=owned,
                      business='expected_tunnel_deadline' if forced else 'finite_complete', paths_removed=True)
         finally:
             trace.detach()
