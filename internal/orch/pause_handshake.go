@@ -15,7 +15,7 @@ import (
 
 // The caller holds the SID lifecycle lock. Wake is queued behind this entire
 // operation, including atomic publication of a retained checkpoint ID.
-func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (retErr error) {
+func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest, beforeCapture ...func() error) (retErr error) {
 	if o.pauseBarriers == nil {
 		return api.ErrProxyUnavailable
 	}
@@ -66,6 +66,9 @@ func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, requ
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
 	activity := barrier.Activity()
+	if activity.Error != "" {
+		return api.ErrProxyUnavailable
+	}
 	o.log.Info("pause proxy activity", "sid", sb.ID, "if_idle", request.IfIdle, "activity", activity.Activity, "handshake_ms", float64(time.Since(started))/1e6)
 	if request.IfIdleSince != nil || request.IdleSinceBootNS != 0 {
 		if err := checkIdleEvidence(activity, request); err != nil {
@@ -81,6 +84,13 @@ func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, requ
 	if err := barrier.Commit(); err != nil {
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
+	for _, intent := range beforeCapture {
+		if err := intent(); err != nil {
+			return err
+		}
+	}
+	pending = cloneSandbox(sb)
+	pending.State = types.StatePausing
 	changed, err := o.st.SetPausing(ctx, sb.ID, sb.RunID, true)
 	if err != nil {
 		return err

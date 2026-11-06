@@ -19,6 +19,7 @@ func TestReconcileAdoptionReleasesCheckpointsWithoutRetiringRun(t *testing.T) {
 		units: []launcher.Unit{{Name: actual, ActiveState: "active"}},
 	}}
 	f.o.lc = lc
+	refreshRunPoolsForTest(f.o)
 	peer := serveDiskCheckpointPeer(t, f.sb)
 	refs := []ctl.DiffCheckpointRef{{DiffID: "root", ID: "obsolete-root"}, {DiffID: "data", ID: "obsolete-data"}}
 	peer.setup(refs, false, false)
@@ -67,6 +68,7 @@ func TestReconcileInterruptedPauseNeverAdoptsLiveRunnerAsRunning(t *testing.T) {
 	actual := instanceUnit("shared@.service", f.sb.RunID)
 	lc := &multiPoolLauncher{reconcileLauncher: &reconcileLauncher{units: []launcher.Unit{{Name: actual, ActiveState: "active"}}}}
 	f.o.lc = lc
+	refreshRunPoolsForTest(f.o)
 	if ok, err := f.o.st.SetPausing(context.Background(), f.sb.ID, f.sb.RunID, true); err != nil || !ok {
 		t.Fatalf("gate=%v %v", ok, err)
 	}

@@ -12,13 +12,21 @@ import (
 // RunPoolConfig is one independent pool. Size is an idle target, not execution
 // capacity or selection weight. Repeated entries are intentional.
 type RunPoolConfig struct {
-	Unit string `yaml:"unit" json:"unit"`
-	Size int    `yaml:"size" json:"size"`
+	Unit         string `yaml:"unit" json:"unit"`
+	Size         int    `yaml:"size" json:"size"`
+	Name         string `yaml:"name,omitempty" json:"name,omitempty"`
+	ResourcePool string `yaml:"resource_pool,omitempty" json:"resource_pool,omitempty"`
+	Capacity     *int   `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	Priority     int    `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
 
 type runPoolInput struct {
-	Unit *string `yaml:"unit" json:"unit"`
-	Size *int    `yaml:"size" json:"size"`
+	Unit         *string `yaml:"unit" json:"unit"`
+	Size         *int    `yaml:"size" json:"size"`
+	Name         string  `yaml:"name,omitempty" json:"name,omitempty"`
+	ResourcePool string  `yaml:"resource_pool,omitempty" json:"resource_pool,omitempty"`
+	Capacity     *int    `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	Priority     int     `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
 
 func (p *RunPoolConfig) decode(in runPoolInput) error {
@@ -26,6 +34,7 @@ func (p *RunPoolConfig) decode(in runPoolInput) error {
 		return fmt.Errorf("config: pool requires unit and size")
 	}
 	p.Unit, p.Size = *in.Unit, *in.Size
+	p.Name, p.ResourcePool, p.Capacity, p.Priority = in.Name, in.ResourcePool, in.Capacity, in.Priority
 	return nil
 }
 
@@ -35,7 +44,7 @@ func (p *RunPoolConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	for key := range fields {
-		if key != "unit" && key != "size" {
+		if key != "unit" && key != "size" && key != "name" && key != "resource_pool" && key != "capacity" && key != "priority" {
 			return fmt.Errorf("config: pool contains unknown field %q", key)
 		}
 	}
@@ -131,6 +140,9 @@ func (u UnitsConfig) validate() error {
 			}
 			if pool.Size < 0 {
 				return fmt.Errorf("config: units.%s_pools[%d].size must be >= 0", kind.name, i)
+			}
+			if pool.Capacity != nil && (*pool.Capacity < 0 || pool.Size > *pool.Capacity) {
+				return fmt.Errorf("config: units.%s_pools[%d] requires 0 <= size <= capacity", kind.name, i)
 			}
 		}
 	}

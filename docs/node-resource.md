@@ -70,7 +70,7 @@ OOM/high-urgency handling is a last safety path, not the normal growth signal.
 Under concurrent growth, sandboxes do not transfer memory directly to one another.
 Each sandbox retains its own growth objective and requests reservation from the common
 node pool. State serializes aggregate reservation changes so concurrent requests cannot
-oversell the same headroom. Normal new grants are additionally shaped by the node-wide
+oversell the same headroom. Normal new grants are additionally shaped by the resource pool's
 runtime grant token bucket; red/critical zones preserve node safety and the emergency
 pool. Runtime growth has no node-side FIFO wait queue: a sandbox that receives a partial
 or zero grant keeps its local objective and retries subject to the returned cooldown as
@@ -302,10 +302,13 @@ reservation or recovery obligation. The local pressure query includes each
 demand's nonsecret age, amount and failure/critical round counts.
 Only valid memory-blocked demands in the managed pool advance pressure rounds.
 Whole-host availability does not create a demand or authorize a resource Pause;
-a critical Zone without a qualifying demand does not itself authorize Pause.
+a critical Zone without a qualifying demand does not itself authorize pressure
+Pause. [Periodic balancing](resource-pools.md#lifecycle-and-pressure) additionally
+allows a raw-critical source with a feasible noncritical destination.
 
 Q includes accepted capture intent, resource-pressure paused rows and their
-starting resumes. Q>0 keeps critical even when RawZone is green. Exit requires
+starting resumes. Q>0 holds an already-critical pool even when RawZone is green;
+it does not promote healthy pools. Exit requires
 Q=0, no related unverified cleanup, RawZone below critical, and no active
 qualified memory blockage throughout the exit hold. It exits only to red.
 Red requires RawZone below red continuously for its own hold before yellow;
@@ -424,8 +427,11 @@ Node and sandbox do not share a state machine. Reservation requests/responses ar
 
 ### 6.4 Resource Pause, recovery and explicit adoption
 
-One capture worker selects the longest current continuous-running interval,
-not CreatedUnix. Running commit resets that interval. It uses the existing
+One capture worker scans oldest to newest current continuous-running interval,
+not CreatedUnix, trying Pause(ifIdle=true). Explicit busy continues the scan;
+if no idle candidate succeeds, ordinary Pause retries the oldest eligible busy
+candidate. Errors/conflicts are not busy. Running commit resets the interval.
+It uses the existing
 memory Pause: native exec quiesce/cleanup, Snapshot capture, old VM exit and
 runner/network/resource cleanup. It adds no retained-VMM pause, page swapper,
 exec preservation or new snapshot format. Checkpoint storage must be disk
@@ -440,6 +446,10 @@ node must not require global allocation silence to recover an unattended sandbox
 `headroom_stable` remains a diagnostic, not a recovery-admission prerequisite.
 Sandboxer subsequently supplies exact I, and final resource admission waits for
 its complete budget before VM start; the pacing timer does not grant memory.
+Background recovery checks available memory, target-pool demand/protection and
+startup concurrency, without requiring projected RawZone below red. It cannot
+trigger a new eviction for its own budget wait. See [resource pools](resource-pools.md)
+for configuration, multi-dimensional watermarks and cross-pool balancing.
 Starting remains in Q until actual running commit. The minimum running window
 limits immediate re-eviction. If all otherwise eligible candidates remain in
 that window, selection waits for it to expire; host-wide availability cannot

@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -23,6 +24,38 @@ func (b *fakePauseBarrier) RequireSingleProxy() error { return nil }
 
 func (b *fakePauseBarrier) Activity() routesync.PauseAck                            { return b.activity }
 func (b *fakePauseBarrier) BeginProxyPauseBarrier() (routesync.PauseBarrier, error) { return b, nil }
+
+func TestPressureIdleProbePreservesPauseOpportunity(t *testing.T) {
+	for _, proxyError := range []bool{false, true} {
+		t.Run(fmt.Sprint(proxyError), func(t *testing.T) {
+			o, sb, state, lc, _, args := pressureCaptureFixture(t)
+			barrier := &fakePauseBarrier{fakeRouteBarrier: newFakeRouteBarrier(nil, nil), activity: routesync.PauseAck{Activity: map[string]routesync.PauseActivity{"forward": {Connected: 1}}}}
+			if proxyError {
+				barrier.activity.Error = "worker unavailable"
+			}
+			barrier.release()
+			o.pauseBarriers = barrier
+			err := o.pauseForPressureMode(context.Background(), sb, true, "")
+			want := api.ErrSandboxBusy
+			if proxyError {
+				want = api.ErrProxyUnavailable
+			}
+			if !errors.Is(err, want) || proxyError && errors.Is(err, api.ErrSandboxBusy) {
+				t.Fatalf("probe error: %v", err)
+			}
+			if snapshot := state.PressureSnapshot(); !snapshot.PauseEligible || snapshot.Pending != 0 {
+				t.Fatalf("probe consumed qualification: %+v", snapshot)
+			}
+			current, err := o.st.Get(context.Background(), sb.ID)
+			if err != nil || current.ResourceObligation || current.State != types.StateRunning || lc.stops.Load() != 0 {
+				t.Fatalf("probe changed lifecycle: %v", err)
+			}
+			if _, err := os.Stat(args); !os.IsNotExist(err) {
+				t.Fatal("probe started capture")
+			}
+		})
+	}
+}
 
 func TestPauseWaitsForActivityACKBeforeCapture(t *testing.T) {
 	for _, test := range []struct {

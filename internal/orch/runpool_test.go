@@ -236,30 +236,28 @@ func TestRunPoolCommitSuccessWinsConcurrentCancel(t *testing.T) {
 	}
 }
 
-func TestRunPoolCommitErrorDoesNotHandTaskAndRunnerCanBeReused(t *testing.T) {
+func TestRunPoolCommitErrorRetiresExactRunner(t *testing.T) {
 	p, lc, ctx, _ := startRunPoolTest(t, 1)
 	runID, waiter := addIdleRunForTest(t, p, lc, ctx)
 	wantErr := errors.New("commit failed")
 	if got, err := p.Assign(ctx, "rejected-task", func(string) error { return wantErr }); !errors.Is(err, wantErr) || got != "" {
-		t.Fatalf("failed commit Assign = %q, %v", got, err)
+		t.Fatalf("failed commit=%q %v", got, err)
 	}
 	select {
 	case result := <-waiter.resp:
-		t.Fatalf("runner received task for failed commit: %+v", result)
-	default:
-	}
-	got, err := p.Assign(ctx, "accepted-task", func(gotRunID string) error {
-		if gotRunID != runID {
-			t.Fatalf("reused run id = %q, want %q", gotRunID, runID)
+		if result.ok || !errors.Is(result.err, wantErr) {
+			t.Fatalf("failed commit handed out a task: %+v", result)
 		}
-		return nil
-	})
-	if err != nil || got != runID {
-		t.Fatalf("Assign after commit error = %q, %v", got, err)
+	case <-time.After(time.Second):
+		t.Fatal("waiter not retired")
 	}
-	result := <-waiter.resp
-	if result.err != nil || !result.ok || result.taskID != "accepted-task" {
-		t.Fatalf("runner reuse task = %+v", result)
+	select {
+	case unit := <-lc.stopped:
+		if unit != testRunUnit(runID) {
+			t.Fatalf("stopped wrong unit %s", unit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed commit unit not stopped")
 	}
 }
 

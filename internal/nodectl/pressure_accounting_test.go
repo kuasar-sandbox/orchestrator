@@ -166,6 +166,9 @@ func TestTokenOnlyGrowDoesNotCreateMemoryPressure(t *testing.T) {
 
 func TestQueuedCreateDoesNotHideEligibleRecovery(t *testing.T) {
 	s, _ := pressureTestState(t)
+	if err := s.ConfigurePressure(DefaultPressurePolicy(), PressureRecord{Zone: ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
 	s.ObserveObligation("recovery", 1, "paused", false)
 	a := NewAdmissionController(AdmissionPolicy{Rate: 100, Burst: 100, QueueTTL: time.Minute, QueueMaxDepth: 4})
 	a.LookupLaunch = func(sid string, _ int) (LaunchAdmission, error) {

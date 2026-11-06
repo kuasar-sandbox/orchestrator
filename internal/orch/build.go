@@ -24,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -1204,56 +1205,119 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	var mmdsRow *types.Sandbox
 	joinCancellation := func() {}
 	defer func() { joinCancellation() }()
-	if _, err := o.builderRunPool.AssignWithFence(buildCtx, b.BuildID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindBuild, runID) }, func(runID string) error {
-		var locateErr error
-		unit, locateErr = o.resolveRunUnit(buildCtx, runKindBuild, runID)
-		if locateErr != nil {
-			return locateErr
-		}
-		joinCancellation = o.stopBuildOnCancellation(buildCtx, b.BuildID, unit)
-		_, err := o.prepareBuilderUnit(buildCtx, b, runID)
-		return err
-	}); err != nil {
-		return nil, buildFailed("runtime", err)
-	}
 	finalPublished := false
 	defer func() {
 		if retErr != nil && !finalPublished {
 			pend.handoff.PublishFinal(nil, retErr)
 		}
 	}()
-
 	prepareDigest := fastBuildPrepareDigest(b.BuildID)
 	var rootSource types.ResumeSource
 	var inherited sandboxcfg.NetworkSpec
-	if sourceTemplate {
-		summary, early, waitErr := o.waitBuildPrepare(buildCtx, pend, unit)
-		if early != nil || waitErr != nil {
-			if early != nil {
-				accepted, fenceErr := o.fenceAcceptedBuildResult(unit, *early)
-				if fenceErr != nil {
-					cleanupSafe = false
-				}
-				return accepted, buildFailed("runtime", fenceErr)
+	var preparedSummary *configsock.ArtifactPrepareSummary
+	var placement *nodectl.Placement
+	targetPool := ""
+	for {
+		if _, err := o.builderRunPool.assignInResourcePool(buildCtx, targetPool, b.BuildID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindBuild, runID) }, func(runID string) error {
+			var locateErr error
+			unit, locateErr = o.resolveRunUnit(buildCtx, runKindBuild, runID)
+			if locateErr != nil {
+				return locateErr
 			}
-			return nil, buildFailed("artifact_prepare", waitErr)
+			joinCancellation = o.stopBuildOnCancellation(buildCtx, b.BuildID, unit)
+			_, err := o.prepareBuilderUnit(buildCtx, b, runID)
+			return err
+		}); err != nil {
+			return nil, buildFailed("runtime", err)
 		}
-		artifactCapacity, inheritedNetwork, prepareErr := validateBuildPrepareSummary(summary)
-		err = prepareErr
-		if err != nil {
-			return nil, buildFailed("artifact_prepare", err)
+		if sourceTemplate {
+			summary, early, waitErr := o.waitBuildPrepare(buildCtx, pend, unit)
+			if early != nil || waitErr != nil {
+				if early != nil {
+					accepted, fenceErr := o.fenceAcceptedBuildResult(unit, *early)
+					if fenceErr != nil {
+						cleanupSafe = false
+					}
+					return accepted, buildFailed("runtime", fenceErr)
+				}
+				return nil, buildFailed("artifact_prepare", waitErr)
+			}
+			artifactCapacity, inheritedNetwork, prepareErr := validateBuildPrepareSummary(summary)
+			err = prepareErr
+			if err != nil {
+				return nil, buildFailed("artifact_prepare", err)
+			}
+			if preparedSummary != nil {
+				expected := configsock.CloneArtifactPrepareSummary(*preparedSummary)
+				expected.ResolutionDigest = summary.ResolutionDigest
+				if !configsock.EqualArtifactPrepareSummary(expected, summary) {
+					return nil, buildFailed("artifact_prepare", errArtifactPrepareConflict)
+				}
+			}
+			copied := configsock.CloneArtifactPrepareSummary(summary)
+			preparedSummary = &copied
+			inherited = inheritedNetwork
+			pend.sourceHasBuildCommands = summary.HasBuildCommands
+			if buildProducesSandbox(b, pend.sourceHasBuildCommands) {
+				pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
+				if err != nil {
+					return nil, buildFailed("resource_resolve", err)
+				}
+			}
+			prepareDigest, rootSource = summary.ResolutionDigest, summary.RootSource
+			o.log.Info("build task artifact prepared", "bid", b.BuildID, "run_id", b.RunID,
+				"task_artifact_ref_count", summary.RequiredRefCount)
 		}
-		inherited = inheritedNetwork
-		pend.sourceHasBuildCommands = summary.HasBuildCommands
-		if buildProducesSandbox(b, pend.sourceHasBuildCommands) {
-			pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
+		controller := o.memoryPressure.Load()
+		if controller == nil {
+			break
+		}
+		if placement == nil {
+			capacity, err := buildPlacementCapacity(pend)
 			if err != nil {
 				return nil, buildFailed("resource_resolve", err)
 			}
+			owner, ok := o.runs.ownership(b.RunID)
+			if !ok {
+				return nil, buildFailed("placement", errors.New("missing builder pool identity"))
+			}
+			claim, err := controller.state.ReservePlacement(b.BuildID, nodectl.NewToken(), capacity, nodectl.OperationCreate, "", func(name string) bool { return name == owner.ResourcePool || o.builderRunPool.hasSupply(name) })
+			if err != nil {
+				return nil, buildFailed("placement", err)
+			}
+			placement = &claim
+			defer controller.state.ReleasePlacement(b.BuildID, claim.Identity)
+			if claim.Pool != owner.ResourcePool {
+				if err := o.stopBuilderUnit(unit); err != nil {
+					return nil, buildFailed("prepare_runner_stop", err)
+				}
+				joinCancellation()
+				unlockEvent := o.lockBuildEvent(b.BuildID)
+				changed, err := o.st.UnbindPreparedBuilder(buildCtx, b.BuildID, b.RunID)
+				if err != nil || !changed {
+					unlockEventFence(unlockEvent)
+					if err == nil {
+						err = store.ErrBuildExecutionOwnership
+					}
+					return nil, buildFailed("placement", err)
+				}
+				oldRun := b.RunID
+				b.RunID = ""
+				pend.handoff.PublishFinal(nil, errLaunchOwnershipLost)
+				o.pendMu.Lock()
+				pend.handoff = newBuildTaskHandoff(sourceTemplate, "", types.ResumeSource{})
+				pend.result = make(chan configsock.BuildResult, 1)
+				o.pendMu.Unlock()
+				unlockEventFence(unlockEvent)
+				o.runs.forget(oldRun)
+				targetPool = claim.Pool
+				continue
+			}
 		}
-		prepareDigest, rootSource = summary.ResolutionDigest, summary.RootSource
-		o.log.Info("build task artifact prepared", "bid", b.BuildID, "run_id", b.RunID,
-			"task_artifact_ref_count", summary.RequiredRefCount)
+		if err := o.bindBuilderPlacement(buildCtx, b, *placement); err != nil {
+			return nil, buildFailed("placement", err)
+		}
+		break
 	}
 	pend.network, pend.templateNetwork, err = o.resolveBuildNetworks(
 		b.Profile, inherited, pend.spec.Network, "build-"+shortID(b.BuildID),
@@ -1895,8 +1959,12 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 	}
 	o.pendMu.Lock()
 	pend := o.pend[buildID]
+	var handoff *buildTaskHandoff
+	if pend != nil {
+		handoff = pend.handoff
+	}
 	o.pendMu.Unlock()
-	if pend == nil || pend.handoff == nil {
+	if pend == nil || handoff == nil {
 		return nil, false, nil
 	}
 	b, err := o.st.GetBuild(ctx, buildID)
@@ -1908,7 +1976,7 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 	}
 	response := &configsock.BuildTaskSpec{BuildID: buildID, RunID: runID, Env: buildTaskEnv(b)}
 	if !pend.sourceTemplate {
-		final, err := pend.handoff.WaitFinal(ctx)
+		final, err := handoff.WaitFinal(ctx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1964,8 +2032,12 @@ func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID 
 	}
 	o.pendMu.Lock()
 	pend := o.pend[buildID]
+	var handoff *buildTaskHandoff
+	if pend != nil {
+		handoff = pend.handoff
+	}
 	o.pendMu.Unlock()
-	if pend == nil || pend.handoff == nil {
+	if pend == nil || handoff == nil {
 		return nil, configsock.RejectBuildPrepare(fmt.Errorf("build: exact-run preparation owner not found"))
 	}
 	allowed, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
@@ -1995,7 +2067,7 @@ func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID 
 			return nil, configsock.RejectBuildPrepare(err)
 		}
 	}
-	replay, err := pend.handoff.Submit(summary)
+	replay, err := handoff.Submit(summary)
 	if err != nil {
 		return nil, configsock.RejectBuildPrepare(err)
 	}
@@ -2003,7 +2075,7 @@ func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID 
 		o.log.Info("build task artifact prepare replay", "bid", buildID, "run_id", runID,
 			"task_artifact_prepare_replay_total", 1)
 	}
-	final, err := pend.handoff.WaitFinal(ctx)
+	final, err := handoff.WaitFinal(ctx)
 	if err != nil {
 		return nil, err
 	}

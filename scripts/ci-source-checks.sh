@@ -13,6 +13,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-telemetry-image-pull.py
 bash test/source/runtask_privilege.sh
 bash test/source/vmm_cgroup.sh
 REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
+bash test/source/resource_pool_units.sh
 bash test/source/journal_contract.sh
 bash test/source/capture_cli.sh
 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh

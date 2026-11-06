@@ -13,11 +13,11 @@ func TestRunPoolConfigurationInputs(t *testing.T) {
 		name, input     string
 		runner, builder []RunPoolConfig
 	}{
-		{"defaults", "{}", []RunPoolConfig{{defaultRunnerUnit, 0}}, []RunPoolConfig{{defaultBuilderUnit, 0}}},
-		{"legacy", "units: {runner: old-run@.service, runner_pool_size: 3, builder: old-build@.service, builder_pool_size: 0}", []RunPoolConfig{{"old-run@.service", 3}}, []RunPoolConfig{{"old-build@.service", 0}}},
-		{"new runner old builder", "units: {runner_pools: [{unit: r@.service, size: 0}], builder_pool_size: 4}", []RunPoolConfig{{"r@.service", 0}}, []RunPoolConfig{{defaultBuilderUnit, 4}}},
-		{"old runner new builder", "units: {runner_pool_size: 2, builder_pools: [{unit: b@.service, size: 0}]}", []RunPoolConfig{{defaultRunnerUnit, 2}}, []RunPoolConfig{{"b@.service", 0}}},
-		{"duplicates", "units: {runner_pools: [{unit: r@.service, size: 2}, {unit: r@.service, size: 0}, {unit: r@.service, size: 2}, {unit: other@.service, size: 1}], builder_pools: [{unit: b@.service, size: 0}, {unit: b@.service, size: 0}]}", []RunPoolConfig{{"r@.service", 2}, {"r@.service", 0}, {"r@.service", 2}, {"other@.service", 1}}, []RunPoolConfig{{"b@.service", 0}, {"b@.service", 0}}},
+		{"defaults", "{}", []RunPoolConfig{{Unit: defaultRunnerUnit, Size: 0}}, []RunPoolConfig{{Unit: defaultBuilderUnit, Size: 0}}},
+		{"legacy", "units: {runner: old-run@.service, runner_pool_size: 3, builder: old-build@.service, builder_pool_size: 0}", []RunPoolConfig{{Unit: "old-run@.service", Size: 3}}, []RunPoolConfig{{Unit: "old-build@.service", Size: 0}}},
+		{"new runner old builder", "units: {runner_pools: [{unit: r@.service, size: 0}], builder_pool_size: 4}", []RunPoolConfig{{Unit: "r@.service", Size: 0}}, []RunPoolConfig{{Unit: defaultBuilderUnit, Size: 4}}},
+		{"old runner new builder", "units: {runner_pool_size: 2, builder_pools: [{unit: b@.service, size: 0}]}", []RunPoolConfig{{Unit: defaultRunnerUnit, Size: 2}}, []RunPoolConfig{{Unit: "b@.service", Size: 0}}},
+		{"duplicates", "units: {runner_pools: [{unit: r@.service, size: 2}, {unit: r@.service, size: 0}, {unit: r@.service, size: 2}, {unit: other@.service, size: 1}], builder_pools: [{unit: b@.service, size: 0}, {unit: b@.service, size: 0}]}", []RunPoolConfig{{Unit: "r@.service", Size: 2}, {Unit: "r@.service", Size: 0}, {Unit: "r@.service", Size: 2}, {Unit: "other@.service", Size: 1}}, []RunPoolConfig{{Unit: "b@.service", Size: 0}, {Unit: "b@.service", Size: 0}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := DecodeConductor(strings.NewReader(tc.input))
@@ -71,7 +71,7 @@ func TestRunPoolConfigurationRejectsInvalidAndMixed(t *testing.T) {
 			kind + "_pools: [{unit: r@.service}]",
 			kind + "_pools: [{unit: r@.service, size: null}]",
 			kind + "_pools: [{unit: r@.service, size: 1.5}]",
-			kind + "_pools: [{unit: r@.service, size: 0, name: extra}]",
+			kind + "_pools: [{unit: r@.service, size: 0, typo: extra}]",
 			kind + "_pools: [{unit: r@.service, size: 0}], " + kind + ": r@.service",
 			kind + "_pools: [{unit: r@.service, size: 0}], " + kind + "_pool_size: 0",
 			kind + "_pools: [{unit: r@.service, size: 0}], " + kind + "_pool_size: 2",
@@ -104,8 +104,8 @@ func TestRunPoolDefaultsCloneAndMergedExplicitZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.Units.RunnerPools = []RunPoolConfig{{"custom@.service", 0}}
-	cfg.Units.BuilderPools = []RunPoolConfig{{"build@.service", 1}}
+	cfg.Units.RunnerPools = []RunPoolConfig{{Unit: "custom@.service", Size: 0}}
+	cfg.Units.BuilderPools = []RunPoolConfig{{Unit: "build@.service", Size: 1}}
 	cfg.applyDefaults()
 	if err := cfg.validateDeclarative(); err != nil {
 		t.Fatalf("inserted defaults caused conflict: %v", err)

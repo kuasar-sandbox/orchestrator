@@ -33,6 +33,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -260,6 +261,17 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPools(runKindSandbox, cfg.Units.RunnerPoolConfigs(), wait, cfg.Paths.RunRoot, lc, &o.runs, log.With("kind", "runner"))
 	o.builderRunPool = newRunPools(runKindBuild, cfg.Units.BuilderPoolConfigs(), wait, cfg.Paths.RunRoot, lc, &o.runs, log.With("kind", "builder"))
+	if st != nil {
+		o.runs.persist = func(m store.RunPoolOwnership) error { return st.SaveRunPoolOwnership(context.Background(), m) }
+		o.runs.erase = func(m store.RunPoolOwnership) error {
+			if p := o.memoryPressure.Load(); p != nil && m.TaskID != "" {
+				if err := p.state.RetireExecution(m.TaskID, m.RunID); err != nil {
+					return err
+				}
+			}
+			return st.DeleteRunPoolOwnership(context.Background(), m.RunID)
+		}
+	}
 	return o
 }
 
@@ -634,7 +646,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	assignStarted := time.Now()
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
-	runID, err := o.runnerPool.AssignWithFence(assignmentCtx, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
+	runID, err := o.assignSandboxRunner(assignmentCtx, sb, preparation.Resources, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
 		// Serialize the runner-binding linearization point with Kill/Delete and
 		// other lifecycle mutations. If deletion wins, the exact CAS below misses
@@ -1438,7 +1450,7 @@ func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
 	return nil
 }
 
-func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (string, error) {
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest, beforeCapture ...func() error) (string, error) {
 	if sb.State == types.StatePaused {
 		return "", api.ErrAlreadyPaused
 	}
@@ -1473,7 +1485,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		"mode", o.cfg.Checkpoint.Mode,
 		"merge_ref", checkpointPolicyValue(request.SnapshotPolicy.MergeRef),
 		"drop_caches", checkpointPolicyValue(request.SnapshotPolicy.DropCaches))
-	if err := o.preparePause(opCtx, sb, request); err != nil {
+	if err := o.preparePause(opCtx, sb, request, beforeCapture...); err != nil {
 		return "", err
 	}
 	captureStarted := time.Now()
@@ -2163,6 +2175,8 @@ func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.
 // acceptance. It is built before route publication, network attach, resource
 // controller admission, cgroup creation, or runner assignment.
 type launchPreparation struct {
+	Placement *nodectl.Placement
+	Prepared  *configsock.ArtifactPrepareSummary
 	Spec      sandboxcfg.SandboxSpec
 	Source    types.ResumeSource
 	Network   sandboxcfg.NetworkSpec
@@ -2183,10 +2197,6 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 		// admission. Request-owned fields and immutable node defaults are still
 		// checked here; inherited fields and capacity arrive asynchronously from
 		// the exact runner's task-local E/S reader.
-		dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
-		if spec.Resource.Startup != nil && !dynamic {
-			return nil, fmt.Errorf("%w: %s.startup requires dynamic resource control", api.ErrBadRequest, sandboxcfg.NsResource)
-		}
 		if _, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname); err != nil {
 			return nil, err
 		}
@@ -2497,7 +2507,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 		o.log.Info("sandbox task artifact prepare replay", "sid", sandboxID, "run_id", runID,
 			"task_artifact_prepare_replay_total", 1)
 	}
-	final, err := attempt.WaitFinalSpec(ctx)
+	final, err := attempt.WaitFinalSpec(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -2642,6 +2652,11 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 // network ownership but remain starting with their durable launch_mode; run-pool
 // startup retries that same accepted cold or memory decision.
 func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
+	if o.memoryPressure.Load() == nil {
+		if err := o.restoreResourcePlacements(ctx, nil); err != nil {
+			return err
+		}
+	}
 	units, err := o.listRunUnits(ctx, runKindSandbox)
 	if err != nil {
 		return err

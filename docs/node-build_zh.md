@@ -75,7 +75,7 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `units.builder_pools` | 缺省 | 每项 `{unit, size}` 创建独立 pool，重复模板和相同项均合法；size 是 idle 目标数，0 按需启动。缺省则沿用 `builder` / `builder_pool_size` 单池（默认 `sandbox-builder@.service` / `0`）。新旧冲突规则及共享 dir/install/pool_wait_timeout 见 Node §3 |
+| `units.builder_pools` | 缺省 | 独立项支持 name/resource_pool/unit/size/capacity/priority；size 是 idle 目标，0 按需启动。缺省沿用 `builder` / `builder_pool_size` 单池（默认 `sandbox-builder@.service` / `0`）。参见[资源池](resource-pools_zh.md)及 Node §3 |
 | `builder.admission.execution.max_builds` | `2` | 同时持有 durable execution claim 的 Build 上限 |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | 不限制 | execution 的聚合准入资源向量;不生成 service/slice CPU 或内存策略,storage V1 仅准入记账 |
 | `builder.admission.registration` | 完整继承 resolved execution | 未带 cancel/delete 意图的 registered/waiting/building Build 注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
@@ -252,8 +252,9 @@ builder 取得 bid 后再锁
 直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
 保证 StopUnit/超时连阶段 VM 一并回收。
 
-builder pool 在全局 execution 准入成功后的实际 Assign 边界独立轮询，锁不覆盖等待。
-注册和准入拒绝不推进游标，size 不影响比例，也不向其它 pool 回退。单个 Build 全部阶段
+全局 execution 准入成功后，按资源容量、权限、供给及使用率选资源池，再按优先级选择
+builder pool，同级随机。size 保持 idle 目标含义。制品准备取得权威容量后可以在最终
+启动前更换准备实例。单个 Build 实际执行的全部阶段
 仍由同一 builder 驱动，不进入普通 runner pool。全局 registration/execution ledger、
 FIFO/claim 与清理释放顺序不变。共享模板仅安装/枚举去重，pool 不去重。
 StartUnit 前登记 RunID 的创建池；assignment 后保留实际 unit 归属，直到原生命周期清理。

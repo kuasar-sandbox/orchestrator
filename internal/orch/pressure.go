@@ -34,12 +34,24 @@ type nodePressureController struct {
 // ConfigureMemoryPressure runs before the resource socket serves or API/run
 // pools start. Durable rows own Q; the controller owns numbers and zone only.
 func (o *Orchestrator) ConfigureMemoryPressure(ctx context.Context, state *nodectl.State, admission *nodectl.AdmissionController, policy nodectl.PressurePolicy) error {
+	if err := o.restoreResourcePlacements(ctx, state); err != nil {
+		return err
+	}
 	record, err := o.st.LoadNodePressure(ctx)
 	if err != nil {
 		return err
 	}
-	if err := state.ConfigurePressure(policy, nodectl.PressureRecord{Zone: nodectl.Zone(record.Zone), Version: record.Version, Reason: record.Reason, SinceUnix: record.SinceUnix}); err != nil {
-		return err
+	for name, pool := range state.PoolStates() {
+		saved, err := o.st.LoadPoolPressure(ctx, name)
+		if err != nil {
+			return err
+		}
+		if saved.Zone == "" && len(state.PoolStates()) == 1 {
+			saved = record
+		}
+		if err := pool.ConfigurePressure(policy, nodectl.PressureRecord{Zone: nodectl.Zone(saved.Zone), Version: saved.Version, Reason: saved.Reason, SinceUnix: saved.SinceUnix}); err != nil {
+			return err
+		}
 	}
 	o.memoryPressure.Store(&nodePressureController{state: state, admission: admission, policy: policy})
 	var rows []*types.Sandbox
@@ -98,6 +110,12 @@ func (o *Orchestrator) PersistMemoryPressure(ctx context.Context) error {
 	if o.memoryPressure.Load() == nil {
 		return nil
 	}
+	for name, pool := range o.memoryPressure.Load().state.PoolStates() {
+		p := pool.PressureSnapshot()
+		if err := o.st.SavePoolPressure(ctx, name, store.NodePressure{Zone: string(p.Zone), Version: p.Version, Reason: p.Reason, SinceUnix: p.SinceUnix}); err != nil {
+			return err
+		}
+	}
 	p := o.memoryPressure.Load().state.PressureSnapshot()
 	return o.st.SaveNodePressure(ctx, store.NodePressure{Zone: string(p.Zone), Version: p.Version, Reason: p.Reason, SinceUnix: p.SinceUnix})
 }
@@ -138,7 +156,8 @@ func (o *Orchestrator) ResourceLaunchAdmission(sid string, peerPID int) (nodectl
 	if sb == nil {
 		// Build VM phases have no Sandbox Pause lifecycle and remain ordinary
 		// creates. Their existing resource/lease authentication is unchanged.
-		return nodectl.LaunchAdmission{}, nil
+		pool, err := o.resourcePoolForConsumer(sid, peerPID, "")
+		return nodectl.LaunchAdmission{ResourcePool: pool}, err
 	}
 	if peerPID <= 0 || sb.RunID == "" || (sb.State != types.StateStarting && sb.State != types.StateRunning) {
 		return nodectl.LaunchAdmission{}, errors.New("resource launch is not owned by a current runner")
@@ -162,6 +181,14 @@ func (o *Orchestrator) ResourceLaunchAdmission(sid string, peerPID int) (nodectl
 		return nodectl.LaunchAdmission{}, errors.New("resource launch peer identity mismatch")
 	}
 	a := launchAdmission(sb)
+	if m, ok := o.runs.ownership(sb.RunID); ok {
+		a.ResourcePool = m.ResourcePool
+	} else {
+		a.ResourcePool, err = o.resourcePoolForConsumer(sid, peerPID, "")
+		if err != nil {
+			return nodectl.LaunchAdmission{}, err
+		}
+	}
 	a.Accepted = true
 	return a, nil
 }
@@ -245,6 +272,17 @@ func (o *Orchestrator) pressureSandboxes() []*types.Sandbox {
 }
 
 func (o *Orchestrator) pauseForPressure(ctx context.Context, candidate *types.Sandbox) error {
+	return o.pauseForPressureMode(ctx, candidate, false, "")
+}
+
+func (o *Orchestrator) pauseForPressureMode(ctx context.Context, candidate *types.Sandbox, ifIdle bool, destination string) (retErr error) {
+	captureStarted := false
+	defer func() {
+		if retErr != nil && captureStarted {
+			retErr = errors.Join(errPressureCaptureStarted, retErr)
+		}
+	}()
+
 	ctx, unlock, err := o.lockLifecycleMutation(ctx, candidate.ID)
 	if err != nil {
 		return err
@@ -271,29 +309,56 @@ func (o *Orchestrator) pauseForPressure(ctx context.Context, candidate *types.Sa
 	if fs.Type == unix.TMPFS_MAGIC || fs.Type == unix.RAMFS_MAGIC {
 		return errors.New("resource pause requires disk-backed checkpoint storage")
 	}
-	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: ifIdle}
 	request.SnapshotPolicy, err = o.resolveSnapshotPolicy(sb.Metadata, sandboxcfg.SnapshotPolicy{})
 	if err != nil {
 		return err
 	}
-	if !o.memoryPressure.Load().state.BeginPressurePause(sb.ID, sb.PressureVersion+1) {
-		return api.ErrResourceUnavailable
-	}
-	changed, err := o.st.BeginResourcePause(ctx, sb)
-	if err != nil || !changed {
-		o.memoryPressure.Load().state.ObserveObligation(sb.ID, sb.PressureVersion+1, "", false)
-		if err == nil {
-			err = api.ErrSandboxChanged
+	intent := func() error {
+		state := o.memoryPressure.Load().state
+		var reservation nodectl.Reservation
+		for _, r := range state.ReservationViews() {
+			if r.SandboxID == sb.ID {
+				reservation = r
+				break
+			}
 		}
-		return err
+		if destination != "" && o.balanceDestination(sb, reservation) != destination {
+			return api.ErrResourceUnavailable
+		}
+		var began bool
+		if destination == "" {
+			began = state.BeginPressurePause(sb.ID, sb.PressureVersion+1)
+		} else {
+			began = state.BeginBalancePause(sb.ID, sb.PressureVersion+1)
+		}
+		if !began {
+			return api.ErrResourceUnavailable
+		}
+		captureStarted = true
+		placement := store.RecoveryPlacement{SourcePool: state.SandboxPool(sb.ID), DestinationPool: destination, CapacityMemory: reservation.Capacity.MemoryBytes, CapacityCPU: reservation.Capacity.CPUMilli, Budget: reservation.ReservationMemory}
+		changed, err := o.st.BeginResourcePause(ctx, sb, placement)
+		if err != nil || !changed {
+			state.ObserveObligation(sb.ID, sb.PressureVersion+1, "", false)
+			if err == nil {
+				err = api.ErrSandboxChanged
+			}
+			return err
+		}
+		// Keep the exact committed version even if the subsequent read fails;
+		// rollback must be able to cancel this intent before returning.
+		sb.ResourceObligation, sb.PauseReason = true, types.PauseReasonResource
+		sb.PressureVersion++
+		current, err := o.st.Get(ctx, sb.ID)
+		if err != nil {
+			return err
+		}
+		*sb = *current
+		o.cache(current)
+		o.observePressureSandbox(current)
+		return nil
 	}
-	sb, err = o.st.Get(ctx, sb.ID)
-	if err != nil {
-		return err
-	} // persisted obligation remains for restart
-	o.cache(sb)
-	o.observePressureSandbox(sb)
-	if _, err = o.pauseSandboxLocked(ctx, sb, request); err != nil {
+	if _, err = o.pauseSandboxLocked(ctx, sb, request, intent); err != nil {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		changed, cancelErr := o.st.CancelResourcePause(cleanupCtx, sb)
@@ -324,9 +389,11 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 	ticker := time.NewTicker(p.policy.Interval)
 	defer ticker.Stop()
 	type result struct {
-		sid   string
-		pause bool
-		err   error
+		sid       string
+		pause     bool
+		err       error
+		failed    []string
+		placement store.RecoveryPlacement
 	}
 	done := make(chan result, 2)
 	pauseBusy, resumeBusy := false, false
@@ -347,7 +414,15 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 			if r.pause {
 				kind = "pause"
 			}
-			o.recordPressureResult(r.sid, kind, r.err)
+			if r.pause && r.placement.DestinationPool != "" {
+				kind = "balance_pause"
+			}
+			o.recordPressureResult(r.sid, kind, r.err, r.placement)
+			for _, sid := range r.failed {
+				if sid != r.sid || r.err != nil {
+					backoff[sid] = time.Now().Add(max(p.policy.Interval, 2*time.Second))
+				}
+			}
 			resumeAfter = time.Now().Add(p.policy.Interval)
 			if r.pause {
 				pauseBusy = false
@@ -377,17 +452,29 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 			}
 		}
 		workerBlocked := ""
-		if !pauseBusy && snapshot.PauseEligible {
-			if sb := pressurePauseCandidate(rows, snapshot, now, backoff, p.policy.MinimumRunTime, p.state.CanPressurePause); sb != nil {
+		if !pauseBusy {
+			plans := o.pressurePausePlans(rows, now, backoff)
+			if len(plans) > 0 {
 				pauseBusy = true
-				go func(sb *types.Sandbox) {
-					err := o.pauseForPressure(ctx, sb)
+				go func() {
+					sid, failed, err := o.executePressurePausePlans(ctx, plans)
+					placement := store.RecoveryPlacement{}
+					for _, plan := range plans {
+						if plan.sandbox.ID == sid {
+							placement.DestinationPool = plan.destination
+							placement.SourcePool = p.state.SandboxPool(sid)
+							if saved, readErr := o.st.RecoveryPlacement(ctx, sid); readErr == nil && saved.SourcePool != "" {
+								placement = saved
+							}
+							break
+						}
+					}
 					select {
-					case done <- result{sid: sb.ID, pause: true, err: err}:
+					case done <- result{sid: sid, pause: true, err: err, failed: failed, placement: placement}:
 					case <-ctx.Done():
 					}
-				}(sb)
-			} else {
+				}()
+			} else if snapshot.PauseEligible {
 				workerBlocked = "no_eligible_running_sandbox"
 			}
 		}
@@ -410,12 +497,13 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 				if _, charged := p.state.SnapshotSandboxResource(sb.ID); charged {
 					continue
 				}
-				if !p.state.TryClaimBackgroundRecovery(sb.ID) {
+				if !o.canBackgroundRecover(ctx, sb) || !p.state.TryClaimBackgroundRecovery(sb.ID) {
 					continue
 				}
 				resumeBusy = true
 				go func(saved *types.Sandbox) {
 					defer p.state.ReleaseBackgroundRecovery(saved.ID)
+					placement, _ := o.st.RecoveryPlacement(ctx, saved.ID)
 					deadline := saved.DeadlineUnix
 					_, attempt, err := o.ensureResumeAccepted(ctx, saved.ID, &deadline, types.ResumeRequest{Trigger: types.ResumeTriggerWake, Mode: types.ResumeMemory}, func(current *types.Sandbox) error {
 						if !current.ResourceObligation || current.PauseReason != types.PauseReasonResource || current.PressureVersion != saved.PressureVersion || current.ResumeSource != saved.ResumeSource {
@@ -426,8 +514,11 @@ func (o *Orchestrator) RunMemoryPressure(ctx context.Context) {
 					if err == nil && attempt != nil {
 						err = attempt.wait(ctx)
 					}
+					if err == nil {
+						placement.DestinationPool = p.state.SandboxPool(saved.ID)
+					}
 					select {
-					case done <- result{sid: saved.ID, err: err}:
+					case done <- result{sid: saved.ID, err: err, placement: placement}:
 					case <-ctx.Done():
 					}
 				}(sb)
@@ -447,9 +538,14 @@ func (o *Orchestrator) ResourcePressureStatus(ctx context.Context) (nodectl.Pres
 	if p == nil {
 		return nodectl.PressureStatus{}, nil
 	}
-	out := nodectl.PressureStatus{Enabled: true, PressureSnapshot: p.state.PressureSnapshot()}
+	out := nodectl.PressureStatus{Enabled: true, PressureSnapshot: p.state.PressureSnapshot(), Pools: p.state.PoolSnapshots()}
+	out.RunnerPools, out.UnattributedRunners = o.runnerPoolStatus()
 	for _, sb := range o.pressureSandboxes() {
-		out.Sandboxes = append(out.Sandboxes, nodectl.SandboxPressureStatus{ID: sb.ID, State: string(sb.State), PauseReason: sb.PauseReason, RecoveryObligation: sb.ResourceObligation, Version: sb.PressureVersion, RunningSinceUnixNano: sb.RunningSinceUnixNano, WaitingSinceUnixNano: sb.PressureSinceUnixNano})
+		placement, err := o.st.RecoveryPlacement(ctx, sb.ID)
+		if err != nil {
+			return nodectl.PressureStatus{}, err
+		}
+		out.Sandboxes = append(out.Sandboxes, nodectl.SandboxPressureStatus{ResourcePool: p.state.SandboxPool(sb.ID), SourcePool: placement.SourcePool, DestinationPool: placement.DestinationPool, ID: sb.ID, State: string(sb.State), PauseReason: sb.PauseReason, RecoveryObligation: sb.ResourceObligation, Version: sb.PressureVersion, RunningSinceUnixNano: sb.RunningSinceUnixNano, WaitingSinceUnixNano: sb.PressureSinceUnixNano})
 	}
 	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].ID < out.Sandboxes[j].ID })
 	p.resultMu.Lock()
@@ -459,7 +555,7 @@ func (o *Orchestrator) ResourcePressureStatus(ctx context.Context) (nodectl.Pres
 	return out, nil
 }
 
-func (o *Orchestrator) recordPressureResult(sid, operation string, err error) {
+func (o *Orchestrator) recordPressureResult(sid, operation string, err error, placements ...store.RecoveryPlacement) {
 	p := o.memoryPressure.Load()
 	if p == nil {
 		return
@@ -474,7 +570,11 @@ func (o *Orchestrator) recordPressureResult(sid, operation string, err error) {
 		copy(p.recent, p.recent[1:])
 		p.recent = p.recent[:63]
 	}
-	p.recent = append(p.recent, nodectl.PressureOperationResult{SandboxID: sid, Operation: operation, Result: result, AtUnixNano: time.Now().UnixNano()})
+	entry := nodectl.PressureOperationResult{SandboxID: sid, Operation: operation, Result: result, AtUnixNano: time.Now().UnixNano()}
+	if len(placements) > 0 {
+		entry.SourcePool, entry.DestinationPool = placements[0].SourcePool, placements[0].DestinationPool
+	}
+	p.recent = append(p.recent, entry)
 }
 
 // Selection uses only current continuous-running age, authoritative lifecycle

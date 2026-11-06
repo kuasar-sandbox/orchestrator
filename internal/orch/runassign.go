@@ -153,6 +153,16 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 		}
 		return err
 	}
+	if state == "starting" {
+		if err := o.beginBuildResourcePhase(ctx, pend, runID, phase, sandboxID); err != nil {
+			return err
+		}
+	}
+	if state == "finished" {
+		if err := o.finishBuildResourcePhase(ctx, runID, sandboxID); err != nil {
+			return err
+		}
+	}
 	o.log.Info("build phase", "bid", buildID, "run_id", runID, "phase", phase,
 		"sandbox_id", sandboxID, "state", state)
 	observed := cloneBuildForObservation(current)

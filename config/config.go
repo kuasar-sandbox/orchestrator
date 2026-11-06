@@ -84,6 +84,12 @@ func (c *Conductor) Clone() *Conductor {
 	out.Units.Install = clonePtr(c.Units.Install)
 	out.Units.RunnerPools = slices.Clone(c.Units.RunnerPools)
 	out.Units.BuilderPools = slices.Clone(c.Units.BuilderPools)
+	for i := range out.Units.RunnerPools {
+		out.Units.RunnerPools[i].Capacity = clonePtr(c.Units.RunnerPools[i].Capacity)
+	}
+	for i := range out.Units.BuilderPools {
+		out.Units.BuilderPools[i].Capacity = clonePtr(c.Units.BuilderPools[i].Capacity)
+	}
 	out.Cluster.Labels = cloneMap(c.Cluster.Labels)
 	out.Sandbox.Network.DNS = cloneSlice(c.Sandbox.Network.DNS)
 	out.Sandbox.Resources.Allocatable.CPU = clonePtr(c.Sandbox.Resources.Allocatable.CPU)
@@ -113,6 +119,7 @@ func (c *Conductor) Clone() *Conductor {
 	if c.ResourceListen != nil {
 		resource := *c.ResourceListen
 		resource.CgroupScanPaths = cloneSlice(c.ResourceListen.CgroupScanPaths)
+		resource.Pools = cloneResourcePools(c.ResourceListen.Pools)
 		out.ResourceListen = &resource
 	}
 	out.Checkpoint.MergeRef = clonePtr(c.Checkpoint.MergeRef)
@@ -153,6 +160,11 @@ func cloneMap[K comparable, V any](in map[K]V) map[K]V {
 // sandboxes use static cgroup. The controller's tuning is inlined here — there is
 // no second config file; nodectl.Resolve consumes this struct directly.
 type ResourceListenConfig struct {
+	Pools           []ResourcePoolConfig `yaml:"pools,omitempty" json:"pools,omitempty"`
+	legacyExplicit  bool
+	legacyDefaulted bool
+	legacyDefaults  ResourceHostConfig
+	marginDefault   float64
 	Pressure        ResourcePressureConfig   `yaml:"pressure" json:"pressure"`
 	Enabled         bool                     `yaml:"enabled" json:"enabled"`
 	Socket          string                   `yaml:"socket" json:"socket"`                       // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
@@ -220,6 +232,7 @@ type ResourceAdmissionConfig struct {
 // owns that protocol constant. Exported so nodectl.Resolve can default a config
 // block built outside config.Load (e.g. in tests).
 func (r *ResourceListenConfig) ApplyDefaults() {
+	r.trackLegacyDefaults()
 	if r.Pressure.Interval == "" {
 		r.Pressure.Interval = "1s"
 	}
@@ -299,6 +312,7 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 	if r.LogLevel == "" {
 		r.LogLevel = "info"
 	}
+	r.finishLegacyDefaults()
 }
 
 // ClusterConfig connects this node to a cluster-ctl registry over node_link
@@ -1233,6 +1247,9 @@ func (c *Conductor) validateDeclarative() error {
 		}
 	}
 	if err := c.Units.validate(); err != nil {
+		return err
+	}
+	if err := c.ValidateResourcePools(); err != nil {
 		return err
 	}
 	poolWait, err := time.ParseDuration(c.Units.PoolWaitTimeout)

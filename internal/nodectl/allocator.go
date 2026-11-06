@@ -1,15 +1,15 @@
 package nodectl
 
 import (
+	"math"
 	"sync"
 	"time"
 )
 
 // AllocatorPolicy bounds runtime memory budget grants.
 //
-// MemoryGrantPerSecBytes is the FIFO drain rate — even with 100 sandboxes
-// burst-requesting simultaneously, total grants per second cannot exceed
-// this rate. This is the core anti-thundering-herd lever.
+// MemoryGrantPerSecBytes is the replenishment rate. Normal/low grants share
+// a bucket of max(rate, MinGrantStep), initially funded with one second's rate.
 //
 // EmergencyFactor (0..1) of allocatable_pool is reserved for urgency=high
 // (oom) requests; normal/low requests cannot consume it.
@@ -30,6 +30,7 @@ type Allocator struct {
 	policy     AllocatorPolicy
 	tokens     float64
 	lastRefill time.Time
+	clock      func() time.Time
 
 	// Per-sandbox grant history for fairness (last 60s grant total).
 	history map[string]*grantHistory
@@ -44,25 +45,31 @@ type grantSample struct {
 	bytes uint64
 }
 
-// NewAllocator builds an Allocator with full bucket and empty history.
+// NewAllocator starts with one second's rate and empty history. A low rate
+// accumulates a complete MinGrantStep over time, without extra initial burst.
 func NewAllocator(policy AllocatorPolicy) *Allocator {
 	return &Allocator{
 		policy:     policy,
 		tokens:     float64(policy.MemoryGrantPerSecBytes), // start with 1s of headroom
 		lastRefill: time.Now(),
+		clock:      time.Now,
 		history:    make(map[string]*grantHistory),
 	}
 }
 
 // refillLocked refills the per-second bucket. Caller holds lock.
 func (a *Allocator) refillLocked() {
-	now := time.Now()
+	now := a.clock()
 	elapsed := now.Sub(a.lastRefill).Seconds()
 	a.tokens += elapsed * float64(a.policy.MemoryGrantPerSecBytes)
-	if a.tokens > float64(a.policy.MemoryGrantPerSecBytes) {
-		a.tokens = float64(a.policy.MemoryGrantPerSecBytes)
+	if a.tokens > float64(a.bucketCapacity()) {
+		a.tokens = float64(a.bucketCapacity())
 	}
 	a.lastRefill = now
+}
+
+func (a *Allocator) bucketCapacity() uint64 {
+	return max(a.policy.MemoryGrantPerSecBytes, a.policy.MinGrantStep)
 }
 
 // recordGrantLocked appends a grant to the per-sandbox history and
@@ -73,7 +80,7 @@ func (a *Allocator) recordGrantLocked(token string, bytes uint64) {
 		h = &grantHistory{}
 		a.history[token] = h
 	}
-	now := time.Now()
+	now := a.clock()
 	h.last60s = append(h.last60s, grantSample{at: now, bytes: bytes})
 	cutoff := now.Add(-60 * time.Second)
 	i := 0
@@ -135,6 +142,9 @@ func (a *Allocator) Grant(token string, requested, headroom uint64, urgency stri
 	if a.policy.MaxGrantStep > 0 && delta > a.policy.MaxGrantStep {
 		delta = a.policy.MaxGrantStep
 	}
+	if urgency != UrgencyHigh {
+		delta = min(delta, a.bucketCapacity())
+	}
 	// Never round a grant above RequestedDelta. A request whose complete tail is
 	// smaller than MinGrantStep must still be grantable; otherwise an earlier
 	// partial grant can strand the sandbox permanently just below its requested
@@ -145,6 +155,11 @@ func (a *Allocator) Grant(token string, requested, headroom uint64, urgency stri
 
 	// Token bucket. urgency=high is unlimited (emergency path).
 	if urgency != UrgencyHigh {
+		// Resolve rejects zero effective rates. Keep direct internal policy
+		// construction fail-closed without a division by zero.
+		if a.policy.MemoryGrantPerSecBytes == 0 {
+			return GrantDecision{CooldownMs: 200}
+		}
 		if a.tokens < float64(delta) {
 			// Compute cooldown — when will we have enough tokens?
 			need := float64(delta) - a.tokens
@@ -152,7 +167,7 @@ func (a *Allocator) Grant(token string, requested, headroom uint64, urgency stri
 			if eta < 50 {
 				eta = 50
 			}
-			return GrantDecision{CooldownMs: int64(eta)}
+			return GrantDecision{CooldownMs: int64(math.Ceil(eta))}
 		}
 		a.tokens -= float64(delta)
 	}

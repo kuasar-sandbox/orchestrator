@@ -59,11 +59,7 @@ func StartResourceController(ctx context.Context, cfg *publicconfig.ResourceList
 	if cfg.StatePath != "" {
 		resourceLogger.Warn("resource_listen.state_path is deprecated and ignored", "state_path", cfg.StatePath)
 	}
-	state := nodectl.NewState(
-		resolved.PhysicalMemory, resolved.PhysicalCPU,
-		resolved.HostReserved.MemoryBytes, resolved.HostReserved.CPUMilli,
-		resolved.Watermarks,
-	)
+	state := nodectl.NewPoolState(resolved)
 	admission := nodectl.NewAdmissionController(resolved.Admission)
 	allocator := nodectl.NewAllocator(resolved.Allocator)
 	inventoryLogger := resourceLogger.With("subsystem", "inventory")

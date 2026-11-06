@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"golang.org/x/sys/unix"
 )
@@ -47,6 +48,9 @@ func resourcePausedFixture(t *testing.T) (*Orchestrator, *types.Sandbox, string,
 		t.Fatal(err)
 	}
 	o.cache(sb)
+	if err := o.st.SaveNodePressure(context.Background(), store.NodePressure{Zone: "critical", Version: 1}); err != nil {
+		t.Fatal(err)
+	}
 	s := attachPressure(t, o)
 	sb, err := o.st.Get(context.Background(), sb.ID)
 	if err != nil {
@@ -328,6 +332,11 @@ func TestPressurePauseUsesExistingCaptureAndConfirmedRelease(t *testing.T) {
 	// Capture I/O cannot block the global resource lock or claim release.
 	if p := s.PressureSnapshot(); p.Capturing != 1 || p.Pending != 1 || p.ReservedMemory != 512<<20 {
 		t.Fatalf("in-flight capture=%+v", p)
+	}
+	intent, intentErr := o.st.RecoveryPlacement(context.Background(), sb.ID)
+	intentRow, rowErr := o.st.Get(context.Background(), sb.ID)
+	if intentErr != nil || rowErr != nil || !intentRow.ResourceObligation || intent.SourcePool != "default" || intent.Budget != 512<<20 {
+		t.Fatalf("capture started before durable recovery intent: %+v %v %v", intent, intentErr, rowErr)
 	}
 	if err := os.WriteFile(release, nil, 0600); err != nil {
 		t.Fatal(err)
