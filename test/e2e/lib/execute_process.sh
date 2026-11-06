@@ -33,7 +33,7 @@ manifest_config: $WORK/manifest.yaml
 paths: { run_root: $EXECUTE_RUN_ROOT, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units:
   dir: $UNIT_DIR
-  # Identical entries remain independent round-robin positions across cold,
+  # Identical entries remain independent logical pools across cold,
   # artifact, pause/resume, deletion and conductor-restart cases below.
   runner_pools:
     - {unit: '${RUNNER_PREFIX}.service', size: 0}

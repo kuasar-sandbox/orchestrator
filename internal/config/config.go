@@ -23,6 +23,8 @@ const (
 type Config = publicconfig.Conductor
 type ProxyFileConfig = publicconfig.Proxy
 type ResourceListenConfig = publicconfig.ResourceListenConfig
+type ResourcePoolConfig = publicconfig.ResourcePoolConfig
+type ResourceDimensionWatermarks = publicconfig.ResourceDimensionWatermarks
 type ResourceHostConfig = publicconfig.ResourceHostConfig
 type ResourceHostReserved = publicconfig.ResourceHostReserved
 type ResourceWatermarksConfig = publicconfig.ResourceWatermarksConfig

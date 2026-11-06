@@ -41,6 +41,9 @@ func TestPressureOperationMatrix(t *testing.T) {
 
 func TestPressureObligationsAndStepwiseRelief(t *testing.T) {
 	s, now := pressureTestState(t)
+	if err := s.ConfigurePressure(DefaultPressurePolicy(), PressureRecord{Zone: ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
 	s.ObserveObligation("a", 1, "capturing", false)
 	s.ObserveObligation("a", 2, "paused", true)
 	s.ObserveObligation("a", 2, "starting", false)
@@ -215,6 +218,9 @@ func TestSavedSourceCompleteBudgetAndSerialStartup(t *testing.T) {
 
 func TestStickyCriticalRuntimeHeadroomAndFinalGate(t *testing.T) {
 	s, _ := pressureTestState(t)
+	if err := s.ConfigurePressure(DefaultPressurePolicy(), PressureRecord{Zone: ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
 	installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "t", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 100, Stage: StageSettled})
 	s.ObserveObligation("paused", 1, "paused", false)
 	a := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1000, MinGrantStep: 1, MaxGrantStep: 1000})
@@ -435,37 +441,26 @@ func TestOrdinaryRecoveryAdmissionHasNoBackgroundClaimFence(t *testing.T) {
 	}
 }
 
-func TestBackgroundRecoveryMustNotProjectRawRed(t *testing.T) {
-	s, _ := pressureTestState(t)
-	// Pool=1000, red starts at 850. Leave absolute room for the recovery while
-	// making its exact saved Budget project the node into red.
-	installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "running", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 700, Stage: StageSettled})
-	if !s.TryClaimBackgroundRecovery("saved") {
-		t.Fatal("background recovery claim unexpectedly blocked")
+func TestBackgroundRecoveryUsesActualBudgetAtAnyWatermark(t *testing.T) {
+	for _, budget := range []uint64{200, 300, 301} {
+		s, _ := pressureTestState(t)
+		installReservationForTest(t, s, Reservation{SandboxID: "running", Token: "running", Capacity: Resources{MemoryBytes: 1000}, ReservationMemory: 700, Stage: StageSettled})
+		if err := s.ConfigurePressure(DefaultPressurePolicy(), PressureRecord{Zone: ZoneCritical, Version: 1}); err != nil {
+			t.Fatal(err)
+		}
+		s.ObserveObligation("saved", 1, "paused", false)
+		if !s.TryClaimBackgroundRecovery("saved") {
+			t.Fatal("claim")
+		}
+		launch := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "saved:1"}
+		got := s.AnalyzeLaunch("saved", budget, launch)
+		if budget <= 300 && got.Status != OutcomeAdmitted {
+			t.Fatalf("budget=%d: %+v", budget, got)
+		}
+		if budget > 300 && (got.Status != OutcomeShortTermBlock || got.Block != BlockedByRecoveryPolicy) {
+			t.Fatalf("over-budget recovery: %+v", got)
+		}
 	}
-	background := LaunchAdmission{Operation: OperationRecovery, SavedSource: true, Accepted: true, Identity: "saved:1"}
-	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeShortTermBlock || got.Block != BlockedByRecoveryPolicy {
-		t.Fatalf("background recovery projected raw red but was admitted: %+v", got)
-	}
-
-	// The same exact resource state must not change explicit/user Wake semantics.
-	s.ReleaseBackgroundRecovery("saved")
-	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeAdmitted {
-		t.Fatalf("ordinary Wake inherited background stability gate: %+v", got)
-	}
-
-	// Once real managed-pool headroom makes the post-recovery state yellow,
-	// unattended recovery can proceed without waiting for effective critical to clear.
-	if _, found, err := s.ReconcileAndGrant("running", 600, 0, UrgencyNormal, NewAllocator(AllocatorPolicy{})); err != nil || !found {
-		t.Fatalf("release running reservation: found=%v err=%v", found, err)
-	}
-	if !s.TryClaimBackgroundRecovery("saved") {
-		t.Fatal("background recovery claim did not reopen after release")
-	}
-	if got := s.AnalyzeLaunch("saved", 200, background); got.Status != OutcomeAdmitted {
-		t.Fatalf("post-recovery yellow state was not admitted: %+v", got)
-	}
-	s.ReleaseBackgroundRecovery("saved")
 }
 
 // A background policy refusal is not executable workload demand: waiting for

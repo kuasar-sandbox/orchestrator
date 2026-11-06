@@ -536,8 +536,8 @@ func testReconcileLiveBuild(t *testing.T, multiple bool) {
 	if o.runs.unit(runID) != unit {
 		t.Fatal("adoption lost actual unit")
 	}
-	if o.runnerPool.next != 0 || o.builderRunPool.next != 0 {
-		t.Fatal("adoption advanced pool cursors")
+	if len(o.runs.waiting) != 0 {
+		t.Fatal("adoption offered an assigned execution to the pool")
 	}
 	if result := <-specDone; result.err != nil || !result.ok {
 		t.Fatalf("recovered BuildSpec = ok %v err %v", result.ok, result.err)

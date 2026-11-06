@@ -13,14 +13,19 @@ import (
 )
 
 type runPool struct {
-	runs        *runIndex
-	kind        string
-	size        int
-	waitTimeout time.Duration
-	runRoot     string
-	lc          launcher.Launcher
-	unitName    func(string) string
-	log         *slog.Logger
+	name         string
+	resourcePool string
+	capacity     *int
+	priority     int
+	reserved     int // guarded by runIndex.mu; includes assignments not yet enqueued
+	runs         *runIndex
+	kind         string
+	size         int
+	waitTimeout  time.Duration
+	runRoot      string
+	lc           launcher.Launcher
+	unitName     func(string) string
+	log          *slog.Logger
 
 	consumeCh       chan *runConsumeReq
 	waitCh          chan *runWaitReq
@@ -95,6 +100,7 @@ type idleRun struct {
 
 func newRunPool(kind string, size int, waitTimeout time.Duration, runRoot string, lc launcher.Launcher, unitName func(string) string, log *slog.Logger) *runPool {
 	return &runPool{
+		name: logicalPoolKind(kind) + "-0", resourcePool: "default",
 		kind: kind, size: size, waitTimeout: waitTimeout, runRoot: runRoot, lc: lc, unitName: unitName, log: log,
 		consumeCh:       make(chan *runConsumeReq),
 		waitCh:          make(chan *runWaitReq),
@@ -190,7 +196,7 @@ func (p *runPool) loop(ctx context.Context) {
 		if req.op == "stop" {
 			// Retired, unassigned runs cannot receive another task. Unit control
 			// retains its exact name independently of this routing index.
-			p.runs.forget(req.runID)
+			p.runs.markState(req.runID, "stopping")
 			stopControls = append(stopControls, req)
 			return
 		}
@@ -221,7 +227,9 @@ func (p *runPool) loop(ctx context.Context) {
 				p.log.Error("run pool: new run id", "kind", p.kind, "err", err)
 				return created
 			}
-			p.runs.register(runID, p) // before a start can reach the control loop
+			if err := p.runs.register(runID, p); err != nil {
+				break
+			} // before StartUnit
 			starting[runID] = startingRun{}
 			created = append(created, runID)
 			queueControl(runControlReq{op: "start", runID: runID})
@@ -352,15 +360,10 @@ func (p *runPool) loop(ctx context.Context) {
 			if err := req.commit(w.runID); err != nil {
 				releaseSessionFence()
 				replyConsume(req, runConsumeResp{err: err})
-				if p.kind == runKindBuild {
-					// Build preparation can be cancelled after touching this unit.
-					// Its original owner must fence the exact unit before releasing
-					// its claim; never lend that unit to another Build meanwhile.
-					replyWait(w.req, runWaitResp{err: err})
-					queueControl(runControlReq{op: "stop", runID: w.runID})
-				} else {
-					idle = append([]idleRun{w}, idle...)
-				}
+				// A failed commit may already have persisted execution identity.
+				// Fence this unit before releasing its slot; never lend it again.
+				replyWait(w.req, runWaitResp{err: err})
+				queueControl(runControlReq{op: "stop", runID: w.runID})
 				continue
 			}
 			p.runs.assigned(w.runID)
@@ -468,6 +471,7 @@ func (p *runPool) loop(ctx context.Context) {
 				continue
 			}
 			idle = append(idle, idleRun{runID: req.runID, req: req})
+			p.runs.markState(req.runID, "idle")
 			assign()
 			// Give the ready worker to the oldest request before retiring this
 			// start from the finite waves of all remaining requests.
@@ -557,10 +561,42 @@ func (p *runPool) loop(ctx context.Context) {
 }
 
 func (p *runPool) controlLoop(ctx context.Context) {
+	type retry struct {
+		next  time.Time
+		delay time.Duration
+	}
+	stopping := map[string]retry{}
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	stop := func(runID string) {
+		unit := p.unitName(runID)
+		stopCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
+		err := p.lc.Stop(stopCtx, unit)
+		cancel()
+		if err == nil {
+			err = p.runs.forget(runID)
+		}
+		if err == nil {
+			delete(stopping, runID)
+			_ = p.lc.ResetFailed(ctx, unit)
+			return
+		}
+		delay := min(max(stopping[runID].delay*2, 200*time.Millisecond), 5*time.Second)
+		stopping[runID] = retry{time.Now().Add(delay), delay}
+		p.log.Warn("run pool: retirement failed; retaining capacity for retry", "unit", unit, "err", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case now := <-tick.C:
+			p.runs.retryRetired(p, now)
+			for runID, retry := range stopping {
+				if !now.Before(retry.next) {
+					stop(runID)
+					break
+				}
+			}
 		case req := <-p.controlCh:
 			unit := p.unitName(req.runID)
 			switch req.op {
@@ -574,8 +610,7 @@ func (p *runPool) controlLoop(ctx context.Context) {
 					return
 				}
 			case "stop":
-				_ = p.lc.Stop(context.Background(), unit)
-				_ = p.lc.ResetFailed(context.Background(), unit)
+				stop(req.runID)
 			default:
 				p.log.Warn("run pool: unknown unit op", "kind", p.kind, "op", req.op, "run_id", req.runID)
 			}

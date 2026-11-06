@@ -87,11 +87,12 @@ func (r Resources) Sub(other Resources) Resources {
 // Reservation is controller-owned mutable state. State methods return copies;
 // no caller receives a pointer stored in the maps.
 type Reservation struct {
-	Token      string    `json:"token"`
-	SandboxID  string    `json:"sandbox_id"`
-	PeerPID    int       `json:"sandbox_ctl_pid,omitempty"`
-	CgroupPath string    `json:"cgroup_path,omitempty"`
-	Capacity   Resources `json:"capacity"`
+	ResourcePool string    `json:"resource_pool,omitempty"`
+	Token        string    `json:"token"`
+	SandboxID    string    `json:"sandbox_id"`
+	PeerPID      int       `json:"sandbox_ctl_pid,omitempty"`
+	CgroupPath   string    `json:"cgroup_path,omitempty"`
+	Capacity     Resources `json:"capacity"`
 	// ConfiguredAllocatable.MemoryBytes is settled guest headroom;
 	// ConfiguredAllocatable.CPUMilli retains the CPU guarantee/weight meaning.
 	// ReservationMemory is node charge, not guest demand or a balloon/cgroup
@@ -145,6 +146,16 @@ const (
 // the same critical section as their reservation transition.
 type State struct {
 	mu sync.Mutex
+	// A multi-pool State routes the existing controller's operations to ledgers.
+	// Ledgers have no server, admission worker or lifecycle owner of their own.
+	pools         map[string]*State
+	bindings      map[string]string
+	PoolName      string
+	CapacityLimit Resources
+	CPUWatermarks Watermarks
+	placements    map[string]Placement
+	poolAllocator *Allocator
+	ResolvePool   func(sid string, pid int, cgroup string) (string, error)
 
 	bySID       map[string]*Reservation
 	tokenToSID  map[string]string
@@ -202,13 +213,40 @@ func (s *State) memoryZoneLocked() Zone {
 }
 
 func (s *State) memoryZoneForReservedLocked(reserved uint64) Zone {
-	pool := s.AllocatablePool.MemoryBytes
-	if pool == 0 {
-		return ZoneRed
+	if s.AllocatablePool.MemoryBytes == 0 {
+		return ZoneCritical // runtime memory must always have a finite budget
 	}
-	high := scaleUint64Floor(pool, s.Wm.HighFactor)
-	low := scaleUint64Floor(pool, s.Wm.LowFactor)
-	emerg := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+	zone := zoneForUsage(reserved, s.AllocatablePool.MemoryBytes, s.Wm)
+	if s.CPUWatermarks.HighFactor > 0 {
+		zone = maxZone(zone, zoneForRatio(s.allocatedCPU, s.AllocatablePool.CPUMilli, s.CPUWatermarks))
+	}
+	return zone
+}
+
+func zoneForRatio(used, limit uint64, wm Watermarks) Zone {
+	if limit == 0 {
+		return ZoneGreen
+	}
+	use := ratio(used, limit)
+	switch {
+	case use >= 1-wm.EmergencyFactor:
+		return ZoneCritical
+	case use >= wm.HighFactor:
+		return ZoneRed
+	case use >= wm.LowFactor:
+		return ZoneYellow
+	default:
+		return ZoneGreen
+	}
+}
+
+func zoneForUsage(reserved, pool uint64, wm Watermarks) Zone {
+	if pool == 0 {
+		return ZoneGreen // omitted dimensions are unlimited
+	}
+	high := scaleUint64Floor(pool, wm.HighFactor)
+	low := scaleUint64Floor(pool, wm.LowFactor)
+	emerg := scaleUint64Floor(pool, wm.EmergencyFactor)
 	criticalStart := uint64(0)
 	if emerg < pool {
 		criticalStart = pool - emerg
@@ -235,6 +273,19 @@ type AdmissionSnapshot struct {
 }
 
 func (s *State) AdmissionSnapshot() AdmissionSnapshot {
+	if s.pools != nil {
+		var out AdmissionSnapshot
+		for _, p := range s.pools {
+			v := p.AdmissionSnapshot()
+			out.Pool = addResourcesSaturating(out.Pool, v.Pool)
+			out.Reserved = addResourcesSaturating(out.Reserved, v.Reserved)
+			out.StartupPool = addResourcesSaturating(Resources{MemoryBytes: out.StartupPool}, Resources{MemoryBytes: v.StartupPool}).MemoryBytes
+			out.StartupInFlight = addResourcesSaturating(Resources{MemoryBytes: out.StartupInFlight}, Resources{MemoryBytes: v.StartupInFlight}).MemoryBytes
+			out.EmergencyMemory = addResourcesSaturating(Resources{MemoryBytes: out.EmergencyMemory}, Resources{MemoryBytes: v.EmergencyMemory}).MemoryBytes
+			out.Zone = nodeZone(out.Zone, v.Zone)
+		}
+		return out
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return AdmissionSnapshot{
@@ -261,6 +312,9 @@ type ResourceSnapshot struct {
 }
 
 func (s *State) ResourceSnapshot() ResourceSnapshot {
+	if s.pools != nil {
+		return s.aggregateResourceSnapshot()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.resourceSnapshotLocked()
@@ -282,7 +336,7 @@ func (s *State) addAggregatesLocked(r *Reservation) error {
 	if err != nil {
 		return err
 	}
-	cpu, err := checkedAggregateAdd(s.allocatedCPU, r.ConfiguredAllocatable.CPUMilli, "CPU allocation")
+	cpu, err := checkedAggregateAdd(s.allocatedCPU, runtimeCPU(r), "CPU allocation")
 	if err != nil {
 		return err
 	}
@@ -307,6 +361,15 @@ func (s *State) addAggregatesLocked(r *Reservation) error {
 	s.pressure.lastReservationChange = s.pressure.clock()
 	s.signalPressureLocked()
 	return nil
+}
+
+// CPU is constant across startup/settled. Zero on the legacy wire means the
+// sandbox omitted allocatable.cpu, so use its declared capacity.
+func runtimeCPU(r *Reservation) uint64 {
+	if r.ConfiguredAllocatable.CPUMilli != 0 {
+		return r.ConfiguredAllocatable.CPUMilli
+	}
+	return r.Capacity.CPUMilli
 }
 
 func aggregateStartupCharge(r *Reservation) uint64 {
@@ -351,7 +414,7 @@ func (s *State) validateAggregateReplacementLocked(remove []*Reservation, add *R
 		if mem, err = checkedAggregateSub(mem, r.ReservationMemory, "memory reservation"); err != nil {
 			return err
 		}
-		if cpu, err = checkedAggregateSub(cpu, r.ConfiguredAllocatable.CPUMilli, "CPU allocation"); err != nil {
+		if cpu, err = checkedAggregateSub(cpu, runtimeCPU(r), "CPU allocation"); err != nil {
 			return err
 		}
 		if startup, err = checkedAggregateSub(startup, aggregateStartupCharge(r), "initial Budget"); err != nil {
@@ -375,7 +438,7 @@ func (s *State) validateAggregateReplacementLocked(remove []*Reservation, add *R
 		if mem, err = checkedAggregateAdd(mem, add.ReservationMemory, "memory reservation"); err != nil {
 			return err
 		}
-		if cpu, err = checkedAggregateAdd(cpu, add.ConfiguredAllocatable.CPUMilli, "CPU allocation"); err != nil {
+		if cpu, err = checkedAggregateAdd(cpu, runtimeCPU(add), "CPU allocation"); err != nil {
 			return err
 		}
 		_, err = checkedAggregateAdd(startup, aggregateStartupCharge(add), "initial Budget")
@@ -410,7 +473,7 @@ func (s *State) removeAggregatesLocked(r *Reservation) error {
 	if err != nil {
 		return err
 	}
-	cpu, err := checkedAggregateSub(s.allocatedCPU, r.ConfiguredAllocatable.CPUMilli, "CPU allocation")
+	cpu, err := checkedAggregateSub(s.allocatedCPU, runtimeCPU(r), "CPU allocation")
 	if err != nil {
 		return err
 	}
@@ -474,6 +537,9 @@ func (s *State) detachLocked(sid string, released bool) (*Reservation, error) {
 	s.signalPressureLocked()
 	if r.Token != "" && s.tokenToSID[r.Token] == sid {
 		delete(s.tokenToSID, r.Token)
+		if s.poolAllocator != nil {
+			s.poolAllocator.CleanupHistory(r.Token)
+		}
 	}
 	if r.CgroupPath != "" && s.cgroupToSID[r.CgroupPath] == sid {
 		delete(s.cgroupToSID, r.CgroupPath)
@@ -482,6 +548,7 @@ func (s *State) detachLocked(sid string, released bool) (*Reservation, error) {
 }
 
 func (s *State) insertLocked(r *Reservation) error {
+	r.ResourcePool = s.PoolName
 	if err := validateReservation(r); err != nil {
 		return err
 	}
@@ -548,6 +615,32 @@ type ProvisionalSpec struct {
 }
 
 func (s *State) InstallProvisional(spec ProvisionalSpec) error {
+	if s.pools != nil && s.forSID(spec.SandboxID) == s && s.ResolvePool != nil {
+		name, err := s.ResolvePool(spec.SandboxID, spec.PeerPID, spec.CgroupPath)
+		if err != nil {
+			return err
+		}
+		if err := s.BindResourcePool(spec.SandboxID, name); err != nil {
+			return err
+		}
+
+	}
+	if p := s.forSID(spec.SandboxID); p != s {
+		return p.InstallProvisional(spec)
+	}
+	if s.pools != nil {
+		return fmt.Errorf("cannot recover resource pool for %s", spec.SandboxID)
+	}
+	if spec.RecoverySource == RecoveryUnknownLease || spec.RecoverySource == RecoveryUnknownManaged {
+		spec.Capacity = s.AllocatablePool
+		// Charge unknown declarations against the entire finite scheduling
+		// envelope, which can exceed the runtime memory pool.
+		spec.Capacity.MemoryBytes = max(spec.Capacity.MemoryBytes, s.CapacityLimit.MemoryBytes)
+		spec.Capacity.CPUMilli = max(spec.Capacity.CPUMilli, s.CapacityLimit.CPUMilli)
+		spec.ConfiguredAllocatable = Resources{CPUMilli: s.AllocatablePool.CPUMilli}
+		spec.ReservationMemory = s.AllocatablePool.MemoryBytes
+		spec.InitialBudget = s.AllocatablePool.MemoryBytes
+	}
 	if spec.SandboxID == "" || spec.RecoveryKey == "" || spec.ReservationMemory == 0 {
 		return fmt.Errorf("invalid provisional reservation")
 	}
@@ -580,6 +673,14 @@ func (s *State) InstallProvisional(spec ProvisionalSpec) error {
 }
 
 func (s *State) HasCgroup(path string) bool {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			if p.HasCgroup(path) {
+				return true
+			}
+		}
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, ok := s.cgroupToSID[path]
@@ -606,6 +707,9 @@ type AdmitSpec struct {
 // never authorizes a new consumer: identity and immutable resource contract
 // must match exactly, and Admit performs the same checks again atomically.
 func (s *State) CanReplayAdmit(spec AdmitSpec) bool {
+	if p := s.forSID(spec.SandboxID); p != s {
+		return p.CanReplayAdmit(spec)
+	}
 	if spec.SandboxID == "" || spec.PeerPID <= 0 || spec.InitialBudget == 0 ||
 		spec.InitialBudget > spec.Capacity.MemoryBytes {
 		return false
@@ -629,6 +733,12 @@ func (s *State) CanReplayAdmit(spec AdmitSpec) bool {
 // new precise reservation. A retry by the same lease owner is idempotent and
 // receives a fresh session token without double charging.
 func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
+	if p := s.forSID(spec.SandboxID); p != s {
+		return p.Admit(spec)
+	}
+	if s.pools != nil {
+		return Reservation{}, nil, fmt.Errorf("resource pool identity unavailable")
+	}
 	if spec.SandboxID == "" || spec.Token == "" || spec.InitialBudget == 0 {
 		return Reservation{}, nil, fmt.Errorf("invalid admit reservation")
 	}
@@ -650,6 +760,13 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	wasExclusive := s.pressure.exclusive == spec.SandboxID
+	if claim, ok := s.placements[spec.SandboxID]; ok {
+		if claim.Capacity != spec.Capacity {
+			return Reservation{}, nil, fmt.Errorf("resource capacity differs from reserved placement")
+		}
+	} else if s.bySID[spec.SandboxID] == nil && !fits(s.scheduledLocked(), spec.Capacity, s.CapacityLimit) {
+		return Reservation{}, nil, fmt.Errorf("resource pool scheduling capacity exhausted")
+	}
 	var oldConn net.Conn
 	if s.bySID[spec.SandboxID] == nil && spec.Admission != nil {
 		oc := s.admissionBudgetLocked(spec.SandboxID, spec.InitialBudget, *spec.Admission)
@@ -744,6 +861,21 @@ type SyncSpec struct {
 }
 
 func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
+	if s.pools != nil && s.forSID(spec.SandboxID) == s {
+		if s.ResolvePool == nil {
+			return Reservation{}, nil, fmt.Errorf("resource pool identity unavailable")
+		}
+		name, err := s.ResolvePool(spec.SandboxID, spec.PeerPID, spec.CgroupPath)
+		if err != nil {
+			return Reservation{}, nil, err
+		}
+		if err := s.BindResourcePool(spec.SandboxID, name); err != nil {
+			return Reservation{}, nil, err
+		}
+	}
+	if p := s.forSID(spec.SandboxID); p != s {
+		return p.Sync(spec)
+	}
 	if spec.SandboxID == "" || spec.Token == "" || spec.ReservationMemory == 0 || spec.ReservationMemory > spec.Capacity.MemoryBytes {
 		return Reservation{}, nil, fmt.Errorf("invalid state sync")
 	}
@@ -775,6 +907,9 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	defer s.mu.Unlock()
 	wasExclusive := s.pressure.exclusive == spec.SandboxID
 	var oldConns []net.Conn
+	if claim, ok := s.placements[spec.SandboxID]; ok && claim.Capacity != spec.Capacity {
+		return Reservation{}, nil, fmt.Errorf("state sync capacity differs from reserved placement")
+	}
 	existing := s.bySID[spec.SandboxID]
 	if existing != nil {
 		if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
@@ -862,6 +997,9 @@ func (s *State) byTokenLocked(token string) *Reservation {
 }
 
 func (s *State) SetSettled(token string, hostMemoryCurrent uint64, now time.Time) (Reservation, bool, error) {
+	if p := s.forToken(token); p != s {
+		return p.SetSettled(token, hostMemoryCurrent, now)
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -914,6 +1052,12 @@ type GrantResult struct {
 // computed only after that reconciliation and the response always describes
 // current+GrantedDelta.
 func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgency string, allocator *Allocator) (GrantResult, bool, error) {
+	if p := s.forToken(token); p != s {
+		return p.ReconcileAndGrant(token, current, requested, urgency, allocator)
+	}
+	if s.poolAllocator != nil {
+		allocator = s.poolAllocator
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.byTokenLocked(token)
@@ -1043,6 +1187,9 @@ func executableMemoryBudget(capacity, reservation uint64) (budget, nextStep uint
 }
 
 func (s *State) Heartbeat(token string, hostMemoryCurrent uint64, now time.Time) (Reservation, bool) {
+	if p := s.forToken(token); p != s {
+		return p.Heartbeat(token, hostMemoryCurrent, now)
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -1060,6 +1207,9 @@ func (s *State) Heartbeat(token string, hostMemoryCurrent uint64, now time.Time)
 }
 
 func (s *State) RecordOOM(token string, count uint64) (Reservation, bool) {
+	if p := s.forToken(token); p != s {
+		return p.RecordOOM(token, count)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.byTokenLocked(token)
@@ -1071,6 +1221,13 @@ func (s *State) RecordOOM(token string, count uint64) (Reservation, bool) {
 }
 
 func (s *State) Release(token string) (Reservation, bool, error) {
+	if p := s.forToken(token); p != s {
+		r, found, err := p.Release(token)
+		if found && err == nil {
+			s.pruneBinding(r.SandboxID, p)
+		}
+		return r, found, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.byTokenLocked(token)
@@ -1085,6 +1242,9 @@ func (s *State) Release(token string) (Reservation, bool, error) {
 }
 
 func (s *State) DropConnection(token string, conn net.Conn) (Reservation, bool) {
+	if p := s.forToken(token); p != s {
+		return p.DropConnection(token, conn)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.byTokenLocked(token)
@@ -1100,6 +1260,9 @@ func (s *State) DropConnection(token string, conn net.Conn) (Reservation, bool) 
 // identity check keep this transition O(1) and prevent an old queue goroutine
 // from detaching a replacement session.
 func (s *State) DropSandboxConnection(sid string, conn net.Conn) (Reservation, bool) {
+	if p := s.forSID(sid); p != s {
+		return p.DropSandboxConnection(sid, conn)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.bySID[sid]
@@ -1111,6 +1274,13 @@ func (s *State) DropSandboxConnection(sid string, conn net.Conn) (Reservation, b
 }
 
 func (s *State) SweepSnapshot() []Reservation {
+	if s.pools != nil {
+		var out []Reservation
+		for _, p := range s.pools {
+			out = append(out, p.SweepSnapshot()...)
+		}
+		return out
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Reservation, 0, len(s.bySID))
@@ -1121,6 +1291,9 @@ func (s *State) SweepSnapshot() []Reservation {
 }
 
 func (s *State) MarkStartupExpired(sid, identity string) bool {
+	if p := s.forSID(sid); p != s {
+		return p.MarkStartupExpired(sid, identity)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.bySID[sid]
@@ -1132,6 +1305,13 @@ func (s *State) MarkStartupExpired(sid, identity string) bool {
 }
 
 func (s *State) RemoveIfIdentity(sid, identity string) (Reservation, bool, error) {
+	if p := s.forSID(sid); p != s {
+		r, found, err := p.RemoveIfIdentity(sid, identity)
+		if found && err == nil {
+			s.pruneBinding(sid, p)
+		}
+		return r, found, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.bySID[sid]
@@ -1154,6 +1334,9 @@ type SandboxResourceSnapshot struct {
 }
 
 func (s *State) SnapshotSandboxResource(sandboxID string) (SandboxResourceSnapshot, bool) {
+	if p := s.forSID(sandboxID); p != s {
+		return p.SnapshotSandboxResource(sandboxID)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.bySID[sandboxID]
@@ -1161,13 +1344,20 @@ func (s *State) SnapshotSandboxResource(sandboxID string) (SandboxResourceSnapsh
 		return SandboxResourceSnapshot{}, false
 	}
 	return SandboxResourceSnapshot{
-		Capacity: r.Capacity, CPUAllocatable: r.ConfiguredAllocatable.CPUMilli,
+		Capacity: r.Capacity, CPUAllocatable: runtimeCPU(r),
 		ReservationMemory: r.ReservationMemory, HostMemoryCurrent: r.LastHostMemoryCurrent,
 		LastReportAt: r.LastReportAt,
 	}, true
 }
 
 func (s *State) ReservationViews() []Reservation {
+	if s.pools != nil {
+		var out []Reservation
+		for _, p := range s.pools {
+			out = append(out, p.ReservationViews()...)
+		}
+		return out
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Reservation, 0, len(s.bySID))

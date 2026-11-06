@@ -71,7 +71,7 @@ grow（§4.3）,不供普通 grow 使用。它不能替代本地 headroom,也不
 
 大量 sandbox 并发 grow 时,sandbox 之间不直接转移内存。每个 sandbox 保留自己的 grow
 objective,并向共同 node pool 请求 reservation。State 串行化 aggregate reservation 更新,
-所以并发请求不能重复消费同一份 headroom。普通新增 grant 还受 node-wide runtime grant
+所以并发请求不能重复消费同一份 headroom。普通新增 grant 还受所属资源池的 runtime grant
 token bucket 整形;red/critical zone 继续保护 node safety 和 emergency pool。Runtime grow
 没有 node 侧 FIFO 等待队列:收到 partial/zero grant 的 sandbox 保留本地 objective,在本地
 控制器处理 observation、pressure event 和未完成事务时,遵守返回的 cooldown 继续重试。
@@ -323,10 +323,12 @@ yellow 不是节点拒绝 cluster-create 的模式。NodeList 不新增动态水
 过期后新请求重新累计，未使用的过期保护即使尚未扫描也不能阻塞准入；过期不清除 reservation
 或恢复义务。本地 pressure 查询显示各需求的非敏感年龄、额度及失败/critical 轮数。
 只有受控资源池内因内存不足而阻塞的有效需求才推进压力轮次。整机可用内存不产生
-demand，也不授权资源 Pause；仅有 critical 水位、没有合格需求时不会自动 Pause。
+demand，也不授权资源 Pause；仅有有效 critical 水位不授权压力 Pause。
+[定时主动均衡](resource-pools_zh.md) 另外要求源池原始水位 critical 且有可行的非 critical 目的池。
 
 Q 包含已受理的 capture intent、resource-pressure paused 及其 starting 恢复。
-即使 RawZone green，只要 Q>0 仍保持 critical。退出同时要求 Q=0、相关未核实清理结束、
+Q>0 使已 critical 的池在 RawZone green 时仍保持 critical，但不把健康池提升到 critical。
+退出同时要求 Q=0、相关未核实清理结束、
 RawZone 低于 critical、无活跃合格内存阻塞，并连续满足 exit hold；只退出到 red。
 red 要求 RawZone 连续低于 red 达到自身 hold 后到 yellow；yellow 要求 RawZone 连续
  green 达到自身 hold 后到 green。反弹重置计时，一次评估至多下降一级。
@@ -454,8 +456,9 @@ node 与 sandbox 流程没有共享状态机;reservation 请求/响应是唯一�
 
 ### 6.4 资源 Pause、恢复与显式接管
 
-单 capture worker 按当前连续运行时间最长优先，不使用 CreatedUnix；running 提交重置
-起点。它复用现有内存 Pause：native exec quiesce/cleanup、Snapshot、旧 VM 退出和
+单 capture worker 按当前连续运行时间从老到新尝试 Pause(ifIdle=true)，不使用 CreatedUnix。
+明确 busy 时继续扫描，没有 idle 成功才普通 Pause 最老合格 busy 候选；错误和冲突不是 busy。
+running 提交重置起点。它复用现有内存 Pause：native exec quiesce/cleanup、Snapshot、旧 VM 退出和
 runner/network/resources 清理。不引入保留 VMM 的 pause、page swapper、exec 保留或新
 snapshot 格式。Checkpoint 必须落到磁盘，拒绝 tmpfs/ramfs；只有实际 Release/reconcile
 才能复用额度。Capture 失败退避，不丢弃已有保存源。
@@ -465,6 +468,8 @@ snapshot 格式。Checkpoint 必须落到磁盘，拒绝 tmpfs/ramfs；只有实
 变化不重置该间隔；繁忙节点不能要求全节点停止分配，才恢复无人访问的资源暂停沙箱。
 `headroom_stable` 仅用于诊断，不是恢复准入前提。随后 sandboxer 给出精确 I，最终资源准入
 仍等待完整预算才启动 VM；节奏计时不授予内存。
+后台恢复仍检查实际可用内存、目标池竞争和保护需求及启动并发，不要求恢复后原始水位低于 red，
+也不会为自身预算不足触发新的换出。多维水位、双 NUMA 配置及跨池均衡见[资源池](resource-pools_zh.md)。
 Starting 在实际 running 提交前仍属于 Q。最短运行窗口抑制刚恢复就换出；如果所有
 其他条件合格的对象仍在窗口内，选择过程等待窗口到期，不根据整机可用内存绕过配置的
 保护。有效需求可在 critical 中协调进一步 Pause，不等待被 Q 自身阻挡的
@@ -572,7 +577,7 @@ reservation 不接受普通 grow transaction。
 ## 9. 性能与可观测性
 
 admission token bucket 限制创建请求洪峰;startup pool 限制创建/恢复中的内存总额;
-runtime grant token bucket 限制普通 grow 的节点总速率。high urgency 可使用 emergency
+runtime grant token bucket 限制各资源池普通 grow 的总速率。high urgency 可使用 emergency
 pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure event 重试。
 
 当前 reservation 与恢复状态通过 `resource status`、`resource list`、本地 `resource pressure` 和既有节点状态生产端观察。ResourceProbe 返回有效 Zone 与同一 reservation R/P；消费者不能由 R/P 重新推导有效水位。异常 queue 诊断进入 conductor 标准日志出口,由部署环境统一采集与保留。重点口径包括:

@@ -64,7 +64,7 @@ These Conductor configuration fields govern the Build service. Shared process, p
 
 | Field | Default | Meaning |
 |---|---|---|
-| `units.builder_pools` | Absent | Each `{unit, size}` entry is an independent pool, including duplicates. size is the idle target; zero starts on demand. Absent uses legacy `builder` / `builder_pool_size` (defaults `sandbox-builder@.service` / `0`). See Node §3 for input conflicts and shared dir/install/pool_wait_timeout |
+| `units.builder_pools` | Absent | Independent entries support name/resource_pool/unit/size/capacity/priority. size is the idle target; zero starts on demand. Absent uses legacy `builder` / `builder_pool_size` (defaults `sandbox-builder@.service` / `0`). See [resource pools](resource-pools.md) and Node §3 |
 | `builder.admission.execution.max_builds` | `2` | Maximum simultaneous durable execution claims |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | Unlimited | Aggregate execution admission vector; no service/slice CPU or memory policy. V1 storage is admission accounting only |
 | `builder.admission.registration` | Entire resolved execution block | Registration limits for registered/waiting/building Builds without cancel/delete intent. An explicit block does not inherit missing fields; each finite dimension must be at least execution's |
@@ -166,10 +166,11 @@ Delegate=yes
 
 Builder locks `<BuildRunDir>/builder.pid`, obtains exact-run bootstrap and, for artifacts, prepares the root before final BuildSpec; images receive final spec directly. It remains resident for the target-aware pipeline of up to three phases. Phase sandbox-ctl/CH processes are its descendants, charged to the entire builder unit. Results return through config-socket. KillMode=control-group makes StopUnit/timeouts cover phase VMs as well; normal systemd termination starts with SIGTERM and uses SIGKILL after the stop timeout if processes remain.
 
-Builder pools round-robin independently at the actual Assign boundary after global
-execution admission. The cursor lock does not cover waiting. Registration and
-rejected admission do not advance it; size does not affect the ratio and failure
-does not fall back to another pool. All phases of one Build use the same Builder,
+After global execution admission, Builder placement uses resource capacity,
+operation permission, supply and runtime utilization, then runner priority with
+random ties. `size` remains an idle target. Artifact preparation can replace its
+worker before final launch, once authoritative capacity is known. All actual
+phases of one Build use the same Builder,
 never ordinary runner pools. Global registration/execution ledgers, FIFO claims
 and cleanup/release order stay unchanged. Only installation/enumeration deduplicate
 shared templates; pools remain independent.

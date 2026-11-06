@@ -62,7 +62,7 @@ func callbackLauncher(t *testing.T, runs *runIndex) *runPoolTestLauncher {
 	return lc
 }
 
-func TestRunPoolsIndependentRoundRobinAndFastCallback(t *testing.T) {
+func TestRunPoolsIndependentIdentityAndFastCallback(t *testing.T) {
 	runs := &runIndex{}
 	lc := callbackLauncher(t, runs)
 	entries := []config.RunPoolConfig{{Unit: "shared@.service", Size: 1}, {Unit: "shared@.service", Size: 3}, {Unit: "shared@.service", Size: 1}, {Unit: "other@.service", Size: 0}}
@@ -73,8 +73,8 @@ func TestRunPoolsIndependentRoundRobinAndFastCallback(t *testing.T) {
 	}
 	for n := 0; n < 16; n++ {
 		id, err := runners.Assign(ctx, fmt.Sprint(n), func(id string) error {
-			if got := poolPosition(runs, runners, id); got != n%4 {
-				return fmt.Errorf("runner position %d want %d", got, n%4)
+			if got := poolPosition(runs, runners, id); got < 0 {
+				return fmt.Errorf("missing runner pool identity: %d", got)
 			}
 			if !validRunID(runKindSandbox, id) {
 				return fmt.Errorf("changed RunID: %s", id)
@@ -92,10 +92,9 @@ func TestRunPoolsIndependentRoundRobinAndFastCallback(t *testing.T) {
 		}
 		runs.forget(id)
 		if n%3 == 0 {
-			want := (n / 3) % 2
 			id, err := builders.Assign(ctx, "build", func(id string) error {
-				if got := poolPosition(runs, builders, id); got != want {
-					return fmt.Errorf("builder position %d want %d", got, want)
+				if got := poolPosition(runs, builders, id); got < 0 {
+					return fmt.Errorf("missing builder pool identity: %d", got)
 				}
 				return nil
 			})
@@ -137,10 +136,12 @@ func TestRunPoolsConcurrentAssignments(t *testing.T) {
 		}(n)
 	}
 	wg.Wait()
+	var total int32
 	for i := range counts {
-		if counts[i].Load() != 30 {
-			t.Errorf("pool %d count %d", i, counts[i].Load())
-		}
+		total += counts[i].Load()
+	}
+	if total != 90 {
+		t.Fatalf("completed assignments=%d", total)
 	}
 	runs.mu.Lock()
 	defer runs.mu.Unlock()
@@ -167,10 +168,10 @@ func TestRunPoolsDoNotHoldSelectionLockOrFallback(t *testing.T) {
 		}
 		return fast(ctx, unit)
 	}
-	pools, ctx, _ := startPoolSet(t, runKindSandbox, []config.RunPoolConfig{{Unit: "slow@.service"}, {Unit: "fast@.service"}}, lc, runs)
+	pools, ctx, _ := startPoolSet(t, runKindSandbox, []config.RunPoolConfig{{Unit: "slow@.service", ResourcePool: "slow"}, {Unit: "fast@.service", ResourcePool: "fast"}}, lc, runs)
 	done := make(chan error, 1)
 	go func() {
-		_, err := pools.Assign(ctx, "slow", func(string) error { t.Error("failed request crossed pools"); return nil })
+		_, err := pools.assignInResourcePool(ctx, "slow", "slow", nil, func(string) error { t.Error("failed request crossed pools"); return nil })
 		done <- err
 	}()
 	select {
@@ -178,7 +179,7 @@ func TestRunPoolsDoNotHoldSelectionLockOrFallback(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	id, err := pools.Assign(ctx, "fast", func(id string) error {
+	id, err := pools.assignInResourcePool(ctx, "fast", "fast", nil, func(id string) error {
 		if poolPosition(runs, pools, id) != 1 {
 			return errors.New("wrong fast pool")
 		}
@@ -231,8 +232,8 @@ func TestRunPoolsPrewarmDuplicatesAndShutdownReclaim(t *testing.T) {
 	}
 	runs.mu.Lock()
 	defer runs.mu.Unlock()
-	if len(runs.waiting) != 0 || len(runs.units) != 0 {
-		t.Fatal("unassigned index retained")
+	if len(runs.waiting) != 0 || len(runs.units) != 4 || len(runs.owners) != 4 {
+		t.Fatal("shutdown must retire callbacks and retain unconfirmed execution ownership")
 	}
 }
 
@@ -265,8 +266,8 @@ func TestRunPoolsCancellationLateCallbackAndCommitFailure(t *testing.T) {
 			failure := errors.New("commit rejected")
 			go func() {
 				_, err := pools.Assign(ctx, "rejected", func(id string) error {
-					if poolPosition(runs, pools, id) != 1 {
-						t.Error("wrong pool")
+					if poolPosition(runs, pools, id) < 0 {
+						t.Error("missing pool identity")
 					}
 					return failure
 				})
@@ -288,6 +289,16 @@ func TestRunPoolsCancellationLateCallbackAndCommitFailure(t *testing.T) {
 			for n := 0; n < 2; n++ {
 				select {
 				case <-lc.stopped:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+			// Stop's notification occurs inside the launcher call. Retirement
+			// keeps ownership until that call returns and the journal is erased;
+			// ResetFailed is the existing control-loop completion boundary.
+			for n := 0; n < 2; n++ {
+				select {
+				case <-lc.reset:
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
 				}

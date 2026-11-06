@@ -96,8 +96,13 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 			return nil, fmt.Errorf("resource_listen: %w", rerr)
 		}
 		cfg.ResourceListen.Socket = r.Listen
-		cfg.ResourceListen.Resources.PhysicalMemory = strconv.FormatUint(r.PhysicalMemory, 10)
-		cfg.ResourceListen.Resources.PhysicalCPU = strconv.Itoa(int(r.PhysicalCPU / 1000))
+		// Explicit pool memory is already net allocatable. Resolve uses an
+		// internal envelope for it, not legacy node physical-resource input.
+		// Emitting that envelope would make a multi-pool dump invalid on reload.
+		if pools := cfg.ResourceListen.ResourcePoolConfigs(); len(pools) == 1 && pools[0].Allocatable.Memory == nil {
+			cfg.ResourceListen.Resources.PhysicalMemory = strconv.FormatUint(r.PhysicalMemory, 10)
+			cfg.ResourceListen.Resources.PhysicalCPU = strconv.FormatUint(r.PhysicalCPU/1000, 10)
+		}
 	}
 	output, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -182,7 +187,9 @@ paths:
 #     - {unit: sandbox-runner@.service, size: 0}
 #   builder_pools:
 #     - {unit: sandbox-builder@.service, size: 0}
-#   # Each entry is an independent round-robin slot; duplicate units/items are legal.
+#   # Each entry is an independent logical pool; equal priorities select randomly.
+#   # Optional name/resource_pool/capacity/priority apply to runner and builder pools.
+#   # size is an idle target; capacity bounds all instances and effective start reservations.
 #   # size is the idle target, not concurrency or weight; zero starts on demand.
 #   # Omit a list to use legacy runner/runner_pool_size or builder/builder_pool_size.
 #   # Empty lists and explicit old/new fields for the same kind are rejected.
@@ -266,6 +273,9 @@ builder:                                           # Build resources are separat
 # resource_listen:
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
+#   # pools: [{name: default, capacity: {cpu: 32, memory: 128GiB}, allocatable: {cpu: 8, memory: 24GiB}}]
+#   # Multiple pools require explicit net memory and omit legacy resources/margin.
+#   # Per-pool watermarks and external unit_dropins: see docs/resource-pools.md.
 #   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]

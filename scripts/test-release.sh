@@ -194,6 +194,7 @@ for entrypoint in \
   test/e2e/cases/orchestrator.resource-recovery.sh \
   test/e2e/cases/orchestrator.resource-reservation.sh \
   test/e2e/cases/orchestrator.resource-startup.sh \
+  test/e2e/cases/orchestrator.static-startup.sh \
   test/e2e/cases/orchestrator.runtask.sh \
   test/e2e/cases/orchestrator.snapshot.sh \
   test/e2e/cases/telemetry.backends.sh \

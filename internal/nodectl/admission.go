@@ -462,7 +462,11 @@ func (a *AdmissionController) resolveLaunch(sid string, pid int) (LaunchAdmissio
 	if a.LookupLaunch == nil {
 		return LaunchAdmission{}, nil
 	}
-	return a.LookupLaunch(sid, pid)
+	launch, err := a.LookupLaunch(sid, pid)
+	if err == nil && launch.ResourcePool != "" && a.state != nil {
+		err = a.state.BindResourcePool(sid, launch.ResourcePool)
+	}
+	return launch, err
 }
 
 func (a *AdmissionController) analyzePending(p *PendingAdmit) Outcome {

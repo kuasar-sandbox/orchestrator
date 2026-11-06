@@ -316,7 +316,7 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `paths.admin_pidfile` | Empty | Multiline PID allowlist for admin, allowing `#` comments; otherwise socket mode 0600 alone |
 | `paths.plugin_pidfile` | Empty | Multiline PID allowlist for Proxy/agent plugin registration; otherwise socket mode 0600 alone |
 | `units.dir` | `/etc/systemd/system` | Template-unit installation directory |
-| `units.runner_pools` / `units.builder_pools` | Absent | Independent ordered pools of `{unit, size}`; see below |
+| `units.runner_pools` / `units.builder_pools` | Absent | Independent pools with name, resource_pool, unit, size, capacity and priority; see below |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | Template-unit names |
 | `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | Idle prestarted RunID unit counts; zero still starts on-demand units through WaitAssignment. Finite execution admission resources permit a nonzero Builder pool; idle units hold no Build claim |
 | `units.pool_wait_timeout` | `5s` | Positive budget from StartUnit through entry into WaitAssignment; timeout cleans that RunID and replenishes the pool |
@@ -367,13 +367,14 @@ user-supplied images remain compatible; sync/quiesce, snapshot/restore and mount
 behavior are unchanged. Apply this only when creating a new empty template,
 never by reformatting an existing data disk.
 
-The primary use case is [NUMA deployment (§5.3)](#numa-deployment): distinct templates carry per-node CPU/memory placement, and new executions are assigned round-robin. The repeated-template example below illustrates configuration semantics, not distinct NUMA bindings.
+The primary use case is [NUMA deployment (§5.3)](#numa-deployment): distinct templates carry per-node CPU/memory placement. [Resource pools](resource-pools.md) add capacity-aware placement and pressure recovery. The repeated-template example below illustrates configuration semantics, not distinct NUMA bindings.
 
-Each `units.runner_pools` / `units.builder_pools` entry contains only `unit` and
-`size`. Each entry creates an independent pool, including repeated templates and
-completely identical entries. `size >= 0` is the target number of idle prestarted
-workers, not execution capacity or round-robin weight; zero participates and
-starts on demand. `dir`, `install` and `pool_wait_timeout` are shared.
+Each `units.runner_pools` / `units.builder_pools` entry accepts `name`,
+`resource_pool`, `unit`, `size`, `capacity` and `priority`. Each entry creates an
+independent pool; templates may be shared within the same resource pool.
+`size >= 0` is the idle prewarm target; zero starts on demand. Optional capacity
+limits all instances and effective start reservations. Higher priority wins,
+with random ties. `dir`, `install` and `pool_wait_timeout` are shared.
 
 ```yaml
 units:
@@ -1148,14 +1149,11 @@ Conductor selects a pool and its systemd template; the operator configures CPU
 placement and memory allocation on that template. This is host-side placement,
 not guest vNUMA topology or a NUMA-aware capacity scheduler.
 
-**NUMA isolation is an upper-layer application pattern built on multiple pools,
-not a new isolation capability implemented by Conductor.** The following is a
-deployment configuration example, not a project test specification. Project
-acceptance covers pool configuration, independent prewarming, simple round-robin,
-actual-unit lookup and the existing lifecycle, plus static example/documentation
-checks. Real NUMA hosts, page-distribution checks, NUMA E2E and performance tests
-are neither required nor scheduled for this feature; they are not merge
-prerequisites or outstanding delivery work.
+NUMA placement is enforced by systemd/Linux. The example below installs placement
+policies manually. To account and schedule each NUMA budget independently, use
+the [resource-pool configuration](resource-pools.md#configuration), including
+`resource_pool` associations and external `unit_dropins`. Validate effective CPU
+and memory-node masks, page placement and cross-pool recovery on the actual host.
 
 For a host with online, memory-bearing NUMA nodes 0 and 1, use distinct template
 names for distinct placement policies. The following replaces the `units` block
@@ -1237,8 +1235,8 @@ Preserve the deployment's executable paths, `%i` **RunID**, pidfile/config socke
 aliases to represent different placements. Conductor does not install or reload
 anything in that mode.
 
-Runner assignments alternate between the two runner pools; Builder assignments
-independently alternate between the two Builder pools. A prewarmed process is
+Runner and Builder assignments use priority with random ties within the selected
+resource pool. A prewarmed process is
 already placed before assignment. Runner children and Builder child
 processes remain under the selected unit; the Builder's A/B/C phases that actually
 run use that same Builder, not fresh pool selections. In-guest work runs through
@@ -1247,11 +1245,10 @@ so placement belongs on their templates. See [Build §4.1](node-build.md#41-buil
 
 The deployment retains these boundaries:
 
-- Two entries sharing one template share its placement policy; duplication does
-  not automatically bind them to different nodes. `size` does not weight the
-  round-robin sequence or limit active workers. Equal assignment counts are not
-  equal CPU/memory usage or per-NUMA admission budgets; existing node-global
-  admission and Build FIFO/claims remain unchanged.
+- Two entries sharing one template must share its resource pool and placement
+  policy; duplication does not bind them to different nodes. `size` is an idle
+  target. Resource-pool capacity and runtime usage govern placement; Builder
+  business FIFO/claims remain separate.
 - A bound execution stays with its actual unit, including Conductor restart.
   Pause/resume requiring a new runner selects again and may use the other node;
   the feature supplies no sticky NUMA placement, live migration or host-node
@@ -1263,7 +1260,8 @@ The deployment retains these boundaries:
   despite free memory elsewhere. Conductor does not retry another pool. A
   deliberate `NUMAPolicy=preferred` fallback configuration must also remove or
   widen single-node `AllowedMemoryNodes`; cpuset restrictions take precedence.
-  That trades strict memory locality for fallback, not NUMA-aware scheduling.
+  That trades strict memory locality for fallback; resource-pool accounting
+  still follows the execution's selected pool.
 
 Setting semantics: [systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html),
 [systemd.resource-control(5)](https://manpages.debian.org/trixie/systemd/systemd.resource-control.5.en.html),

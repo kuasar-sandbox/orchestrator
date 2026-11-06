@@ -33,6 +33,9 @@ type Store struct {
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS run_pool_ownership (run_id TEXT PRIMARY KEY, ownership TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_pool_pressure (name TEXT PRIMARY KEY, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS resource_recovery_placement (sandbox_id TEXT PRIMARY KEY, placement TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sandboxes (
   id                   TEXT PRIMARY KEY,
   instance_id          TEXT NOT NULL DEFAULT '',
@@ -185,6 +188,13 @@ CREATE TABLE IF NOT EXISTS manifest_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_ascandidate ON manifest_keys(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_key_hash);
+CREATE TRIGGER IF NOT EXISTS resource_recovery_clear AFTER UPDATE OF resource_obligation ON sandboxes
+ WHEN NEW.resource_obligation=0 BEGIN
+ DELETE FROM resource_recovery_placement WHERE sandbox_id=NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS resource_recovery_delete AFTER DELETE ON sandboxes BEGIN
+ DELETE FROM resource_recovery_placement WHERE sandbox_id=OLD.id;
+END;
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used

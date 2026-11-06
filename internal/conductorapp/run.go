@@ -106,6 +106,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 			return err
 		}
 	}
+	if err := core.RestoreRunPoolIdentities(ctx); err != nil {
+		return fmt.Errorf("restore run pool identities: %w", err)
+	}
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}

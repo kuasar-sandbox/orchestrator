@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
 )
@@ -309,6 +310,53 @@ resource_listen:
 	}
 	if strings.Contains(text, "control_socket:") {
 		t.Fatalf("--resolve exposes removed control_socket:\n%s", text)
+	}
+}
+
+func TestRenderConductorConfigResolvePreservesResourcePools(t *testing.T) {
+	for _, multi := range []bool{false, true} {
+		name := "single"
+		extra := ""
+		if multi {
+			name = "multiple"
+			extra = "    - {name: second, allocatable: {memory: 2GiB, cpu: 4}}\n"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := writeConductorConfig(t, `
+api: {domain: config.test}
+encryption_key: test-key
+sandbox:
+  boot: {kernel: /kernel, runtime: /runtime}
+units:
+  runner_pools: [{unit: runner@.service, resource_pool: first, size: 0}]
+  builder_pools: [{unit: builder@.service, resource_pool: first, size: 0}]
+resource_listen:
+  enabled: true
+  pools:
+    - {name: first, capacity: {cpu: 8}, allocatable: {memory: 1GiB}}
+`+extra)
+			out, err := renderConductorConfig(false, true, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(out), "physical_memory:") || strings.Contains(string(out), "operational_margin_factor:") {
+				t.Fatal("resolved explicit pools acquired legacy physical-resource input")
+			}
+			if err := os.WriteFile(path, out, 0600); err != nil {
+				t.Fatal(err)
+			}
+			reloaded, err := config.LoadConductor(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := nodectl.Resolve(reloaded.ResourceListen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.Pools[0].Allocatable.MemoryBytes != 1<<30 || resolved.Pools[0].Allocatable.CPUMilli != 8000 || multi && len(resolved.Pools) != 2 {
+				t.Fatalf("resolved pool budgets changed on reload: %+v", resolved.Pools)
+			}
+		})
 	}
 }
 

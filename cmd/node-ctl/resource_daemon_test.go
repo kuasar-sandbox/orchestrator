@@ -35,6 +35,9 @@ func TestResourceProbeSaturatesConservativeRecoveryCharge(t *testing.T) {
 // even though no live reservation alone explains the outstanding obligation.
 func TestResourceProbeExportsEffectiveCriticalWithoutInventingReservation(t *testing.T) {
 	s := nodectl.NewState(1000, 1000, 0, 0, nodectl.Watermarks{LowFactor: .7, HighFactor: .85, EmergencyFactor: .05, StartupFactor: .5})
+	if err := s.ConfigurePressure(nodectl.DefaultPressurePolicy(), nodectl.PressureRecord{Zone: nodectl.ZoneCritical, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
 	s.ObserveObligation("paused", 1, "paused", false)
 	p := conductorapp.NewResourceProbe(s, nodectl.NewAdmissionController(nodectl.AdmissionPolicy{})).Snapshot()
 	if p.Zone != "critical" || p.Allocated != 0 || p.Pool != 1000 {

@@ -128,6 +128,7 @@ func TestMultiPoolSandboxRecoveryAndIndexLifetime(t *testing.T) {
 				lc.units = append(lc.units, launcher.Unit{Name: actual, ActiveState: "active"})
 			}
 			o.lc = lc
+			refreshRunPoolsForTest(o)
 			o.vs = &reconcileVS{}
 			switch state {
 			case "paused":

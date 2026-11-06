@@ -35,10 +35,13 @@ func OperationAllowed(zone Zone, op Operation) bool {
 // starting operation. SavedSource permits a complete, serialized saved budget;
 // it does not grant critical eligibility.
 type LaunchAdmission struct {
-	Operation   Operation
-	SavedSource bool
-	Accepted    bool
-	Identity    string
+	Background bool // coordinator preflight only; never supplied by the resource RPC
+
+	ResourcePool string
+	Operation    Operation
+	SavedSource  bool
+	Accepted     bool
+	Identity     string
 }
 
 type PressurePolicy struct {
@@ -178,6 +181,14 @@ func (s *State) initPressureLocked() {
 }
 
 func (s *State) ConfigurePressure(policy PressurePolicy, record PressureRecord) error {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			if err := p.ConfigurePressure(policy, PressureRecord{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if err := policy.Validate(); err != nil {
 		return err
 	}
@@ -247,7 +258,7 @@ func (s *State) advancePressureLocked(now time.Time) {
 	if zoneRank(raw) > zoneRank(p.record.Zone) {
 		s.transitionPressureLocked(raw, "reservation", now)
 	}
-	if p.pending > 0 || p.cleanup > 0 {
+	if p.record.Zone == ZoneCritical && (p.pending > 0 || p.cleanup > 0) {
 		s.transitionPressureLocked(ZoneCritical, "recovery_obligation", now)
 		p.holdSince = time.Time{}
 		return
@@ -292,6 +303,14 @@ func (s *State) advancePressureLocked(now time.Time) {
 }
 
 func (s *State) CheckOperation(op Operation) error {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			if p.CheckOperation(op) == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("no pool permits operation %d", op)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
@@ -306,6 +325,12 @@ func (s *State) CheckOperation(op Operation) error {
 // capture intent). Versions fence stale callbacks. Empty phase discharges Q but
 // can retain a separate cleanup barrier; it never releases a reservation.
 func (s *State) ObserveObligation(sid string, version uint64, phase string, cleanup bool) {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			p.ObserveObligation(sid, version, phase, cleanup)
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observeObligationLocked(sid, version, phase, cleanup, cleanup, false)
@@ -314,6 +339,12 @@ func (s *State) ObserveObligation(sid string, version uint64, phase string, clea
 // ObserveResourceObligation distinguishes remaining lifecycle ownership from
 // reservation charge, so a resource Release cannot certify network/run cleanup.
 func (s *State) ObserveResourceObligation(sid string, version uint64, phase string, owner, accountCharge bool) {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			p.ObserveResourceObligation(sid, version, phase, owner, accountCharge)
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observeObligationLocked(sid, version, phase, owner || (accountCharge && s.bySID[sid] != nil), owner, accountCharge)
@@ -423,6 +454,12 @@ func (s *State) protectedLocked(owner string) uint64 {
 }
 
 func (s *State) ForgetDemand(key string) {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			p.ForgetDemand(key)
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
@@ -442,10 +479,24 @@ func (s *State) TryClaimBackgroundRecovery(sid string) bool {
 		return false
 	}
 	s.pressure.backgroundRecovery = sid
+	// The node serializes recovery, but competing demand is a target-pool
+	// decision. Mark the identity in every ledger so selection can move it.
+	for _, p := range s.pools {
+		p.mu.Lock()
+		p.initPressureLocked()
+		p.pressure.backgroundRecovery = sid
+		p.mu.Unlock()
+	}
+
 	return true
 }
 
 func (s *State) ReleaseBackgroundRecovery(sid string) {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			p.ReleaseBackgroundRecovery(sid)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
@@ -469,6 +520,10 @@ func (s *State) competingExecutableDemandLocked(sid string, now time.Time) bool 
 }
 
 func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budget uint64) {
+	if p := s.forSID(sid); p != s {
+		p.RecordAdmissionWait(sid, admission, budget)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
@@ -477,6 +532,12 @@ func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budge
 		return
 	}
 	oc := s.admissionBudgetLocked(sid, budget, admission)
+	if admission.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid {
+		if d := s.pressure.demands["admit:"+sid]; d != nil && d.identity == admission.Identity {
+			s.clearDemandLocked("admit:" + sid)
+		}
+		return
+	}
 	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByRecoveryPolicy {
 		// A policy fence is not executable memory demand. In particular it
 		// must not trigger Pause to make its own projected watermark safe.
@@ -519,6 +580,9 @@ func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budge
 }
 
 func (s *State) PressureSnapshot() PressureSnapshot {
+	if s.pools != nil {
+		return s.aggregatePressureSnapshot()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
@@ -595,6 +659,12 @@ func (e *AdmissionWaitError) Error() string {
 }
 
 func (s *State) AnalyzeLaunch(sid string, budget uint64, launch LaunchAdmission) Outcome {
+	if p := s.forSID(sid); p != s {
+		return p.AnalyzeLaunch(sid, budget, launch)
+	}
+	if s.pools != nil {
+		return Outcome{Status: OutcomeLongTermReject, RejectCode: "pool_identity", RejectMsg: "resource pool identity unavailable"}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.admissionBudgetLocked(sid, budget, launch)
@@ -605,7 +675,7 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 	now := s.pressure.clock()
 	s.advancePressureLocked(now)
 	pool := s.AllocatablePool.MemoryBytes
-	backgroundRecovery := launch.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid
+	backgroundRecovery := launch.Operation == OperationRecovery && (launch.Background || s.pressure.backgroundRecovery == sid)
 	if backgroundRecovery && s.competingExecutableDemandLocked(sid, now) {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 	}
@@ -613,14 +683,9 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 	if budget == 0 || pool == 0 || budget > pool {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_node_capacity", RejectMsg: "initial budget exceeds node pool"}
 	}
-	// Unattended recovery is deliberately more conservative than an explicit
-	// Wake: it must not consume enough managed-pool headroom to recreate the
-	// node's red/critical reservation pressure. The exact saved Budget is known
-	// here, so this uses the existing raw watermarks without a new margin or
-	// host-memory signal. Explicit/user recovery has no coordinator claim and
-	// keeps the normal OperationRecovery admission semantics.
+	// Background work waits for actual budget; it never creates pressure demand.
 	if backgroundRecovery {
-		if s.reservedMemory > pool || budget > pool-s.reservedMemory || zoneRank(s.memoryZoneForReservedLocked(s.reservedMemory+budget)) >= zoneRank(ZoneRed) {
+		if s.reservedMemory > pool || budget > pool-s.reservedMemory {
 			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 		}
 	}
@@ -665,6 +730,9 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 }
 
 func (s *State) CanPressurePause(sid string) bool {
+	if p := s.forSID(sid); p != s {
+		return p.CanPressurePause(sid)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.bySID[sid]
@@ -674,6 +742,15 @@ func (s *State) CanPressurePause(sid string) bool {
 // BeginPressurePause registers Q under the same mutex as zone decisions before
 // the node commits intent or performs capture. It never calls a lifecycle owner.
 func (s *State) BeginPressurePause(sid string, version uint64) bool {
+	return s.beginPressurePause(sid, version, false)
+}
+func (s *State) BeginBalancePause(sid string, version uint64) bool {
+	return s.beginPressurePause(sid, version, true)
+}
+func (s *State) beginPressurePause(sid string, version uint64, balance bool) bool {
+	if p := s.forSID(sid); p != s {
+		return p.beginPressurePause(sid, version, balance)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.bySID[sid]
@@ -691,9 +768,9 @@ func (s *State) BeginPressurePause(sid string, version uint64) bool {
 	if old, found := s.pressure.obligations[sid]; found && (old.version > version || old.version == version && old.phase != "") {
 		return false
 	}
-	eligible := false
+	eligible := balance && s.memoryZoneForReservedLocked(s.reservedMemory) == ZoneCritical
 	for _, d := range s.pressure.demands {
-		if d.memoryBlocked && s.pressure.demandFresh(d, s.pressure.clock()) && d.critical >= s.pressure.policy.PauseAfterRounds {
+		if !balance && d.memoryBlocked && s.pressure.demandFresh(d, s.pressure.clock()) && d.critical >= s.pressure.policy.PauseAfterRounds {
 			eligible = true
 		}
 	}
@@ -718,6 +795,14 @@ func (s *State) BeginPressurePause(sid string, version uint64) bool {
 
 // ForgetAdmissionWait only cancels the exact unused launch protection.
 func (s *State) ForgetAdmissionWait(sid, identity string) {
+	if s.pools != nil {
+		// Cancellation can arrive after old resources were released and the
+		// SID was rebound. Match the exact launch identity in every pool.
+		for _, p := range s.pools {
+			p.ForgetAdmissionWait(sid, identity)
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
@@ -732,6 +817,12 @@ func (s *State) ForgetAdmissionWait(sid, identity string) {
 // ordinary object with no pressure history. A charged or obligated predecessor
 // cannot be reset. Runtime callbacks do not call this method.
 func (s *State) ResetPressureIdentity(sid string) {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			p.ResetPressureIdentity(sid)
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if old, found := s.pressure.obligations[sid]; found && old.phase == "" && !old.cleanup {
@@ -744,6 +835,12 @@ func (s *State) ResetPressureIdentity(sid string) {
 // discard this deleted object's bookkeeping instead of retaining tombstones
 // for every sandbox ever run by this node.
 func (s *State) RetirePressureIdentity(sid string) {
+	if s.pools != nil {
+		for _, p := range s.pools {
+			p.RetirePressureIdentity(sid)
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ob, found := s.pressure.obligations[sid]

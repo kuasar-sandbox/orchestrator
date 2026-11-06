@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -20,6 +21,7 @@ import (
 // standalone daemon and no separate config file — the tuning is inlined in serve's
 // config and consumed directly here.
 type Resolved struct {
+	Pools           []ResolvedPool
 	Listen          string // absolute bind/dial path; may retain a short parent alias
 	SocketIdentity  string // canonical owner/lease inventory identity
 	CgroupScanPaths []string
@@ -46,6 +48,25 @@ type Resolved struct {
 // error if any field is malformed.
 func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	c.ApplyDefaults()
+	if c.Admission.Rate <= 0 {
+		return nil, fmt.Errorf("resource_listen.admission.rate must be > 0")
+	}
+	if c.Admission.Burst <= 0 {
+		return nil, fmt.Errorf("resource_listen.admission.burst must be > 0")
+	}
+	if err := c.ValidatePools(); err != nil {
+		return nil, err
+	}
+	// Explicit pool memory is already net allocatable; legacy host deductions
+	// are only used when the sole pool omits memory.
+	input := c
+	copy := *c
+	if pools := c.ResourcePoolConfigs(); pools[0].Allocatable.Memory != nil {
+		copy.Resources.PhysicalMemory = *pools[0].Allocatable.Memory
+		copy.Resources.HostReserved.Memory = "0"
+		copy.Watermarks.OperationalMarginFactor = 0
+	}
+	c = &copy
 
 	listen := c.Socket
 	if listen == "" {
@@ -86,11 +107,14 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	if c.Resources.PhysicalCPU == "auto" || c.Resources.PhysicalCPU == "" {
 		out.PhysicalCPU = uint64(runtime.NumCPU()) * 1000
 	} else {
-		var cores int
-		if _, err := fmt.Sscanf(c.Resources.PhysicalCPU, "%d", &cores); err != nil {
-			return nil, fmt.Errorf("physical_cpu: %w", err)
+		cores, err := strconv.ParseUint(c.Resources.PhysicalCPU, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("resource_listen.resources.physical_cpu must be auto or a complete decimal integer: %w", err)
 		}
-		out.PhysicalCPU = uint64(cores) * 1000
+		if cores > math.MaxUint64/1000 {
+			return nil, fmt.Errorf("resource_listen.resources.physical_cpu exceeds the millicore range")
+		}
+		out.PhysicalCPU = cores * 1000
 	}
 
 	hostMem, err := util.ParseSize(c.Resources.HostReserved.Memory)
@@ -100,9 +124,15 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	if hostMem >= out.PhysicalMemory {
 		return nil, fmt.Errorf("host_reserved.memory (%d) must be < physical_memory (%d)", hostMem, out.PhysicalMemory)
 	}
+	// The float64 representation of MaxUint64 rounds to 2^64. Use that
+	// exclusive bound before multiplication, retaining legacy truncation.
+	hostCPU := c.Resources.HostReserved.CPU
+	if !finiteFactor(hostCPU) || hostCPU >= math.Ldexp(1, 64)/1000 {
+		return nil, fmt.Errorf("resource_listen.resources.host_reserved.cpu must be finite, non-negative and representable in millicores")
+	}
 	out.HostReserved = Resources{
 		MemoryBytes: hostMem,
-		CPUMilli:    uint64(c.Resources.HostReserved.CPU * 1000),
+		CPUMilli:    uint64(hostCPU * 1000),
 	}
 
 	out.Watermarks = Watermarks{
@@ -198,8 +228,53 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		MinGrantStep:           4 << 20,   // 4 MiB
 		MaxGrantStep:           512 << 20, // 512 MiB
 	}
+	for i, cfg := range input.ResourcePoolConfigs() {
+		p := ResolvedPool{Name: cfg.Name, Allocatable: Resources{MemoryBytes: pool}, Watermarks: out.Watermarks}
+		if cfg.Capacity.Memory != nil {
+			p.Capacity.MemoryBytes, _ = util.ParseSize(*cfg.Capacity.Memory)
+		}
+		if cfg.Capacity.CPU != nil {
+			p.Capacity.CPUMilli = cpuMilliCeil(*cfg.Capacity.CPU)
+		}
+		if cfg.Allocatable.Memory != nil {
+			p.Allocatable.MemoryBytes, _ = util.ParseSize(*cfg.Allocatable.Memory)
+		}
+		p.MemoryGrantPerSecBytes = scaleUint64Floor(p.Allocatable.MemoryBytes, c.RateLimits.MemoryGrantPerSecFactor)
+		if p.MemoryGrantPerSecBytes == 0 {
+			return nil, fmt.Errorf("resource_listen.rate_limits.memory_grant_per_sec_factor produces zero bytes/s for resource_listen.pools[%d] (%s) effective allocatable.memory", i, p.Name)
+		}
+		p.Allocatable.CPUMilli = p.Capacity.CPUMilli
+		if cfg.Allocatable.CPU != nil {
+			p.Allocatable.CPUMilli = cpuMilliCeil(*cfg.Allocatable.CPU)
+		}
+		p.CPUWatermarks = p.Watermarks
+		for dimension, override := range cfg.Watermarks {
+			w := override.Resolve(input.Watermarks)
+			target := &p.Watermarks
+			if dimension == "cpu" {
+				target = &p.CPUWatermarks
+			}
+			target.LowFactor, target.HighFactor, target.EmergencyFactor = w.LowFactor, w.HighFactor, w.EmergencyFactor
+		}
+		low := scaleUint64Floor(p.Allocatable.MemoryBytes, p.Watermarks.LowFactor)
+		high := scaleUint64Floor(p.Allocatable.MemoryBytes, p.Watermarks.HighFactor)
+		critical := p.Allocatable.MemoryBytes - scaleUint64Floor(p.Allocatable.MemoryBytes, p.Watermarks.EmergencyFactor)
+		if low >= high || high >= critical || p.Watermarks.StartupFactor <= p.Watermarks.EmergencyFactor {
+			return nil, fmt.Errorf("pool %s has invalid rounded memory thresholds or startup factor", p.Name)
+		}
+		out.Pools = append(out.Pools, p)
+	}
 
 	return out, nil
+}
+
+type ResolvedPool struct {
+	MemoryGrantPerSecBytes uint64
+	Name                   string
+	Capacity               Resources
+	Allocatable            Resources
+	Watermarks             Watermarks
+	CPUWatermarks          Watermarks
 }
 
 func finiteFactor(value float64) bool {

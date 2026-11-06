@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"gopkg.in/yaml.v3"
 )
 
@@ -91,24 +93,145 @@ func TestStaticStartupRequestIsAccepted(t *testing.T) {
 	}
 }
 
-func TestStaticStartupRestoreRequestIsRejectedSynchronously(t *testing.T) {
-	cfg := &config.Config{}
-	lc := &countingLauncher{}
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
-	vs := &resourcePreflightVS{}
-	o.vs = vs
-	req := createRequestFixture(t, o, "7")
-	req.TemplateID = types.TemplateID{
-		Profile: types.ProfileBare,
-		Kind:    types.KindSnp,
-		Ref:     "manifest://" + strings.Repeat("7", 64),
-	}.String()
-	req.Metadata[sandboxcfg.NsResource] = `{"startup":{"memory":"1GiB"}}`
-
-	if _, err := o.Create(ctx, req); !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("Create error = %v, want ErrBadRequest", err)
+func TestStaticExplicitStartupSurvivesPauseAndResume(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		for _, mode := range []types.ResumeMode{types.ResumeMemory, types.ResumeCold} {
+			t.Run(fmt.Sprintf("disabled=%t/%s", disabled, mode), func(t *testing.T) {
+				installCheckpointSandboxCtl(t)
+				cfg := &config.Config{}
+				cfg.Checkpoint.Mode = config.CheckpointLocal
+				if disabled {
+					cfg.ResourceListen = &config.ResourceListenConfig{Enabled: false}
+				}
+				launchModes := make(chan string, 2)
+				lc := &countingLauncher{artifactLaunchModes: launchModes}
+				o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+				barrier := &fakePauseBarrier{fakeRouteBarrier: newFakeRouteBarrier(nil, nil)}
+				barrier.release()
+				o.pauseBarriers = barrier
+				req := createRequestFixture(t, o, "6")
+				req.Metadata[sandboxcfg.NsResource] = `{"startup":{"memory":"1GiB"}}`
+				created, err := o.Create(ctx, req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				initial := waitForSandbox(t, o, ctx, created.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "initial static image")
+				if _, err := o.Pause(ctx, created.ID, req.APIKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}); err != nil {
+					t.Fatal(err)
+				}
+				paused := waitForSandbox(t, o, ctx, created.ID, func(sb *types.Sandbox) bool { return sb.State == types.StatePaused && sb.RunID == "" }, "released checkpoint")
+				if paused.ResumeSource.Ref != checkpointSnapshotRef || paused.ResumeSource.SandboxRef != checkpointSandboxRef {
+					t.Fatalf("checkpoint source=%+v", paused.ResumeSource)
+				}
+				if _, _, err := o.ensureResumeAccepted(ctx, created.ID, nil, types.ResumeRequest{Trigger: types.ResumeTriggerConnect, Mode: mode}, nil); err != nil {
+					t.Fatal(err)
+				}
+				current := waitForSandbox(t, o, ctx, created.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "static resume")
+				if current.RunID == initial.RunID {
+					t.Fatal("resume reused retired runner")
+				}
+				wantMode := types.LaunchMemory
+				if mode == types.ResumeCold {
+					wantMode = types.LaunchCold
+				}
+				select {
+				case got := <-launchModes:
+					if got != string(wantMode) {
+						t.Fatalf("artifact launch=%s want %s", got, wantMode)
+					}
+				default:
+					t.Fatal("missing artifact preparation")
+				}
+				body, err := os.ReadFile(o.sandboxConfigPath(current))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rendered rtconfig.SandboxConfig
+				if err := yaml.Unmarshal(body, &rendered); err != nil {
+					t.Fatal(err)
+				}
+				if rendered.Resources.Control.Controller != "" || rendered.Resources.Startup == nil || rendered.Resources.Startup.Memory != "1GiB" {
+					t.Fatalf("static policy changed on resume: %+v", rendered.Resources)
+				}
+				// Use the actual sandboxer adapter with the rendered static config.
+				// A memory restore must ignore startup in favor of the saved budget.
+				hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{Context: ctx}, &rendered)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer hooks.Release("test complete")
+				var snapshot uint64
+				wantBudget := uint64(1 << 30)
+				if mode == types.ResumeMemory {
+					snapshot, wantBudget = 1536<<20, 1536<<20
+				}
+				budget, err := hooks.Admit(current.ID, snapshot)
+				if err != nil || budget != wantBudget {
+					t.Fatalf("SDK initial budget=%d want=%d err=%v", budget, wantBudget, err)
+				}
+			})
+		}
 	}
-	assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
+}
+
+func TestStartupCreateUsesSameResolverForStaticAndDynamicArtifacts(t *testing.T) {
+	for _, controller := range []string{"omitted", "disabled", "dynamic"} {
+		for _, kind := range []types.Kind{types.KindImg, types.KindSbx, types.KindSnp} {
+			for _, patch := range []string{`{}`, `{"startup":{}}`, `{"startup":{"memory":"1GiB"}}`, `{"startup":{"memory":"bad"}}`, `{"startup":{"memory":"3GiB"}}`} {
+				t.Run(fmt.Sprintf("%s/%s/%s", controller, kind, patch), func(t *testing.T) {
+					cfg := &config.Config{}
+					if controller != "omitted" {
+						cfg.ResourceListen = &config.ResourceListenConfig{Enabled: controller == "dynamic"}
+					}
+					lc := &countingLauncher{}
+					o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+					if controller == "dynamic" {
+						o.SetResourceControllerSocketIdentity(filepath.Join(cfg.Paths.RunRoot, "resource.sock"))
+					}
+					vs := &resourcePreflightVS{}
+					o.vs = vs
+					req := createRequestFixture(t, o, "7")
+					req.TemplateID = types.TemplateID{Profile: types.ProfileBare, Kind: kind, Ref: "manifest://" + strings.Repeat("7", 64)}.String()
+					req.Metadata[sandboxcfg.NsResource] = patch
+					created, err := o.Create(ctx, req)
+					invalid, oversized := strings.Contains(patch, "bad"), strings.Contains(patch, "3GiB")
+					if invalid || oversized && kind == types.KindImg {
+						if !errors.Is(err, api.ErrBadRequest) {
+							t.Fatalf("invalid synchronous input=%v", err)
+						}
+						assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
+						return
+					}
+					if err != nil || created == nil {
+						t.Fatalf("Create acceptance=%+v %v", created, err)
+					}
+					if oversized {
+						assertAsyncFreshRestoreFailure(t, o, ctx, created, vs, lc)
+						return
+					}
+					current := waitForSandbox(t, o, ctx, created.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "running with startup")
+					body, err := os.ReadFile(o.sandboxConfigPath(current))
+					if err != nil {
+						t.Fatal(err)
+					}
+					var rendered rtconfig.SandboxConfig
+					if err := yaml.Unmarshal(body, &rendered); err != nil {
+						t.Fatal(err)
+					}
+					want := "2GiB"
+					if strings.Contains(patch, "1GiB") {
+						want = "1GiB"
+					}
+					if rendered.Resources.Startup == nil || rendered.Resources.Startup.Memory != want {
+						t.Fatalf("startup=%+v", rendered.Resources.Startup)
+					}
+					if (rendered.Resources.Control.Controller != "") != (controller == "dynamic") {
+						t.Fatal("static test silently enabled dynamic controller")
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestPausedResumeSnapshotReadFailureReturnsToPausedAsynchronously(t *testing.T) {

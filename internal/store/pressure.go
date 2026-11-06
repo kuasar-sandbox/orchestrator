@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -12,16 +13,37 @@ import (
 
 // BeginResourcePause journals the obligation before any capture I/O. The SID
 // lifecycle fence belongs to orch; this exact-run CAS also protects recovery.
-func (s *Store) BeginResourcePause(ctx context.Context, sb *types.Sandbox) (bool, error) {
+func (s *Store) BeginResourcePause(ctx context.Context, sb *types.Sandbox, placements ...RecoveryPlacement) (bool, error) {
 	if sb == nil || sb.State != types.StateRunning || sb.RunID == "" {
 		return false, errors.New("resource pause requires an owned running sandbox")
 	}
-	r, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET pause_reason='resource-pressure', resource_obligation=1, pressure_version=pressure_version+1, pressure_since_ns=?
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	r, err := tx.ExecContext(ctx, `UPDATE sandboxes SET pause_reason='resource-pressure', resource_obligation=1, pressure_version=pressure_version+1, pressure_since_ns=?
  WHERE id=? AND state='running' AND run_id=? AND resource_obligation=0 AND pressure_version=? AND sandbox_result_run_id=''`, time.Now().UnixNano(), sb.ID, sb.RunID, sb.PressureVersion)
 	if err != nil {
 		return false, err
 	}
-	return sandboxUpdateChanged("begin resource pause", sb.ID, r)
+	changed, err := sandboxUpdateChanged("begin resource pause", sb.ID, r)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if len(placements) > 0 {
+		raw, err := json.Marshal(placements[0])
+		if err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_recovery_placement(sandbox_id,placement) VALUES(?,?) ON CONFLICT(sandbox_id) DO UPDATE SET placement=excluded.placement`, sb.ID, string(raw)); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // CancelResourcePause only cancels an uncommitted capture intent. A committed

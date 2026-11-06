@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -75,7 +76,11 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	assignStarted := time.Now()
 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
 	var commitStarted, commitFinished time.Time
-	runID, err := o.runnerPool.AssignWithFence(assignmentCtx, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
+	resourcePool := ""
+	if preparation.Placement != nil {
+		resourcePool = preparation.Placement.Pool
+	}
+	runID, err := o.runnerPool.assignInResourcePool(assignmentCtx, resourcePool, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
 		commitStarted = time.Now()
 		unlock := o.lifecycle.Lock(sb.ID)
 		defer unlock()
@@ -86,7 +91,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		if !changed {
 			return errLaunchOwnershipLost
 		}
-		if o.sandboxReadyTimeout > 0 {
+		if o.sandboxReadyTimeout > 0 && attempt.Deadline().IsZero() {
 			attempt.SetDeadline(time.Now().Add(o.sandboxReadyTimeout))
 		}
 		sb.RunID = runID
@@ -190,6 +195,77 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	resources, err := o.resolveArtifactResources(preparation.Spec, artifactCapacity)
 	if err != nil {
 		return launchFailed("resource_resolve", fmt.Errorf("orch: resolve restored sandbox resources: %w", err))
+	}
+	if controller := o.memoryPressure.Load(); controller != nil {
+		if preparation.Prepared != nil {
+			expected := configsock.CloneArtifactPrepareSummary(*preparation.Prepared)
+			expected.ResolutionDigest = summary.ResolutionDigest // each exact run has its own digest
+			if !configsock.EqualArtifactPrepareSummary(expected, summary) {
+				return launchFailed("artifact_prepare", errArtifactPrepareConflict)
+			}
+		}
+		if preparation.Placement == nil {
+			capacity, err := schedulingCapacity(resources)
+			if err != nil {
+				return err
+			}
+			owner, ok := o.runs.ownership(sb.RunID)
+			if !ok {
+				return fmt.Errorf("missing preparation runner identity")
+			}
+			exclude, err := o.recoveryExclusion(ctx, sb)
+			if err != nil {
+				return err
+			}
+			supply, err := o.placementSupply(ctx, sb, capacity, owner.ResourcePool)
+			if err != nil {
+				return err
+			}
+			claim, err := controller.state.ReservePlacement(sb.ID, nodectl.NewToken(), capacity, launchAdmission(sb).Operation, exclude, supply)
+			if err != nil {
+				return launchFailed("placement", err)
+			}
+			defer controller.state.ReleasePlacement(sb.ID, claim.Identity)
+			if claim.Pool != owner.ResourcePool {
+				// Keep the old runner in the durable sandbox row until the existing
+				// lifecycle fence confirms exit, so any failure uses normal cleanup.
+				// Stop may synchronously report its prepare-only exit. Hold the SID
+				// lock through unbinding so its result/session finalizer cannot cancel
+				// the accepted launch while ownership is moving to the next runner.
+				unlock := o.lifecycle.Lock(sb.ID)
+				if err := o.fenceSandboxRunner(ctx, sb.RunID); err != nil {
+					unlock()
+					return launchFailed("prepare_runner_stop", err)
+				}
+				changed, err := o.st.UnbindPreparedRunner(ctx, sb.ID, sb.RunID)
+				if err != nil || !changed {
+					unlock()
+					if err == nil {
+						err = errLaunchOwnershipLost
+					}
+					return err
+				}
+				oldRun := sb.RunID
+				attempt.SetRunID("")
+				sb.RunID = ""
+				o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = "" })
+				unlock()
+				o.runs.forget(oldRun)
+				cancelLaunch()
+				readyListener.Close()
+				<-readinessResult
+				attempt.ResetPreparation()
+				finalPublished = true
+				next := *preparation
+				next.Placement = &claim
+				next.Prepared = &summary
+				return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, &next)
+			}
+			preparation.Placement = &claim
+		}
+		if err := o.bindPreparedPlacement(ctx, sb, *preparation.Placement); err != nil {
+			return err
+		}
 	}
 	mergedNetwork := sandboxcfg.MergeNetwork(inheritedNetwork, preparation.Spec.Network)
 	network, err := o.resolveNetwork(tmpl.Profile, mergedNetwork, o.cfg.Sandbox.Network.Hostname)

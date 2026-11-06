@@ -49,11 +49,21 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 			files[pool.Unit] = kind.content
 		}
 	}
+	dropins, err := o.resourcePoolDropins()
+	if err != nil {
+		return err
+	}
+	for name, content := range dropins {
+		files[name] = content
+	}
 	changed := false
 	for name, content := range files {
 		path := filepath.Join(o.cfg.Units.Dir, name)
 		if old, err := os.ReadFile(path); err == nil && string(old) == content {
 			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
 		}
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("orch: install unit %s: %w", name, err)
@@ -61,12 +71,58 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 		changed = true
 		o.log.Info("installed unit", "path", path)
 	}
+	// Only our namespaced fragments are eligible for removal, including templates
+	// no longer configured. Administrator fragments are never rewritten.
+	stale, err := filepath.Glob(filepath.Join(o.cfg.Units.Dir, "*@.service.d", "50-kuasar-resource-pool-*.conf"))
+	if err != nil {
+		return err
+	}
+	for _, path := range stale {
+		rel, err := filepath.Rel(o.cfg.Units.Dir, path)
+		if err != nil {
+			return err
+		}
+		if _, keep := files[rel]; keep {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		changed = true
+	}
 	if changed {
 		if err := o.lc.Reload(ctx); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (o *Orchestrator) resourcePoolDropins() (map[string]string, error) {
+	if err := o.cfg.ValidateResourcePools(); err != nil {
+		return nil, err
+	}
+	byPool := map[string][]string{}
+	for _, pool := range o.cfg.ResourceListen.ResourcePoolConfigs() {
+		byPool[pool.Name] = pool.UnitDropins
+	}
+	files := map[string]string{}
+	for _, pools := range [][]config.RunPoolConfig{o.cfg.Units.RunnerPoolConfigs(), o.cfg.Units.BuilderPoolConfigs()} {
+		for _, pool := range pools {
+			for i, source := range byPool[pool.ResourcePoolName()] {
+				path := filepath.Join(pool.Unit+".d", fmt.Sprintf("50-kuasar-resource-pool-%04d.conf", i))
+				if _, done := files[path]; done {
+					continue
+				}
+				content, err := os.ReadFile(source)
+				if err != nil {
+					return nil, fmt.Errorf("orch: read resource pool drop-in %s: %w", source, err)
+				}
+				files[path] = string(content)
+			}
+		}
+	}
+	return files, nil
 }
 
 func (o *Orchestrator) runnerUnitFile() string {

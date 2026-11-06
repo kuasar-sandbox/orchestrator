@@ -42,7 +42,7 @@ func TestMultiPoolBuildAdmissionRemainsGlobal(t *testing.T) {
 	key, _, _ := allowlistedBuildIdentity(t, o)
 	first := registerTriggerTestBuild(t, o, key)
 	second := registerTriggerTestBuild(t, o, key)
-	if o.builderRunPool.next != 0 {
+	if len(o.runs.units) != 0 {
 		t.Fatal("registration selected a pool")
 	}
 	if _, err := o.RegisterBuild(ctx, key, api.RegisterSpec{Name: "rejected", Profile: types.ProfileE2B, Resources: types.BuildResources{CPU: 2000, Memory: 2 << 30}}); err == nil {
@@ -53,14 +53,14 @@ func TestMultiPoolBuildAdmissionRemainsGlobal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if o.builderRunPool.next != 0 {
+	if len(o.runs.units) != 0 {
 		t.Fatal("trigger selected before execution admission")
 	}
 	done = make(chan struct{})
 	go func() { defer close(done); o.BuildPool(ctx, 10*time.Millisecond) }()
 	select {
 	case unit := <-lc.started:
-		if unitToRunIDFromTemplate("one@.service", unit) == "" {
+		if unitToRunIDFromTemplate("one@.service", unit) == "" && unitToRunIDFromTemplate("two@.service", unit) == "" {
 			t.Fatalf("first pool: %s", unit)
 		}
 	case <-time.After(3 * time.Second):
@@ -88,10 +88,14 @@ func TestMultiPoolBuildAdmissionRemainsGlobal(t *testing.T) {
 	if a.Status != types.BuildBuilding || b.Status != types.BuildWaiting {
 		t.Fatalf("FIFO order %s/%s", a.Status, b.Status)
 	}
-	o.builderRunPool.mu.Lock()
-	next := o.builderRunPool.next
-	o.builderRunPool.mu.Unlock()
-	if next != 1 || o.runnerPool.next != 0 {
-		t.Fatalf("rejected execution advanced cursors: builder=%d runner=%d", next, o.runnerPool.next)
+	o.runs.mu.Lock()
+	defer o.runs.mu.Unlock()
+	if len(o.runs.units) != 1 {
+		t.Fatalf("execution count=%d", len(o.runs.units))
+	}
+	for _, owner := range o.runs.owners {
+		if owner.kind != runKindBuild {
+			t.Fatal("build selected a sandbox runner")
+		}
 	}
 }

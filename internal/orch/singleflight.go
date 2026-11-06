@@ -69,6 +69,23 @@ func (a *launchAttempt) SetRunID(runID string) {
 	a.mu.Unlock()
 }
 
+// ResetPreparation follows confirmed retirement of a prepare-only run. It
+// keeps the accepted operation, cancellation and deadline, but no old handoff.
+func (a *launchAttempt) ResetPreparation() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.prepareChannelsLocked()
+	if !a.finalSet {
+		close(a.finalReady)
+	}
+	a.runID = ""
+	a.prepareReady, a.finalReady = make(chan struct{}), make(chan struct{})
+	a.prepare, a.finalSpec = nil, nil
+	a.prepareCount = 0
+	a.finalErr = nil
+	a.finalSet = false
+}
+
 func (a *launchAttempt) RunID() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -204,15 +221,22 @@ func (a *launchAttempt) publishFinal(spec *configsock.LaunchSpec, err error) {
 	a.mu.Unlock()
 }
 
-func (a *launchAttempt) WaitFinalSpec(ctx context.Context) (*configsock.LaunchSpec, error) {
+func (a *launchAttempt) WaitFinalSpec(ctx context.Context, expectedRun ...string) (*configsock.LaunchSpec, error) {
 	a.mu.Lock()
 	a.prepareChannelsLocked()
+	if len(expectedRun) > 0 && a.runID != expectedRun[0] {
+		a.mu.Unlock()
+		return nil, errLaunchOwnershipLost
+	}
 	ready := a.finalReady
 	a.mu.Unlock()
 	select {
 	case <-ready:
 		a.mu.Lock()
 		defer a.mu.Unlock()
+		if ready != a.finalReady || len(expectedRun) > 0 && a.runID != expectedRun[0] {
+			return nil, errLaunchOwnershipLost
+		}
 		return cloneLaunchSpec(a.finalSpec), a.finalErr
 	case <-ctx.Done():
 		return nil, ctx.Err()

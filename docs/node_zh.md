@@ -470,7 +470,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
-| `units.runner_pools` / `units.builder_pools` | 缺省 | 有序独立 `{unit, size}` pool 列表，见下文 |
+| `units.runner_pools` / `units.builder_pools` | 缺省 | 独立 pool 列表，支持 name/resource_pool/unit/size/capacity/priority，见下文 |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
 | `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | 空闲预启动 run-id 单元数;0 = 不保留 idle,有任务时仍按需经 WaitAssignment 流程启动. 有限 execution CPU/memory 准入资源允许非零 Builder pool,idle 单元不持有 Build claim.  |
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
@@ -519,11 +519,12 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 的模板和用户自带镜像继续兼容；sync/quiesce、快照/恢复及挂载行为保持不变。
 此约定仅适用于新建空模板，不要重新格式化已有数据盘。
 
-多池的主要应用场景是 [NUMA 部署（§5.3）](#numa-deployment)：由不同 unit 模板承载不同节点的 CPU/内存放置策略，再轮询分配新执行。以下重复模板示例仅说明配置语义，不代表不同 NUMA 绑定。
+多池的主要应用场景是 [NUMA 部署（§5.3）](#numa-deployment)：不同 unit 模板承载不同节点的 CPU/内存放置策略，[资源池](resource-pools_zh.md) 提供容量感知调度和压力恢复。以下重复模板示例仅说明配置语义，不代表不同 NUMA 绑定。
 
-`units.runner_pools` / `units.builder_pools` 每项仅包含 `unit` 和 `size`。
-每个列表项创建独立 pool，同类重复模板及完全相同的配置项也保留独立位置。
-`size >= 0` 是空闲预启动 worker 目标数，不是并发容量或轮询权重；0 仍参与轮询并按需启动。
+`units.runner_pools` / `units.builder_pools` 每项支持 name/resource_pool/unit/size/capacity/priority。
+每项创建独立 pool，同一资源池内允许共享模板。
+`size >= 0` 是 idle 预热目标，0 按需启动；可选 capacity 限制全部实例及有效启动预留。
+同资源池内 priority 越高越优先，同级随机。
 `dir`、`install`、`pool_wait_timeout` 由所有 pool 共享。
 
 ```yaml
@@ -1481,12 +1482,11 @@ pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CL
 多池的主要部署场景是：让单个 Sandbox 的宿主侧执行保持在一个 NUMA 节点内，
 同时把新的执行分散到多个节点。Conductor 选择 pool 及其 systemd 模板；运维在模板上
 配置 CPU 放置与内存分配策略。这是宿主侧部署能力，不是 guest vNUMA 拓扑，
-也不是 NUMA 感知的容量调度器。
+资源池配置则提供按池容量和运行使用率的调度。
 
-**NUMA 隔离是基于多池机制的上层应用模式，不是 Conductor 新增的隔离能力。**
-以下是部署配置示例，不是项目测试规范。项目只验收多池配置、独立预热、简单轮询、
-实际 unit 定位及既有生命周期，并静态检查示例与文档一致性；不要求或安排真实
-NUMA 主机验证、页分布检查、NUMA E2E 或性能测试，也不将其列为合入前置或遗留工作。
+NUMA 放置由 systemd/Linux 执行。以下示例手工管理放置策略；需要独立 NUMA 容量和
+使用率调度时，采用[资源池配置](resource-pools_zh.md)，关联 resource_pool 和外部
+unit_dropins。部署应在真实主机检查有效 CPU/内存节点集合、页分布及跨池恢复。
 
 对具有在线且带内存的 NUMA 节点 0、1 的主机，用不同模板名称表达不同放置策略。
 以下内容替换完整 Conductor 配置中的 `units` 块；不要同时保留旧单池字段。
@@ -1561,7 +1561,7 @@ Conductor 重写的基础文件。
 `Delegate=yes`、`ctl/vmm`、清理行为及既有 slice 合同。不要用 unit alias 表达不同绑定。
 该模式下 Conductor 不执行任何模板安装或 reload。
 
-普通 runner 在两个 runner pool 间轮询；Builder 在两个 builder pool 间独立轮询。
+runner 和 Builder 在选定资源池内按优先级分配，同级随机。
 预热进程在分配业务前已处于对应放置策略下。Runner 父进程及其直接子进程、Builder 的各阶段子进程
 留在选定 unit 下；一个 Build 实际执行的 A/B/C 阶段仍由同一个 Builder 驱动，
 不按阶段重新取池；guest 内的工作通过这些阶段 VMM 执行。
@@ -1570,9 +1570,8 @@ Conductor 重写的基础文件。
 
 部署仍遵循以下边界：
 
-- 两个 pool 共用一个模板，就共用该模板的放置策略；重复项不会自动绑定到不同节点。
-  `size` 不改变轮询权重，也不限制活动 worker。分配次数接近不代表 CPU/内存负载均衡，
-  更不代表按 NUMA 节点做准入；现有节点全局准入与 Build FIFO/claim 保持不变。
+- 两个 pool 共用模板时必须共用资源池和放置策略，重复项不会自动绑定到不同节点。
+  `size` 是 idle 目标；资源池容量和运行使用率决定选池，Builder 业务 FIFO/claim 独立保留。
 - 已绑定执行保留实际 unit，Conductor 重启也不改变它。Pause/resume 需要新 runner 时
   重新取池，可能使用另一 NUMA 节点；本特性不提供 NUMA 粘性、在线迁移，也不把宿主
   节点身份写进可移植制品。活动或待清理执行仍依赖的模板必须保留在配置中。
@@ -1581,7 +1580,7 @@ Conductor 重写的基础文件。
 - 严格单节点绑定可能在其他节点仍有空闲内存时触发本地回收或分配失败/OOM；
   Conductor 不会自动换池重试。如有意用 `NUMAPolicy=preferred` 允许内存回退，
   必须同时去掉或扩大单节点 `AllowedMemoryNodes`，因为 cpuset 限制优先。
-  这是以严格内存本地性换取回退，不是新增 NUMA 调度。
+  这是以严格内存本地性换取回退；资源账本仍归属执行所选的池。
 
 设置语义参考：[systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html)、
 [systemd.resource-control(5)](https://manpages.debian.org/trixie/systemd/systemd.resource-control.5.en.html)、
