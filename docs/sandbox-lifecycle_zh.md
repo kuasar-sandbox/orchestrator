@@ -135,7 +135,7 @@ Header `{}` 清除两个低优先级选择，改用正常默认值。
 
 本次新增 Create 配置的两个非空字段都使用现有 `ValidLocalSandboxID` 契约：
 1..57 字节，只允许小写 ASCII 字母、数字和连字符，首尾必须是字母或数字。
-精确模式是 `^[a-z0-9](node_zh.md?:[a-z0-9-]{0,55}[a-z0-9])?$`。大写、点、斜线、空白、NUL
+精确模式是 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。大写、点、斜线、空白、NUL
 和超长值直接拒绝，不做自动转换。迁移 token 编码层保留历史 StableID 契约；节点 Import
 准入独立执行相同的 1..57 字节格式校验（[密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model)）。
 

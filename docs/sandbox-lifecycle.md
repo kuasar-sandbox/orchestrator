@@ -110,7 +110,7 @@ stored optional field; `Sandbox.StableID()` supplies the local-ID fallback.
 Both nonempty fields in this new Create configuration use the existing
 `ValidLocalSandboxID` contract: 1..57 bytes, lowercase ASCII letters, digits and
 hyphens, starting and ending with a letter or digit. The exact pattern is
-`^[a-z0-9](node.md?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
+`^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
 NUL and longer values are rejected rather than normalized. Migration-token
 encoding retains its historical StableID contract; node Import admission
 independently enforces the same 1..57-byte format ([Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)).
