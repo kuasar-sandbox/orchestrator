@@ -43,8 +43,9 @@ Conductor、独立 Proxy 和 Telemetry 支持静态链接的运行期扩展，�
 字段语义由 [Node](node_zh.md)、[Build](node-build_zh.md)、[Proxy](node-proxy_zh.md) 与
 [资源策略](node-resource_zh.md) 维护;导出类型/helper 见 [config](../config/config.go)。
 
-`app/conductor` 和 `app/proxy` 重新导出各自 `app/*/extension` 叶包的类型、常量和 sentinel,
-调用方可选任一公共 import 入口,无需导入 internal 包。两个 App 包均提供
+`app/conductor` 和 `app/proxy` 重新导出各自 `app/*/extension` 叶包的主要类型、常量和 sentinel。
+可选的 Proxy 结束接口 `Shutdown` 仍位于 `app/proxy/extension`，没有 `proxy.Shutdown` alias。
+两种 import 入口都属于公共 API，无需导入 internal 包。两个 App 包均提供
 `New(Hooks) *App`、`(*App).Run() error`、`(*App).RunContext(context.Context) error`,
 生命周期见下文。`Runtime.MarshalJSON() ([]byte, error)` 与
 `(*Runtime).UnmarshalJSON([]byte) error` 始终拒绝序列化/反序列化。
@@ -282,6 +283,8 @@ Core 固定最低 TLS 1.2 与 `h2`/`http/1.1` ALPN。
 
 ### Proxy 生命周期、命名监听与 InplaceRestart
 
+在 [InplaceRestart 流程](node-proxy_zh.md#inplacerestart)中，A 是原 master，B 是临时服务实例，A′ 是原 PID exec 后的实例。
+
 每个 master 实例从操作受理时的相同原始输入执行一次 Configure；B 的派生路径不会成为
 下次基线。BindRuntime 在各 master 与 worker epoch 中重新创建进程材料。
 InplaceRestart 在固定目标映像中重新初始化，不修改运行中实例的冻结配置，也不动态加载扩展。
@@ -321,7 +324,7 @@ Run 保留 SIGINT/TERM；RunContext 由嵌入入口自行组装信号和触发�
 在 `Status.CoordinatorPID` 等于当前 master PID 的主协调实例，并在程序入口重新运行时
 保持原配置。核心动作不选择信号。
 
-Master 与 worker 扩展都可实现以下可选结束接口：
+Master 与 worker 扩展都可实现 `app/proxy/extension` 中的可选 [`extension.Shutdown` 结束接口](../app/proxy/extension/extension.go)：
 
 ```go
 type Shutdown interface {
@@ -367,9 +370,11 @@ err := app.Run() // RunContext(ctx) 使用显式父生命周期。
 ```
 
 New 无副作用，App 只能运行一次。Configure 是唯一 startup hook，早于 store/listener/
-receiver 副作用。Core 冻结 config，解析 authoritative material provider、最终校验，
-然后打开显式 local TSDB 和选定 query backend, 启动 extension、可选 Collector graph、
-选定 HTTP query handler 和 Plugin subscriber.
+receiver 副作用。Configure 返回后，App 先检查不可变 executable 并校验最终声明，再 clone
+config。Runtime resolution 检查 binding 与配置是否匹配，调用已提供的 authoritative
+`QueryHeaders` provider，并重新校验得到的 headers。Provider 不能修复非法的 Configure 声明。
+随后 core 仅在启用时打开 local TSDB，构造选定 query backend（包括定制 `QueryBackend` factory），
+再启动 extension、可选 Collector graph、选定 HTTP query handler 和 Plugin subscriber。
 `Runtime` 拒绝 JSON 序列化/反序列化，包含进程内 Logger、Extension、QueryBackend、QueryHeaders、MetricsHandler 及可选 advanced Collector binding。私有协议也不要序列化 Runtime，
 Hook 返回后不要保留并修改 Configure 的声明。
 

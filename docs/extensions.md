@@ -44,7 +44,7 @@ The public `config` package exposes `LoadConductor(path string) (*Conductor, err
 
 `(*Conductor).Clone() *Conductor` and `(*Proxy).Clone() *Proxy` deep-copy declarations and preserve nil. Both expose `ParkTimeoutDur() time.Duration`. `(*ResourceAllocatable).SetMemory(string)` marks an explicit memory value; `InheritMemory()` restores nil, meaning inherited default/clamping rather than an explicitly configured `256MiB`. Configuration field semantics remain in [Node](node.md), [Build](node-build.md), [Proxy](node-proxy.md) and [resource policy](node-resource.md); exported types and helpers are in [config](../config/config.go).
 
-`app/conductor` and `app/proxy` re-export their respective leaf `app/*/extension` types, constants and sentinels. Consumers may use either public import surface; no internal package is required. In each App package, `New(Hooks) *App`, `(*App).Run() error` and `(*App).RunContext(context.Context) error` have the lifecycle defined below. `Runtime.MarshalJSON() ([]byte, error)` and `(*Runtime).UnmarshalJSON([]byte) error` always reject serialization/deserialization.
+`app/conductor` and `app/proxy` re-export the main types, constants and sentinels from their respective leaf `app/*/extension` packages. The optional Proxy completion interface `Shutdown` remains in `app/proxy/extension`; it has no `proxy.Shutdown` alias. Both import surfaces are public; no internal package is required. In each App package, `New(Hooks) *App`, `(*App).Run() error` and `(*App).RunContext(context.Context) error` have the lifecycle defined below. `Runtime.MarshalJSON() ([]byte, error)` and `(*Runtime).UnmarshalJSON([]byte) error` always reject serialization/deserialization.
 
 <a id="conductor-bootstrap"></a>
 
@@ -150,6 +150,8 @@ Process-owned mapping and transport cleanup are defined once in the [Proxy worke
 
 ### Proxy lifecycle, named listeners and InplaceRestart
 
+In the [InplaceRestart sequence](node-proxy.md#inplacerestart), A is the original master, B is the temporary serving instance, and A′ is the original PID after exec.
+
 Each master incarnation runs Configure once from the accepted original input.
 B's derived paths never become the next baseline. BindRuntime returns fresh
 process-local bindings for each master and worker epoch. InplaceRestart reruns
@@ -203,7 +205,7 @@ Keep custom triggers on the main coordinator (`Status.CoordinatorPID` equals
 the current master PID) and preserve their configuration
 when the executable entry runs again. The core action does not choose a signal.
 
-Both master and worker extensions may implement this optional completion point:
+Both master and worker extensions may implement the optional [`extension.Shutdown` completion interface](../app/proxy/extension/extension.go) from `app/proxy/extension`:
 
 ```go
 type Shutdown interface {
@@ -258,11 +260,14 @@ err := app.Run() // RunContext(ctx) supports an explicit parent lifecycle.
 ```
 
 New is side-effect-free; an App can run only once. Configure is the sole startup
-hook and runs before store/listener/receiver side effects. Core freezes config,
-resolves authoritative material providers, performs final validation, then opens
-the explicit local TSDB and selected query backend, then starts the extension,
-optional Collector graph, selected HTTP query handler and Plugin
-subscriber. `Runtime` rejects JSON serialization/deserialization and contains
+hook and runs before store/listener/receiver side effects. After Configure, App
+checks the immutable executable and validates final declarations before cloning
+config. Runtime resolution checks binding/configuration agreement, invokes the
+authoritative `QueryHeaders` provider when supplied, and revalidates the resulting
+headers. A provider cannot repair invalid Configure declarations. Core then opens
+the local TSDB only when enabled, constructs the selected query backend (including
+the custom `QueryBackend` factory), and starts the extension, optional Collector
+graph, selected HTTP query handler and Plugin subscriber. `Runtime` rejects JSON serialization/deserialization and contains
 process-local Logger, Extension, QueryBackend, QueryHeaders, MetricsHandler and
 optional advanced Collector bindings. Never serialize it in a private protocol
 or retain/mutate Configure's declarations after the hook returns.
