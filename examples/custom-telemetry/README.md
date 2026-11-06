@@ -2,6 +2,8 @@
 
 # Custom telemetry
 
+This is a runnable static App integration. The complete public SDK and lifecycle contracts belong to [application extensions](../../docs/extensions.md#examples); deployment and operational requirements stay with the corresponding capability document.
+
 Build the trusted statically linked App:
 
 ```sh
@@ -18,7 +20,7 @@ itself in place; there is no fallback after a custom startup failure.
 The same `proxy_netns` configuration reaches `Configure` as `Config.ProxyNetNS`.
 It selects both sandbox OTLP listeners' namespace without moving the executable
 or remote clients. The early Preview `sandbox_netns` key is rejected by strict
-bootstrap/config decoding. See the [management deployment](../../docs/telemetry.md#4-direct-sandbox-facing-otlp).
+bootstrap/config decoding. See the [management deployment](../../docs/observability.md#guest-otlp).
 
 `Configure` runs once before stores/listeners. Config contains declarations;
 Runtime contains process-local bindings. The example logs lifecycle start/stop and
@@ -60,5 +62,5 @@ error does not fall back to YAML or local DB. `local.enabled` explicitly creates
 the optional TSDB, and `sandboxlocal` exports to it through Collector. The
 `extension` package has no OTel types, dynamic registry or DI container.
 
-See the complete [telemetry specification](../../docs/telemetry.md) and
+See the complete [telemetry specification](../../docs/observability.md#telemetry) and
 [extension contract](../../docs/extensions.md#telemetry-bootstrap-and-extension).

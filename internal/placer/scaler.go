@@ -21,12 +21,12 @@ type placeParams struct {
 	rules               []clustercfg.ShuffleRule
 	candidates          int
 	zoneAdmitMax        string // exclude nodes hotter than this (green<yellow<red<critical); "" = no zone filter
-	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match, §4.2)
+	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match; docs/cluster.md#placer-placement)
 	excludedNodeIDs     map[string]struct{}
 	buildResources      *routesync.BuildResources
 }
 
-// placeSandbox runs the sandbox placement algorithm (cluster-placer.md):
+// placeSandbox runs the sandbox placement algorithm (docs/cluster.md#placer-placement):
 // matchSelectors ∧ ¬draining ∧ zone≤max ∧ runtime-match ∧ shuffle
 // slot, then P2C by water level. (Build placement is resource-aware — placeBuild.)
 func placeSandbox(p placeParams) (string, error) {
@@ -48,7 +48,7 @@ func placeSandbox(p placeParams) (string, error) {
 	return p2c(eligible, p.candidates, sandboxLoad).NodeID, nil
 }
 
-// placeBuild runs resource-aware build placement (cluster-placer.md). The
+// placeBuild runs resource-aware build placement (docs/cluster.md#placer-placement). The
 // low-frequency node_list deliberately carries configured capacity but not
 // heartbeat usage, so this layer only rejects a request that can never fit a
 // node. Registry rechecks current registration headroom at the Holder boundary,
@@ -131,7 +131,7 @@ func eligibleNode(n *registry.NodeRecord, p placeParams, maxZone int) bool {
 		return false // hotter than admit (red/critical excluded)
 	}
 	if p.targetRuntimeDigest != "" && n.RuntimeDigest != "" && n.RuntimeDigest != p.targetRuntimeDigest {
-		return false // snapshot/template runtime mismatch would fail restore (§4.2)
+		return false // snapshot/template runtime mismatch would fail restore (docs/cluster.md#placer-placement)
 	}
 	return true
 }
@@ -151,7 +151,7 @@ func zoneRank(z string) int {
 	}
 }
 
-// sandboxLoad is a node's sandbox load for ranking (cluster-placer.md):
+// sandboxLoad is a node's sandbox load for ranking (docs/cluster.md#placer-placement):
 // preferred = allocated/pool water level; fallback = sandbox count / capacity
 // headroom; last resort = raw count.
 func sandboxLoad(n *registry.NodeRecord) float64 {
@@ -165,7 +165,7 @@ func sandboxLoad(n *registry.NodeRecord) float64 {
 }
 
 // shuffleSlots returns the deterministic set of shard_by label values this group
-// is pinned to (cluster-placer.md), or (nil,"") when no shuffle rule
+// is pinned to (docs/cluster.md#placer-placement), or (nil,"") when no shuffle rule
 // applies. It buckets the given nodes by each rule's shard_by label and uses
 // maglev.LocateN to pick the group's n slots from that set.
 func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg.ShuffleRule) (map[string]bool, string) {
@@ -206,9 +206,9 @@ func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg
 }
 
 // effectiveSelectors narrows a group's static nodeSelectors to its shuffle slots
-// (cluster-placer.md): the cross-product of the static selectors with
+// (docs/cluster.md#placer-placement): the cross-product of the static selectors with
 // {shard_by ∈ pinned slots}. Returns (sel, true) when a shuffle rule applies, so
-// the registry's key distribution (§7.6) predistributes only to the pinned nodes;
+// the registry's key distribution (docs/cluster.md#placer-key-distribution) predistributes only to the pinned nodes;
 // (nil, false) when no shuffle rule narrows (key dist uses the static selectors).
 func effectiveSelectors(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, bool) {
 	slotSet, shardBy := shuffleSlots(group, nodes, rules)
@@ -257,8 +257,9 @@ func labelsContain(labels, want map[string]string) bool {
 }
 
 // p2c picks the least-loaded (by load) of k DISTINCT random candidates
-// (power-of-two-choices when k=2): decorrelated, herd-resistant (cluster-placer.md
-// §4.2). Sampling is WITHOUT replacement — with replacement, k=2 over a 2-node set
+// (power-of-two-choices when k=2): decorrelated, herd-resistant
+// (docs/cluster.md#placer-placement). Sampling is WITHOUT replacement — with
+// replacement, k=2 over a 2-node set
 // returns the more-loaded node ~25% of the time, exactly the eligible-set size
 // shuffle-sharding produces. Fisher-Yates also randomizes tie order.
 func p2c(nodes []*registry.NodeRecord, k int, load func(*registry.NodeRecord) float64) *registry.NodeRecord {

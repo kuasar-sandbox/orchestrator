@@ -700,7 +700,7 @@ func (c *RegistryConfig) NodeLinkSplit() bool {
 }
 
 // ===========================================================================
-// router.yaml — e2b-compatible unified ingress (cluster-router.md).
+// router.yaml — e2b-compatible unified ingress (docs/cluster.md#router-configuration).
 // ===========================================================================
 
 // RouterConfig is the router role's config, grouped as upstream (registry) /
@@ -800,7 +800,7 @@ func (c *RouterConfig) RouteIdleDur() time.Duration {
 }
 
 // ===========================================================================
-// placer.yaml — placement scheduler (cluster-placer.md).
+// placer.yaml — placement scheduler (docs/cluster.md#placer-configuration).
 // ===========================================================================
 
 // PlacerConfig is the standalone placer's config. It discovers registry

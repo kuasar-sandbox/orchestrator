@@ -2,6 +2,8 @@
 
 # Custom independent Proxy
 
+This is a runnable static App integration. The complete public SDK and lifecycle contracts belong to [application extensions](../../docs/extensions.md#examples); deployment and operational requirements stay with the corresponding capability document.
+
 Build the example with:
 
 ```sh
@@ -52,7 +54,7 @@ failure, does not return a normal error, and does not verify Kuasar's
 `X-Access-Token`. It supports the current ordinary HTTP and CONNECT transport;
 it also relays negotiated HTTP/1.1 WebSocket upgrades through the shared core
 transport. HTTP/2 extended CONNECT and arbitrary Upgrade protocols are not
-supported; see [transport boundaries](../../docs/node-proxy.md#51-http11-websocket-forwarding). The wrapped handler serves the node's
+supported; see [transport boundaries](../../docs/node-proxy.md#http11-websocket-forwarding). The wrapped handler serves the node's
 `data_listen` sandbox ingress, while MMDS remains outside the wrapper.
 
 This is process organization for statically linked, same-UID trusted code, not
@@ -88,5 +90,5 @@ keeps its existing behavior. Ready depends on initial Bookmark and actual
 worker acceptance, including MMDS when enabled. `Runtime.ListenerFiles` can
 deliver named listeners from master BindRuntime; successful binding transfers
 ownership to App. Ordinary node-ctl → xproxy activation is received by the final
-master automatically. See [Proxy deployment and bounded shutdown](../../docs/node-proxy.md#92-business-readiness-and-service-status)
+master automatically. See [Proxy deployment and bounded shutdown](../../docs/node-proxy.md#readiness)
 for FD names, systemd units, atomic target replacement, deadlines and recovery.

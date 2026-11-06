@@ -22,7 +22,7 @@ import (
 )
 
 // runRouter starts the router role: the e2b-compatible unified ingress
-// (cluster-router.md). It dials the registry route_link for reserve, route
+// (docs/cluster.md#client-access). It dials the registry route_link for reserve, route
 // resolution, build placement, and API-key verification.
 func runRouter(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("router", flag.ExitOnError)
@@ -72,7 +72,7 @@ func runRouter(args []string, log *slog.Logger) error {
 		}
 	}()
 
-	// Optional Prometheus metrics endpoint (router_requests_total{plane,result}, §10).
+	// Optional Prometheus metrics endpoint (router_requests_total{plane,result}; docs/cluster.md#router-performance).
 	if cfg.MetricsListen != "" {
 		mln, merr := net.Listen("tcp", cfg.MetricsListen)
 		if merr != nil {
@@ -89,7 +89,7 @@ func runRouter(args []string, log *slog.Logger) error {
 		}()
 	}
 
-	// SO_REUSEPORT so multiple same-host router replicas can share :443 (cluster-router.md).
+	// SO_REUSEPORT so multiple same-host router replicas can share :443 (docs/cluster.md#client-access).
 	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
 		var serr error
 		if err := c.Control(func(fd uintptr) {

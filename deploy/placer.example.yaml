@@ -1,5 +1,5 @@
 # cluster-ctl placer config — cluster-ctl placer --config /etc/cluster-ctl/placer.yaml.
-# Standalone placement scheduler (docs/cluster-placer.md): it starts from registry
+# Standalone placement scheduler (docs/cluster.md#placer-configuration): it starts from registry
 # membership, joins the placer memberlist label, consumes node_list, and provides
 # placement for registry callers.
 # Validate with `cluster-ctl config placer --config placer.yaml`.

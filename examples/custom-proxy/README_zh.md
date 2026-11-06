@@ -2,6 +2,8 @@
 
 # 定制独立 Proxy
 
+本示例是可运行的静态 App 集成入口。公共 SDK 与生命周期契约见[应用扩展](../../docs/extensions_zh.md#examples)；部署和运行要求仍由对应能力文档维护。
+
 构建示例：
 
 ```sh
@@ -40,7 +42,7 @@ X-Access-Token、parking、native exec KAT/CEL 和错误行为。
 ForwardAuthorized 采用 handler 形式，拥有成功或失败响应，不返回普通 error，也不验证
 Kuasar 的 X-Access-Token。它支持普通 HTTP、CONNECT 和协商成功的 HTTP/1.1 WebSocket；
 不支持 HTTP/2 extended CONNECT 或任意 Upgrade 协议，见
-[传输边界](../../docs/node-proxy_zh.md#51-http11-websocket-转发)。Wrapper 仅作用于
+[传输边界](../../docs/node-proxy_zh.md#http11-websocket-forwarding)。Wrapper 仅作用于
 data_listen 的 sandbox 入口，MMDS 不经过它。
 
 这是静态链接、相同 UID 的受信代码组织方式。私有管理路由缺少鉴权只是最小示例，
@@ -63,4 +65,4 @@ timeout 省略或为零时，InplaceRestart 不可用，自动停机立即收尾
 Ready 依赖初始 Bookmark 和 worker 实际接纳，包含已启用的 MMDS。
 Master BindRuntime 可交付 `Runtime.ListenerFiles`，成功后由 App 负责关闭。
 普通 node-ctl → xproxy 激活由最终 master 自动接收。FD 名称、systemd unit、目标程序
-原子投放、期限和自动恢复见[Proxy 部署与有界停机](../../docs/node-proxy_zh.md#92-业务就绪与服务状态)。
+原子投放、期限和自动恢复见[Proxy 部署与有界停机](../../docs/node-proxy_zh.md#readiness)。

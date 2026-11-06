@@ -7,7 +7,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// Cluster node-link message types (node.md §10 / cluster.md). They extend the
+// Cluster node-link message types (docs/cluster.md#node-link). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
 // the execution-state authority (its sandbox routes flow as ID-only
 // Upsert/Delete + Bookmark), while the registry resolves cluster identity and
@@ -36,7 +36,7 @@ type PlaceReq struct {
 	RouteKey            string            `json:"route_key"`
 	SandboxID           string            `json:"sandbox_id,omitempty"`
 	Config              map[string]string `json:"config,omitempty"`
-	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
+	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware; docs/cluster.md#placer-placement)
 	BuildResources      *BuildResources   `json:"build_resources,omitempty"`
 	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
 	ExcludeNodeIDs      []string          `json:"exclude_node_ids,omitempty"`
@@ -92,7 +92,7 @@ const (
 	CmdDelete        = "delete"         // destroy a sandbox
 	CmdKeyPut        = "key_put"        // install / renew an API/manifest key-pair lease
 	CmdKeyDrop       = "key_drop"       // drop a key lease
-	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
+	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids; docs/cluster.md#cluster-build)
 )
 
 // Build projection frames flow node -> Registry. BuildSyncBegin/End bracket one
@@ -146,7 +146,7 @@ const (
 
 // NodeRegister is the node's first up-frame on node-link: its identity + capacity,
 // so the registry can place sandboxes (and later builds) on it and forward the
-// data plane to it (cluster.md / §6.1).
+// data plane to it (docs/cluster.md#node-link).
 type NodeRegister struct {
 	NodeID                    string               `json:"node_id"`
 	Labels                    map[string]string    `json:"labels,omitempty"`   // zone / pool / slot / node (nodeSelectors)
@@ -207,7 +207,7 @@ func BuildAdmissionLimitFromTypes(in types.BuildAdmissionLimit) *BuildAdmissionL
 // Heartbeat is the node's periodic water-level report (cluster.md). Allocated
 // is the sum of sandbox NodeReservations, not host
 // cgroup charge or guest demand. Draining is set by node-side drain
-// (node-resource.md §2) so placement excludes the node.
+// (docs/node-resource.md#resource-command) so placement excludes the node.
 type Heartbeat struct {
 	Zone                   string               `json:"zone,omitempty"`
 	Allocated              int64                `json:"allocated,omitempty"` // reserved memory Budget (bytes)
@@ -218,8 +218,9 @@ type Heartbeat struct {
 	Draining               bool                 `json:"draining,omitempty"`
 }
 
-// Command is a lifecycle / key primitive the registry sends the node (cluster.md
-// §5.1). The node replies with a CmdAck(cmd_id) immediately (accepted/rejected)
+// Command is a lifecycle / key primitive the registry sends the node
+// (docs/cluster.md#node-link). The node replies with a CmdAck(cmd_id) immediately
+// (accepted/rejected)
 // and reports the terminal sandbox state via the route stream. CmdID correlates
 // only the current delivery with its Ack; retry semantics are operation-specific.
 // Fields are populated per Kind.
@@ -250,7 +251,7 @@ type Command struct {
 	ManifestKey            string `json:"manifest_key,omitempty"`             // hex; only on inline key_put
 	ManifestKeyRef         string `json:"manifest_key_ref,omitempty"`         // provider ref
 	ExpiresUnix            int64  `json:"expires_unix,omitempty"`             // lease expiry (key_put)
-	// build_register (§7.5): pre-provision a build with registry-assigned ids +
+	// build_register (docs/cluster.md#cluster-build): pre-provision a build with registry-assigned ids +
 	// its immutable resource demand. ImageRepo/RegistryAuth are the group's image-pull creds,
 	// delivered WITH the immutable registration command. The node retains them in
 	// protected registration state for exact replay and restart recovery; neither

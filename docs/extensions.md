@@ -1,8 +1,12 @@
 [English](extensions.md) | [简体中文](extensions_zh.md)
 
-# Runtime extensions
+<a id="overview"></a>
 
-Create identity is selected before the Hook. `SandboxOperation.SandboxID` stays immutable, and reintroducing `kuasar-sandbox.identity` into the cleaned mutable metadata is rejected. See [Sandbox identity on Create](node.md#412-create-identity).
+# Application extensions
+
+Build a custom Conductor, Proxy or Telemetry application through the public Go APIs. Static bootstrap/configuration, object sources, lifecycle hooks and request wrappers are separate extension boundaries. Start with the complete examples, then the contract for the boundary you implement.
+
+Create identity is selected before the Hook. `SandboxOperation.SandboxID` stays immutable, and reintroducing `kuasar-sandbox.identity` into the cleaned mutable metadata is rejected. See [Sandbox identity on Create](sandbox-lifecycle.md#create-identity).
 
 Kuasar's conductor, independent Proxy and Telemetry support statically linked runtime
 extensions for deployments that need process-local integration without carrying
@@ -18,7 +22,21 @@ priorities, provide a dependency-injection container, or reserve URL
 namespaces. A private project can compose any modules it needs behind the one
 object for that role and lifetime.
 
+**Read by task:** [Run an example](#examples) · [Configuration API](#public-configuration-entry-points) · [Conductor App](#conductor-bootstrap) · [Proxy App](#proxy-bootstrap) · [Telemetry App](#telemetry-bootstrap-and-extension) · [Object sources](#conductor-object-sources) · [Hooks](#conductor-lifecycle-hooks)
+
+<a id="examples"></a>
+
+## Runnable examples
+
+- [Conductor](../examples/custom-conductor/README.md)
+- [Proxy](../examples/custom-proxy/README.md)
+- [Telemetry](../examples/custom-telemetry/README.md)
+
+<a id="component-bootstrap-and-process-local-material"></a>
+
 ## Component bootstrap and process-local material
+
+<a id="public-configuration-entry-points"></a>
 
 ### Public configuration entry points
 
@@ -27,6 +45,8 @@ The public `config` package exposes `LoadConductor(path string) (*Conductor, err
 `(*Conductor).Clone() *Conductor` and `(*Proxy).Clone() *Proxy` deep-copy declarations and preserve nil. Both expose `ParkTimeoutDur() time.Duration`. `(*ResourceAllocatable).SetMemory(string)` marks an explicit memory value; `InheritMemory()` restores nil, meaning inherited default/clamping rather than an explicitly configured `256MiB`. Configuration field semantics remain in [Node](node.md), [Build](node-build.md), [Proxy](node-proxy.md) and [resource policy](node-resource.md); exported types and helpers are in [config](../config/config.go).
 
 `app/conductor` and `app/proxy` re-export their respective leaf `app/*/extension` types, constants and sentinels. Consumers may use either public import surface; no internal package is required. In each App package, `New(Hooks) *App`, `(*App).Run() error` and `(*App).RunContext(context.Context) error` have the lifecycle defined below. `Runtime.MarshalJSON() ([]byte, error)` and `(*Runtime).UnmarshalJSON([]byte) error` always reject serialization/deserialization.
+
+<a id="conductor-bootstrap"></a>
 
 ### Conductor bootstrap
 
@@ -72,6 +92,8 @@ Conductor's exact public material surface is defined in [app/conductor](../app/c
 `TLSMaterialProviderFunc`, `EncryptionKeyProviderFunc` and `ObjectStoreCredentialsProviderFunc` adapt functions with the exact corresponding method arguments/results. `TLSPurposeAPI = "api"` is resolved first; `TLSPurposeNodeLinkClient = "node-link-client"` is used only when `Cluster.NodeLink.Endpoint` is nonempty. Certificates are leaf-first DER with a matching signer; chain and signer must be supplied together. Empty material disables that purpose. API `ClientCAs` requires a server certificate and enables required verified client certificates; node-link uses `RootCAs`. Core fixes minimum TLS 1.2 and ALPN (`h2`/`http/1.1` for API, `h2` for node-link).
 
 The encryption provider must return a nonempty ordered set of raw 32-byte AES keys. Index zero encrypts new records; the key set permits decrypting earlier records. This process encryption key set is distinct from updating tenant credential-distribution records. A custom object-store provider requires configured `Builder.FilesStorage`, nonempty access/secret keys and, when `CanExpire`, a nonzero future `Expires`. It is primed before core startup. Later, the AWS SDK credentials cache invokes it when credentials need renewal during a Build S3 presign or HEAD operation; refresh can block or fail that operation. Implementations must account for request latency and must not assume startup-only execution. Provider errors do not fall back to YAML or the ambient credential chain. See the owning [filestore adapter](../internal/filestore/filestore.go).
+
+<a id="proxy-bootstrap"></a>
 
 ### Proxy bootstrap
 
@@ -122,9 +144,10 @@ Proxy's [public material types](../app/proxy/proxy.go) are deliberately differen
 
 `RoleMaster = "master"` and `RoleWorker = "worker"`. Certificate/signer matching, paired presence, empty-material TLS disablement and required verified client certificates with `ClientCAs` follow the same server-material constraints. Core retains minimum TLS 1.2 and `h2`/`http/1.1` ALPN. `Hooks.Configure` takes `(context.Context, *Config) error`; `Hooks.BindRuntime` takes `(context.Context, Process, *Runtime) error`, as shown above.
 
-Process-owned mapping and transport cleanup are defined once in the [Proxy worker lifetime contract](node-proxy.md#91-worker-lifetime-and-transport-cancellation). Public source, Hook and wrapper interfaces follow below; those are not another data-plane implementation.
+Process-owned mapping and transport cleanup are defined once in the [Proxy worker lifetime contract](node-proxy.md#worker-lifetime). Public source, Hook and wrapper interfaces follow below; those are not another data-plane implementation.
 
-<a id="proxy-lifecycle"></a>
+<a id="proxy-lifecycle-named-listeners-and-inplacerestart"></a>
+
 ### Proxy lifecycle, named listeners and InplaceRestart
 
 Each master incarnation runs Configure once from the accepted original input.
@@ -141,7 +164,7 @@ listener files: workers receive internal bootstrap copies. Named inputs can
 also come from `app/activation.Receive()`; the final master automatically
 consumes activation when entering through node-ctl. Do not deliver the same
 name through both sources. Configuration explicitly selects names; see
-[listener and deployment rules](node-proxy.md#95-named-listeners-and-systemd-deployment).
+[listener and deployment rules](node-proxy.md#listener-ownership).
 
 The public App provides:
 
@@ -200,6 +223,8 @@ idle consumers must wait for normal single-instance observations. The
 [custom-proxy example](../examples/custom-proxy/README.md) joins its route Watch.
 Lifecycle, listener and control resources remain core-owned; extensions should
 not close service-shared listeners or retain Hosts after Shutdown completion.
+
+<a id="telemetry-bootstrap-and-extension"></a>
 
 ### Telemetry bootstrap and extension
 
@@ -299,8 +324,10 @@ down Collector, Extension, the query backend and optional local TSDB, in that or
 a bounded context. Extensions may not keep using Reader after Shutdown. Core
 identity, Collector-only collection writes, SandboxID lookup and no-Wake rules are
 not configurable. Complete defaults/storage/network/query contracts live in
-[Telemetry](telemetry.md); the buildable [custom telemetry example](../examples/custom-telemetry/README.md)
+[Telemetry](observability.md#telemetry); the buildable [custom telemetry example](../examples/custom-telemetry/README.md)
 separates ordinary lifecycle/material code from advanced Collector code.
+
+<a id="conductor-object-sources"></a>
 
 ## Conductor object sources
 
@@ -373,6 +400,10 @@ reason. That removal is not durable: after a resync the failed build is simply
 absent from the current set, while `BuildSource.Get` can still read its durable
 error row.
 
+`SandboxView` preserves the nil (disabled) versus zero (immediate) distinction of `IdleTimeout *int64` and projects `AutoReset`, `DeadUnix`, `AutoResetError` and pause/resource-obligation fields. Every read and callback still receives its own deep copy.
+
+<a id="watch-generations"></a>
+
 ### Watch generations
 
 A Watch is an eventually convergent state stream, not a durable event log:
@@ -413,7 +444,9 @@ For route consumers, both the live delete and omission from a reconnecting full
 snapshot withdraw an older projection. Durable local cleanup continues from the
 retained row independently of either route convergence path.
 
-`Host.Stats()` exposes the same bounded native section reader used by the public stats APIs and telemetry plugin. Statically linked conductor extensions call its `ReadStats(ctx, StatsRequest)` method. `StatsRequest` selects exact SandboxIDs, resource/traffic/usage sections and optional native usage view/cursor/limit; `SandboxStats` contains each unchanged native body and a correlation-only StableID. This trusted in-process entry performs no API-key collection, guest wake or sampling. It enforces the same 64-object, eight-concurrent-read, five-second and 4 MiB limits. Do not perform slow reads inside a Watch callback; retain the Host and use a separate cancellable task. See [Node native usage](node.md#native-usage), [native batch contract](node.md#native-stats-batches) and [the public types](../app/conductor/extension/stats.go). Reads during Start or before core reconciliation/provider wiring completes return unavailable immediately; they do not block extension startup or expose partially configured sources. After startup they use the same domain Reader.
+`Host.Stats()` exposes the same bounded native section reader used by the public stats APIs and telemetry plugin. Statically linked conductor extensions call its `ReadStats(ctx, StatsRequest)` method. `StatsRequest` selects exact SandboxIDs, resource/traffic/usage sections and optional native usage view/cursor/limit; `SandboxStats` contains each unchanged native body and a correlation-only StableID. This trusted in-process entry performs no API-key collection, guest wake or sampling. It enforces the same 64-object, eight-concurrent-read, five-second and 4 MiB limits. Do not perform slow reads inside a Watch callback; retain the Host and use a separate cancellable task. See [Node native usage](observability.md#native-usage), [native batch contract](observability.md#native-stats-batches) and [the public types](../app/conductor/extension/stats.go). Reads during Start or before core reconciliation/provider wiring completes return unavailable immediately; they do not block extension startup or expose partially configured sources. After startup they use the same domain Reader.
+
+<a id="conductor-lifecycle-hooks"></a>
 
 ## Conductor lifecycle hooks
 
@@ -444,7 +477,7 @@ Sandbox operations are admitted as follows:
   durable `starting`, directories, network attachment, route publication, or
   runner assignment. A Hook may change the template reference, timeout,
   metadata, environment, secure flag, and supported request MMDS input. The
-  Hook may also change `AutoPauseMemory`; the final template is resolved again
+  Hook may also change `AutoPauseMemory`, `IdleTimeout`, and `AutoReset`; the final template is resolved again
   and must retain the core-owned profile.
 - `pause`: after ownership, running incarnation, and checkpoint preconditions
   are captured; before snapshot or durable state changes. The Hook may change
@@ -463,8 +496,8 @@ The public [Sandbox request types and enums](../app/conductor/extension/sandbox_
 
 | Request | Fields and constraints |
 |---|---|
-| `SandboxCreateRequest` | `TemplateID string`, immutable `Profile Profile`, `TimeoutSeconds int`, `Metadata`/`Env map[string]string`, `Secure bool`, `AutoPauseMemory *bool`, `IdleTimeout *int64` (nil disables; zero is immediate; nonnegative integer seconds), `MMDS *string`; MMDS preserves top-level input presence. Request-scoped MMDS/metadata may contain secrets or credentials: do not log them as an object-source projection |
-| `SandboxPauseRequest` | Immutable `CaptureKind CaptureKind` (`snapshot`/`sandbox`), `IfIdle bool`, and `IfIdleSince *time.Time` (hooks cannot remove or change the timestamp); `CheckpointMergeRef`/`CheckpointDropCaches *bool`, where nil inherits Sandbox/node policy |
+| `SandboxCreateRequest` | `TemplateID string`, immutable `Profile Profile`, `TimeoutSeconds int`, `Metadata`/`Env map[string]string`, `Secure bool`, `AutoPauseMemory *bool`, `IdleTimeout *int64`, `AutoReset bool`, and `MMDS *string`. Nil IdleTimeout disables the policy, zero is immediate and positive values are integer seconds. Create hooks may change these policies; core validates the final values. MMDS preserves top-level presence. Request data can contain secrets or credentials and must not be logged as a non-secret object projection |
+| `SandboxPauseRequest` | Core-owned `CaptureKind CaptureKind` (`snapshot`/`sandbox`), `Checkpoint bool`, `IfIdle bool`, and `IfIdleSince *time.Time`; hooks cannot change or remove these values, including through the timestamp pointer. `CheckpointMergeRef`/`CheckpointDropCaches *bool` are mutable; nil inherits Sandbox/node policy |
 | `SandboxResumeRequest` | `RequestedDeadlineUnix *int64`, where nil uses core resume-deadline policy; immutable `Mode ResumeMode` (`auto`/`memory`/`cold`) and `Trigger ResumeTrigger` (`connect`/`wake`/`route`/`exec`/`exec-session`) |
 | `SandboxDeleteRequest` | `Reason string` is diagnostic; editing it does not alter cleanup behavior |
 
@@ -482,7 +515,7 @@ durable `BuildID` verifies the original tenant-keyed request identity and
 credential fingerprints without invoking the mutable Hook again, so policy
 changes cannot break an ACK-lost replay.
 
-`Register.Resources` is the sole registration execution vector (`CPU` in milli-CPU, `Memory`/`Storage` in bytes). The Hook must leave `Builder.Resources` nil; reintroducing that duplicate authority is rejected. Mutable Builder controls are `Target *BuildTarget {Kind BuildTargetKind; Memory bool}`, `Referer *BuildRefererOptions {Enabled, Writeback *bool}`, and `Registry *BuildRegistryOptions` whose `TLS *BuildRegistryTLSOptions` contains `CABundlePEM string` and `InsecureSkipVerify bool`. Target kinds are `image` and `sandbox`; nil means auto resolution from final effective start/ready commands under the [Build target contract](node-build.md#31-request-scoped-builder-input), not from arbitrary configuration presence.
+`Register.Resources` is the sole registration execution vector (`CPU` in milli-CPU, `Memory`/`Storage` in bytes). The Hook must leave `Builder.Resources` nil; reintroducing that duplicate authority is rejected. Mutable Builder controls are `Target *BuildTarget {Kind BuildTargetKind; Memory bool}`, `Referer *BuildRefererOptions {Enabled, Writeback *bool}`, and `Registry *BuildRegistryOptions` whose `TLS *BuildRegistryTLSOptions` contains `CABundlePEM string` and `InsecureSkipVerify bool`. Target kinds are `image` and `sandbox`; nil means auto resolution from final effective start/ready commands under the [Build target contract](node-build.md#request-scoped-builder-input), not from arbitrary configuration presence.
 
 The public [Build request types](../app/conductor/extension/build_hook.go) define `BuildTriggerRequest` as `FromImage`, `FromTemplate`, `StartCommand`, `ReadyCommand` strings, `Steps []BuildStep`, and `ResourceAssertion BuildResourcePatch`. Each [BuildStep](../app/conductor/extension/build.go) contains `Type string`, `Args []string`, `FilesHash string` and `Force bool`. `BuildResourcePatch` contains `CPU`, `Memory`, `Storage *int64` in the same execution units as registration; nil leaves assert nothing, while present leaves must equal immutable registered resources.
 
@@ -509,6 +542,10 @@ Any other error is logged with its private detail and exposed only as a fixed
 temporary-unavailable `503`. Core validation of a modified candidate retains
 the ordinary `400`/`409` contracts.
 
+`IdleTimeout` is a Create policy, persisted through the typed standalone/cluster Create chain after final validation; it is neither template state nor metadata. Conditional Pause on a resource-paused Sandbox returns a conflict. An extension cannot adopt it to bypass the core final check; see [Pause conditions](sandbox-lifecycle.md#capture-and-pause).
+
+<a id="conductor-api-wrapper"></a>
+
 ## Conductor API wrapper
 
 The same object may implement:
@@ -530,6 +567,8 @@ the API fallback on the conductor config socket. Config-socket task, run, admin,
 plugin, and secret-management routes remain outside the wrapper. Conductor has
 no data-plane handler. A nil extension or an extension without
 `APIWrapper` uses the existing core handler object directly.
+
+<a id="proxy-master-extension"></a>
 
 ## Proxy master extension
 
@@ -573,6 +612,8 @@ additional reserved namespace or conflict registry. Returning nil aborts
 startup; panics are not recovered. A nil extension or one without this optional
 interface uses the original handler directly.
 
+<a id="master-route-source"></a>
+
 ### Master route source
 
 ```go
@@ -614,6 +655,8 @@ only in the goroutine calling Watch. Extension lag, callback errors, or resyncs
 cannot terminate routesync, block SHM changes or worker notification, delay a
 RouteBarrier ACK, or affect Wake/activation.
 
+<a id="master-traffic-source"></a>
+
 ### Master traffic source
 
 `TrafficSource.Get(context.Context, string) (TrafficView, error)` has no found boolean or Watch. `ErrTrafficUnavailable` means route identity or complete worker contributions are unavailable; `ErrTrafficConflict` means the current route state cannot produce the requested observation. [TrafficView](../app/proxy/extension/traffic.go) carries `SandboxID`, `Profile`, `State`, effective `MaxInflight config.MaxInflight`, `Inflight TrafficInflight`, `IdleSince *time.Time` and `Services map[string]ServiceTrafficView`. Inflight has `Parking`/`Connected uint64`; each service adds `IdleSince *time.Time`. `config.MaxInflight` has `Total`, `Forward`, `E2BEnvd`, `E2BCodeInterpreter`, `Exec uint32` (JSON `total`, `forward`, `e2b:envd`, `e2b:code-interpreter`, `exec`); zero is unlimited and `Unlimited() bool` checks the whole vector.
@@ -627,6 +670,8 @@ not query the stats UDS or derive limits from the conductor Sandbox row. Returne
 time pointers are independent copies. V1 intentionally has no traffic Watch. A
 route retained during reconnect remains queryable, so callers that require
 freshness also inspect `Routes().SyncState()`.
+
+<a id="proxy-worker-extension"></a>
 
 ## Proxy worker extension
 
@@ -671,6 +716,8 @@ Returning nil aborts the worker epoch; panics are not recovered. A nil worker
 extension or one without `IngressWrapper` uses the original core handler object
 directly.
 
+<a id="worker-route-point-lookup"></a>
+
 ### Worker route point lookup
 
 `GetRoute` returns an independent public `RouteView` copied from the worker's
@@ -679,6 +726,8 @@ and revision used by the master projection, not the raw SHM record, router,
 tokens, or mutable pointers. Worker V1 deliberately has no route Watch; dynamic
 route observation remains master-only. This small surface is API discipline,
 not a security boundary for trusted same-process code.
+
+<a id="authorized-core-forwarding"></a>
 
 ### Authorized core forwarding
 
@@ -725,9 +774,11 @@ callback and writes no guest request bytes if it fails. CONNECT has no guest
 HTTP request and never invokes `Rewrite`. Native exec targets are rejected by
 this generic helper: standard exec continues through `next` and its KAT plus
 per-command CEL path. The helper shares the core HTTP/CONNECT transport, including
-[HTTP/1.1 WebSocket forwarding](node-proxy.md#51-http11-websocket-forwarding).
+[HTTP/1.1 WebSocket forwarding](node-proxy.md#http11-websocket-forwarding).
 It returns only after the upgraded relay finishes; wrappers do not own a separate
 WebSocket transport or traffic lifecycle.
+
+<a id="ingress-boundary"></a>
 
 ## Ingress boundary
 
@@ -737,6 +788,8 @@ control API handler; they never relay ordinary HTTP or CONNECT to a worker.
 Cluster router, registry, and placer do not gain extensions or private ingress:
 a private deployment must canonicalize a cluster request at its outer boundary
 before using the existing canonical cluster path.
+
+<a id="boundaries"></a>
 
 ## Boundaries
 

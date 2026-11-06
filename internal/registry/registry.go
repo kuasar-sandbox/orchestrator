@@ -56,7 +56,7 @@ type nodeConn interface {
 // Placer suggests a node for a new sandbox: the placer suggests, the registry
 // commits by CAS.
 // PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
-// cluster-placer.md); TargetRuntimeDigest lets the placer prefer compatible
+// docs/cluster.md#groups-and-placement); TargetRuntimeDigest lets the placer prefer compatible
 // node runtimes when the caller knows the required runtime identity.
 type PlaceRequest struct {
 	Group               string
@@ -157,7 +157,7 @@ type reserveCall struct {
 	finishOnce sync.Once
 	result     *ReserveResult
 	err        error
-	// re-Place context (§7.4): a rejected create re-places once on another node
+	// re-Place context (docs/cluster.md#route-link): a rejected create re-places once on another node
 	// before failing the Reserve. orig is the pre-reserve record to restore on
 	// timeout/reject while the row is still RESERVED.
 	group, routeKey   string
@@ -1125,7 +1125,7 @@ func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 
 // applyRoute is called by the channel reader for each sandbox route the node
 // streams up. It converges SandboxStore and, on a running route, satisfies a
-// waiting ReserveSandbox (cluster.md / §7.2).
+// waiting ReserveSandbox (docs/cluster.md#route-link).
 func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry) {
 	if e == nil || e.SandboxID == "" {
 		return

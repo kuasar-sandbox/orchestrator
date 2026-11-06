@@ -9,7 +9,7 @@ import (
 )
 
 // Source is the route authority the stream distributes. internal/orch implements
-// it for the proxy plane; the cluster node-link (node.md §10) implements it for the
+// it for the proxy plane; the cluster node-link (docs/cluster.md#node-link) implements it for the
 // node's sandbox/build routes.
 type Source interface {
 	// Range streams the full current route set (running + paused sandboxes) one

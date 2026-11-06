@@ -192,7 +192,7 @@ fi
 echo "==> PASS: starting SetTimeout=204, Pause=409, Kill removed row/runner without resurrection"
 
 # ---- create the sandbox (boots the microVM) -------------------------------
-# Inject sandbox config via the X-Kuasar-Sandbox-Network header (docs/node.md §4.4): the guest
+# Inject sandbox config via the X-Kuasar-Sandbox-Network header (docs/sandbox-lifecycle.md#request-configuration): the guest
 # hostname should become CFG_HOST, verified by `hostname` in the exec below.
 CFG_HOST="e2e-cfg-host"
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE; inject hostname=$CFG_HOST via header)"

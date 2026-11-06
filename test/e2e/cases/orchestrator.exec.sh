@@ -39,7 +39,7 @@ sed 's/^/  guest| /' "$WORK/exec.out"
 grep -q "$MARK" "$WORK/exec.out" || fail "guest command output missing $MARK (envd exec failed; see above)"
 grep -q 'EXIT_CODE 0' "$WORK/exec.out" || fail "guest command exit code != 0"
 echo "==> PASS: command executed in guest (saw $MARK, exit 0)"
-# Sandbox-config injection (docs/node.md §4.4): the X-Kuasar-Sandbox-Network header set the guest
+# Sandbox-config injection (docs/sandbox-lifecycle.md#request-configuration): the X-Kuasar-Sandbox-Network header set the guest
 # hostname, which is observed through the real guest command.
 grep -q "$CFG_HOST" "$WORK/exec.out" || fail "guest hostname was not injected"
 

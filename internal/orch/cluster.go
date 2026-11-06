@@ -655,9 +655,9 @@ func saturatedBuildUsage() *routesync.BuildAdmissionUsage {
 // present (a static-cgroup node is never "hot" from the cluster's view).
 const nodectlZoneGreen = "green"
 
-// ClusterNodeInfo builds the static node-register fields for node-link (cluster.md
-// §5.1): sandbox capacity, both build admission limits, and the guest runtime
-// identity used by placement.
+// ClusterNodeInfo builds the static node-register fields for node-link
+// (docs/cluster.md#node-link): sandbox capacity, both build admission limits,
+// and the guest runtime identity used by placement.
 func (o *Orchestrator) ClusterNodeInfo() (capacity int, registration, execution *routesync.BuildAdmissionLimit, runtimeDigest string) {
 	registrationLimit, _ := configresolve.BuilderRegistrationLimit(o.cfg.Builder)
 	executionLimit, _ := configresolve.BuilderExecutionLimit(o.cfg.Builder)

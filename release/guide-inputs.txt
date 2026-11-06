@@ -1,18 +1,18 @@
-# Owner-maintained user documentation inputs, relative to this repository.
-# The platform reads this file from the selected source revision.
-# Entries may be Markdown files, directories, or glob patterns; each must match.
-# Keep source/developer-only documentation outside the selected inputs.
 README.md
 README_zh.md
 docs/node.md
 docs/node_zh.md
+docs/sandbox-lifecycle.md
+docs/sandbox-lifecycle_zh.md
 docs/node-build.md
 docs/node-build_zh.md
 docs/node-proxy.md
 docs/node-proxy_zh.md
 docs/node-resource.md
 docs/node-resource_zh.md
-docs/node-journald.md
-docs/node-journald_zh.md
-docs/telemetry.md
-docs/telemetry_zh.md
+docs/observability.md
+docs/observability_zh.md
+docs/cluster.md
+docs/cluster_zh.md
+docs/extensions.md
+docs/extensions_zh.md

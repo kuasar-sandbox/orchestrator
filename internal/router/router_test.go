@@ -1020,7 +1020,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/route-link/reserve-build":
-			// The registry assigns the build/template ids + places it (§7.5); the
+			// The registry assigns the build/template ids + places it (docs/cluster.md#cluster-build); the
 			// router synthesizes the e2b register response and routes follow-ups.
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {

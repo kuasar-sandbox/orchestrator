@@ -1,5 +1,5 @@
 // Package router is the cluster's e2b-compatible unified ingress
-// (cluster-router.md): it serves the e2b control plane (api.<domain>) and the
+// (docs/cluster.md#client-access): it serves the e2b control plane (api.<domain>) and the
 // data plane (<port>-<sid>.<domain>) by Host, reserving sandboxes through the
 // registry's control API and forwarding the data plane to the target node (the
 // two-hop path: client -> router -> node data endpoint -> guest).
@@ -132,7 +132,7 @@ const buildTTL = time.Hour
 // group-scoped control request to a route owner, then forwards data to nodes.
 type Router struct {
 	domain        string
-	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§7)
+	dataPlaneAuth string // off | log | enforce — data-plane access-token check (docs/cluster.md#router-data-plane)
 	mx            *metrics.M
 	routeLinkBase string       // static base used by New in tests / size-1 local mode
 	routeClient   *http.Client // static client used by New in tests / size-1 local mode
@@ -148,7 +148,7 @@ type Router struct {
 
 	authTTL time.Duration
 	authMu  sync.Mutex
-	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
+	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (docs/cluster.md#router-route-cache)
 
 	routeTTL         time.Duration
 	routeIdleTimeout time.Duration
@@ -683,7 +683,7 @@ func createHeaderValue(header http.Header, name string) (string, bool) {
 // --- build control plane ---
 
 // buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
-// build/template ids + places the build, §7.5).
+// build/template ids + places the build; docs/cluster.md#cluster-build).
 type buildReserveResult struct {
 	BuildID     string             `json:"build_id"`
 	TemplateID  string             `json:"template_id"`
@@ -1163,7 +1163,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSandboxVerb forwards a sid-scoped control verb (get/kill/pause/timeout/
-// export) to the node holding the sandbox (cluster-router.md); kill's
+// export) to the node holding the sandbox (docs/cluster.md#client-access); kill's
 // teardown propagates back as a route delete, converging the registry.
 func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
@@ -1183,7 +1183,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	}
 	// Authenticate the caller against the sandbox's group before forwarding (the
 	// node re-authenticates too, but the ingress must not be an open relay / sid
-	// oracle — cluster-router.md/§8).
+	// oracle — docs/cluster.md#router-data-plane).
 	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
@@ -1217,7 +1217,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	rt.forwardToNode(w, r, rr, nodePath, r.Method == http.MethodGet && isSandboxResourcePath(r.URL.Path))
 }
 
-// handleList returns the group's sandbox shard (cluster-router.md: list is
+// handleList returns the group's sandbox shard (docs/cluster.md#client-access: list is
 // group-local — the registry holds every node's sandboxes for the group).
 func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
@@ -1497,7 +1497,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
 		return
 	}
-	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
+	// Hot path: serve from the local route cache (zero control round-trip; docs/cluster.md#router-route-cache). On a
 	// miss (cache lagging / cold), fall back to route_link.
 	rr := rt.cachedRoute(group, routeKey, sid)
 	if rr != nil && !routeMatchesIdentity(rr, group, routeKey, sid) {
@@ -2311,7 +2311,7 @@ func (rt *Router) cacheRouteLocked(cacheKey string, now time.Time) *routeResolve
 }
 
 // verifyAuth checks an api key against a group via the control API, caching a
-// valid result for authTTL (cluster-router.md). It returns (ok, err): a
+// valid result for authTTL (docs/cluster.md#client-access). It returns (ok, err): a
 // non-nil err means the control API was unreachable (caller → 503); ok==false
 // with nil err means the key was rejected (caller → 403).
 func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, error) {

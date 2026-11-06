@@ -66,7 +66,7 @@ type Conductor struct {
 	// tokens). Disabled => envd runs non-secure and the proxy is the sole data-plane gate.
 	MMDS MMDSConfig `yaml:"mmds" json:"mmds"`
 	// Cluster connects this node to a cluster-ctl registry over node-link
-	// (node.md §10); empty = standalone single-node.
+	// (docs/cluster.md#node-attachment); empty = standalone single-node.
 	Cluster ClusterConfig `yaml:"cluster" json:"cluster"`
 	// Singular top-level references.
 	EncryptionKey  string `yaml:"encryption_key" json:"encryption_key"`   // credential at-rest AES-256 (":"-sep, first active); or NODE_CONFIG_ENCRYPTION_KEY env
@@ -204,7 +204,7 @@ type ResourceHostReserved struct {
 }
 
 // ResourceWatermarksConfig sets the zone thresholds as fractions of the allocatable
-// pool (node-resource.md §3.2 / §4).
+// pool (docs/node-resource.md#resource-policy and #resource-model).
 type ResourceWatermarksConfig struct {
 	OperationalMarginFactor float64 `yaml:"operational_margin_factor" json:"operational_margin_factor"` // default 0.10
 	HighFactor              float64 `yaml:"high_factor" json:"high_factor"`                             // red zone start; default 0.85
@@ -227,7 +227,7 @@ type ResourceAdmissionConfig struct {
 	QueueMaxDepth int    `yaml:"queue_max_depth" json:"queue_max_depth"` // queue capacity; default 256
 }
 
-// ApplyDefaults fills the controller tuning defaults (node-resource.md §3.2). The
+// ApplyDefaults fills the controller tuning defaults (docs/node-resource.md#resource_listen). The
 // socket default (pkg/resource.DefaultSocket) is applied by nodectl.Resolve, which
 // owns that protocol constant. Exported so nodectl.Resolve can default a config
 // block built outside config.Load (e.g. in tests).
@@ -316,7 +316,7 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 }
 
 // ClusterConfig connects this node to a cluster-ctl registry over node_link
-// (node.md §10). Empty NodeLink.Endpoint = standalone single-node (no cluster).
+// (docs/cluster.md#node-attachment). Empty NodeLink.Endpoint = standalone single-node (no cluster).
 type ClusterConfig struct {
 	NodeLink          ClusterNodeLink   `yaml:"node_link" json:"node_link"`                   // how to reach registry node_link
 	NodeID            string            `yaml:"node_id" json:"node_id"`                       // this node's id; "" = hostname
@@ -447,7 +447,7 @@ func (u UnitsConfig) PoolWaitDuration() time.Duration {
 type SandboxConfig struct {
 	TimeoutSec int                   `yaml:"timeout_sec" json:"timeout_sec"` // default TTL; default 300
 	DeadTTL    string                `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
-	Capacity   int                   `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator, §4.2); 0 = unbounded
+	Capacity   int                   `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator; docs/cluster.md#placer-placement); 0 = unbounded
 	Resources  ResourcesConfig       `yaml:"resources" json:"resources"`     // capacity + resource control
 	Timeouts   SandboxTimeoutsConfig `yaml:"timeouts,omitempty" json:"timeouts,omitempty"`
 	Usage      UsageConfig           `yaml:"usage" json:"usage"`     // node-local native accounting policy
@@ -686,7 +686,7 @@ type BuilderConfig struct {
 	// the client uploads the (gzipped tar) context straight to the bucket via
 	// a presigned PUT, and the build sandbox fetches it via a presigned GET.
 	// Unset → COPY steps are rejected (501). For local/single-node without a
-	// cloud object store, point it at a versitygw gateway. (§11)
+	// cloud object store, point it at a versitygw gateway. (docs/node-build.md#execution-and-publication)
 	FilesStorage *FilesStorageConfig `yaml:"files_storage" json:"files_storage"`
 }
 

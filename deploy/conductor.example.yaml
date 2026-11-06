@@ -1,5 +1,5 @@
 # node-ctl conductor serve config — node-ctl conductor serve --config /etc/node-ctl/conductor.yaml.
-# See orchestrator/docs/node.md §3. Generate a fresh skeleton with
+# See orchestrator/docs/node.md#conductor-configuration. Generate a fresh skeleton with
 # `node-ctl config conductor --template`; validate yours with
 # `node-ctl config conductor --config conductor.yaml [--resolve]`.
 # The paired deployment examples use distinct plaintext node upstreams:
@@ -69,8 +69,8 @@ paths:
   # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids # PID allowlist gating the plugin plane
 
 # Systemd template units (generated + installed at startup, then daemon-reloaded).
-# Primary multi-pool use case: NUMA-local deployment. See docs/node.md#numa-deployment
-# and docs/node_zh.md#numa-deployment for topology, named templates, placement drop-ins
+# Primary multi-pool use case: NUMA-local deployment. See docs/node.md#numa-deployment-with-multiple-pools
+# and docs/node_zh.md#numa-deployment-with-multiple-pools for topology, named templates, placement drop-ins
 # (install before prewarming), and application boundaries. No NUMA-host test is required.
 # Sharing one template does not give its pools different NUMA bindings.
 # units:
@@ -79,7 +79,9 @@ paths:
 #     - {unit: sandbox-runner@.service, size: 0}
 #   builder_pools:
 #     - {unit: sandbox-builder@.service, size: 0}
-#   # Each entry is an independent round-robin slot; duplicate units/items are legal.
+#   # Each entry is an independent logical pool; equal priorities select randomly.
+#   # Optional name/resource_pool/capacity/priority apply to runner and builder pools.
+#   # size is an idle target; capacity bounds all instances and effective start reservations.
 #   # size is the idle target, not concurrency or weight; zero starts on demand.
 #   # Omit a list to use legacy runner/runner_pool_size or builder/builder_pool_size.
 #   # Empty lists and explicit old/new fields for the same kind are rejected.
@@ -166,7 +168,10 @@ builder:
 # resource_listen:
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
-#   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
+#   # pools: [{name: default, capacity: {cpu: 32, memory: 128GiB}, allocatable: {cpu: 8, memory: 24GiB}}]
+#   # Multiple pools require explicit net memory and omit legacy resources/margin.
+#   # Per-pool watermarks and external unit_dropins: see docs/node-resource.md#resource-pools.
+#   # Advanced tuning — all defaulted (docs/node-resource.md#resource_listen); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]
 #   # resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 16GiB, cpu: 1.5 } }
@@ -214,7 +219,7 @@ checkpoint:
 #     external-mmds:
 #       endpoint: unix:///run/kuasar/mmds/external-mmds.sock
 
-# cluster: connect this node to a cluster-ctl registry over node_link (node.md §10).
+# cluster: connect this node to a cluster-ctl registry over node_link (docs/cluster.md#node-attachment).
 # Omitted = standalone single-node.
 # cluster:
 #   node_link:                                    # how to reach registry node_link
