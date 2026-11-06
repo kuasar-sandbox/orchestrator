@@ -275,8 +275,8 @@ builder:                                           # Build resources are separat
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
 #   # pools: [{name: default, capacity: {cpu: 32, memory: 128GiB}, allocatable: {cpu: 8, memory: 24GiB}}]
 #   # Multiple pools require explicit net memory and omit legacy resources/margin.
-#   # Per-pool watermarks and external unit_dropins: see docs/resource-pools.md.
-#   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
+#   # Per-pool watermarks and external unit_dropins: see docs/node-resource.md#resource-pools.
+#   # Advanced tuning — all defaulted (docs/node-resource.md#resource_listen); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]
 #   # resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 16GiB, cpu: 1.5 } }
@@ -307,7 +307,7 @@ checkpoint:                                        # paused-state capture
 #     reserved_path_prefixes: [/latest/api/, /internal/]
 #   services:
 #     external-mmds: { endpoint: unix:///run/kuasar/mmds/external-mmds.sock }
-# cluster:                                         # connect this node to registry node_link (node.md §10)
+# cluster:                                         # connect this node to registry node_link (docs/cluster.md#node-attachment)
 #   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
 #     # node supports registry owner redirect; registry returns member node_advertise targets when available

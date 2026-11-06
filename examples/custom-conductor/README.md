@@ -2,6 +2,8 @@
 
 # Custom conductor
 
+This is a runnable static App integration. The complete public SDK and lifecycle contracts belong to [application extensions](../../docs/extensions.md#examples); deployment and operational requirements stay with the corresponding capability document.
+
 Build the example with:
 
 ```sh
@@ -38,7 +40,7 @@ Proxy and never enter this App.
 
 There is no dynamic plugin loader or extension registry. A nil Extension keeps
 the built-in behavior and creates no observation hub or watcher goroutine. See
-[`docs/extensions.md`](../../docs/extensions.md) for the trust and consistency
+[extensions.md](../../docs/extensions.md) for the trust and consistency
 contracts.
 
 `config.DecodeConductor` is an environment-independent declarative parser: a
@@ -76,6 +78,6 @@ trusted telemetry plugin. The fixed request/concurrency/time/size limits and
 whole-batch errors also apply in process. StableID cannot replace SandboxID.
 Keep the raw JSON or decode the native integer types; do not round through a
 generic float64 map or expose this trusted reader through an unauthenticated
-wrapper. See [native usage](../../docs/node.md#native-usage).
+wrapper. See [native usage](../../docs/observability.md#native-usage).
 
 The same `StatsRequest` accepts `Sections: []string{"traffic"}`. Each result has `Traffic.Inflight.Connected`, logical per-service connected counts, flat `Traffic.Platform`/`Traffic.Transit` counters and empty `Traffic.Egress`. A missing port yields empty planes; a configured read failure fails the batch. Submit up to 64 exact SandboxIDs together: conductor performs one native switch read and, for the built-in Proxy provider, one stats UDS batch. Resource, traffic and usage are domain reads, independent of telemetry lifetime.

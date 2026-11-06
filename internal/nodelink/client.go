@@ -1,5 +1,6 @@
-// Package nodelink is the node side of the cluster node-link channel (node.md
-// §10): a node-ctl conductor serve dials the registry, registers its identity, then — as
+// Package nodelink is the node side of the cluster node-link channel
+// (docs/cluster.md#node-link): a node-ctl conductor serve dials the registry,
+// registers its identity, then — as
 // the route authority — streams its sandbox routes up while executing the
 // registry's lifecycle/key commands. It reuses the routesync engine (the frame
 // codec + StreamAuthority): the only node-link-specific bits are sending a
@@ -38,7 +39,7 @@ type Node interface {
 	HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck
 	// Heartbeat is the node's current water level (live sandbox count, drain),
 	// sent periodically so the registry tracks liveness (the dead-node sweep) and
-	// placement headroom (cluster.md / §11).
+	// placement headroom (docs/cluster.md#node-link).
 	Heartbeat() *routesync.Heartbeat
 }
 
@@ -208,7 +209,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 		}
 	}
 	// Periodic heartbeat (node -> registry): liveness for the dead-node sweep +
-	// water level for placement (cluster.md / §11), serialized via the outbox.
+	// water level for placement (docs/cluster.md#node-link), serialized via the outbox.
 	go func() {
 		t := time.NewTicker(c.heartbeat)
 		defer t.Stop()

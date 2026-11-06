@@ -109,7 +109,7 @@ placer_link:
   place_timeout: 2s
 `
 
-const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (docs/cluster-router.md).
+const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (docs/cluster.md#router-configuration).
 # e2b-compatible unified ingress. Required: domain.
 domain: sandboxes.example.com
 registry:                            # bootstrap endpoint for registry membership
@@ -127,7 +127,7 @@ cache:
 # metrics_listen: ":9910"            # optional Prometheus text endpoint
 `
 
-const placerConfigSkeleton = `# cluster-ctl placer config — cluster-ctl placer --config <this> (docs/cluster-placer.md).
+const placerConfigSkeleton = `# cluster-ctl placer config — cluster-ctl placer --config <this> (docs/cluster.md#placer-configuration).
 # Standalone placement scheduler; starts from registry membership, joins the
 # placer memberlist label, consumes node_list, and provides placement.
 placer:

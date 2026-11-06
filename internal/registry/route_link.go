@@ -108,7 +108,7 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ListItem is one row of a group's sandbox listing (cluster-router.md: list is
+// ListItem is one row of a group's sandbox listing (docs/cluster.md#router-addressing: list is
 // served from the group's SandboxStore shard, no cross-group).
 type ListItem struct {
 	IdleTimeout *int64 `json:"idleTimeout"`
@@ -162,7 +162,7 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, res)
 }
 
-// serveBuild resolves a build_id to its node (router restart recovery, §7.5).
+// serveBuild resolves a build_id to its node (router restart recovery; docs/cluster.md#cluster-build).
 func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	var res *BuildReserveResult

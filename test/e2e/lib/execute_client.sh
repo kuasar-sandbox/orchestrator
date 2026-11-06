@@ -3,7 +3,7 @@
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
-    # Optional sandbox-config injection header (docs/node.md §4.4): set REQ_NET_HEADER to a JSON
+    # Optional sandbox-config injection header (docs/sandbox-lifecycle.md#request-configuration): set REQ_NET_HEADER to a JSON
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
     [ -n "${REQ_RESOURCE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Resource: ${REQ_RESOURCE_HEADER}")

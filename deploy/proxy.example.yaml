@@ -2,7 +2,7 @@
 # A single independent Proxy master registers on conductor's plugin plane, owns
 # listener sockets, and supervises worker processes that read a shared-memory
 # route table.
-# See orchestrator/docs/node-proxy.md §2. Validate with
+# See orchestrator/docs/node-proxy.md#proxy-configuration. Validate with
 # `node-ctl config proxy --config proxy.yaml`.
 
 # serve's control socket: the master registers on its plugin plane and streams the

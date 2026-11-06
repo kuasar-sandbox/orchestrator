@@ -1,4 +1,4 @@
-# cluster-placer.service — cluster placement scheduler (cluster-placer.md).
+# cluster-placer.service — cluster placement scheduler (docs/cluster.md#groups-and-placement).
 # Starts the placer member API, follows registry membership, consumes node_list
 # WATCH_LIST and serves Place/verify-key for registry callers. Operator-managed.
 [Unit]

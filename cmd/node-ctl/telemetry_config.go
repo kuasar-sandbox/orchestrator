@@ -98,5 +98,5 @@ collector:
         receivers: [envd, sandboxstats, sandboxotlp]
         processors: [batch]
         exporters: [sandboxlocal]
-# See docs/telemetry.md for Collector pipelines and query backends.
+# See docs/observability.md#telemetry for Collector pipelines and query backends.
 `

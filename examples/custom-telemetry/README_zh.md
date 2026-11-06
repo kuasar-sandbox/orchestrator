@@ -2,6 +2,8 @@
 
 # 定制 telemetry
 
+本示例是可运行的静态 App 集成入口。公共 SDK 与生命周期契约见[应用扩展](../../docs/extensions_zh.md#examples)；部署和运行要求仍由对应能力文档维护。
+
 构建受信、静态链接的 App：
 
 ```sh
@@ -17,7 +19,7 @@ root 或服务 UID 属主。在独立 `telemetry.yaml` 的 `paths.telemetry_exec
 `proxy_netns` 配置通过 `Config.ProxyNetNS` 传入 `Configure`.
 它选择两种沙箱 OTLP listener 的 namespace, 不移动 executable 或其远端 client.
 早期 Preview 的 `sandbox_netns` key 必须改名, strict bootstrap/config decode 拒绝旧名称.
-部署方法见 [management 网络](../../docs/telemetry_zh.md#4-直接面向沙箱的-otlp).
+部署方法见 [management 网络](../../docs/observability_zh.md#guest-otlp).
 
 `Configure` 在 store/listener 前执行一次. Config 保存声明, Runtime 保存进程内
 binding. 示例记录 lifecycle start/stop 并注册 `privatedeployment` processor factory.
@@ -53,5 +55,5 @@ Provider 失败不会回退 YAML 或本地 DB. `local.enabled` 显式创建可�
 `sandboxlocal` 经 Collector 写入它. `extension` 包没有 OTel 类型、动态 registry
 或 DI container.
 
-完整契约见 [telemetry 规范](../../docs/telemetry_zh.md) 和
-[扩展指南](../../docs/extensions_zh.md#telemetry-bootstrap-与扩展)。
+完整契约见 [telemetry 规范](../../docs/observability_zh.md#telemetry) 和
+[扩展指南](../../docs/extensions_zh.md#telemetry-bootstrap-and-extension)。

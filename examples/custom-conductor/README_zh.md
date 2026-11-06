@@ -2,6 +2,8 @@
 
 # 自定义 conductor
 
+本示例是可运行的静态 App 集成入口。公共 SDK 与生命周期契约见[应用扩展](../../docs/extensions_zh.md#examples)；部署和运行要求仍由对应能力文档维护。
+
 构建示例:
 
 ```sh
@@ -32,7 +34,7 @@ metadata, 并在 core 最终规范化之前提高过短的 Create timeout. 私�
 
 不存在动态 plugin loader 或 extension registry. Extension 为 nil 时保持 built-in
 行为, 不创建观察 hub 或 watcher goroutine. 信任和一致性合同参见
-[`docs/extensions_zh.md`](../../docs/extensions_zh.md).
+[extensions_zh.md](../../docs/extensions_zh.md).
 
 `config.DecodeConductor` 是环境无关的声明式解析器: 第三方文档不必重复本机 dispatch
 executable 或携带加密材料. 替换 Config 时须保留不可变 bootstrap executable,
@@ -63,6 +65,6 @@ rows, err := e.host.Stats().ReadStats(ctx, conductor.StatsRequest{
 它与公开 stats API 和可信 telemetry plugin 调用相同的 conductor 领域 Reader.
 固定请求数、并发、时间、大小上限和整批错误也适用于进程内调用. StableID 不能替代
 SandboxID. 保留原始 JSON 或解码为原生整数类型; 不经过通用 float64 map 舍入,
-也不要通过未认证 wrapper 暴露此可信 Reader. 参见[原生 usage](../../docs/node_zh.md#原生-usage).
+也不要通过未认证 wrapper 暴露此可信 Reader. 参见[原生 usage](../../docs/observability_zh.md#native-usage).
 
 同一 `StatsRequest` 接受 `Sections: []string{"traffic"}`. 每项结果包含 `Traffic.Inflight.Connected`、逻辑 service 的 connected 计数、平铺的 `Traffic.Platform`/`Traffic.Transit` 计数和空 `Traffic.Egress`. 未绑定端口时对应平面为空;配置来源读取失败则整批失败. 可一次提交最多 64 个精确 SandboxID: conductor 执行一次原生交换机读取,使用内置 Proxy provider 时还执行一次 stats UDS 批量请求. Resource、traffic、usage 均为领域读取,不依赖 telemetry 的生命周期.

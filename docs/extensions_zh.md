@@ -1,14 +1,32 @@
 [English](extensions.md) | [简体中文](extensions_zh.md)
 
-# 运行期扩展
+<a id="overview"></a>
 
-Create 身份在 Hook 前已选定，`SandboxOperation.SandboxID` 不可变；把 `kuasar-sandbox.identity` 重新加入已清理的可变 metadata 会被拒绝。完整契约见 [Node Create 身份](node_zh.md#412-create-身份)。
+# 应用扩展
+
+通过公共 Go API 构建自定义 Conductor、Proxy 或 Telemetry 应用。静态 bootstrap/配置、对象源、生命周期 Hook 与请求 wrapper 是不同扩展边界。先运行完整示例，再阅读实现边界的契约。
+
+Create 身份在 Hook 前已选定，`SandboxOperation.SandboxID` 不可变；把 `kuasar-sandbox.identity` 重新加入已清理的可变 metadata 会被拒绝。完整契约见 [Node Create 身份](sandbox-lifecycle_zh.md#create-identity)。
 
 Conductor、独立 Proxy 和 Telemetry 支持静态链接的运行期扩展，使部署能在进程内集成而不必长期维护 fork。扩展是编入 xconductor、xproxy 或 xtelemetry 的受信代码，共享 core 的地址空间、UID、生命周期、文件系统及网络权限。API 组织 ownership 与并发，不构成安全沙箱。
 
 每个 Conductor/Telemetry/Proxy master 进程持有一个扩展对象，每个 Proxy worker epoch 新建一个对象。框架不在运行期发现或加载插件，不维护扩展 registry，不设 priority、DI container 或 URL namespace。私有项目可在各角色单一对象后自行组合模块。
 
+**阅读路径：** [运行示例](#examples) · [配置 API](#public-configuration-entry-points) · [Conductor App](#conductor-bootstrap) · [Proxy App](#proxy-bootstrap) · [Telemetry App](#telemetry-bootstrap-and-extension) · [对象源](#conductor-object-sources) · [Hook](#conductor-lifecycle-hooks)
+
+<a id="examples"></a>
+
+## 可运行示例
+
+- [Conductor](../examples/custom-conductor/README_zh.md)
+- [Proxy](../examples/custom-proxy/README_zh.md)
+- [Telemetry](../examples/custom-telemetry/README_zh.md)
+
+<a id="component-bootstrap-and-process-local-material"></a>
+
 ## 组件 bootstrap 与进程内材料
+
+<a id="public-configuration-entry-points"></a>
 
 ### 公共配置入口
 
@@ -30,6 +48,8 @@ Conductor、独立 Proxy 和 Telemetry 支持静态链接的运行期扩展，�
 `New(Hooks) *App`、`(*App).Run() error`、`(*App).RunContext(context.Context) error`,
 生命周期见下文。`Runtime.MarshalJSON() ([]byte, error)` 与
 `(*Runtime).UnmarshalJSON([]byte) error` 始终拒绝序列化/反序列化。
+
+<a id="conductor-bootstrap"></a>
 
 ### Conductor bootstrap
 
@@ -132,6 +152,8 @@ key 集支持解密此前记录;进程加密 key 集与租户凭据分发表更�
 刷新可以阻塞该操作或使其失败。实现须考虑请求延迟,不能假定回调只在启动时执行。
 错误不得回退 YAML 或环境默认凭据链。参见拥有该行为的 [filestore adapter](../internal/filestore/filestore.go)。
 
+<a id="proxy-bootstrap"></a>
+
 ### Proxy bootstrap
 
 运维入口仍只有 `node-ctl proxy serve --config ...`。公共 Load/Decode 只做环境无关的 strict
@@ -190,7 +212,7 @@ Serve.Start 错误或 nil wrapper 不开放 data listener,由既有 master super
 worker。worker 从不读取 `proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响
 replacement worker。
 
-Worker 是专用、单次运行的子进程：内置与定制入口在 `Run` 返回后必须退出 worker 进程。成功建立的 route SHM 与 admission 映射存活到进程退出；`PreparedWorker.Close` 只关闭继承描述符，不卸载仍可能被 handler/extension/traffic GC 引用的映射。Supervisor 仍须确认进程退出后才清理共享计数。普通 HTTP 与 HTTP/2 CONNECT 的取消会关闭 backend，与有效流量限制无关；HTTP/1 hijacked CONNECT 保留半关闭语义。详见 [worker 生命周期与转发取消](node-proxy_zh.md#91-worker-生命周期与传输取消)。
+Worker 是专用、单次运行的子进程：内置与定制入口在 `Run` 返回后必须退出 worker 进程。成功建立的 route SHM 与 admission 映射存活到进程退出；`PreparedWorker.Close` 只关闭继承描述符，不卸载仍可能被 handler/extension/traffic GC 引用的映射。Supervisor 仍须确认进程退出后才清理共享计数。普通 HTTP 与 HTTP/2 CONNECT 的取消会关闭 backend，与有效流量限制无关；HTTP/1 hijacked CONNECT 保留半关闭语义。详见 [worker 生命周期与转发取消](node-proxy_zh.md#worker-lifetime)。
 
 公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，开放 logger、
 启动期 TLS material provider，以及按 process role 使用的可信、静态编译
@@ -227,7 +249,7 @@ dial → ordinary HTTP/CONNECT → traffic close`。该 helper 拥有 `ResponseW
 不得再写错误；它不校验 Kuasar `X-Access-Token`。`Revalidate` 在 activation 后、dial 前执行；
 普通 HTTP 的 `Rewrite` 只收到 guest-facing clone，失败时不写任何 guest request bytes；CONNECT
 不调用 Rewrite。generic helper 拒绝 native exec，后者继续经 `next` 走 KAT + per-command CEL。
-本接口复用 core 的 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#51-http11-websocket-转发)，不增加扩展专用传输接口。
+本接口复用 core 的 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#http11-websocket-forwarding)，不增加扩展专用传输接口。
 
 该 API 只对应独立 Proxy,不为 conductor 增加数据面 factory;也不开放原始 Router,
 SHM、listener、routesync、stats、dial target 或 credential records。除同一 master Extension 的
@@ -253,10 +275,11 @@ Proxy 的 [公共材料类型](../app/proxy/proxy.go) 与 Conductor 有明确区
 Core 固定最低 TLS 1.2 与 `h2`/`http/1.1` ALPN。
 `Hooks.Configure` 签名为 `(context.Context, *Config) error`,
 `Hooks.BindRuntime` 为 `(context.Context, Process, *Runtime) error`,如上例。
-映射与传输清理统一见 [Proxy worker 生命周期](node-proxy_zh.md#91-worker-生命周期与传输取消);
+映射与传输清理统一见 [Proxy worker 生命周期](node-proxy_zh.md#worker-lifetime);
 下述 source、Hook 与 wrapper 接口不构成另一套数据面实现。
 
-<a id="proxy-lifecycle"></a>
+<a id="proxy-lifecycle-named-listeners-and-inplacerestart"></a>
+
 ### Proxy 生命周期、命名监听与 InplaceRestart
 
 每个 master 实例从操作受理时的相同原始输入执行一次 Configure；B 的派生路径不会成为
@@ -268,7 +291,7 @@ Master 的 BindRuntime 可交付 `Runtime.ListenerFiles map[string]*os.File`。
 返回后冻结命名集合；调用者要保留句柄须提供独立副本。Worker Hook 不得交付监听文件，
 worker 使用内部 bootstrap 副本。`app/activation.Receive()` 可接收环境 FD；
 node-ctl 链路中的最终 master 自动消费 activation。两种来源不得重复交付同名文件。
-配置显式选择名称，见[监听与部署规约](node-proxy_zh.md#95-命名监听与-systemd-部署)。
+配置显式选择名称，见[监听与部署规约](node-proxy_zh.md#listener-ownership)。
 
 公共 App 提供：
 
@@ -313,6 +336,8 @@ type Shutdown interface {
 `Traffic().Get` 的 `InplaceRestart` 标记服务观测可能不完整，idle 消费方应等待正常单实例读数。[custom-proxy 示例](../examples/custom-proxy/README_zh.md)
 等待路由 Watch 退出。生命周期、listener 与控制资源仍由核心拥有；扩展不得关闭服务共享
 listener，也不得在 Shutdown 完成后继续使用 Host。
+
+<a id="telemetry-bootstrap-and-extension"></a>
 
 ### Telemetry bootstrap 与扩展
 
@@ -394,9 +419,11 @@ paused saved usage. 普通基础设施 receiver 不要求 SandboxID. `applicatio
 关闭时先撤销 Plugin lease、drain query/ingress，再依次关闭 Collector、Extension、
 query backend 与可选 local TSDB; 每步 cleanup 都有有界 context。Extension 在 Shutdown 后不能继续使用
 Reader。Core identity、Collector-only collection write、SandboxID lookup 和 no-Wake 规则
-不可配置。完整默认值、storage/network/query 契约由 [Telemetry](telemetry_zh.md) 维护；
+不可配置。完整默认值、storage/network/query 契约由 [Telemetry](observability_zh.md#telemetry) 维护；
 可构建 [custom telemetry 示例](../examples/custom-telemetry/README_zh.md) 将普通 lifecycle/
 material 代码与 advanced Collector 代码分开。
+
+<a id="conductor-object-sources"></a>
 
 ## Conductor 对象源
 
@@ -446,6 +473,10 @@ type Host interface {
 
 `SandboxSource.Watch` 覆盖全部持久 Sandbox 行。`BuildSource.Watch` 覆盖当前 registered、waiting、building、ready 集合；live 转入 error 时发出包含最终视图与原因的 `BuildRemove`。这个 removal 不是持久事件：重同步后，失败 Build 只是缺席于当前集合，`BuildSource.Get` 仍能读取其持久 error 行。
 
+`SandboxView` 保留 `IdleTimeout *int64` 的 nil（关闭）/0（立即）区别，并投影 `AutoReset`、`DeadUnix`、`AutoResetError` 与 pause/resource obligation 信息；每次读取和回调仍独立 deep-copy。
+
+<a id="watch-generations"></a>
+
 ### Watch 代际
 
 Watch 是最终收敛的状态流，不是持久事件日志：
@@ -465,7 +496,9 @@ Core 先订阅，再查询 SQLite 快照，避免修改永久落入 snapshot/liv
 
 对路由消费者而言，live delete 和重新连接后的完整快照中缺席，都会撤销旧投影。持久本地清理独立于这两条路由收敛路径，从保留的行继续执行。
 
-`Host.Stats()` 提供与公开 stats API 和 telemetry plugin 共用的有界原生 section Reader. 静态链接的 conductor extension 调用它的 `ReadStats(ctx, StatsRequest)` 方法. `StatsRequest` 选择精确 SandboxID、resource/traffic/usage section 及可选原生 usage view/cursor/limit; `SandboxStats` 包含各 section 原样 body 和仅作关联的 StableID. 此可信进程内入口不收集 API key、不唤醒 guest、不采样. 它执行同样的 64 对象、八个并发读取、五秒和 4 MiB 上限. 不要在 Watch callback 内执行慢读取; 应保留 Host, 在独立可取消任务中读取. 参见[Node 原生 usage](node_zh.md#原生-usage)和[原生 batch 合同](node_zh.md#原生-stats-batch)及[公共类型](../app/conductor/extension/stats.go). Start 期间及 core reconciliation/provider 装配完成之前, 读取立即返回 unavailable, 不阻塞 extension 启动, 也不暴露尚未配置完成的来源. 启动后使用同一领域 Reader.
+`Host.Stats()` 提供与公开 stats API 和 telemetry plugin 共用的有界原生 section Reader. 静态链接的 conductor extension 调用它的 `ReadStats(ctx, StatsRequest)` 方法. `StatsRequest` 选择精确 SandboxID、resource/traffic/usage section 及可选原生 usage view/cursor/limit; `SandboxStats` 包含各 section 原样 body 和仅作关联的 StableID. 此可信进程内入口不收集 API key、不唤醒 guest、不采样. 它执行同样的 64 对象、八个并发读取、五秒和 4 MiB 上限. 不要在 Watch callback 内执行慢读取; 应保留 Host, 在独立可取消任务中读取. 参见[Node 原生 usage](observability_zh.md#native-usage)和[原生 batch 合同](observability_zh.md#native-stats-batches)及[公共类型](../app/conductor/extension/stats.go). Start 期间及 core reconciliation/provider 装配完成之前, 读取立即返回 unavailable, 不阻塞 extension 启动, 也不暴露尚未配置完成的来源. 启动后使用同一领域 Reader.
+
+<a id="conductor-lifecycle-hooks"></a>
 
 ## Conductor 生命周期 Hook
 
@@ -487,8 +520,8 @@ operation 是独立可变副本，精确有一个 request 字段非 nil。`ID`�
 
 | Request | 字段与约束 |
 |---|---|
-| `SandboxCreateRequest` | `TemplateID string`、不可变 `Profile Profile`、`TimeoutSeconds int`、`Metadata`/`Env map[string]string`、`Secure bool`、`AutoPauseMemory *bool`、`MMDS *string`;MMDS 保留顶层输入 presence。请求级 MMDS/metadata 可含 secret 或 credential,不得当作非秘密对象源投影记录日志 |
-| `SandboxPauseRequest` | 不可变 `CaptureKind CaptureKind`(`snapshot`/`sandbox`);`CheckpointMergeRef`/`CheckpointDropCaches *bool`,nil 继承 Sandbox/node policy |
+| `SandboxCreateRequest` | `TemplateID string`、不可变 `Profile Profile`、`TimeoutSeconds int`、`Metadata`/`Env map[string]string`、`Secure bool`、`AutoPauseMemory *bool`、`IdleTimeout *int64`、`AutoReset bool`、`MMDS *string`。IdleTimeout 的 nil 关闭、0 立即，正值为整数秒；Create Hook 可调整这些策略，核心重新校验最终值。MMDS 保留顶层输入 presence；请求可含秘密或凭据，不作为非秘密对象投影记录日志 |
+| `SandboxPauseRequest` | `CaptureKind CaptureKind`（`snapshot`/`sandbox`）、`Checkpoint bool`、`IfIdle bool` 和 `IfIdleSince *time.Time` 均由核心拥有，Hook 不得修改、删除或通过指针改写。`CheckpointMergeRef`/`CheckpointDropCaches *bool` 可调整；nil 继承 Sandbox/node policy |
 | `SandboxResumeRequest` | `RequestedDeadlineUnix *int64`,nil 使用 core resume-deadline policy;不可变 `Mode ResumeMode`(`auto`/`memory`/`cold`) 与 `Trigger ResumeTrigger`(`connect`/`wake`/`route`/`exec`/`exec-session`) |
 | `SandboxDeleteRequest` | `Reason string` 仅诊断,修改不改变 cleanup 行为 |
 
@@ -497,7 +530,7 @@ operation 是独立可变副本，精确有一个 request 字段非 nil。`ID`�
 
 Sandbox 操作准入位置如下：
 
-- `create`：调用方鉴权、严格解析、初步模板解析、metadata 归一化与 ID 分配之后；launch claim、持久 starting、目录、network attach、路由发布和 runner 分配之前。Hook 可改模板引用、timeout、metadata、environment、secure 及支持的请求 MMDS 输入，也可改 `AutoPauseMemory`；最终模板需重新解析，并保留 core-owned profile。
+- `create`：调用方鉴权、严格解析、初步模板解析、metadata 归一化与 ID 分配之后；launch claim、持久 starting、目录、network attach、路由发布和 runner 分配之前。Hook 可改模板引用、timeout、metadata、environment、secure 及支持的请求 MMDS 输入，也可改 `AutoPauseMemory`、`IdleTimeout` 与 `AutoReset`；最终模板需重新解析，并保留 core-owned profile。
 - `pause`：捕获 ownership、running incarnation 和 checkpoint 前置条件之后，快照或持久状态修改之前。Hook 可改本次动作的 merge-ref/drop-cache 策略；`CaptureKind` 可观察但由 core 持有，不能修改。
 - `resume`：仅用于 API Connect、Proxy Wake、native exec 和 canonical cluster command 共用的真实 paused → starting 准入。running/starting 的幂等 join 不调用 Hook。Hook 可改请求 deadline；`Mode` 和 `Trigger` 可观察但由 core 持有。
 - `delete`：仅普通显式 API Delete 或 canonical cluster Delete，可拒绝该请求。失败 create/resume 的回滚、对账、shutdown、恢复和其他强制 cleanup 不调用 Hook，不能被扩展可用性阻止。
@@ -510,7 +543,7 @@ Hook 必须让 `Builder.Resources` 保持 nil;重新引入重复权威会被拒�
 `Referer *BuildRefererOptions {Enabled, Writeback *bool}`、`Registry *BuildRegistryOptions`,
 后者的 `TLS *BuildRegistryTLSOptions` 含 `CABundlePEM string` 与 `InsecureSkipVerify bool`。
 Target kind 是 `image` 或 `sandbox`;nil 按最终 effective start/ready 自动解析,
-不是按任意配置是否存在推导,见 [Build target 契约](node-build_zh.md#31-请求级-builder-输入)。
+不是按任意配置是否存在推导,见 [Build target 契约](node-build_zh.md#request-scoped-builder-input)。
 
 公共 [Build request 类型](../app/conductor/extension/build_hook.go) 中,`BuildTriggerRequest` 包含
 `FromImage`、`FromTemplate`、`StartCommand`、`ReadyCommand` string,`Steps []BuildStep` 与
@@ -525,6 +558,15 @@ Build `trigger` 在 ownership/state 检查与初步纯解析后、source 解析�
 
 匹配 `extension.ErrRejected` 的错误产生固定策略拒绝：直连 API 为 403，集群为相应 rejected ACK。其他错误只在日志保留私有细节，对外固定为 temporary-unavailable 503。修改后候选的 core validation 仍保持普通 400/409 契约。
 
+`SandboxCreateRequest.IdleTimeout *int64` 与 `SandboxView.IdleTimeout *int64` 保留
+nil（关闭）和 0（立即）的区别，正数为整数秒。Create hook 可修改该策略，最终值由核心
+重新校验并沿 standalone/cluster 的类型化创建链持久化。它不属于模板或 metadata。
+`SandboxPauseRequest.IfIdleSince *time.Time` 与 `IfIdle`、`CaptureKind` 一样由核心拥有；
+hook 修改、删除或通过指针原地改写时间均拒绝。携条件的 resource-paused 实例返回冲突，
+不通过扩展接管绕过终检。完整合同见 [节点 Pause](sandbox-lifecycle_zh.md#capture-and-pause)。
+
+<a id="conductor-api-wrapper"></a>
+
 ## Conductor API wrapper
 
 同一对象还可实现：
@@ -538,6 +580,8 @@ type APIWrapper interface {
 `WrapAPI` 在 Start 后调用一次，返回 nil 会终止启动。Wrapper 可增加私有路由、在调用 next 前改写请求、覆盖 core 路由、反代其他服务或直接返回本地响应。框架不恢复 panic、不保留前缀、不检测路由冲突、不规定私有鉴权，也不要求必须调用 next。
 
 公共 `api.<domain>` listener 与 conductor config socket 的 API fallback 使用同一个被包装的 handler。Config socket 的 task、run、admin、plugin、secret-management 路由不经过 wrapper。Conductor 没有数据面 handler。扩展为 nil 或没有 APIWrapper 时，直接使用现有 core handler 对象。
+
+<a id="proxy-master-extension"></a>
 
 ## Proxy master 扩展
 
@@ -569,6 +613,8 @@ type ManagementWrapper interface {
 没有额外保留 namespace 或冲突 registry。返回 nil 会终止启动，不恢复 panic。
 扩展为 nil 或不提供该接口时，直接使用原 handler。
 
+<a id="master-route-source"></a>
+
 ### Master 路由源
 
 ```go
@@ -593,6 +639,8 @@ location、完整凭据指纹与 `Revision uint64`。
 
 Observing sink 仅在 core SHM 操作成功后更新扩展投影。发布有界且非阻塞，回调仅在调用 Watch 的 goroutine 运行。扩展滞后、回调错误或 resync 不能终止 routesync、阻塞 SHM 修改和 worker notification、推迟 RouteBarrier ACK，或影响 Wake/activation。
 
+<a id="master-traffic-source"></a>
+
 ### Master traffic 源
 
 `TrafficSource.Get(context.Context, string) (TrafficView, error)` 没有 found boolean 或 Watch。
@@ -608,6 +656,8 @@ Observing sink 仅在 core SHM 操作成功后更新扩展投影。发布有界�
 traffic extension 投影不暴露 RunID;Proxy 在内部保留 route/run/worker fence. `Connected` 替代原来的逻辑 `Egress` 字段,仍仅在 backend 最终 Close 时结束. conductor `Host.Stats().ReadStats` 还发布平铺 `Platform`/`Transit` 计数和空 `Egress`,与公开 API 共用同一份原生读取.
 
 `TrafficSource.Get` 在进程内直接组合当前 applied route 身份、有效的 per-Sandbox maxInflight policy 和 MasterStats；它不查询 stats UDS，也不从 conductor Sandbox 行推导限额。`TrafficView.MaxInflight` 使用 canonical `config.MaxInflight` 结构；返回的 map 与时间指针是独立副本。V1 明确没有 traffic Watch。重连期间保留的 route 仍可查询，需要新鲜状态的调用方还必须检查 `Routes().SyncState()`。
+
+<a id="proxy-worker-extension"></a>
 
 ## Proxy worker 扩展
 
@@ -637,9 +687,13 @@ type IngressWrapper interface {
 
 最终 handler 在该 epoch 内冻结，原样用于节点的 data_listen。它先于 ParseSandbox、ParseConnect 和 core token 准入收到请求，因此可定义私有 Header/path/authentication 契约、改写 canonical E2b-Sandbox-* 输入再调用 next、直接响应、访问其他上游或有意覆盖标准请求。需要内置行为时，未匹配请求应调用 next。MMDS 不使用该 wrapper。返回 nil 终止 worker epoch，不恢复 panic；worker extension 为 nil 或不含 IngressWrapper 时直接使用原 core handler。
 
+<a id="worker-route-point-lookup"></a>
+
 ### Worker 路由单点查询
 
 `GetRoute` 从 worker 当前 SHM point lookup 复制独立公共 RouteView，暴露与 master 投影相同的既有非秘密字段和 revision，而非原始 SHM record、router、token 或可变指针。Worker V1 不提供 route Watch；动态观察仅在 master。这个小接口面是 API 约束，不是受信同进程代码的安全边界。
+
+<a id="authorized-core-forwarding"></a>
 
 ### 已授权 core 转发
 
@@ -667,11 +721,15 @@ type ForwardRequest struct {
 
 一个逻辑请求无论直接 ForwardAuthorized，还是 canonicalize 后调用 next，admission 都只发生一次；wrapper 不能嵌套这两条路径。拒绝先于 Wake、activation 或 dial，使用 core 的 429 max_inflight_reached。Admission lease 和 parking/connected 记账共享普通响应、CONNECT relay、取消及失败 cleanup 的单一生命周期。Generic helper 仍拒绝 native exec，因此不能绕过 KAT/CEL/首帧 gate，也不能把 exec admission 提前到 gate 之前。
 
-普通 HTTP 的 Rewrite 收到独立的 Guest 请求副本。回调后 core 完成最终 hop-header/transport 归一化，回调失败则不写任何 Guest 请求字节。CONNECT 没有 Guest HTTP 请求，绝不调用 Rewrite。Generic helper 拒绝 native exec target，标准 exec 继续走 next 与 KAT、逐命令 CEL 路径。Helper 共享 core 的 HTTP/CONNECT 传输，包括 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#51-http11-websocket-转发)；升级后等待 relay 结束才返回，wrapper 不维护另一套 WebSocket 传输或流量生命周期。
+普通 HTTP 的 Rewrite 收到独立的 Guest 请求副本。回调后 core 完成最终 hop-header/transport 归一化，回调失败则不写任何 Guest 请求字节。CONNECT 没有 Guest HTTP 请求，绝不调用 Rewrite。Generic helper 拒绝 native exec target，标准 exec 继续走 next 与 KAT、逐命令 CEL 路径。Helper 共享 core 的 HTTP/CONNECT 传输，包括 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#http11-websocket-forwarding)；升级后等待 relay 结束才返回，wrapper 不维护另一套 WebSocket 传输或流量生命周期。
+
+<a id="ingress-boundary"></a>
 
 ## Ingress 边界
 
 Worker IngressWrapper 只在 Proxy data_listen 可达。Conductor 公共 listener 与 config-socket API fallback 均使用被包装的控制 API handler，绝不将普通 HTTP/CONNECT 转发给 worker。Cluster router、registry、placer 不增加 extension 或 private ingress；私有部署必须先在外层 canonicalize 集群请求，再进入既有 canonical 集群路径。
+
+<a id="boundaries"></a>
 
 ## 边界
 
@@ -680,12 +738,3 @@ Conductor、Telemetry、Proxy master 或 worker 扩展为 nil 时保留内置启
 此 API 没有 namespace、固定 extension URI、动态加载、热更新或 component compatibility version。WebSocket 属于共享 core transport，不增加扩展专用 API。
 
 可构建程序见 [`examples/custom-conductor`](../examples/custom-conductor)、[`examples/custom-proxy`](../examples/custom-proxy) 与 [`examples/custom-telemetry`](../examples/custom-telemetry)。
-
-### idle 实例策略与 Pause 条件
-
-`SandboxCreateRequest.IdleTimeout *int64` 与 `SandboxView.IdleTimeout *int64` 保留
-nil（关闭）和 0（立即）的区别，正数为整数秒。Create hook 可修改该策略，最终值由核心
-重新校验并沿 standalone/cluster 的类型化创建链持久化。它不属于模板或 metadata。
-`SandboxPauseRequest.IfIdleSince *time.Time` 与 `IfIdle`、`CaptureKind` 一样由核心拥有；
-hook 修改、删除或通过指针原地改写时间均拒绝。携条件的 resource-paused 实例返回冲突，
-不通过扩展接管绕过终检。完整合同见 [节点 Pause](node_zh.md#811-capture-与-pause)。

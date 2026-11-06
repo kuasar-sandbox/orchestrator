@@ -1,23 +1,125 @@
 [English](node-build.md) | [简体中文](node-build_zh.md)
 
-# 节点模板构建
+<a id="overview"></a>
+
+# 模板 Build
+
+本篇定义 Build 注册、目标选择、阶段执行及 canonical 制品发布。先提供完整 CLI 用例，再定义身份与 API；随后维护配置、worker 交接及恢复。
 
 本篇完整定义 Build 注册、目标选择、不可变执行资源、任务准备、顺序阶段执行、发布及恢复。[节点规范](node_zh.md) 维护共享进程、socket、凭据与节点恢复边界；[Registry 规范](cluster_zh.md) 维护集群构建意图和放置。
 
-## 1. Build API
+**阅读路径：** [运行 Build](#client-workflow) · [制品](#artifact-identity) · [API](#build-api) · [配置](#build-configuration) · [Worker 交接](#task-handoff) · [执行与发布](#execution-and-publication) · [恢复](#recovery)
+
+<a id="client-workflow"></a>
+
+## 显式 Image、E 和 S 的客户端配方
+
+前提是已配置 Node/API key/TLS 信任，`APP_IMAGE` 为可达、原生架构、digest 固定
+且已包含应用的镜像。复用 Node 的 registry 凭据，不需要 COPY bucket。[Build API](#build-api)定义 Register、Trigger、Status 的权威契约；本用例使用 HTTP，显式目标通过 Register Header 表达。
+项目固定的 E2B Python 2.25.1 支持 auto 流程，但 `Template.build(headers=...)`
+把 Builder 头同时传给 Register 和 Trigger，不适合 register-only 显式目标。
+
+选择 `BUILD_KIND=img` 仅发布镜像，`sbx` 发布带 portable 默认值的冷 E，`snp`
+发布初始化内存 S。S 需设置实际服务 `APP_START` 和 `APP_READY`；显式 Image
+不能传入这些命令。auto 无有效命令时选 Image，有有效 start 或 ready 时选内存
+S，永不自动选 E。本例使用 Demo 执行预算，请按节点检查准入。
+
+```python
+import json, os, time, urllib.request
+api = os.environ["E2B_API_URL"].rstrip("/")
+key = os.environ["E2B_API_KEY"]
+targets = {
+    "img": {"kind": "image"},
+    "sbx": {"kind": "sandbox", "memory": False},
+    "snp": {"kind": "sandbox", "memory": True},
+}
+kind = os.environ["BUILD_KIND"]  # img, sbx, snp
+
+def call(method, path, body=None, extra=None):
+    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+    headers.update(extra or {})
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(api + path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read()
+        return json.loads(raw) if raw else None
+
+registered = call("POST", "/v3/templates",
+    {"name": "explicit-example", "profile": "e2b", "cpuCount": 2, "memoryMB": 6144},
+    {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})})
+tid, bid = registered["templateID"], registered["buildID"]
+print("Keep registration/build handles:", tid, bid)
+trigger = {"fromImage": os.environ["APP_IMAGE"]}
+if kind == "snp":
+    trigger.update(startCmd=os.environ["APP_START"], readyCmd=os.environ["APP_READY"])
+call("POST", f"/v2/templates/{tid}/builds/{bid}", trigger)
+deadline = time.monotonic() + 900
+while True:
+    status = call("GET", f"/templates/{tid}/builds/{bid}/status")
+    assert status["buildID"] == bid
+    if status["status"] == "error":
+        raise RuntimeError("Build failed; inspect this build's status/logs")
+    if status["status"] == "ready":
+        assert status["profile"] == "e2b" and status["kind"] == kind
+        assert status["target"]["kind"] == targets[kind]["kind"]
+        assert status["target"].get("memory", False) == targets[kind].get("memory", False)
+        assert status["templateID"].startswith(f"e2b-{kind}-")
+        print("Canonical template:", status["templateID"])
+        break
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Polling stopped; build may still run. Use cancel/status with saved handles.")
+    time.sleep(2)
+```
+
+成功后使用 canonical ID create 并检查命令/文件；S 还需 pause/connect 比对状态，
+见[首个应用流程](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/templates_zh.md#first-application)。
+客户端轮询超时不会取消执行。保存 `tid/bid`，检查阶段/原因并按 [取消与删除 Build 记录](#cancel-and-delete-a-build-record) Cancel/
+DELETE 等待所有权清理完成。结果不明时不要盲目重复 Trigger。删除 Build 行不删
+远端工件，应另行保留 canonical ID 与父链/密钥依赖。旧 Release 必须按打包契约
+核对后才使用这些当前 main 目标选项。
+
+<a id="artifact-identity"></a>
+
+## 模板 ID 与工件权威
+
+```
+persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
+                                            profile∈{e2b,bare}; kind∈{img,sbx,snp}
+transient templateID = transient-<registration-id>  保留以查询、取消和删除 Build 记录
+```
+
+- **持久 id 自描述**:payload 是 `manifest://<key>` 或
+  `file://<digest>.image@digest:<digest>@location:<name>`；encrypted carrier 使用 `@hmac:`，
+  Bundle 用 `@manifest:<root-key>`；运行期解析 profile（选择共享 runtime 的 guest 行为）、kind(img = image cold,sbx = Sandbox E cold,snp = Snapshot S memory restore)
+  和 canonical portable ref。snp 可在 Connect 时显式选择 cold,但 TemplateID 的缺省仍是 memory。
+  local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
+- **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
+  之后启动使用持久 id,取消和删除记录仍用注册临时 id。Build status、临时 id、name/alias 与本机 list 仅在终态 Build row 的
+  retention window 内可用。
+- **无独立 templates 表**:canonical TemplateID 本身编码 profile、artifact kind 与 portable ref，
+  其制品才是长期 launch authority。`builds` 只承担构建执行、短期 status/index/alias，不是模板
+  catalog；终态 row 删除后 canonical TemplateID 仍可创建 img/sbx/snp Sandbox，也可直接作为后续
+  Build 的 `fromTemplate`。快照晋升的模板
+  ([](sandbox-lifecycle_zh.md#capture-and-pause))同样无需写 builds 表。
+
+<a id="build-api"></a>
+
+## Build API
 
 实现 e2b **v2 build system** 的端点族(SDK `Template.build` / CLI 走它);构建语义与
-资源池见 [§5](#5-按目标执行与发布)。
+资源池见 [按目标执行与发布](#execution-and-publication)。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应暴露 requested `target`(省略即 auto) |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段, requested `target`, 终态 derived `kind`, 及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`, `cancelRequested`, `deleteRequested`, `executionClaimed`, `runID`, `storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
-| files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [§5](#5-按目标执行与发布) |
+| files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [按目标执行与发布](#execution-and-publication) |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile`、requested `target` 和 resolved artifact `kind` |
 
-### 1.1 取消与删除 Build 记录
+<a id="cancel-and-delete-a-build-record"></a>
+
+### 取消与删除 Build 记录
 
 Cancel 停止执行并清理本地资源,保留 Build 诊断行. DELETE 精确删除一条 Build 行及其拥有的附属数据库数据. 两者沿用 Build 认证和 ownership 校验,不申请注册或执行准入,容量满时仍可调用. 这是 E2B 风格 API 的项目扩展;DELETE 不删除远端模板或产物.
 
@@ -47,35 +149,15 @@ Cancel 204 表示执行和清理均已完成;未被其他操作删除的记录�
 
 `node-ctl builder cancel <build-id>` 和 `node-ctl builder delete <transient-template-id> [--cancel]` 经本地管理 socket 调用同一 Core 操作. `node-ctl builder status` 展示用量对应的 Build 身份、意图、claim 与资源向量.
 
-## 2. 模板 ID 与工件权威
+<a id="build-configuration"></a>
 
-```
-persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
-                                            profile∈{e2b,bare}; kind∈{img,sbx,snp}
-transient templateID = transient-<registration-id>  保留以查询、取消和删除 Build 记录
-```
+## Build 配置
 
-- **持久 id 自描述**:payload 是 `manifest://<key>` 或
-  `file://<digest>.image@digest:<digest>@location:<name>`；encrypted carrier 使用 `@hmac:`，
-  Bundle 用 `@manifest:<root-key>`；运行期解析 profile（选择共享 runtime 的 guest 行为）、kind(img = image cold,sbx = Sandbox E cold,snp = Snapshot S memory restore)
-  和 canonical portable ref。snp 可在 Connect 时显式选择 cold,但 TemplateID 的缺省仍是 memory。
-  local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
-- **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
-  之后启动使用持久 id,取消和删除记录仍用注册临时 id。Build status、临时 id、name/alias 与本机 list 仅在终态 Build row 的
-  retention window 内可用。
-- **无独立 templates 表**:canonical TemplateID 本身编码 profile、artifact kind 与 portable ref，
-  其制品才是长期 launch authority。`builds` 只承担构建执行、短期 status/index/alias，不是模板
-  catalog；终态 row 删除后 canonical TemplateID 仍可创建 img/sbx/snp Sandbox，也可直接作为后续
-  Build 的 `fromTemplate`。快照晋升的模板
-  ([§8.1](node_zh.md#81-artifact-lifecycle转模板与迁移))同样无需写 builds 表。
-
-## 3. Build 配置
-
-下列字段属于 Conductor 配置，但其完整 Build 服务语义在本篇维护。共享进程、路径和凭据配置见 [节点规范](node_zh.md#3-配置)。
+下列字段属于 Conductor 配置，但其完整 Build 服务语义在本篇维护。共享进程、路径和凭据配置见 [节点规范](node_zh.md#conductor-configuration)。
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `units.builder_pools` | 缺省 | 独立项支持 name/resource_pool/unit/size/capacity/priority；size 是 idle 目标，0 按需启动。缺省沿用 `builder` / `builder_pool_size` 单池（默认 `sandbox-builder@.service` / `0`）。参见[资源池](resource-pools_zh.md)及 Node §3 |
+| `units.builder_pools` | 缺省 | 独立项支持 `name`、`resource_pool`、`unit`、`size`、`capacity`、`priority`；`size` 是 idle 目标，0 按需启动。缺省沿用 `builder` / `builder_pool_size` 单池（默认 `sandbox-builder@.service` / `0`）。[资源池契约](node-resource_zh.md#resource-pools) 定义放置与容量；[Node 配置](node_zh.md#conductor-configuration) 定义共享 dir/install/pool_wait_timeout 及新旧列表冲突 |
 | `builder.admission.execution.max_builds` | `2` | 同时持有 durable execution claim 的 Build 上限 |
 | `builder.admission.execution.resources.{cpu,memory,storage}` | 不限制 | execution 的聚合准入资源向量;不生成 service/slice CPU 或内存策略,storage V1 仅准入记账 |
 | `builder.admission.registration` | 完整继承 resolved execution | 未带 cancel/delete 意图的 registered/waiting/building Build 注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
@@ -83,13 +165,13 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 | `builder.terminal_ttl` | `24h` | 已完成 cleanup、无 execution/runtime/result owner 的 `ready/error` Build 历史保留期；必须为正 Go duration |
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
-| `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行([§5](#5-按目标执行与发布)) |
-| `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用([§4.4](node_zh.md#44-沙箱配置传递链)、[§5](#5-按目标执行与发布)) |
+| `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行([按目标执行与发布](#execution-and-publication)) |
+| `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用([沙箱配置传递链](sandbox-lifecycle_zh.md#request-configuration)、[按目标执行与发布](#execution-and-publication)) |
 | `builder.diff_template` | – | 构建沙箱可写盘使用 `mkfs.ext4 -O ^has_journal` 预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
-| `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元不设置 `TimeoutStartSec`;另有独立的 60 秒 fencing/宿主清理窗口,见 §6) |
-| `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw([§5](#5-按目标执行与发布)) |
+| `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元不设置 `TimeoutStartSec`;另有独立的 60 秒 fencing/宿主清理窗口,见 [持久化、恢复与保留](#recovery)) |
+| `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw([按目标执行与发布](#execution-and-publication)) |
 
-多池的主要应用场景是 NUMA 部署，双节点 runner/Builder 配置、systemd 放置策略 drop-in、安装顺序及应用边界（不要求 NUMA 实测）见 [Node §5.3](node_zh.md#numa-deployment)。仅在全局执行准入后选择一次 Builder pool；实际执行的 A/B/C 阶段保持在同一 Builder unit 及其宿主放置策略下。Builder size 是预热目标，不是每 NUMA 节点的并发/内存预算。由构建产物创建的后续 Sandbox 独立选择 runner，制品不会把它固定到 Build 宿主的 NUMA 节点。
+独立 NUMA 预算使用[资源池与放置](node-resource_zh.md#resource-pools)；[Node NUMA 部署](node_zh.md#numa-deployment-with-multiple-pools) 另示范共享默认资源预算、手工管理放置策略的模板。部署应在真实主机验证有效放置与跨池恢复。Builder 在全局执行准入后选池；制品准备取得权威 Capacity 后，可在最终启动前更换准备 worker。实际执行的 A/B/C 阶段保持在同一 Builder unit 及资源池内。Builder `size` 是预热目标，可选 worker `capacity` 限制槽位；资源池声明容量与运行预算是另一层约束。由构建产物创建的后续 Sandbox 独立选择 runner，制品不会把它固定到 Build 宿主的 NUMA 节点。
 
 Builder 配置直接替换下列旧字段，不保留 alias：
 
@@ -101,9 +183,11 @@ builder.vcpu/memory    -> 删除；A/B phase 从 immutable Build.Resources 派�
 ```
 
 若显式配置 registration,它不会从 execution 隐式继承省略维度;若整块省略则完整继承
-resolved execution。仅缺少当前 schema marker 的不兼容开发数据库要求重建;已支持 schema 的 additive migration、拒绝边界与无双读规则见 §6。
+resolved execution。仅缺少当前 schema marker 的不兼容开发数据库要求重建;已支持 schema 的 additive migration、拒绝边界与无双读规则见 [持久化、恢复与保留](#recovery)。
 
-### 3.1 请求级 Builder 输入
+<a id="request-scoped-builder-input"></a>
+
+### 请求级 Builder 输入
 
 构建注册额外接受 **build-only** 命名空间 `kuasar-sandbox.builder`,对应请求头
 `X-Kuasar-Sandbox-Builder`,当前形态:
@@ -128,7 +212,7 @@ target 和这些 build-only 字段解析后均从模板 metadata 中剥离,
 
 Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/metadata、
 `envVars` 和实例选项的共享 typed parser,各 namespace 的字段与 Header/metadata 合并规则
-见 [Node §4.4](node_zh.md#44-沙箱配置传递链)。Register 始终拒绝 `kuasar-sandbox.identity`、
+见 [沙箱配置传递链](sandbox-lifecycle_zh.md#request-configuration)。Register 始终拒绝 `kuasar-sandbox.identity`、
 租户提供的 node-managed cluster metadata、`restore` 与 `autoPauseMemory`。
 普通 Build runtime 输入存 `builds.metadata_json`,build-only 输入存 `builds.builder_json`;
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
@@ -169,9 +253,11 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   Create/restore 仍可恢复逻辑网络。IMG 没有 Sandbox metadata 通道，只使用当前 Create/group/node
   配置，绝不从 retention 内旧 Build row 回填；SBX/SNP 长期权威是自身 E。
 
-## 4. 任务交接
+<a id="task-handoff"></a>
 
-复用已认证的 [节点 config socket/run 平面](node_zh.md#6-本机控制-socketrun--task--admin--plugin--api-平面)。业务身份、exact RunID 与已锁定 task pidfile 在解密 provider 前验证。共享平面维护分配、phase/result envelope；下述为 Build 专属 payload。
+## 任务交接
+
+复用已认证的 [节点 config socket/run 平面](node_zh.md#local-control-channels)。业务身份、exact RunID 与已锁定 task pidfile 在解密 provider 前验证。共享平面维护分配、phase/result envelope；下述为 Build 专属 payload。
 
 - **run-builder**:取得 bid 后锁
   `<BuildRunDir>/builder.pid`,以 bid + exact run-id 取 bootstrap。
@@ -180,7 +266,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   只以 S 定位 E，完整 E/source-image config 与已过滤的 sorted ref-location 留在 task 内，
   向 conductor 只提交非秘密 bounded summary 并等待最终 BuildSpec。reader/fetcher
   在提交前已显式关闭，conductor 不读取任何 tenant artifact。run-builder 将本地保留结果合入
-  final spec 后**驻留**驱动 target-aware、最多三阶段的构建流水线(§5):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
+  final spec 后**驻留**驱动 target-aware、最多三阶段的构建流水线([按目标执行与发布](#execution-and-publication)):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
   `{target, exactly-one-of image_ref|sandbox_ref|snapshot_ref, start_cmd, ready_cmd, error, failure_stage}` 经 config-socket 回传。根cfg读取、
   prepare RPC、phase report与pipeline统一在同一个absolute deadline内预留最多最后5秒用于持久
@@ -215,12 +301,14 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   SBX task 直接读取 E；SNP task 只读取 S 的 `sandbox_ref` 来定位并读取 E，丢弃 S memory
   payload/from-refs。返回 conductor 的 bounded summary 包含精确根 S/E 对；完整 E config
   与选中的 runtime argv source ref 留在 run-builder 进程内，随后强制 Phase B materialize。
-  run-builder 据此自建阶段沙箱([§5](#5-按目标执行与发布));仅在该构建单元运行期间可取(serve 持挂
+  run-builder 据此自建阶段沙箱([按目标执行与发布](#execution-and-publication));仅在该构建单元运行期间可取(serve 持挂
   pending 状态,单元退出即失效)。
 
-### 4.1 Builder unit 与进程生命周期
+<a id="builder-unit-and-process-lifecycle"></a>
 
-单元安装、共享 pool 分配与 cgroup 基础设施见 [Node §5](node_zh.md#5-进程管理systemd-模板单元启动时自动生成安装);下方单元日志注释中的 §5.2 指 [Node journald](node_zh.md#52-日志journald-单汇--标签词表)。
+### Builder unit 与进程生命周期
+
+单元安装、共享 pool 分配与 cgroup 基础设施见 [进程管理(systemd 模板单元,启动时自动生成安装)](node_zh.md#systemd-pools)；日志 target、身份与发送限制见 [Journal 输出](observability_zh.md#logs)。
 
 **builder 单元**(`%i` = run-id):
 
@@ -234,7 +322,7 @@ CollectMode=inactive-or-failed
 Type=exec
 WorkingDirectory=/run/sandbox
 StandardError=journal
-# 关闭此单元日志限流以保留构建细节；不保证 journal 故障下零丢失（§5.2）
+# 关闭此单元日志限流以保留构建细节；不保证 journal 故障下零丢失（日志:journald 单汇 + 标签词表）
 LogRateLimitIntervalSec=0
 ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/runners/%i.pid \
           --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
@@ -248,7 +336,7 @@ Delegate=yes
 builder 取得 bid 后再锁
 `<BuildRunDir>/builder.pid`,取 exact-run bootstrap；artifact source
 完成 task-local root prepare 和第二阶段后再取最终 BuildSpec,image 路径在 bootstrap 内直接取 final,
-**驻留**驱动 target-aware、最多三阶段的流水线(§5),阶段沙箱(`sandbox-ctl run` + cloud-hypervisor)是其
+**驻留**驱动 target-aware、最多三阶段的流水线([按目标执行与发布](#execution-and-publication)),阶段沙箱(`sandbox-ctl run` + cloud-hypervisor)是其
 直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
 保证 StopUnit/超时连阶段 VM 一并回收。
 
@@ -257,13 +345,21 @@ builder pool，同级随机。size 保持 idle 目标含义。制品准备取得
 启动前更换准备实例。单个 Build 实际执行的全部阶段
 仍由同一 builder 驱动，不进入普通 runner pool。全局 registration/execution ledger、
 FIFO/claim 与清理释放顺序不变。共享模板仅安装/枚举去重，pool 不去重。
+
+资源池调度预留先覆盖潜在串行阶段中的最大容量；实际阶段开始时，在同一资源池中以
+该阶段 Capacity 替换。前一阶段完成先持久化，再确认 VM/运行预留已释放，下一阶段才
+能开始；该预留不构成额外 Builder 业务配额或外层 cgroup 限额。准备 worker 不启动 VM。
+准备需要换池时，先停止旧 worker，再解除绑定，由替代 worker 重新准备并核对 summary，
+最后发布运行配置。
+
 StartUnit 前登记 RunID 的创建池；assignment 后保留实际 unit 归属，直到原生命周期清理。
 重启按配置模板恢复实际 unit，保留先查持久 Build 绑定的 WaitAssignment 重试路径。
 取消、终态删除、失败、已接受结果与待清理归属均使用实际 unit；枚举失败不能清空归属。
 仍有执行或待清理归属的模板必须保留配置，旧未分配预热进程按 orphan 清理，新 pool 独立补齐。
 
 Builder service 和 sandbox-builder.slice 负责进程归属, 委托与整组回收,orchestrator 不增加
-CPU/内存限额或其它父级资源策略. 有限 execution 准入资源允许非零 builder_pool_size;
+由 Builder 业务配额派生的外层 CPUQuota/MemoryMax/MemoryHigh 或 weight 强制策略；
+显式[资源池放置 drop-in](node-resource_zh.md#pool-systemd-placement) 另行安装。有限 execution 准入资源允许非零 builder_pool_size;
 idle 单元不持有 Build claim. idle 与按需 worker 都必须先有持久 execution claim,再成功
 绑定 exact run-id,最后发布 assignment. 绑定失败不发布 assignment,未分配 worker 与 Build
 沿用既有 pool 和归属清理规则.
@@ -274,10 +370,13 @@ memory.max, memory.high, CPU capacity ceiling 和 weight;ctl 保留独立的同�
 恢复继续核对执行身份, 存活, 持久 preparation, 已接受结果, deadline, phase 和清理归属,
 不读取 service/slice 资源属性.
 
+<a id="upgrading-an-existing-deployment"></a>
+
 #### 既有部署的一次性升级
 
 外层 systemd enforcement 契约直接删除,不替换为父级 quota, weight, memory.high, overhead
-预算或后台清理器. 新 unit instance 不接收 orchestrator 资源属性. 更新项目生成的
+预算或后台清理器。新 unit instance 不接收自动派生的 Builder 业务配额属性；显式资源池
+drop-in 仍生效。更新项目生成的
 sandbox-builder.slice 会删除 CPUQuota/MemoryMax 行并 reload systemd;既有 live service
 仍可能保留旧进程写入的 runtime properties,daemon-reload 不会删除这些属性的来源文件.
 
@@ -322,10 +421,11 @@ Store.Open 独立处理受支持 schema:存在才删除 builds.enforcement_statu
 storageEnforcement: admission-only 语义保留. 旧 writer 仍引用已删除列,不支持混用或直接
 回退旧二进制;writer 版本协同和回退必须结合升级前的一致备份.
 
+<a id="execution-and-publication"></a>
 
-## 5. 按目标执行与发布
+## 按目标执行与发布
 
-构建经 e2b API 提交(端点见 [§1](#1-build-api);无独立构建 CLI),落 `builds` 表,由资源池调度,
+构建经 e2b API 提交(端点见 [Build API](#build-api);无独立构建 CLI),落 `builds` 表,由资源池调度,
 每次执行绑定一个 `sandbox-builder@<run-id>` 单元。**镜像拉取与 step 执行都发生在构建沙箱
 (microVM)内**——宿主 run-builder 会中转工件 stream、下载并 gunzip COPY context 及发布输出；
 该边界是租户构建命令在 guest 内执行，不是租户数据从不经过宿主用户态。
@@ -355,7 +455,7 @@ Build 不使用业务 pause/resume，因此导入、构建步骤及最终模板�
 不会用空白模板替换。仅根盘的 E 继续支持既有 Build 继承路径；
 来源数据盘保留原有不支持的边界。本次后端变更不增加来源内存恢复，也不扩大 Build
 接受的磁盘拓扑。启动准备、首次访问和普通模板复制的成本，与命名本地 Pause 的收益
-分别衡量，见[节点捕获](node_zh.md#本地磁盘-checkpoint)。
+分别衡量，见[节点捕获](sandbox-lifecycle_zh.md#local-disk-checkpoints)。
 
 **serve 侧(每构建一次)**:registered/waiting 阶段不建对象目录；durable execution claim
 成功后才创建 `BuildRunDir=<RunRoot>/builds/<BuildID>` 与
@@ -398,7 +498,7 @@ build row 更新原子删除 MMDS routes namespace 和 encrypted value blob。Re
 namespace 是 request-scoped,不会进入最终 template metadata、snapshot.cfg、镜像或后续从该
 模板创建的 Sandbox;Trigger 也不能重写它。
 
-**单元内(run-builder,[§2.4](node_zh.md#24-node-ctl-run-sandbox--run-builder))** 依 BuildSpec([§4](#4-任务交接))最多跑三个阶段,每阶段一台
+**单元内(run-builder,[`node-ctl run-sandbox` / `run-builder`](node_zh.md#task-launcher-commands))** 依 BuildSpec([任务交接](#task-handoff))最多跑三个阶段,每阶段一台
 microVM(`sandbox-ctl run` 直接子进程)。父进程为每个 phase 建匿名 pipe,通过
 `ExtraFiles` 传 `--ready-fd=<实际 child fd>`,严格等待
 `control_ready\nready\nEOF`;父端 writer 在 `Start` 成功后立即关闭,child 提前退出
@@ -458,7 +558,7 @@ run-builder 对每阶段调用
   Sandbox Create/顶层 E 相同的 cold-config projection，以 final image 完整替换 boot。
   image source 普通 cold run；有 source E defaults 时调用
   `sandbox-ctl run --from <E> --replace-boot --config <C0>`，绝不 `--restore S`。
-  **生产 e2b runtime** 的 envd 姿态随部署([Proxy §7](node-proxy_zh.md#7-mmds))，`/init` 注入 register
+  **生产 e2b runtime** 的 envd 姿态随部署([MMDS](node-proxy_zh.md#mmds))，`/init` 注入 register
   `envVars` 和可选 instance credentials（此后 RPC 携 `X-Access-Token`）。startCmd 可选，
   **经 envd 启动**(e2b 默认身份 `user`、`/home/user`),流挂至就绪后断开——envd
   不因断流杀进程，进程以 **envd 管理进程**身份冻入快照。readyCmd 以 2s 间隔轮询至
@@ -498,7 +598,7 @@ rootfs"——文件系统操作,不是 e2b 进程语义,故走 sandbox-ctl exec 
 envd),且**镜像无需自带 tar/gzip**(flatten-ctl 纯 Go 解包,scratch/distroless 亦可
 COPY)。三段:
 
-1. **上传协商(files 端点,[§1](#1-build-api))**:客户端先 `GET /templates/{tid}/files/{hash}`,
+1. **上传协商(files 端点,[Build API](#build-api))**:客户端先 `GET /templates/{tid}/files/{hash}`,
    服务端校验归属后回 `{present, url}`;`present=false` 时客户端把 **gzip(tar)** 上下文
    经 presigned PUT **直传桶**(字节不过控制面,e2b SDK 同款裸 PUT)。对象 key =
    `{prefix}/files/{aaaa}/{bb}/{uuid}/{hash}`(uuid=tid 的 uuidv7 部分;aaaa=uuid[0:4]
@@ -514,7 +614,7 @@ COPY)。三段:
    (Docker 语义,`--chown` 覆盖,名字在解包根的 /etc/passwd 解析);`--dense` 守稀疏
    铁律(源码无权威洞元数据,零即数据)。单源 COPY(e2b executor 同限)。
 
-**对象存储(`builder.files_storage`,[§3](#3-build-配置))**:S3/OBS;serve 只 presign + HEAD,
+**对象存储(`builder.files_storage`,[Build 配置](#build-configuration))**:S3/OBS;serve 只 presign + HEAD,
 唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`make -C guest-runtime/native-deps versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
 **发布与 target matrix**:
@@ -572,14 +672,14 @@ TemplateID 在 Build row TTL 删除后仍完全自描述；未声明 hostname �
 **构建日志流(journald → status API → SDK on_build_logs)**:SDK 按需消费 `build` 流,
 不包含 `console` 或 `sandbox-ctl` component 诊断。每个 phase 的完整目标携
 `KUASAR_BUILD_ID`/`KUASAR_RUN_ID`;target 构造与独立输出身份见
-[Build journal 身份](node-journald_zh.md#build-输出)。run-builder 经 pure-Go `go-systemd/journal`
+[Build journal 身份](observability_zh.md#journal-build-output)。run-builder 经 pure-Go `go-systemd/journal`
 写里程碑(`import: pulling…`、`step N: RUN…`、`template: ready`、`uploading…`),
 并把保留的 RUN/startCmd envd stream 回放到同一汇(envd 自身无 journal)。
 sandbox-ctl 的 phase app stdout/stderr 与四个 journal-routed flatten/export/referrer exec 调用点
 使用完整 `build` target;flatten 不带 `--no-progress`,所以仍可见 layer count/flatten 进度。
 文件/制品输出与 stderr error-tail capture 保持独立。流水线失败补写 `build failed: <err>`。
 日志不经临时文件;发送与存储仍是 best-effort,关闭单元限流不保证零丢失。
-**读取**:status([§1](#1-build-api))按 `?logsOffset`(已读条数)分页;
+**读取**:status([Build API](#build-api))按 `?logsOffset`(已读条数)分页;
 serve `journalctl KUASAR_BUILD_ID=<bid> SYSLOG_IDENTIFIER=build --output=json`
 取 MESSAGE/PRIORITY/时间戳,PRIORITY→e2b level
 (≤3 error、4 warn、≥7 debug、余 info),切片 `[offset:]` 回
@@ -655,7 +755,9 @@ env/files 自身可含敏感值，应与这些平台根凭据区分。
 **不支持**:多源 COPY(e2b executor 亦只取 src+dst)、step 级缓存(`force` 字段
 接受但忽略,总是全量执行)、服务端 Dockerfile 解析(CLI 已在客户端展开为 steps)。
 
-## 6. 持久化、恢复与保留
+<a id="recovery"></a>
+
+## 持久化、恢复与保留
 
 Build 使用同一节点 SQLite,完整专属表为:
 
@@ -682,7 +784,7 @@ build_mmds_route_secret_values
 ```
 
 `builds` 是 registration/execution 两级准入与执行状态的持久真相，也是 retention window 内的
-status/index/alias；它不是长期模板 catalog（§2）。
+status/index/alias；它不是长期模板 catalog（[模板 ID 与工件权威](#artifact-identity)）。
 
 
 `resources_*` 是不可变 Build execution/admission resources；最终 Sandbox resource 属于
@@ -724,9 +826,11 @@ detach port 并删除两个目录. 清理完成前保留持久归属; terminal c
 execution result 并释放 execution claim. phase 子进程的自清理不是最终正确性依据.节点级数据库、config socket 与 runner pidfile 不位于对象目录内，不受 Sandbox/Build
 `RemoveAll` 影响。
 
-共享 SQLite 基础设施与终态 reaper 由 [节点可靠性](node_zh.md#14-可靠性) 维护;Build schema 与恢复由本节维护。Build 行是有保留期的执行/status/alias 记录，不是永久模板目录；已发布 canonical template ref 不依赖原 Build 行。
+共享 SQLite 基础设施与终态 reaper 由 [节点可靠性](node_zh.md#recovery) 维护;Build schema 与恢复由本节维护。Build 行是有保留期的执行/status/alias 记录，不是永久模板目录；已发布 canonical template ref 不依赖原 Build 行。
 
-### 6.1 取消、预算与恢复
+<a id="cancellation-budgets-and-recovery"></a>
+
+### 取消、预算与恢复
 
 registration usage 只统计 status IN (registered, waiting, building) 且两个意图时间均为零的行. execution usage 统计全部 execution_claimed=1 的行,独立于 status 和意图. 数量和 CPU/memory/storage 向量、真实准入 SQL、管理、metrics 和节点上报采用相同口径. waiting 数量与 oldest waiting 只包含仍可执行的记录. 接受取消/删除的事务提交即释放注册容量;exact unit 停止、本地清理和 PutBuildTerminal 成功后才释放执行容量. 正常成功、失败和总超时仍自动清理. 容量变化以可合并通知唤醒既有 FIFO pool 和节点用量上报,周期检查继续兜底.
 
@@ -736,11 +840,13 @@ registration usage 只统计 status IN (registered, waiting, building) 且两个
 
 清理完成后 PutBuildTerminal 释放 claim,提交后立即通知容量变化,再按既有注册/retention 锁单独条件硬删除. 等待终态发布的注册重放不能重新插入已删除身份. 最终 DELETE 失败保留 delete 意图,不重新占执行预算. 立即重试、既有生命周期有界补偿和启动恢复继续处理,不等 terminal_ttl. Stop/unit 存活状态回读/detach/目录/终态失败保留必要归属以重试. 启动先处理 cancel/delete 再收养流水线:停止活 unit、清理已退出 unit、直接删无归属 marked 终态行,不为已取消任务重读源产物或重置原执行截止时间.
 
-两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 缺少 transient 字段的旧 owner ref 只依据仍匹配的 route/binding 补齐. provisional 插入、注册 ACK/拒绝及重放 ref 更新均比较原身份和当前 revision,迟到操作不能覆盖后继记录. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md §13). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
+两个意图列通过加法迁移增加,均为 INTEGER NOT NULL DEFAULT 0,既有行从零开始. Registry 分别保留不可变注册 transient ID 与结果 PersistID,以 group + transient ID 定位原节点. 缺少 transient 字段的旧 owner ref 只依据仍匹配的 route/binding 补齐. provisional 插入、注册 ACK/拒绝及重放 ref 更新均比较原身份和当前 revision,迟到操作不能覆盖后继记录. 节点完整同步在既有 Registry binding 下更新投影,并在丢失 BuildDelete 后删除缺失记录. 它不重建已丢失的 Registry 归属分片(见 cluster_zh.md [状态所有权与灾备边界](cluster_zh.md#registry-state-ownership-and-disaster-recovery-boundaries)). Router 原样转发 Query 与 Builder Header;节点 ownership 是最终权威. 节点不可达、投影不完整或权威查询失败返回服务错误,不能改派或猜测删除.
 
 按现有版本协调一起升级 node/router/Registry writer. 回退到不理解意图的旧 writer 前,停止接受新的取消/删除,由当前版本收敛全部待处理操作. 有未完成意图时,加法 schema 本身不能保证安全回退. 不增加长期双 writer、新任务表或兼容服务. 记录删除后已发布 canonical img/sbx/snp 引用、已有 Sandbox、下游 fromTemplate 和共享产物的其他 Build 仍可用;绝不删除远端内容.
 
 托管沙箱的 checkpoint 选择性清理不在 Build 阶段之间执行。后续 phase 可能仍读取前一阶段的 S/E，因此阶段输入与任意 FileSink 输出继续由原 owner 持有。Build 终态收尾先 fence exact runner 并释放阶段资源，再由既有 BuildBaseDir finalizer 删除所属 checkpoint 目录。失败、取消和重启仍保留该 finalizer 的持久责任，不删除共享发布 ref。
+
+<a id="checkpoint-publication-reports"></a>
 
 ### Checkpoint 发布报告
 
@@ -748,74 +854,6 @@ Builder 对 checkpoint S 调用 `sandbox-ctl publish --json --quiet`，接受 ch
 前验证且只接受 `snapshotRef`、最终 `sandboxRef` 和 `removedRefs`。根必须 portable
 且角色正确；差集必须有序、唯一并采用安全的公开引用。无效/尾随 JSON、缺少根和 stdout
 污染都会使发布失败，进度 stderr 单独处理。Builder 继续返回规范 `snp` TemplateID；
-Export 新增 HTTP 报告字段见[节点发布与迁移](node_zh.md#814-publishtemplate-与-migration)。
+Export 新增 HTTP 报告字段见[节点发布与迁移](sandbox-lifecycle_zh.md#publication-and-migration)。
 直接发布 image/Sandbox 的 `PublishSource` 调用保持既有 role/ref 契约、source 所有权和
 流式行为。报告不增加 payload 缓存、额外 staging 文件、GC 或删除权限。
-
-<a id="explicit-target-recipe"></a>
-## 7. 显式 Image、E 和 S 的客户端配方
-
-前提是已配置 Node/API key/TLS 信任，`APP_IMAGE` 为可达、原生架构、digest 固定
-且已包含应用的镜像。复用 Node 的 registry 凭据，不需要 COPY bucket。上文
-Register、Trigger、Status 是权威契约；这里使用 HTTP，不虚构 SDK target 参数。
-项目固定的 E2B Python 2.25.1 支持 auto 流程，但 `Template.build(headers=...)`
-把 Builder 头同时传给 Register 和 Trigger，不适合 register-only 显式目标。
-
-选择 `BUILD_KIND=img` 仅发布镜像，`sbx` 发布带 portable 默认值的冷 E，`snp`
-发布初始化内存 S。S 需设置实际服务 `APP_START` 和 `APP_READY`；显式 Image
-不能传入这些命令。auto 无有效命令时选 Image，有有效 start 或 ready 时选内存
-S，永不自动选 E。本例使用 Demo 执行预算，请按节点检查准入。
-
-```python
-import json, os, time, urllib.request
-api = os.environ["E2B_API_URL"].rstrip("/")
-key = os.environ["E2B_API_KEY"]
-targets = {
-    "img": {"kind": "image"},
-    "sbx": {"kind": "sandbox", "memory": False},
-    "snp": {"kind": "sandbox", "memory": True},
-}
-kind = os.environ["BUILD_KIND"]  # img, sbx, snp
-
-def call(method, path, body=None, extra=None):
-    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
-    headers.update(extra or {})
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(api + path, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=30) as response:
-        raw = response.read()
-        return json.loads(raw) if raw else None
-
-registered = call("POST", "/v3/templates",
-    {"name": "explicit-example", "profile": "e2b", "cpuCount": 2, "memoryMB": 6144},
-    {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})})
-tid, bid = registered["templateID"], registered["buildID"]
-print("Keep registration/build handles:", tid, bid)
-trigger = {"fromImage": os.environ["APP_IMAGE"]}
-if kind == "snp":
-    trigger.update(startCmd=os.environ["APP_START"], readyCmd=os.environ["APP_READY"])
-call("POST", f"/v2/templates/{tid}/builds/{bid}", trigger)
-deadline = time.monotonic() + 900
-while True:
-    status = call("GET", f"/templates/{tid}/builds/{bid}/status")
-    assert status["buildID"] == bid
-    if status["status"] == "error":
-        raise RuntimeError("Build failed; inspect this build's status/logs")
-    if status["status"] == "ready":
-        assert status["profile"] == "e2b" and status["kind"] == kind
-        assert status["target"]["kind"] == targets[kind]["kind"]
-        assert status["target"].get("memory", False) == targets[kind].get("memory", False)
-        assert status["templateID"].startswith(f"e2b-{kind}-")
-        print("Canonical template:", status["templateID"])
-        break
-    if time.monotonic() >= deadline:
-        raise TimeoutError("Polling stopped; build may still run. Use cancel/status with saved handles.")
-    time.sleep(2)
-```
-
-成功后使用 canonical ID create 并检查命令/文件；S 还需 pause/connect 比对状态，
-见[首个应用流程](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md#first-application)。
-客户端轮询超时不会取消执行。保存 `tid/bid`，检查阶段/原因并按 §1.1 Cancel/
-DELETE 等待所有权清理完成。结果不明时不要盲目重复 Trigger。删除 Build 行不删
-远端工件，应另行保留 canonical ID 与父链/密钥依赖。旧 Release 必须按打包契约
-核对后才使用这些当前 main 目标选项。

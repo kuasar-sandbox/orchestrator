@@ -74,7 +74,7 @@ const TelemetryPluginID = "telemetry"
 const (
 	KindRoute     = "route"      // route stream only (observer)
 	KindRouteWake = "route_wake" // route stream + this subscriber issues Wakes (a proxy)
-	KindRegistry  = "registry"   // cluster registry subscribing to a node's routes (node.md §10)
+	KindRegistry  = "registry"   // cluster registry subscribing to a node's routes (docs/cluster.md#node-link)
 )
 
 // RouteEntry.State values (mirror internal/types.State string values).
@@ -251,13 +251,13 @@ type Msg struct {
 	Route     *RouteEntry `json:"route,omitempty"`      // upsert
 	SID       string      `json:"sid,omitempty"`        // delete | wake | command target
 	BarrierID string      `json:"barrier_id,omitempty"` // route_barrier | route_barrier_ack
-	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
+	// Cluster node-link variants (docs/cluster.md#node-link): node_register / heartbeat / cmd_ack
 	// flow node -> registry; command flows registry -> node; rev stamps down events.
 	NodeReg  *NodeRegister `json:"node_register,omitempty"`
 	Beat     *Heartbeat    `json:"heartbeat,omitempty"`
 	Cmd      *Command      `json:"command,omitempty"`
 	Ack      *CmdAck       `json:"cmd_ack,omitempty"`
-	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
+	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from
 	RevToken string        `json:"rev_token,omitempty"`
 	FullSync bool          `json:"full_sync,omitempty"`   // bookmark follows a full snapshot, not an incremental replay
 	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry BuildUpsert/BuildDelete

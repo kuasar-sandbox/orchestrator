@@ -185,7 +185,7 @@ type Orchestrator struct {
 	extensionBuildHook   conductorextension.BuildHook
 
 	clusterBuildMu sync.Mutex
-	clusterBuilds  map[string]*clusterBuild // build_id -> transient cluster image-pull creds (§7.5)
+	clusterBuilds  map[string]*clusterBuild // build_id -> transient cluster image-pull creds (docs/cluster.md#cluster-build)
 	buildSubsMu    sync.Mutex
 	buildSubs      map[int]chan routesync.BuildEvent // node-link Build projection subscribers
 	buildSubSeq    int

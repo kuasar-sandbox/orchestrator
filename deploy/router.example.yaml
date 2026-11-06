@@ -1,5 +1,5 @@
 # cluster-ctl router config — cluster-ctl router --config /etc/cluster-ctl/router.yaml.
-# e2b-compatible unified ingress (docs/cluster-router.md). Required: domain.
+# e2b-compatible unified ingress (docs/cluster.md#router-configuration). Required: domain.
 # Validate with `cluster-ctl config router --config router.yaml`.
 
 domain: sandboxes.example.com

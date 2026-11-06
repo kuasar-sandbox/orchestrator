@@ -1,5 +1,7 @@
 [English](README.md) | [简体中文](README_zh.md)
 
+<a id="overview"></a>
+
 # orchestrator
 
 For the first cross-component sandbox or Demo, follow the project
@@ -14,7 +16,28 @@ selected release; source support does not imply all historical assets exist.
 
 It provides the northbound API, node-local lifecycle orchestration, data-plane proxy integration, tenant credentials, resource admission, and the Registry/Router/Placer control plane used to operate a cluster of Kuasar Sandbox nodes. The repository evolves and releases independently while participating in project-level cross-component validation and aggregate releases.
 
+<a id="documentation"></a>
+
+## Choose a capability
+
+The eight maintained topics below contain both operational usage and the complete capability contract. Public use appears before internal ownership and protocols. Each topic has matching English and Chinese editions. Cross-component installation and upgrade belong to the [main project](https://github.com/kuasar-sandbox/kuasar-sandbox); source contributions and component packaging belong to [CONTRIBUTING.md](CONTRIBUTING.md).
+
+| Topic | Contents |
+|---|---|
+| [Node operation](docs/node.md) | Services, shared configuration, systemd pools, local channels and recovery |
+| [Sandbox lifecycle](docs/sandbox-lifecycle.md) | Create and identity, Pause/Resume, Reset/dead retention, Delete and migration |
+| [Template Build](docs/node-build.md) | Build API, request inputs, immutable artifacts, execution, publication and cancellation |
+| [Access and proxy](docs/node-proxy.md) | SDK access, credentials, exec, forwarding, MMDS, traffic admission and routesync |
+| [Resources and admission](docs/node-resource.md) | Capacity/startup policy, reservation, node pressure, recovery and resource protocols |
+| [Observability](docs/observability.md) | Journal output, native stats, lossless usage, OTLP metrics and history queries |
+| [Cluster control](docs/cluster.md) | Public ingress, Groups, role configuration, replicated ownership, routing and recovery |
+| [Application extensions](docs/extensions.md) | Static App bootstrap, public Go contracts, object sources, hooks and wrappers |
+
+<a id="responsibilities"></a>
+
 ## Responsibilities
+
+<a id="standalone-node"></a>
 
 ### Standalone node
 
@@ -29,6 +52,8 @@ It provides the northbound API, node-local lifecycle orchestration, data-plane p
 
 A standalone deployment exposes an E2B-compatible API that can be used by the unmodified E2B SDK and CLI.
 
+<a id="multi-node-cluster"></a>
+
 ### Multi-node cluster
 
 `cluster-ctl` runs three independent roles:
@@ -39,13 +64,17 @@ A standalone deployment exposes an E2B-compatible API that can be used by the un
 
 The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration.
 
+<a id="security-and-multi-tenancy"></a>
+
 ## Security and multi-tenancy
 
 The node and cluster paths keep platform credentials, content-protection keys, and scoped data-plane capabilities separate. API access, regular data forwarding, and native exec use purpose-specific credentials. Content-protection keys are not exposed to the guest.
 
 Node resource admission is also part of the multi-tenant boundary: the reservation controller owns node-wide admission, resource-pool accounting, grants, watermarks, and recovery. Per-sandbox cgroup, balloon, and VMM execution remains owned by `sandboxer`; the node controller does not take over the sandbox-internal resource loop.
 
-For security architecture and deployment trust boundaries, see the [project system overview](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md) and [deployment guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md). Report vulnerabilities privately through the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy).
+For security architecture and deployment trust boundaries, see the [project system overview](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/architecture.md) and [deployment guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md). Report vulnerabilities privately through the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy).
+
+<a id="main-commands"></a>
 
 ## Main commands
 
@@ -66,167 +95,26 @@ For security architecture and deployment trust boundaries, see the [project syst
 
 A successful move export accepts source deletion durably; RunDir, BaseDir and
 checkpoint cleanup may finish later. Same-ID Create/import conflicts until cleanup
-completes. `--keep-source` preserves the source. See the [node export/import
-contract](docs/node.md#27-node-ctl-export-sandbox--import-sandbox).
+completes. `--keep-source` preserves the source. See the [node export/import contract](docs/sandbox-lifecycle.md#export-import-command).
 
 The repository also builds `node-stub-ctl`, an E2E helper that simulates node-link participants without starting MicroVMs.
 
+<a id="profiles"></a>
+
 ## Profiles
 
-- **`e2b`** — the guest runs Envd and exposes the full E2B-compatible data plane;
+- **`e2b`** — the guest runs Envd and exposes the supported E2B-compatible data services;
 - **`bare`** — the guest does not require Envd and is reached through its network services and native platform integration.
 
-## Source ownership
-
-| Path | Role |
-|---|---|
-| `cmd/node-ctl` | Conductor/Proxy/Telemetry serve, managed run-sandbox/run-builder, resource status/list/drain, builder status, config, manifest-key, export/import and version |
-| `cmd/cluster-ctl` | Independent Registry/Router/Placer processes, config and version |
-| `cmd/node-stub-ctl` | E2E node-link participants with separate admin/API/data listeners, restart/reset, Sandbox/Build state and fault injection; no microVM |
-| `cmd/e2b-key-ctl` | DB/config-free gen-key, derive-api-secret, gen-apikey, fingerprint and seal-pull-token |
-| `config`, `app/conductor`, `app/proxy`, `app/telemetry` | Public declarative configuration and static custom Apps; sealed-memfd/in-place-exec bootstrap and startup Config/Runtime Hooks |
-| `internal/telemetry`, `internal/telemetryapp` | Trusted route/peer identity, envd and OTLP Collector receivers, storage/exporters, E2B compatibility and component lifecycle |
-| `internal/orch` | Node lifecycle, Build pools, local route authority, unit generation and restart reconciliation |
-| `internal/nodectl` | Reservation admission, pools/watermarks/grants, inventory/StateSync recovery and audit; not the Sandbox balloon/cgroup loop |
-| `internal/nodelink` | Conductor–Registry registration, heartbeat, events and commands over framed JSON/h2c |
-| `internal/{registry,router,placer}` | Replicated shardkv namespaces, Reserve/Build state and node-link key cache; unified E2B ingress/active cache; provider/importer, WATCH_LIST and P2C placement |
-| `internal/api` | E2B control REST, X-API-KEY authentication, export/import and ExecAccessToken issuance |
-| `internal/proxy`, `internal/proxyshm`, `internal/proxyadmission`, `internal/routesync` | L7 forwarding, service-addressed CONNECT/native-exec gate, fixed shared route view, independent inflight arena, confidential MMDS heap, park/wake and generation cleanup; route/node-link register/bookmark/typed results |
-| `internal/configsock` | Run/task/admin/plugin/API planes, exact-run bootstrap/prepare, manifest-key/MMDS/Builder administration and controlled routes; SO_PEERCRED/pidfile authentication |
-| `internal/{apikey,secretbox,keys,regcreds}` | APISecret/API-key MAC, AES-GCM root storage, Forward/Exec kat1 and data tokens, ManifestKey-wrapped image-pull credentials |
-| `internal/{config,clustercfg,sandboxcfg,store}` | Node/cluster configuration, SANDBOX_CONFIG rendering and node SQLite Sandbox/Build/credential-pair state |
-| `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2/exact routes, worker-master queries, HTTP-over-UDS services, Prometheus, systemd D-Bus, connector-ctl adaptation and utilities |
-| `deploy/` | Per-role example YAML and node/Proxy/Telemetry/Registry/Router/Placer systemd units |
-| `examples/custom-conductor` | Buildable xconductor entered through node-ctl conductor serve |
-| `examples/custom-proxy` | Buildable xproxy entered through node-ctl proxy serve; master reexecutes workers |
-| `examples/custom-telemetry` | Buildable static telemetry App with native Collector factories, pipelines and query extension |
-
-## Build and test
-
-Local builds use environment-provided Go and inherit its `GOROOT` and
-`GOTOOLCHAIN` selection. CI builds and packages use native x86_64/aarch64 runners
-with the admitted Workbench image pinned once per architecture and run. Release
-builds, ordinary tests and packaging use build mode with an ordinary UID and
-private writable paths. The complete `bash scripts/ci-source-checks.sh` gate runs
-in Workbench system mode, retaining source/race/vet/helper tests together with
-systemd, real Docker telemetry backend and network-namespace checks. Their
-required capabilities and assertions remain mandatory. Release orchestration
-uses environment-provided `gh` with `api --slurp`; its credentials do not enter
-the source environment.
-The publisher's archive validator is compiled from trusted publisher source in a
-separate Workbench invocation with cache restore/save disabled. Assembly and
-publication execute that exact validator without another compilation.
-
-The Go binaries are built with `CGO_ENABLED=0`.
-
-```bash
-make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
-make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
-make test                       # unit and helper tests
-ORG=/path/to/exact/sources make test-source  # source/race/vet/integration gates
-```
-
-Capture CLI/DB fixture contracts are source integration, not product E2E. The
-required source gate builds the exact sibling sandboxer's `sandbox-ctl` and runs
-`TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase`
-and `TestExportPublicationCLIAPI` from this exact orchestrator source. Every
-selected group must run at least one subcase and every started subcase must pass;
-Skip, failure, parent-only output, or missing exact sibling source fails the gate.
-
-Product E2E follows **prebuilt products → prepare → `<suite>.<case>.sh` → the
-shared public runner**. The full filename is the case ID; its first segment is
-the suite. The project owns the nine suites `basic`, `storage`, `image`,
-`network`, `sandbox`, `snapshot`, `orchestrator`, `builder`, and `telemetry`.
-Cases consume `BIN`, `WORK`, `OUT`, `E2E_LIB`, prepared helper paths and prepared
-images. They do not compile, search sibling source trees, pull fallback images,
-or select a host product in place of a missing prepared input. Real guest builds,
-flattening, snapshots and publication are operations under test and stay real.
-
-Metadata, Proxy and guest-telemetry cases can reuse immutable execute-image
-preparation when the public runner supplies `E2E_TEMPLATE_CACHE_DIR` and
-`E2E_TEMPLATE_CACHE_PROVENANCE`. The first `build_image_template` call still
-uses real `fromImage` construction. It exports verified, unencrypted tarstream
-content; later calls verify and import it under their own keys into independent
-Stores, then register new template/Build identities through `fromTemplate`.
-The requested e2b/bare profile remains case-specific. Guest boot, workload,
-network, snapshot and cleanup assertions remain real; dedicated Builder/Demo
-and `build_ready_template` preparation do not use this cache.
-
-Entries bind the complete prepared digest, native architecture, full execute
-image config ID, recipe version and reader/tool hashes. Publication is atomic
-under a lock. Matching corruption fails without rebuilding; interrupted staging
-is never a hit. No key, encrypted Store, live VM, snapshot or writable disk is
-shared. The runner owns retention and never reuses an earlier run's directory.
-`run --no-template-cache` (or an older runner without these inputs) preserves
-ordinary preparation. Per-case `template-preparation.jsonl` records hit/miss/
-disabled and total duration; `template-cache-phases.jsonl` separates production,
-export/verification, import and API registration costs. Compare real paired runs
-at identical inputs/resources before claiming a speedup.
-
-From the assembled project platform directory, use its sole public entrypoint:
-
-```sh
-python3 test/e2e/e2e prepare --release-dir /path/to/platform --workdir /path/to/prepared
-python3 /path/to/prepared/test/e2e/e2e list --suite orchestrator
-python3 /path/to/prepared/test/e2e/e2e run --workdir /path/to/prepared --include orchestrator.lifecycle.sh
-```
-
-Preparation must supply the selected products, helper executables and local
-images required by the selection. KVM cases require Linux, root, systemd and
-the prepared Kernel/Runtime. Missing inputs fail the case. Helpers own fixture,
-process, network, HTTP and observation primitives; each case owns its scenario.
-See the project [E2E contract](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/172)
-for aggregation and release acceptance.
-
-The [owner coverage table](docs/node.md#15-tests) maps each substantive contract
-to its maintained focused case.
-
-Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
-
-Source builds require Go 1.26.1 or newer. Standalone builds resolve the obtainable
-versions committed in `go.mod`. Coordinated Preview builds use the selected local
-`orchestrator`, `sandboxer`, `accelerator` and `connector` modules:
-
-```bash
-GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator)" || exit 1
-export GOWORK
-make build
-```
-
-The workspace verifies module paths and uses exactly this closure without redundant
-`replace` directives or changes to `go.mod`/`go.sum`. Product, helper and source tests
-share the selected modules. Runtime/Kernel artifacts remain additional prerequisites
-for real sandbox tests.
-
-The source `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh` flow starts real control-plane processes
-but no MicroVMs. Its run directory is private. Failure output reports diagnostic
-filenames and sizes, not raw responses, logs or capability-bearing objects.
-Daemon output is written directly to private files, not streamed to CI; the
-private diagnostic umask is applied only after any local binary build.
-For local diagnosis, set `CLUSTER_STUB_KEEP_WORK=1` to retain the run directory
-and inspect it privately; do not upload its unredacted files. This does not
-replace the real MicroVM integration suite.
-
-The real execute/MMDS cases allocate switch, namespace, veth and runner/builder
-unit names from their existing private run directory. Cleanup stops only those
-unit instances and removes only resources created by that run. Explicit names
-that already exist or have inconsistent switch state are refused, not adopted
-or force-deleted. The cases hold a host-local lock on the existing systemd runtime
-directory because their routes, forwarding and slice names are shared; a second
-concurrent execute/MMDS invocation is refused before resource creation. The lock
-descriptor is not inherited by daemons. Async launch assertions wait for the
-actual runner observation without relaxing sandbox identity or launch-mode
-checks. `make test` includes isolated cleanup/concurrency regressions; those
-checks do not substitute for running the corresponding real lifecycle, exec, pause/wake, snapshot and MMDS cases.
-
-Cross-repository contract changes require linked companion PRs and exact-source
-integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
+<a id="deployment-overview"></a>
 
 ## Deployment overview
 
-A standalone node normally starts Conductor, Proxy and Telemetry as separate services. Telemetry uses the existing Plugin Plane without joining Create/Resume barriers; its failure does not change sandbox lifecycle. Default metrics history uses embedded Prometheus TSDB without an external database. A cluster adds independent Registry, Router, and Placer processes. Configuration examples and systemd units are under `deploy/`.
+A standalone node runs Conductor and Proxy; start the independent Telemetry service when needed. Telemetry uses the Plugin Plane without joining Create/Resume barriers, and its failure does not change Sandbox lifecycle. The example configuration explicitly enables embedded Prometheus TSDB. Local storage requires `local.enabled`; an unconfigured query backend defaults to `none`, and writes and queries are assembled independently. See [observability](docs/observability.md#telemetry). A cluster adds Registry, Router and Placer. Configuration examples and systemd units are under `deploy/`.
 
-The user-facing, release-based installation path is documented in the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md). Production deployments should use durable storage, production TLS, protected credentials, an explicit network policy, and capacity settings validated against their workloads.
+The release-based installation path is the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md). Production deployments should use durable storage, production TLS, protected credentials, an explicit network policy and capacity settings validated against their workloads.
+
+<a id="development-example"></a>
 
 ## Development example
 
@@ -235,6 +123,7 @@ Prepare binaries, kernel/Runtime artifacts, networking and protected configurati
 ```bash
 node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
+# Optional: independent metrics collection and history query service
 node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 ```
 
@@ -255,75 +144,35 @@ cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 # Standalone development; replace host and the canonical template placeholder.
 export E2B_API_URL=http://host:3000
 export E2B_SANDBOX_URL=http://host:3443
-python -c 'from e2b import Sandbox; s = Sandbox.create("<canonical-template-id>"); print(s.commands.run("uname -a").stdout)'
+python - <<'PY'
+from e2b import Sandbox
+sandbox = Sandbox.create("<canonical-template-id>")
+try:
+    print(sandbox.commands.run("uname -a").stdout)
+finally:
+    sandbox.kill()
+PY
 ```
 
-Complete commands/configuration/API and cluster entry rules remain in [Node](docs/node.md) and [Cluster](docs/cluster.md).
+Continue with [node configuration](docs/node.md), [Sandbox API](docs/sandbox-lifecycle.md), [access and credentials](docs/node-proxy.md), or [cluster ingress](docs/cluster.md#client-access).
+
+<a id="contract-ownership"></a>
 
 ## Contract ownership
 
-Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintained in [Node paths and lifecycle](docs/node.md). Create input identity, stable versus node-local identity, credential binding, conflicts and retry behavior live in [Node §4.1.2](docs/node.md#412-create-identity). The complete Build directory/task/publication/recovery and retention contracts live in [Node Build](docs/node-build.md); retained Registry Build projection and reconnect convergence live in [Cluster](docs/cluster.md). Canonical artifacts remain launch authority independently of retained Build rows. Named publication is a logical commit, without a final-file/parent fsync power-loss guarantee; Build owns the full matrix and failure behavior.
+Node roots, object RunDir/BaseDir and RunID/PathID belong to [node directories and identities](docs/node.md#node-directories-and-identities). Public Create identity, conflicts/retries, state changes, Reset/dead retention and cleanup belong to [Sandbox lifecycle](docs/sandbox-lifecycle.md); credential binding belongs to [access and proxy](docs/node-proxy.md#credential-model). [Build](docs/node-build.md) owns Build directory/task/publication/recovery and retention; [cluster Build](docs/cluster.md#cluster-build) owns the retained Registry projection and reconnect convergence. Canonical artifacts remain long-term launch authority independently of retained Build rows. Named publication is a logical commit without a final-file/parent fsync power-loss guarantee; Build owns the full matrix and failure behavior.
+
+<a id="release-model"></a>
 
 ## Release model
 
-Preview cleanup ignores historical `SHA256SUMS` and body records. Completeness uses exact package names and native asset IDs, sizes, digests and upload states; historical x86_64-only and complete dual-architecture packages are protected. Missing or ambiguous metadata is retained and reported. Cleanup rechecks the actual tag and Release before deletion, supports partial retries and treats only confirmed 404 as absence. The project release policy continues to define scope and retention.
-
-The selected owner source declares its complete compiled E2E helper inventory in `release/helper-inputs.json`. Its recipe, `scripts/build-e2e-helpers.sh`, accepts the target architecture and a fresh output directory. It runs only during the source-build stage with the admitted dependency workspace; package preparation and case execution consume its verified binaries. Internal build targets and package paths remain owned here.
-
-Build from the selected source with the component Makefile. `release.sh package`
-uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
-it collects materials and creates the bundle without rebuilding those binaries
-or resetting source/build caches. Keep the selected source checkouts, dependency
-versions and native build records together with the outputs.
-
-Packaging records the actual Go versions and effective module replacements.
-Go/module LICENSE and NOTICE files come from the selected compiler installation
-and matching module sources, preserving nested paths. Module resolution uses the
-normal Go cache and routing; downloaded module checksums must match the binaries.
-Only explicitly collected internal sibling dependencies use their own source
-materials; an organization namespace alone does not exempt other modules.
-Unsupported third-party local replacements need versioned module inputs for
-the official package. Selected Kuasar sources are provided through the explicit Go workspace.
-
-Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. Packages and Releases do not carry source or historical test records, or independent `SHA256SUMS`.
-
-`make release` verifies `ACCELERATOR_VERSION`, `CONNECTOR_VERSION` and `SANDBOXER_VERSION` against clean sibling checkouts, generates the four-module Go workspace, then builds and packages the same outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. The publisher uses human release notes and refuses to replace an existing asset with different bytes.
-
-The four official Go executables must identify their own Orchestrator command
-main packages and target the selected Linux architecture (amd64 for x86_64,
-arm64 for aarch64) with `CGO_ENABLED=0`. Packaging copies
-the twelve deployment files from the selected source tree and collects the actual
-Accelerator, Connector and Sandboxer dependency materials using the existing
-`RELEASE_*_SOURCE_DIR`, optional `RELEASE_*_SOURCE_SHA` and version selections.
-Standalone validation checks the bundle's dependency URL/commit fields agree;
-it does not require sibling repositories or dependency tags on the validation host.
-Before extraction the archive gate rejects extra payloads, aliases, duplicate
-entries, links, incorrect numeric root ownership and incorrect modes.
-Material directories remain component-scoped.
-
-This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the node and cluster binaries plus deployment files. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
+This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the node and cluster binaries plus deployment files. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Source-only tests and unselected maintenance material remain in the source repositories.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact component tags and validating the combined system on real KVM infrastructure. An orchestrator component version and a project aggregate version are related by the aggregate selection; they are not required to have the same number.
 
 Complete component-branch, Preview/Stable/Latest, mutation-group and cancelled-operation retry rules are maintained only in the project [release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md) and [latest Stable aggregate release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
 
-## Documentation
-
-Detailed design and reference documents provide complete English and Chinese editions:
-
-- [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, and reliability;
-- [Node template builds](docs/node-build.md): full Build API, configuration, execution, publication and recovery.
-- [Runtime extensions](docs/extensions.md): complete Conductor/Proxy/Telemetry SDK lifecycle, sources, Hooks, wrappers and query/Collector bindings.
-- [Telemetry](docs/telemetry.md) ([Chinese edition](docs/telemetry_zh.md)) — direct FloatingIP OTLP ingress, envd scrape, native stats collection, standard Collector pipelines, optional local TSDB, independent Prometheus/ClickHouse queries, generic HTTP extensions, E2B history and identity invariants;
-- [`docs/node-journald.md`](docs/node-journald.md) ([Chinese edition](docs/node-journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
-- [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
-- [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;
-- [Native usage](docs/node.md#native-usage) — lossless usage API, node policy, online/offline ownership and trusted local stats reads.
-- [`docs/cluster.md`](docs/cluster.md) — Registry membership, replicated state, node links, reservation state, and cluster E2E;
-- [`docs/cluster-router.md`](docs/cluster-router.md) — unified cluster control- and data-plane ingress, routing, and stable/node-local identity translation;
-- [`docs/cluster-placer.md`](docs/cluster-placer.md) — providers/importers, WATCH_LIST, source leases, selector patches, and placement recommendations.
-
-Use the language selector at the beginning of each paired specification. Shared contracts have one complete owner; the guides link to that owner instead of maintaining parallel schemas.
+<a id="project-boundaries"></a>
 
 ## Project boundaries
 
@@ -332,6 +181,8 @@ Use the language selector at the beginning of each paired specification. Shared 
 - image and snapshot data infrastructure belongs to [`accelerator`](https://github.com/kuasar-sandbox/accelerator);
 - high-density MicroVM networking belongs to [`connector`](https://github.com/kuasar-sandbox/connector);
 - the guest kernel and runtime image belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime).
+
+<a id="license"></a>
 
 ## License
 
