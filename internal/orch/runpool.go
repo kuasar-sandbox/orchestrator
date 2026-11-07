@@ -42,6 +42,7 @@ type runConsumeReq struct {
 	ctx          context.Context
 	commit       func(runID string) error
 	sessionFence func(runID string) (bool, func())
+	reservation  *runReservation
 	resp         chan runConsumeResp
 	stopCancel   func() bool
 	// startAttempts is the finite wave of already in-flight or demand-created
@@ -131,10 +132,14 @@ func (p *runPool) Assign(ctx context.Context, taskID string, commit func(runID s
 }
 
 func (p *runPool) AssignWithFence(ctx context.Context, taskID string, sessionFence func(runID string) (bool, func()), commit func(runID string) error) (string, error) {
+	return p.assignWithReservation(ctx, taskID, sessionFence, commit, nil)
+}
+
+func (p *runPool) assignWithReservation(ctx context.Context, taskID string, sessionFence func(runID string) (bool, func()), commit func(runID string) error, reservation *runReservation) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, sessionFence: sessionFence, resp: make(chan runConsumeResp, 1)}
+	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, sessionFence: sessionFence, reservation: reservation, resp: make(chan runConsumeResp, 1)}
 	select {
 	case p.consumeCh <- req:
 	case <-ctx.Done():
@@ -366,7 +371,7 @@ func (p *runPool) loop(ctx context.Context) {
 				queueControl(runControlReq{op: "stop", runID: w.runID})
 				continue
 			}
-			p.runs.assigned(w.runID)
+			p.runs.assigned(w.runID, req.reservation)
 			replyWait(w.req, runWaitResp{taskID: req.taskID, ok: true})
 			replyConsume(req, runConsumeResp{runID: w.runID})
 			releaseSessionFence()

@@ -66,11 +66,12 @@ func (p *runPools) assignInResourcePool(ctx context.Context, resourcePool, taskI
 		if resourcePool != "" && pool.resourcePool != resourcePool {
 			continue
 		}
-		if !pool.runs.reserve(pool) {
+		reservation := pool.runs.reserve(pool)
+		if reservation == nil {
 			continue
 		}
-		defer pool.runs.unreserve(pool)
-		return pool.AssignWithFence(ctx, taskID, sessionFence, commit)
+		defer reservation.release()
+		return pool.assignWithReservation(ctx, taskID, sessionFence, commit, reservation)
 	}
 	return "", fmt.Errorf("no runner supply in resource pool %q", resourcePool)
 }
@@ -136,7 +137,7 @@ func (r *runIndex) register(runID string, p *runPool) error {
 	return nil
 }
 
-func (r *runIndex) assigned(runID string) {
+func (r *runIndex) assigned(runID string, reservation *runReservation) {
 	if r == nil {
 		return
 	}
@@ -145,6 +146,11 @@ func (r *runIndex) assigned(runID string) {
 	delete(r.waiting, runID)
 	if r.states != nil {
 		r.states[runID] = "bound"
+	}
+	// The bound instance now accounts for this request. Consume its temporary
+	// reservation in the same critical section, before publishing the handoff.
+	if reservation != nil && reservation.runs == r && reservation.pool == r.owners[runID] {
+		reservation.releaseLocked()
 	}
 }
 
@@ -270,16 +276,42 @@ func (r *runIndex) hasSupply(p *runPool) bool {
 	defer r.mu.Unlock()
 	return r.supplyLocked(p)
 }
-func (r *runIndex) reserve(p *runPool) bool {
+
+// A reservation belongs to one assignment, including retries across starting
+// units. active is guarded by runs.mu so handoff and caller cleanup can each
+// release it without decrementing another request's reservation.
+type runReservation struct {
+	runs   *runIndex
+	pool   *runPool
+	active bool
+}
+
+func (r *runIndex) reserve(p *runPool) *runReservation {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.supplyLocked(p) {
-		return false
+		return nil
 	}
 	p.reserved++
-	return true
+	return &runReservation{runs: r, pool: p, active: true}
 }
-func (r *runIndex) unreserve(p *runPool) { r.mu.Lock(); defer r.mu.Unlock(); p.reserved-- }
+
+func (reservation *runReservation) release() {
+	if reservation == nil {
+		return
+	}
+	reservation.runs.mu.Lock()
+	defer reservation.runs.mu.Unlock()
+	reservation.releaseLocked()
+}
+
+func (reservation *runReservation) releaseLocked() {
+	if reservation.active {
+		reservation.pool.reserved--
+		reservation.active = false
+	}
+}
+
 func (r *runIndex) ownership(runID string) (store.RunPoolOwnership, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
