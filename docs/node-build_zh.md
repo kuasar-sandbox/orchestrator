@@ -4,7 +4,7 @@
 
 # 模板 Build
 
-本篇定义 Build 注册、目标选择、阶段执行及 canonical 制品发布。先提供完整 CLI 用例，再定义身份与 API；随后维护配置、worker 交接及恢复。
+本篇定义 Build 注册、目标选择、阶段执行及 canonical 制品发布。先提供完整 HTTP 客户端用例，再定义身份与 API；随后维护配置、worker 交接及恢复。
 
 本篇完整定义 Build 注册、目标选择、不可变执行资源、任务准备、顺序阶段执行、发布及恢复。[节点规范](node_zh.md) 维护共享进程、socket、凭据与节点恢复边界；[Registry 规范](cluster_zh.md) 维护集群构建意图和放置。
 
@@ -99,8 +99,7 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 - **无独立 templates 表**:canonical TemplateID 本身编码 profile、artifact kind 与 portable ref，
   其制品才是长期 launch authority。`builds` 只承担构建执行、短期 status/index/alias，不是模板
   catalog；终态 row 删除后 canonical TemplateID 仍可创建 img/sbx/snp Sandbox，也可直接作为后续
-  Build 的 `fromTemplate`。快照晋升的模板
-  ([](sandbox-lifecycle_zh.md#capture-and-pause))同样无需写 builds 表。
+  Build 的 `fromTemplate`。[快照晋升的模板](sandbox-lifecycle_zh.md#capture-and-pause)同样无需写 builds 表。
 
 <a id="build-api"></a>
 
@@ -276,7 +275,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   支持的 RunRoot 下仍不超过 Linux `sun_path`。
 
 - `POST /internal/task/build/bootstrap`(run-builder;req `{build_id,run_id,version}`)
-  当前 BuildTask schema 为 v6（v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
+  当前 BuildTask schema 为 v7（v7 携带当前节点的 runtime 启动超时策略；v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
   删除旧 broad `publish_location_parent`；v4 增加 register-time requested target，并把 SBX/SNP
   source 收敛为通用 cold Sandbox E；v3 以 `run_dir`/`base_dir` 替代混合语义 workdir，
   `checkpoint_mode` 自 v2 起必需),sandbox ArtifactPrepare
@@ -285,18 +284,18 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   LaunchMode 和 bounded network/disk summary 取代旧 v1 Snapshot-only wire),两个版本号独立演进；bootstrap 和 build prepare 的版本不匹配均在读取
   secret-bearing provider 前返回 400,
   防止旧 task 静默忽略必需的 publication 语义。参见 [build_task.go](../internal/configsock/build_task.go)
-  与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。可选的 Build-only 命令存在性摘要与 digest 字段受 BuildTask v6 gate 保护,不回传命令文本;普通 Sandbox preparation 不使用该 Build-only 字段。认证后返回 task env 与 exactly one of
+  与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。v6 引入的可选 Build-only 命令存在性摘要与 digest 字段仍受当前 BuildTask gate 保护,不回传命令文本;普通 Sandbox preparation 不使用该 Build-only 字段。认证后返回 task env 与 exactly one of
   `Final|Prepare`。Final 是
   **BuildSpec(构建工作单)**:`{build_id, profile, run_dir, base_dir, from_image | from_template
   (+kind), requested_target?, checkpoint_mode, steps[], start_cmd, ready_cmd, paths, net,
   resources, sandbox_resources, sandbox_spec/namespaces/env, mmds_enabled, envd_token,
-  insecure, platform, timeouts}`；task env 含
+  insecure, platform, runtime_timeouts, timeouts}`；task env 含
   `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据。artifact Prepare 含 RunID、source kind/ref、恢复已准备 Snapshot 时的受理 E、LaunchMode、manifest config、
   ref-location parent、ref 上限和从 execution claim 起算的绝对 deadline。task 读取根 cfg 后向
   `POST /internal/task/build/prepare` 提交 `{build_id,run_id,version,summary}`；相同对与 digest replay 返回同一 final result，
   冲突返回 409，HTTP waiter 取消不撤销已接受 summary。`paths` 是宿主侧工件与工具
   (kernel / runtime / 两个 diff template / sandbox-ctl /
-  flatten-ctl / manifest-ctl / manifest_config);`net` 是 serve 预先 attach 的
+  仅用于 referrer-hit 校验的宿主 flatten-ctl / manifest_config);`net` 是 serve 预先 attach 的
   网络槽(tapfd transport、mac、inner_ip、nexthop、hostname、dns),全构建复用。
   SBX task 直接读取 E；SNP task 只读取 S 的 `sandbox_ref` 来定位并读取 E，丢弃 S memory
   payload/from-refs。返回 conductor 的 bounded summary 包含精确根 S/E 对；完整 E config
@@ -502,8 +501,16 @@ namespace 是 request-scoped,不会进入最终 template metadata、snapshot.cfg
 microVM(`sandbox-ctl run` 直接子进程)。父进程为每个 phase 建匿名 pipe,通过
 `ExtraFiles` 传 `--ready-fd=<实际 child fd>`,严格等待
 `control_ready\nready\nEOF`;父端 writer 在 `Start` 成功后立即关闭,child 提前退出
-即表现为 EOF。A 阶段只等待这条 runtime wire(60s),不再用 guest exec 轮询;B/C
-在 runtime wire 后继续等 envd `/health`,两者共用一次 90s boot deadline:
+即表现为 EOF。A 阶段只等待这条 runtime wire(60s),不再用 guest exec 轮询；B 和 e2b C
+在 runtime wire 后继续等 envd `/health`，与 runtime readiness 共用该次 90s boot deadline。
+Bare C 在该截止时间内等待 runtime readiness，随后固定等待 20 秒就绪，不使用 envd。
+
+`BuildSpec.runtime_timeouts` 将当前节点的 `sandbox.timeouts.app_start` 策略传入
+每个实际执行的 A/B/C 阶段，包括从来源 E 启动的 B。它约束 `launch_ack` 后 runtime
+应用的初次启动，不是租户 `startCmd`/`readyCmd` 或 RUN 步骤的预算。空值或零值
+不添加启动总截止时间，但不会取消阶段 readiness 等待或绝对 Build deadline；正值
+增加启动上限，不改变 socket deadline。该节点策略与
+`builder.{pull,step,ready,total}_timeout_sec` 分开配置，不从来源 E 继承。
 
 共用的子进程启动边界只注入可信 VMM/readiness 描述符、推导子进程 FD 编号并启动命令。无论启动成功或失败，都关闭父进程的 readiness 副本；VMM 描述符仅借用，唯一一次 Wait 仍由调用方负责。命令构造、环境、阶段取消、readiness 消费和 phase teardown 保持为 Build 职责；复用启动边界不改变构建生命周期。
 
@@ -727,8 +734,9 @@ claim 后先持久绑定 exact run-id,最后发布 assignment. execution CPU/mem
 Admit/heartbeat/Release，并在 teardown/Release 完成后才进入下一阶段。A/B execution VM
 resources 只从不可变 `Build.Resources` 派生；register Create resource 则以 source E portable
 capacity（如有）为默认、供最终 Sandbox E/C0 使用，Image target 为精确零值且不必解析。
-两者不互相推导。Build.Resources 本身不进入 nodectl，因此 active phase 只出现一条普通
-Sandbox reservation，不存在双重记账；`target=sandbox,memory=false` 没有 C reservation。
+两者不互相推导。全局 Build 准入与资源池调度、运行预留分开记账。预启动调度预留按维度取
+已解析的 A/B capacity 与 memory target 的 C capacity（如适用）的最大值；实际 phase 以自身
+Capacity 替换该预留，而不是叠加第二份计费。`target=sandbox,memory=false` 没有 C reservation。
 
 ready/error 是有保留期的 Build 历史. registration usage 在 cancel/delete 意图提交或正常终态转换时释放.
 终态事务写入 `finished_unix`. 执行过的 Build 先完成 unit/cgroup、network、runtime/result 与
@@ -749,7 +757,9 @@ BuildRunDir/BuildBaseDir 清理, 再由终态提交释放 execution claim. 完�
 解析结果加密存 `builds.registry_auth_enc`,构建时解出注入
 `FLATTEN_REGISTRY_{USERNAME,PASSWORD|TOKEN}`(flatten-ctl `pkg/remote` 读取,token
 优先),**经 exec env 进入 import 阶段的 guest——入 guest 的只有 `FLATTEN_*`,
-`MANIFEST_KEY` 永不入 guest**。租户 roots/pull credentials 仅加密存库与运行期 env，不进入 phase YAML；调用方 workload
+`MANIFEST_KEY` 永不入 guest**。租户 roots/pull credentials 在 SQLite 中加密保存，授权运行时会解密：已认证 task
+收到明文值，MANIFEST_KEY 安装到宿主 task 环境，选中的 FLATTEN_* 值进入 guest exec
+环境。通过环境传递不等于加密。这些平台凭据不进入生成的 phase YAML；调用方 workload
 env/files 自身可含敏感值，应与这些平台根凭据区分。
 
 **不支持**:多源 COPY(e2b executor 亦只取 src+dst)、step 级缓存(`force` 字段
