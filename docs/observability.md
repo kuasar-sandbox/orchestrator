@@ -25,7 +25,11 @@ The public Sandbox Telemetry ingress and query contract covers metrics. Infrastr
 
 ## Instantaneous resource and traffic stats
 
-Both endpoints first read the Sandbox business row and verify API-key ownership; failure returns 404. They observe without Connect/Wake/Resume/Pause/envd calls and set Cache-Control: no-store.
+`GET /sandboxes/{SandboxID}/stats/resource` and
+`GET /sandboxes/{SandboxID}/stats/traffic` use the normal API-key authentication
+path. A missing or malformed key returns 401; a missing Sandbox business row or
+failed ownership check returns 404. The stats handlers set `Cache-Control: no-store`
+and observe without Connect/Wake/Resume/Pause/envd calls.
 
 Resource stats read the current sandbox-ctl owner's effective resource specification and host VMM cgroup through its existing control socket. Conductor adds the embedded resource controller's reservation when available:
 
@@ -169,9 +173,11 @@ their decimal-string representations. Coverage, completeness, status,
 metadata are preserved. No orchestrator RunID is added to the stats model.
 
 The running owner is authoritative for live state, its adopted saved baseline
-and confirmed history. Only an absent/refused owner socket permits offline
-fallback. After a connection succeeds, protocol errors, EOF, owner errors,
-cancellation and timeout do not fall back to an apparently readable file.
+and confirmed history. Conductor selects offline reading directly when the
+current object has no RunDir. Otherwise, only an absent/refused owner socket
+permits offline fallback. After a connection succeeds, protocol errors, EOF,
+owner errors, cancellation and timeout do not fall back to an apparently readable
+file.
 Every response proves the exact owner SandboxID, including empty/disabled
 views and empty history. Reader and sandboxer owner must use compatible
 revisions of that ctl envelope.
@@ -509,6 +515,11 @@ a required dependency of, conductor/Proxy.
 the query UDS. With no handler, public `/metrics` returns 503. Conductor's three
 native stats APIs keep their original sources in every mode.
 
+An omitted `query.backend` defaults to `none`. An omitted `query.handler`
+defaults to `e2b` when a backend is selected, otherwise `none`; explicitly set
+`handler: none` to disable the query endpoint while retaining a backend.
+Enabling local storage alone selects neither a write pipeline nor a query backend.
+
 | Deployment | Configuration |
 |---|---|
 | Remote write and read | Standard remote exporter plus matching `query.backend`/endpoint/schema/labels |
@@ -722,8 +733,8 @@ See [deploy YAML](../deploy/telemetry.example.yaml),
 [service unit](../deploy/node-telemetry.service) and
 [custom telemetry](../examples/custom-telemetry/README.md).
 
-Shutdown first stops route subscription/revokes the query lease, drains query
-and OTLP ingress, shuts down Collector receivers/processors/exporters, then the
+Shutdown first stops route subscription/revokes the query lease and drains the
+query server, then shuts down Collector (including its OTLP receivers), the
 extension and finally the query backend and optional local TSDB. Startup failures unwind the same owned
 resources. Retained extension work is canceled even when startup fails. Keep the
 storage path persistent and do not make conductor/Proxy systemd dependencies
@@ -795,7 +806,6 @@ namespace primitives as Proxy/MMDS. Empty means the process's current namespace.
 `proxy_netns` is the canonical YAML/JSON key and `ProxyNetNS` the Go field.
 Configurations from the early Preview that used `sandbox_netns` must rename
 that key; strict decoding rejects it, including when both keys are present.
-Telemetry was not part of the existing Stable configuration contract.
 An unknown namespace name/path, failed setns or failed bind aborts startup;
 already-created listeners and application resources are closed. There is no
 fallback to the host namespace. Only listener creation runs inside the selected
@@ -869,12 +879,14 @@ existing trust domain and can transform pdata; there is no final sandbox-only
 guard across asynchronous pipeline boundaries.
 
 Limits apply before transport decoding where possible: 256 connections per
-listener, 32 concurrent requests globally, 4 MiB per encoded/decompressed HTTP
-request and gRPC message by default. Resource/point attributes are limited to 32,
-keys 128 bytes and values 256 bytes; batches allow 128 resources, 16,384 points
-and 4,096 metrics per scope. Excess is rejected, not silently truncated.
+listener, 32 concurrent requests shared by HTTP and gRPC within each
+`sandboxotlp` instance (not process-wide), and 4 MiB per encoded/decompressed HTTP
+request and gRPC message by default. After reserved attributes are removed,
+resource/scope/point attributes are limited to 32, keys 128 bytes and values
+256 bytes. Trusted resource identity is then added. Batches allow 128 resources,
+16,384 points and 4,096 metrics per scope. Excess is rejected, not silently truncated.
 The gRPC server's 10s deadline starts before reading the message body, so a
-stalled client cannot indefinitely retain a global request slot.
+stalled client cannot indefinitely retain an instance request slot.
 
 <a id="e2b-metrics-history"></a>
 
@@ -888,6 +900,9 @@ that exact node SandboxID and does not join migration histories by StableID.
 StableID is only external observability correlation. RunID remains runner/run-plane,
 systemd/pidfile, MMDSv2 and logging/debug identity; it is never a telemetry label,
 resource attribute, TSDB identity, query key or pause/resume series discriminator.
+Retained metrics do not preserve public access after deletion: once the Sandbox
+business row is gone, Conductor returns 404 even if the backend still retains
+its samples. Backend retention and public object lookup are separate contracts.
 
 With `query.handler: e2b`, the independent E2B adapter uses the seven
 `query.e2b.metrics` mappings and `query.e2b.source` (default `envd`). Deployments

@@ -25,8 +25,11 @@
 
 ## 即时 resource / traffic stats
 
-两个接口都先读取 Sandbox 业务记录并验证 API key ownership;失败统一 404。它们是只读观察,
-不调用 Connect、Wake、Resume、Pause 或 envd,响应带 `Cache-Control: no-store`。
+`GET /sandboxes/{SandboxID}/stats/resource` 与
+`GET /sandboxes/{SandboxID}/stats/traffic` 沿用普通 API key 鉴权路径。缺失或格式
+错误的 key 返回 401；Sandbox 业务记录不存在或 ownership 校验失败返回 404。
+Stats handler 设置 `Cache-Control: no-store`，只读观察，不调用 Connect、Wake、
+Resume、Pause 或 envd。
 
 resource stats 经既有 ctl socket 读取当前 sandbox-ctl owner 的最终资源规格和宿主 VMM cgroup. conductor 在有观测时组合内置 resource controller 的 reservation:
 
@@ -47,7 +50,7 @@ resource stats 经既有 ctl socket 读取当前 sandbox-ctl owner 的最终资�
 
 `memoryUsed` 读取 `memory.current`,`cpuSeconds` 读取 `cpu.stat.usage_usec / 1e6`,两者来自同一个已 pin 的宿主 VMM cgroup. 不增加 ctl 进程或 guest CPU,不扣 inactive file/balloon,也不把宿主 memory 限制在 guest capacity 内. CPU seconds 是当前来源的累计值,来源重建可以重置;生命周期累计由 native usage 负责. 原生 JSON 保留整数字节,CPU seconds 以具有微秒精度的精确十进制输出. 消费端转为二进制浮点时可能损失精度.
 
-各宿主字段分别保留有效性:合法零值正常返回,缺失的 memory 或 CPU 观测分别省略. `timestampUnix` 是实际读取时间;两个宿主字段都没有观测时省略,不把 heartbeat/cache 时间刷新为当前时间. 没有 live VMM 时仍可从 owner 读取最终规格,但不伪造当前宿主观测. starting/running 没有可达 owner 为 503;paused 和其它没有当前 runtime 的状态为 409. 与 runtime 或 binding replacement 并发的读取失效.
+各宿主字段分别保留有效性:合法零值正常返回,缺失的 memory 或 CPU 观测分别省略. `timestampUnix` 是实际读取时间;两个宿主字段都没有观测时省略,不把 heartbeat/cache 时间刷新为当前时间. 没有 live VMM 时仍可从 owner 读取最终规格,但不伪造当前宿主观测. starting/running/pausing 没有可达 owner 为 503;paused 和其它没有当前 runtime 的状态为 409. 与 runtime 或 binding replacement 并发的读取失效.
 
 静态/动态资源控制、usage 关闭、telemetry 停止时均可独立使用. 读取不 Wake,不采样/保存 usage,不调用 guest 或 Cloud Hypervisor,不修改控制策略,也不创建 resource 历史. 原生 API 的 `cpuCount`、`memTotal`、`memAllocatable` 和 `memUsed` 已删除;旧的 reservation 值 `memAllocatable` 由 `memoryReserved` 替代,`memoryHeadroom` 单独表达 headroom. E2B `/metrics` 和 list/SKU 兼容字段保持原有含义.
 
@@ -174,7 +177,8 @@ Record 和 `next_cursor`; 验证为空的文件返回
 加入 orchestrator RunID.
 
 运行中的 owner 对 live 状态、自己接纳的 saved 基线和已确认 history 具有权威.
-仅 owner socket 不存在或拒绝连接时允许离线回退. 成功连接之后, 协议错误、EOF、
+当前对象没有 RunDir 时，Conductor 直接选择离线读取；否则仅 owner socket
+不存在或拒绝连接时允许离线回退. 成功连接之后, 协议错误、EOF、
 owner 错误、取消或超时均不能回退到看似可读的文件. 每个响应都证明精确 owner
 SandboxID, 包括空/关闭的 View 和空 history. Reader 与 sandboxer owner 必须使用
 该 ctl envelope 的兼容版本.
@@ -476,6 +480,10 @@ conductor/Proxy 并列部署，不作为它们的 required dependency。
 `custom`. 只有 Reader 和 handler 都可用时才注册 query UDS. 没有 handler 时,
 公开 `/metrics` 返回 503. Conductor 的三个原生 stats API 在所有模式中都保留原始来源.
 
+省略 `query.backend` 时默认为 `none`。省略 `query.handler` 时，已选择 backend
+则默认为 `e2b`，否则为 `none`；要保留 backend 但关闭查询端点，须显式设置
+`handler: none`。仅启用 local storage 不会自动选择写入 pipeline 或 query backend。
+
 | 部署方式 | 配置 |
 |---|---|
 | 远端写入与查询 | 标准远端 exporter, 加上匹配的 `query.backend`/endpoint/schema/labels |
@@ -655,8 +663,8 @@ bootstrap 选择受信静态 App，不使用 Go runtime plugin。参见
 [部署 YAML](../deploy/telemetry.example.yaml)、[service unit](../deploy/node-telemetry.service)、
 [custom telemetry](../examples/custom-telemetry/README_zh.md)。
 
-关闭时先停止 route subscription、撤销 query lease，drain query/OTLP ingress，再关闭
-Collector receivers/processors/exporters，然后 extension, 最后 query backend 与可选 local TSDB.
+关闭时先停止 route subscription、撤销 query lease，drain query server，再关闭
+Collector（含其 OTLP receiver），然后 extension，最后 query backend 与可选 local TSDB。
 启动失败也按相同资源 ownership 回收，即使启动失败也取消 extension 保留的后台工作。
 Storage path 应持久化；不要让 conductor/Proxy 的 systemd dependency require telemetry，
 telemetry 故障不得改变 sandbox lifecycle。
@@ -703,9 +711,9 @@ goroutine/FD 峰值（含 fixture server）、allocation、TSDB batch write 与 
 导出至宿主网络 HTTP sink. 已暂停沙箱通过同一 lease 授权读取面导出实际 saved usage;
 断言与公开原生 API 比较 CPU/内存累计值及原始 saved 时间, 并确认沙箱保持 paused.
 
-已有真实 Proxy E2E fixture 同时覆盖 envd → Collector
+独立的 `telemetry.guest.sh` 用例使用自身真实 guest 生命周期，覆盖 envd → Collector
 → local DB、guest 经 connector mgmt-extract 的 OTLP、auth、paused query、telemetry
-不可用、lease 撤销和 TSDB restart，不另建第二套 VM 生命周期。
+不可用、lease 撤销和 TSDB restart。
 
 <a id="guest-otlp"></a>
 
@@ -715,7 +723,7 @@ Telemetry 使用与 Proxy/MMDS 相同的 netns primitive, 自己在 `proxy_netns
 listener; 空值表示当前进程 namespace.
 `proxy_netns` 是唯一目标 YAML/JSON key, Go 字段为 `ProxyNetNS`.
 早期 Preview 中使用 `sandbox_netns` 的配置必须迁移 key; strict decode 拒绝旧字段,
-也拒绝同时提供两个字段. Telemetry 未进入现有 Stable 配置合同.
+也拒绝同时提供两个字段.
 未知 namespace 名称/路径, setns 或 bind 失败均终止启动, 关闭已创建 listener 及应用资源,
 不回退宿主 namespace. 仅创建 listener 时进入指定 namespace, 随后调用线程恢复原 namespace.
 配置不移动整个进程, 不改变 conductor/query/envd UDS, 远端 exporter 或 query client;
@@ -773,12 +781,13 @@ OTLP 请求在 target 失效时仍然失败. 普通基础设施 receiver 使用�
 SandboxID. 可信部署 processor 和静态扩展仍属于原信任域, 可以转换 pdata; 异步
 pipeline 边界不存在最终 sandbox-only guard.
 
-尽可能在 transport decode 前施加上限：默认每 listener 256 条连接，全局 32 个并发
-请求，HTTP 压缩体/解压体与 gRPC message 各 4 MiB。Resource/point attributes 最多
-32 个，key 128 bytes、value 256 bytes；batch 最多 128 resources、16,384 points，每
-scope 最多 4,096 metrics。超限返回错误，不悄悄截断。
+尽可能在 transport decode 前施加上限：默认每 listener 256 条连接，每个
+`sandboxotlp` 实例的 HTTP/gRPC 共用 32 个并发请求槽位（不是进程级全局上限），
+HTTP 压缩体/解压体与 gRPC message 各 4 MiB。移除保留属性后，resource/scope/point
+attributes 各最多 32 个，key 128 bytes、value 256 bytes，随后添加可信 resource 身份。
+Batch 最多 128 resources、16,384 points，每 scope 最多 4,096 metrics。超限返回错误，不悄悄截断。
 gRPC server 的 10s deadline 在读取 message body 前就开始，停滞客户端不能无限期
-占用全局请求槽位。
+占用实例的请求槽位。
 
 <a id="e2b-metrics-history"></a>
 
@@ -791,6 +800,8 @@ Cluster Router 现有 public SandboxID → 当前 node SandboxID 路由保持不
 correlation。RunID 继续用于 runner/run-plane、systemd/pidfile、MMDSv2、logging/debug；
 不作为 telemetry label、resource attribute、TSDB identity、query key 或 pause/resume
 series discriminator。
+保留 metrics 不等于删除后仍可公开查询：Sandbox 业务记录删除后，即使 backend
+仍保留其 sample，Conductor 也返回 404。Backend retention 与公开对象 lookup 是独立契约。
 
 `query.handler: e2b` 选择独立 E2B adapter, 使用七项 `query.e2b.metrics`
 映射与 `query.e2b.source` (默认 `envd`). 部署方可显式选择具有相同观测语义的其他
