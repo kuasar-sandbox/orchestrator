@@ -282,10 +282,10 @@ keeps the existing token shape.
 Explicit Pause body may be empty or:
 
 ```json
-{"memory":false,"checkpoint_merge_ref":null,"checkpoint_drop_caches":null}
+{"memory":false}
 ```
 
-Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field returns 400 before freeze/capture/lifecycle side effects. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
+Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field, even with a null value, returns 400 before freeze/capture/lifecycle side effects. Explicit merge_ref/drop_caches fields in the Pause Header have the same restriction. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
 
 `ifIdleSince` optionally adds a continuous-idle threshold to `ifIdle=true`.
 Use an RFC 3339 timestamp with a timezone (subsecond precision is retained).
@@ -656,7 +656,9 @@ retains local materialized lowers; callers that did not opt into retention keep 
 paused is committed; repeat E-only paused returns 204. Memory-bearing paused, starting, running,
 pausing and deleting return 409; foreign/missing parents return 404. Unavailable/incomplete current
 disks fail with 422 and retain dead. Reset never substitutes an empty disk, template, old checkpoint
-or previous run description, and never waits for an exited runtime to initialize storage.
+or previous run description, and never waits for an exited runtime to initialize storage. Request
+cancellation stops waiting, not an accepted Reset operation. Retries join the same durable operation
+ID until success or a definitive failure has committed.
 
 The parent persists one Reset operation ID per automatic terminal opportunity in the same dead
 transaction. The worker uses the shared SDK through `sandbox-ctl reset --checkpoint-dir ...
@@ -844,7 +846,7 @@ Standalone import defaults to source NodeSandboxID; an explicit target changes o
 | E-only | Omitted/null or false | Original E-only | Auto/false cold-starts |
 | E-only | true | No row inserted; 409 memory unavailable | No resume accepted |
 
-E-only selection changes only the new row's ResumeSource. It does not create a replacement snapshot, modify the token or delete/rewrite the original S/E. Authentication and expectations still apply to the complete original pair.
+E-only selection changes only the new row's ResumeSource. It does not create a replacement snapshot, modify the token or delete/rewrite the original S/E. Authentication and expectations still apply to the complete original pair. E-only Import does not open artifacts or check target boot files; successful import does not establish that E is readable or cold-bootable. Those checks belong to the later launch.
 
 The platform adds runtime admission at exactly two entries: fresh Create from an snp template, inside its existing asynchronous tenant preparation; and Import selecting S, synchronously before insertion. Import uses a short-lived tenant helper to read S and its paired E metadata and check the runtime identity actually required by that source. It does not restore memory, scan the disk graph or allocate a sandbox runner. For Import, a definite runtime mismatch returns 409; metadata, access, I/O and cancellation failures remain check errors. Existing local Connect/Resume/Wake add no platform precheck; sandboxer still validates the runtime at actual memory restore.
 
@@ -1006,19 +1008,20 @@ snp -> LaunchMemory -> sandbox-ctl run --restore <S>
 The state machine is:
 
 ```text
-Create(img|sbx|snp)
-  |
-  v
-starting --success--> running --Proxy ACK--> pausing --capture--> paused(source=E|S)
-  |                      |                       |
-  |                      +--Kill--> deleting    | Resume(auto|memory|cold)
-  |                                              v
-  +--fresh failure--> dead                    starting(launch_mode=cold|memory)
-                                                   |
-                              running <--success---+
-                                                   +--failure--> paused(original E|S)
+Create(img|sbx|snp) --> starting --success--> running
+                         +--fresh failure--> dead
 
-starting|paused|dead --explicit Delete--> deleting --finalizer success--> absent
+running --Proxy ACK--> pausing --capture + commit--> paused(source=E|S)
+paused --Resume(auto|memory|cold)--> starting(launch_mode=cold|memory)
+                                      +--success--> running
+                                      +--failure--> paused(original E|S)
+
+running --termination + cleanup--> dead --Reset + commit--> paused(source=E)
+Import --source selection + insert--> paused(source=E|S)
+
+running|starting|paused|dead --Kill/Delete acceptance--> deleting
+deleting --finalizer success--> absent
+(dead retention expiry also requests deletion)
 ```
 
 Starting is durable and spans admission, artifact preparation, resources/network, pool assignment, runtime readiness and mandatory e2b /init. Fresh Create stores image/cold/memory launch_mode. Paused resume stores cold/memory in the same atomic paused→starting update. Running/paused/deleting/dead clear launch_mode. Running may retain latest ResumeSource to track local artifact ownership; a successful Pause atomically replaces it.
@@ -1084,7 +1087,7 @@ Runtime uses three explicit DTOs:
 
 - ImageColdConfig for run --config may contain image root/diff template, launch/env/files, mounts/init/plugin, resources/network/metadata.
 - SandboxHostConfig for run --from E --config includes only ApplyFromRules host/instance fields: actual kernel/runtime bindings, active diff, resource controller/host policy, network provider/identity, timeouts, allowed persistent overrides, ephemeral_files and launch.ephemeral_env. It cannot declare immutable root/data graph. Paused E or S+cold treats E C0 as authoritative without replaying old row launch/env/files; only fresh KindSbx Create can deliberately apply current persistent overrides.
-- SnapshotHostConfig for run --restore S --config includes only allowed kernel/runtime, active diff, controller/allocatable, network provider/identity, restore policy and timeouts. The type omits launch/files/ephemeral files/init/plugin/mounts/metadata/cmdline/disk graph.
+- SnapshotHostConfig for run --restore S --config renders the allowed runtime candidate, active diff, controller/allocatable, network provider/identity, restore policy and timeouts. The renderer clears and omits the kernel binding because S already contains the running guest kernel. The type omits launch/files/ephemeral files/init/plugin/mounts/metadata/cmdline/disk graph.
 
 Node-generated hosts/resolv.conf use ephemeral_files during cold launch, not portable C0; memory restore does not reinject them. Persistent env/files follow deliberate C0 overrides; ephemeral input affects this cold invocation only. Rendered YAML must pass LoadMergedWithPresence and the corresponding ApplyFromRules/ApplyRestoreRules, retaining E's data-disk name/order/mount authority.
 
