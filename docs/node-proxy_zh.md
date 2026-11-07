@@ -1448,8 +1448,9 @@ Hello policy,不广播给 route observer.Proxy master 原子替换 registry,work
   失败广播保留的 dead 管理 Upsert,resume 失败广播 paused。
 - **envd 鉴权姿态(`mmds.enabled`)**:该开关决定 create 是否给 envd 下发 token、proxy
   是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
-  `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
-  token,使快照扇出沙箱数据面可用.姿态对比与 MMDS 两段式协议见 node-proxy.md [MMDS](#mmds).
+  `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` 安装该身份绑定的
+  EnvdAccessToken，使快照扇出沙箱数据面可用。新身份未显式提供 token 时默认生成；
+  保留身份的恢复或迁移不自动轮换它。姿态对比与 MMDS 两段式协议见 node-proxy.md [MMDS](#mmds).
 
 <a id="failure-boundaries"></a>
 
@@ -1477,8 +1478,8 @@ Hello policy,不广播给 route observer.Proxy master 原子替换 registry,work
 - **失败码**:Create/standalone Connect 无可用 proxy route stream,barrier 超时/断连或 route apply
   失败 = 503;非法 target = 400;exec 的非 CONNECT method = 405;未知/已删除 sid = 404;
   鉴权失败 = 401;已识别但 profile 不支持的 service = 501;
-  后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503;ordinary admission 达限 =
-  429 + `max_inflight_reached`,exec 达限 = CONNECT 200 后 generic ctl error。
+  后端/proxy 未注册或不可达 = 502;CONNECT 接受前的 exec route lookup 错误 = 503;ordinary admission 达限 =
+  429 + `max_inflight_reached`;CONNECT 200 后的 exec activation/backend 失败或达限 = generic ctl error。
 
 <a id="worker-lifetime"></a>
 
