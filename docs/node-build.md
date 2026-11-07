@@ -29,6 +29,9 @@ This example uses the Demo's execution budget; validate admission for your node.
 
 ```python
 import json, os, time, urllib.request
+if not __debug__:
+    raise RuntimeError("Run this recipe without Python optimization (-O/-OO or PYTHONOPTIMIZE).")
+
 api = os.environ["E2B_API_URL"].rstrip("/")
 key = os.environ["E2B_API_KEY"]
 targets = {

@@ -26,6 +26,9 @@ S，永不自动选 E。本例使用 Demo 执行预算，请按节点检查准�
 
 ```python
 import json, os, time, urllib.request
+if not __debug__:
+    raise RuntimeError("Run this recipe without Python optimization (-O/-OO or PYTHONOPTIMIZE).")
+
 api = os.environ["E2B_API_URL"].rstrip("/")
 key = os.environ["E2B_API_KEY"]
 targets = {
