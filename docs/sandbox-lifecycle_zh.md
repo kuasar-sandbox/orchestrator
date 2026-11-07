@@ -32,8 +32,8 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
-| get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?, max_checkpoints?}` + 可选 `X-Kuasar-Sandbox-*` Header;`max_checkpoints` 仅接受省略或 1；`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata`、autoReset，以及可选 deadAt/executionResult/autoResetError（[终止、Reset 与数据保留](#reset-and-retention)） |
 | usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
 | metrics history | `GET /sandboxes/{SandboxID}/metrics?start=...&end=...` | 精确 SandboxID ownership、opaque live telemetry UDS 转发；不可用为 503，不 Wake/Resume；[E2B 契约](observability_zh.md#e2b-metrics-history) |
@@ -305,14 +305,14 @@ checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceO
 显式 `POST /sandboxes/{id}/pause` 的 body 可为空或为:
 
 ```json
-{"memory":false,"checkpoint_merge_ref":null,"checkpoint_drop_caches":null}
+{"memory":false}
 ```
 
 `memory` omitted/null/true 选择 `CaptureSnapshot`;false 选择 `CaptureSandbox`。显式 Pause 的缺省始终
 是 Snapshot S,不继承 `autoPauseMemory`。因此 `Create(autoPauseMemory=false) + Pause({})` 保存 S,
 而同一 Sandbox TTL 到期保存 E。`checkpoint_merge_ref` 和 `checkpoint_drop_caches` 只属于
-`SnapshotPolicy`;若 `memory=false` 同时携任一字段,API 在 guest freeze、capture 或 lifecycle
-副作用前返回 400。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
+`SnapshotPolicy`;若 `memory=false` 同时携任一字段（即使值为 `null`）,API 在 guest freeze、capture 或 lifecycle
+副作用前返回 400。Pause Header 中显式提供 `merge_ref`/`drop_caches` 也受此限制。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
 `merge_ref`、`drop_caches`,不接受 `memory`。
 
 `ifIdleSince` 可为 `ifIdle=true` 增加持续空闲时间阈值。格式为带时区的
@@ -632,7 +632,8 @@ guest 使用磁盘前，共享 sandboxer 启动路径在 BaseDir/checkpoint 持�
 `POST /sandboxes/{id}/reset` 沿用鉴权和归属检查。仅 E-only paused 提交后返回 204，重复请求
 幂等成功。带内存 paused、starting、running、pausing、deleting 返回 409，外部/不存在对象
 返回 404。当前盘缺失或未就绪返回 422 并保持 dead；不补空盘、不回退模板/旧 checkpoint/上一轮
-描述，也不等待已退出 runtime 初始化磁盘。
+描述，也不等待已退出 runtime 初始化磁盘。请求取消只停止等待，不撤销已接纳的 Reset；
+重试加入同一持久 operation ID，直到成功或明确失败已提交。
 
 每轮自动机会的 Reset operation ID 与 dead 在同一事务持久提交。worker 通过共享 SDK 薄封装
 `sandbox-ctl reset --checkpoint-dir ... --sandbox-id ... --instance-id ... --run-id ...
@@ -811,7 +812,8 @@ proxy 不读取 kind。Migration token 是 sandbox 级敏感凭据,不会随 rou
 | E-only | true | 不插入记录；409 memory unavailable | 不接纳恢复 |
 
 选择 E-only 只改变新记录的 ResumeSource，不新建替代快照，不修改 token，也不删除或改写
-原 S/E。认证和 Expectations 仍针对原完整对。
+原 S/E。认证和 Expectations 仍针对原完整对。E-only Import 不打开制品或检查目标启动文件；
+导入成功不保证 E 可读或能够冷启动，这些检查留给后续 launch。
 
 平台只在两个入口新增 runtime 准入：从 snp 模板首次 Create，在既有异步租户准备阶段检查；
 Import 最终选择 S，在插入前同步检查。Import 通过短生命周期的租户 helper 读取 S 与关联 E
@@ -878,7 +880,7 @@ TemplateID），发布进度不会进入 stdout。无效/尾随 JSON、被污染
 ## 沙箱配置传递链
 
 每实例沙箱配置经**命名空间化的 e2b metadata 保留键** `kuasar-sandbox.<ns>`(各值一个
-JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定义可配置子集，再由 renderer 生成 sandboxer 配置；
+JSON 对象字符串)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定义可配置子集，再由 renderer 生成 sandboxer 配置；
 不能把完整 runtime YAML 当作租户策略直接导入：
 
 | 命名空间 | 去向 |
@@ -1041,19 +1043,20 @@ snp -> LaunchMemory -> sandbox-ctl run --restore <S>
 状态机如下:
 
 ```text
-Create(img|sbx|snp)
-  |
-  v
-starting --success--> running --Proxy ACK--> pausing --capture--> paused(source=E|S)
-  |                      |                       |
-  |                      +--Kill--> deleting    | Resume(auto|memory|cold)
-  |                                              v
-  +--fresh failure--> dead                    starting(launch_mode=cold|memory)
-                                                   |
-                              running <--success---+
-                                                   +--failure--> paused(original E|S)
+Create(img|sbx|snp) --> starting --success--> running
+                         +--fresh failure--> dead
 
-starting|paused|dead --explicit Delete--> deleting --finalizer success--> absent
+running --Proxy ACK--> pausing --capture + commit--> paused(source=E|S)
+paused --Resume(auto|memory|cold)--> starting(launch_mode=cold|memory)
+                                      +--success--> running
+                                      +--failure--> paused(original E|S)
+
+running --termination + cleanup--> dead --Reset + commit--> paused(source=E)
+Import --source selection + insert--> paused(source=E|S)
+
+running|starting|paused|dead --Kill/Delete acceptance--> deleting
+deleting --finalizer success--> absent
+(dead retention expiry also requests deletion)
 ```
 
 `starting` 是持久业务状态,覆盖 admission、artifact prepare、resource/network、runner pool、
@@ -1152,8 +1155,9 @@ preparation 不得替换已导入或已持久保存的 E.
   `launch.ephemeral_env`。它不能声明 immutable root/data disk graph。paused E 或 S+cold 时 E 的 C0
   权威,不重放 row 中旧 launch/env/files;只有 fresh `KindSbx` Create 可有意提交 create-time persistent
   override。
-- `SnapshotHostConfig`:用于 `run --restore S --config`;只声明 `ApplyRestoreRules` 允许的 kernel/runtime、
+- `SnapshotHostConfig`:用于 `run --restore S --config`;renderer 输出 `ApplyRestoreRules` 允许的 runtime 候选、
   active diff、resource controller/allocatable、network provider/实例字段、restore policy 和 timeout。
+  renderer 清空并省略 kernel binding，因为运行中的 guest kernel 已保存在 S 中。
   类型本身不包含 launch、files、ephemeral files、init/plugin、mounts、metadata、boot cmdline 或 disk graph。
 
 node 生成的 `/etc/hosts`、`/etc/resolv.conf` 在 cold 路径进入 `ephemeral_files`,不写 portable C0;
