@@ -54,11 +54,11 @@ Each host observation has independent validity: a valid zero is returned, while 
 
 This works with static or dynamic resource control, with usage disabled and with telemetry stopped. Reading does not Wake, sample/save usage, call the guest or Cloud Hypervisor, or change control policy. It creates no resource history. The former native `cpuCount`, `memTotal`, `memAllocatable` and `memUsed` fields are removed; the old reservation-valued `memAllocatable` is replaced by `memoryReserved`, while `memoryHeadroom` is a separate explicit concept. E2B `/metrics` and list/SKU compatibility fields retain their existing meanings.
 
-Traffic stats report authenticated logical ingress accepted by final node Proxy:
+Traffic stats report logical ingress admitted by the final node Proxy. Ordinary requests follow the effective authentication policy (`log`/`off` admission does not guarantee valid credentials); exec always requires valid KAT authentication and ExecRequest admission:
 
 ```text
 ingress = parking + connected
-parking = Authenticated, but activation/final backend dial has not completed
+parking = Admitted, but activation/final backend dial has not completed
 connected  = Final node proxy→Sandbox backend is established and not finally closed
 ```
 
@@ -111,7 +111,7 @@ e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/e
 
 Conductor queries the current trusted Proxy registration's stats_socket master cache, without worker fan-out. Unregistered master, unsynchronized route, mismatched RunID/profile/state, failed worker stream or unready replacement returns 503. This stats window does not alter master route/admission authority or Create barrier. The complete shared-admission algorithm, error proof, worker state machine, absolute snapshots and failure windows are in [node-proxy.md](node-proxy.md) [Per-sandbox traffic admission and stats](node-proxy.md#admission).
 
-The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services`, `platform`, `transit`, and `egress`. Conductor owns this native API and composes the existing Proxy observation with the current Sandbox-to-switch/port binding. `platform` maps connector Mgmt RX/TX packets/bytes; `transit` maps Transit RX/TX. Both use the sandbox viewpoint. Each configured current port supplies all four unsigned integer counters, including valid zero. A sandbox without an attached port has empty `platform`/`transit` objects, meaning no applicable current observation. `egress: {}` always means no publishable egress statistics; it does not mean observed zero traffic. There are no per-service packet counters, source groups or network API alias.
+The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services`, `platform`, `transit`, and `egress`. Conductor owns this native API and composes the existing Proxy observation with the current Sandbox-to-switch/port binding. `platform` maps connector Mgmt RX/TX packets/bytes; `transit` maps Transit RX/TX. Both use the sandbox viewpoint. Each configured current port supplies all four unsigned integer counters, including valid zero. Only when `VswitchPort`, `FloatingIP`, `InnerIP` and `PortMAC` are all empty does a sandbox have empty `platform`/`transit` objects, meaning no applicable current observation. A partial network binding returns 503 before either source is queried. `egress: {}` always means no publishable egress statistics; it does not mean observed zero traffic. There are no per-service packet counters, source groups or network API alias.
 
 `connected` replaces the former native `inflight.egress` and `services[*].egress`, preserving the established-backend-until-final-Close meaning. Top-level `idleSince` describes only admitted Proxy ingress; management monitoring packets do not refresh it and it makes no claim about sandbox computation or network idleness. Packets are packet counts, not application request counts; bytes are observed frame bytes, not throughput. Management uses the existing port/management ingress frame length; transit uses the frame before encapsulation or after removal of outer GENEVE headers, retaining Ethernet. Different observation points are not added into a traffic total. The cumulative counters belong to the current attachment and can reset on reuse; the API creates no network history.
 
