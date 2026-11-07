@@ -400,8 +400,9 @@ arguments and output buffers and validating that retry's complete report. I/O,
 space, corruption and incomplete-report failures never trigger this fallback.
 New starts must support the enabled mode. Deploy matching sandboxer source and
 binaries containing [sandboxer #336](https://github.com/kuasar-sandbox/sandboxer/pull/336)
-(`7cd3ed4c5a8807b75b175bdb845867effb1c5018` or a successor); the sibling module
-selected by `go.mod` replacement is part of that requirement.
+(`7cd3ed4c5a8807b75b175bdb845867effb1c5018` or a successor); the selected Sandboxer SDK
+module must also match. Standalone builds use the version committed in `go.mod`; coordinated builds select local modules through
+an explicit Go workspace ([Build and test](../CONTRIBUTING.md#build-and-test)).
 
 Task-local Open, Clone and Validate preserve the Checkpoint layout. Its root and
 data disks already contain active data even when the ordinary active-base field
