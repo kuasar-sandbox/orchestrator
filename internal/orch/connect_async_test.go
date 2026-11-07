@@ -144,9 +144,7 @@ func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A migration resume probes snapshot metadata before launching. An empty PATH
-	// makes that best-effort probe fail immediately and keeps this unit test local.
-	t.Setenv("PATH", t.TempDir())
+	// Runtime admission is modeled independently from asynchronous launch.
 
 	cfg := &config.Config{}
 	cfg.Sandbox.Boot.Runtime = runtimePath
@@ -154,6 +152,7 @@ func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 	startGate := make(chan struct{})
 	lc := &countingLauncher{started: started, startGate: startGate}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	installSnapshotRuntimeAdmissionStub(t, o, "compatible")
 
 	mk := strings.Repeat("c", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, mk)
@@ -229,7 +228,6 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", t.TempDir())
 
 	cfg := &config.Config{}
 	cfg.Sandbox.Boot.Runtime = runtimePath
@@ -237,6 +235,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 	startGate := make(chan struct{})
 	lc := &countingLauncher{started: started, startGate: startGate}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	installSnapshotRuntimeAdmissionStub(t, o, "compatible")
 
 	mk := strings.Repeat("7", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, mk)

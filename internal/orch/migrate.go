@@ -440,7 +440,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 // ImportSandbox authenticates the caller's paired tenant roots and inserts the
 // token as a paused standalone sandbox. An empty targetID reuses the source
 // NodeSandboxID; a non-empty targetID replaces only the node-local identity.
-func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
+func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetID string, options api.ImportOptions) (string, error) {
 	if apiKey == "" {
 		return "", fmt.Errorf("import-sandbox: API key is required: %w", api.ErrNotAllowed)
 	}
@@ -453,7 +453,7 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetI
 	if pair.APISecret == "" {
 		return "", fmt.Errorf("import-sandbox: credential pair is not installed: %w", api.ErrNotAllowed)
 	}
-	sb, err := o.importSandboxWithKey(ctx, pair, token, targetID, migrationtoken.Expectations{}, nil, 0)
+	sb, err := o.importSandboxWithKey(ctx, pair, token, targetID, migrationtoken.Expectations{}, nil, 0, options)
 	if err != nil {
 		return "", err
 	}
@@ -473,8 +473,9 @@ func (o *Orchestrator) importSandboxWithKey(
 	expected migrationtoken.Expectations,
 	cluster *types.ClusterSandboxContext,
 	deadlineOverride int64,
+	options api.ImportOptions,
 ) (*types.Sandbox, error) {
-	return o.importSandboxWithKeyOptions(ctx, pair, token, targetID, expected, cluster, deadlineOverride, standaloneMMDSImport{})
+	return o.importSandboxWithKeyOptions(ctx, pair, token, targetID, expected, cluster, deadlineOverride, options, standaloneMMDSImport{})
 }
 
 type standaloneMMDSImport struct {
@@ -491,6 +492,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	expected migrationtoken.Expectations,
 	cluster *types.ClusterSandboxContext,
 	deadlineOverride int64,
+	options api.ImportOptions,
 	mmdsImport standaloneMMDSImport,
 ) (*types.Sandbox, error) {
 	if targetID != "" && !types.ValidLocalSandboxID(targetID) {
@@ -517,12 +519,14 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	if err != nil {
 		return nil, fmt.Errorf("import-sandbox: profile: %w", err)
 	}
-	runtimeDigest, err := sha256File(o.runtimeFileFor(profile))
-	if err != nil {
-		return nil, fmt.Errorf("import-sandbox: hash runtime: %w", err)
+	// Validate the authenticated original S/E pair before projecting it. The V1
+	// RuntimeDigest remains a legacy signing field, not source compatibility.
+	source := types.ResumeSource{Kind: payload.ResumeSourceKind, Ref: payload.ResumeSourceRef, SandboxRef: payload.ResumeSandboxRef}
+	if _, err := types.ResolveLaunchMode(source, types.ResumeModeForMemory(options.Memory)); err != nil {
+		return nil, fmt.Errorf("import-sandbox: %w", err)
 	}
-	if runtimeDigest != payload.RuntimeDigest {
-		return nil, fmt.Errorf("import-sandbox: %w: runtime", migrationtoken.ErrIncompatible)
+	if options.Memory != nil && !*options.Memory && source.Kind == types.ResumeSourceSnapshot {
+		source = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: source.SandboxRef}
 	}
 	if targetID == "" {
 		targetID = payload.NodeSandboxID
@@ -563,23 +567,19 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		metadata = clusterSandboxMetadata(metadata)
 	}
 	sb := &types.Sandbox{
-		ID:            targetID,
-		Profile:       profile,
-		Cluster:       trustedCluster,
-		StableIDValue: payload.StableID,
-		TemplateID:    payload.TemplateID,
-		State:         types.StatePaused,
-		DeadlineUnix:  payload.DeadlineUnix,
-		CreatedUnix:   payload.CreatedUnix,
-		RunDir:        nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, targetID),
-		BaseDir:       nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, targetID),
-		APISecret:     pair.APISecret,
-		ManifestKey:   pair.ManifestKey,
-		ResumeSource: types.ResumeSource{
-			Kind:       payload.ResumeSourceKind,
-			Ref:        payload.ResumeSourceRef,
-			SandboxRef: payload.ResumeSandboxRef,
-		},
+		ID:              targetID,
+		Profile:         profile,
+		Cluster:         trustedCluster,
+		StableIDValue:   payload.StableID,
+		TemplateID:      payload.TemplateID,
+		State:           types.StatePaused,
+		DeadlineUnix:    payload.DeadlineUnix,
+		CreatedUnix:     payload.CreatedUnix,
+		RunDir:          nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, targetID),
+		BaseDir:         nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, targetID),
+		APISecret:       pair.APISecret,
+		ManifestKey:     pair.ManifestKey,
+		ResumeSource:    source,
 		AutoPauseMemory: payload.AutoPauseMemory, IdleTimeout: types.CloneIdleTimeout(payload.IdleTimeout),
 		AutoReset:          payload.AutoReset,
 		ServiceSecret:      payload.ServiceSecret,
@@ -605,8 +605,21 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 			return nil, fmt.Errorf("import-sandbox: MMDS route projection: %w: %v", migrationtoken.ErrInvalidPayload, err)
 		}
 	}
+	if source.Kind == types.ResumeSourceSnapshot {
+		// Keep the local admission budget through insertion: the node-link stream
+		// itself is not canceled when the registry stops waiting for its ACK.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, snapshotRuntimeAdmissionBudget)
+		defer cancel()
+		if err := o.checkImportedSnapshotRuntime(ctx, sb); err != nil {
+			return nil, err
+		}
+	}
 	unlockEvent := o.lockExtensionSandboxEvent(sb.ID)
 	defer unlockEventFence(unlockEvent)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var insertErr error
 	if mmdsImport.routesPresent {
 		insertErr = o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, sb, mmdsImport.routesDigest, mmdsImport.secretValues)
@@ -623,7 +636,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	return sb, nil
 }
 
-func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, apiKey, token string, requestMetadata map[string]string, header *string) (*types.Sandbox, error) {
+func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, apiKey, token string, requestMetadata map[string]string, header *string, options api.ImportOptions) (*types.Sandbox, error) {
 	pair, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
@@ -659,7 +672,7 @@ func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, 
 	}
 
 	imported, err := o.importSandboxWithKeyOptions(
-		ctx, pair, token, id, migrationtoken.Expectations{}, nil, 0,
+		ctx, pair, token, id, migrationtoken.Expectations{}, nil, 0, options,
 		standaloneMMDSImport{
 			routesPresent: routesPresent,
 			routesJSON:    routesJSON,

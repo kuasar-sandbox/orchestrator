@@ -49,7 +49,7 @@ func (o *Orchestrator) execSession(
 	if _, err := compiler.Compile(conditions); err != nil {
 		return "", fmt.Errorf("exec session: invalid conditions: %w", api.ErrBadRequest)
 	}
-	if _, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken); err != nil {
+	if _, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken, api.ImportOptions{}); err != nil {
 		return "", err
 	}
 	var token string

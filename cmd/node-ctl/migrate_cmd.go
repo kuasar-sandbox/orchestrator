@@ -81,6 +81,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 func importSandboxCmd(args []string, _ *slog.Logger) error {
 	tok, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("import-sandbox", flag.ContinueOnError)
+	memory := fs.Bool("memory", true, "preserve memory state; false imports only E (default follows token)")
 	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -89,14 +90,20 @@ func importSandboxCmd(args []string, _ *slog.Logger) error {
 		tok = fs.Arg(0)
 	}
 	if tok == "" {
-		return fmt.Errorf("usage: node-ctl import-sandbox <token> [--socket S]")
+		return fmt.Errorf("usage: node-ctl import-sandbox <token> [--memory=true|false] [--socket S]")
 	}
 	apiKey := os.Getenv("E2B_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("import-sandbox: E2B_API_KEY is required")
 	}
+	body := map[string]any{"token": tok}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "memory" {
+			body["memory"] = *memory
+		}
+	})
 	code, resp, err := udsDo(resolveSocket(*socket), http.MethodPost,
-		"/sandboxes/import", map[string]string{"X-API-KEY": apiKey}, map[string]any{"token": tok})
+		"/sandboxes/import", map[string]string{"X-API-KEY": apiKey}, body)
 	if err != nil {
 		return err
 	}

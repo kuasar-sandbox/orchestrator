@@ -623,7 +623,11 @@ Connect accepts a bounded strict JSON object with timeout and optional bool/null
 
 Running Connect remains idempotent; false does not restart it. A starting resume accepts omitted/null by joining the current attempt. An explicit matching mode joins; mismatch returns 409 without changing durable choice. Router/route-link/Registry/node-link retain pointer presence.
 
-BeginResume(id, deadline, LaunchMode, RunDir, EnvdUDS, CiUDS) requires fully cleaned runner/network/RunDir ownership and atomically writes starting, mode and new canonical RunDir/UDS. CommitStartingRunning/RollbackStartingPaused/RollbackStartingDead clear mode. Failed S+cold returns to the original paused S, allowing later memory selection. Conductor restart reconstructs an accepted starting resume from source plus durable mode, so lost cache cannot turn S+cold into memory restore.
+BeginResume(id, deadline, LaunchMode, RunDir, EnvdUDS, CiUDS) requires fully cleaned runner/network/RunDir ownership and atomically writes starting, mode and new canonical RunDir/UDS. CommitStartingRunning/RollbackStartingPaused/RollbackStartingDead clear mode. For an existing local S, a failed cold attempt returns to the original paused S, allowing later memory selection. Conductor restart reconstructs an accepted starting resume from source plus durable mode, so lost cache cannot turn S+cold into memory restore.
+
+Cold launch from E uses the target node's configured kernel and runtime, preserves the source workload/disk graph and derives a new C0 with those boot identities. Selecting cold from an existing S uses its paired E without rewriting S or requiring an E-only export. Memory restore retains the original C0, needs a runtime with the required digest type and value, and does not require an external kernel file.
+
+If Connect must import a missing target, its memory selector also chooses the imported durable source: false stores E-only before cold launch. A later launch failure leaves paused E. For subsequent paused resumes, auto remains cold and true returns 409 until a new S is captured. This differs from one cold attempt on an existing local paused S. Import never rewrites the original token or deletes its S/E artifacts; see [Import selection](#import-selection).
 
 Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. A future autoResume=false must be separate traffic policy, not inferred from E/S kind; complete E2B autoResume is not implemented.
 
@@ -777,7 +781,7 @@ Paused E promotes to sbx, S to snp; E is not rejected for lacking memory. Build 
 
 The authenticated KMT V1 payload carries optional `autoReset` when true. Import restores this policy. Existing tokens omit it and import with the default false. An older strict reader rejects tokens carrying the new field.
 
-KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Target expectations compare both S and E. Import performs no artifact access and atomically restores the complete pair, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Destination retrieves roots from trusted local allowlist and verifies fingerprints/runtime digest/profile. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
+KMT V1 directly contains resumeSourceKind, resumeSourceRef, resumeSandboxRef and autoPauseMemory. Snapshot requires its exact associated E in resumeSandboxRef; E-only requires that field to be empty. Missing fields, duplicate/unknown JSON and invalid combinations are rejected, including old Snapshot tokens without E. Import authenticates the original token and compares target expectations against its original S/E pair before selecting the new durable source. Destination retrieves tenant roots from the trusted local allowlist and verifies fingerprints/profile. It atomically inserts the selected source, deadline, portable env/metadata and existing ServiceSecret/Envd/Traffic/Forward credentials. Token contains no raw tenant roots, host paths, MMDS secret values, cluster group/route key or generation.
 
 Export admission completes outstanding paused cleanup before registering the
 attempt or starting publication. A private source-operation lock outside the
@@ -827,6 +831,27 @@ under a different node-local ID.
 
 Standalone import defaults to source NodeSandboxID; an explicit target changes only local ID while retaining StableID/service credentials. Atomic insert-only conflicts with 409. Connect can synchronously import a missing target from X-Kuasar-Migration-Token; existing targets ignore it. Paused routes project only kind-independent artifact_location local/remote for trusted migration consumers. Proxy does not inspect artifact kind; migration tokens are sensitive Sandbox credentials and never route-broadcast.
 
+<a id="import-selection"></a>
+
+### Import selection and runtime compatibility
+
+`POST /sandboxes/import` accepts optional `memory: boolean|null` alongside `token` and optional `sandboxID`. Import creates paused state; it does not start a VM:
+
+| Authenticated token source | Import memory | New durable source | Subsequent resume |
+|---|---|---|---|
+| S + paired E | Omitted/null or true | Original S + E, after runtime admission | Auto/true restores memory; false cold-starts |
+| S + paired E | false | E-only, using the token's paired E | Auto/false cold-starts; true returns 409 |
+| E-only | Omitted/null or false | Original E-only | Auto/false cold-starts |
+| E-only | true | No row inserted; 409 memory unavailable | No resume accepted |
+
+E-only selection changes only the new row's ResumeSource. It does not create a replacement snapshot, modify the token or delete/rewrite the original S/E. Authentication and expectations still apply to the complete original pair.
+
+The platform adds runtime admission at exactly two entries: fresh Create from an snp template, inside its existing asynchronous tenant preparation; and Import selecting S, synchronously before insertion. Import uses a short-lived tenant helper to read S and its paired E metadata and check the runtime identity actually required by that source. It does not restore memory, scan the disk graph or allocate a sandbox runner. For Import, a definite runtime mismatch returns 409; metadata, access, I/O and cancellation failures remain check errors. Existing local Connect/Resume/Wake add no platform precheck; sandboxer still validates the runtime at actual memory restore.
+
+Import selecting S uses an internal four-second admission context, or the caller's earlier deadline, for the metadata/helper check and passes it to insertion. Normal helper output drains within that context; cancellation closes the parent pipe endpoints, with a separate 250 ms bound on process cancellation cleanup. The existing same-sandbox lifecycle fence does not support cancellation, so waiting for that lock can exceed the admission budget. Import checks the context again after acquiring it and rejects an expired insertion. A failed or timed-out metadata check inserts no row. The budget is therefore not a hard deadline for the entire Import request, a user option or sandbox TTL; fresh snp Create keeps its existing task deadline. These checks do not add component-aware scheduling.
+
+The token remains KMT V1. `RuntimeDigest` still means the whole-file SHA-256 of the node's default runtime when the token is minted, but Import no longer compares it with the target default file. Minting a migration token during Export therefore still needs that default runtime file and retains its hashing cost. Old receivers can parse V1 but retain their old compatibility rules. Upgrade the receiving Conductor and matching tools before relying on Import memory selection: older HTTP handlers can silently ignore the unknown `memory:false` field. See [the upgrade compatibility proposal](https://github.com/kuasar-sandbox/orchestrator/issues/519).
+
 Running means runtime readiness and mandatory e2b /init, not application-port health. Generic backend health/dial retry is separate work. Cluster Create/Connect reuse node primitives. Secrets-only CONNECT import remains standalone-only; node-link carries no MMDS route-value plaintext.
 
 <a id="export-import-command"></a>
@@ -837,7 +862,7 @@ These clients use conductor's local **API plane** for `POST /sandboxes/{id}/expo
 
 ```
 node-ctl export-sandbox <sid> [--checkpoint ID] [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
-node-ctl import-sandbox <token> [--socket S]
+node-ctl import-sandbox <token> [--memory=true|false] [--socket S]
 ```
 
 - `--timeout` bounds the complete export request (default `20m`, positive Go duration). Publication materializes disk contents and can exceed short administrative deadlines. A timeout cancels this client request; it is not proof that an already accepted server operation rolled back. Check the source/result before retrying.
@@ -845,6 +870,7 @@ node-ctl import-sandbox <token> [--socket S]
 - `export-sandbox <sid> --to-template` publishes paused E or S and prints persistent `sbx`/`snp` templateID for fan-out. Source retention is identical: `--keep-source` retains it; omission accepts its deletion with the same eventual cleanup semantics.
 - Resume remains allowed during local-artifact upload. If Resume wins first, KMT Export cancels upload and returns 409, whereas Template Export continues and returns templateID. Both abandon the source finalizer without updating/deleting source or local artifact.
 - `import-sandbox <token>` defaults to source NodeSandboxID, inserts a paused row without overwriting and prints SID; an existing target, including a source still in `deleting`, returns 409. Reusing the same node-local ID requires cleanup to finish; import does not wait for it. API body may choose another node-local `sandboxID`, retaining logical authentication identity and service credentials. A subsequent Connect accepts asynchronous resume.
+- Omit `--memory` to preserve the token's source. `--memory=false` permanently imports only E, including from an S token; `--memory=true` requires S. The client sends the field only when explicitly specified. The [Import selection table](#import-selection) defines compatibility and failure behavior; using this option requires a server that supports it.
 
 `--json` prints the complete successful Export API response. Default output remains
 one `result` line (token or template ID); quiet publication progress never enters
@@ -1075,9 +1101,12 @@ Builder total/step/readiness deadlines retain their existing responsibilities.
 
 Ordinary accepted launches follow the attempt owner through prepare, readiness
 and /init, without the former implicit 60-second limit. Sandbox bootstrap version
-6 permits zero/omitted `absolute_deadline_unix_nano`; positive means an explicit
-absolute cutoff and negative is invalid. Shared prepare summary stays version 5;
-Builder version 7 and its positive work deadline/reporting reserve are unchanged.
+7 retains zero/omitted `absolute_deadline_unix_nano`; positive means an explicit
+absolute cutoff and negative is invalid. Version 7 additionally requires fresh snp
+tasks to honor runtime admission. Deploy matching Conductor and sandbox runner
+versions; bootstrap version 6 is rejected instead of silently omitting that check.
+Shared prepare summary stays version 5; Builder version 7 and its positive work
+deadline/reporting reserve, the cluster protocol and KMT V1 are unchanged.
 
 Manifest opens reuse Sandboxer's `OpenManifestStream`/readretry with the original
 scoped fetcher, Bundle identity and caller context. Builder benefits within its

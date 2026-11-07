@@ -589,9 +589,18 @@ Connect 在 Router、route-link、Registry 和 node-link 间保留 `*bool` 的�
 `BeginResume(id, deadline, LaunchMode, RunDir, EnvdUDS, CiUDS)` 只接受 runner/network/RunDir 已完成
 cleanup 的 paused row，并原子写 `state=starting, launch_mode` 与新一代 canonical RunDir/UDS。
 `CommitStartingRunning`、`RollbackStartingPaused`、
-`RollbackStartingDead` 清空 `launch_mode`。失败的 S+cold 恢复原 paused S,不会改写成 E,所以之后
-仍可选择 memory。conductor 重启遇到 starting resume 时从 durable source + `launch_mode` 重建
-attempt;例如 S+cold 不会因进程内缓存丢失而错误执行 memory restore。
+`RollbackStartingDead` 清空 `launch_mode`。对本地已有 S，失败的 cold 尝试恢复原 paused S，
+不会改写成 E，所以之后仍可选择 memory。conductor 重启遇到 starting resume 时从 durable
+source + `launch_mode` 重建 attempt；例如 S+cold 不会因进程内缓存丢失而错误执行 memory restore。
+
+从 E 冷启动使用目标节点配置的 kernel 和 runtime，保留来源工作负载/磁盘图，并派生记录本次
+boot 身份的新 C0。对已有 S 选择 cold 时使用其关联 E，无需改写 S 或先导出 E-only。内存恢复
+保留原 C0，要求 runtime 的 digest 类型和值匹配，不依赖外部 kernel 文件。
+
+Connect 若需导入缺失的目标，同一个 memory 选项也决定导入后的持久来源：false 先保存 E-only，
+再冷启动。后续启动失败仍为 paused E。之后从 paused 恢复时，auto 继续冷启动，true 返回
+409，直到捕获新的 S。这与本地已有 paused S 的一次 cold 尝试不同。Import 不改写原 token，也不删除其 S/E 制品；
+见 [Import 选择](#import-selection)。
 
 Proxy 的 ordinary ingress 和 native exec activation 都经 `OnWake` 使用
 `ResumeTriggerWake`;`ExecSession` 使用 `ResumeTriggerExecSession`.公开的
@@ -741,11 +750,10 @@ build pipeline 的 Snapshot 输出仍是 `snp`,但 publication 同样调用 `san
 KMT V1 payload 直接携 `resumeSourceKind`、`resumeSourceRef`、`resumeSandboxRef` 和
 `autoPauseMemory`。Snapshot 必须在 `resumeSandboxRef` 中携带关联 E；E-only 的该字段必须
 为空。缺失字段、重复或未知 JSON 字段以及错误组合均被拒绝，包括缺少 E 的旧 Snapshot
-token。目标 Expectations 同时比较 S 和 E。Import 不访问工件，原子恢复完整对、deadline、
-portable env/metadata 和既有
-ServiceSecret/Envd/Traffic/Forward token;目标 node 从本地 trusted key table 取得 APISecret +
-ManifestKey 并校验 fingerprints、runtime digest 和 profile。token 不携 raw tenant roots、host path、
-MMDS secret value、cluster Group/RouteKey 或 generation。
+token。Import 先认证原 token，并针对原 S/E 对校验目标 Expectations，再选择新记录的持久来源。
+目标 node 从本地 trusted key table 取得租户根密钥，校验 fingerprints 和 profile，原子插入
+选定来源、deadline、portable env/metadata 和既有 ServiceSecret/Envd/Traffic/Forward 凭据。
+token 不携 raw tenant roots、host path、MMDS secret value、cluster Group/RouteKey 或 generation。
 
 本地磁盘 Checkpoint 的发布由 sandboxer 将固定版本物化为普通可移植磁盘产物，并从发布 E
 中移除 `checkpoint.json`，原本地来源不变。移往其他节点或回退到不支持 Checkpoint E 的
@@ -788,6 +796,43 @@ StableID 和 service credentials。insert 是原子的 insert-only,冲突返回 
 paused route 只投影与 kind 正交的 `artifact_location=local|remote`,供可信迁移组件判断节点绑定;
 proxy 不读取 kind。Migration token 是 sandbox 级敏感凭据,不会随 route 广播。
 
+<a id="import-selection"></a>
+
+### Import 选择与 runtime 兼容性
+
+`POST /sandboxes/import` 在 `token` 和可选 `sandboxID` 之外，接受可选的
+`memory: boolean|null`。Import 创建 paused 状态，不启动 VM：
+
+| 已认证的 token 来源 | Import memory | 新记录的持久来源 | 后续恢复 |
+|---|---|---|---|
+| S + 关联 E | omitted/null 或 true | runtime 准入通过后保留原 S + E | auto/true 恢复内存；false 冷启动 |
+| S + 关联 E | false | E-only，使用 token 的关联 E | auto/false 冷启动；true 返回 409 |
+| E-only | omitted/null 或 false | 原 E-only | auto/false 冷启动 |
+| E-only | true | 不插入记录；409 memory unavailable | 不接纳恢复 |
+
+选择 E-only 只改变新记录的 ResumeSource，不新建替代快照，不修改 token，也不删除或改写
+原 S/E。认证和 Expectations 仍针对原完整对。
+
+平台只在两个入口新增 runtime 准入：从 snp 模板首次 Create，在既有异步租户准备阶段检查；
+Import 最终选择 S，在插入前同步检查。Import 通过短生命周期的租户 helper 读取 S 与关联 E
+元数据，检查该来源实际要求的 runtime 身份，不恢复内存、不扫描磁盘图，也不分配沙箱 runner。
+Import 遇到确定的 runtime 不匹配返回 409；元数据、访问、I/O 和取消错误仍作为检查错误返回。已有本地
+Connect/Resume/Wake 不新增平台预检查；真正恢复内存时，sandboxer 仍校验 runtime。
+
+选择 S 的 Import 对元数据/helper 检查使用固定四秒的内部准入 context，若 caller deadline
+更早则服从该时限，并将 context 传给插入。helper 正常退出后的输出读取仍使用该 context；
+取消时关闭父进程的管道端点，进程取消收尾另有 250 ms 上限。已有同沙箱 lifecycle fence 不支持
+取消，等待该锁可能超过准入预算；取得锁后，Import 再次检查 context，拒绝过期插入。
+元数据检查失败或超时不插入记录。因此该预算不是整个 Import 请求的硬截止时间，也不是用户
+配置项或沙箱 TTL；首次 snp Create 沿用既有 task deadline。这些检查不新增按组件兼容性调度
+节点的机制。
+
+Token 仍为 KMT V1。`RuntimeDigest` 保留签发时节点默认 runtime 整文件 SHA-256 的含义，
+但 Import 不再将其与目标默认文件比较。因此 Export 签发 migration token 时仍依赖该默认
+runtime 文件，并保留整文件 hash 成本。旧接收端能解析 V1，但仍执行旧兼容性规则。使用 Import memory
+选项前，应升级接收端 Conductor 与配套工具；旧 HTTP handler 可能静默忽略未知的
+`memory:false` 字段。设计依据见 [升级兼容性提案](https://github.com/kuasar-sandbox/orchestrator/issues/519)。
+
 `running` 仅表示 runtime readiness 与 mandatory e2b `/init` 已完成,不保证用户应用端口健康。
 通用 backend health/dial retry 仍由独立工作跟踪。cluster 的 create/connect 复用上述 node-local
 原语;secrets-only CONNECT import 仍只属于 standalone,node-link 不传 MMDS secret plaintext。
@@ -801,7 +846,7 @@ serve daemon **api 平面**的客户端(经本机控制 socket 调 `POST /sandbo
 
 ```
 node-ctl export-sandbox <sid> [--checkpoint ID] [--to-template] [--keep-source] [--json] [--timeout D] [--socket S]
-node-ctl import-sandbox <token> [--socket S]
+node-ctl import-sandbox <token> [--memory=true|false] [--socket S]
 ```
 
 - `--timeout` 限定完整导出请求时间，默认 `20m`，必须是正的 Go duration。发布需要物化磁盘内容，可能超过短管理请求的预算。超时会取消本次客户端请求，但不证明已接纳的服务端操作已经回滚；重试前应核对来源及发布结果。
@@ -819,6 +864,9 @@ node-ctl import-sandbox <token> [--socket S]
   node-local ID 需要等待物理清理完成，import 本身不会等待。API body 可通过可选 `sandboxID` 指定另一
   个 node-local target,但不会改变逻辑认证主体或既有 service credential。随后调用
   `connect` 即可异步恢复。
+- 省略 `--memory` 保留 token 的来源；`--memory=false` 永久只导入 E，包括来源为 S 的 token；
+  `--memory=true` 要求 S。客户端仅在显式指定时发送该字段。兼容性与失败行为见
+  [Import 选择表](#import-selection)；使用该选项需要服务端已支持。
 
 `--json` 输出完整的成功 Export API 响应；默认仍只打印一行 `result`（token 或
 TemplateID），发布进度不会进入 stdout。无效/尾随 JSON、被污染的 stdout、缺少 result
@@ -1124,9 +1172,11 @@ E/S 制品不携带它。Socket 期限、API/Proxy 等待、assignment 预算、
 Builder 总期限/步骤/readiness 保持各自职责。
 
 普通已接纳启动从 prepare、readiness 到 /init 跟随 attempt owner，不再隐式附加
-60 秒总期限。Sandbox bootstrap 版本 6 允许 `absolute_deadline_unix_nano` 为零或
-省略；正数是显式绝对截止，负数非法。共用 prepare summary 保持版本 5；
-Builder 版本 7、正数 work deadline 及结果上报预留不变。
+60 秒总期限。Sandbox bootstrap 版本 7 继续允许 `absolute_deadline_unix_nano` 为零或
+省略；正数是显式绝对截止，负数非法。版本 7 还要求首次 snp task 执行 runtime 准入。
+Conductor 与 sandbox runner 须部署配套版本；bootstrap 版本 6 会被拒绝，避免静默漏检。
+共用 prepare summary 保持版本 5；Builder 版本 7、正数 work deadline 及结果上报预留、
+cluster protocol 和 KMT V1 均不变。
 
 Manifest 打开复用 Sandboxer 的 `OpenManifestStream`/readretry，保留原 scoped
 fetcher、Bundle 身份和调用方 context。Builder 在自身 work deadline 内受益；

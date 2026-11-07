@@ -657,7 +657,7 @@ func TestExportMoveSameIDConflictUntilCleanupCompletes(t *testing.T) {
 			}
 			switch admission {
 			case "import":
-				if _, err := o.ImportSandbox(ctx, fixture.apiKey, result.Result, ""); !errors.Is(err, api.ErrAlreadyExists) {
+				if _, err := o.ImportSandbox(ctx, fixture.apiKey, result.Result, "", api.ImportOptions{}); !errors.Is(err, api.ErrAlreadyExists) {
 					t.Fatalf("import while deleting = %v", err)
 				}
 			case "create":
@@ -681,7 +681,7 @@ func TestExportMoveSameIDConflictUntilCleanupCompletes(t *testing.T) {
 			waitForExportDeletion(t, o, sb.ID)
 			switch admission {
 			case "import":
-				if id, err := o.ImportSandbox(ctx, fixture.apiKey, result.Result, ""); err != nil || id != sb.ID {
+				if id, err := o.ImportSandbox(ctx, fixture.apiKey, result.Result, "", api.ImportOptions{}); err != nil || id != sb.ID {
 					t.Fatalf("import after cleanup = %q, %v", id, err)
 				}
 				imported, err := o.st.Get(ctx, sb.ID)

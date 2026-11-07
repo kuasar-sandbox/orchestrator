@@ -94,7 +94,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 		t.Fatalf("move export retained source run directory: %v", err)
 	}
 	// Standalone import defaults to the source NodeSandboxID after a move.
-	imported, err := o.ImportSandbox(ctx, apiKey, tok, "")
+	imported, err := o.ImportSandbox(ctx, apiKey, tok, "", api.ImportOptions{})
 	if err != nil || imported != sid {
 		t.Fatalf("import: imported=%q err=%v", imported, err)
 	}
@@ -157,7 +157,7 @@ func TestArtifactKindRoundTripsThroughTemplateAndMigrationToken(t *testing.T) {
 				t.Fatal(err)
 			}
 			targetID := "target-" + test.name
-			if got, err := o.ImportSandbox(ctx, apiKey, token, targetID); err != nil || got != targetID {
+			if got, err := o.ImportSandbox(ctx, apiKey, token, targetID, api.ImportOptions{}); err != nil || got != targetID {
 				t.Fatalf("ImportSandbox = %q, %v", got, err)
 			}
 			imported, err := o.st.Get(ctx, targetID)
@@ -233,7 +233,7 @@ func TestMigrationTokenDoesNotMaterializeAbsentTrafficMetadata(t *testing.T) {
 	if _, present := payload.Metadata[sandboxcfg.NsTraffic]; present {
 		t.Fatalf("migration materialized absent traffic: %+v", payload.Metadata)
 	}
-	importedID, err := o.ImportSandbox(context.Background(), apiKey, token, "absent-traffic-target")
+	importedID, err := o.ImportSandbox(context.Background(), apiKey, token, "absent-traffic-target", api.ImportOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	}
 	targetCache := "64MiB"
 	o.cfg.Sandbox.Resources.DiffCOW = &config.ResourceDiffCOW{CacheSize: &targetCache}
-	targetID, err := o.ImportSandbox(context.Background(), apiKey, token, "target-resource")
+	targetID, err := o.ImportSandbox(context.Background(), apiKey, token, "target-resource", api.ImportOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 	}
 
 	targetID := "logical-g1"
-	gotID, err := o.ImportSandbox(ctx, apiKey, token, targetID)
+	gotID, err := o.ImportSandbox(ctx, apiKey, token, targetID, api.ImportOptions{})
 	if err != nil || gotID != targetID {
 		t.Fatalf("explicit import = %q, %v", gotID, err)
 	}
@@ -445,7 +445,7 @@ func TestImportRejectsLocationUnsafeStableID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := o.ImportSandbox(ctx, apiKey, token, "other-target"); err == nil ||
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "other-target", api.ImportOptions{}); err == nil ||
 		!errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "stable ID") {
 		t.Fatalf("import = %v, want a bad-request stable ID rejection", err)
 	}
@@ -465,14 +465,14 @@ func TestImportIsInsertOnlyAndMapsDuplicateToAlreadyExists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := o.ImportSandbox(ctx, apiKey, token, "target"); err != nil {
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "target", api.ImportOptions{}); err != nil {
 		t.Fatalf("first import: %v", err)
 	}
 	before, err := o.st.Get(ctx, "target")
 	if err != nil || before == nil {
 		t.Fatal(err)
 	}
-	if _, err := o.ImportSandbox(ctx, apiKey, token, "target"); !errors.Is(err, api.ErrAlreadyExists) {
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "target", api.ImportOptions{}); !errors.Is(err, api.ErrAlreadyExists) {
 		t.Fatalf("second import error = %v, want ErrAlreadyExists", err)
 	}
 	after, err := o.st.Get(ctx, "target")
@@ -511,7 +511,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 		Profile:       source.Profile,
 		RuntimeDigest: digest,
 		ResumeSource:  source.ResumeSource,
-	}, cluster, 0)
+	}, cluster, 0, api.ImportOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +531,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 	}
 }
 
-func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
+func TestImportRejectsTenantAndTrustedExpectationMismatch(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime-a"))
 	source := migrationSandbox(t, dir, "source", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
@@ -544,7 +544,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	t.Run("API secret", func(t *testing.T) {
 		wrong := pair
 		wrong.APISecret = strings.Repeat("1", 64)
-		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "api-mismatch", migrationtoken.Expectations{}, nil, 0)
+		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "api-mismatch", migrationtoken.Expectations{}, nil, 0, api.ImportOptions{})
 		if !errors.Is(err, migrationtoken.ErrCredentialMismatch) {
 			t.Fatalf("error = %v, want credential mismatch", err)
 		}
@@ -552,7 +552,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	t.Run("manifest key", func(t *testing.T) {
 		wrong := pair
 		wrong.ManifestKey = strings.Repeat("2", 64)
-		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "manifest-mismatch", migrationtoken.Expectations{}, nil, 0)
+		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "manifest-mismatch", migrationtoken.Expectations{}, nil, 0, api.ImportOptions{})
 		if !errors.Is(err, migrationtoken.ErrAuthentication) {
 			t.Fatalf("error = %v, want authentication failure", err)
 		}
@@ -573,7 +573,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil, 0)
+			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil, 0, api.ImportOptions{})
 			if !errors.Is(err, migrationtoken.ErrIncompatible) {
 				t.Fatalf("error = %v, want incompatible target", err)
 			}
@@ -583,8 +583,10 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	if err := os.WriteFile(o.runtimeFileFor(source.Profile), []byte("runtime-b"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := o.importSandboxWithKey(context.Background(), pair, token, "runtime-mismatch", migrationtoken.Expectations{}, nil, 0); !errors.Is(err, migrationtoken.ErrIncompatible) {
-		t.Fatalf("runtime mismatch error = %v, want incompatible target", err)
+	// The authenticated legacy whole-file hash does not describe S's runtime.
+	// This fixture's tenant admission helper independently accepts the source.
+	if _, err := o.importSandboxWithKey(context.Background(), pair, token, "runtime-changed", migrationtoken.Expectations{}, nil, 0, api.ImportOptions{}); err != nil {
+		t.Fatalf("legacy runtime hash incorrectly blocked import: %v", err)
 	}
 }
 
@@ -599,7 +601,7 @@ func TestImportRejectsInvalidExplicitTarget(t *testing.T) {
 	pair := store.KeyPair{APISecret: source.APISecret, ManifestKey: source.ManifestKey}
 	for _, target := range []string{"UPPER", "has/slash", "-prefix", "suffix-", strings.Repeat("a", 58)} {
 		t.Run(target, func(t *testing.T) {
-			if _, err := o.importSandboxWithKey(context.Background(), pair, token, target, migrationtoken.Expectations{}, nil, 0); err == nil ||
+			if _, err := o.importSandboxWithKey(context.Background(), pair, token, target, migrationtoken.Expectations{}, nil, 0, api.ImportOptions{}); err == nil ||
 				!strings.Contains(err.Error(), "invalid target sandbox ID") {
 				t.Fatalf("target %q error = %v", target, err)
 			}

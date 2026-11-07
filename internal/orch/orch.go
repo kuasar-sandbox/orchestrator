@@ -1678,7 +1678,7 @@ func (o *Orchestrator) resolveSnapshotPolicy(metadata map[string]string, actionO
 }
 
 func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, options api.ConnectOptions) (*types.Sandbox, error) {
-	_, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
+	_, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken, api.ImportOptions{Memory: options.Memory})
 	if err != nil {
 		return nil, err
 	}
@@ -1718,7 +1718,7 @@ func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migratio
 	if len(migrationToken) > migrationtoken.MaxWireSize {
 		return nil, migrationtoken.ErrTokenTooLarge
 	}
-	if _, err := o.prepareStandaloneTargetWithMMDS(ctx, id, apiKey, migrationToken, metadata, header); err != nil {
+	if _, err := o.prepareStandaloneTargetWithMMDS(ctx, id, apiKey, migrationToken, metadata, header, api.ImportOptions{Memory: options.Memory}); err != nil {
 		return nil, err
 	}
 	var requestedDeadline *int64
@@ -1746,7 +1746,7 @@ func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migratio
 // authenticates a standalone API operation target. Callers perform their own
 // operation-specific result preparation before scheduling an asynchronous
 // resume.
-func (o *Orchestrator) prepareStandaloneTarget(ctx context.Context, id, apiKey, migrationToken string) (*types.Sandbox, error) {
+func (o *Orchestrator) prepareStandaloneTarget(ctx context.Context, id, apiKey, migrationToken string, options api.ImportOptions) (*types.Sandbox, error) {
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -1754,10 +1754,10 @@ func (o *Orchestrator) prepareStandaloneTarget(ctx context.Context, id, apiKey, 
 	// Auto-migrate: connecting to a sandbox absent on this node with a migration
 	// token (api_headers X-Kuasar-Migration-Token) imports it (paused row) then
 	// schedules an asynchronous resume. ImportSandbox checks the tenant key,
-	// token fingerprints, runtime digest, and exact caller-selected target ID.
+	// token fingerprints, selected source compatibility, and exact target ID.
 	// An existing target ignores the token completely, including malformed input.
 	if sb == nil && migrationToken != "" {
-		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken, id)
+		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken, id, options)
 		if ierr != nil {
 			if !errors.Is(ierr, api.ErrAlreadyExists) {
 				return nil, ierr
@@ -2457,6 +2457,13 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		RelativeDir:              checkpointDir,
 		MaxRefs:                  maxRequiredArtifactRefs,
 		AbsoluteDeadlineUnixNano: deadlineUnixNano,
+	}
+	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindSnp && sb.LaunchMode == types.LaunchMemory {
+		runtimePath, err := filepath.Abs(o.runtimeFileFor(tmpl.Profile))
+		if err != nil {
+			return nil, false, fmt.Errorf("orch: absolute runtime path: %w", err)
+		}
+		response.Prepare.SnapshotRuntime = "file://" + runtimePath
 	}
 	return response, true, nil
 }

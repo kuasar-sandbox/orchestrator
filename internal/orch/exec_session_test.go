@@ -225,8 +225,7 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Keep the migration snapshot probe local and deterministic.
-	t.Setenv("PATH", t.TempDir())
+	// Model synchronous tenant runtime admission independently of launch.
 
 	cfg := &config.Config{}
 	cfg.Sandbox.Boot.Runtime = runtimePath
@@ -234,6 +233,7 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 	startGate := make(chan struct{})
 	lc := &countingLauncher{started: started, startGate: startGate}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	installSnapshotRuntimeAdmissionStub(t, o, "compatible")
 
 	manifestKey := strings.Repeat("c", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)

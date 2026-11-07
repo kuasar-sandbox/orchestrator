@@ -70,6 +70,8 @@ func main() {
 		err = runBuilder(os.Args[2:], log)
 	case "config":
 		err = configCmd(os.Args[2:], log)
+	case "check-snapshot-runtime":
+		err = checkSnapshotRuntimeCmd(os.Stdin, os.Stdout)
 	case "checkpoint-cleanup":
 		err = checkpointCleanupCmd(os.Args[2:])
 	case "manifest-key":

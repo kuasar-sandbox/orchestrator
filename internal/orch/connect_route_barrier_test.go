@@ -36,6 +36,7 @@ type connectRouteResult struct {
 
 func TestConnectWithMMDSImportWaitsForProxyRouteApplication(t *testing.T) {
 	f := newBlockedResumeFixture(t)
+	installSnapshotRuntimeAdmissionStub(t, f.o, "compatible")
 	runtimePath := filepath.Join(t.TempDir(), "runtime.erofs")
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
 		t.Fatal(err)

@@ -12,10 +12,10 @@ import (
 // runners cannot complete this protocol.
 const ArtifactPrepareSchemaVersion = 5
 
-// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 6
-// accepts an omitted/zero prepare deadline as following the task owner.
+// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 7
+// requires fresh Snapshot creates to check their source runtime in the tenant task.
 // ArtifactPrepareSummary and Builder retain their independent versions.
-const SandboxBootstrapVersion = 6
+const SandboxBootstrapVersion = 7
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -40,6 +40,9 @@ type ArtifactPrepareSpec struct {
 	RelativeDir           string `json:"relative_dir,omitempty"`
 	MaxRefs               int    `json:"max_refs"`
 	ReadSourceImageConfig bool   `json:"read_source_image_config,omitempty"`
+	// SnapshotRuntime is set only for an initial snp Create. Existing resumes
+	// rely on restore's runtime checks; imports check before insertion.
+	SnapshotRuntime string `json:"snapshot_runtime,omitempty"`
 	// PreflightImageBundle is Build-only. It verifies the named-location image
 	// Bundle configuration, task customer key, and write admission before the
 	// source E/S carrier or its image is scanned.

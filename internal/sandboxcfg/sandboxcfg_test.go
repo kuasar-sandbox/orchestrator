@@ -644,6 +644,9 @@ func TestGeneratedSnapshotHostConfigSatisfiesApplyRestoreRules(t *testing.T) {
 			t.Fatalf("Snapshot host renderer emitted immutable %s:\n%s", field, body)
 		}
 	}
+	if presence.Has("boot.kernel") || host.Boot.Kernel != "" || host.Boot.Runtime != "file://"+p.Runtime {
+		t.Fatalf("memory restore must omit kernel and keep target runtime candidate:\n%s", body)
+	}
 	runtime, c0, err := rtconfig.ApplyRestoreRules(rendererPortableConfig(), host, presence)
 	if err != nil {
 		t.Fatalf("ApplyRestoreRules rejected generated config: %v\n%s", err, body)
