@@ -189,7 +189,7 @@ node resource policy
   < portable artifact capacity constraint
 ```
 
-Each resource leaf overlays independently. For example, group capacity.memory and Create allocatable.memory both survive. Every layer is validated before merging. Group/reserve, standalone/cluster and Build registration share the helper. Other namespaces follow their own rules below.
+Each resource leaf overlays independently. For example, group capacity.memory and Create allocatable.memory both survive. Every layer is validated before merging. Group/reserve, standalone/cluster and Build registration share the helper. Other namespaces follow the rules in [Sandbox configuration propagation](sandbox-lifecycle.md#request-configuration).
 
 `X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` gives the sandbox a 32 MiB dirty limit when the node has omitted it. Use `"max_dirty_size":"16MiB"` inside `diff_cow` to set it explicitly. Sizes must be positive multiples of 4 KiB. Raw policy, request metadata and migration tokens retain only configured leaves. Restore resolves cache limits on the target node independently of portable artifact capacity. Build execution inherits the node policy, and the target Sandbox also applies the target request.
 
@@ -652,8 +652,8 @@ cluster-create rejection mode. NodeList has no dynamic zone fields or aliases.
 A failure round is a time-progressed recheck of the same valid demand and
 launch/token identity. Concurrent duplicates, credential/shape errors,
 impossible capacity, drain, transport failures, and startup-slot/rate-token
-waits do not count. Three qualified rounds enter critical; three further
-rounds authorize one Pause. Another Pause needs fresh rounds. Reservation
+waits do not count. With the default `critical_after_rounds` and `pause_after_rounds`, three qualified
+rounds enter critical and three further rounds authorize one Pause. Another Pause needs fresh rounds. Reservation
 increments that do not increase sandboxer's executable Budget retain the
 still-blocked demand and protection for its next executable step.
 Demand freshness is independent of polling: its bounded
@@ -975,7 +975,14 @@ The controller does not read the old persistent state schema or reconstruct gues
 
 ### Reservation lifecycle
 
-Startup TTL cleans failed creations that never reached Settled. Heartbeat timeout, Release and inventory cleanup atomically remove indices/aggregate charge by reservation identity/token. Unknown or provisional reservations cannot use ordinary growth transactions.
+Startup TTL marks an unfinished startup as `startup_expired`; it is not permission
+to release a live consumer's charge. The sweeper retains the reservation while a
+connection is live or inventory finds a locked lease/managed pidfile or populated
+cgroup. Non-disappearance inspection errors also retain the charge conservatively.
+Only an expired startup or stale disconnected heartbeat whose consumer is gone
+can be swept. Confirmed Release and eligible cleanup remove indices and aggregate
+charge atomically by reservation identity/token. Unknown or provisional
+reservations cannot use ordinary growth transactions.
 
 <a id="performance"></a>
 

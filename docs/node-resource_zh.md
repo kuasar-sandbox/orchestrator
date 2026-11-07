@@ -107,6 +107,11 @@ located来源mapping,但不会打开或递归扫描refs Bundle。task把 Capacit
 和 VM 启动前,并且绝不回退 node default。`BudgetAtSnapshot` 仍由 sandboxer 从 CH
 snapshot target/current 计算,不由 orchestrator probe 或推导。
 
+公共配置 `ResourceAllocatable.Memory` 以 `*string` 保留存在性：nil 继承内部 resolver 的
+`256MiB` 默认值；非 nil（包括显式 `256MiB`）属于 operator/custom Configure 策略，
+必须适配最终 Capacity。`SetMemory`/`InheritMemory` 是便捷方法，直接赋指针具有相同
+语义。Clone 与 component bootstrap JSON 均保留这种存在性。
+
 <a id="resource_listen"></a>
 
 ### resource_listen
@@ -230,7 +235,7 @@ node resource policy
 
 各个叶子独立合并。group 只设 `capacity.memory`、create 只设
 `allocatable.memory` 时两者同时保留。Build row metadata 不是 Create overlay 层。其它
-namespace 遵循下文各自的合并规则，多数采用 whole-namespace 覆盖。每一层都先
+namespace 遵循[Sandbox 配置透传](sandbox-lifecycle_zh.md#request-configuration)中的各自规则，多数采用 whole-namespace 覆盖。每一层都先
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
 
@@ -933,9 +938,12 @@ controller 不读取旧持久化 state schema,也不从 memory.current 重建 Gu
 
 ### reservation 生命周期
 
-startup TTL 只清理未达到 Settled 的失败创建。heartbeat timeout、release 和 inventory
-清理均按 reservation identity/token 原子删除索引与 aggregate。未知或 provisional
-reservation 不接受普通 grow transaction。
+startup TTL 将未完成启动标记为 `startup_expired`，不授权释放存活消费者的占账。
+只要连接仍活跃，或 inventory 发现 locked lease/managed pidfile、populated cgroup，
+sweeper 就保留 reservation。检查出错且不能确认为对象已消失时，也保守保留占账。
+只有启动已过期或断连 heartbeat 已陈旧、且消费者确认消失，才可被 sweeper 清理。
+已确认的 Release 与符合条件的清理按 reservation identity/token 原子删除索引和
+aggregate charge。未知或 provisional reservation 不接受普通 grow transaction。
 
 <a id="performance"></a>
 
