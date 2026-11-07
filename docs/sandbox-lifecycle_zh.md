@@ -414,7 +414,8 @@ UUID 生成失败时尚不启动捕获命令；没有再次捕获的重复请求
 I/O、空间不足、损坏或报告不完整都不能触发降级。新启动必须支持已启用的模式。
 部署需使用包含 [sandboxer #336](https://github.com/kuasar-sandbox/sandboxer/pull/336)
 的匹配源码和二进制（`7cd3ed4c5a8807b75b175bdb845867effb1c5018` 或后继版本）；
-`go.mod` replacement 实际选择的兄弟模块也是这一要求的一部分。
+实际选定的 Sandboxer SDK 模块也必须匹配。单仓构建使用 `go.mod` 中提交的版本；
+协同构建通过显式 Go workspace 选择本地模块（[构建与测试](../CONTRIBUTING_zh.md#构建与测试)）。
 
 Task-local Open、Clone、Validate 保留 Checkpoint 布局。即使普通 active-base 字段为空，
 根盘和数据盘也已有活动内容，因此预检不注入空白盘。普通直接 EROFS 来源仍需准备可写 upper。
