@@ -64,7 +64,7 @@ typed stale fallback 路径需要 registry:
    reconcile。conductor 进程重启可接管仍存活的 unit，不能把两者写成无条件清空持久行或自动重建全部旧 sandbox；见 [状态所有权与灾备边界](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry 可靠性](#registry-reliability)。
 7. **placer 不拥有生命周期**:placer 只做 group 导入、selector patch、shuffle-sharding、P2C 与 Place
    建议。node owner 检查当前连接与 usage；Build 注册最终准入由 node 的 durable transaction 决定。
-8. **router 不订阅海量 group**:create/data Reserve 返回 READY 或失败;connect/exec-session
+8. **router 不订阅海量 group**:create Reserve 返回 READY 或失败;data Reserve 也可返回 PAUSING;connect/exec-session
    Reserve 在 node 同步准备完成后返回,不等待异步 resume.router 只维护有界 route cache;
    在途请求不作为新请求的路由来源.
 
@@ -122,6 +122,10 @@ Reserve operation;数据面 cache miss 先 Resolve.RouteResolve 同时返回 `AP
 ```python
 import os, uuid
 from e2b import Sandbox
+
+if not __debug__:
+    raise RuntimeError("Run this recipe without Python optimization (-O/-OO or PYTHONOPTIMIZE).")
+
 headers = {
     "X-Kuasar-Sandbox-Group": os.environ["KUASAR_GROUP"],
     "X-Kuasar-Route-Key": str(uuid.uuid4()),
@@ -1982,9 +1986,9 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
   `X-Access-Token`,exec 另携
   `E2b-Sandbox-Service: exec`.Registry 对普通目标按 profile/端口选择 EnvdAccessToken
   或 ForwardAccessToken;exec 则以 `StableID + ServiceSecret` 验证 KAT.
-  鉴权在任何 route CAS/CmdConnect 之前完成.READY 直接返回;
+  鉴权在任何 route CAS/CmdConnect 之前完成.READY 或 PAUSING 直接返回;
   PAUSED 先 CAS RESERVED 并下发 CmdConnect;RESERVED 等待当前稳定 lineage 的事件。只在获得
-  READY 且 DataEndpoint 有效时返回 `Route`。不存在的 route 直接返回 not found,不创建
+  READY 或 PAUSING 且 DataEndpoint 有效时返回 `Route`。不存在的 route 直接返回 not found,不创建
   sandbox。
 
 `Route` 是受保护结果,同时携稳定 SandboxID,当前 NodeSandboxID,`APIEndpoint`,
@@ -2097,7 +2101,7 @@ flowchart TD
 #### 原则
 
 1. **每个请求必须有 group**:`X-Kuasar-Sandbox-Group` 是 cluster 控制面和数据面的分片依据。
-2. **Reserve 操作显式分类**:create/data 只在 READY 时返回;connect/exec-session 在 node
+2. **Reserve 操作显式分类**:create 只在 READY 时返回;data 也可返回 PAUSING;connect/exec-session 在 node
    同步准备并返回 typed result 后完成,不等待异步 resume.router 不订阅 route watch.
 3. **热路径优先使用 route cache**:近期解析且具有 node target 的 route 命中时,无论
    ready/paused/starting,新请求都不触发 Resolve/Reserve;
@@ -2313,13 +2317,13 @@ node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/bu
 registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
 build execution、node ref、admission 或本机 checkpoint。节点虽持久化 cluster sandbox 的独立系统上下文,
 但当前 node-link full report 不回传 Registry-owned identity;registry 执行 shard 完全丢失时不能仅靠 route event
-重建 ownership,也不能预装 ownership 让旧事件看似合法。这条显式 recovery/bootstrap 协议尚未实现,由
-[issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 跟踪;当前不得用手工写入执行 row 规避该限制。
+重建 ownership,也不能预装 ownership 让旧事件看似合法。这条显式 recovery/bootstrap 协议尚未实现;
+[issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 是以 not planned 关闭的历史提案,不是可用恢复步骤;当前不得用手工写入执行 row 规避该限制。
 
-可移植 paused sandbox 的灾备对象是带 migration token 的**未绑定持久 route**,不是 SandboxRecord。
-它不携带旧 SID/NodeID/admission,恢复时重新 placement,由目标 node 校验 remote snapshot 后创建新身份,
-READY 上报才建立运行态 route。该 recovery-only workflow 由
-[issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪,不挂载在正常 route_link API。
+以 not planned 关闭的历史提案 [issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33)
+曾将带 migration token 的**未绑定持久 route**设计为可移植 paused sandbox 的灾备对象,而不是 SandboxRecord。
+该设计不携带旧 SID/NodeID/admission,拟重新 placement,由目标 node 校验 remote snapshot 并创建新身份,
+再由 READY 上报建立运行态 route。此 recovery-only workflow 尚未实现,正常 route_link API 不提供该能力。
 
 Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 E-only 或精确 S/E 对，
 其中可以使用 Bundle ref。保留 S 的 Import 只在租户 helper 中读取 S 与关联 E 元数据进行 runtime
@@ -2330,7 +2334,7 @@ Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 
 Bundle 及其无 location sibling，带 location 的外部依赖保持原地址。
 
 sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/provider 自己的持久化和灾备流程负责。
-在 #33/#34 完成前,完整 registry 执行态丢失没有 operator runtime import 兜底;系统必须明确报告不可恢复,
+当前协议对完整 registry 执行态丢失没有 operator runtime import 兜底;#33/#34 是历史提案,不是实现承诺;系统必须明确报告不可恢复,
 而不是构造可能与节点冲突的 route/build ownership。
 
 <a id="registry-reliability"></a>
@@ -2346,9 +2350,9 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 | node 整机重启 | 运行进程丢失。SQLite/artifact 保留时仍 reconcile paused row、已接纳的中断 restore、cleanup owner 和保留的 Build；缺失执行经节点上报/exact route 清理收敛，不无条件删除全部 durable row 或自动重建全部旧 sandbox |
 | registry 单成员故障 | owner set quorum 足够时继续服务；恢复后由同 shard 访问或事实源上报触发 read-repair；单 owner 部署不能容忍其 owner 丢失 |
 | registry 多成员故障导致 quorum 不足 | 对应 shard 停写,不降级乱写 |
-| registry 执行 shard 全失但 node 存活 | 不导入备份执行 row；需要显式 recovery/bootstrap 协议按 node 持久事实重建投影（#34，当前未实现） |
+| registry 执行 shard 全失但 node 存活 | 不导入备份执行 row；按 node 持久事实重建投影所需的 recovery/bootstrap 协议不可用（#34 是未实现的历史提案） |
 | membership 变更 | active/next joint 写 quorum + old_grace read-only 证书/快照来源 |
-| 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。Registry 执行态丢失时，灾备输入是 provider 数据、portable template/manifest 和未来 migration-token route（#33），不是执行 row import |
+| 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。provider 数据与 portable template/manifest 仍可复用，但不能恢复丢失的 Registry 执行归属。migration-token route 恢复（#33）是未实现的历史提案，不是执行 row import 或可用兜底 |
 
 <a id="registry-performance"></a>
 
