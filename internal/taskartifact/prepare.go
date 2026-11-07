@@ -99,6 +99,9 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	if err := validateRequest(sourceKind, spec.RootRef, launchMode); err != nil {
 		return nil, err
 	}
+	if spec.SnapshotRuntime != "" && (sourceKind != types.ResumeSourceSnapshot || launchMode != types.LaunchMemory) {
+		return nil, errors.New("task artifact prepare: runtime admission requires a memory Snapshot create")
+	}
 	maxRefs := spec.MaxRefs
 	if maxRefs == 0 {
 		maxRefs = DefaultMaxRefs
@@ -214,6 +217,11 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 				closeErr = fmt.Errorf("task artifact prepare: close Snapshot reader: %w", closeErr)
 			}
 			return nil, errors.Join(readErr, closeErr)
+		}
+		if spec.SnapshotRuntime != "" {
+			if _, err := restore.ResolveRuntimeBinding(ctx, spec.SnapshotRuntime, document.Config.Boot.RuntimeRef); err != nil {
+				return nil, fmt.Errorf("task artifact prepare: Snapshot runtime: %w", err)
+			}
 		}
 		selectedSandbox := document.SandboxRef
 		rootSource.SandboxRef, err = pairedSandboxIdentity(spec.RootRef, selectedSandbox, spec.RelativeDir, pathLocations)

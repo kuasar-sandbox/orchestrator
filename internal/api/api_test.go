@@ -1923,7 +1923,7 @@ func TestFailExecSessionMapsStaleExtensionResult(t *testing.T) {
 	}
 }
 
-func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
+func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string, options ImportOptions) (string, error) {
 	return c.importSandbox(ctx, apiKey, token, targetID)
 }
 

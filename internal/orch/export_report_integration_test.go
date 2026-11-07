@@ -136,7 +136,7 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 							if err != nil || original.ResumeSource != sb.ResumeSource {
 								t.Fatalf("local keep-source changed S0/E0: %+v %v", original, err)
 							}
-							if _, err := o.ImportSandbox(ctx, apiKey, initial.Result, "report-imported"); err != nil {
+							if _, err := o.ImportSandbox(ctx, apiKey, initial.Result, "report-imported", api.ImportOptions{}); err != nil {
 								t.Fatal(err)
 							}
 							sid = "report-imported"

@@ -663,9 +663,7 @@ func TestPrepareClusterConnectRejectsTokenMismatchBeforeInsert(t *testing.T) {
 			return migrationtoken.ErrCredentialMismatch
 		},
 		"runtime": func(t *testing.T, fixture *clusterConnectFixture, _ *routesync.Command) error {
-			if err := os.WriteFile(fixture.o.runtimeFileFor(types.ProfileE2B), []byte("different-runtime"), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			installSnapshotRuntimeAdmissionStub(t, fixture.o, "incompatible")
 			return migrationtoken.ErrIncompatible
 		},
 	} {

@@ -27,6 +27,7 @@ func mmdsMigrationFixture(t *testing.T) (*Orchestrator, string, string, *types.S
 	cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	o := testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
+	installSnapshotRuntimeAdmissionStub(t, o, "compatible")
 	manifestKey := strings.Repeat("6", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
 	if _, err := o.st.AddKeyPair(context.Background(), store.KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, "", 0, ""); err != nil {
@@ -44,7 +45,7 @@ func mmdsMigrationFixture(t *testing.T) (*Orchestrator, string, string, *types.S
 func TestStandaloneImportUsesTokenRoutesAndRequestSecretsOnly(t *testing.T) {
 	o, _, apiKey, _, token := mmdsMigrationFixture(t)
 	header := `{"secrets":{"key":"import-value"}}`
-	target, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, map[string]string{"ordinary": "ignored"}, &header)
+	target, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, map[string]string{"ordinary": "ignored"}, &header, api.ImportOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestStandaloneImportRejectsAnyRequestRoutesKey(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			o, _, apiKey, _, token := mmdsMigrationFixture(t)
-			_, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, tt.metadata, tt.header)
+			_, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, tt.metadata, tt.header, api.ImportOptions{})
 			if !errors.Is(err, api.ErrBadRequest) {
 				t.Fatalf("error = %v", err)
 			}
@@ -89,7 +90,7 @@ func TestStandaloneImportRejectsAnyRequestRoutesKey(t *testing.T) {
 func TestStandaloneImportFailureLeavesNoSecretRow(t *testing.T) {
 	o, _, apiKey, _, token := mmdsMigrationFixture(t)
 	header := `{"secrets":{"undeclared":"value"}}`
-	if _, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, nil, &header); !errors.Is(err, api.ErrBadRequest) {
+	if _, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, nil, &header, api.ImportOptions{}); !errors.Is(err, api.ErrBadRequest) {
 		t.Fatalf("error = %v", err)
 	}
 	if target, err := o.st.Get(context.Background(), "target"); err != nil || target != nil {
@@ -107,7 +108,7 @@ func TestStandaloneImportRejectsInvalidTokenRoutesWithoutRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, nil, nil); !errors.Is(err, migrationtoken.ErrInvalidPayload) {
+	if _, err := o.prepareStandaloneTargetWithMMDS(context.Background(), "target", apiKey, token, nil, nil, api.ImportOptions{}); !errors.Is(err, migrationtoken.ErrInvalidPayload) {
 		t.Fatalf("error = %v", err)
 	}
 	if target, err := o.st.Get(context.Background(), "target"); err != nil || target != nil {
@@ -118,7 +119,7 @@ func TestStandaloneImportRejectsInvalidTokenRoutesWithoutRows(t *testing.T) {
 func TestImportSandboxValidatesTokenRoutesAgainstTargetPolicy(t *testing.T) {
 	o, _, apiKey, _, token := mmdsMigrationFixture(t)
 	o.cfg.MMDS.Routes.Enabled = false
-	if _, err := o.ImportSandbox(context.Background(), apiKey, token, "target"); !errors.Is(err, migrationtoken.ErrInvalidPayload) {
+	if _, err := o.ImportSandbox(context.Background(), apiKey, token, "target", api.ImportOptions{}); !errors.Is(err, migrationtoken.ErrInvalidPayload) {
 		t.Fatalf("error = %v", err)
 	}
 	if target, err := o.st.Get(context.Background(), "target"); err != nil || target != nil {

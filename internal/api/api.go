@@ -363,6 +363,12 @@ type PauseRequest struct {
 	CheckpointDropCaches *bool      `json:"checkpoint_drop_caches,omitempty"`
 }
 
+// ImportOptions selects the durable state kept by a newly imported target.
+// Nil preserves the token source; false selects E-only; true requires S.
+type ImportOptions struct {
+	Memory *bool `json:"memory,omitempty"`
+}
+
 type ConnectOptions struct {
 	TimeoutSec int
 	Memory     *bool
@@ -420,7 +426,7 @@ type Core interface {
 	// successful export consumes that capture and leaves the parent intact.
 	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool, checkpointID string) (types.ExportResult, error)
 	DeleteCheckpoint(ctx context.Context, apiKey, sid, checkpointID string) error
-	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
+	ImportSandbox(ctx context.Context, apiKey, token, targetID string, options ImportOptions) (string, error)
 }
 
 // ConnectMMDSCore is the standalone-only extension for migration-time initial
@@ -1308,6 +1314,7 @@ func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token     string `json:"token"`
 		SandboxID string `json:"sandboxID"`
+		Memory    *bool  `json:"memory,omitempty"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&body)
@@ -1338,7 +1345,7 @@ func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error())
 		return
 	}
-	id, err := a.core.ImportSandbox(r.Context(), apiKeyFrom(r.Context()), body.Token, body.SandboxID)
+	id, err := a.core.ImportSandbox(r.Context(), apiKeyFrom(r.Context()), body.Token, body.SandboxID, ImportOptions{Memory: body.Memory})
 	if err != nil {
 		if errors.Is(err, migrationtoken.ErrTokenTooLarge) {
 			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())

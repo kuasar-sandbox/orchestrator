@@ -16,6 +16,12 @@ func installExportCheckpointCleanup(t *testing.T) {
 	dir := t.TempDir()
 	const script = `#!/bin/sh
 set -eu
+if [ "$1" = check-snapshot-runtime ]; then
+  [ "${#MANIFEST_KEY}" = 64 ]
+  /bin/cat >/dev/null
+  printf '%s\n' '{"status":"compatible"}'
+  exit 0
+fi
 [ "$1" = checkpoint-cleanup ] || exit 64
 shift
 sid= pathid= base= from=

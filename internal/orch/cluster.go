@@ -933,6 +933,7 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 		migrationtoken.Expectations{StableID: stableID, Profile: profile},
 		&types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
 		requestedDeadline,
+		api.ImportOptions{Memory: cmd.Memory},
 	)
 	if err != nil {
 		if !errors.Is(err, api.ErrAlreadyExists) {

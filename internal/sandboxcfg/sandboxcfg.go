@@ -402,7 +402,7 @@ type hostActiveDiskConfig struct {
 }
 
 type hostBootConfig struct {
-	Kernel  string                 `yaml:"kernel"`
+	Kernel  string                 `yaml:"kernel,omitempty"`
 	Runtime string                 `yaml:"runtime"`
 	Root    hostActiveRootConfig   `yaml:"root"`
 	Disks   []hostActiveDiskConfig `yaml:"disks,omitempty"`
@@ -558,7 +558,8 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 	}
 	// A new Sandbox-template Create may intentionally persist request launch,
 	// env, files, init, mounts, and metadata into the next C1. A resume from a
-	// durable paused source keeps E's C0 authoritative and emits none of them.
+	// durable paused source keeps E's workload fields and emits none of them.
+	// Cold boot still selects the target kernel/runtime and derives a new C0.
 	freshTemplateCreate := p.Sandbox.ResumeSource.Empty() && p.Template.Kind == types.KindSbx
 	if freshTemplateCreate {
 		launchContainer := &rtconfig.SandboxConfig{}
@@ -592,6 +593,9 @@ func (p Params) BuildSnapshotHostConfig() (*SnapshotHostConfig, error) {
 	// cold-mount policy in Params and leave durable request metadata intact for
 	// later cold launches, but do not pass it as a restore-time mount override.
 	resources.DiffCOW.Discard = ""
+	// The kernel is already captured in S. Runtime stays a host candidate; the
+	// restore selector resolves the identity required by the paired E.
+	boot.Kernel = ""
 	return &SnapshotHostConfig{
 		Resources: resources,
 		Timeouts:  p.Timeouts,

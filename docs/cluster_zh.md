@@ -1738,11 +1738,17 @@ import、鉴权/签名及同一 resume acceptance。
   | 命令 | 节点动作 |
   |---|---|
   | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster, auto_reset?}` | 冷启 `template_ref` + 保存/合并 `config`([生命周期与状态机](sandbox-lifecycle_zh.md#state-and-ownership);snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt、成功的 route/lease barrier |
-  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?, memory?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成旧 runner/network/RunDir 清理，并在 paused→starting acceptance 中恢复 canonical RunDir/UDS、持久化 deadline 与 resolved launch mode；`memory?` 保留 omitted/null/false/true 三态选择（[Resume admission、Connect 与 Wake](sandbox-lifecycle_zh.md#resume)）。Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
+  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?, memory?}` | `sid` 是 NodeSandboxID。target 已存在时忽略 token，校验完整指纹、profile 和 cluster context；对已有 paused S 的 false 是保留持久来源的一次 cold 尝试。target 缺失且带 KMT1 时，同步认证原始对并以命令 sid/context insert paused 行：false 永久选择 E-only；omitted/null 保留 token 来源；true 要求 S。随后用同一 selector 解析 ResumeMode（[Import 选择](sandbox-lifecycle_zh.md#import-selection)）。Ack 前完成旧 runner/network/RunDir 清理，并在 paused→starting acceptance 中恢复 canonical RunDir/UDS、持久化 deadline 与 resolved launch mode。Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint；restore 异步，缺失且无 token 则拒绝 |
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致;Ack 仍只表示 exact owner 已持久转为 `deleting`,不等待 node-local finalizer 完成;deleting 管理 Upsert 在 Ack 返回前发布，业务路由撤销不是 cleanup 完成证明;pending 重放幂等([进程管理(systemd 模板单元,启动时自动生成安装)](node_zh.md#systemd-pools) kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰([密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model));registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | `config.builder.target` 是 canonical register-only requested target，参与 replay digest/node validation；节点以同一 canonical Build.Resources 做最终、事务化 registration admission。最终 Sandbox Create 配置/resources、build-only options 与 cluster group 分开持久化；A/B resources 不从 target Sandbox resources 推导。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
+
+保留 S 的自动 Import 在插入/Ack 前读取 S 与关联 E 元数据并检查 runtime 兼容性。节点本地
+四秒 context 覆盖该检查与插入，caller 更早取消时提前结束；helper 管道收尾另有最多 250 ms。
+Registry 的五秒 Ack 等待不会取消 node-link stream，因此不能充当检查时限。检查失败不插入
+目标。新 E-only 导入在冷启动失败后仍为 E；本地已有 S 仍保留 S。并发插入的胜者保持权威。
+这些规则属于已选节点的准入，不改变 placement 或重试协议。
 
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md [命令行接口](node-resource_zh.md#resource-command) 的 resource drain 或本机维护策略),
 集群侧只停止向其分配。
@@ -1946,8 +1952,9 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
 - `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;body 只允许可选 `memory`，不允许 config/auto_pause_memory，selector 原样进入 CmdConnect；Header 携 `X-API-KEY`,可选
   `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
   对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
-  排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、可选
-  import、旧 runner/network/RunDir ownership 清理、paused→starting 时恢复 canonical RunDir/UDS、
+  排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、按同一 memory
+  selector 可选 import（新目标的 false 永久选择 E-only）、旧 runner/network/RunDir ownership 清理、
+  paused→starting 时恢复 canonical RunDir/UDS、
   deadline 持久化和凭据读取,Ack
   返回 typed `ConnectResult`;Registry 校验其
   NodeSandboxID/TemplateID/Profile/三项公开 token 与 route 一致后返回 `Route + Connect`。
@@ -2316,11 +2323,13 @@ build execution、node ref、admission 或本机 checkpoint。节点虽持久化
 READY 上报才建立运行态 route。该 recovery-only workflow 由
 [issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪,不挂载在正常 route_link API。
 
-Manifest Bundle不改变migration token/KMT wire:token仍只携根Bundle ref。目标node的task-local
-preflight只读根Bundle的连续metadata prefix,从平面 `bundle/refs` 收集located来源并用
-`checkpoint.remote.ref_location_parent`确定性派生完整mapping;同目录sibling无需mapping,
-被引用Bundle不会在编排层打开或递归扫描。export/promote继续委托sandboxer原样发布根Bundle及
-其无location sibling,带location的外部依赖保持原地址。
+Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 E-only 或精确 S/E 对，
+其中可以使用 Bundle ref。保留 S 的 Import 只在租户 helper 中读取 S 与关联 E 元数据进行 runtime
+准入。目标 node 的 task-local launch preflight 读取根 Bundle 的连续 metadata prefix，从平面
+`bundle/refs` 收集本次选定启动所需的 located 来源，并用 `checkpoint.remote.ref_location_parent`
+确定性派生 mapping；同目录 sibling 无需 mapping，cold 选择不依赖仅用于内存的 closure。
+共享 Conductor 不打开或递归扫描被引用 Bundle。export/promote 继续委托 sandboxer 原样发布根
+Bundle 及其无 location sibling，带 location 的外部依赖保持原地址。
 
 sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/provider 自己的持久化和灾备流程负责。
 在 #33/#34 完成前,完整 registry 执行态丢失没有 operator runtime import 兜底;系统必须明确报告不可恢复,
