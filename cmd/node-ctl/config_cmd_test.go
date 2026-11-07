@@ -239,7 +239,7 @@ func TestRenderConductorConfigNormalizesNestedResourceDefaults(t *testing.T) {
 api: { domain: config.test }
 encryption_key: test-key
 sandbox:
-  resources: { diff_cow: { cache_size: 64MiB } }
+  resources: { diff_cow: { cache_size: 64MiB, discard: manual } }
   boot: { kernel: /kernel, runtime: /runtime }
 `)
 	out, err := renderConductorConfig(false, false, path)
@@ -257,7 +257,7 @@ sandbox:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cow := decoded.Sandbox.Resources.DiffCOW; cow == nil || cow.CacheSize == nil || *cow.CacheSize != "64MiB" || cow.MaxDirtySize != nil {
+	if cow := decoded.Sandbox.Resources.DiffCOW; cow == nil || cow.CacheSize == nil || *cow.CacheSize != "64MiB" || cow.MaxDirtySize != nil || cow.Discard == nil || *cow.Discard != "manual" {
 		t.Fatalf("render/read changed DiffCOW presence: %+v", cow)
 	}
 	for _, want := range []string{

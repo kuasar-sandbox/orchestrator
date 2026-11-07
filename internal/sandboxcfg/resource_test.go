@@ -50,8 +50,53 @@ func TestDiffCOWResourceResolution(t *testing.T) {
 	}
 }
 
+func TestDiffCOWDiscardPolicyResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name, node, request, want string
+	}{
+		{"default", "", `{}`, ""},
+		{"node manual", "manual", `{}`, "manual"},
+		{"node retained by cache patch", "manual", `{"diff_cow":{"cache_size":"64MiB"}}`, "manual"},
+		{"request manual", "auto", `{"diff_cow":{"discard":"manual"}}`, "manual"},
+		{"request auto", "manual", `{"diff_cow":{"discard":"auto"}}`, "auto"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := NodeResourcePolicy{}
+			if tc.node != "" {
+				node.DiffCOW = &DiffCOWPatch{Discard: stringPtr(tc.node)}
+			}
+			patch, err := ParseResourcePatch(tc.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, fromArtifact := range []bool{false, true} {
+				// Artifact capacity applies to both E cold launches and S restores.
+				// Mount policy is removed only by the memory-restore renderer.
+				resources, err := ResolveResources(ResourceResolveInput{Node: node, Patch: patch,
+					Restore: fromArtifact, ArtifactCapacity: &rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"}})
+				if err != nil || resources.DiffCOW.Discard != tc.want {
+					t.Fatalf("artifact=%t: DiffCOW=%+v, err=%v", fromArtifact, resources.DiffCOW, err)
+				}
+				wantMode := tc.want
+				if wantMode == "" {
+					wantMode = "auto"
+				}
+				if got, err := resources.DiffCOW.DiscardMode(); err != nil || got != wantMode {
+					t.Fatalf("resolved discard mode=%q, err=%v", got, err)
+				}
+			}
+			if canonical, err := MarshalResourcePatch(patch); err != nil || canonical != tc.request {
+				t.Fatalf("request policy changed: %q, %v", canonical, err)
+			}
+			if node.DiffCOW != nil && *node.DiffCOW.Discard != tc.node {
+				t.Fatal("node policy changed")
+			}
+		})
+	}
+}
+
 func TestDiffCOWPresenceAndProgrammaticValidation(t *testing.T) {
-	for _, raw := range []string{`{}`, `{"diff_cow":{}}`, `{"diff_cow":{"cache_size":"12KiB"}}`} {
+	for _, raw := range []string{`{}`, `{"diff_cow":{}}`, `{"diff_cow":{"cache_size":"12KiB"}}`, `{"diff_cow":{"discard":"manual"}}`} {
 		got, err := MergeMetadata(map[string]string{NsResource: raw}, nil)
 		if err != nil || got[NsResource] != raw {
 			t.Errorf("persist %s = %v, %v", raw, got, err)
@@ -59,24 +104,29 @@ func TestDiffCOWPresenceAndProgrammaticValidation(t *testing.T) {
 	}
 	for _, cow := range []*DiffCOWPatch{
 		{CacheSize: stringPtr("")}, {MaxDirtySize: stringPtr("")},
+		{Discard: stringPtr("")}, {Discard: stringPtr("off")},
 	} {
 		if err := ValidateNodeResourcePolicy(NodeResourcePolicy{DiffCOW: cow}, false); err == nil {
 			t.Errorf("node accepted %+v", cow)
 		}
 		if _, err := MergeResourcePatch(ResourcePatch{DiffCOW: cow}, ResourcePatch{DiffCOW: &DiffCOWPatch{
-			CacheSize: stringPtr("64MiB"), MaxDirtySize: stringPtr("32MiB"),
+			CacheSize: stringPtr("64MiB"), MaxDirtySize: stringPtr("32MiB"), Discard: stringPtr("auto"),
 		}}); err == nil {
 			t.Errorf("merge hid explicit empty leaf in %+v", cow)
 		}
 	}
-	base := ResourcePatch{DiffCOW: &DiffCOWPatch{CacheSize: stringPtr("128MiB")}}
-	over := ResourcePatch{DiffCOW: &DiffCOWPatch{MaxDirtySize: stringPtr("64MiB")}}
+	base := ResourcePatch{DiffCOW: &DiffCOWPatch{CacheSize: stringPtr("128MiB"), Discard: stringPtr("manual")}}
+	over := ResourcePatch{DiffCOW: &DiffCOWPatch{MaxDirtySize: stringPtr("64MiB"), Discard: stringPtr("auto")}}
 	merged, err := MergeResourcePatch(base, over)
 	if err != nil {
 		t.Fatal(err)
 	}
-	*merged.DiffCOW.CacheSize, *merged.DiffCOW.MaxDirtySize = "8MiB", "4MiB"
-	if *base.DiffCOW.CacheSize != "128MiB" || *over.DiffCOW.MaxDirtySize != "64MiB" || base.DiffCOW.MaxDirtySize != nil {
+	if *merged.DiffCOW.Discard != "auto" {
+		t.Fatal("discard override did not replace the inherited policy")
+	}
+	*merged.DiffCOW.CacheSize, *merged.DiffCOW.MaxDirtySize, *merged.DiffCOW.Discard = "8MiB", "4MiB", "manual"
+	if *base.DiffCOW.CacheSize != "128MiB" || *over.DiffCOW.MaxDirtySize != "64MiB" || base.DiffCOW.MaxDirtySize != nil ||
+		*base.DiffCOW.Discard != "manual" || *over.DiffCOW.Discard != "auto" {
 		t.Fatal("merged DiffCOW shares input leaves")
 	}
 }
@@ -87,6 +137,8 @@ func TestParseResourcePatchStrictSchema(t *testing.T) {
 		`{"capacity":{}}`,
 		`{"diff_cow":{}}`,
 		`{"diff_cow":{"max_dirty_size":"64MiB"}}`,
+		`{"diff_cow":{"discard":"auto"}}`,
+		`{"diff_cow":{"discard":"manual"}}`,
 		`{"capacity":{"cpu":2}}`,
 		`{"capacity":{"memory":"2GiB"}}`,
 		`{"allocatable":{"cpu":0.5,"memory":"256MiB"}}`,
@@ -124,6 +176,13 @@ func TestParseResourcePatchStrictSchema(t *testing.T) {
 		"cow alignment":       {`{"diff_cow":{"cache_size":"7KiB"}}`, NsResource + ".diff_cow.cache_size"},
 		"cow overflow":        {`{"diff_cow":{"cache_size":"9223372036854775808"}}`, NsResource + ".diff_cow.cache_size"},
 		"cow invalid pair":    {`{"diff_cow":{"cache_size":"16MiB","max_dirty_size":"32MiB"}}`, NsResource + ".diff_cow.max_dirty_size"},
+		"discard empty":       {`{"diff_cow":{"discard":""}}`, NsResource + ".diff_cow.discard"},
+		"discard null":        {`{"diff_cow":{"discard":null}}`, NsResource + ".diff_cow.discard"},
+		"discard wrong type":  {`{"diff_cow":{"discard":true}}`, NsResource + ".diff_cow.discard"},
+		"discard unknown":     {`{"diff_cow":{"discard":"off"}}`, NsResource + ".diff_cow.discard"},
+		"discard whitespace":  {`{"diff_cow":{"discard":" manual "}}`, NsResource + ".diff_cow.discard"},
+		"discard case":        {`{"diff_cow":{"discard":"AUTO"}}`, NsResource + ".diff_cow.discard"},
+		"discard duplicate":   {`{"diff_cow":{"discard":"auto","discard":"manual"}}`, NsResource},
 		"control":             {`{"control":{}}`, NsResource + ".control is node-managed"},
 		"overhead":            {`{"overhead":{"memory":"1MiB"}}`, NsResource + ".overhead is not request-configurable"},
 		"watermark":           {`{"watermark_high":{}}`, NsResource + ".watermark_high is node-managed"},

@@ -141,7 +141,7 @@ Preflight requires `host_reserved.memory < physical_memory` and validates `0 <= 
 
 ### Request/template ownership
 
-Tenant resource patches allow `capacity`, `allocatable`, `startup` and the two `diff_cow` leaves. The node resolver owns `control`, `overhead`, `watermark_high`, sensors and deflate_on_oom. The parser rejects unknown or unauthorized fields.
+Tenant resource patches allow `capacity`, `allocatable`, `startup` and the `diff_cow` cache limits and cold-start discard policy. The node resolver owns `control`, `overhead`, `watermark_high`, sensors and deflate_on_oom. The parser rejects unknown or unauthorized fields.
 
 <a id="conductor-resource-configuration"></a>
 
@@ -158,6 +158,7 @@ These fields belong to Conductor configuration. Shared loading, path and environ
 | `sandbox.resources.watermark_high.ratio` | `0.875` | Node-owned memory.high pressure ratio in `(0,1)`; requests/templates cannot override |
 | `sandbox.resources.diff_cow.cache_size` | `32MiB` | Host cache shared by the sandbox's writable disks |
 | `sandbox.resources.diff_cow.max_dirty_size` | Half the final cache size, rounded down to 4 KiB, minimum 4 KiB | An explicit limit must fit within the cache |
+| `sandbox.resources.diff_cow.discard` | `auto` | Writable ext4 cold-mount policy: `auto` mounts with `discard`; `manual` uses `nodiscard` while retaining explicit trim support |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource [resource_listen](#resource_listen). Omitted/disabled means static cgroups |
 
 <a id="request-resources"></a>
@@ -171,7 +172,7 @@ Resource and traffic merge by leaf. Public resource JSON permits only:
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
   "startup": {"memory": "1GiB"},
-  "diff_cow": {"cache_size": "64MiB", "max_dirty_size": "16MiB"}
+  "diff_cow": {"cache_size": "64MiB", "max_dirty_size": "16MiB", "discard": "auto"}
 }
 ```
 
@@ -190,7 +191,31 @@ node resource policy
 
 Each resource leaf overlays independently. For example, group capacity.memory and Create allocatable.memory both survive. Every layer is validated before merging. Group/reserve, standalone/cluster and Build registration share the helper. Other namespaces follow their own rules below.
 
-`X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` gives the sandbox a 32 MiB dirty limit when the node has omitted it. Use `"max_dirty_size":"16MiB"` inside `diff_cow` to set it explicitly. Sizes must be positive multiples of 4 KiB. Raw policy, request metadata and migration tokens retain only configured leaves. Restore resolves them on the target node independently of portable artifact capacity. Build execution inherits the node limits, and the target Sandbox also applies the target request.
+`X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` gives the sandbox a 32 MiB dirty limit when the node has omitted it. Use `"max_dirty_size":"16MiB"` inside `diff_cow` to set it explicitly. Sizes must be positive multiples of 4 KiB. Raw policy, request metadata and migration tokens retain only configured leaves. Restore resolves cache limits on the target node independently of portable artifact capacity. Build execution inherits the node policy, and the target Sandbox also applies the target request.
+
+To defer filesystem discard on a new cold start, set
+`sandbox.resources.diff_cow.discard: manual` on the node, or send
+`X-Kuasar-Sandbox-Resource: {"diff_cow":{"discard":"manual"}}` for the
+instance. `auto` preserves the default automatic discard mounts; `manual`
+explicitly uses `nodiscard` on the writable ext4 root and data disks, including
+overlay upper filesystems. The value must be exactly `auto` or `manual`.
+Both modes retain the block device's DISCARD capability. Manual mode schedules
+no trim job; explicit trim requires access to the underlying ext4 filesystem,
+not its visible overlayfs mount. Until blocks are trimmed or reused, deleted
+payload can continue to occupy local storage and new exports. See the
+[sandboxer mount-policy contract](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/configuration.md#diff-cow-policy)
+for the mount scope and runtime compatibility requirement: a manual cold launch
+requires a Guest runtime that advertises this capability, and fails explicitly
+with an older runtime.
+
+This leaf applies to image boots and cold launches from Sandbox E. Memory
+restore from Snapshot S preserves the captured mounts: the renderer omits
+`discard` from the restore host document while retaining both cache limits.
+Changing node policy or a retained resource patch does not remount a restored
+Guest. Request metadata and migration tokens retain the explicitly requested
+mode for a later cold launch; node defaults come from the node performing that
+launch. This leaf does not enter Portable E as a resource field. Runtime cache
+budgets and their ownership are unchanged.
 
 <a id="resource-resolution"></a>
 

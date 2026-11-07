@@ -158,7 +158,7 @@ func TestConductorCloneIsDeep(t *testing.T) {
 	cpu := config.CPUCores("2")
 	memory := "4GiB"
 	allocatableMemory := "512MiB"
-	cacheSize, dirtySize := "64MiB", "16MiB"
+	cacheSize, dirtySize, discard := "64MiB", "16MiB", "manual"
 	cfg := &config.Conductor{
 		Units:   config.UnitsConfig{Install: &install},
 		Cluster: config.ClusterConfig{Labels: map[string]string{"zone": "z1"}},
@@ -166,7 +166,7 @@ func TestConductorCloneIsDeep(t *testing.T) {
 			Network: config.NetworkConfig{DNS: []string{"1.1.1.1"}},
 			Resources: config.ResourcesConfig{
 				Allocatable:   config.ResourceAllocatable{CPU: &one, Memory: &allocatableMemory},
-				DiffCOW:       &config.ResourceDiffCOW{CacheSize: &cacheSize, MaxDirtySize: &dirtySize},
+				DiffCOW:       &config.ResourceDiffCOW{CacheSize: &cacheSize, MaxDirtySize: &dirtySize, Discard: &discard},
 				Startup:       &config.ResourceStartup{Memory: "1GiB"},
 				WatermarkHigh: &config.ResourceWatermarkHigh{Ratio: &ratio},
 			},
@@ -199,6 +199,7 @@ func TestConductorCloneIsDeep(t *testing.T) {
 	*clone.Sandbox.Resources.Allocatable.Memory = "1GiB"
 	*clone.Sandbox.Resources.DiffCOW.CacheSize = "32MiB"
 	*clone.Sandbox.Resources.DiffCOW.MaxDirtySize = "8MiB"
+	*clone.Sandbox.Resources.DiffCOW.Discard = "auto"
 	clone.Sandbox.Resources.Startup.Memory = "2GiB"
 	*clone.Sandbox.Resources.WatermarkHigh.Ratio = 0.9
 	*clone.Builder.Admission.Execution.MaxBuilds = 9
@@ -214,7 +215,7 @@ func TestConductorCloneIsDeep(t *testing.T) {
 
 	if !*cfg.Units.Install || cfg.Cluster.Labels["zone"] != "z1" || cfg.Sandbox.Network.DNS[0] != "1.1.1.1" ||
 		*cfg.Sandbox.Resources.Allocatable.CPU != 1 || *cfg.Sandbox.Resources.Allocatable.Memory != "512MiB" ||
-		cfg.Sandbox.Resources.DiffCOW == clone.Sandbox.Resources.DiffCOW || cacheSize != "64MiB" || dirtySize != "16MiB" ||
+		cfg.Sandbox.Resources.DiffCOW == clone.Sandbox.Resources.DiffCOW || cacheSize != "64MiB" || dirtySize != "16MiB" || discard != "manual" ||
 		cfg.Sandbox.Resources.Startup.Memory != "1GiB" ||
 		*cfg.Sandbox.Resources.WatermarkHigh.Ratio != 0.8 || *cfg.Builder.Admission.Execution.MaxBuilds != 3 ||
 		*cfg.Builder.Admission.Execution.Resources.CPU != "2" || *cfg.Builder.Admission.Execution.Resources.Memory != "4GiB" ||

@@ -173,7 +173,7 @@ sandbox YAML,runner 仍通过继承 cgroup FD 注入该 host capability。
 
 同一 Sandbox 的可写盘共享一份宿主机 DiffCOW 缓存。`cache_size` 缺省为 32 MiB，省略的 `max_dirty_size` 按最终缓存的一半向下对齐到 4 KiB，至少为 4 KiB。上例得到 64 MiB 缓存与 32 MiB 脏数据上限。显式大小须为 4 KiB 的正整数倍，脏数据上限不得超过缓存。
 
-tenant resource patch 支持 `capacity`、`allocatable`、`startup` 和 `diff_cow` 的两个叶子。`control`、
+tenant resource patch 支持 `capacity`、`allocatable`、`startup`，以及 `diff_cow` 的缓存限制与冷启动 discard 策略。`control`、
 `overhead`、`watermark_high`、sensor 和 `deflate_on_oom` 均由 node resolver 管理。
 parser 对未知字段和这些越权字段直接报错,不会静默忽略。
 
@@ -192,6 +192,7 @@ parser 对未知字段和这些越权字段直接报错,不会静默忽略。
 | `sandbox.resources.watermark_high.ratio` | `0.875` | node-owned sandbox `memory.high` pressure ratio,必须在 `(0,1)`;request/template 不可覆盖 |
 | `sandbox.resources.diff_cow.cache_size` | `32MiB` | 同一 Sandbox 的可写磁盘共享的宿主机缓存 |
 | `sandbox.resources.diff_cow.max_dirty_size` | 最终缓存的一半，向下对齐到 4 KiB，至少 4 KiB | 显式脏数据上限不得超过缓存 |
+| `sandbox.resources.diff_cow.discard` | `auto` | 可写 ext4 的冷启动挂载策略：`auto` 使用 `discard` 挂载；`manual` 使用 `nodiscard`，同时保留显式 trim 能力 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md [resource_listen](#resource_listen)。省略或 disabled = 静态 cgroup |
 
 <a id="request-resources"></a>
@@ -205,7 +206,7 @@ parser 对未知字段和这些越权字段直接报错,不会静默忽略。
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
   "startup": {"memory": "1GiB"},
-  "diff_cow": {"cache_size": "64MiB", "max_dirty_size": "16MiB"}
+  "diff_cow": {"cache_size": "64MiB", "max_dirty_size": "16MiB", "discard": "auto"}
 }
 ```
 
@@ -233,7 +234,24 @@ namespace 遵循下文各自的合并规则，多数采用 whole-namespace 覆�
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
 
-例如节点省略脏数据上限时，请求头 `X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` 会得到 32 MiB 的脏数据上限。在 `diff_cow` 内提供 `"max_dirty_size":"16MiB"` 可显式设置上限。两项大小均须为 4 KiB 的正整数倍。原始策略、请求 metadata 和迁移 token 只保存显式叶子，恢复时由目标节点重新解析，独立于制品 capacity。Build 执行继承节点配置，目标 Sandbox 再叠加其请求配置。
+例如节点省略脏数据上限时，请求头 `X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` 会得到 32 MiB 的脏数据上限。在 `diff_cow` 内提供 `"max_dirty_size":"16MiB"` 可显式设置上限。两项大小均须为 4 KiB 的正整数倍。原始策略、请求 metadata 和迁移 token 只保存显式叶子，恢复时由目标节点重新解析缓存限制，独立于制品 capacity。Build 执行继承节点策略，目标 Sandbox 再叠加其请求配置。
+
+若希望新冷启动延后文件系统 discard，可在节点设置
+`sandbox.resources.diff_cow.discard: manual`，或为实例发送
+`X-Kuasar-Sandbox-Resource: {"diff_cow":{"discard":"manual"}}`。
+`auto` 保持默认的自动 discard 挂载；`manual` 对可写 ext4 根盘与数据盘（包括
+overlay upper 文件系统）明确使用 `nodiscard`。值只能是精确的 `auto` 或 `manual`。
+两种模式均保留块设备的 DISCARD 能力。manual 不安排 trim 任务；显式 trim 需要访问
+底层 ext4 文件系统，不能直接针对可见的 overlayfs 挂载。块在 trim 或复用前，已删除
+payload 仍可能占用本地空间并进入新导出。挂载范围与 runtime 兼容要求见
+[sandboxer 挂载策略契约](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/configuration_zh.md#diff-cow-policy)：
+manual 冷启动需要 Guest runtime 声明相应能力，旧 runtime 会明确报错。
+
+该叶子用于 image 启动和从 Sandbox E 冷启动。从 Snapshot S 恢复内存时保留捕获的挂载：
+renderer 在 restore host 文档中省略 `discard`，同时保留两项缓存限制。修改节点策略或
+保留的资源 patch 不会重新挂载恢复后的 Guest。请求 metadata 和迁移 token 为后续冷启动
+保留显式请求的模式；节点默认策略来自执行该次冷启动的节点。该叶子不会作为资源字段
+进入 Portable E。运行时缓存预算及其所有权不变。
 
 <a id="resource-resolution"></a>
 

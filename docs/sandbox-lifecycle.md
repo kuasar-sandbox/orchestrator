@@ -861,7 +861,7 @@ Each instance receives configuration through reserved e2b metadata namespaces `k
 
 | Namespace | Destination |
 |---|---|
-| resource | Strict partial patch for capacity, allocatable, startup and DiffCOW cache limits |
+| resource | Strict partial patch for capacity, allocatable, startup, DiffCOW cache limits and cold-start discard policy ([resource schema](node-resource.md#request-resources)) |
 | traffic | Host-only explicit per-Sandbox max_inflight total/forward/e2b:envd/e2b:code-interpreter/exec; never guest configuration |
 | network | hostname/nexthop to guest; inner_ip/transit_* to vswitch Attach; dns to resolv.conf |
 | launch | exec/args/env/workdir/restart/user/stop_signal/plugin/cgroup_control; bare only, since e2b reserves launch for envd |
