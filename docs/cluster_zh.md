@@ -798,7 +798,7 @@ membership:
 node_link:
   # listen: ""                 # 空 = 复用 member.listen;非空 = 独立 node 长连接监听
   heartbeat_interval: 10s
-  node_dead_after: 30s          # node-link 断线后清理持久状态的等待时间
+  node_dead_after: 30s          # 断线节点最后心跳的过期阈值
 
 route_link:
   park_timeout: 30s
@@ -892,6 +892,9 @@ standalone placer 必须配置至少一个 `import_groups` source。嵌入式或
 
 ### Placer 配置
 
+下例的 `https://` advertise 要求匹配的 `placer.tls` 证书/key 与对端信任；仅填写 URL
+不会在 `placer.listen` 上启用 TLS。
+
 ```yaml
 placer:
   id: placer-1
@@ -924,6 +927,7 @@ placement:
 | `registry.bootstrap` | registry bootstrap endpoint,用于拉取 membership |
 | `placer.id` | placer 实例 id |
 | `placer.listen` | placer HTTP API 监听 |
+| `placer.tls` | listener/memberlist TLS 证书与 key；配置 CA 时还要求验证客户端证书 |
 | `placer.advertise` | registry 调用 placer 的地址,同时作为 placer memberlist HTTP transport 地址 |
 | `placer.memberlist_label` | placer memberlist label,默认 `placer.default` |
 | `import_groups[]` | standalone placer 的 group source;内置 `source_type=file` |
@@ -977,8 +981,7 @@ registry node_link owner or relay holder
 集群下两条到节点的路径:
 
 - **node-link**:注册、心跳、sandbox route 事件、Build snapshot/delta、命令、manifest key 租约。
-- **router 转发到本节点 e2b 控制面 / 数据面**:pause/kill/timeout、build status/files 转发本机 e2b
-  控制面;数据面经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 后进入本机 proxy(node-proxy.md)。
+- **router 转发到本节点控制面 / 数据面**:pause/timeout、Build status/files 使用节点 APIEndpoint；父 Sandbox Delete 则调用 Registry，由 node-link 下发 CmdDelete。数据使用独立的 Proxy DataEndpoint 和当前 NodeSandboxID。普通 token 请求保留调用方 token；已验签的无 token 文件请求只在外层 CONNECT 添加 EnvdAccessToken，不向内层 HTTP 注入（见[数据面](#router-data-plane)）。
 
 <a id="membership-and-state"></a>
 
@@ -1564,13 +1567,10 @@ node_link 流按事件重要性处理:
 
 这样 Reserve 的 READY route report 不会被心跳持久化阻塞。node-local `starting` upsert
 只为节点 proxy/MMDS 暴露 launch 身份:node_link owner 在全量同步时将其计入 seen set,
-但不把它增加为 route_link 业务状态,也不覆盖既有 RESERVED/PAUSED;后续 READY/PAUSED/Delete
-才推进 route_link。create 候选失败的 Delete 若仍命中当前 in-flight RESERVED fence,
-Registry 通过该 fence 恢复 Reserve 前 route(全新 create 则删除 reservation),不能先删
+但不把它增加为 route_link 业务状态，也不覆盖既有 RESERVED/PAUSED；后续 running/pausing/paused/dead/deleting Upsert 与最终 Delete 推进 route_link。正常的 Create Ack 后失败发布保留数据的 dead，不是 Delete，父对象硬删除前不能替换。若实际 Delete 仍命中 in-flight create 的 RESERVED fence（不包括原 paused resume），Registry 通过该 fence 恢复 Reserve 前 route（全新 create 则删除 reservation），不能先删
 RESERVED 行使旧 route 失去回滚锚点。sandbox 事件携带 NodeSandboxID、profile
 与 node-owned 执行态;nodelink owner 以 `(node_id,NodeSandboxID)` 查本节点归属表得到稳定
-SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
-park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
+SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。迟到 READY 若没有归属表项则被忽略：Registry 无权删除可能是 standalone 的 node-local sandbox。若归属 ref 仍在，但它指向的 route 已不存在或被替换，才可清理这个过期实例。
 
 Connect 或 ExecSession 在已有迁移路径上提交新节点 generation 时，清除源节点的实例 ID 和状态版本。新节点首次获授权的投影建立本地实例身份，原节点的迟到报告仍受 generation 约束。
 
@@ -1737,7 +1737,7 @@ import、鉴权/签名及同一 resume acceptance。
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster, auto_reset?}` | 冷启 `template_ref` + 保存/合并 `config`([生命周期与状态机](sandbox-lifecycle_zh.md#state-and-ownership);snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt、成功的 route/lease barrier |
+  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster, idle_timeout?, auto_pause_memory?, auto_reset?}` | 冷启 `template_ref` + 保存/合并 `config`([生命周期与状态机](sandbox-lifecycle_zh.md#state-and-ownership);snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt、成功的 route/lease barrier |
   | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?, memory?}` | `sid` 是 NodeSandboxID。target 已存在时忽略 token，校验完整指纹、profile 和 cluster context；对已有 paused S 的 false 是保留持久来源的一次 cold 尝试。target 缺失且带 KMT1 时，同步认证原始对并以命令 sid/context insert paused 行：false 永久选择 E-only；omitted/null 保留 token 来源；true 要求 S。随后用同一 selector 解析 ResumeMode（[Import 选择](sandbox-lifecycle_zh.md#import-selection)）。Ack 前完成旧 runner/network/RunDir 清理，并在 paused→starting acceptance 中恢复 canonical RunDir/UDS、持久化 deadline 与 resolved launch mode。Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint；restore 异步，缺失且无 token 则拒绝 |
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致;Ack 仍只表示 exact owner 已持久转为 `deleting`,不等待 node-local finalizer 完成;deleting 管理 Upsert 在 Ack 返回前发布，业务路由撤销不是 cleanup 完成证明;pending 重放幂等([进程管理(systemd 模板单元,启动时自动生成安装)](node_zh.md#systemd-pools) kill) |
@@ -1777,8 +1777,7 @@ revision，node 按该订阅者 cursor 重放；它不是 node register 字段�
 否则逐条全量 route + bookmark。Build projection 每个新 session 都执行完整 bracket，不依赖 route token；
 Registry 重启亦然。
 
-node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 APISecret+ManifestKey 凭据对及创建期
-credentials 只进入加密存储和运行期内存;沙箱级 token 属敏感数据,仅在可信链路内传输。
+node-link 生产走 mTLS(`cluster.node_link.tls`)。节点将下行 APISecret+ManifestKey 凭据对及创建期 credentials 加密持久化到本机存储，并在受信运行期使用。这不代表 Registry 存储端到端加密：受保护 Registry route 凭据仍为明文结构化字段，见[密钥与鉴权](#cluster-credentials)。沙箱级 token 属敏感数据，仅在可信链路内传输。
 
 接入集群与本机 plugin 平面使用同一 routesync 引擎和线格式,仅订阅者 kind 不同。router 不订阅节点
 plugin 平面,机群路由经 registry 聚合。
@@ -1940,16 +1939,16 @@ POST /route-link/reserve
 ```
 
 Reserve body 按 operation 使用独立 typed schema:create 携 create config,exec-session 携
-`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。create body 是可选 `config` map 与独立 `auto_pause_memory` 与 `auto_reset` bool（后者默认 false），最多 16 MiB。四种 operation 的凭据和
+`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。create body 是可选 `config` map 及独立的 `idle_timeout`、`auto_pause_memory`、`auto_reset` typed 字段，最多 16 MiB。四种 operation 的凭据和
 完成条件不同;Registry 对 exec-session body 再做严格 schema/bounds 校验,不接受旧的
 `ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
 - `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.resource`、`kuasar-sandbox.traffic`、`kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
-  `kuasar-sandbox.checkpoint`；`auto_pause_memory` 与 `auto_reset` 是独立 typed body 字段，拒绝 `memory`。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+  `kuasar-sandbox.checkpoint`；`idle_timeout`、`auto_pause_memory`（默认 true）与 `auto_reset`（默认 false）是独立 typed body 字段，拒绝 `memory`。`idle_timeout` 是可表示为 duration 的非负整数秒；absent/null 关闭策略，0 仍表示启用，它不是 config namespace。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
   attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
   Registry 内合并。
-- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;body 只允许可选 `memory`，不允许 config/auto_pause_memory，selector 原样进入 CmdConnect；Header 携 `X-API-KEY`,可选
+- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;body 只允许可选 `memory`，不允许非空 config 或非 null 的 idle_timeout/auto_pause_memory/auto_reset，selector 原样进入 CmdConnect；Header 携 `X-API-KEY`,可选
   `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
   对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
   排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、按同一 memory
@@ -2002,8 +2001,7 @@ Registry 不在 Ack 超时、链路中断或 node 重启后自动重投同一个
 绑定校验和 node-local launch ownership 保持可重试;Exec Session 重试可以签发新的 KAT.系统不持久化
 command digest、Ack/result 或临时去重状态.
 
-孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,node_sandbox_id)` 查归属表;表项不存在,
-或表项指向的 `(group,route_key)` 已不存在/被其他实例替换,则下发 delete/kill 到该 node。该过程不经过
+孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,node_sandbox_id)` 查归属表；没有表项则忽略报告，不因此授权删除。有匹配归属 ref 时，route 不存在或 lineage 不匹配才下发 delete/kill 到该 node；ref 保留到最终 Delete。该过程不经过
 数据面,不依赖 access token 或全局 sandbox ID 查询。全量同步、孤儿清理和节点回收均比较
 `(group,route_key,sandbox_id,node_sandbox_id,sandbox_generation,profile,api_secret_fingerprint)` 完整归属,
 避免迟到事件跨代际或凭据 binding 删除新记录。
@@ -2343,7 +2341,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 |---|---|
 | router 崩溃 | 丢本地缓存;重启后 cache miss 重新 Resolve |
 | placer 崩溃 | registry 对同 group failover 到下一个 ready placer;热路径不受影响 |
-| node_link 断线 | node owner 立即拒绝该 node 的新提交；route owner 排除并重选；node_dead_after 后清理 node profile/node_list 和关联执行态；node 重连后全量/增量重报 |
+| node_link 断线 | node owner 立即拒绝该 node 的新提交；route owner 排除并重选；断线节点最后心跳超过 node_dead_after 后，通过 revision fence 接管过期 profile，清理目录和符合条件的执行投影；dead/deleting Sandbox 管理行及精确归属仍保留，in-flight reservation 不被 sweep；node 重连后全量/增量重报 |
 | conductor 进程重启 | 依据 systemd unit reconcile durable row：接管活 sandbox/builder，重试 deleting/paused cleanup、已接纳的中断 restore，并清理/失败缺失的新执行；这不是整机重启 |
 | node 整机重启 | 运行进程丢失。SQLite/artifact 保留时仍 reconcile paused row、已接纳的中断 restore、cleanup owner 和保留的 Build；缺失执行经节点上报/exact route 清理收敛，不无条件删除全部 durable row 或自动重建全部旧 sandbox |
 | registry 单成员故障 | owner set quorum 足够时继续服务；恢复后由同 shard 访问或事实源上报触发 read-repair；单 owner 部署不能容忍其 owner 丢失 |
