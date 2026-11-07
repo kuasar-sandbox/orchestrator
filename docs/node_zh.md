@@ -190,8 +190,9 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 |---|---|
 | `conductor serve` | 启动 conductor:控制面 + 本机控制 socket + reaper + 构建池;配 `cluster` 则起 node-link 客户端([集群接入(node-link)](cluster_zh.md#node-attachment)),配 `resource_listen` 则内置资源控制器(node-resource.md) |
 | `proxy serve` | 启动独立数据面 master/worker(见 [`node-ctl proxy`](node-proxy_zh.md#proxy-command) 与 node-proxy.md) |
+| `telemetry serve` | 启动独立 metrics 采集与查询服务（[Telemetry](observability_zh.md#telemetry)） |
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用([`node-ctl run-sandbox` / `run-builder`](#task-launcher-commands)、[本机控制 socket(run / task / admin / plugin / api 平面)](#local-control-channels)) |
-| `resource` | `status`/`list`/`drain`:reservation 控制器巡检与 admission 排空(node-resource.md [命令行接口](node-resource_zh.md#resource-command)) |
+| `resource` | `status`/`list`/`drain`/`pressure`:巡检 reservation、资源/worker 池及压力恢复，并控制 admission 排空(node-resource.md [命令行接口](node-resource_zh.md#resource-command)) |
 | `builder status` / `builder cancel <build-id>` / `builder delete <transient-template-id> [--cancel]` | 查看持久用量、transient ID、操作意图与 claim; 取消执行或删除一条 Build 记录 ([取消与删除 Build 记录](node-build_zh.md#cancel-and-delete-a-build-record)) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
 | `manifest-key` | `add`/`remove`/`check`/`list`:create/build/import 凭据对白名单管理([密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model);集群下另由 registry 租约写入,[集群接入(node-link)](cluster_zh.md#node-attachment)) |
@@ -238,9 +239,9 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 |---|---|---|
 | `--config` | `/etc/node-ctl/conductor.yaml` | conductor 配置文件([配置](#conductor-configuration)) |
 
-启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元([进程管理(systemd 模板单元,启动时自动生成安装)](#systemd-pools))→
-重启对账([可靠性](#recovery))→ 起 reaper(TTL,5s 周期)→(配 `resource_listen` 则起内置资源控制器,
-node-resource.md)→ 起本机控制 socket并确认监听成功([本机控制 socket(run / task / admin / plugin / api 平面)](#local-control-channels))→ 起 runner/builder 预启动池与
+启动序列:打开 sqlite(文件 chmod 0600)→ 恢复并验证持久 pool/unit 身份 → 生成并安装 systemd 模板单元([进程管理(systemd 模板单元,启动时自动生成安装)](#systemd-pools))→
+Sandbox 重启对账([可靠性](#recovery))→(配 `resource_listen` 则起内置资源控制器,
+node-resource.md)→ 起本机控制 socket并确认监听成功([本机控制 socket(run / task / admin / plugin / api 平面)](#local-control-channels))→ 在 bootstrap/result recovery gate 保护下完成 Build 对账 → 起 reaper(TTL,5s 周期)、runner/builder 预启动池与
 构建准入循环([按目标执行与发布](node-build_zh.md#execution-and-publication))→(配 `cluster.node_link.endpoint` 则拨 registry 起 node-link 客户端,[集群接入(node-link)](cluster_zh.md#node-attachment))→
 监听 `api.listen`.该 listener 只服务 wrapped control API;sandbox data Host 或 CONNECT
 不会转发到 backend.TLS 证书缺省时以明文 h2c 服务(dev:SDK 控制面走 `E2B_API_URL`).
@@ -426,7 +427,7 @@ serve 启动时生成并安装各配置模板及固定的两个 slice(`sandbox-r
 `sandbox-builder.slice`)到 `units.dir`；同名同内容只写一次，同名不同内容在写入前拒绝。
 内容变更才 `daemon-reload`(D-Bus `Reload`);
 `units.install: false` 则交由运维带外管理,程序不生成文件,也不读取或校验运维资源属性. ExecStart 里的 `node-ctl` 路径
-取自 serve 自身所在目录(自动发现,[配置](#conductor-configuration))。
+使用 runtime resolution/bootstrap 保留的原始 node-ctl 精确路径，custom conductor 模式也如此([配置](#conductor-configuration))。
 
 runner 与 builder 先按声明 Capacity、操作权限和 worker 供给过滤资源池，再选择运行
 使用率最低的池，同使用率随机；在所选资源池内按逻辑 worker pool 的 priority 优先，
@@ -836,8 +837,8 @@ node worker 统计一次.
   `socats`(真实路径分别为 `/app/user`、`/app/ptys`、`/app/socats`)。bare profile 默认
   `false`,可经 `kuasar-sandbox.launch.cgroup_control` 显式启用。
 - envd 是 **guest-runtime/native-deps** 的原生构建产物(与 vmlinux/mkfs.erofs
-  并列):`make -C guest-runtime/native-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
-  `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。`make -C guest-runtime sandbox-runtime` 负责把它和构建工具链一起注入 runtime。
+  并列):`make -C guest-runtime/native-deps envd` 使用 e2b-dev/runtime 源码 tarball（`ENVD_TARBALL`，默认 tag
+  `2026.22`，并固定 `ENVD_TARBALL_SHA256`；覆盖源码时一并更新匹配的校验和），需要构建产物时在 `packages/envd` 内构建；已有可执行产物直接复用。`make -C guest-runtime sandbox-runtime` 负责把它和构建工具链一起注入 runtime。
 - **userland 门槛**(对 base/客户镜像的约束):须有 `bash`、`coreutils`/`util-linux`、
   预建默认用户(默认 `user`,含 `/home/user`)、cgroup v2、可写 `/run`。envd 跑每条
   guest 命令以默认用户、并包一层 `ionice -c 2 -n 4 nice -n N "$@"`——缺用户或缺
