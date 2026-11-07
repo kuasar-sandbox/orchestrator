@@ -73,12 +73,17 @@ API UDS，不使用 Proxy StatsSocket。
 
 ## SDK / CLI 对接与协议 pin
 
-- 重定向:`E2B_DOMAIN=<domain>` + `E2B_API_KEY`(生产,TLS);dev 走
-  `E2B_API_URL`/`E2B_SANDBOX_URL`(http/h2c)。控制面要求 Host 命中 `api.*`。
+- 生产 TLS 使用 `E2B_DOMAIN` 与 `E2B_API_KEY`；开发环境可用 HTTP/h2c 的
+  `E2B_API_URL` 与 `E2B_SANDBOX_URL` 分别访问控制和数据 listener。经集群 Router 时，
+  只有去掉端口后精确等于 `api.<configured domain>` 的 Host 才进入控制面，不接受任意
+  `api.*`。直接访问 Conductor 控制 listener（包括开发用 `E2B_API_URL`）没有此 Host
+  限制：API mux 按 method/path 路由，不转发 Sandbox 数据。
 - api_key 形态:`e2b_` + 72 hex(共 76 字符);e2b SDK 以 `/^e2b_[0-9a-f]+$/` 校验
   格式,服务端另验 MAC([密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](#credential-model))。
-- envd 版本 pin:按 e2b-dev/infra 发布 tag 定版(guest-runtime/native-deps `ENVD_TARBALL`,默认
-  `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
+- envd 从 `e2b-dev/runtime` 源码 tarball 的 `packages/envd` 构建。
+  `guest-runtime/native-deps/Makefile` 将 `ENVD_TARBALL` 固定到 `2026.22` tag，
+  并设置匹配的 `ENVD_TARBALL_SHA256`；这是源码输入，不是预编译 envd 下载。
+  已记录的 SDK 兼容基线为 JavaScript `e2b` 2.27.x / Python 2.25.x，不代表所有后续版本。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
 - 内部 Proxy/observer 的帧、消息与兼容版本统一由[路由同步协议](#route-synchronization)维护，不属于 SDK 兼容性定义。
@@ -182,8 +187,8 @@ TrafficAccessToken 仅供外部网关及 e2b
   扩大凭据和模板边界.
 - **根凭据不落明文**:sqlite 内加密;运行期只在必要的进程内存、受保护路由投影和进程 env 中。
   sandbox ManifestKey只在exact-run bootstrap认证后投递,runner以它覆盖继承环境中的同名项,
-  且最终exec env只有一个authoritative `MANIFEST_KEY`。conductor可持久化/投递该值,但不调用
-  sandbox/build host preparation中不调用CustomerKey、不建立key-bound reader、不打开/解密/解析snapshot。
+  且最终exec env只有一个authoritative `MANIFEST_KEY`。conductor可持久化/投递该值，但 sandbox/build host preparation
+  不调用 CustomerKey、不建立 key-bound reader、不打开/解密/解析租户制品。
   `<sid>.yaml`非密不含根凭据。
   builder task同样只在认证后取得 authoritative env；run-builder仅把`MANIFEST_KEY`安装为
   process-wide reader authority，并先清除继承的registry credential keys。registry凭据只保留在
@@ -215,7 +220,7 @@ TrafficAccessToken 仅供外部网关及 e2b
   UUIDv7,SID,audience 和可选 expiry.session ID 只在 KAT 内部使用,不在 API 响应中外显.
   `MmdsSecret =
   HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
-  密钥,`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md [MMDS](#mmds))。
+  密钥；此处 sid 是 node-local SandboxID，不是 StableID，manifest key 先从 hex 解码为字节；`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md [MMDS](#mmds))。
 - **MMDS route value 独立存储**:`MmdsSecret` 只签名/验证 MMDSv2 token;
   `MMDSRouteSecretValues` 才是 secret route 返回的敏感 value 集合。每个 sandbox/build
   owner 各有一份 encrypted JSON blob,只编码实际 name→opaque bytes,不保存 version、
@@ -690,7 +695,7 @@ service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显�
    netns 内拨号;
 6. 写入一条 HTTP 请求，流式复制响应，或转发协商成功的 HTTP/1.1 WebSocket Upgrade；响应或完整 relay 结束后一次性关闭 flow 并释放额度。
 
-普通 HTTP 在交换结束前持续观察所选路由的 running 状态、RunID、后端地址以及当前 target 的授权身份。路由撤销会取消该传输，无需等待 TCP 重传超时。在尚未向 guest 写入任何 HTTP 字节时，同一个已获准请求可以用原 binding 再次执行激活并拨最新端点；它保留原有的一次 admission/traffic flow 以及客户端 context/deadline。一旦开始转发，取消只关闭后端并沿用现有 upstream-error 处理，绝不重放 HTTP 字节。策略更新（包括 limited/unlimited 切换和其他服务凭据修改）不会驱逐已接受的传输；后续如需重新激活，仍校验原有完整 binding。这是本机传输可用性行为，不是报文隔离的前置条件；connector generation 的隔离机制保持独立。CONNECT 继续使用既有的 stream 和 half-close 语义。
+普通 HTTP 允许在 `running → pausing` 时保留同一后端，并在交换结束前持续观察所选路由的状态、RunID、后端地址以及当前 target 的授权身份。路由撤销会取消该传输，无需等待 TCP 重传超时。在尚未向 guest 写入任何 HTTP 字节时，同一个已获准请求可以用原 binding 再次执行激活并拨最新端点；它保留原有的一次 admission/traffic flow 以及客户端 context/deadline。一旦开始转发，取消只关闭后端并沿用现有 upstream-error 处理，绝不重放 HTTP 字节。策略更新（包括 limited/unlimited 切换和其他服务凭据修改）不会驱逐已接受的传输；后续如需重新激活，仍校验原有完整 binding。这是本机传输可用性行为，不是报文隔离的前置条件；connector generation 的隔离机制保持独立。CONNECT 继续使用既有的 stream 和 half-close 语义。
 
 CONNECT:
 
@@ -702,10 +707,11 @@ CONNECT:
 
 node proxy 的 exec 路径分为三个有序阶段:
 
-1. CONNECT 200 前只做无副作用本地 `LookupExec`,以 route 中的
+1. CONNECT 200 前，无副作用本地 `LookupExec` 提供 route identity；worker 随后以其中的
    `StableID + ServiceSecret` 严格验证 `X-Access-Token` KAT,并在 HMAC 验证成功后
-   编译/读取有界缓存中的 CEL programs.该阶段不 parking、不 activation、不拨
-   `ctl.sock`;token/identity/expiry/conditions 失败以 HTTP 400/401/404/501 结束.
+   编译/读取有界缓存中的 CEL programs。Lookup 可以等待初始 route synchronization/propagation，
+   但不 Wake、不进入 traffic parking/admission；该阶段不 activation、不拨
+   `ctl.sock`;token/identity/expiry/conditions 失败以 HTTP 400/401/404/501 结束，route lookup 错误返回 503。
 2. 返回并 flush CONNECT 200 后,在固定 10 秒 first-request timeout 内读取完整首个 ctl
    frame.解析严格覆盖顶层 `exec_request`、`ExecSpec` 和 `StdioSpec`,保留客户端原始
    4-byte little-endian length + JSON bytes,重新检查 expiry,构造规范化 request view 并
@@ -780,8 +786,10 @@ extended CONNECT。
 - `exec` 只接受以 ServiceSecret 直接 HMAC 签名,绑定 `StableID` 且
   `aud=exec` 的 `kat1` ExecAccessToken.Envd/Forward/Traffic token 不能代替它.
 
-opaque Envd/Forward token 按各自线格式校验;exec KAT 执行严格格式,签名,SID,audience
-和可选过期时间校验.
+EnvdAccessToken 是 opaque token；ForwardAccessToken 则是 ServiceSecret 签发、绑定
+`StableID` 且 `aud=forward` 的确定性 `kat1`，不是 opaque envd token。普通请求把传入 token
+与受信 route 中该目标的 expected token 比较，遵循下表模式和 legacy 签名文件例外。
+Exec 独立严格验证 KAT 格式、签名、SID、audience 和可选 expiry，再授权首个 ExecRequest。
 
 `auth` / policy `auth_mode`:
 
@@ -1275,7 +1283,7 @@ routesync 仍是帧化 JSON over h2c,由 proxy master 拨 conductor:
 ```text
 master → conductor : register{subscribe: route_wake, proxy{stats_socket?}, mmds}
 master → conductor : wake{sid} / route_barrier_ack{barrier_id}
-conductor → master : hello{policy}
+conductor → master : hello{policy, proxy_capabilities}
 conductor → master : upsert* → bookmark → upsert/delete/route_barrier...
 ```
 
