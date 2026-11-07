@@ -96,13 +96,15 @@ sandbox:
 - `0 < startup.memory <= capacity.memory`。
 - `0 < watermark_high.ratio < 1`,缺省 `0.875`。
 
-restore 的 Capacity 来自 snapshot。`startup.memory` 不参与 restore admission;
+restore 的 Capacity 来自 Snapshot S 引用的配对 Sandbox E 的 portable 配置。`startup.memory` 不参与 restore admission;
 sandboxer 上报的 `BudgetAtSnapshot` 是唯一 initial reservation。
 
 restore 的同步请求只校验 portable patch 结构。runner 绑定 exact run-id 后,task 在进程内
-读取根 `snapshot.cfg`;Manifest Bundle根会先只读metadata prefix,从平面 `bundle/refs`补全
-located来源mapping,但不会打开或递归扫描refs Bundle。task把 Capacity 作为非秘密 summary
-交给唯一 launch worker;conductor不打开 snapshot。request 显式 Capacity 可作为 assertion,不一致或 snapshot 读取失败成为
+读取 Snapshot S 并沿 `sandbox_ref` 读取配对 E。snapshot reader 本身就会打开 E 以派生配置视图，
+prepare 从 E 的 portable 配置取得 Capacity。该 metadata/config 准备可打开所需 sibling/ref
+载体中的 E，并从平面 `bundle/refs` 元数据补全 located 来源 mapping，但不递归扫描无关 Bundle。
+task 把 Capacity 作为非秘密 summary
+交给唯一 launch worker;conductor 不打开制品。request 显式 Capacity 可作为 assertion,不一致或来源制品读取失败成为
 异步 `resource_resolve` failure。失败发生在 network Attach、sandbox YAML、controller Admit
 和 VM 启动前,并且绝不回退 node default。`BudgetAtSnapshot` 仍由 sandboxer 从 CH
 snapshot target/current 计算,不由 orchestrator probe 或推导。
