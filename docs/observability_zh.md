@@ -54,11 +54,11 @@ resource stats 经既有 ctl socket 读取当前 sandbox-ctl owner 的最终资�
 
 静态/动态资源控制、usage 关闭、telemetry 停止时均可独立使用. 读取不 Wake,不采样/保存 usage,不调用 guest 或 Cloud Hypervisor,不修改控制策略,也不创建 resource 历史. 原生 API 的 `cpuCount`、`memTotal`、`memAllocatable` 和 `memUsed` 已删除;旧的 reservation 值 `memAllocatable` 由 `memoryReserved` 替代,`memoryHeadroom` 单独表达 headroom. E2B `/metrics` 和 list/SKU 兼容字段保持原有含义.
 
-`GET /sandboxes/{id}/stats/traffic` 返回最终 node proxy 已鉴权接纳的逻辑 ingress:
+`GET /sandboxes/{id}/stats/traffic` 返回最终 node proxy 已接纳的逻辑 ingress. 普通请求遵循实际生效的鉴权策略(`log`/`off` 放行不保证凭据有效);exec 始终要求有效 KAT 鉴权及 ExecRequest 准入:
 
 ```text
 ingress = parking + connected
-parking = 鉴权成功,但生命周期激活/最终 backend dial 尚未完成
+parking = 已接纳,但生命周期激活/最终 backend dial 尚未完成
 connected  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
 ```
 
@@ -121,7 +121,7 @@ stats 的 503 窗口不影响 Proxy master 的 route/admission authority 或 Cre
 admission算法、误差证明、worker-local状态机、绝对快照 stream 和故障窗口见
 [node-proxy_zh.md](node-proxy_zh.md) [per-Sandbox traffic admission 与 stats](node-proxy_zh.md#admission)。
 
-响应为平铺结构: `state`、`maxInflight`、`inflight`、`idleSince`、`services`、`platform`、`transit` 和 `egress`. Conductor 拥有该原生 API,按照当前 Sandbox 到 switch/port 的绑定组织既有 Proxy 观测与网络计数. `platform` 映射 connector 的 Mgmt RX/TX 包数和字节数,`transit` 映射 Transit RX/TX;两者都采用沙箱视角. 已配置且当前有效的端口返回全部四项无符号整数,包括合法的 0. 没有 attached port 的沙箱返回空 `platform`/`transit` 对象,表示没有适用的当前观测. `egress: {}` 始终表示尚无可发布的 egress 统计,不是观测到零流量. 不发布 per-service 包计数、来源分组或 network API 别名.
+响应为平铺结构: `state`、`maxInflight`、`inflight`、`idleSince`、`services`、`platform`、`transit` 和 `egress`. Conductor 拥有该原生 API,按照当前 Sandbox 到 switch/port 的绑定组织既有 Proxy 观测与网络计数. `platform` 映射 connector 的 Mgmt RX/TX 包数和字节数,`transit` 映射 Transit RX/TX;两者都采用沙箱视角. 已配置且当前有效的端口返回全部四项无符号整数,包括合法的 0. 仅当 `VswitchPort`、`FloatingIP`、`InnerIP` 和 `PortMAC` 全部为空时,沙箱才返回空 `platform`/`transit` 对象,表示没有适用的当前观测. 部分网络绑定在查询任一来源前返回 503. `egress: {}` 始终表示尚无可发布的 egress 统计,不是观测到零流量. 不发布 per-service 包计数、来源分组或 network API 别名.
 
 `connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 仅描述 Proxy 已接纳 ingress;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
 
