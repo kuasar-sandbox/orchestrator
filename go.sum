@@ -443,6 +443,8 @@ github.com/kuasar-sandbox/go-erofs v0.0.0-20261014160540-827da6f90114 h1:cizGvwL
 github.com/kuasar-sandbox/go-erofs v0.0.0-20261014160540-827da6f90114/go.mod h1:dSHtzRj2SkFvXd4w9CllMZRw2WtMV3lzJOHiEe0oapU=
 github.com/kuasar-sandbox/sandboxer v0.1.13-preview.20261104.1 h1:m0itGtqLfP2OGhqxuWExTjPOmjtHntfBuEvNZfG+aS8=
 github.com/kuasar-sandbox/sandboxer v0.1.13-preview.20261104.1/go.mod h1:kB5ZKUL91A+NJy9uSOhdiP1F+h+KYIUZfv581qQKFbU=
+github.com/kuasar-sandbox/sandboxer v0.1.14-preview.20261107.0.20261106234250-7caf9e110f63 h1:pFCKmaHM8xljrtvsrmy9WPebAlBdiFjBo7A/pac2Q8s=
+github.com/kuasar-sandbox/sandboxer v0.1.14-preview.20261107.0.20261106234250-7caf9e110f63/go.mod h1:pxmJbvES5s5+zHDzzAU2bfmkb/+u5RkaOFICFOAncxs=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/lightstep/go-expohisto v1.0.0 h1:UPtTS1rGdtehbbAF7o/dhkWLTDI73UifG8LbfQI7cA4=

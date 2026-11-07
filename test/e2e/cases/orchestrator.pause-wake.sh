@@ -185,6 +185,41 @@ wait_mmds_listener
 echo "==> PASS: conductor restarted in local mode with node merge_ref=true/drop_caches=false"
 
 # ---- Create metadata/header + Pause body/header fieldwise overlays --------
+assert_manual_discard() { # $1=cold|restored
+    local phase="$1" evidence="$CASE_OUT/discard-$1.log"
+    python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
+        || fail "$phase lost the stored manual discard request"
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select metadata_json from sandboxes where id=?", (sys.argv[2],)).fetchone()
+if row is None:
+    raise SystemExit("manual discard sandbox row not found")
+metadata = json.loads(row[0])
+policy = json.loads(metadata.get("kuasar-sandbox.resource", "{}"))
+mode = (policy.get("diff_cow") or {}).get("discard")
+if mode != "manual":
+    raise SystemExit(f"stored discard={mode!r}, want 'manual'")
+PY
+    # vdb is the ext4 upper for this template's root overlay. Reading ext4's
+    # effective options distinguishes nodiscard even when /proc/mounts omits it.
+    if ! timeout -k 2s 15 "$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$EXECUTE_RUN_ROOT/sandboxes" -- /bin/sh -ceu '
+        options=/proc/fs/ext4/vdb/options
+        cat "$options"
+        grep -qx nodiscard "$options"
+        if grep -qx discard "$options"; then
+            echo "unexpected automatic discard on vdb" >&2
+            exit 1
+        fi
+        maximum=$(cat /sys/block/vdb/queue/discard_max_bytes)
+        test "$maximum" -gt 0
+        printf "discard_max_bytes=%s\n" "$maximum"
+    ' >"$evidence" 2>&1; then
+        sed 's/^/  discard| /' "$evidence"
+        fail "$phase did not retain manual ext4 mounts and explicit trim support"
+    fi
+    echo "==> PASS: $phase kept request discard=manual, ext4 nodiscard, and block DISCARD support"
+}
+
 CREATE_POLICY_BODY=$(python3 - "$TEMPLATE" <<'PY'
 import json, sys
 print(json.dumps({
@@ -196,9 +231,12 @@ print(json.dumps({
 }))
 PY
 )
+# Snapshot Create and the history restores below keep the template's captured
+# mounts. This stored request policy takes effect at the later cold Connect.
+REQ_RESOURCE_HEADER='{"diff_cow":{"discard":"manual"}}'
 REQ_CHECKPOINT_HEADER='{"merge_ref":false,"drop_caches":null}'
 code=$(req POST /sandboxes "$AK" "$CREATE_POLICY_BODY")
-unset REQ_CHECKPOINT_HEADER
+unset REQ_RESOURCE_HEADER REQ_CHECKPOINT_HEADER
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "policy create=$code (want 201)"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
@@ -217,6 +255,9 @@ got = metadata.get("kuasar-sandbox.checkpoint")
 want = '{"merge_ref":false,"drop_caches":true}'
 if got != want:
     raise SystemExit(f"stored checkpoint metadata={got!r}, want {want!r}")
+resource = json.loads(metadata.get("kuasar-sandbox.resource", "{}"))
+if (resource.get("diff_cow") or {}).get("discard") != "manual":
+    raise SystemExit("Create header did not persist manual discard policy")
 PY
 echo "==> PASS: Create checkpoint header overlaid body per field and persisted canonical metadata"
 
@@ -329,6 +370,20 @@ assert_run_source_mode "$S_COLD_RUN_CALL" "$SID" from \
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/policy-persist.txt" >"$WORK/policy-read.out" 2>&1 || true
 grep -q "$POLICY_PERSIST" "$WORK/policy-read.out" || { sed 's/^/  guest| /' "$WORK/policy-read.out"; fail "Snapshot S cold launch lost E disk state"; }
 echo "==> PASS: Connect(memory=false) selected E from Snapshot S and cold-launched its disk state"
+assert_manual_discard cold
+
+# Capture the cold mounts, then restore without repeating the request header.
+# Node must preserve durable manual policy but omit it from restore host config.
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":true}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "manual discard memory pause=$code (want 204)"; }
+wait_paused_cleanup "$SID" || fail "manual discard memory pause did not finish"
+MANUAL_RESTORE_RUN_CALL=$(run_argv_count)
+code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113}')
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "manual discard memory Wake=$code (want 200)"; }
+wait_sandbox_state "$SID" running 1200 || fail "manual discard memory Wake did not reach running"
+assert_run_source_mode "$MANUAL_RESTORE_RUN_CALL" "$SID" restore \
+    || fail "manual discard Wake did not resume Snapshot S"
+assert_manual_discard restored
 
 E_LOCAL_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')

@@ -149,16 +149,16 @@ func TestCreateDiffCOWHeaderToColdConfig(t *testing.T) {
 	id := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}
 	body := fmt.Sprintf(`{"templateID":%q,"metadata":{"kuasar-sandbox.resource":"{\"diff_cow\":{\"cache_size\":\"96MiB\"}}"}}`, id.String())
 	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(body),
-		header("X-Kuasar-Sandbox-Resource", `{"diff_cow":{"cache_size":"64MiB"}}`))
-	if response.Code != http.StatusCreated || request.Metadata[sandboxcfg.NsResource] != `{"diff_cow":{"cache_size":"64MiB"}}` {
+		header("X-Kuasar-Sandbox-Resource", `{"diff_cow":{"cache_size":"64MiB","discard":"manual"}}`))
+	if response.Code != http.StatusCreated || request.Metadata[sandboxcfg.NsResource] != `{"diff_cow":{"cache_size":"64MiB","discard":"manual"}}` {
 		t.Fatalf("create status=%d, metadata=%v, body=%s", response.Code, request.Metadata, response.Body.String())
 	}
 	spec, err := sandboxcfg.ParseSpec(request.Metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodeCache := "128MiB"
-	node := configresolve.SandboxResources(publicconfig.ResourcesConfig{DiffCOW: &publicconfig.ResourceDiffCOW{CacheSize: &nodeCache}})
+	nodeCache, nodeDiscard := "128MiB", "auto"
+	node := configresolve.SandboxResources(publicconfig.ResourcesConfig{DiffCOW: &publicconfig.ResourceDiffCOW{CacheSize: &nodeCache, Discard: &nodeDiscard}})
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{Node: node, Patch: spec.Resource})
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +179,8 @@ func TestCreateDiffCOWHeaderToColdConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Resources.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}) || node.DiffCOW.MaxDirtySize != nil {
+	if cfg.Resources.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432", Discard: "manual"}) ||
+		node.DiffCOW.MaxDirtySize != nil || *node.DiffCOW.Discard != "auto" {
 		t.Fatalf("node=%+v, runtime=%+v", node.DiffCOW, cfg.Resources.DiffCOW)
 	}
 }

@@ -94,7 +94,7 @@ func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePo
 	}
 	if cow := in.DiffCOW; cow != nil {
 		out.DiffCOW = &sandboxcfg.DiffCOWPatch{
-			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), Discard: clonePtr(cow.Discard),
 		}
 	}
 	if in.WatermarkHigh != nil {
@@ -121,7 +121,7 @@ func PublicSandboxResources(policy sandboxcfg.NodeResourcePolicy) publicconfig.R
 	}
 	if cow := policy.DiffCOW; cow != nil {
 		out.DiffCOW = &publicconfig.ResourceDiffCOW{
-			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), Discard: clonePtr(cow.Discard),
 		}
 	}
 	if policy.WatermarkHigh != nil {

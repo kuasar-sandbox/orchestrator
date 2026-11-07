@@ -16,7 +16,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/kuasar-sandbox/accelerator v0.1.10
 	github.com/kuasar-sandbox/connector v0.1.6
-	github.com/kuasar-sandbox/sandboxer v0.1.13-preview.20261104.1
+	github.com/kuasar-sandbox/sandboxer v0.1.14-preview.20261107.0.20261106234250-7caf9e110f63
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector v0.145.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter v0.145.0

@@ -835,7 +835,7 @@ JSON 对象)注入,零 SDK/API 改动。这些独立的 typed 租户 schema 定�
 
 | 命名空间 | 去向 |
 |---|---|
-| `resource` | 按叶子合并的严格资源 patch，支持 capacity、allocatable、startup 和 DiffCOW 缓存限制 |
+| `resource` | 按叶子合并的严格资源 patch，支持 capacity、allocatable、startup、DiffCOW 缓存限制与冷启动 discard 策略（[资源 schema](node-resource_zh.md#request-resources)） |
 | `traffic` | host-only 的 per-Sandbox `max_inflight.{total,forward,e2b:envd,e2b:code-interpreter,exec}` 显式 patch;不进入 guest |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |

@@ -587,8 +587,13 @@ func (p Params) BuildSnapshotHostConfig() (*SnapshotHostConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	resources := p.Resources
+	// Memory restore resumes the captured ext4 mounts. Keep the resolved
+	// cold-mount policy in Params and leave durable request metadata intact for
+	// later cold launches, but do not pass it as a restore-time mount override.
+	resources.DiffCOW.Discard = ""
 	return &SnapshotHostConfig{
-		Resources: p.Resources,
+		Resources: resources,
 		Timeouts:  p.Timeouts,
 		Usage:     usage,
 		Network:   p.buildRuntimeNetwork(),

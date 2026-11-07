@@ -197,7 +197,7 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 	}
 	host := &rtconfig.SandboxConfig{
 		Resources: rtconfig.ResourcesConfig{
-			DiffCOW:     rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"},
+			DiffCOW:     rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432", Discard: "manual"},
 			Capacity:    rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
 			Allocatable: rtconfig.AllocatableConfig{CPU: 2, Memory: "2GiB"},
 		},
@@ -230,6 +230,7 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 		"launch.plugin", "launch.user", "launch.stop_signal",
 		"launch.stop_grace_period", "resources.allocatable.deflate_on_oom",
 		"resources.diff_cow.cache_size", "resources.diff_cow.max_dirty_size",
+		"resources.diff_cow.discard",
 		"mounts", "files", "init", "metadata",
 	} {
 		if !presence.Has(path) {
@@ -577,6 +578,7 @@ func artifactRendererParams(mode types.LaunchMode) Params {
 
 func TestGeneratedSandboxHostConfigSatisfiesApplyFromRules(t *testing.T) {
 	p := artifactRendererParams(types.LaunchCold)
+	p.Resources.DiffCOW.Discard = "manual"
 	p.EnvVars = map[string]string{"ROW": "must-not-rebind"}
 	p.Spec.Files = []rtconfig.FileConfig{{Path: "/etc/row", Content: "must-not-rebind"}}
 	body, err := p.BuildYAML()
@@ -618,6 +620,7 @@ func TestGeneratedSandboxHostConfigSatisfiesApplyFromRules(t *testing.T) {
 
 func TestGeneratedSnapshotHostConfigSatisfiesApplyRestoreRules(t *testing.T) {
 	p := artifactRendererParams(types.LaunchMemory)
+	p.Resources.DiffCOW.Discard = "manual"
 	p.EnvVars = map[string]string{"ROW": "forbidden"}
 	p.Spec.Files = []rtconfig.FileConfig{{Path: "/etc/row", Content: "forbidden"}}
 	body, err := p.BuildYAML()
@@ -628,7 +631,7 @@ func TestGeneratedSnapshotHostConfigSatisfiesApplyRestoreRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"launch", "files", "ephemeral_files", "init", "mounts", "metadata", "boot.cmdline", "boot.disks"} {
+	for _, field := range []string{"launch", "files", "ephemeral_files", "init", "mounts", "metadata", "boot.cmdline", "boot.disks", "resources.diff_cow.discard"} {
 		if presence.Any(field) {
 			t.Fatalf("Snapshot host renderer emitted forbidden %s:\n%s", field, body)
 		}
@@ -645,8 +648,10 @@ func TestGeneratedSnapshotHostConfigSatisfiesApplyRestoreRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRestoreRules rejected generated config: %v\n%s", err, body)
 	}
-	if runtime.Resources.DiffCOW != p.Resources.DiffCOW {
-		t.Fatalf("restore S lost host DiffCOW: %+v", runtime.Resources.DiffCOW)
+	wantCOW := p.Resources.DiffCOW
+	wantCOW.Discard = ""
+	if runtime.Resources.DiffCOW != wantCOW || p.Resources.DiffCOW.Discard != "manual" {
+		t.Fatalf("restore S changed cache or original cold-mount policy: runtime=%+v source=%+v", runtime.Resources.DiffCOW, p.Resources.DiffCOW)
 	}
 	if runtime.Launch.Env["ARTIFACT"] != "yes" || c0.Metadata["owner"] != "artifact" {
 		t.Fatalf("Snapshot restore changed C0: runtime=%+v c0=%+v", runtime.Launch, c0.Metadata)
