@@ -237,7 +237,7 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--config` | `/etc/node-ctl/conductor.yaml` | conductor 配置文件([配置](#conductor-configuration)) |
+| `--config` | `/etc/node-ctl/conductor.yaml` | 单个 YAML 路径或有序 `PATH[:PATH...]`([配置](#conductor-configuration)) |
 
 启动序列:打开 sqlite(文件 chmod 0600)→ 恢复并验证持久 pool/unit 身份 → 生成并安装 systemd 模板单元([进程管理(systemd 模板单元,启动时自动生成安装)](#systemd-pools))→
 Sandbox 重启对账([可靠性](#recovery))→(配 `resource_listen` 则起内置资源控制器,
@@ -313,6 +313,47 @@ declarative defaults 和已提供值的枚举/duration/range/格式校验；它�
 文件或根据 executable 决定启动必填项。同一输入的结果不随 `NODE_CONFIG_ENCRYPTION_KEY` 改变。
 未知 YAML 字段和多文档输入会失败，Config 的 JSON/YAML 只包含可序列化 declarative 数据，
 不含 logger、provider 或运行时句柄。
+
+<a id="configuration-files"></a>
+
+**单文件或显式文件列表。** Conductor、Proxy 和 Telemetry 的 `--config` 支持
+`PATH[:PATH...]`。`node-ctl config` 及公共 `LoadConductor`、`LoadProxy`、
+`LoadTelemetry` 使用同一加载规则：
+
+```bash
+node-ctl conductor serve --config base.yaml:platform.yaml:instance.yaml
+node-ctl proxy serve --config proxy.yaml:proxy-instance.yaml
+node-ctl telemetry serve --config telemetry.yaml:telemetry-instance.yaml
+node-ctl config conductor --config base.yaml:platform.yaml:instance.yaml
+```
+
+只读取显式列出的文件，严格从左到右处理，不排序、不去重；原有单文件调用和默认路径
+继续有效。冒号作为列表分隔符，路径本身不能包含冒号，空路径段报错。目录发现、通配符
+展开和文件顺序由调用方或服务启动脚本负责；重复 `--config` 不会累积文件。
+
+映射按键递归合并；后层标量和整个数组替换继承值。后层 `null` 删除相应继承键，第一份
+文件的 `null` 保留原有单文件语义。空映射不清空已有键。显式 `false`、`0`、空字符串及
+空数组进入原生默认值与校验规则，例如空 DNS 数组采用原生默认值，空 `runner_pools`
+数组仍不合法。从继承的旧执行池配置切换到显式执行池时，先删除旧字段：
+
+```yaml
+# platform.yaml 覆盖包含 units.runner / runner_pool_size 的基础配置。
+units:
+  runner: null
+  runner_pool_size: null
+  runner_pools:
+    - unit: sandbox-runner@.service
+      size: 2
+```
+
+各文件先独立解析 anchors 与 `<<`，再进行跨文件合并，不支持跨文件 alias 引用。
+覆盖锚点定义所在字段不会改变同文件其他引用字段原先的值。语法错误、重复键、多文档
+在每个文件中检查，即使后层会覆盖对应内容也会报错并指出路径。字段解码、默认值和
+声明式校验仅对合并后的配置执行一次，片段可以不完整。总输入与最终合并 YAML 均限制为
+4 MiB。配置值中的相对路径解释保持现状；不新增 include、模板替换、按名称合并数组
+或热更新。`DecodeConductor`、`DecodeProxy`、`DecodeTelemetry` 仍从 reader 读取单个
+文档，不访问或发现配置文件。
+
 `ResourceAllocatable.Memory` 以 `*string` 公开 presence：`nil` 表示继承 internal resolver
 中的 `256MiB` 默认值，非 nil（包括显式 `256MiB`）表示 operator/custom `Configure`
 的明确策略，必须满足 capacity 上界。`SetMemory` / `InheritMemory` 只是便利方法；直接赋

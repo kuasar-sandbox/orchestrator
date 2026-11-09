@@ -656,9 +656,11 @@ routing 和两个带 queue/retry 的 OTLP HTTP sink. 添加 `local.enabled` 和
 ### 配置、关闭与验证
 
 通过 `node-ctl config telemetry --template` 或
-`node-ctl config telemetry --config FILE [--resolve]` 检查声明。`--resolve` 对 telemetry
-没有额外作用。YAML 限一个严格解码 document、最多 4 MiB；未知/重复字段失败。默认值
-只应用一次，不在 custom hook 后重新填充。`paths.telemetry_executable` 沿用 sealed
+`node-ctl config telemetry --config PATH[:PATH...] [--resolve]` 检查声明。serve 与配置
+诊断共用[配置文件加载规则](node_zh.md#configuration-files)，每个文件仅一个 YAML 文档，
+总输入与最终合并 YAML 均最多 4 MiB。`--resolve` 对 telemetry 没有额外作用。
+最终配置中的未知字段及每个文件内的重复键会失败；默认值只对合并结果应用一次，
+不在 custom hook 后重新填充。`paths.telemetry_executable` 沿用 sealed
 bootstrap 选择受信静态 App，不使用 Go runtime plugin。参见
 [部署 YAML](../deploy/telemetry.example.yaml)、[service unit](../deploy/node-telemetry.service)、
 [custom telemetry](../examples/custom-telemetry/README_zh.md)。

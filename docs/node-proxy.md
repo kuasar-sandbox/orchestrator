@@ -201,6 +201,10 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 Static customization interfaces, configuration hooks, runtime binding, private route sources and authorized forwarding are defined in [Extensions](extensions.md#proxy-bootstrap).
 
+`--config` also accepts an ordered `base.yaml:override.yaml` list. The master
+loads and merges it once; workers continue to use the frozen bootstrap
+configuration. See the shared [configuration-file rules](node.md#configuration-files).
+
 `proxy.yaml` fields:
 
 | Field | Default | Meaning |

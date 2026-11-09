@@ -348,6 +348,9 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 静态定制接口、配置 Hook、运行期绑定、私有路由及授权转发见 [扩展指南](extensions_zh.md#proxy-bootstrap)。
 
+`--config` 也支持有序 `base.yaml:override.yaml` 列表，由 master 加载合并一次；
+worker 继续使用冻结后的 bootstrap 配置。共享规则见[配置文件加载](node_zh.md#configuration-files)。
+
 `proxy.yaml` 字段:
 
 | 字段 | 默认 | 说明 |

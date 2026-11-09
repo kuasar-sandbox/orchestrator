@@ -25,11 +25,11 @@ import (
 //	  [-o <file>]                                        # write to file (default stdout)
 func configCmd(args []string, _ *slog.Logger) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: node-ctl config <conductor|proxy|telemetry> [--template | --config <f> [--resolve]] [-o <f>]")
+		return fmt.Errorf("usage: node-ctl config <conductor|proxy|telemetry> [--template | --config PATH[:PATH...] [--resolve]] [-o <f>]")
 	}
 	role := args[0]
 	fs := flag.NewFlagSet("config "+role, flag.ExitOnError)
-	cfgPath := fs.String("config", "", "input config YAML to normalize + validate")
+	cfgPath := fs.String("config", "", "configuration YAML path or ordered PATH[:PATH...] list to normalize + validate")
 	template := fs.Bool("template", false, "emit a commented skeleton for the role")
 	resolve := fs.Bool("resolve", false, "expand auto/derived values to the effective form")
 	out := fs.String("o", "", "write output to this file instead of stdout")
@@ -70,7 +70,7 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 		return []byte(conductorConfigSkeleton), nil
 	}
 	if path == "" {
-		return nil, fmt.Errorf("config conductor: --config <file> or --template required")
+		return nil, fmt.Errorf("config conductor: --config PATH[:PATH...] or --template required")
 	}
 	cfg, err := config.LoadConductor(path)
 	if err != nil {
@@ -121,7 +121,7 @@ func renderProxyConfig(template bool, path string) ([]byte, error) {
 		return []byte(proxyConfigSkeleton), nil
 	}
 	if path == "" {
-		return nil, fmt.Errorf("config proxy: --config <file> or --template required")
+		return nil, fmt.Errorf("config proxy: --config PATH[:PATH...] or --template required")
 	}
 	cfg, err := config.LoadProxy(path)
 	if err != nil {
