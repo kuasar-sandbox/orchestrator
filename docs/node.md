@@ -439,7 +439,7 @@ Before assignment, run-sandbox accepts only membership in its matching RunID uni
 
 sandbox-ctl restores CLOEXEC immediately, configures limits and creates CH atomically in vmm with clone3(CLONE_INTO_CGROUP). memory.high therefore constrains VMM while sandbox-ctl can service UFFD/vsock/signals/reaping under guest pressure. Sandboxer owns high, balloon target/current and grow/shrink ordering; node controller only handles reservation requests. Linux 5.7+ and seccomp permission for clone3 are required. Unsupported hosts fail closed, with no post-start migration/shared-cgroup fallback.
 
-KillMode=control-group covers ctl/vmm recursively. systemd reclaims the delegated subtree after StopUnit; conductor need not move processes or remove cgroups itself. Delegation/hierarchy/controller/FD failures precede CH startup.
+KillMode=control-group covers ctl/vmm recursively. After StopUnit/ResetFailed and confirmation that the unit is inactive, or confirmation that it is absent, conductor prunes any remaining empty delegated runner cgroup subtree. Cleanup requires cgroup.events populated=0 and removes directories only; it neither kills nor moves processes, and failures retain ownership for retry. Delegation/hierarchy/controller/FD failures precede CH startup.
 
 <a id="numa-deployment-with-multiple-pools"></a>
 
