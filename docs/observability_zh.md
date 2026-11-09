@@ -225,8 +225,11 @@ sandbox:
 
 默认值分别为 false、`1s` 和 `5m`. 周期必须是正的 Go duration, flush 不小于
 sample, sample 的两倍不得超出原生有符号 duration 范围. 关闭时也执行校验.
-显式 null、错误类型、未知/重复字段和 YAML merge key 均拒绝. Clone、配置输出、
-外部 conductor bootstrap 和 Configure hook 后的最终校验保留同一策略.
+单文件加载和直接调用 `DecodeConductor` 会拒绝 `usage` 内的显式 null、错误类型、
+未知/重复字段和 merge key. 多个 `PATH[:PATH...]` 输入先解析各文件内的 YAML merge,
+后续文件中的 null 映射值删除继承键, 再校验合并后的 `usage`. 首文件的 null
+仍作为值保留; 每个文件的重复键在合并前就会被拒绝. Clone、配置输出、外部
+conductor bootstrap 和 Configure hook 后的最终校验保留最终得到的策略.
 
 Conductor 将节点策略下发到 image cold start、`run --from` 和 `run --restore`.
 Usage 是宿主策略, 不进入 portable E/S artifact; 恢复使用当前节点策略. 启用
@@ -292,8 +295,9 @@ Build phase target 携 `KUASAR_BUILD_ID`、`KUASAR_RUN_ID`。字段不从环境�
 | `console` | runner/Build phase 的 `--console` | guest 内核 dmesg | 仅宿主;不进入 SDK Build 流 |
 
 所有这些 native stream 直写 journal,不经临时日志文件。run-builder 里程碑与 envd RUN 回放使用
-pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CLI、CH stderr、panic 与
-发送失败 fallback 保留原有出口。Builder 单元设置 `LogRateLimitIntervalSec=0`,runner 保留默认限流;
+pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CLI、CH stderr 与 panic
+保留原有出口。发送失败遵循[下文各输出路径的规则](#journal-boundaries-and-verification)。
+Builder 单元设置 `LogRateLimitIntervalSec=0`,runner 保留默认限流;
 这不保证 journal/storage 故障下零丢失、恰好一次持久化或零阻塞发送。
 
 <a id="journal-ownership-and-output-targets"></a>
@@ -372,8 +376,16 @@ exporter 或中心日志存储。
 `--log-to` 只选择运行时组件诊断出口，不替换进程描述符，不接管 Cloud Hypervisor
 stderr、runtime panic、node-ctl pre-exec 信息或 systemd 事件。
 
-原生发送是同步且尽力而为的。成功后不再复制到 stderr；失败则回退到原始出口。
-不承诺恰好一次持久化日志或零阻塞。
+发送行为取决于 writer 和所选 sandboxer 版本。包含
+[独立诊断发送](https://github.com/kuasar-sandbox/sandboxer/pull/431)的版本中，
+app stdio 与 console 保留同步背压，发送失败时尽力回退到原始出口。显式
+`--log-to` 使用 `OpenDiagnostic`：拥塞或发送失败会丢弃当前消息，不同步回退到
+stderr。旧二进制保留其版本的发送行为；仅凭 orchestrator 的 Go module 固定依赖
+无法确定外部 `sandbox-ctl` 可执行文件的版本。
+
+Run-builder 自身的 writer 仅在构造时 `journal.Enabled()` 为 false 才选择 stderr。
+选择 journal 后，后续 `journal.Send` 错误被忽略，不会改为写 stderr。发送成功的
+journal 消息不再复制到 stderr。不承诺恰好一次持久化日志或零阻塞。
 
 测试覆盖实际生成的 runner/Build 参数、StableID 回退及独立值、恢复/import/新对象
 隔离、转义和文件/捕获行为保留。owner E2E runner 用 journal cursor 包围真实沙箱、
