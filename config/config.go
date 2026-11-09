@@ -15,7 +15,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -925,19 +924,10 @@ func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
 }
 
 // LoadConductor reads, strictly decodes, defaults, and declaratively validates
-// a conductor configuration file. Startup callers must separately invoke
+// one file or an ordered PATH[:PATH...] list. Startup callers separately invoke
 // ValidateConductorFinal after any custom Configure hook.
 func LoadConductor(path string) (*Conductor, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("config: read %s: %w", path, err)
-	}
-	defer f.Close()
-	c, err := DecodeConductor(f)
-	if err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
-	}
-	return c, nil
+	return loadYAMLConfig(path, "config", DecodeConductor)
 }
 
 // DecodeConductor strictly decodes one YAML document, applies declarative
@@ -1392,20 +1382,11 @@ type ProxyPathsConfig struct {
 	RunRoot         string `yaml:"run_root" json:"run_root"`                                     // sandbox runtime root containing <sid>/ctl.sock; required
 }
 
-// LoadProxy reads the proxy master config, applies defaults, and validates
+// LoadProxy reads one file or an ordered PATH[:PATH...] list, defaults, and validates
 // provided declarative values. Startup callers separately validate final
 // requirements after any custom Configure hook.
 func LoadProxy(path string) (*Proxy, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("proxy config: read %s: %w", path, err)
-	}
-	defer f.Close()
-	p, err := DecodeProxy(f)
-	if err != nil {
-		return nil, fmt.Errorf("proxy config: parse %s: %w", path, err)
-	}
-	return p, nil
+	return loadYAMLConfig(path, "proxy config", DecodeProxy)
 }
 
 // DecodeProxy strictly decodes one proxy YAML document, applies declarative

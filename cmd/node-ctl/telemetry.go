@@ -16,10 +16,10 @@ import (
 
 func telemetryCmd(args []string, logger *slog.Logger) error {
 	if len(args) < 1 || args[0] != "serve" {
-		return fmt.Errorf("usage: node-ctl telemetry serve [--config <telemetry.yaml>]")
+		return fmt.Errorf("usage: node-ctl telemetry serve [--config PATH[:PATH...]]")
 	}
 	flags := flag.NewFlagSet("telemetry serve", flag.ContinueOnError)
-	path := flags.String("config", "/etc/node-ctl/telemetry.yaml", "telemetry config file")
+	path := flags.String("config", "/etc/node-ctl/telemetry.yaml", "telemetry configuration YAML path or ordered PATH[:PATH...] list")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}

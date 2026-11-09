@@ -176,7 +176,7 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--config` | `/etc/node-ctl/conductor.yaml` | Conductor configuration ([Configuration](#conductor-configuration)) |
+| `--config` | `/etc/node-ctl/conductor.yaml` | One YAML path or ordered `PATH[:PATH...]` ([Configuration](#conductor-configuration)) |
 
 Startup opens SQLite with file mode 0600, restores and validates persisted pool/unit identities, generates/installs systemd templates ([Process management through systemd template units](#systemd-pools)), reconciles Sandbox restart state ([Reliability](#recovery)), starts the optional embedded resource controller, binds and confirms the local control socket ([Local control socket: run, task, admin, plugin and API planes](#local-control-channels)), reconciles Builds behind their bootstrap/result recovery gate, then starts the 5-second TTL reaper, runner/builder pools and Build admission ([Target-aware execution and publication](node-build.md#execution-and-publication)), optionally dials `cluster.node_link.endpoint` ([Cluster integration (node-link)](cluster.md#node-attachment)), then listens on `api.listen`. That listener serves only the wrapped control API; sandbox data Host requests and CONNECT do not reach backends. With no TLS certificates it serves plaintext h2c; development SDK control uses `E2B_API_URL`.
 
@@ -220,6 +220,55 @@ The command performs strict declarative decoding, defaulting and diagnosis. It n
 ## Configuration
 
 Conductor uses `conductor.yaml`. The fully commented [deploy/conductor.example.yaml](../deploy/conductor.example.yaml) matches the shape of `node-ctl config conductor --template`. The authoritative type is `config.Conductor` in public package `github.com/kuasar-sandbox/orchestrator/config`; internal code reuses that schema. It provides strict `LoadConductor`/`DecodeConductor`, `LoadProxy`/`DecodeProxy`, final validators that do not reapply defaults after hooks, and genuinely deep `Clone` operations. Decode/Load perform bounded strict decoding, declarative defaulting and enum/duration/range/format validation of supplied values. They do not inspect environment, component files or executable-dependent startup requirements. Identical input produces identical results regardless of `NODE_CONFIG_ENCRYPTION_KEY`. Unknown YAML fields and multiple documents fail. Config JSON/YAML contains only serializable declarations, never loggers, providers or runtime handles.
+
+<a id="configuration-files"></a>
+
+**One file or an explicit file list.** Conductor, Proxy and Telemetry accept
+`--config PATH[:PATH...]`. The same ordered input is accepted by `node-ctl config`
+and the public `LoadConductor`, `LoadProxy` and `LoadTelemetry` functions:
+
+```bash
+node-ctl conductor serve --config base.yaml:platform.yaml:instance.yaml
+node-ctl proxy serve --config proxy.yaml:proxy-instance.yaml
+node-ctl telemetry serve --config telemetry.yaml:telemetry-instance.yaml
+node-ctl config conductor --config base.yaml:platform.yaml:instance.yaml
+```
+
+Only the listed files are read, from left to right, without sorting or
+deduplication. Existing single-file calls and default paths remain valid.
+The colon is a list separator; paths must not contain it and empty list elements
+are errors. Directory discovery, glob expansion and ordering belong to the caller
+or service startup script. Repeating `--config` does not accumulate paths.
+
+Mappings merge recursively; later scalar values and complete arrays replace
+inherited values. A later `null` removes the corresponding inherited key; nulls
+in the first file retain native single-document meaning. An empty mapping does
+not clear inherited keys. Explicit `false`, `0`, empty strings and empty arrays
+reach the existing defaults and validation rules: for example, an empty DNS
+array selects the native default, while an empty `runner_pools` array is invalid.
+To switch an inherited legacy execution-pool definition, remove its old fields:
+
+```yaml
+# platform.yaml overrides a base file containing units.runner/runner_pool_size.
+units:
+  runner: null
+  runner_pool_size: null
+  runner_pools:
+    - unit: sandbox-runner@.service
+      size: 2
+```
+
+Each file independently resolves YAML anchors and `<<` before the cross-file
+merge; aliases never reference another file. Replacing an anchor's defining
+field leaves other fields at their original file-local values. Syntax errors,
+duplicate keys and multiple documents fail with the input path even when a
+later file would overwrite the affected values. Field decoding, defaults and
+declarative validation run once on the final configuration, so individual
+fragments may be incomplete. Both total input and final merged YAML are limited
+to 4 MiB. Relative configuration values keep their existing interpretation;
+there is no include, template expansion, array-by-name merge or hot reload.
+`DecodeConductor`, `DecodeProxy` and `DecodeTelemetry` still read one document
+from their reader and never discover or open files.
 
 Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under `resources`/`network`/`boot`), `builder`, `checkpoint`, `mmds`, `cluster` (node-link, [Cluster integration (node-link)](cluster.md#node-attachment)) and `resource_listen` (embedded controller with all tuning inline; [node-resource.md](node-resource.md)). `encryption_key` and `manifest_config` are top-level values. Built-in node-ctl explicitly performs final declarative validation, then runtime resolution reads the environment/YAML encryption key. Custom conductor validates after Configure; Runtime providers may supply key/TLS/object-store material. A provider overrides environment/YAML and never falls back after failure. Helper executable paths (`sandbox-ctl`, `connector-ctl`, `flatten-ctl`) are outside public Config. Resolution starts at the original node-ctl's exact adjacent release directory, retaining PATH fallback when a helper is absent.
 

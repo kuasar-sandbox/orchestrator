@@ -13,7 +13,7 @@ func renderTelemetryConfig(template bool, path string) ([]byte, error) {
 		return []byte(telemetryConfigSkeleton), nil
 	}
 	if path == "" {
-		return nil, fmt.Errorf("config telemetry: --config <file> or --template required")
+		return nil, fmt.Errorf("config telemetry: --config PATH[:PATH...] or --template required")
 	}
 	cfg, err := config.LoadTelemetry(path)
 	if err != nil {

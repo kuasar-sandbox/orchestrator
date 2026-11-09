@@ -22,7 +22,7 @@ import (
 // private re-executions detected before CLI parsing in main.
 func runProxy(args []string, logger *slog.Logger) error {
 	flags := flag.NewFlagSet("proxy serve", flag.ContinueOnError)
-	configPath := flags.String("config", "/etc/node-ctl/proxy.yaml", "proxy config file")
+	configPath := flags.String("config", "/etc/node-ctl/proxy.yaml", "proxy configuration YAML path or ordered PATH[:PATH...] list")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}

@@ -724,10 +724,13 @@ starts neither Collector nor local storage.
 ### Configuration, shutdown and verification
 
 Use `node-ctl config telemetry --template`, or
-`node-ctl config telemetry --config FILE [--resolve]`, to inspect declarations.
-`--resolve` has no extra telemetry-specific effect. YAML is one strictly decoded
-document, capped at 4 MiB; unknown/duplicate fields fail. Defaults are applied
-once, not after custom hooks. `paths.telemetry_executable` selects a trusted
+`node-ctl config telemetry --config PATH[:PATH...] [--resolve]`, to inspect declarations.
+Serve and config diagnosis share the ordered multi-file loading rules in
+[configuration files](node.md#configuration-files); each file contains one YAML
+document, and total input and final merged YAML are capped at 4 MiB.
+`--resolve` has no extra telemetry-specific effect. Unknown final fields and
+per-file duplicate keys fail. Defaults are applied once to the merged result,
+not after custom hooks. `paths.telemetry_executable` selects a trusted
 static App through the existing sealed bootstrap, not Go runtime plugins.
 See [deploy YAML](../deploy/telemetry.example.yaml),
 [service unit](../deploy/node-telemetry.service) and

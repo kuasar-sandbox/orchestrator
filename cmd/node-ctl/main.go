@@ -1,12 +1,12 @@
 // Command node-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
-//	node-ctl conductor serve --config <conductor.yaml>          # run the node conductor
-//	node-ctl proxy serve --config <proxy.yaml>                  # independent data-plane Proxy master
-//	node-ctl telemetry serve --config <telemetry.yaml>          # independent sandbox metrics Collector
+//	node-ctl conductor serve --config PATH[:PATH...]            # run the node conductor
+//	node-ctl proxy serve --config PATH[:PATH...]                # independent data-plane Proxy master
+//	node-ctl telemetry serve --config PATH[:PATH...]            # independent sandbox metrics Collector
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	                                                                    # in-unit launchers (not for humans)
-//	node-ctl config <conductor|proxy|telemetry> [--template|--config <f>|--resolve]  # config diagnose / generate
+//	node-ctl config <conductor|proxy|telemetry> [--template|--config PATH[:PATH...]|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain|pressure>                      # node reservation controller inspection (hosted in serve via resource_listen)
@@ -102,21 +102,21 @@ func usage() {
 
 func conductorCmd(args []string, log *slog.Logger) error {
 	if len(args) < 1 || args[0] != "serve" {
-		return fmt.Errorf("usage: node-ctl conductor serve [--config <conductor.yaml>]")
+		return fmt.Errorf("usage: node-ctl conductor serve [--config PATH[:PATH...]]")
 	}
 	return runConductor(args[1:], log)
 }
 
 func proxyCmd(args []string, log *slog.Logger) error {
 	if len(args) < 1 || args[0] != "serve" {
-		return fmt.Errorf("usage: node-ctl proxy serve [--config <proxy.yaml>]")
+		return fmt.Errorf("usage: node-ctl proxy serve [--config PATH[:PATH...]]")
 	}
 	return runProxy(args[1:], log)
 }
 
 func runConductor(args []string, log *slog.Logger) error {
 	flags := flag.NewFlagSet("conductor serve", flag.ExitOnError)
-	configPath := flags.String("config", "/etc/node-ctl/conductor.yaml", "config file")
+	configPath := flags.String("config", "/etc/node-ctl/conductor.yaml", "configuration YAML path or ordered PATH[:PATH...] list")
 	_ = flags.Parse(args)
 	cfg, err := publicconfig.LoadConductor(*configPath)
 	if err != nil {

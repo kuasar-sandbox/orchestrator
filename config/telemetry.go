@@ -5,7 +5,6 @@ import (
 	"io"
 	"math"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -88,13 +87,10 @@ var defaultE2BMetrics = map[string]string{
 	"diskTotal": "sandbox.disk.total", "diskUsed": "sandbox.disk.used",
 }
 
+// LoadTelemetry reads one file or an ordered PATH[:PATH...] list and applies
+// the same defaults and validation as DecodeTelemetry.
 func LoadTelemetry(path string) (*Telemetry, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("telemetry config: %w", err)
-	}
-	defer file.Close()
-	return DecodeTelemetry(file)
+	return loadYAMLConfig(path, "telemetry config", DecodeTelemetry)
 }
 
 func DecodeTelemetry(reader io.Reader) (*Telemetry, error) {
