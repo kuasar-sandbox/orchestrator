@@ -14,9 +14,9 @@ require (
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
-	github.com/kuasar-sandbox/accelerator v0.1.10
-	github.com/kuasar-sandbox/connector v0.1.6
-	github.com/kuasar-sandbox/sandboxer v0.1.14
+	github.com/kuasar-sandbox/accelerator v0.1.12
+	github.com/kuasar-sandbox/connector v0.1.8
+	github.com/kuasar-sandbox/sandboxer v0.1.15
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector v0.145.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter v0.145.0
