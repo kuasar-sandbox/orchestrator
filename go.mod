@@ -16,7 +16,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/kuasar-sandbox/accelerator v0.1.10
 	github.com/kuasar-sandbox/connector v0.1.6
-	github.com/kuasar-sandbox/sandboxer v0.1.14-preview.20261107.1.0.20261107022758-3b3bff611621
+	github.com/kuasar-sandbox/sandboxer v0.1.14
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector v0.145.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter v0.145.0
@@ -266,7 +266,7 @@ require (
 	go.opentelemetry.io/collector/internal/telemetry v0.145.0 // indirect
 	go.opentelemetry.io/collector/pdata/pprofile v0.148.0 // indirect
 	go.opentelemetry.io/collector/pdata/testdata v0.148.0 // indirect
-	go.opentelemetry.io/collector/pdata/xpdata v0.145.0 // indirect
+	go.opentelemetry.io/collector/pdata/xpdata v0.148.0 // indirect
 	go.opentelemetry.io/collector/pipeline v1.54.0 // indirect
 	go.opentelemetry.io/collector/pipeline/xpipeline v0.145.0 // indirect
 	go.opentelemetry.io/collector/processor/processorhelper v0.145.0 // indirect
@@ -325,6 +325,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-// Match the pdata version required by Prometheus; the old xpdata uses removed pooling APIs.
-replace go.opentelemetry.io/collector/pdata/xpdata => go.opentelemetry.io/collector/pdata/xpdata v0.148.0

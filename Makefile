@@ -96,7 +96,7 @@ VERSION ?= v0.1.0
 KUASAR_PLATFORM_DIR ?= ../kuasar-sandbox
 ACCELERATOR_VERSION ?= v0.1.10
 CONNECTOR_VERSION ?= v0.1.6
-SANDBOXER_VERSION ?= v0.1.13-preview.20261104.1
+SANDBOXER_VERSION ?= v0.1.14
 
 release:
 	@set -e; workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
