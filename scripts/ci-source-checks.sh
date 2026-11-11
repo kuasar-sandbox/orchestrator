@@ -3,6 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+bash test/source/go_consumer.sh
 go test -count=1 -timeout=5m ./...
 # Give each race-instrumented package the source Workbench's two CPUs. Tests
 # retain their own goroutine/subprocess concurrency and per-package deadline.
