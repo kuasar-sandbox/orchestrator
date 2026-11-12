@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	MMDSRouteStatic  = "static"
-	MMDSRouteSecret  = "secret"
-	MMDSRouteService = "service"
+	MMDSRouteStatic      = "static"
+	MMDSRouteSecret      = "secret"
+	MMDSRouteService     = "service"
+	MMDSRouteHoldTraffic = "hold-traffic"
 
 	defaultMMDSContentType = "text/plain"
 	maxMMDSContentType     = 256
@@ -430,6 +431,10 @@ func validateMMDSEffective(part partialMMDS, policy MMDSPolicy, requireServices 
 				}
 			}
 			referencedSecrets[r.Secret] = struct{}{}
+		case MMDSRouteHoldTraffic:
+			if p.secret || p.service || p.data || p.contentType {
+				return MMDSDocument{}, fmt.Errorf("MMDS route %q: hold-traffic accepts only path and type", path)
+			}
 		case MMDSRouteService:
 			if !p.service || r.Service == "" {
 				return MMDSDocument{}, fmt.Errorf("MMDS route %q: service is required", path)
@@ -529,11 +534,14 @@ func reservedMMDSPathCollision(path string, configured []string) bool {
 		return true
 	}
 	for _, prefix := range configured {
+		if prefix == "/" {
+			return true
+		}
 		prefix = strings.TrimSuffix(prefix, "/")
 		if prefix == "" {
 			continue
 		}
-		if prefix == "/" || path == prefix || strings.HasPrefix(path, prefix+"/") {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}
 	}

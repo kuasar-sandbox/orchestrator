@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -163,6 +164,7 @@ func TestClusterKnownTargetCountsOnlyFinalNodeWorker(t *testing.T) {
 }
 
 func waitClusterTraffic(t *testing.T, master *proxystats.MasterStats, sandboxID string, parking, egress uint64) {
+	master.ObserveRoute(routesync.RouteEntry{SandboxID: sandboxID, RunID: "run-1", State: routesync.StateRunning, Hold: &routesync.HoldActivity{}})
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

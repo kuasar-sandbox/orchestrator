@@ -60,6 +60,7 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 	}
 	identity = RouteIdentity{Profile: types.ProfileBare, State: types.StateStarting}
 	missingRun.State = types.StateStarting
+	observeZero(master, "s1", "", types.StateStarting)
 	resp := do(missingRun)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("pre-assignment starting status=%d, want 200: %s", resp.Code, resp.Body.String())
@@ -75,6 +76,7 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 		RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused,
 		MaxInflight: publicconfig.MaxInflight{Total: 32, Forward: 8, Exec: 2},
 	}
+	observeZero(master, "s1", "run-1", types.StatePaused)
 	staleState := query
 	staleState.State = types.StateRunning
 	if resp := do(staleState); resp.Code != http.StatusServiceUnavailable {
@@ -104,6 +106,7 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 	var restarting atomic.Bool
 	master.InplaceRestart = restarting.Load
 	readyWorker(t, master, "w0", 1)
+	observeZero(master, "s1", "run-1", types.StateRunning)
 	socket := filepath.Join(t.TempDir(), "stats.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
@@ -123,7 +126,7 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].Stats == nil || len(results[0].Stats.Services) != 4 {
+	if len(results) != 1 || results[0].Stats == nil || len(results[0].Stats.Services) != 5 {
 		t.Fatalf("query results = %+v", results)
 	}
 	for _, active := range []bool{true, false} {

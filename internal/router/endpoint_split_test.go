@@ -23,6 +23,20 @@ func TestSandboxControlUsesOnlyAPIEndpoint(t *testing.T) {
 	var apiHits, dataHits atomic.Int32
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiHits.Add(1)
+		if strings.HasSuffix(r.URL.Path, "/traffic/hold") {
+			if r.URL.Path != "/sandboxes/sb-1-g0/traffic/hold" || r.Header.Get(HeaderAPIKey) != "e2b_test" {
+				t.Errorf("hold: wrong node identity or credentials")
+			}
+			if r.Method == http.MethodPut {
+				b, err := io.ReadAll(r.Body)
+				if err != nil || string(b) != `{"value":2,"ifMatch":0}` {
+					t.Errorf("hold: condition lost: %q (%v)", b, err)
+				}
+				w.WriteHeader(http.StatusConflict)
+			}
+			_, _ = io.WriteString(w, `{"value":1}`)
+			return
+		}
 		if r.Method == http.MethodDelete && r.URL.Path != "/sandboxes/sb-1-g0/checkpoints/capture-1" {
 			t.Errorf("checkpoint delete path=%s", r.URL.Path)
 		}
@@ -54,10 +68,16 @@ func TestSandboxControlUsesOnlyAPIEndpoint(t *testing.T) {
 		{method: http.MethodGet, path: "/sandboxes/sb-1"},
 		{method: http.MethodPost, path: "/sandboxes/sb-1/pause"},
 		{method: http.MethodPost, path: "/sandboxes/sb-1/timeout"},
+		{method: http.MethodGet, path: "/sandboxes/sb-1/traffic/hold"},
+		{method: http.MethodPut, path: "/sandboxes/sb-1/traffic/hold"},
 		{method: http.MethodDelete, path: "/sandboxes/sb-1/checkpoints/capture-1"},
 	}
 	for _, test := range requests {
-		req, _ := http.NewRequest(test.method, front.URL+test.path, nil)
+		var body io.Reader
+		if test.method == http.MethodPut {
+			body = strings.NewReader(`{"value":2,"ifMatch":0}`)
+		}
+		req, _ := http.NewRequest(test.method, front.URL+test.path, body)
 		req.Host = "api.test.local"
 		req.Header.Set(HeaderGroup, "/g")
 		req.Header.Set(HeaderRouteKey, "rk")
@@ -65,6 +85,18 @@ func TestSandboxControlUsesOnlyAPIEndpoint(t *testing.T) {
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if strings.HasSuffix(test.path, "/traffic/hold") {
+			content, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			want := http.StatusOK
+			if test.method == http.MethodPut {
+				want = http.StatusConflict
+			}
+			if err != nil || resp.StatusCode != want || string(content) != `{"value":1}` {
+				t.Fatalf("hold %s status=%d body=%q err=%v", test.method, resp.StatusCode, content, err)
+			}
+			continue
 		}
 		resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {

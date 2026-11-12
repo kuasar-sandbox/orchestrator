@@ -3,10 +3,13 @@ package proxyshm
 import (
 	"bytes"
 	"context"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-const testMMDSRoutes = `{"routes":[{"path":"/static","data":"x"},{"path":"/secret","type":"secret","secret":"key"},{"path":"/svc","type":"service","service":"local"}]}`
+const testMMDSRoutes = `{"routes":[{"path":"/static","data":"x"},{"path":"/secret","type":"secret","secret":"key"},{"path":"/svc","type":"service","service":"local"},{"type":"hold-traffic","path":"/hold"}]}`
 
 func routeValues(values map[string][]byte) *routesync.MMDSRouteSecretValues {
 	converted := routesync.MMDSRouteSecretValues(values)
@@ -78,6 +81,14 @@ func TestMMDSViewNilSecretProjectionFailsClosed(t *testing.T) {
 	view.Bookmark()
 	if got := view.Resolve("sandbox-1", "/secret"); !got.Unavailable {
 		t.Fatal("incomplete full-sync response metadata mismatch")
+	}
+	for _, path := range []string{"/static", "/svc", "/hold"} {
+		if got := view.Resolve("sandbox-1", path); !got.Found || got.Unavailable {
+			t.Fatalf("%s unavailable along with secret blob", path)
+		}
+	}
+	if got := view.Resolve("sandbox-1", "/unknown"); got.Found || got.Unavailable {
+		t.Fatal("unknown route should stay absent")
 	}
 }
 
@@ -243,12 +254,84 @@ func TestExternalWorkerRelaysServiceFromConductorPolicy(t *testing.T) {
 	defer client.Close()
 	worker := NewMMDSWorkerView(table, nil, nil, nil, time.Second, client)
 	route, found, err := worker.MMDSRoute(context.Background(), "sandbox-1", "/svc")
-	if err != nil || !found || route.StatusCode != http.StatusAccepted || route.ContentType != "application/json" || string(route.Body) != `{"external":true}` {
-		t.Fatalf("external service route metadata mismatch: found=%t status=%d content-type=%q err=%v", found, route.StatusCode, route.ContentType, err)
+	if err != nil || !found || route.ReadService == nil {
+		t.Fatalf("external service lookup: found=%t err=%v", found, err)
+	}
+	select {
+	case <-requestSeen:
+		t.Fatal("lookup invoked the external provider")
+	default:
+	}
+	result := route.ReadService(context.Background())
+	if result.StatusCode != http.StatusAccepted || result.ContentType != "application/json" || string(result.Body) != `{"external":true}` {
+		t.Fatalf("service GET = %+v", result)
 	}
 	select {
 	case <-requestSeen:
 	case <-time.After(time.Second):
 		t.Fatal("service did not receive request")
+	}
+}
+
+// Exercise the real guest handler, floating-IP/token binding, shared worker
+// view, master route lookup and hold RPC together, without a real guest VM.
+func TestHoldGuestAcrossWorkerMasterAndIncarnationChange(t *testing.T) {
+	_, wt, master, _ := newMMDSSourceTestViews(t, 4)
+	master.BeginSync()
+	r := testMMDSSourceRoute("sandbox-1", routesync.StateRunning, testMMDSSourceBase())
+	r.MmdsSecret = "00010203"
+	r.MMDSRoutes = testMMDSRoutes // includes a secret with unavailable values
+	applyMMDSSourceRoute(t, master, r)
+	master.Bookmark()
+	s, w := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var current int64
+	go mmdsrpc.NewServer(s, master.ResolveMMDS, nil).WithHold(ctx, func(_ context.Context, sid, run, path string, value, match *int64) (*int64, int) {
+		if sid != "sandbox-1" || run != "run-sandbox-1" || path != "/hold" {
+			t.Errorf("wrong guest binding: %q %q %q", sid, run, path)
+			return nil, 409
+		}
+		if match != nil && current != *match {
+			return &current, 409
+		}
+		if value != nil {
+			current = *value
+		}
+		return &current, 200
+	}).Serve()
+	client := mmdsrpc.NewClient(w)
+	defer client.Close()
+	worker := NewMMDSWorkerView(wt, nil, nil, nil, time.Second, client)
+	handler := mmds.New(worker, time.Second, nil).Handler()
+	call := func(method, path, token, body string) (int, string) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.RemoteAddr = r.FloatingIP + ":3333"
+		if method == http.MethodGet {
+			req.Body = http.NoBody
+		}
+		req.Header.Set("X-metadata-token-ttl-seconds", "60")
+		req.Header.Set("X-metadata-token", token)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+	status, token := call("PUT", "/latest/api/token", "", "")
+	if status != 200 {
+		t.Fatalf("mint failed: %d", status)
+	}
+	if s, b := call("PUT", "/hold?if-match=%30", token, "1"); s != 200 || b != "1" {
+		t.Fatalf("hold write = %d %q", s, b)
+	}
+	if s, b := call("GET", "/hold", token, ""); s != 200 || b != "1" {
+		t.Fatalf("hold read = %d %q", s, b)
+	}
+	if s, _ := call("GET", "/secret", token, ""); s != 503 {
+		t.Fatalf("unavailable secret = %d", s)
+	}
+	r.RunID = "run-2"
+	applyMMDSSourceRoute(t, master, r)
+	if s, _ := call("PUT", "/hold", token, "0"); s != 401 {
+		t.Fatalf("stale guest token status = %d", s)
 	}
 }

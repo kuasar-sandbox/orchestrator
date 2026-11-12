@@ -63,3 +63,61 @@ func TestClientFailsPendingRequestWhenConnectionCloses(t *testing.T) {
 		t.Fatal("pending request did not fail")
 	}
 }
+
+func TestHoldRPCDoesNotBlockMetadataAndRequiresDeclaration(t *testing.T) {
+	master, worker := net.Pipe()
+	entered, release := make(chan struct{}), make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	server := NewServer(master, func(sid, path string) EndpointResponse {
+		switch path {
+		case "/work":
+			return EndpointResponse{Found: true, Type: "hold-traffic"}
+		case "/public":
+			return EndpointResponse{Found: true, Type: "static", Body: []byte("data")}
+		default:
+			return EndpointResponse{}
+		}
+	}, nil).WithHold(ctx, func(ctx context.Context, sid, run, path string, value, match *int64) (*int64, int) {
+		if sid != "s" || run != "old-run" || path != "/work" || value == nil || *value != 0 || match == nil || *match != 3 {
+			t.Errorf("bad forwarded hold: %q %q %q %v %v", sid, run, path, value, match)
+		}
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, 503
+		}
+		actual := int64(9)
+		return &actual, 409
+	})
+	go server.Serve()
+	client := NewClient(worker)
+	defer client.Close()
+	done := make(chan error, 1)
+	zero, three := int64(0), int64(3)
+	go func() {
+		r, err := client.Hold(ctx, "s", "old-run", "/work", &zero, &three)
+		if err == nil && (r.HoldStatus != 409 || r.HoldValue == nil || *r.HoldValue != 9) {
+			err = fmt.Errorf("lost comparison result: %+v", r)
+		}
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("hold did not reach authority")
+	}
+	r, err := client.Resolve(ctx, "s", "/public")
+	if err != nil || !r.Found || string(r.Body) != "data" {
+		t.Fatalf("ordinary MMDS blocked by control request: %+v %v", r, err)
+	}
+	r, err = client.Hold(ctx, "s", "old-run", "/public", &zero, nil)
+	if err != nil || r.HoldStatus != 404 {
+		t.Fatalf("ordinary service accepted control operation: %+v %v", r, err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

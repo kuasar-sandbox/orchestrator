@@ -2,13 +2,16 @@ package proxystats
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -23,6 +26,10 @@ func readyWorker(t *testing.T, master *MasterStats, workerID string, epoch uint6
 	if err := master.Receive(workerID, epoch, Frame{Type: TypeReady, Version: Version, Epoch: epoch, Sequence: 1}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func observeZero(m *MasterStats, sid, run string, state types.State) {
+	m.ObserveRoute(routesync.RouteEntry{SandboxID: sid, RunID: run, State: string(state), Hold: &routesync.HoldActivity{}})
 }
 
 func TestMasterAggregatesWorkersAndDuplicateAbsoluteFrames(t *testing.T) {
@@ -60,6 +67,7 @@ func TestMasterAggregatesWorkersAndDuplicateAbsoluteFrames(t *testing.T) {
 	if err := master.Receive("w1", 1, conflictingDuplicate); err == nil {
 		t.Fatal("same sequence with different content was accepted")
 	}
+	observeZero(master, "s1", "run-1", types.StateRunning)
 	stats, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, types.StateRunning)
 	if err != nil {
 		t.Fatal(err)
@@ -150,6 +158,7 @@ func TestMasterFaultWindowExitAndReplacementReadiness(t *testing.T) {
 	if !master.Available() {
 		t.Fatal("replacement ready did not restore availability")
 	}
+	observeZero(master, "s1", "run-2", types.StatePaused)
 	stats, err := master.SandboxTrafficStats(context.Background(), "s1", "run-2", types.ProfileE2B, types.StatePaused)
 	if err != nil {
 		t.Fatal(err)
@@ -188,11 +197,13 @@ func TestMasterAdvancesIdleBaselineOnRunAndWorkerEpochChanges(t *testing.T) {
 	master.trustSince = point
 	readyWorker(t, master, "w0", 1)
 
+	observeZero(master, "s1", "run-1", types.StateRunning)
 	first, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, types.StateRunning)
 	if err != nil || first.IdleSince == nil || first.IdleSince.Before(base) {
 		t.Fatalf("first idle baseline = %+v err=%v", first, err)
 	}
 	point = timePoint{wall: base.Add(time.Minute), bootNS: 200}
+	observeZero(master, "s1", "run-2", types.StateRunning)
 	second, err := master.SandboxTrafficStats(context.Background(), "s1", "run-2", types.ProfileBare, types.StateRunning)
 	if err != nil || second.IdleSince == nil || second.IdleSince.Before(point.wall) {
 		t.Fatalf("RunID baseline = %+v err=%v", second, err)
@@ -226,6 +237,7 @@ func TestMasterRunBaselineStartsOnlyWhenObservedRunning(t *testing.T) {
 
 	for i, state := range []types.State{types.StateStarting, types.StatePaused} {
 		point = timePoint{wall: base.Add(time.Duration(i+1) * time.Minute), bootNS: int64(200 + i*100)}
+		observeZero(master, "s1", "run-1", state)
 		stats, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, state)
 		if err != nil || stats.IdleSince != nil {
 			t.Fatalf("%s stats = %+v err=%v", state, stats, err)
@@ -238,39 +250,20 @@ func TestMasterRunBaselineStartsOnlyWhenObservedRunning(t *testing.T) {
 	}
 
 	point = timePoint{wall: base.Add(3 * time.Minute), bootNS: 400}
+	observeZero(master, "s1", "run-1", types.StateRunning)
 	running, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, types.StateRunning)
 	if err != nil || running.IdleSince == nil || running.IdleSince.Before(point.wall) {
 		t.Fatalf("running baseline = %+v err=%v, want >= %s", running, err, point.wall)
 	}
 }
 
-func TestMasterPrunesQueryOnlyRunMarkersWithoutHoldingLockAcrossLookup(t *testing.T) {
-	master := NewMasterStats(metrics.New(), []string{"w0"})
-	readyWorker(t, master, "w0", 1)
-	if _, err := master.SandboxTrafficStats(context.Background(), "deleted", "run-1", types.ProfileBare, types.StateRunning); err != nil {
-		t.Fatal(err)
+func TestQueryCannotEstablishHoldOrIdleWithoutRoute(t *testing.T) {
+	m := NewMasterStats(nil, []string{"w"})
+	readyWorker(t, m, "w", 1)
+	if _, err := m.SandboxTrafficStats(context.Background(), "missing", "r", types.ProfileBare, types.StateRunning); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("query without authority: %v", err)
 	}
-	lookupEntered := make(chan struct{})
-	releaseLookup := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		master.pruneRunMarkers(func(string) bool {
-			close(lookupEntered)
-			<-releaseLookup
-			return false
-		})
-		close(done)
-	}()
-	<-lookupEntered
-	if !master.Available() {
-		t.Fatal("route lookup held the master aggregate lock")
-	}
-	close(releaseLookup)
-	<-done
-	master.mu.Lock()
-	_, retained := master.runSince["deleted"]
-	master.mu.Unlock()
-	if retained {
-		t.Fatal("query-only deleted run marker was retained")
+	if len(m.routes) != 0 {
+		t.Fatal("stats query created a route")
 	}
 }

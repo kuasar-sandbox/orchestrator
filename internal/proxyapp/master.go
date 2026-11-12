@@ -13,8 +13,10 @@ import (
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
@@ -225,12 +227,6 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	}
 	managementHandler = instance.management(managementHandler)
 	startMasterTask(func() {
-		masterStats.RunGC(masterCtx, func(sandboxID string) bool {
-			_, found := table.Lookup(sandboxID)
-			return found
-		}, time.Minute)
-	})
-	startMasterTask(func() {
 		if err := statsServer.ServeHandler(masterCtx, statsListener, managementHandler); err != nil && masterCtx.Err() == nil {
 			logger.Error("proxy stats socket", "err", err)
 		}
@@ -249,6 +245,11 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	if runtime.candidateDial != nil {
 		dial = runtime.candidateDial
 	}
+	holdClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
+	}}
+	defer holdClient.CloseIdleConnections()
+	guestHold := configsock.GuestHoldClient(holdClient, instance.status.InstanceID)
 	startMasterTask(func() {
 		subscriber := routesync.NewSubscriber(dial, instance.status.InstanceID, registration, routeSink, view, logger)
 		subscriber.SnapshotSlots = table.SnapshotSlots
@@ -336,7 +337,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	for index := 0; index < cfg.Workers; index++ {
 		workerIndex := index
 		startMasterTask(func() {
-			superviseWorker(masterCtx, instance, workerIndex, effective, proxyNamespace, dataListener, mmdsListener, view, admission, masterStats, logger)
+			superviseWorker(masterCtx, instance, workerIndex, effective, proxyNamespace, dataListener, mmdsListener, view, guestHold, admission, masterStats, logger)
 		})
 	}
 
@@ -358,12 +359,12 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	return instance.drainWorkers()
 }
 
-func superviseWorker(ctx context.Context, instance *Instance, index int, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) {
+func superviseWorker(ctx context.Context, instance *Instance, index int, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, guestHold mmdsrpc.HoldHandler, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) {
 	workerID := fmt.Sprintf("proxy-%d", index)
 	var epoch uint64
 	for ctx.Err() == nil && !instance.stopped() {
 		epoch++
-		err := runWorkerProcess(ctx, instance, index, workerID, epoch, effective, proxyNamespace, dataListener, mmdsListener, view, admission, stats, logger)
+		err := runWorkerProcess(ctx, instance, index, workerID, epoch, effective, proxyNamespace, dataListener, mmdsListener, view, guestHold, admission, stats, logger)
 		if ctx.Err() != nil || instance.stopped() {
 			return
 		}

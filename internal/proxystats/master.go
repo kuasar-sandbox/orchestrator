@@ -9,7 +9,6 @@ import (
 	"math"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
@@ -39,9 +38,13 @@ type aggregateService struct {
 	idle    timePoint
 }
 
-type runMarker struct {
-	runID string
-	since timePoint
+// routeObservation comes from the ordered authority stream, never a stats query.
+// Its hold contribution is independent of how many workers serve the sandbox.
+type routeObservation struct {
+	runID, state string
+	since        timePoint // current run's running baseline; preserved through its pause gate
+	hold         aggregateService
+	holdKnown    bool
 }
 
 // MasterStats holds continuously aggregated worker contributions. Public reads
@@ -62,8 +65,7 @@ type MasterStats struct {
 	clockUnavailable bool
 	now              func() timePoint
 	trustSince       timePoint
-	runSince         map[string]runMarker // lazy query cache
-	routeSince       map[string]runMarker // written only by route observations
+	routes           map[string]routeObservation
 }
 
 func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
@@ -82,7 +84,7 @@ func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
 		clockWatch: watch, clockUnavailable: watchErr != nil,
 		metrics: mx, expected: expected, workers: make(map[string]*workerContribution),
 		traffic: make(map[string]aggregateTraffic), now: currentTimePoint,
-		trustSince: now, runSince: make(map[string]runMarker), routeSince: make(map[string]runMarker),
+		trustSince: now, routes: make(map[string]routeObservation),
 	}
 }
 
@@ -328,29 +330,24 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	if state != types.StateStarting && state != types.StateRunning && state != types.StatePaused && state != types.StatePausing {
 		return nil, api.ErrStatsConflict
 	}
+	route := m.routes[sandboxID]
+	if !route.holdKnown || route.runID != runID || route.state != string(state) {
+		return nil, api.ErrStatsUnavailable
+	}
 	services, ok := profileServices(profile)
 	if !ok {
 		return nil, api.ErrStatsUnavailable
 	}
-	now := m.now()
-	marker := m.runSince[sandboxID]
-	if observed := m.routeSince[sandboxID]; observed.runID == runID && observed.since.bootNS > 0 {
-		marker = observed
-	}
-	if state == types.StateRunning {
-		if marker.runID != runID || marker.since.bootNS == 0 {
-			marker = runMarker{runID: runID, since: now}
-			m.runSince[sandboxID] = marker
+	// Queries cannot manufacture a trusted zero or move the run baseline. A
+	// pre-running / paused route has no running baseline for its service view.
+	baseline := route.since
+	if baseline.bootNS <= 0 {
+		if state == types.StateRunning {
+			return nil, api.ErrStatsUnavailable
 		}
-	} else if marker.runID != runID || marker.since.bootNS == 0 {
-		// starting/paused observations cannot establish when this run became
-		// running. Drop an older run marker and use this observation as the local
-		// response baseline without retaining it as a running marker. The first
-		// running query will establish that run's durable lower bound.
-		delete(m.runSince, sandboxID)
-		marker = runMarker{since: now}
+		baseline = m.now()
 	}
-	baseline := laterPoint(m.trustSince, marker.since)
+	baseline = laterPoint(m.trustSince, baseline)
 	aggregate := m.traffic[sandboxID]
 	result = &api.TrafficStats{
 		State: string(state), Services: make(map[string]api.ServiceTrafficStats, len(services)),
@@ -358,6 +355,12 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	var topIdle timePoint
 	for _, service := range services {
 		current := aggregate.services[service]
+		if service == "hold" {
+			current = route.hold
+		}
+		if math.MaxUint64-result.Inflight.Connected < current.egress || math.MaxUint64-result.Inflight.Parking < current.parking {
+			return nil, api.ErrStatsUnavailable
+		}
 		item := api.ServiceTrafficStats{Parking: current.parking, Connected: current.egress}
 		result.Inflight.Parking += current.parking
 		result.Inflight.Connected += current.egress
@@ -384,9 +387,10 @@ func profileServices(profile types.Profile) ([]string, bool) {
 			string(proxy.ConnectServiceE2BEnvd),
 			string(proxy.ConnectServiceE2BInterpreter),
 			string(proxy.ConnectServiceExec),
+			"hold",
 		}, true
 	case types.ProfileBare:
-		return []string{string(proxy.ConnectServiceForward), string(proxy.ConnectServiceExec)}, true
+		return []string{string(proxy.ConnectServiceForward), string(proxy.ConnectServiceExec), "hold"}, true
 	default:
 		return nil, false
 	}
@@ -403,44 +407,4 @@ func (m *MasterStats) WorkerIDs() []string {
 	}
 	sort.Strings(ids)
 	return ids
-}
-
-// RunGC bounds query-created run markers for sandboxes that never produced a
-// worker traffic entry (and therefore cannot later emit a remove frame). Route
-// lookup runs without the aggregate lock; a delete/recreate race can only drop a
-// marker and make the next idle boundary more conservative.
-func (m *MasterStats) RunGC(ctx context.Context, routeExists func(string) bool, interval time.Duration) {
-	if routeExists == nil {
-		return
-	}
-	if interval <= 0 {
-		interval = time.Minute
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			m.pruneRunMarkers(routeExists)
-		}
-	}
-}
-
-func (m *MasterStats) pruneRunMarkers(routeExists func(string) bool) {
-	m.mu.Lock()
-	ids := make([]string, 0, len(m.runSince))
-	for sandboxID := range m.runSince {
-		ids = append(ids, sandboxID)
-	}
-	m.mu.Unlock()
-	for _, sandboxID := range ids {
-		if routeExists(sandboxID) {
-			continue
-		}
-		m.mu.Lock()
-		delete(m.runSince, sandboxID)
-		m.mu.Unlock()
-	}
 }

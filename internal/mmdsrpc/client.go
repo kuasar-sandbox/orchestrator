@@ -61,6 +61,22 @@ func (c *Client) fail(err error) {
 }
 
 func (c *Client) Resolve(ctx context.Context, sandboxID, path string) (EndpointResponse, error) {
+	return c.call(ctx, EndpointRequest{SandboxID: sandboxID, Path: path})
+}
+
+func (c *Client) Hold(ctx context.Context, sandboxID, runID, path string, value, ifMatch *int64) (EndpointResponse, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return EndpointResponse{}, errors.New("mmdsrpc: hold requires a deadline")
+	}
+	return c.call(ctx, EndpointRequest{SandboxID: sandboxID, Path: path,
+		Hold: &HoldRequest{RunID: runID, Value: value, IfMatch: ifMatch, Deadline: deadline.UnixNano()}})
+}
+
+func (c *Client) call(ctx context.Context, request EndpointRequest) (EndpointResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return EndpointResponse{}, err
+	}
 	c.mu.Lock()
 	if c.closed {
 		err := c.err
@@ -76,7 +92,7 @@ func (c *Client) Resolve(ctx context.Context, sandboxID, path string) (EndpointR
 	c.pending[id] = result
 	c.mu.Unlock()
 
-	request := EndpointRequest{RequestID: id, SandboxID: sandboxID, Path: path}
+	request.RequestID = id
 	c.writeMu.Lock()
 	err := writeFrame(c.rw, request)
 	c.writeMu.Unlock()

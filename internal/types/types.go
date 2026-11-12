@@ -370,6 +370,10 @@ type SandboxCheckpoint struct {
 
 // Sandbox pressure fields are node-owned lifecycle state, never user metadata.
 type Sandbox struct {
+	// HoldValue is node-local runtime state. nil means the known initial zero;
+	// it is never copied to a new sandbox, template or migration token.
+	HoldValue *int64 `json:"-"`
+
 	MaxCheckpoints int    // sandbox option, currently fixed at 1
 	InstanceID     string // immutable parent incarnation; never a timestamp
 	AutoReset      bool

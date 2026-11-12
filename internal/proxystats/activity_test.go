@@ -1,9 +1,10 @@
 package proxystats
 
 import (
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func TestActivityInitialIdleAndWorkerRecovery(t *testing.T) {
@@ -11,7 +12,7 @@ func TestActivityInitialIdleAndWorkerRecovery(t *testing.T) {
 	n := timePoint{wall: time.Now(), bootNS: 100}
 	m.now = func() timePoint { return n }
 	m.trustSince = n
-	route := routesync.RouteEntry{SandboxID: "s", RunID: "r", State: routesync.StateRunning}
+	route := routesync.RouteEntry{SandboxID: "s", RunID: "r", State: routesync.StateRunning, Hold: &routesync.HoldActivity{}}
 	m.ObserveRoute(route)
 	if m.Activity(route).State != "unknown" {
 		t.Fatal("incomplete initial observation certified")

@@ -41,6 +41,7 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 
 func (o *Orchestrator) routeEntryContext(ctx context.Context, sb *types.Sandbox) (routesync.RouteEntry, error) {
 	e, trafficErr := routeEntryBase(sb)
+	e.Hold = o.projectHold(sb)
 	routes, values, err := o.mmdsRouteProjection(ctx, sb)
 	e.MMDSRoutes = routes
 	if values != nil {
@@ -308,10 +309,19 @@ func (o *Orchestrator) Replay(ctx context.Context, afterSeq int64, fn func(route
 // --- publish ---
 
 func (o *Orchestrator) publishUpsert(sb *types.Sandbox) {
-	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: o.routeEntry(sb)})
+	route := o.routeEntry(sb)
+	// MMDS projection above may perform I/O. Rebind hold at publication, so
+	// a previously started upsert cannot deliver an old counter after its PUT.
+	o.holdMu.Lock()
+	defer o.holdMu.Unlock()
+	route.Hold = o.projectHoldLocked(sb)
+	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: route})
 }
 
 func (o *Orchestrator) publishDelete(sid string) {
+	o.holdMu.Lock()
+	delete(o.holds, sid)
+	o.holdMu.Unlock()
 	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
 }
 

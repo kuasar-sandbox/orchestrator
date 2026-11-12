@@ -15,12 +15,20 @@ import (
 )
 
 type fakeSource struct {
+	hold        func(context.Context, string, string, string, *int64, *int64) (*int64, int)
 	fip         map[string]string
 	info        map[string][2]string
 	routes      map[string]map[string]MMDSRoute
 	routeErr    error
 	incarnation map[string]string
 	unavailable bool
+}
+
+func (f fakeSource) MMDSHold(ctx context.Context, sid, run, path string, value, match *int64) (*int64, int) {
+	if f.hold == nil {
+		return nil, http.StatusServiceUnavailable
+	}
+	return f.hold(ctx, sid, run, path, value, match)
 }
 
 func (f fakeSource) MMDSAvailable() bool { return !f.unavailable }

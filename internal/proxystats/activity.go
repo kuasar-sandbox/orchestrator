@@ -9,12 +9,16 @@ func (m *MasterStats) Activity(r routesync.RouteEntry) routesync.Activity {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	marker := m.routeSince[r.SandboxID]
-	if r.State != routesync.StateRunning || r.TrafficPolicyInvalid || !m.availableLocked() || marker.runID != r.RunID || marker.since.bootNS <= 0 {
+	marker := m.routes[r.SandboxID]
+	if !marker.holdKnown || marker.state != routesync.StateRunning || r.State != routesync.StateRunning || r.TrafficPolicyInvalid || !m.availableLocked() || marker.runID != r.RunID || marker.since.bootNS <= 0 {
 		return a
 	}
 	a.Generation = m.trustSince.bootNS
-	a.SinceBootNS = laterPoint(marker.since, m.trustSince).bootNS
+	if marker.hold.egress != 0 {
+		a.State = "busy"
+		return a
+	}
+	a.SinceBootNS = max(laterPoint(marker.since, m.trustSince).bootNS, marker.hold.idle.bootNS)
 	a.State = "idle"
 	for _, v := range m.traffic[r.SandboxID].services {
 		if v.parking != 0 || v.egress != 0 {

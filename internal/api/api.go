@@ -385,6 +385,7 @@ const (
 // on the target resource and treats a mismatch as not-found. Create/RegisterBuild
 // additionally require the APISecret/ManifestKey pair to be allowlisted.
 type Core interface {
+	SandboxHoldCore
 	Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) // req.APIKey carries the key
 	Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error)
 	List(ctx context.Context, apiKey, state string, limit int, cursor string) ([]*types.Sandbox, string, error)
@@ -482,6 +483,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /sandboxes/{id}", a.auth(a.get))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/resource", a.auth(a.resourceStats))
 	mux.HandleFunc("GET /sandboxes/{id}/metrics", a.auth(a.sandboxMetrics))
+	mux.HandleFunc("GET /sandboxes/{id}/traffic/hold", a.auth(a.hold))
+	mux.HandleFunc("PUT /sandboxes/{id}/traffic/hold", a.auth(a.hold))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/traffic", a.auth(a.trafficStats))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/usage", a.auth(a.usageStats))
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))

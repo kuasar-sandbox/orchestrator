@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   resume_sandbox_ref   TEXT NOT NULL DEFAULT '',
   auto_pause_memory    INTEGER NOT NULL DEFAULT 1,
  idle_timeout INTEGER,
+ hold_value INTEGER CHECK(hold_value >= 0),
   max_checkpoints      INTEGER NOT NULL DEFAULT 1 CHECK(max_checkpoints=1),
   launch_mode          TEXT NOT NULL DEFAULT '',
   service_secret_enc       TEXT NOT NULL,
@@ -241,6 +242,11 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		return nil, err
 	}
 	if err := ensureColumn(ctx, db, "sandboxes", "idle_timeout", "INTEGER"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// NULL is a known initial zero: this sandbox has never asserted a hold.
+	if err := ensureColumn(ctx, db, "sandboxes", "hold_value", "INTEGER CHECK(hold_value >= 0)"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -1417,7 +1423,7 @@ var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,sta
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
-  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error`
+  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,hold_value`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
@@ -1432,7 +1438,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.IdleTimeout, &sb.MaxCheckpoints, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano,
-		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError); err != nil {
+		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError, &sb.HoldValue); err != nil {
 		return nil, err
 	}
 	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
