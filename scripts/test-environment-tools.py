@@ -93,7 +93,10 @@ class EnvironmentTools(unittest.TestCase):
             lines=workflow.read_text().splitlines()
             for index,line in enumerate(lines):
                 if 'GOWORK=' in line and 'go_workspace.py' in line:
-                    commands.append(line.strip()+'\n'+lines[index+1].strip())
+                    end = next(j for j in range(index + 1, len(lines)) if lines[j].strip() == 'export GOWORK')
+                    command = '\n'.join(lines[index:end + 1])
+                    # Workbench receives the admitted producer version and exact upstream pins.
+                    commands.append(re.sub(r'\$\{\{ needs\.preflight\.outputs\.[a-z_]+ \}\}', 'selected', command))
         self.assertTrue(commands)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);python=root/'python3'
@@ -125,21 +128,33 @@ class EnvironmentTools(unittest.TestCase):
             command.append(line[len(prefix):])
         values = {"source_sha": "a" * 40, "version": "v1.2.3-preview.20261009.4",
                   "accelerator_version": "v2.3.4", "connector_version": "v3.4.5-preview.20261008.2",
-                  "sandboxer_version": "v4.5.6"}
+                  "sandboxer_version": "v4.5.6", "accelerator_sha": "b" * 40,
+                  "connector_sha": "c" * 40, "sandboxer_sha": "d" * 40}
         program = re.sub(r"\$\{\{ needs\.preflight\.outputs\.([a-z_]+) \}\}",
                          lambda match: values[match.group(1)], "\n".join(command))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools = root / "tools"
             scripts = root / "tooling/scripts"
+            consumer = root / "tooling/test/source/go_consumer.sh"
+            consumer.parent.mkdir(parents=True)
+            consumer.write_text('test "$GOWORK" = "$HOME/selected.go.work"\n')
+            selected_program = program.replace("/inputs/release/.ci/component-packaging", str(root / "tooling"))
             (root / "orchestrator").mkdir()
-            selected_program=program.replace("/inputs/release/.ci/component-packaging/scripts/release.sh",str(scripts/"release.sh"))
             tools.mkdir()
             scripts.mkdir(parents=True)
             commands = {
                 "go": '#!/bin/sh\ntest "$GOWORK" = "$HOME/selected.go.work"\n',
                 "make": '#!/bin/sh\ntest "$GOWORK" = "$HOME/selected.go.work"\n',
-                "python3": '#!/bin/sh\ntest "$*" = "-B /inputs/release/ci/integration/go_workspace.py --root /src --owners orchestrator" || exit 98\necho "$HOME/selected.go.work"\n',
+                "python3": (
+                    '#!/bin/sh\n'
+                    'test "$*" = "-B /inputs/release/ci/integration/go_workspace.py --root /src '
+                    '--owners orchestrator --bound-release --version {version} '
+                    '--dependency accelerator {accelerator_version} {accelerator_sha} '
+                    '--dependency connector {connector_version} {connector_sha} '
+                    '--dependency sandboxer {sandboxer_version} {sandboxer_sha}" || exit 98\n'
+                    'echo "$HOME/selected.go.work"\n'
+                ).format(**values),
                 "git": "#!/bin/sh\ncase $1 in rev-parse) echo " + values["source_sha"]
                        + ";; show) echo 1;; *) exit 92;; esac\n",
             }

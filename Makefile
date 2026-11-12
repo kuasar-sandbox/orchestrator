@@ -94,13 +94,17 @@ test-source:
 
 VERSION ?= v0.1.0
 KUASAR_PLATFORM_DIR ?= ../kuasar-sandbox
-ACCELERATOR_VERSION ?= v0.1.12
-CONNECTOR_VERSION ?= v0.1.8
-SANDBOXER_VERSION ?= v0.1.15
+# Explicit dependency tags select Preview inputs. Otherwise use this module's
+# declared release requirement without resolving the module graph.
+go_requirement = $(shell GOWORK=off $(GO) mod edit -json | \
+	jq -er --arg path "github.com/kuasar-sandbox/$(1)" '.Require[] | select(.Path == $$path) | .Version')
+ACCELERATOR_VERSION ?= $(call go_requirement,accelerator)
+CONNECTOR_VERSION ?= $(call go_requirement,connector)
+SANDBOXER_VERSION ?= $(call go_requirement,sandboxer)
 
 release:
 	@set -e; workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
-		--root .. --owners orchestrator --dependency-tag "accelerator=$(ACCELERATOR_VERSION)" --dependency-tag "connector=$(CONNECTOR_VERSION)" --dependency-tag "sandboxer=$(SANDBOXER_VERSION)")"; \
+		--root .. --owners orchestrator --version "$(VERSION)" --dependency-tag "accelerator=$(ACCELERATOR_VERSION)" --dependency-tag "connector=$(CONNECTOR_VERSION)" --dependency-tag "sandboxer=$(SANDBOXER_VERSION)")"; \
 	$(MAKE) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
 	rm -rf "build/release-bundle"; \
 	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
