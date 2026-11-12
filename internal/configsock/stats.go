@@ -13,6 +13,7 @@ import (
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
@@ -87,6 +88,9 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 		writeStatsError(w, api.ErrBadRequest)
 		return
 	}
+	if !holdAware {
+		ctx = proxystats.WithPhysicalTelemetry(ctx)
+	}
 	rows, err := s.deps.Stats.ReadStats(ctx, request)
 	if ctx.Err() != nil || lease.Err() != nil {
 		err = api.ErrStatsUnavailable
@@ -122,7 +126,9 @@ func legacyTelemetryStats(rows []conductorextension.SandboxStats) ([]conductorex
 		r := *row.Traffic
 		hold, present := r.Services["hold"]
 		if !present {
-			continue // The source is already connection-only.
+			// The legacy Proxy selected its physical idle time by boot clock.
+			// Service wall timestamps can be out of order after a clock step.
+			continue
 		}
 		if hold.Parking != 0 || hold.Connected > r.Inflight.Connected {
 			return nil, api.ErrStatsUnavailable
@@ -134,9 +140,9 @@ func legacyTelemetryStats(rows []conductorextension.SandboxStats) ([]conductorex
 		r.Services = maps.Clone(r.Services)
 		delete(r.Services, "hold")
 		// The logical total can be busy or can have a more recent release.
-		// In v11 the top-level idle time is the last physical service to idle.
+		// Only a complete physical snapshot can establish an idle timestamp.
 		r.IdleSince = nil
-		if r.State == routesync.StateRunning && r.Inflight.Connected == 0 && r.Inflight.Parking == 0 {
+		if !r.InplaceRestart && r.State == routesync.StateRunning && r.Inflight.Connected == 0 && r.Inflight.Parking == 0 {
 			for _, physical := range r.Services {
 				if physical.IdleSince == nil {
 					r.IdleSince = nil

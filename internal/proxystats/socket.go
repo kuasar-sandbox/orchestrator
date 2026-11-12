@@ -31,6 +31,19 @@ type TrafficQuery struct {
 	State     types.State   `json:"state"`
 }
 
+type physicalTelemetryKey struct{}
+
+// WithPhysicalTelemetry selects the original Proxy idle timestamp for a
+// connection-only Telemetry reader. It is local to the authorized stats call.
+func WithPhysicalTelemetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, physicalTelemetryKey{}, true)
+}
+
+func IsPhysicalTelemetry(ctx context.Context) bool {
+	physical, _ := ctx.Value(physicalTelemetryKey{}).(bool)
+	return physical
+}
+
 type BatchRequest struct {
 	Sandboxes []TrafficQuery `json:"sandboxes"`
 }

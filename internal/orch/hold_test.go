@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -212,7 +213,13 @@ func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
 	ctx := context.Background()
 	zero, one := int64(0), int64(1)
 	since := o.idleTime().Wall
-	legacyStats := &api.TrafficStats{IdleSince: &since}
+	// exec became idle after a backwards wall-clock step. The legacy Proxy
+	// chose it as the last physical service using CLOCK_BOOTTIME.
+	beforeClockStep := since.Add(time.Minute)
+	legacyStats := &api.TrafficStats{State: "running", IdleSince: &since, Services: map[string]api.ServiceTrafficStats{
+		"forward": {IdleSince: &beforeClockStep}, "exec": {IdleSince: &since},
+	}}
+	physicalCtx := proxystats.WithPhysicalTelemetry(ctx)
 	// Ordinary v11 service remains usable, without fabricating services.hold.
 	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{})
 	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 1, &zero); !errors.Is(err, api.ErrProxyUnavailable) {
@@ -225,7 +232,7 @@ func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
 	if o.idleCandidates[sb.ID] == nil {
 		t.Fatal("legacy idle timer lost")
 	}
-	if s, err := o.checkIngressHold(sb, legacyStats); err != nil || s != legacyStats {
+	if s, err := o.checkIngressHold(ctx, sb, legacyStats); err != nil || s != legacyStats {
 		t.Fatal(s, err)
 	}
 
@@ -239,8 +246,10 @@ func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
 	if o.idleCandidates[sb.ID] != nil {
 		t.Fatal("legacy sample armed timer despite retained hold")
 	}
-	if _, err := o.checkIngressHold(sb, legacyStats); !errors.Is(err, api.ErrStatsUnavailable) {
-		t.Fatal("published false complete idle", err)
+	for _, readCtx := range []context.Context{ctx, physicalCtx} {
+		if _, err := o.checkIngressHold(readCtx, sb, legacyStats); !errors.Is(err, api.ErrStatsUnavailable) {
+			t.Fatal("published false complete idle", err)
+		}
 	}
 	if n, err := o.GetSandboxHold(ctx, sb.ID, key); err != nil || n != 1 {
 		t.Fatal(n, err)
@@ -255,8 +264,11 @@ func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
 	if c == nil || c.observation.SinceBootNS != released.BootNS || c.t0.BootNS != released.BootNS {
 		t.Fatalf("did not start a fresh timeout: %#v", c)
 	}
-	if s, err := o.checkIngressHold(sb, legacyStats); err != nil || !s.IdleSince.Equal(released.Wall) || !legacyStats.IdleSince.Equal(since) {
+	if s, err := o.checkIngressHold(ctx, sb, legacyStats); err != nil || !s.IdleSince.Equal(released.Wall) || !legacyStats.IdleSince.Equal(since) {
 		t.Fatal(s, err)
+	}
+	if s, err := o.checkIngressHold(physicalCtx, sb, legacyStats); err != nil || s.IdleSince == nil || !s.IdleSince.Equal(since) {
+		t.Fatal("physical view lost the Proxy idle timestamp", s, err)
 	}
 	clock.Add(int64(time.Second))
 	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 0, nil); err != nil {

@@ -100,7 +100,7 @@ func (o *Orchestrator) prepareTrafficReads(ctx context.Context, sandboxes []*typ
 		if row.SandboxID != sandboxes[i].ID || row.Stats == nil {
 			return nil, nil, api.ErrStatsUnavailable
 		}
-		ingress[i], err = o.checkIngressHold(sandboxes[i], row.Stats)
+		ingress[i], err = o.checkIngressHold(ctx, sandboxes[i], row.Stats)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -193,19 +193,24 @@ func (o *Orchestrator) readIngressStats(ctx context.Context, sb *types.Sandbox) 
 	if stats == nil {
 		return nil, api.ErrStatsUnavailable
 	}
-	return o.checkIngressHold(sb, stats)
+	return o.checkIngressHold(ctx, sb, stats)
 }
 
 // A v11 proxy returns its original services shape. It cannot certify an
 // all-idle result while a confirmed hold from an earlier session is active.
 // After release its physical idle time may predate that logical busy interval.
-func (o *Orchestrator) checkIngressHold(sb *types.Sandbox, stats *api.TrafficStats) (*api.TrafficStats, error) {
+func (o *Orchestrator) checkIngressHold(ctx context.Context, sb *types.Sandbox, stats *api.TrafficStats) (*api.TrafficStats, error) {
 	if _, present := stats.Services["hold"]; present {
 		return stats, nil
 	}
 	h := o.projectHold(sb)
 	if !h.Valid() || h.Value != 0 {
 		return nil, api.ErrStatsUnavailable
+	}
+	// The Proxy used its boot clock to choose the last physical service.
+	// Its original timestamp remains authoritative even if wall time moved back.
+	if proxystats.IsPhysicalTelemetry(ctx) {
+		return stats, nil
 	}
 	if stats.IdleSince != nil && h.IdleSince != nil && h.IdleSince.After(*stats.IdleSince) {
 		corrected := *stats
