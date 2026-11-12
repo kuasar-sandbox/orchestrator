@@ -6,6 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // Source is the route authority the stream distributes. internal/orch implements
@@ -134,7 +137,8 @@ func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	// Handshake: policy first (flush so the peer's RoundTrip returns), then the
 	// shared route-stream loop. The cluster node-link sends a NodeRegister frame
 	// instead of Hello and calls StreamAuthority directly.
-	projection := localRouteProjection(reg)
+	capabilities = effectiveProxyCapabilities(reg, capabilities)
+	projection := localRouteProjection(reg, capabilities)
 	policy := src.Policy()
 	if !projection.mmds {
 		policy.MMDS = nil
@@ -249,7 +253,7 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	resumed := false
 	// Local Proxy observations are rebuilt on BeginSync. Incremental replay
 	// alone cannot restore untouched positive holds or retained MMDS state.
-	if reg.ResumeFrom != "" && !projection.hold {
+	if reg.ResumeFrom != "" && !projection.fullSync() {
 		if rs, ok := src.(ResumableSource); ok {
 			if after, ok := CheckRevToken(reg.ResumeFrom, rs.SourceFingerprint()); ok {
 				err := rs.Replay(sctx, after, func(ev Event) error {
@@ -268,7 +272,9 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 	if !resumed {
 		if err := src.Range(sctx, func(r RouteEntry) error {
-			projection.apply(&r)
+			if err := projection.apply(&r); err != nil {
+				return err
+			}
 			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 		}); err != nil {
 			return
@@ -378,13 +384,17 @@ func writeEvent(w io.Writer, ev Event, projection routeProjection) error {
 	switch ev.Kind {
 	case TypeUpsert:
 		r := ev.Route
-		projection.apply(&r)
+		if err := projection.apply(&r); err != nil {
+			return err
+		}
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID
 	case TypePauseBarrier:
 		r := ev.Route
-		projection.apply(&r)
+		if err := projection.apply(&r); err != nil {
+			return err
+		}
 		m.Route, m.BarrierID = &r, ev.BarrierID
 	case TypeRouteBarrier:
 		if ev.BarrierID == "" {
@@ -398,23 +408,41 @@ func writeEvent(w io.Writer, ev Event, projection routeProjection) error {
 }
 
 type routeProjection struct {
-	hold bool // traffic-serving local Proxy, irrespective of MMDS
+	hold bool // negotiated with the local traffic Proxy, irrespective of MMDS
 	mmds bool
 }
 
 // Node-link callers always use the empty projection. Local capabilities have
 // already been admitted by the configuration socket before ServeAuthority.
-func localRouteProjection(reg Register) routeProjection {
-	proxy := reg.handlesWake() && reg.Proxy != nil
-	return routeProjection{hold: proxy, mmds: proxy && reg.Mmds}
+func effectiveProxyCapabilities(reg Register, offered []string) []string {
+	if reg.WantsHoldTraffic() || !slices.Contains(offered, HoldTrafficV1) {
+		return offered
+	}
+	return slices.DeleteFunc(slices.Clone(offered), func(c string) bool { return c == HoldTrafficV1 })
 }
 
-func (p routeProjection) apply(route *RouteEntry) {
+func localRouteProjection(reg Register, accepted []string) routeProjection {
+	proxy := reg.handlesWake() && reg.Proxy != nil
+	return routeProjection{hold: reg.WantsHoldTraffic() && slices.Contains(accepted, HoldTrafficV1), mmds: proxy && reg.Mmds}
+}
+
+func (p routeProjection) fullSync() bool { return p.mmds || p.hold }
+
+func (p routeProjection) apply(route *RouteEntry) error {
 	if !p.hold {
 		route.Hold = nil
 	}
 	if !p.mmds {
 		route.MMDSRoutes = ""
 		route.MMDSRouteSecretValues = nil
+	} else if !p.hold && route.MMDSRoutes != "" {
+		// Old v11 MMDS parsers reject an unknown declaration and abort the
+		// entire route stream. Filter only hold, preserving other exact paths.
+		raw, err := sandboxcfg.MMDSRoutesWithoutHold(route.MMDSRoutes)
+		if err != nil {
+			return err
+		}
+		route.MMDSRoutes = raw
 	}
+	return nil
 }

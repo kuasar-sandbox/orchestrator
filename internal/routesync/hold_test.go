@@ -1,9 +1,12 @@
 package routesync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,12 +43,17 @@ func (s *holdReplaySource) Replay(_ context.Context, _ int64, send func(Event) e
 
 func TestHoldProjectionOnlyReachesLocalTrafficProxy(t *testing.T) {
 	for _, tc := range []struct {
-		name               string
-		kind               string
-		proxy, link, token bool
-		wantHold, full     bool
+		name                                string
+		kind                                string
+		proxy, link, token                  bool
+		legacyClient, legacyAuthority, mmds bool
+		wantHold, full                      bool
 	}{
 		{name: "proxy without MMDS restores all holds", kind: KindRouteWake, proxy: true, token: true, wantHold: true, full: true},
+		{name: "legacy traffic proxy replays physical routes", kind: KindRouteWake, proxy: true, legacyClient: true, token: true},
+		{name: "legacy MMDS proxy retains previous fullsync contract", kind: KindRouteWake, proxy: true, mmds: true, legacyClient: true, token: true, full: true},
+		{name: "authority without hold", kind: KindRouteWake, proxy: true, mmds: true, legacyAuthority: true, token: true, full: true},
+		{name: "negotiated MMDS proxy", kind: KindRouteWake, proxy: true, mmds: true, wantHold: true, full: true},
 		{name: "telemetry route observer", kind: KindRoute, full: true},
 		{name: "wake without proxy capability", kind: KindRouteWake, full: true},
 		{name: "observer replay", kind: KindRoute, token: true},
@@ -53,11 +61,13 @@ func TestHoldProjectionOnlyReachesLocalTrafficProxy(t *testing.T) {
 		{name: "node link claiming local proxy", kind: KindRouteWake, proxy: true, link: true, full: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			const mixed = `{"routes":[{"path":"/status","data":"ok"},{"path":"/job","type":"hold-traffic"},{"path":"/svc","type":"service","service":"svc"},{"path":"/s","type":"secret","secret":"v"}]}`
+			values := MMDSRouteSecretValues{"v": []byte("secret")}
 			src := &holdReplaySource{mmdsProjectionSource{
-				initial: RouteEntry{SandboxID: "s", State: StateRunning, Hold: &HoldActivity{Value: 3}},
+				initial: RouteEntry{SandboxID: "s", State: StateRunning, Hold: &HoldActivity{Value: 3}, MMDSRoutes: mixed, MMDSRouteSecretValues: &values},
 				events:  make(chan Event, 2),
 			}}
-			reg := Register{Subscribe: &Subscribe{Kind: tc.kind}}
+			reg := Register{HoldTraffic: !tc.legacyClient, Mmds: tc.mmds, Subscribe: &Subscribe{Kind: tc.kind}}
 			if tc.proxy {
 				reg.Proxy = &Proxy{}
 			}
@@ -73,9 +83,14 @@ func TestHoldProjectionOnlyReachesLocalTrafficProxy(t *testing.T) {
 			if tc.link {
 				go StreamAuthority(ctx, downW, func() {}, upR, src, reg, nil, nil, nil)
 			} else {
-				go ServeAuthority(ctx, downW, func() {}, upR, src, reg, nil, nil)
-				if m := readTestMessage(t, downR); m.Type != TypeHello {
-					t.Fatal(m.Type)
+				offered := []string{InplaceRestartV1}
+				if !tc.legacyAuthority {
+					offered = append(offered, HoldTrafficV1)
+				}
+				go serveAuthority(ctx, downW, func() {}, upR, src, reg, nil, nil, offered, nil)
+				if m := readTestMessage(t, downR); m.Type != TypeHello || m.Hello.Version != 11 ||
+					slices.Contains(m.Hello.ProxyCapabilities, HoldTrafficV1) != tc.wantHold || !slices.Contains(m.Hello.ProxyCapabilities, InplaceRestartV1) {
+					t.Fatalf("unexpected Hello: %+v", m.Hello)
 				}
 			}
 			check := func(kind string) {
@@ -83,6 +98,21 @@ func TestHoldProjectionOnlyReachesLocalTrafficProxy(t *testing.T) {
 				m := readTestMessage(t, downR)
 				if m.Type != kind || m.Route == nil || (m.Route.Hold != nil) != tc.wantHold {
 					t.Fatalf("%s: got %+v", kind, m)
+				}
+				switch {
+				case !tc.mmds:
+					if m.Route.MMDSRoutes != "" || m.Route.MMDSRouteSecretValues != nil {
+						t.Fatal("MMDS leaked")
+					}
+				case tc.wantHold:
+					if m.Route.MMDSRoutes != mixed {
+						t.Fatal("negotiated declaration changed")
+					}
+				default:
+					raw := m.Route.MMDSRoutes
+					if strings.Contains(raw, "hold-traffic") || !strings.Contains(raw, "/status") || !strings.Contains(raw, "/svc") || !strings.Contains(raw, `"type":"secret"`) || m.Route.MMDSRouteSecretValues == nil || string((*m.Route.MMDSRouteSecretValues)["v"]) != "secret" {
+						t.Fatalf("invalid legacy projection: %s", raw)
+					}
 				}
 				if tc.wantHold && m.Route.Hold.Value != 3 {
 					t.Fatalf("%s: hold = %+v", kind, m.Route.Hold)
@@ -103,5 +133,37 @@ func TestHoldProjectionOnlyReachesLocalTrafficProxy(t *testing.T) {
 			src.events <- Event{Kind: TypePauseBarrier, BarrierID: "b", Route: pausing}
 			check(TypePauseBarrier)
 		})
+	}
+}
+
+func TestLegacyProjectionRejectsMalformedHoldDeclaration(t *testing.T) {
+	for _, raw := range []string{`{"routes":[{"path":"/job","type":"hold-traffic","secret":"oops"}]}`, `{"routes":[{"path":"/job","type":"future-type"}]}`} {
+		var w bytes.Buffer
+		e := Event{Kind: TypeUpsert, Route: RouteEntry{MMDSRoutes: raw}}
+		if err := writeEvent(&w, e, routeProjection{mmds: true}); err == nil || w.Len() != 0 {
+			t.Fatalf("silently stripped malformed declaration: %s", raw)
+		}
+	}
+}
+
+// A released v11 authority will ignore the new field in Register. With no
+// MMDS it would otherwise honor a resume token, sending only changed routes.
+func TestHoldSubscriberRequestsFullRangeFromLegacyAuthority(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var wire bytes.Buffer
+	reg := Register{Subscribe: &Subscribe{Kind: KindRouteWake}, Proxy: &Proxy{}, HoldTraffic: true, ResumeFrom: "existing-token"}
+	s := &Subscriber{reg: reg}
+	_ = s.writeUp(ctx, &wire, nil)
+	frame, err := ReadMsg(&wire)
+	if err != nil || frame.Register == nil || frame.Register.ResumeFrom != "" || !frame.Register.HoldTraffic {
+		t.Fatalf("register=%+v err=%v", frame, err)
+	}
+	s.reg = Register{Subscribe: &Subscribe{Kind: KindRoute}, ResumeFrom: "observer-token"}
+	wire.Reset()
+	_ = s.writeUp(ctx, &wire, nil)
+	frame, err = ReadMsg(&wire)
+	if err != nil || frame.Register == nil || frame.Register.ResumeFrom != "observer-token" {
+		t.Fatal("lost observer replay")
 	}
 }

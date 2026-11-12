@@ -237,7 +237,8 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		Proxy: &routesync.Proxy{
 			StatsSocket: &routesync.Socket{Path: cfg.StatsSocket},
 		},
-		Mmds: true,
+		Mmds:        true,
+		HoldTraffic: true,
 	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)

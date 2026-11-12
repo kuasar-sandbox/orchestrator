@@ -88,3 +88,49 @@ func TestHoldCombinesWithPhysicalFlowsOnceAndPreservesZeroEdge(t *testing.T) {
 		t.Fatalf("missing hold returned valid stats: %v", err)
 	}
 }
+
+func TestLegacyTrafficUntilHoldIsNegotiatedAgain(t *testing.T) {
+	m := NewMasterStats(nil, []string{"a"})
+	readyWorker(t, m, "a", 1)
+	r := routesync.RouteEntry{SandboxID: "s", RunID: "r", State: routesync.StateRunning}
+	ctx := context.Background()
+	stats := func() (*api.TrafficStats, error) {
+		return m.SandboxTrafficStats(ctx, "s", "r", types.ProfileBare, types.StateRunning)
+	}
+	m.SetHoldTraffic(false)
+	m.ObserveRoute(r)
+	legacy, err := stats()
+	if err != nil || legacy.IdleSince == nil || len(legacy.Services) != 2 || m.Activity(r).State != "idle" {
+		t.Fatalf("legacy physical idle: %+v, %v", legacy, err)
+	}
+	if _, ok := legacy.Services["hold"]; ok {
+		t.Fatal("legacy fabricated a hold observation")
+	}
+	if err := m.Receive("a", 1, Frame{Type: TypeUpdate, Version: Version, Epoch: 1, Sequence: 2, Traffic: []SandboxSnapshot{{SandboxID: "s", Services: map[string]ServiceSnapshot{"exec": {Connected: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err = stats()
+	if err != nil || legacy.Inflight.Connected != 1 || m.Activity(r).State != "busy" {
+		t.Fatalf("legacy physical flow: %+v, %v", legacy, err)
+	}
+	m.ResetObservation()
+	m.SetHoldTraffic(true)
+	m.ObserveRoute(r)
+	if _, err := stats(); !errors.Is(err, api.ErrStatsUnavailable) || m.Activity(r).State != "unknown" {
+		t.Fatal("incomplete negotiated projection was treated as legacy")
+	}
+	r.Hold = &routesync.HoldActivity{Value: 2}
+	m.ObserveRoute(r)
+	supported, err := stats()
+	if err != nil || supported.Services["hold"].Connected != 2 || supported.Inflight.Connected != 3 {
+		t.Fatalf("negotiated session: %+v, %v", supported, err)
+	}
+	m.ResetObservation()
+	m.SetHoldTraffic(false)
+	r.Hold = nil
+	m.ObserveRoute(r)
+	legacy, err = stats()
+	if err != nil || legacy.Inflight.Connected != 1 || len(legacy.Services) != 2 {
+		t.Fatalf("new legacy session inherited stale hold: %+v, %v", legacy, err)
+	}
+}

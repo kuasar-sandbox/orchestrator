@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -330,5 +333,112 @@ func TestNativeStatsSlowResponseIsBounded(t *testing.T) {
 	_, err = io.Copy(io.Discard, response.Body)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal("stalled write did not terminate with an incomplete response", err)
+	}
+}
+
+func TestTelemetryTrafficViewFollowsLiveRegistration(t *testing.T) {
+	start, recent := time.Unix(100, 0).UTC(), time.Unix(150, 0).UTC()
+	rows := []conductorextension.SandboxStats{
+		{SandboxID: "s1", Traffic: &conductorextension.TrafficStats{
+			State: "running", Inflight: conductorextension.TrafficInflight{Connected: 2},
+			Services: map[string]conductorextension.ServiceTrafficStats{
+				"exec": {IdleSince: &start}, "forward": {IdleSince: &recent}, "hold": {Connected: 2},
+			},
+		}},
+	}
+	reg := NewRegistry()
+	var physicalView bool
+	reader := nativeStatsFunc(func(ctx context.Context, _ conductorextension.StatsRequest) ([]conductorextension.SandboxStats, error) {
+		physicalView = proxystats.IsPhysicalTelemetry(ctx)
+		return rows, nil
+	})
+	server := New("", Deps{Plugins: reg, Stats: reader}, discardLogger())
+	read := func(t *testing.T, aware bool) conductorextension.TrafficStats {
+		t.Helper()
+		p := &Plugin{ID: routesync.TelemetryPluginID, peerPID: os.Getpid(), Caps: routesync.Register{HoldTraffic: aware, Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}}}
+		reg.Add(p)
+		reg.markRouteStreamReady(p)
+		req := httptest.NewRequest("POST", PathTelemetryStats, strings.NewReader(`{"sandboxIDs":["s1"],"sections":["traffic"]}`))
+		req = req.WithContext(context.WithValue(req.Context(), peerPIDKey{}, os.Getpid()))
+		rec := httptest.NewRecorder()
+		server.router().ServeHTTP(rec, req)
+		if physicalView == aware {
+			t.Fatalf("hold-aware registration %t selected physical view %t", aware, physicalView)
+		}
+		var got []conductorextension.SandboxStats
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || len(got) != 1 || got[0].Traffic == nil {
+			t.Fatalf("stats status=%d: %s", rec.Code, rec.Body.String())
+		}
+		return *got[0].Traffic
+	}
+	legacy := read(t, false)
+	if _, ok := legacy.Services["hold"]; ok || legacy.Inflight.Connected != 0 || legacy.IdleSince != nil {
+		t.Fatalf("legacy physical view: %+v", legacy)
+	}
+	modern := read(t, true)
+	if modern.Services["hold"].Connected != 2 || modern.Inflight.Connected != 2 || modern.IdleSince != nil {
+		t.Fatalf("negotiated native view after old read: %+v", modern)
+	}
+	// One physical flow remains after subtracting hold: it must stay busy.
+	rows[0].Traffic.Services["exec"] = conductorextension.ServiceTrafficStats{Connected: 1}
+	rows[0].Traffic.Inflight.Connected++
+	got := read(t, false)
+	if got.IdleSince != nil || got.Inflight.Connected != 1 || got.Services["exec"].Connected != 1 {
+		t.Fatalf("physical busy view: %+v", got)
+	}
+	rows[0].Traffic.Inflight.Connected = 1
+	if _, err := legacyTelemetryStats(rows); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("inconsistent source accepted: %v", err)
+	}
+}
+
+func TestLegacyTelemetryPreservesProxyPhysicalIdle(t *testing.T) {
+	// The exec connection closed last by boot time, after the wall clock was
+	// set back. The Proxy selected its top-level time before serialization.
+	beforeStep, afterStep := time.Unix(200, 0).UTC(), time.Unix(100, 0).UTC()
+	physical := conductorextension.TrafficStats{
+		State: "running", IdleSince: &afterStep,
+		Services: map[string]conductorextension.ServiceTrafficStats{
+			"forward": {IdleSince: &beforeStep}, "exec": {IdleSince: &afterStep},
+		},
+	}
+	rows := []conductorextension.SandboxStats{{Traffic: &physical}}
+	got, err := legacyTelemetryStats(rows)
+	if err != nil || got[0].Traffic.IdleSince == nil || !got[0].Traffic.IdleSince.Equal(afterStep) {
+		t.Fatalf("physical idle changed after wall-clock step: got %+v, err %v", got, err)
+	}
+}
+
+func TestLegacyTelemetryIdleFromNativeHoldSnapshot(t *testing.T) {
+	beforeStep, stamp := time.Unix(200, 0).UTC(), time.Unix(100, 0).UTC()
+	for _, tt := range []struct {
+		name     string
+		state    string
+		partial  bool
+		exec     *time.Time
+		wantIdle bool
+	}{
+		{"identical service wall times", "running", false, &stamp, true},
+		{"physical services span a clock step", "running", false, &beforeStep, false},
+		{"partial restart", "running", true, &stamp, false},
+		{"paused", "paused", false, &stamp, false},
+		{"unknown service observation", "running", false, nil, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rows := []conductorextension.SandboxStats{{Traffic: &conductorextension.TrafficStats{
+				InplaceRestart: tt.partial, State: tt.state, Inflight: conductorextension.TrafficInflight{Connected: 2},
+				Services: map[string]conductorextension.ServiceTrafficStats{
+					"forward": {IdleSince: &stamp}, "exec": {IdleSince: tt.exec}, "hold": {Connected: 2},
+				},
+			}}}
+			got, err := legacyTelemetryStats(rows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			idle := got[0].Traffic.IdleSince
+			if (idle != nil) != tt.wantIdle || (idle != nil && !idle.Equal(stamp)) || got[0].Traffic.InplaceRestart != tt.partial {
+				t.Fatalf("physical idle = %v, want idle = %t, partial = %t", idle, tt.wantIdle, tt.partial)
+			}
+		})
 	}
 }

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
@@ -23,7 +26,8 @@ const nativeStatsReplyTimeout = time.Second
 
 type NativeStatsReader = conductorextension.StatsReader
 
-func (r *Registry) telemetryStatsLease(peer int) (context.Context, bool) {
+// Capture capability and authorization from the same live registration.
+func (r *Registry) telemetryStatsLease(peer int) (lease context.Context, holdAware bool) {
 	if r == nil || peer <= 0 {
 		return nil, false
 	}
@@ -33,14 +37,14 @@ func (r *Registry) telemetryStatsLease(peer int) (context.Context, bool) {
 	if p == nil || !p.ready || p.peerPID != peer || p.lease == nil || p.lease.Err() != nil {
 		return nil, false
 	}
-	return p.lease, true
+	return p.lease, p.Caps.HoldTraffic
 }
 
 func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	peer, ok := peerFrom(r.Context())
-	lease, live := s.deps.Plugins.telemetryStatsLease(peer)
-	if !ok || !live || !s.pluginAuthed(peer) {
+	lease, holdAware := s.deps.Plugins.telemetryStatsLease(peer)
+	if !ok || lease == nil || !s.pluginAuthed(peer) {
 		http.Error(w, "not authorized (telemetry plugin)", http.StatusForbidden)
 		return
 	}
@@ -84,6 +88,9 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 		writeStatsError(w, api.ErrBadRequest)
 		return
 	}
+	if !holdAware {
+		ctx = proxystats.WithPhysicalTelemetry(ctx)
+	}
 	rows, err := s.deps.Stats.ReadStats(ctx, request)
 	if ctx.Err() != nil || lease.Err() != nil {
 		err = api.ErrStatsUnavailable
@@ -92,12 +99,65 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 		writeStatsError(w, err)
 		return
 	}
+	if !holdAware {
+		rows, err = legacyTelemetryStats(rows)
+		if err != nil {
+			writeStatsError(w, err)
+			return
+		}
+	}
 	encoded, err := json.Marshal(rows)
 	if err != nil || len(encoded) > conductorextension.MaxStatsResponseBytes {
 		writeStatsError(w, fmt.Errorf("%w: native stats response encoding", api.ErrStatsUnavailable))
 		return
 	}
 	writeStatsResponse(w, http.StatusOK, encoded)
+}
+
+// Older Telemetry binaries export every service and the top-level connected
+// count as physical sockets. Give only that internal consumer its original
+// view without mutating data shared with the native API or an extension.
+func legacyTelemetryStats(rows []conductorextension.SandboxStats) ([]conductorextension.SandboxStats, error) {
+	var out []conductorextension.SandboxStats
+	for i, row := range rows {
+		if row.Traffic == nil {
+			continue
+		}
+		r := *row.Traffic
+		hold, present := r.Services["hold"]
+		if !present {
+			// The legacy Proxy selected its physical idle time by boot clock.
+			// Service wall timestamps can be out of order after a clock step.
+			continue
+		}
+		if hold.Parking != 0 || hold.Connected > r.Inflight.Connected {
+			return nil, api.ErrStatsUnavailable
+		}
+		if out == nil {
+			out = slices.Clone(rows)
+		}
+		r.Inflight.Connected -= hold.Connected
+		r.Services = maps.Clone(r.Services)
+		delete(r.Services, "hold")
+		// A custom reader may return native totals without the Proxy's physical
+		// view. Its wall timestamps cannot order events across a clock step.
+		// When all physical services agree, their last idle time is unambiguous.
+		r.IdleSince = nil
+		if !r.InplaceRestart && r.State == routesync.StateRunning && r.Inflight.Connected == 0 && r.Inflight.Parking == 0 {
+			for _, physical := range r.Services {
+				if physical.IdleSince == nil || (r.IdleSince != nil && !r.IdleSince.Equal(*physical.IdleSince)) {
+					r.IdleSince = nil
+					break
+				}
+				r.IdleSince = physical.IdleSince
+			}
+		}
+		out[i].Traffic = &r
+	}
+	if out == nil {
+		return rows, nil
+	}
+	return out, nil
 }
 
 func writeStatsError(w http.ResponseWriter, err error) {

@@ -19,6 +19,8 @@ import (
 
 const (
 	BatchPath             = "/v1/traffic:batchGet"
+	trafficViewHeader     = "X-Kuasar-Traffic-View"
+	physicalTrafficView   = "physical"
 	maxBatchQueries       = 128
 	maxBatchRequestBytes  = 64 << 10
 	maxBatchResponseBytes = 1 << 20
@@ -31,13 +33,27 @@ type TrafficQuery struct {
 	State     types.State   `json:"state"`
 }
 
+type physicalTelemetryKey struct{}
+
+// WithPhysicalTelemetry selects the original Proxy idle timestamp for a
+// connection-only Telemetry reader. It is local to the authorized stats call.
+func WithPhysicalTelemetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, physicalTelemetryKey{}, true)
+}
+
+func IsPhysicalTelemetry(ctx context.Context) bool {
+	physical, _ := ctx.Value(physicalTelemetryKey{}).(bool)
+	return physical
+}
+
 type BatchRequest struct {
 	Sandboxes []TrafficQuery `json:"sandboxes"`
 }
 
 type BatchResult struct {
-	SandboxID string            `json:"sandboxID"`
-	Stats     *api.TrafficStats `json:"stats"`
+	SandboxID    string            `json:"sandboxID"`
+	Stats        *api.TrafficStats `json:"stats"`
+	PhysicalOnly bool              `json:"-"` // Proxy acknowledged the requested physical view on the stats socket.
 }
 
 type BatchResponse struct {
@@ -111,6 +127,11 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 		writeSocketError(w, http.StatusBadRequest, "invalid batch request")
 		return
 	}
+	ctx := r.Context()
+	physical := r.Header.Get(trafficViewHeader) == physicalTrafficView
+	if physical {
+		ctx = WithPhysicalTelemetry(ctx)
+	}
 	response := BatchResponse{Sandboxes: make([]BatchResult, 0, len(request.Sandboxes))}
 	for _, query := range request.Sandboxes {
 		if !validSandboxID(query.SandboxID) ||
@@ -128,7 +149,7 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 			writeSocketError(w, http.StatusServiceUnavailable, "traffic stats unavailable")
 			return
 		}
-		stats, err := s.master.SandboxTrafficStats(r.Context(), query.SandboxID, query.RunID, query.Profile, query.State)
+		stats, err := s.master.SandboxTrafficStats(ctx, query.SandboxID, query.RunID, query.Profile, query.State)
 		if err != nil {
 			status := http.StatusServiceUnavailable
 			if errors.Is(err, api.ErrStatsConflict) {
@@ -141,6 +162,9 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 		response.Sandboxes = append(response.Sandboxes, BatchResult{SandboxID: query.SandboxID, Stats: stats})
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if physical {
+		w.Header().Set(trafficViewHeader, physicalTrafficView)
+	}
 	_ = json.NewEncoder(w).Encode(response)
 }
 
@@ -170,6 +194,10 @@ func QuerySocket(ctx context.Context, socketPath string, queries []TrafficQuery)
 		return nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	physical := IsPhysicalTelemetry(ctx)
+	if physical {
+		request.Header.Set(trafficViewHeader, physicalTrafficView)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("%w: query proxy stats: %v", api.ErrStatsUnavailable, err)
@@ -192,10 +220,12 @@ func QuerySocket(ctx context.Context, socketPath string, queries []TrafficQuery)
 	if err := decoder.Decode(&batch); err != nil || len(batch.Sandboxes) != len(queries) {
 		return nil, api.ErrStatsUnavailable
 	}
+	acknowledged := physical && response.Header.Get(trafficViewHeader) == physicalTrafficView
 	for i, result := range batch.Sandboxes {
 		if result.SandboxID != queries[i].SandboxID || result.Stats == nil {
 			return nil, api.ErrStatsUnavailable
 		}
+		batch.Sandboxes[i].PhysicalOnly = acknowledged
 	}
 	return batch.Sandboxes, nil
 }

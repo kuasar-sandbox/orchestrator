@@ -114,11 +114,11 @@ connected  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
 conductor Sandbox row 推导;全零对象表示 unlimited。配置 `M` 是整个 node Proxy 对该
 Sandbox 的近似上限,`N` 个 worker 的短暂理论上界为 `M+N-1`,不是每 worker 的 `M`。
 
-e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec/hold`,bare 是
-`forward/exec/hold`。顶层 `inflight` 是各 service 求和。 `hold.connected` 计数单位为工作项；物理连接指标和 `maxInflight` 不包含它。每个 service 仅在两项为零时附
-`idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
+e2b 返回 `forward/e2b:envd/e2b:code-interpreter/exec`，bare 返回 `forward/exec`。流量 Proxy 与 Conductor 协商支持 hold 时，两种 profile 均另含 hold。顶层 `inflight` 是各 service 求和。 `hold.connected` 计数单位为工作项；物理连接指标和 `maxInflight` 不包含它。每个 service 仅在两项为零时附
+`idleSince`;顶层时间表示运行中且计数全零的沙箱内最后一个归零的适用 service；有启动时钟证据时按启动时钟确定顺序。
 starting/pausing/paused 返回 inflight 但不返回顶层 idle。接口不返回 idle bool/duration、last
 open/close、累计连接数、速率/延迟/端口明细或 worker 信息。
+旧版 Telemetry 保留 Proxy 按启动时钟确定的物理空闲起点。若 Proxy 仅提供物理空闲的墙钟时间，且它与已记录的 hold 释放时间不同，原生 API 省略顶层 `idleSince`；各物理 service 的空闲时间和计数仍可读取。
 
 conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master cache,查询时不扇出 worker.master 未注册,
 route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。

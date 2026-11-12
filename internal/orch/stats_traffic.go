@@ -95,12 +95,22 @@ func (o *Orchestrator) prepareTrafficReads(ctx context.Context, sandboxes []*typ
 	if len(results) != len(sandboxes) {
 		return nil, nil, api.ErrStatsUnavailable
 	}
+	physicalTelemetry := proxystats.IsPhysicalTelemetry(ctx)
 	ingress := make([]*api.TrafficStats, len(results))
 	for i, row := range results {
 		if row.SandboxID != sandboxes[i].ID || row.Stats == nil {
 			return nil, nil, api.ErrStatsUnavailable
 		}
-		ingress[i] = row.Stats
+		// Only the private reader can consume the Proxy's acknowledged
+		// physical aggregate independently of the logical hold count.
+		if physicalTelemetry && row.PhysicalOnly {
+			ingress[i] = row.Stats
+			continue
+		}
+		ingress[i], err = o.checkIngressHold(ctx, sandboxes[i], row.Stats)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return network, ingress, nil
 }
@@ -189,6 +199,32 @@ func (o *Orchestrator) readIngressStats(ctx context.Context, sb *types.Sandbox) 
 	}
 	if stats == nil {
 		return nil, api.ErrStatsUnavailable
+	}
+	return o.checkIngressHold(ctx, sb, stats)
+}
+
+// A v11 proxy returns its original services shape. It cannot certify an
+// all-idle result while a confirmed hold from an earlier session is active.
+// After release its physical idle time may predate that logical busy interval.
+func (o *Orchestrator) checkIngressHold(ctx context.Context, sb *types.Sandbox, stats *api.TrafficStats) (*api.TrafficStats, error) {
+	if _, present := stats.Services["hold"]; present {
+		return stats, nil
+	}
+	h := o.projectHold(sb)
+	if !h.Valid() || h.Value != 0 {
+		return nil, api.ErrStatsUnavailable
+	}
+	// The Proxy used its boot clock to choose the last physical service.
+	// Its original timestamp remains authoritative even if wall time moved back.
+	if proxystats.IsPhysicalTelemetry(ctx) {
+		return stats, nil
+	}
+	// v11 returns no boot timestamp for physical idle. If both events have
+	// distinct wall times, a clock step can reverse their apparent order.
+	if stats.IdleSince != nil && h.IdleSince != nil && !h.IdleSince.Equal(*stats.IdleSince) {
+		corrected := *stats
+		corrected.IdleSince = nil
+		return &corrected, nil
 	}
 	return stats, nil
 }

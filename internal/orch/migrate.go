@@ -547,8 +547,10 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, trafficSpec.Traffic); err != nil {
 		return nil, fmt.Errorf("import-sandbox: token traffic metadata: %w: %v", migrationtoken.ErrInvalidPayload, err)
 	}
+	var mmdsRoutes []sandboxcfg.MMDSRoute
 	if raw, present := metadata[sandboxcfg.NsMMDS]; present {
-		_, routesJSON, err := sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
+		var routesJSON string
+		mmdsRoutes, routesJSON, err = sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
 		if err != nil {
 			return nil, fmt.Errorf("import-sandbox: token MMDS routes: %w: %v", migrationtoken.ErrInvalidPayload, err)
 		}
@@ -597,11 +599,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
 	if mmdsImport.routesPresent {
-		initial := &mmdsInitialRouteSecretValues{
-			routesDigest: mmdsImport.routesDigest,
-			values:       mmdsImport.secretValues,
-		}
-		if err := validateInitialMMDSRouteEntry(sb, initial); err != nil {
+		if err := validateMMDSRouteEntry(sb, mmdsRoutes, mmdsImport.secretValues); err != nil {
 			return nil, fmt.Errorf("import-sandbox: MMDS route projection: %w: %v", migrationtoken.ErrInvalidPayload, err)
 		}
 	}
