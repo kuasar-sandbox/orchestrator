@@ -583,8 +583,10 @@ controller 只处理它发起的 reservation 请求。
 节点要求 Linux 5.7+ 且 seccomp 允许 `clone3`;不满足时 sandbox 启动 fail closed,
 不回退到启动后迁移或共享 cgroup。
 
-`KillMode=control-group` 递归覆盖 `ctl/` 与 `vmm/`;StopUnit 后 systemd 回收整个委托
-子树,无需 serve 单独搬迁进程或 rmdir。任何委托、层次、controller 或 FD 校验失败均在
+`KillMode=control-group` 递归覆盖 `ctl/` 与 `vmm/`;完成 StopUnit/ResetFailed 并确认
+unit inactive，或确认 unit 已不存在后，conductor 清理残留的空 runner 委托 cgroup
+子树。清理要求 `cgroup.events` 中 `populated=0`，只删除目录，不杀死或搬迁进程；
+失败时保留归属以便重试。任何委托、层次、controller 或 FD 校验失败均在
 CH 启动前 fail closed。
 
 <a id="numa-deployment-with-multiple-pools"></a>
