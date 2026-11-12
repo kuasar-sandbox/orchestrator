@@ -147,11 +147,11 @@ func (r *Registry) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 func (r *Registry) HoldTrafficReady() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.holdTrafficReadyLocked()
+	return r.holdTrafficReadyLocked(false)
 }
 
-func (r *Registry) holdTrafficReadyLocked() bool {
-	found := false
+func (r *Registry) holdTrafficReadyLocked(requireMMDS bool) bool {
+	hasReceiver := false
 	for _, p := range r.m {
 		if p.Caps.SubscribeKind() != routesync.KindRouteWake || p.Caps.Proxy == nil {
 			continue
@@ -159,9 +159,11 @@ func (r *Registry) holdTrafficReadyLocked() bool {
 		if !proxyRouteParticipantReady(p) || !p.Caps.WantsHoldTraffic() {
 			return false
 		}
-		found = true
+		if !requireMMDS || p.Caps.Mmds {
+			hasReceiver = true
+		}
 	}
-	return found
+	return hasReceiver
 }
 
 func proxyRouteParticipantReady(p *Plugin) bool {
@@ -250,13 +252,13 @@ func (b *proxyRouteBarrier) Wait(ctx context.Context) error {
 	}
 }
 
-// RequireHoldTraffic makes the existing Create barrier confirm that every
-// traffic proxy can serve the declared MMDS route, including at Commit.
+// RequireHoldTraffic makes the Create barrier check that every traffic Proxy
+// supports hold and at least one receives the declared guest route.
 func (b *proxyRouteBarrier) RequireHoldTraffic() error {
 	r := b.registry
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.holdTrafficReadyLocked() {
+	if !r.holdTrafficReadyLocked(true) {
 		return ErrProxyRouteUnavailable
 	}
 	b.requireHold = true
@@ -280,7 +282,7 @@ func (b *proxyRouteBarrier) Commit() error {
 	if len(b.acked) != len(b.required) {
 		return ErrProxyRouteUnavailable
 	}
-	if (b.singleProxy && !b.singleProxyLocked()) || (b.requireHold && !r.holdTrafficReadyLocked()) {
+	if (b.singleProxy && !b.singleProxyLocked()) || (b.requireHold && !r.holdTrafficReadyLocked(true)) {
 		delete(r.barriers, b.id)
 		return ErrProxyRouteLeaseChanged
 	}

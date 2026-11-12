@@ -935,7 +935,9 @@ requires v12, replace that Conductor and its Proxies together.
 
 A new Conductor accepts a new positive count or a Create that declares a guest
 hold path only when at least one traffic Proxy is registered and all such peers
-are ready and support hold. Otherwise it returns 503; ordinary Create, Wake,
+are ready and support hold. For a guest path, at least one of these Proxies must
+also subscribe to MMDS. This applies to the final sandbox declaration, including
+paths added by a cluster Create hook. Otherwise the operation returns 503. Ordinary Create, Wake,
 and connection-based idle still work. Legacy proxies receive their familiar
 MMDS routes; only the hold path is omitted. A legacy Proxy joining later cannot
 erase a confirmed count. The owner can still read it and, while the sandbox is

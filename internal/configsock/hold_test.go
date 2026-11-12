@@ -118,6 +118,7 @@ func TestHoldAdmissionIncludesNotReadyAndLegacyServingPeers(t *testing.T) {
 	}
 	modern := &Plugin{ID: "proxy", Caps: proxyCaps()}
 	modern.Caps.HoldTraffic = true
+	modern.Caps.Mmds = true
 	r.Add(modern)
 	if r.HoldTrafficReady() {
 		t.Fatal("incomplete registration enabled hold")
@@ -154,5 +155,58 @@ func TestHoldAdmissionIncludesNotReadyAndLegacyServingPeers(t *testing.T) {
 	r.Remove(modern)
 	if r.HoldTrafficReady() {
 		t.Fatal("missing traffic authority accepted hold")
+	}
+}
+
+func TestGuestHoldAdmissionRequiresMMDSReceiver(t *testing.T) {
+	r := NewRegistry()
+	begin := func() *proxyRouteBarrier {
+		t.Helper()
+		b, err := r.BeginProxyRouteBarrier()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(b.Cancel)
+		return b.(*proxyRouteBarrier)
+	}
+	traffic := &Plugin{ID: "traffic", Caps: proxyCaps()}
+	traffic.Caps.HoldTraffic = true
+	r.Add(traffic)
+	r.markRouteStreamReady(traffic)
+	if !r.HoldTrafficReady() {
+		t.Fatal("host hold requires no MMDS receiver")
+	}
+	b := begin()
+	if err := b.RequireHoldTraffic(); !errors.Is(err, ErrProxyRouteUnavailable) {
+		t.Fatalf("guest route without an MMDS receiver: got %v", err)
+	}
+	b.Cancel()
+
+	mmds := &Plugin{ID: "mmds", Caps: traffic.Caps}
+	mmds.Caps.Mmds = true
+	r.Add(mmds)
+	r.markRouteStreamReady(mmds)
+	b = begin()
+	if err := b.RequireHoldTraffic(); err != nil {
+		t.Fatal(err)
+	}
+	r.routeBarrierAck(traffic, b.ID())
+	r.routeBarrierAck(mmds, b.ID())
+	if err := b.Commit(); err != nil {
+		t.Fatalf("MMDS receiver and traffic-only peer: %v", err)
+	}
+
+	b = begin()
+	if err := b.RequireHoldTraffic(); err != nil {
+		t.Fatal(err)
+	}
+	r.routeBarrierAck(traffic, b.ID())
+	r.routeBarrierAck(mmds, b.ID())
+	r.Remove(mmds)
+	if err := b.Commit(); !errors.Is(err, ErrProxyRouteDisconnected) {
+		t.Fatalf("last MMDS receiver disconnected after ACK: got %v", err)
+	}
+	if !r.HoldTrafficReady() {
+		t.Fatal("loss of MMDS receiver disabled host hold")
 	}
 }

@@ -1199,7 +1199,8 @@ Conductor 在 Hello 中确认 `hold_traffic_v1`。没有确认时，Proxy 继续
 v0.1.14 发布版使用 v11。如果已经部署了强制使用 v12 的 main 中间构建，应同时替换该节点的 Conductor 和 Proxy。
 
 新 Conductor 只在至少注册了一个流量 Proxy，且所有流量 Proxy 均已就绪并支持 hold 时，
-接受新的正数写入或声明 guest hold 路径的 Create；否则返回 503。普通 Create、Wake 和按连接自动暂停
+接受新的正数写入或声明 guest hold 路径的 Create。声明 guest 路径还要求至少一个流量 Proxy 订阅
+MMDS。检查以最终沙箱声明为准，包含集群 Create hook 添加的路径。条件不满足时返回 503。普通 Create、Wake 和按连接自动暂停
 仍可用。给旧 Proxy 的 MMDS 声明仅去掉 hold 路径，保留其他路由。旧 Proxy 后来加入不会清除
 已登记的计数；所属调用方仍可通过节点 API 读取，并在沙箱运行时归零。旧统计源无法反映已有正数时，
 节点返回 503。清零后原生统计恢复 200。若旧 Proxy 的物理空闲时间与 hold 释放时间不同，节点会省略

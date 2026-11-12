@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -14,7 +15,6 @@ import (
 
 type mmdsInitialRouteSecretValues struct {
 	routesDigest string
-	requiresHold bool
 	values       store.MMDSRouteSecretValues
 }
 
@@ -24,32 +24,33 @@ func initialMMDSRouteSecretValues(doc sandboxcfg.MMDSDocument) *mmdsInitialRoute
 	if !doc.RoutesPresent {
 		return nil
 	}
-	initial := &mmdsInitialRouteSecretValues{
+	return &mmdsInitialRouteSecretValues{
 		routesDigest: sandboxcfg.MMDSRoutesDigest(doc.RoutesJSON),
 		values:       store.MMDSRouteSecretValues(doc.SecretValues),
 	}
-	for _, r := range doc.Routes {
-		if r.Type == sandboxcfg.MMDSRouteHoldTraffic {
-			initial.requiresHold = true
-			break
-		}
-	}
-	return initial
 }
 
-func validateInitialMMDSRouteEntry(sb *types.Sandbox, initial *mmdsInitialRouteSecretValues) error {
-	if initial == nil || sb == nil {
-		return nil
+// Fresh Create admits the final routes that will actually be published,
+// including cluster Hook metadata supplied without any initial secrets.
+func (o *Orchestrator) validateFreshMMDSRoutes(sb *types.Sandbox, values store.MMDSRouteSecretValues) (requiresHold bool, err error) {
+	raw, present := sb.Metadata[sandboxcfg.NsMMDS]
+	if !present {
+		return false, nil
 	}
-	return validateMMDSRouteEntry(sb, initial.values)
-}
-
-func validateMMDSRouteEntry(sb *types.Sandbox, secretValues store.MMDSRouteSecretValues) error {
-	raw := sb.Metadata[sandboxcfg.NsMMDS]
-	routes, err := sandboxcfg.DecodePersistedMMDSRoutes(raw)
+	routes, canonical, err := sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
 	if err != nil {
-		return err
+		return false, err
 	}
+	sb.Metadata[sandboxcfg.NsMMDS] = canonical
+	if err := validateMMDSRouteEntry(sb, routes, values); err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(routes, func(r sandboxcfg.MMDSRoute) bool {
+		return r.Type == sandboxcfg.MMDSRouteHoldTraffic
+	}), nil
+}
+
+func validateMMDSRouteEntry(sb *types.Sandbox, routes []sandboxcfg.MMDSRoute, secretValues store.MMDSRouteSecretValues) error {
 	entry, err := routeEntryBase(sb)
 	if err != nil {
 		return err
@@ -58,7 +59,7 @@ func validateMMDSRouteEntry(sb *types.Sandbox, secretValues store.MMDSRouteSecre
 	// routes and secrets must still fit when the last hold is released.
 	longestWall := time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 	entry.Hold = &routesync.HoldActivity{IdleSince: &longestWall, IdleSinceBootNS: math.MaxInt64}
-	entry.MMDSRoutes = raw
+	entry.MMDSRoutes = sb.Metadata[sandboxcfg.NsMMDS]
 	if sandboxcfg.MMDSHasSecretRoutes(routes) {
 		values := make(routesync.MMDSRouteSecretValues, len(secretValues))
 		for name, value := range secretValues {

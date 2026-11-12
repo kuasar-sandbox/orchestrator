@@ -294,7 +294,7 @@ func (o *Orchestrator) validateInitialBuildMMDS(build *types.Build, document san
 		State: types.StateRunning, RunID: "build-registration-check",
 		APISecret: build.APISecret, ManifestKey: build.ManifestKey, Metadata: build.Metadata,
 	}
-	if err := validateInitialMMDSRouteEntry(transportRow, initial); err != nil {
+	if err := validateMMDSRouteEntry(transportRow, document.Routes, initial.values); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	return initial, nil

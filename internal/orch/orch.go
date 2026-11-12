@@ -332,7 +332,14 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err := lifecycleCtx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
-	if err := validateInitialMMDSRouteEntry(sb, initialMMDS); err != nil {
+	var routesDigest string
+	var secretValues store.MMDSRouteSecretValues
+	if initialMMDS != nil {
+		routesDigest = initialMMDS.routesDigest
+		secretValues = initialMMDS.values
+	}
+	requiresHold, err := o.validateFreshMMDSRoutes(sb, secretValues)
+	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	preparation, err := o.prepareSandboxLaunch(ctx, sb, tmpl)
@@ -352,7 +359,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
 	}
 	defer barrier.Cancel()
-	if initialMMDS != nil && initialMMDS.requiresHold {
+	if requiresHold {
 		b, ok := barrier.(interface{ RequireHoldTraffic() error })
 		if !ok {
 			return nil, nil, api.ErrProxyUnavailable
@@ -376,12 +383,6 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err := o.checkResourceLaunch(sb); err != nil {
 		o.launches.Finish(attempt, err)
 		return nil, nil, err
-	}
-	var routesDigest string
-	var secretValues store.MMDSRouteSecretValues
-	if initialMMDS != nil {
-		routesDigest = initialMMDS.routesDigest
-		secretValues = initialMMDS.values
 	}
 	if err := o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, cloneSandbox(sb), routesDigest, secretValues); err != nil {
 		o.launches.Finish(attempt, err)

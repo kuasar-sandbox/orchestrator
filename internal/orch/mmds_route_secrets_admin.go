@@ -59,7 +59,7 @@ func (o *Orchestrator) mutateMMDSRouteSecretValue(ctx context.Context, sandboxID
 	} else {
 		proposed[name] = append([]byte(nil), value...)
 	}
-	if err := validateMMDSRouteEntry(sb, proposed); err != nil {
+	if err := validateMMDSRouteEntry(sb, routes, proposed); err != nil {
 		return fmt.Errorf("secret value set cannot be synchronized: %w: %v", api.ErrBadRequest, err)
 	}
 	if deleteValue {
