@@ -44,7 +44,7 @@ func (s *Server) handleGuestHold(w http.ResponseWriter, r *http.Request) {
 	registry.mu.Lock()
 	plugin := registry.m[id]
 	var lease context.Context
-	if plugin != nil && plugin.peerPID == peer && plugin.ready && isTrustedMMDSProxyRegistration(id, plugin.Caps) {
+	if plugin != nil && plugin.peerPID == peer && plugin.ready && plugin.Caps.WantsHoldTraffic() && isTrustedMMDSProxyRegistration(id, plugin.Caps) {
 		lease = plugin.lease
 	}
 	registry.mu.Unlock()

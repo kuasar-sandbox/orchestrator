@@ -267,6 +267,32 @@ func DecodePersistedMMDSRoutes(raw string) ([]MMDSRoute, error) {
 	return doc.Routes, nil
 }
 
+// MMDSRoutesWithoutHold projects accepted declarations to a legacy MMDS
+// reader. Validate before filtering: an invalid document must not silently
+// become a valid empty set. Preserve the original bytes unless filtering.
+func MMDSRoutesWithoutHold(raw string) (string, error) {
+	rs, err := DecodePersistedMMDSRoutes(raw)
+	if err != nil {
+		return "", err
+	}
+	keep := rs[:0]
+	for _, route := range rs {
+		if route.Type != MMDSRouteHoldTraffic {
+			keep = append(keep, route)
+		}
+	}
+	if len(keep) == len(rs) {
+		return raw, nil
+	}
+	if len(keep) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(struct {
+		Routes []MMDSRoute `json:"routes"`
+	}{keep})
+	return string(b), err
+}
+
 func parseMMDSPartial(raw string, maxBytes int) (partialMMDS, error) {
 	if maxBytes <= 0 {
 		return partialMMDS{}, errors.New("invalid MMDS namespace size policy")

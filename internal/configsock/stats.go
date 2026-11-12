@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -23,7 +25,8 @@ const nativeStatsReplyTimeout = time.Second
 
 type NativeStatsReader = conductorextension.StatsReader
 
-func (r *Registry) telemetryStatsLease(peer int) (context.Context, bool) {
+// Capture capability and authorization from the same live registration.
+func (r *Registry) telemetryStatsLease(peer int) (lease context.Context, holdAware bool) {
 	if r == nil || peer <= 0 {
 		return nil, false
 	}
@@ -33,14 +36,14 @@ func (r *Registry) telemetryStatsLease(peer int) (context.Context, bool) {
 	if p == nil || !p.ready || p.peerPID != peer || p.lease == nil || p.lease.Err() != nil {
 		return nil, false
 	}
-	return p.lease, true
+	return p.lease, p.Caps.HoldTraffic
 }
 
 func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	peer, ok := peerFrom(r.Context())
-	lease, live := s.deps.Plugins.telemetryStatsLease(peer)
-	if !ok || !live || !s.pluginAuthed(peer) {
+	lease, holdAware := s.deps.Plugins.telemetryStatsLease(peer)
+	if !ok || lease == nil || !s.pluginAuthed(peer) {
 		http.Error(w, "not authorized (telemetry plugin)", http.StatusForbidden)
 		return
 	}
@@ -92,12 +95,64 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 		writeStatsError(w, err)
 		return
 	}
+	if !holdAware {
+		rows, err = legacyTelemetryStats(rows)
+		if err != nil {
+			writeStatsError(w, err)
+			return
+		}
+	}
 	encoded, err := json.Marshal(rows)
 	if err != nil || len(encoded) > conductorextension.MaxStatsResponseBytes {
 		writeStatsError(w, fmt.Errorf("%w: native stats response encoding", api.ErrStatsUnavailable))
 		return
 	}
 	writeStatsResponse(w, http.StatusOK, encoded)
+}
+
+// Older Telemetry binaries export every service and the top-level connected
+// count as physical sockets. Give only that internal consumer its original
+// view without mutating data shared with the native API or an extension.
+func legacyTelemetryStats(rows []conductorextension.SandboxStats) ([]conductorextension.SandboxStats, error) {
+	var out []conductorextension.SandboxStats
+	for i, row := range rows {
+		if row.Traffic == nil {
+			continue
+		}
+		r := *row.Traffic
+		hold, present := r.Services["hold"]
+		if !present {
+			continue // The source is already connection-only.
+		}
+		if hold.Parking != 0 || hold.Connected > r.Inflight.Connected {
+			return nil, api.ErrStatsUnavailable
+		}
+		if out == nil {
+			out = slices.Clone(rows)
+		}
+		r.Inflight.Connected -= hold.Connected
+		r.Services = maps.Clone(r.Services)
+		delete(r.Services, "hold")
+		// The logical total can be busy or can have a more recent release.
+		// In v11 the top-level idle time is the last physical service to idle.
+		r.IdleSince = nil
+		if r.State == routesync.StateRunning && r.Inflight.Connected == 0 && r.Inflight.Parking == 0 {
+			for _, physical := range r.Services {
+				if physical.IdleSince == nil {
+					r.IdleSince = nil
+					break
+				}
+				if r.IdleSince == nil || physical.IdleSince.After(*r.IdleSince) {
+					r.IdleSince = physical.IdleSince
+				}
+			}
+		}
+		out[i].Traffic = &r
+	}
+	if out == nil {
+		return rows, nil
+	}
+	return out, nil
 }
 
 func writeStatsError(w http.ResponseWriter, err error) {

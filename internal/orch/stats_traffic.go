@@ -100,7 +100,10 @@ func (o *Orchestrator) prepareTrafficReads(ctx context.Context, sandboxes []*typ
 		if row.SandboxID != sandboxes[i].ID || row.Stats == nil {
 			return nil, nil, api.ErrStatsUnavailable
 		}
-		ingress[i] = row.Stats
+		ingress[i], err = o.checkIngressHold(sandboxes[i], row.Stats)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return network, ingress, nil
 }
@@ -189,6 +192,25 @@ func (o *Orchestrator) readIngressStats(ctx context.Context, sb *types.Sandbox) 
 	}
 	if stats == nil {
 		return nil, api.ErrStatsUnavailable
+	}
+	return o.checkIngressHold(sb, stats)
+}
+
+// A v11 proxy returns its original services shape. It cannot certify an
+// all-idle result while a confirmed hold from an earlier session is active.
+// After release its physical idle time may predate that logical busy interval.
+func (o *Orchestrator) checkIngressHold(sb *types.Sandbox, stats *api.TrafficStats) (*api.TrafficStats, error) {
+	if _, present := stats.Services["hold"]; present {
+		return stats, nil
+	}
+	h := o.projectHold(sb)
+	if !h.Valid() || h.Value != 0 {
+		return nil, api.ErrStatsUnavailable
+	}
+	if stats.IdleSince != nil && h.IdleSince != nil && h.IdleSince.After(*stats.IdleSince) {
+		corrected := *stats
+		corrected.IdleSince = h.IdleSince
+		return &corrected, nil
 	}
 	return stats, nil
 }

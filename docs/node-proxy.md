@@ -923,9 +923,29 @@ same value does not. A stale positive value has no TTL: the workload owner must
 reconcile it. Unconditional Pause still works. Same-row Pause/Resume and Reset
 retain the value; a new local row (including Import) starts at zero. To continue
 work across nodes, keep an admitted connection until the destination confirms
-the new count. Upgrade Conductor and Proxy together for routesync v12.
+the new count.
 
-The physical services are `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b uses all four; bare uses forward/exec. Both profiles also report hold. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
+**Rolling upgrades:** routesync remains v11. A new Proxy requests
+`hold_traffic` when it registers and a supporting Conductor confirms
+`hold_traffic_v1` in Hello. Without confirmation, the Proxy forwards traffic,
+reports physical services and uses the original connection-based idle policy.
+A missing hold on a route in a *confirmed* session means activity is unknown.
+The v0.1.14 release uses v11. If you deployed an intermediate main build that
+requires v12, replace that Conductor and its Proxies together.
+
+A new Conductor accepts a new positive count or a Create that declares a guest
+hold path only when at least one traffic Proxy is registered and all such peers
+are ready and support hold. Otherwise it returns 503; ordinary Create, Wake,
+and connection-based idle still work. Legacy proxies receive their familiar
+MMDS routes; only the hold path is omitted. A legacy Proxy joining later cannot
+erase a confirmed count. The owner can still read it and, while the sandbox is
+running, clear it through the node API. If a legacy statistics source would
+report an active hold as idle, the node returns 503. Before downgrading the
+**Conductor** itself to a build without hold, finish or hand off outstanding
+work, or disable idle auto-pause for the affected sandboxes. The old authority
+cannot enforce a count saved by its replacement.
+
+The physical services are `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b uses all four; bare uses forward/exec. Both profiles also report hold when negotiated. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
 
 Example idle response for a bare sandbox (inapplicable e2b limits are zero):
 
@@ -1032,7 +1052,7 @@ The master projects the downstream route stream into shared memory:
 - `Bookmark` removes old records absent from this generation and marks initial sync complete.
 - `Policy` writes the shared header. Each worker request reads current `auth_mode` and `park_timeout_ms`.
 
-Pause uses routesync v12 `pause_barrier{barrier_id,route}` and `pause_ack{barrier_id,pause_ack}`.
+Pause uses routesync v11 `pause_barrier{barrier_id,route}` and `pause_ack{barrier_id,pause_ack}`.
 The conductor snapshots currently online ready registrations, ignoring those already disconnected.
 There is no persistent Proxy inventory; zero participants is permitted. Each master applies the
 `pausing` route before synchronously sampling every live worker, including draining workers,

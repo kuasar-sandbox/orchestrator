@@ -155,6 +155,15 @@ func (o *Orchestrator) sandboxHold(ctx context.Context, id string, value, ifMatc
 	if !holdRunning(sb) {
 		return 0, api.ErrHoldStateConflict
 	}
+	// The session set is an admission cut, not a durable inventory. If a
+	// legacy proxy joins afterwards, the authoritative count still vetoes
+	// conditional Pause. Reading and releasing hold need no capable proxy.
+	if *value > 0 {
+		caps, ok := o.routeBarriers.(interface{ HoldTrafficReady() bool })
+		if !ok || !caps.HoldTrafficReady() {
+			return 0, api.ErrProxyUnavailable
+		}
+	}
 	actual, changed, err := o.st.SetHoldValue(ctx, sb.ID, sb.InstanceID, sb.RunID, *value, ifMatch)
 	switch {
 	case errors.Is(err, store.ErrHoldNotMatched):

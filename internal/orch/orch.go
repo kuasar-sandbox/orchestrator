@@ -352,6 +352,15 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
 	}
 	defer barrier.Cancel()
+	if initialMMDS != nil && initialMMDS.requiresHold {
+		b, ok := barrier.(interface{ RequireHoldTraffic() error })
+		if !ok {
+			return nil, nil, api.ErrProxyUnavailable
+		}
+		if err := b.RequireHoldTraffic(); err != nil {
+			return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
+		}
+	}
 
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()

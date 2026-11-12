@@ -1191,11 +1191,22 @@ MMDS 读写使用十进制文本，只有声明了该路径的沙箱可以访问
 结束前确认登记总数成功，并在结果可交付后再释放最后一项。正数归零会开始新的空闲区间；
 重复写入同值不会重置计时。hold 没有 TTL，残留计数由业务核对。无条件 Pause 仍可执行。
 同一本地记录的 Pause/Resume 和 Reset 保留计数；新记录（含独立 Import）从零开始。
-跨节点接续工作时，应保持一条已接纳的连接，直到目的节点确认重新登记。Conductor 与 Proxy
-需要配套升级到 routesync v12。
+跨节点接续工作时，应保持一条已接纳的连接，直到目的节点确认重新登记。
+
+**滚动升级：** routesync 仍使用 v11。新 Proxy 注册时声明 `hold_traffic`，支持它的
+Conductor 在 Hello 中确认 `hold_traffic_v1`。没有确认时，Proxy 继续转发，按真实连接
+返回原有服务统计、判定空闲。已经确认支持 hold 的会话里，单条路由缺少 hold 表示活动未知。
+v0.1.14 发布版使用 v11。如果已经部署了强制使用 v12 的 main 中间构建，应同时替换该节点的 Conductor 和 Proxy。
+
+新 Conductor 只在至少注册了一个流量 Proxy，且所有流量 Proxy 均已就绪并支持 hold 时，
+接受新的正数写入或声明 guest hold 路径的 Create；否则返回 503。普通 Create、Wake 和按连接自动暂停
+仍可用。给旧 Proxy 的 MMDS 声明仅去掉 hold 路径，保留其他路由。旧 Proxy 后来加入不会清除
+已登记的计数；所属调用方仍可通过节点 API 读取，并在沙箱运行时归零。旧统计源无法反映已有正数时，
+节点返回 503。若要把 **Conductor 本身**降级为不识别 hold 的版本，应先完成或交接已登记的工作，
+或者先关闭相应沙箱的空闲自动暂停；旧 Conductor 不会执行新版本保存的计数。
 
 物理 service 包括 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
-bare 使用 forward/exec。两种 profile 均另含 hold。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
+bare 使用 forward/exec。协商支持时，两种 profile 均另含 hold。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
 成功时在同一 worker-local entry lock 中原子执行 `parking--/connected++`;activation 或 dial
 失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 connected;只有 tracked backend
 的最终 `Close` 以 `sync.Once` 结束 connected。token 或 ExecRequest admission 失败不进入
@@ -1331,7 +1342,7 @@ master 把下行路由流投影到共享内存:
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
-Pause 使用 routesync v12 的 `pause_barrier{barrier_id,route}` 和
+Pause 使用 routesync v11 的 `pause_barrier{barrier_id,route}` 和
 `pause_ack{barrier_id,pause_ack}`. Conductor 固定本次开始时在线且 ready 的 Proxy 集合,
 忽略此前已断链的 Proxy, 不持久化清单; 空参与集允许继续. 各 master 先应用 `pausing`
 路由, 再通过私有控制通道同步采样所有 worker, 包括正在 drain 的 worker. Worker 在

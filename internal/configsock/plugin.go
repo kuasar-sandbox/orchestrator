@@ -141,6 +141,29 @@ func (r *Registry) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 	return r.beginRouteBarrierLocked(participants, false)
 }
 
+// HoldTrafficReady reports capability across traffic-serving registrations,
+// including peers in the middle of initial sync or handover. An observer
+// must not enable hold, nor does a missing registration imply support.
+func (r *Registry) HoldTrafficReady() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.holdTrafficReadyLocked()
+}
+
+func (r *Registry) holdTrafficReadyLocked() bool {
+	found := false
+	for _, p := range r.m {
+		if p.Caps.SubscribeKind() != routesync.KindRouteWake || p.Caps.Proxy == nil {
+			continue
+		}
+		if !proxyRouteParticipantReady(p) || !p.Caps.WantsHoldTraffic() {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 func proxyRouteParticipantReady(p *Plugin) bool {
 	return p != nil && p.ready &&
 		p.Caps.Subscribe != nil && p.Caps.Subscribe.Kind == routesync.KindRouteWake &&
@@ -201,6 +224,7 @@ type proxyRouteBarrier struct {
 	err         error
 	pause       bool
 	singleProxy bool
+	requireHold bool
 	activity    routesync.PauseAck
 }
 
@@ -226,6 +250,19 @@ func (b *proxyRouteBarrier) Wait(ctx context.Context) error {
 	}
 }
 
+// RequireHoldTraffic makes the existing Create barrier confirm that every
+// traffic proxy can serve the declared MMDS route, including at Commit.
+func (b *proxyRouteBarrier) RequireHoldTraffic() error {
+	r := b.registry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.holdTrafficReadyLocked() {
+		return ErrProxyRouteUnavailable
+	}
+	b.requireHold = true
+	return nil
+}
+
 // Commit is the barrier linearization point. ACK completion alone is
 // insufficient: every captured participant must still be the current ready
 // registration while this check holds the registry lock.
@@ -243,7 +280,7 @@ func (b *proxyRouteBarrier) Commit() error {
 	if len(b.acked) != len(b.required) {
 		return ErrProxyRouteUnavailable
 	}
-	if b.singleProxy && !b.singleProxyLocked() {
+	if (b.singleProxy && !b.singleProxyLocked()) || (b.requireHold && !r.holdTrafficReadyLocked()) {
 		delete(r.barriers, b.id)
 		return ErrProxyRouteLeaseChanged
 	}
@@ -380,7 +417,7 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 				receiver.OnProxyActivity(ctx, source, &a)
 			})
 		},
-		ProxyCapabilities: []string{routesync.InplaceRestartV1},
+		ProxyCapabilities: []string{routesync.InplaceRestartV1, routesync.HoldTrafficV1},
 		RouteStreamReady:  func() { s.deps.Plugins.markRouteStreamReady(p) },
 		RouteBarrierAck:   func(barrierID string) { s.deps.Plugins.routeBarrierAck(p, barrierID) },
 		PauseAck:          func(barrierID string, ack routesync.PauseAck) { s.deps.Plugins.pauseAck(p, barrierID, ack) },

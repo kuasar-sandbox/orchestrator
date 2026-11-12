@@ -132,7 +132,7 @@ func Run(ctx context.Context, cfg *config.Telemetry, runtime *Runtime) (resultEr
 	case "custom":
 		handler = runtime.MetricsHandler
 	}
-	registration := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}, Telemetry: &routesync.Telemetry{}}
+	registration := routesync.Register{HoldTraffic: true, Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}, Telemetry: &routesync.Telemetry{}}
 	if reader != nil && handler != nil {
 		listener, release, err := listenQuery(cfg.APISocket)
 		if err != nil {

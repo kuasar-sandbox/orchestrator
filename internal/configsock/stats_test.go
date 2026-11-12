@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -330,5 +332,56 @@ func TestNativeStatsSlowResponseIsBounded(t *testing.T) {
 	_, err = io.Copy(io.Discard, response.Body)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal("stalled write did not terminate with an incomplete response", err)
+	}
+}
+
+func TestTelemetryTrafficViewFollowsLiveRegistration(t *testing.T) {
+	start, recent := time.Unix(100, 0).UTC(), time.Unix(150, 0).UTC()
+	rows := []conductorextension.SandboxStats{
+		{SandboxID: "s1", Traffic: &conductorextension.TrafficStats{
+			State: "running", Inflight: conductorextension.TrafficInflight{Connected: 2},
+			Services: map[string]conductorextension.ServiceTrafficStats{
+				"exec": {IdleSince: &start}, "forward": {IdleSince: &recent}, "hold": {Connected: 2},
+			},
+		}},
+	}
+	reg := NewRegistry()
+	reader := nativeStatsFunc(func(context.Context, conductorextension.StatsRequest) ([]conductorextension.SandboxStats, error) {
+		return rows, nil
+	})
+	server := New("", Deps{Plugins: reg, Stats: reader}, discardLogger())
+	read := func(t *testing.T, aware bool) conductorextension.TrafficStats {
+		t.Helper()
+		p := &Plugin{ID: routesync.TelemetryPluginID, peerPID: os.Getpid(), Caps: routesync.Register{HoldTraffic: aware, Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}}}
+		reg.Add(p)
+		reg.markRouteStreamReady(p)
+		req := httptest.NewRequest("POST", PathTelemetryStats, strings.NewReader(`{"sandboxIDs":["s1"],"sections":["traffic"]}`))
+		req = req.WithContext(context.WithValue(req.Context(), peerPIDKey{}, os.Getpid()))
+		rec := httptest.NewRecorder()
+		server.router().ServeHTTP(rec, req)
+		var got []conductorextension.SandboxStats
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || len(got) != 1 || got[0].Traffic == nil {
+			t.Fatalf("stats status=%d: %s", rec.Code, rec.Body.String())
+		}
+		return *got[0].Traffic
+	}
+	legacy := read(t, false)
+	if _, ok := legacy.Services["hold"]; ok || legacy.Inflight.Connected != 0 || legacy.IdleSince == nil || !legacy.IdleSince.Equal(recent) {
+		t.Fatalf("legacy physical view: %+v", legacy)
+	}
+	modern := read(t, true)
+	if modern.Services["hold"].Connected != 2 || modern.Inflight.Connected != 2 || modern.IdleSince != nil {
+		t.Fatalf("negotiated native view after old read: %+v", modern)
+	}
+	// One physical flow remains after subtracting hold: it must stay busy.
+	rows[0].Traffic.Services["exec"] = conductorextension.ServiceTrafficStats{Connected: 1}
+	rows[0].Traffic.Inflight.Connected++
+	got := read(t, false)
+	if got.IdleSince != nil || got.Inflight.Connected != 1 || got.Services["exec"].Connected != 1 {
+		t.Fatalf("physical busy view: %+v", got)
+	}
+	rows[0].Traffic.Inflight.Connected = 1
+	if _, err := legacyTelemetryStats(rows); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("inconsistent source accepted: %v", err)
 	}
 }

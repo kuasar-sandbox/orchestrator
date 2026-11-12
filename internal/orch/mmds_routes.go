@@ -14,6 +14,7 @@ import (
 
 type mmdsInitialRouteSecretValues struct {
 	routesDigest string
+	requiresHold bool
 	values       store.MMDSRouteSecretValues
 }
 
@@ -23,10 +24,17 @@ func initialMMDSRouteSecretValues(doc sandboxcfg.MMDSDocument) *mmdsInitialRoute
 	if !doc.RoutesPresent {
 		return nil
 	}
-	return &mmdsInitialRouteSecretValues{
+	initial := &mmdsInitialRouteSecretValues{
 		routesDigest: sandboxcfg.MMDSRoutesDigest(doc.RoutesJSON),
 		values:       store.MMDSRouteSecretValues(doc.SecretValues),
 	}
+	for _, r := range doc.Routes {
+		if r.Type == sandboxcfg.MMDSRouteHoldTraffic {
+			initial.requiresHold = true
+			break
+		}
+	}
+	return initial
 }
 
 func validateInitialMMDSRouteEntry(sb *types.Sandbox, initial *mmdsInitialRouteSecretValues) error {

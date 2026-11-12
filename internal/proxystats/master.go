@@ -66,6 +66,7 @@ type MasterStats struct {
 	now              func() timePoint
 	trustSince       timePoint
 	routes           map[string]routeObservation
+	physicalOnly     bool // confirmed v11 session without negotiated hold support
 }
 
 func NewMasterStats(mx *metrics.M, workerIDs []string) *MasterStats {
@@ -331,7 +332,7 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 		return nil, api.ErrStatsConflict
 	}
 	route := m.routes[sandboxID]
-	if !route.holdKnown || route.runID != runID || route.state != string(state) {
+	if (!m.physicalOnly && !route.holdKnown) || route.runID != runID || route.state != string(state) {
 		return nil, api.ErrStatsUnavailable
 	}
 	services, ok := profileServices(profile)
@@ -356,6 +357,9 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	for _, service := range services {
 		current := aggregate.services[service]
 		if service == "hold" {
+			if m.physicalOnly {
+				continue
+			}
 			current = route.hold
 		}
 		if math.MaxUint64-result.Inflight.Connected < current.egress || math.MaxUint64-result.Inflight.Parking < current.parking {

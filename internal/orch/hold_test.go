@@ -148,6 +148,29 @@ func TestBuildRegisterRejectsHoldRoute(t *testing.T) {
 	}
 }
 
+func TestCreateGuestHoldRequiresServingProxySupport(t *testing.T) {
+	o, ctx := newAsyncConnectTestOrchestrator(t, mmdsFeatureConfig(), &countingLauncher{})
+	req := createRequestFixture(t, o, "7")
+	req.Metadata[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/work","type":"hold-traffic"}]}`
+	req.Metadata[sandboxcfg.NsIdentity] = `{"id":"guest-hold"}`
+	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{barrier: newFakeRouteBarrier(nil, nil)})
+	if created, err := o.Create(ctx, req); created != nil || !errors.Is(err, api.ErrProxyUnavailable) {
+		t.Fatalf("accepted unsupported guest declaration: %+v, %v", created, err)
+	}
+	if stored, err := o.st.Get(ctx, "guest-hold"); err != nil || stored != nil {
+		t.Fatalf("failed admission persisted a sandbox: %+v, %v", stored, err)
+	}
+
+	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
+	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
+	o.vs = blocked
+	defer close(blocked.gate)
+	created, err := o.Create(ctx, req)
+	if err != nil || created == nil || created.ID != "guest-hold" {
+		t.Fatalf("capable proxy rejected guest declaration: %+v, %v", created, err)
+	}
+}
+
 func TestHoldDeleteAndRecreateSameSID(t *testing.T) {
 	ctx := context.Background()
 	o, sb, key, _, _, _ := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
@@ -180,5 +203,67 @@ func TestHoldDeleteAndRecreateSameSID(t *testing.T) {
 	}
 	if h := o.projectHold(fresh); h == nil || h.Value != 0 || h.IdleSince != nil {
 		t.Fatal("new parent's initial state inherited old hold history", h)
+	}
+}
+
+func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
+	o, sb, _, clock := idleFixture(t)
+	key := mintTestAPIKey(t, sb.APISecret)
+	ctx := context.Background()
+	zero, one := int64(0), int64(1)
+	since := o.idleTime().Wall
+	legacyStats := &api.TrafficStats{IdleSince: &since}
+	// Ordinary v11 service remains usable, without fabricating services.hold.
+	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{})
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 1, &zero); !errors.Is(err, api.ErrProxyUnavailable) {
+		t.Fatal(err)
+	}
+	if n, err := o.GetSandboxHold(ctx, sb.ID, key); n != 0 || err != nil {
+		t.Fatal(n, err)
+	}
+	observeIdle(o, sb, 1)
+	if o.idleCandidates[sb.ID] == nil {
+		t.Fatal("legacy idle timer lost")
+	}
+	if s, err := o.checkIngressHold(sb, legacyStats); err != nil || s != legacyStats {
+		t.Fatal(s, err)
+	}
+
+	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 1, &zero); err != nil {
+		t.Fatal(err)
+	}
+	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{})
+	// Legacy physical idle reports contain no hint about the retained hold.
+	observeIdle(o, sb, 1)
+	if o.idleCandidates[sb.ID] != nil {
+		t.Fatal("legacy sample armed timer despite retained hold")
+	}
+	if _, err := o.checkIngressHold(sb, legacyStats); !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatal("published false complete idle", err)
+	}
+	if n, err := o.GetSandboxHold(ctx, sb.ID, key); err != nil || n != 1 {
+		t.Fatal(n, err)
+	}
+	clock.Add(int64(2 * time.Second))
+	released := o.idleTime()
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 0, &one); err != nil {
+		t.Fatal("cannot release after handover", err)
+	}
+	observeIdle(o, sb, 1)
+	c := o.idleCandidates[sb.ID]
+	if c == nil || c.observation.SinceBootNS != released.BootNS || c.t0.BootNS != released.BootNS {
+		t.Fatalf("did not start a fresh timeout: %#v", c)
+	}
+	if s, err := o.checkIngressHold(sb, legacyStats); err != nil || !s.IdleSince.Equal(released.Wall) || !legacyStats.IdleSince.Equal(since) {
+		t.Fatal(s, err)
+	}
+	clock.Add(int64(time.Second))
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	observeIdle(o, sb, 1)
+	if o.idleCandidates[sb.ID] != c {
+		t.Fatal("duplicate zero moved timer")
 	}
 }

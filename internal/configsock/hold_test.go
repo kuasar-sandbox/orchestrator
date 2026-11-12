@@ -2,6 +2,7 @@ package configsock
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -58,7 +59,7 @@ func TestHoldRPCRequiresLiveRegisteredMMDSPeer(t *testing.T) {
 	handler := New("", Deps{GuestHold: c, Plugins: reg}, slog.New(slog.NewTextHandler(io.Discard, nil))).router()
 	rt := &holdLoopbackTransport{handler: handler}
 	client := GuestHoldClient(&http.Client{Transport: rt}, "instance")
-	p := &Plugin{ID: "instance", peerPID: 71, Caps: routesync.Register{Mmds: true, Proxy: &routesync.Proxy{}, Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake}}}
+	p := &Plugin{ID: "instance", peerPID: 71, Caps: routesync.Register{Mmds: true, HoldTraffic: true, Proxy: &routesync.Proxy{}, Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake}}}
 	reg.Add(p)
 	ctx := context.Background()
 	one, zero := int64(1), int64(0)
@@ -95,8 +96,63 @@ func TestHoldRPCRequiresLiveRegisteredMMDSPeer(t *testing.T) {
 	}
 	reg.Remove(p)
 	reject()
+	legacy := &Plugin{ID: p.ID, peerPID: p.peerPID, Caps: p.Caps}
+	legacy.Caps.HoldTraffic = false
+	reg.Add(legacy)
+	reg.markRouteStreamReady(legacy)
+	reject()
+	reg.Remove(legacy)
 	observer := &Plugin{ID: "instance", peerPID: 71, Caps: routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}}}
 	reg.Add(observer)
 	reg.markRouteStreamReady(observer)
 	reject()
+}
+
+func TestHoldAdmissionIncludesNotReadyAndLegacyServingPeers(t *testing.T) {
+	r := NewRegistry()
+	observer := &Plugin{ID: "observer", Caps: routesync.Register{HoldTraffic: true, Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}}}
+	r.Add(observer)
+	r.markRouteStreamReady(observer)
+	if r.HoldTrafficReady() {
+		t.Fatal("observer advertised hold support for the node")
+	}
+	modern := &Plugin{ID: "proxy", Caps: proxyCaps()}
+	modern.Caps.HoldTraffic = true
+	r.Add(modern)
+	if r.HoldTrafficReady() {
+		t.Fatal("incomplete registration enabled hold")
+	}
+	r.markRouteStreamReady(modern)
+	if !r.HoldTrafficReady() {
+		t.Fatal("ready modern proxy did not enable hold")
+	}
+	b, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cancel()
+	required := b.(*proxyRouteBarrier)
+	if err = required.RequireHoldTraffic(); err != nil {
+		t.Fatal(err)
+	}
+	r.routeBarrierAck(modern, b.ID())
+	// A joining legacy proxy invalidates hold admission even before it can
+	// participate in the ordinary route application barrier.
+	legacy := &Plugin{ID: "candidate", Caps: proxyCaps()}
+	r.Add(legacy)
+	if r.HoldTrafficReady() || !errors.Is(b.Commit(), ErrProxyRouteLeaseChanged) {
+		t.Fatal("mixed handover accepted hold admission")
+	}
+	r.markRouteStreamReady(legacy)
+	if r.HoldTrafficReady() {
+		t.Fatal("legacy participant accepted after sync")
+	}
+	r.Remove(legacy)
+	if !r.HoldTrafficReady() {
+		t.Fatal("departed legacy peer still suppresses support")
+	}
+	r.Remove(modern)
+	if r.HoldTrafficReady() {
+		t.Fatal("missing traffic authority accepted hold")
+	}
 }
