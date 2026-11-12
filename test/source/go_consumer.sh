@@ -10,11 +10,12 @@ cleanup() {
     if [[ -n "$work" ]]; then rm -f -- "$work" "$work.sum"; fi
 }
 trap cleanup EXIT
-selection="${GOWORK:-off}"
 # Source checks may run go through a driver restricted to the product workspace.
 # The external application owns its module and, for Preview, a private workspace.
 go="${KUASAR_CONSUMER_GO:-}"
 if [[ -z "$go" ]]; then go="$(go -C "$root" env GOROOT)/bin/go"; fi
+selection="$("$go" -C "$root" env GOWORK)"
+selection="${selection:-off}"
 cd "$consumer"
 export GOWORK=off
 "$go" mod init example.com/consumer

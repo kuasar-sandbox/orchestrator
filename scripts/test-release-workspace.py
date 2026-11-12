@@ -32,7 +32,8 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.owner = self.root/OWNER
-        self.env = dict(os.environ, GOWORK='off', GOPROXY='off', GOSUMDB='off', PYTHONDONTWRITEBYTECODE='1')
+        self.env = dict(os.environ, GOENV='off', GOWORK='off', GOPROXY='off',
+                        GONOPROXY='none', GOSUMDB='off', PYTHONDONTWRITEBYTECODE='1')
         for key in list(self.env):
             if key.startswith(('RELEASE_', 'MAKE')) or key in ('MFLAGS', 'KUASAR_E2E_GO'):
                 self.env.pop(key)
@@ -150,7 +151,8 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         script = ['bash', str(ROOT/'test/source/go_consumer.sh'), str(self.owner)]
         go = shutil.which('go', path=self.env['PATH'])
         env = dict(self.env, KUASAR_CONSUMER_GO=go)
-        subprocess.run(script, cwd=self.root, env=env, check=True, capture_output=True)
+        for mode in ('off', 'auto'):
+            subprocess.run(script, cwd=self.root, env=dict(env, GOWORK=mode), check=True, capture_output=True)
         module = self.owner / 'go.mod'
         module.write_text(module.read_text().replace('accelerator v0.1.10', 'accelerator v0.1.11'))
         self.before[module] = module.read_bytes()
@@ -160,7 +162,8 @@ class ReleaseWorkspaceTests(unittest.TestCase):
                         '-replace=github.com/kuasar-sandbox/accelerator@v0.1.11=./accelerator',
                         str(work)], cwd=self.root, env=env, check=True)
         before = work.read_bytes()
-        subprocess.run(script, cwd=self.root, env=dict(env, GOWORK=str(work)), check=True)
+        for mode in (str(work), 'auto'):
+            subprocess.run(script, cwd=self.root, env=dict(env, GOWORK=mode), check=True)
         self.assertEqual(work.read_bytes(), before)
         self.assertEqual(list(self.root.glob('consumer-*.work*')), [])
 
