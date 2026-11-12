@@ -12,9 +12,19 @@ import (
 const maxFrame = 1 << 20
 
 type EndpointRequest struct {
-	RequestID uint64 `json:"id"`
-	SandboxID string `json:"sid"`
-	Path      string `json:"path"`
+	RequestID uint64       `json:"id"`
+	SandboxID string       `json:"sid"`
+	Path      string       `json:"path"`
+	Hold      *HoldRequest `json:"hold,omitempty"`
+}
+
+// HoldRequest carries an incarnation verified by the worker. A nil Value is
+// a read; a non-nil zero is a write of zero.
+type HoldRequest struct {
+	RunID    string `json:"run_id"`
+	Value    *int64 `json:"value,omitempty"`
+	IfMatch  *int64 `json:"if_match,omitempty"`
+	Deadline int64  `json:"deadline_unix_nano"`
 }
 
 // EndpointResponse never carries a provider URL. ServiceSocket is an already
@@ -29,6 +39,8 @@ type EndpointResponse struct {
 	Present       bool   `json:"present,omitempty"`
 	Service       string `json:"service,omitempty"`
 	ServiceSocket string `json:"service_socket,omitempty"`
+	HoldStatus    int    `json:"hold_status,omitempty"`
+	HoldValue     *int64 `json:"hold_value,omitempty"`
 }
 
 func writeFrame(w io.Writer, value any) error {

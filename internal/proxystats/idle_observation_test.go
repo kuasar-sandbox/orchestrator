@@ -2,9 +2,11 @@ package proxystats
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -17,7 +19,7 @@ func TestStaleStatsQueryCannotChangeRouteIdleEvidence(t *testing.T) {
 			m.now = func() timePoint { return n }
 			m.trustSince = n
 			readyWorker(t, m, "w", 1)
-			old := routesync.RouteEntry{SandboxID: "s", RunID: "old", State: routesync.StateRunning}
+			old := routesync.RouteEntry{SandboxID: "s", RunID: "old", State: routesync.StateRunning, Hold: &routesync.HoldActivity{}}
 			m.ObserveRoute(old)
 			n.bootNS = 200
 			n.wall = n.wall.Add(100)
@@ -31,8 +33,8 @@ func TestStaleStatsQueryCannotChangeRouteIdleEvidence(t *testing.T) {
 			// A read validated the old route before ObserveRoute installed its successor.
 			n.bootNS = 300
 			n.wall = n.wall.Add(100)
-			if _, err := m.SandboxTrafficStats(context.Background(), "s", "old", types.ProfileBare, state); err != nil {
-				t.Fatal(err)
+			if _, err := m.SandboxTrafficStats(context.Background(), "s", "old", types.ProfileBare, state); !errors.Is(err, api.ErrStatsUnavailable) {
+				t.Fatalf("stale stats query: %v", err)
 			}
 			if got := m.Activity(current); got != want {
 				t.Fatalf("stale read changed activity: %+v, want %+v", got, want)

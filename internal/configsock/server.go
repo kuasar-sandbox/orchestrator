@@ -470,6 +470,7 @@ type AdminKeyResponse struct {
 
 // Deps wires the planes for New.
 type Deps struct {
+	GuestHold                    GuestHoldCore
 	Stats                        NativeStatsReader
 	Provider                     Provider // exact-run task bootstrap/prepare and reports
 	Admin                        Admin    // admin plane (manifest-key allowlist)
@@ -583,6 +584,9 @@ func (s *Server) router() http.Handler {
 	if s.deps.MMDSRouteSecretAdmin != nil {
 		mux.HandleFunc(PathAdminMMDSRouteSecretPut, s.handleAdminMMDSRouteSecretPut)
 		mux.HandleFunc(PathAdminMMDSRouteSecretDelete, s.handleAdminMMDSRouteSecretDelete)
+	}
+	if s.deps.GuestHold != nil && s.deps.Plugins != nil {
+		mux.HandleFunc("POST /internal/plugin/{id}/hold", s.handleGuestHold)
 	}
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream

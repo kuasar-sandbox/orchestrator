@@ -20,6 +20,7 @@ import (
 
 type testCoreSink struct {
 	table       *proxyshm.Table
+	stats       *proxystats.MasterStats
 	applyErr    error
 	beforeApply func(routesync.RouteEntry)
 	effective   *publicconfig.MaxInflight
@@ -43,7 +44,13 @@ func (s *testCoreSink) ApplyUpsert(route routesync.RouteEntry) error {
 			route.AdmissionGeneration = 1
 		}
 	}
-	return s.table.Upsert(route)
+	if err := s.table.Upsert(route); err != nil {
+		return err
+	}
+	if s.stats != nil {
+		s.stats.ObserveRoute(route)
+	}
+	return nil
 }
 
 func (s *testCoreSink) ApplyDelete(sandboxID string) { s.table.Delete(sandboxID) }
@@ -60,14 +67,14 @@ func newTestHost(t *testing.T, capacity int, stats *proxystats.MasterStats) (*Ho
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = table.Close() })
-	core := &testCoreSink{table: table}
+	core := &testCoreSink{table: table, stats: stats}
 	host, sink := newWithCapacity(core, table, stats, capacity)
 	return host, sink, core
 }
 
 func testRoute(sandboxID, runID string) routesync.RouteEntry {
 	return routesync.RouteEntry{
-		SandboxID: sandboxID, StableID: "stable-" + sandboxID,
+		Hold: &routesync.HoldActivity{}, SandboxID: sandboxID, StableID: "stable-" + sandboxID,
 		Profile: "bare", TemplateID: "tmpl-1",
 		State: routesync.StateRunning, RunID: runID,
 		FloatingIP: "10.0.0.2", ArtifactLocation: "remote",
@@ -367,7 +374,9 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 		t.Fatalf("traffic before sync = %v", err)
 	}
 	sink.BeginSync()
-	if err := sink.ApplyUpsert(testRoute("s1", "run-1")); err != nil {
+	route := testRoute("s1", "run-1")
+	route.Hold.Value = 2
+	if err := sink.ApplyUpsert(route); err != nil {
 		t.Fatal(err)
 	}
 	sink.Bookmark()
@@ -378,7 +387,7 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 	}
 	if view.SandboxID != "s1" || view.Profile != proxyextension.ProfileBare ||
 		view.State != proxyextension.RouteStateRunning || view.MaxInflight != wantMaxInflight ||
-		view.Inflight.Parking != 2 || view.Inflight.Connected != 3 {
+		view.Inflight.Parking != 2 || view.Inflight.Connected != 5 || view.Services["hold"].Connected != 2 {
 		t.Fatalf("traffic view = %+v", view)
 	}
 	forward := view.Services[string(internalproxy.ConnectServiceForward)]
@@ -399,7 +408,7 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 
 	sink.InvalidateSync()
 	stale, err := host.Traffic().Get(context.Background(), "s1")
-	if err != nil || stale.SandboxID != "s1" || stale.Inflight.Connected != 3 {
+	if err != nil || stale.SandboxID != "s1" || stale.Inflight.Connected != 5 {
 		t.Fatalf("retained stale route traffic = %+v err=%v", stale, err)
 	}
 }

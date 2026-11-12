@@ -66,6 +66,9 @@ func (o *Orchestrator) preparePause(ctx context.Context, sb *types.Sandbox, requ
 		return errors.Join(api.ErrProxyUnavailable, err)
 	}
 	activity := barrier.Activity()
+	if request.IfIdle {
+		activity = withHoldActivity(activity, o.projectHold(sb))
+	}
 	if activity.Error != "" {
 		return api.ErrProxyUnavailable
 	}

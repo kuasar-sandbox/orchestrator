@@ -15,6 +15,7 @@ import (
 func TestInvalidPolicyStatsUnavailableWithoutPoisoningOtherSandbox(t *testing.T) {
 	master := NewMasterStats(metrics.New(), []string{"w0"})
 	readyWorker(t, master, "w0", 1)
+	observeZero(master, "good", "run", types.StatePaused)
 	server := NewStatsServer(master, func() bool { return true }, func(sid string) (RouteIdentity, bool) {
 		identity := RouteIdentity{RunID: "run", Profile: types.ProfileBare, State: types.StatePaused}
 		identity.TrafficPolicyInvalid = sid == "bad"

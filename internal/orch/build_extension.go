@@ -119,6 +119,11 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	for _, route := range mmdsDoc.Routes {
+		if route.Type == sandboxcfg.MMDSRouteHoldTraffic {
+			return nil, fmt.Errorf("%w: hold-traffic routes require a sandbox and cannot be registered for builds", api.ErrBadRequest)
+		}
+	}
 	credentials, metadata, err := sandboxcfg.ExtractCredentials(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)

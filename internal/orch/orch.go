@@ -55,6 +55,10 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
+	holdMu       sync.Mutex
+	holds        map[string]holdProjection
+	holdRecovery idleclock.Point
+
 	idleNow        func() idleclock.Point
 	idleMu         sync.Mutex
 	idleCandidates map[string]*idleCandidate
@@ -3048,6 +3052,10 @@ func cloneSandbox(sb *types.Sandbox) *types.Sandbox {
 	}
 	nb := *sb
 	nb.IdleTimeout = types.CloneIdleTimeout(sb.IdleTimeout)
+	if sb.HoldValue != nil {
+		v := *sb.HoldValue
+		nb.HoldValue = &v
+	}
 	if sb.Cluster != nil {
 		cluster := *sb.Cluster
 		nb.Cluster = &cluster

@@ -175,7 +175,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		close(startedExtension.statsReady)
 	}
 	configServer := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
-		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, BuilderAdmissionAdmin: core, BuilderActionAdmin: core, ResourcePressureAdmin: core,
+		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, GuestHold: core, BuilderAdmissionAdmin: core, BuilderActionAdmin: core, ResourcePressureAdmin: core,
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
 		API:                          apiHandler, AdminPidfile: cfg.Paths.AdminPidfile,
 		RouteSource: core, Plugins: plugins, PluginPidfile: cfg.Paths.PluginPidfile,

@@ -416,6 +416,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	}
 	// Variable MMDS declarations and plaintext values are master-heap only.
 	// Clear them before any fixed-layout comparison or write.
+	in.Hold = nil // Conductor-owned traffic evidence, not a fixed route binding.
 	in.MMDSRoutes = ""
 	in.MMDSRouteSecretValues = nil
 	in.MaxInflightPatch = nil

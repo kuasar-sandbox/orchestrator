@@ -3,6 +3,8 @@ package orch
 import (
 	"context"
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -44,6 +46,10 @@ func validateMMDSRouteEntry(sb *types.Sandbox, secretValues store.MMDSRouteSecre
 	if err != nil {
 		return err
 	}
+	// Reserve the maximum serialized hold projection. An admitted set of
+	// routes and secrets must still fit when the last hold is released.
+	longestWall := time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
+	entry.Hold = &routesync.HoldActivity{IdleSince: &longestWall, IdleSinceBootNS: math.MaxInt64}
 	entry.MMDSRoutes = raw
 	if sandboxcfg.MMDSHasSecretRoutes(routes) {
 		values := make(routesync.MMDSRouteSecretValues, len(secretValues))

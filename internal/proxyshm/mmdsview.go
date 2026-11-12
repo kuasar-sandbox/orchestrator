@@ -71,11 +71,10 @@ func (v *MMDSView) Upsert(route routesync.RouteEntry) error {
 		return err
 	}
 	entry := mmdsEntry{routes: routes, available: true}
-	if sandboxcfg.MMDSHasSecretRoutes(routes) {
-		if route.MMDSRouteSecretValues == nil {
-			entry.available = false
-		} else {
-			entry.values = cloneBytesMap(map[string][]byte(*route.MMDSRouteSecretValues))
+	if route.MMDSRouteSecretValues != nil {
+		entry.values = make(map[string][]byte, len(*route.MMDSRouteSecretValues))
+		for key, value := range *route.MMDSRouteSecretValues {
+			entry.values[key] = append([]byte(nil), value...)
 		}
 	}
 	v.byID[route.SandboxID] = entry
@@ -149,7 +148,14 @@ func (v *MMDSView) Resolve(sandboxID, exactPath string) mmdsrpc.EndpointResponse
 		response.Type = sandboxcfg.MMDSRouteStatic
 		response.ContentType = sandboxcfg.MMDSRuntimeContentType(route)
 		response.Body = []byte(route.Data)
+	case sandboxcfg.MMDSRouteHoldTraffic:
+		response.Type = sandboxcfg.MMDSRouteHoldTraffic
 	case sandboxcfg.MMDSRouteSecret:
+		// nil means the confidential projection is unavailable; a trusted
+		// empty map means the requested value is absent (404).
+		if entry.values == nil {
+			return mmdsrpc.EndpointResponse{Unavailable: true}
+		}
 		response.Type = sandboxcfg.MMDSRouteSecret
 		response.ContentType = sandboxcfg.MMDSRuntimeContentType(route)
 		value, configured := entry.values[route.Secret]

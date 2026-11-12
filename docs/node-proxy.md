@@ -686,16 +686,17 @@ proxy worker ─┬─► shared route view(token identity + RunID)
               └─► master socketpair RPC(routes + values + service socket)
 ```
 
-The two-stage protocol mints a token and then uses it for either root or declared-path GET:
+The two-stage protocol mints a token and then uses it to read metadata or operate on a declared hold route:
 
 1. `PUT /latest/api/token` requires exactly one `X-metadata-token-ttl-seconds`, in `1..21600`. It finds the enriched starting/running route's FloatingIP using the request source IP. Before initial starting has a FloatingIP, only this minting path may wait for `park_timeout`. The returned HMAC token binds SID, source IP, current `RunID`, `aud=mmds`, and expiry.
 2. `GET /` revalidates signature, source, expiry, audience, and current `RunID`, then returns `{instanceID, envID, address, accessTokenHash}` (`address` is currently empty). Pause/resume changes the incarnation, invalidating previous tokens.
-3. `GET <declared-path>` performs the same authentication and then exact lookup. Undeclared routes or declared secrets without a configured value return 404; unavailable storage/sync returns 503. Static/secret Content-Type defaults to `text/plain` only at response time, without rewriting configuration.
+3. `GET <declared-path>` performs the same authentication and then exact lookup. Undeclared routes and trusted secret projections with a missing value return 404. If only secret values are unavailable, only secret reads return 503; an unavailable route declaration still fails closed. Static/secret Content-Type defaults to `text/plain` only at response time, without rewriting configuration.
 
-The deterministic per-sandbox `mmds_secret` lets different PUT/GET workers validate each other's session tokens. Request paths are neither cleaned nor redirected. Query, fragment, percent escapes, characters requiring percent encoding, empty/dot segments, backslashes, wildcards, and trailing slashes except root are rejected. GET with nonzero/unknown Content-Length, any Transfer-Encoding, or an unknown body returns 400; the handler does not probe by reading even one body byte. Built-in root matches only `/`. Every guest response includes `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+The deterministic per-sandbox `mmds_secret` lets different PUT/GET workers validate each other's session tokens. Request paths are neither cleaned nor redirected. Reads and the token endpoint reject queries. Only a PUT on a declared hold route accepts a query: one optional `if-match` decimal operand. Fragments, percent escapes in the path, characters requiring percent encoding, empty/dot segments, backslashes, wildcards, and trailing slashes except root are rejected. GET with nonzero/unknown Content-Length, any Transfer-Encoding, or an unknown body returns 400; the handler does not probe by reading even one body byte. Built-in root matches only `/`. Every guest response includes `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
-Three custom route types exist:
+Four custom route types exist:
 
+- `hold-traffic` exposes the sandbox’s shared count as decimal text. GET reads it; PUT (also lowercase `put`) sets it. Omit query parameters for an unconditional write. Build Register rejects this sandbox-only type.
 - `static` directly returns declared UTF-8 `data`.
 - `secret` retrieves current opaque bytes by the route's `secret` name. PUT replaces the whole value. DELETE commits removal before publishing an asynchronous route update; guest GET returns 404 after the Proxy projection applies it. There is no deletion barrier, cancellation of an already-resolved response, value wait or TTL. Content-Type always comes from the route.
 - `service` resolves a local Unix socket from the master's sole registry. The worker/handler creates a new `GET <exact-path> HTTP/1.1` with `Host: mmds-service` and only the additional headers `E2b-Sandbox-Id: <sid>` and `E2b-Sandbox-Service: <service>`. It sends no port and forwards no guest Host, query, body, token, Authorization, Cookie, or other guest headers. V1 relays only a valid status, bounded body, and valid Content-Type (default `text/plain`), without following redirects. Timeout maps to 504; oversized/invalid responses to 502; missing services or unreachable sockets to 503.
@@ -893,7 +894,38 @@ Conductor restart. The policy is heap-only route data, not part of SHM activatio
 identity. Automatic Pause logs receipt lag, idle wait, handshake/capture duration,
 result and retry count for diagnosis; it creates no node-link Pause command.
 
-Services are fixed to `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b returns all four; bare returns only forward/exec. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
+The `hold` traffic service counts unfinished work that outlives its request. Both
+profiles expose it in `services.hold`: `parking` is zero and `connected` is the
+reported count. Native `inflight.connected` includes it once. It does not use
+a connection slot, select a CONNECT target, or change physical connection metrics.
+
+Use authenticated `GET /sandboxes/{id}/traffic/hold` to read the value, including
+while paused. Send `PUT` with `{"value":1,"ifMatch":0}` to replace it conditionally;
+omit `ifMatch` for an unconditional assignment. A successful write returns
+`200 {"value":1}`. A failed comparison returns 409 with the actual value. Only
+running sandboxes accept writes; lifecycle conflicts return 409 without a value
+and never wake the guest.
+
+To let a workload report for itself, explicitly declare
+`{"routes":[{"path":"/work/hold","type":"hold-traffic"}]}` in the existing MMDS
+namespace on direct node Create. After obtaining a guest metadata token:
+
+```sh
+curl -fsS -X PUT -H "X-metadata-token: $TOKEN" -d '1' \
+  'http://169.254.169.254/work/hold?if-match=0'
+```
+
+The MMDS GET/PUT bodies are decimal text; this path is available only to the
+sandbox that declared it. Report the total and confirm the write **before**
+closing the last business connection. Publish the work result before releasing
+the last hold. A positive-to-zero change starts a new idle interval; writing the
+same value does not. A stale positive value has no TTL: the workload owner must
+reconcile it. Unconditional Pause still works. Same-row Pause/Resume and Reset
+retain the value; a new local row (including Import) starts at zero. To continue
+work across nodes, keep an admitted connection until the destination confirms
+the new count. Upgrade Conductor and Proxy together for routesync v12.
+
+The physical services are `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b uses all four; bare uses forward/exec. Both profiles also report hold. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
 
 Example idle response for a bare sandbox (inapplicable e2b limits are zero):
 
@@ -913,6 +945,11 @@ Example idle response for a bare sandbox (inapplicable e2b limits are zero):
   },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
+    "hold": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:00:00Z"
+    },
     "forward": {
       "parking": 0,
       "connected": 0,
@@ -946,7 +983,7 @@ Top-level `idleSince` appears only for state=running with all inflight counts ze
 
 The response is flat: `state`, `maxInflight`, `inflight`, `idleSince`, `services`, `platform`, `transit`, and `egress`. Conductor owns this native API and composes the existing Proxy observation with the current Sandbox-to-switch/port binding. `platform` maps connector Mgmt RX/TX packets/bytes; `transit` maps Transit RX/TX. Both use the sandbox viewpoint. Each configured current port supplies all four unsigned integer counters, including valid zero. A sandbox without an attached port has empty `platform`/`transit` objects only when its FloatingIP, inner IP and port MAC are also absent, meaning no applicable current observation. An attached port requires all three identity fields; a partial binding returns 503 before querying either source. `egress: {}` always means no publishable egress statistics; it does not mean observed zero traffic. There are no per-service packet counters, source groups or network API alias.
 
-`connected` replaces the former native `inflight.egress` and `services[*].egress`, preserving the established-backend-until-final-Close meaning. Top-level `idleSince` describes only admitted Proxy ingress; management monitoring packets do not refresh it and it makes no claim about sandbox computation or network idleness. Packets are packet counts, not application request counts; bytes are observed frame bytes, not throughput. Management uses the existing port/management ingress frame length; transit uses the frame before encapsulation or after removal of outer GENEVE headers, retaining Ethernet. Different observation points are not added into a traffic total. The cumulative counters belong to the current attachment and can reset on reuse; the API creates no network history.
+`connected` replaces the former native `inflight.egress` and `services[*].egress`, preserving the established-backend-until-final-Close meaning. Top-level `idleSince` covers admitted Proxy ingress and declared hold activity; management monitoring packets do not refresh it and it makes no claim about sandbox computation or network idleness. Packets are packet counts, not application request counts; bytes are observed frame bytes, not throughput. Management uses the existing port/management ingress frame length; transit uses the frame before encapsulation or after removal of outer GENEVE headers, retaining Ethernet. Different observation points are not added into a traffic total. The cumulative counters belong to the current attachment and can reset on reuse; the API creates no network history.
 
 Conductor batches at most 64 current ports per switch through connector's Go `Stats(ports)` API, with no per-sandbox CLI processes or second lifecycle authority. It reuses its allocation/detach fence; connector reuses the pin-directory shared lock, current pinned-map ID and reset-confirmation flag. The existing Proxy stats socket also accepts a bounded batch. Configured-source read errors, unconfirmed reset, control contention, incomplete results or changed bindings return 503 for the whole read, never zero or an older complete-looking response. The same domain reads serve the public API, trusted local batch and conductor extension. Stats remains available independently of telemetry and does not participate in Create/Resume readiness.
 
@@ -995,7 +1032,7 @@ The master projects the downstream route stream into shared memory:
 - `Bookmark` removes old records absent from this generation and marks initial sync complete.
 - `Policy` writes the shared header. Each worker request reads current `auth_mode` and `park_timeout_ms`.
 
-Pause uses routesync v11 `pause_barrier{barrier_id,route}` and `pause_ack{barrier_id,pause_ack}`.
+Pause uses routesync v12 `pause_barrier{barrier_id,route}` and `pause_ack{barrier_id,pause_ack}`.
 The conductor snapshots currently online ready registrations, ignoring those already disconnected.
 There is no persistent Proxy inventory; zero participants is permitted. Each master applies the
 `pausing` route before synchronously sampling every live worker, including draining workers,
