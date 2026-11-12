@@ -264,7 +264,7 @@ func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
 	if c == nil || c.observation.SinceBootNS != released.BootNS || c.t0.BootNS != released.BootNS {
 		t.Fatalf("did not start a fresh timeout: %#v", c)
 	}
-	if s, err := o.checkIngressHold(ctx, sb, legacyStats); err != nil || !s.IdleSince.Equal(released.Wall) || !legacyStats.IdleSince.Equal(since) {
+	if s, err := o.checkIngressHold(ctx, sb, legacyStats); err != nil || s.IdleSince != nil || !legacyStats.IdleSince.Equal(since) {
 		t.Fatal(s, err)
 	}
 	if s, err := o.checkIngressHold(physicalCtx, sb, legacyStats); err != nil || s.IdleSince == nil || !s.IdleSince.Equal(since) {
@@ -277,5 +277,54 @@ func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
 	observeIdle(o, sb, 1)
 	if o.idleCandidates[sb.ID] != c {
 		t.Fatal("duplicate zero moved timer")
+	}
+}
+
+func TestLegacyProxyNativeIdleAfterHoldRelease(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	id := batchSandboxes(t, o, 1)[0]
+	sb, err := o.st.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb.RunID = "run"
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	key := mintTestAPIKey(t, sb.APISecret)
+	physical := idleclock.Point{BootNS: 10, Wall: time.Unix(200, 0).UTC()}
+	services := map[string]api.ServiceTrafficStats{"exec": {IdleSince: &physical.Wall}}
+	source := &api.TrafficStats{State: "running", Services: services, IdleSince: &physical.Wall}
+	o.SetSandboxTrafficProvider(nativeTrafficFunc(func(context.Context, string) (*api.TrafficStats, error) {
+		return source, nil // Only the wall timestamp crosses a legacy stats socket.
+	}))
+	for _, tc := range []struct {
+		name        string
+		releaseWall int64
+		wantIdle    bool
+	}{
+		{"wall steps back", 100, false},
+		{"wall advances normally", 300, false},
+		{"both wall timestamps agree", 200, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := physical
+			o.idleNow = func() idleclock.Point { return now }
+			if _, err := o.SetSandboxHold(ctx, id, key, 1, nil); err != nil {
+				t.Fatal(err)
+			}
+			now = idleclock.Point{BootNS: 20, Wall: time.Unix(tc.releaseWall, 0).UTC()}
+			if _, err := o.SetSandboxHold(ctx, id, key, 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			got, err := o.TrafficStats(ctx, id, key)
+			if err != nil || got == nil || got.Services["exec"] != services["exec"] || got.Inflight != source.Inflight {
+				t.Fatalf("traffic response = %+v, %v", got, err)
+			}
+			if (got.IdleSince != nil) != tc.wantIdle || (got.IdleSince != nil && !got.IdleSince.Equal(physical.Wall)) {
+				t.Fatalf("native idle timestamp = %v", got.IdleSince)
+			}
+		})
 	}
 }

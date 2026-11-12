@@ -372,7 +372,7 @@ func TestTelemetryTrafficViewFollowsLiveRegistration(t *testing.T) {
 		return *got[0].Traffic
 	}
 	legacy := read(t, false)
-	if _, ok := legacy.Services["hold"]; ok || legacy.Inflight.Connected != 0 || legacy.IdleSince == nil || !legacy.IdleSince.Equal(recent) {
+	if _, ok := legacy.Services["hold"]; ok || legacy.Inflight.Connected != 0 || legacy.IdleSince != nil {
 		t.Fatalf("legacy physical view: %+v", legacy)
 	}
 	modern := read(t, true)
@@ -409,28 +409,35 @@ func TestLegacyTelemetryPreservesProxyPhysicalIdle(t *testing.T) {
 	}
 }
 
-func TestLegacyTelemetryHoldSnapshotWithoutPhysicalIdle(t *testing.T) {
-	stamp := time.Unix(100, 0).UTC()
+func TestLegacyTelemetryIdleFromNativeHoldSnapshot(t *testing.T) {
+	beforeStep, stamp := time.Unix(200, 0).UTC(), time.Unix(100, 0).UTC()
 	for _, tt := range []struct {
-		name    string
-		state   string
-		partial bool
-		exec    *time.Time
+		name     string
+		state    string
+		partial  bool
+		exec     *time.Time
+		wantIdle bool
 	}{
-		{"partial restart", "running", true, &stamp},
-		{"paused", "paused", false, &stamp},
-		{"unknown service observation", "running", false, nil},
+		{"identical service wall times", "running", false, &stamp, true},
+		{"physical services span a clock step", "running", false, &beforeStep, false},
+		{"partial restart", "running", true, &stamp, false},
+		{"paused", "paused", false, &stamp, false},
+		{"unknown service observation", "running", false, nil, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rows := []conductorextension.SandboxStats{{Traffic: &conductorextension.TrafficStats{
-				InplaceRestart: tt.partial, State: tt.state,
+				InplaceRestart: tt.partial, State: tt.state, Inflight: conductorextension.TrafficInflight{Connected: 2},
 				Services: map[string]conductorextension.ServiceTrafficStats{
-					"forward": {IdleSince: &stamp}, "exec": {IdleSince: tt.exec}, "hold": {IdleSince: &stamp},
+					"forward": {IdleSince: &stamp}, "exec": {IdleSince: tt.exec}, "hold": {Connected: 2},
 				},
 			}}}
 			got, err := legacyTelemetryStats(rows)
-			if err != nil || got[0].Traffic.IdleSince != nil || got[0].Traffic.InplaceRestart != tt.partial {
-				t.Fatalf("inferred physical idle: got %+v, err %v", got, err)
+			if err != nil {
+				t.Fatal(err)
+			}
+			idle := got[0].Traffic.IdleSince
+			if (idle != nil) != tt.wantIdle || (idle != nil && !idle.Equal(stamp)) || got[0].Traffic.InplaceRestart != tt.partial {
+				t.Fatalf("physical idle = %v, want idle = %t, partial = %t", idle, tt.wantIdle, tt.partial)
 			}
 		})
 	}

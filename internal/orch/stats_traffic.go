@@ -219,9 +219,11 @@ func (o *Orchestrator) checkIngressHold(ctx context.Context, sb *types.Sandbox, 
 	if proxystats.IsPhysicalTelemetry(ctx) {
 		return stats, nil
 	}
-	if stats.IdleSince != nil && h.IdleSince != nil && h.IdleSince.After(*stats.IdleSince) {
+	// v11 returns no boot timestamp for physical idle. If both events have
+	// distinct wall times, a clock step can reverse their apparent order.
+	if stats.IdleSince != nil && h.IdleSince != nil && !h.IdleSince.Equal(*stats.IdleSince) {
 		corrected := *stats
-		corrected.IdleSince = h.IdleSince
+		corrected.IdleSince = nil
 		return &corrected, nil
 	}
 	return stats, nil

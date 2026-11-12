@@ -940,7 +940,11 @@ and connection-based idle still work. Legacy proxies receive their familiar
 MMDS routes; only the hold path is omitted. A legacy Proxy joining later cannot
 erase a confirmed count. The owner can still read it and, while the sandbox is
 running, clear it through the node API. If a legacy statistics source would
-report an active hold as idle, the node returns 503. Before downgrading the
+report an active hold as idle, the node returns 503. After release, native
+stats return 200. If the legacy Proxy reports a different wall time for physical
+idle, the node omits the optional top-level `idleSince`: v11 does not provide
+the physical boot-clock timestamp needed to order those two events.
+Before downgrading the
 **Conductor** itself to a build without hold, finish or hand off outstanding
 work, or disable idle auto-pause for the affected sandboxes. The old authority
 cannot enforce a count saved by its replacement. A v0.1.14 Conductor also

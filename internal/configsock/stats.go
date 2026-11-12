@@ -139,18 +139,17 @@ func legacyTelemetryStats(rows []conductorextension.SandboxStats) ([]conductorex
 		r.Inflight.Connected -= hold.Connected
 		r.Services = maps.Clone(r.Services)
 		delete(r.Services, "hold")
-		// The logical total can be busy or can have a more recent release.
-		// Only a complete physical snapshot can establish an idle timestamp.
+		// A custom reader may return native totals without the Proxy's physical
+		// view. Its wall timestamps cannot order events across a clock step.
+		// When all physical services agree, their last idle time is unambiguous.
 		r.IdleSince = nil
 		if !r.InplaceRestart && r.State == routesync.StateRunning && r.Inflight.Connected == 0 && r.Inflight.Parking == 0 {
 			for _, physical := range r.Services {
-				if physical.IdleSince == nil {
+				if physical.IdleSince == nil || (r.IdleSince != nil && !r.IdleSince.Equal(*physical.IdleSince)) {
 					r.IdleSince = nil
 					break
 				}
-				if r.IdleSince == nil || physical.IdleSince.After(*r.IdleSince) {
-					r.IdleSince = physical.IdleSince
-				}
+				r.IdleSince = physical.IdleSince
 			}
 		}
 		out[i].Traffic = &r
