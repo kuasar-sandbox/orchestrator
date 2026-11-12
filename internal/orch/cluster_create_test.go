@@ -52,6 +52,55 @@ func clusterCreateCommand(fingerprint, sid string) *routesync.Command {
 	}
 }
 
+func TestClusterCreateAdmitsHoldFromFinalHookMetadata(t *testing.T) {
+	const hold = `{"routes":[{"path":"/work","type":"hold-traffic"}]}`
+	for _, tt := range []struct {
+		name       string
+		routes     string
+		legacy     bool
+		reserved   []string
+		wantStatus int
+	}{
+		{name: "legacy rejects hold", routes: hold, legacy: true, wantStatus: http.StatusServiceUnavailable},
+		{name: "capable accepts hold", routes: hold},
+		{name: "legacy accepts ordinary route", routes: `{"routes":[{"path":"/other","data":"ok"}]}`, legacy: true},
+		{name: "capable rejects reserved path", routes: hold, reserved: []string{"/work"}, wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := mmdsFeatureConfig()
+			cfg.Sandbox.TimeoutSec = 60
+			cfg.MMDS.Routes.ReservedPathPrefixes = tt.reserved
+			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
+			blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
+			o.vs = blocked
+			defer close(blocked.gate)
+			if tt.legacy {
+				b := newFakeRouteBarrier(nil, nil)
+				b.release()
+				o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{barrier: b})
+			}
+			_, _, fingerprint := allowlistedBuildIdentity(t, o)
+			cmd := clusterCreateCommand(fingerprint, "cluster-hook-mmds")
+			o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, op *conductorextension.SandboxOperation) error {
+				op.Create.Metadata = map[string]string{sandboxcfg.NsMMDS: tt.routes}
+				return nil
+			}), nil)
+			ack := o.HandleCommand(ctx, cmd)
+			sb, err := o.st.Get(ctx, cmd.SID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantStatus == 0 {
+				if ack.Status != routesync.AckAccepted || sb == nil || sb.Metadata[sandboxcfg.NsMMDS] != tt.routes {
+					t.Fatalf("cluster hook route admission: ack=%+v sandbox=%+v", ack, sb)
+				}
+			} else if ack.Status != routesync.AckRejected || ack.HTTPStatus != tt.wantStatus || sb != nil {
+				t.Fatalf("unsupported cluster hook route: ack=%+v sandbox=%+v", ack, sb)
+			}
+		})
+	}
+}
+
 func TestClusterCreatePersistsAutoPauseMemoryDefaultAndValues(t *testing.T) {
 	for _, test := range []struct {
 		name  string

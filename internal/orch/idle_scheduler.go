@@ -47,6 +47,23 @@ func (o *Orchestrator) OnProxyActivity(_ context.Context, source string, a *rout
 		if current == nil || a.RunID == "" || current.RunID != a.RunID {
 			return
 		}
+		// v11 proxies report physical flows. A retained hold can survive a
+		// proxy downgrade; use the authority even between route publications.
+		// Preserve missing physical proof as unknown. A later refresh after a
+		// release gets a distinct since value and starts a full timeout.
+		if a.State == "idle" && a.SinceBootNS > 0 {
+			h := o.projectHold(current)
+			normalized := *a
+			switch {
+			case !h.Valid():
+				normalized.State = "unknown"
+			case h.Value > 0:
+				normalized.State = "busy"
+			default:
+				normalized.SinceBootNS = max(normalized.SinceBootNS, h.IdleSinceBootNS)
+			}
+			a = &normalized
+		}
 	}
 	o.idleMu.Lock()
 	defer o.idleMu.Unlock()

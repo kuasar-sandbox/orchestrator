@@ -24,6 +24,8 @@ func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config
 
 type immediateRouteBarrierCoordinator struct{}
 
+func (immediateRouteBarrierCoordinator) HoldTrafficReady() bool { return true }
+
 func (immediateRouteBarrierCoordinator) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 	return immediateRouteBarrier{}, nil
 }
@@ -31,6 +33,7 @@ func (immediateRouteBarrierCoordinator) BeginProxyRouteBarrier() (routesync.Rout
 type immediateRouteBarrier struct{}
 
 func (immediateRouteBarrier) ID() string                 { return "test-immediate-route-barrier" }
+func (immediateRouteBarrier) RequireHoldTraffic() error  { return nil }
 func (immediateRouteBarrier) Wait(context.Context) error { return nil }
 func (immediateRouteBarrier) Commit() error              { return nil }
 func (immediateRouteBarrier) Cancel()                    {}

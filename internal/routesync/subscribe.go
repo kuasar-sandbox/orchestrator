@@ -136,12 +136,13 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	// Reader: preserve the established BeginSync-before-policy callback order,
 	// then apply route frames until EOF/error.
 	s.sink.BeginSync()
-	go s.forwardActivity(sctx, up)
+	capabilities := effectiveProxyCapabilities(s.reg, hello.Hello.ProxyCapabilities)
 	if sink, ok := s.sink.(CapabilitySink); ok {
-		sink.SetProxyCapabilities(hello.Hello.ProxyCapabilities)
+		sink.SetProxyCapabilities(capabilities)
 	}
 	s.sink.SetPolicy(hello.Hello.Policy)
-	if s.SnapshotSlots != nil && (s.reg.ResumeFrom == "" || localRouteProjection(s.reg).hold) {
+	go s.forwardActivity(sctx, up)
+	if s.SnapshotSlots != nil && (s.registration().ResumeFrom == "" || localRouteProjection(s.reg, capabilities).fullSync()) {
 		ids, capacity := s.SnapshotSlots()
 		if len(ids) > 0 {
 			if err := s.reconcileSnapshot(sctx, resp.Body, up, ids, capacity); err != nil {
@@ -160,10 +161,21 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	}
 }
 
+// A hold-aware Proxy rebuilds its per-route observations on BeginSync. Request
+// a full range even from a v11 authority which cannot interpret HoldTraffic
+// (and therefore cannot know to ignore a resume token).
+func (s *Subscriber) registration() Register {
+	r := s.reg
+	if r.WantsHoldTraffic() {
+		r.ResumeFrom = ""
+	}
+	return r
+}
+
 // writeUp is the session's sole up-stream writer. It sends Register first, then
 // serializes Wake and RouteBarrierAck frames until the session ends.
 func (s *Subscriber) writeUp(ctx context.Context, w io.Writer, up <-chan *Msg) error {
-	r := s.reg
+	r := s.registration()
 	if err := WriteMsg(w, &Msg{Type: TypeRegister, Register: &r}); err != nil {
 		return err
 	}

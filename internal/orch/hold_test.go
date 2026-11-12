@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -148,6 +149,29 @@ func TestBuildRegisterRejectsHoldRoute(t *testing.T) {
 	}
 }
 
+func TestCreateGuestHoldRequiresServingProxySupport(t *testing.T) {
+	o, ctx := newAsyncConnectTestOrchestrator(t, mmdsFeatureConfig(), &countingLauncher{})
+	req := createRequestFixture(t, o, "7")
+	req.Metadata[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/work","type":"hold-traffic"}]}`
+	req.Metadata[sandboxcfg.NsIdentity] = `{"id":"guest-hold"}`
+	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{barrier: newFakeRouteBarrier(nil, nil)})
+	if created, err := o.Create(ctx, req); created != nil || !errors.Is(err, api.ErrProxyUnavailable) {
+		t.Fatalf("accepted unsupported guest declaration: %+v, %v", created, err)
+	}
+	if stored, err := o.st.Get(ctx, "guest-hold"); err != nil || stored != nil {
+		t.Fatalf("failed admission persisted a sandbox: %+v, %v", stored, err)
+	}
+
+	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
+	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
+	o.vs = blocked
+	defer close(blocked.gate)
+	created, err := o.Create(ctx, req)
+	if err != nil || created == nil || created.ID != "guest-hold" {
+		t.Fatalf("capable proxy rejected guest declaration: %+v, %v", created, err)
+	}
+}
+
 func TestHoldDeleteAndRecreateSameSID(t *testing.T) {
 	ctx := context.Background()
 	o, sb, key, _, _, _ := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
@@ -180,5 +204,127 @@ func TestHoldDeleteAndRecreateSameSID(t *testing.T) {
 	}
 	if h := o.projectHold(fresh); h == nil || h.Value != 0 || h.IdleSince != nil {
 		t.Fatal("new parent's initial state inherited old hold history", h)
+	}
+}
+
+func TestHoldAcrossLegacyProxyHandover(t *testing.T) {
+	o, sb, _, clock := idleFixture(t)
+	key := mintTestAPIKey(t, sb.APISecret)
+	ctx := context.Background()
+	zero, one := int64(0), int64(1)
+	since := o.idleTime().Wall
+	// exec became idle after a backwards wall-clock step. The legacy Proxy
+	// chose it as the last physical service using CLOCK_BOOTTIME.
+	beforeClockStep := since.Add(time.Minute)
+	legacyStats := &api.TrafficStats{State: "running", IdleSince: &since, Services: map[string]api.ServiceTrafficStats{
+		"forward": {IdleSince: &beforeClockStep}, "exec": {IdleSince: &since},
+	}}
+	physicalCtx := proxystats.WithPhysicalTelemetry(ctx)
+	// Ordinary v11 service remains usable, without fabricating services.hold.
+	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{})
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 1, &zero); !errors.Is(err, api.ErrProxyUnavailable) {
+		t.Fatal(err)
+	}
+	if n, err := o.GetSandboxHold(ctx, sb.ID, key); n != 0 || err != nil {
+		t.Fatal(n, err)
+	}
+	observeIdle(o, sb, 1)
+	if o.idleCandidates[sb.ID] == nil {
+		t.Fatal("legacy idle timer lost")
+	}
+	if s, err := o.checkIngressHold(ctx, sb, legacyStats); err != nil || s != legacyStats {
+		t.Fatal(s, err)
+	}
+
+	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 1, &zero); err != nil {
+		t.Fatal(err)
+	}
+	o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{})
+	// Legacy physical idle reports contain no hint about the retained hold.
+	observeIdle(o, sb, 1)
+	if o.idleCandidates[sb.ID] != nil {
+		t.Fatal("legacy sample armed timer despite retained hold")
+	}
+	for _, readCtx := range []context.Context{ctx, physicalCtx} {
+		if _, err := o.checkIngressHold(readCtx, sb, legacyStats); !errors.Is(err, api.ErrStatsUnavailable) {
+			t.Fatal("published false complete idle", err)
+		}
+	}
+	if n, err := o.GetSandboxHold(ctx, sb.ID, key); err != nil || n != 1 {
+		t.Fatal(n, err)
+	}
+	clock.Add(int64(2 * time.Second))
+	released := o.idleTime()
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 0, &one); err != nil {
+		t.Fatal("cannot release after handover", err)
+	}
+	observeIdle(o, sb, 1)
+	c := o.idleCandidates[sb.ID]
+	if c == nil || c.observation.SinceBootNS != released.BootNS || c.t0.BootNS != released.BootNS {
+		t.Fatalf("did not start a fresh timeout: %#v", c)
+	}
+	if s, err := o.checkIngressHold(ctx, sb, legacyStats); err != nil || s.IdleSince != nil || !legacyStats.IdleSince.Equal(since) {
+		t.Fatal(s, err)
+	}
+	if s, err := o.checkIngressHold(physicalCtx, sb, legacyStats); err != nil || s.IdleSince == nil || !s.IdleSince.Equal(since) {
+		t.Fatal("physical view lost the Proxy idle timestamp", s, err)
+	}
+	clock.Add(int64(time.Second))
+	if _, err := o.SetSandboxHold(ctx, sb.ID, key, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	observeIdle(o, sb, 1)
+	if o.idleCandidates[sb.ID] != c {
+		t.Fatal("duplicate zero moved timer")
+	}
+}
+
+func TestLegacyProxyNativeIdleAfterHoldRelease(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	id := batchSandboxes(t, o, 1)[0]
+	sb, err := o.st.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb.RunID = "run"
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	key := mintTestAPIKey(t, sb.APISecret)
+	physical := idleclock.Point{BootNS: 10, Wall: time.Unix(200, 0).UTC()}
+	services := map[string]api.ServiceTrafficStats{"exec": {IdleSince: &physical.Wall}}
+	source := &api.TrafficStats{State: "running", Services: services, IdleSince: &physical.Wall}
+	o.SetSandboxTrafficProvider(nativeTrafficFunc(func(context.Context, string) (*api.TrafficStats, error) {
+		return source, nil // Only the wall timestamp crosses a legacy stats socket.
+	}))
+	for _, tc := range []struct {
+		name        string
+		releaseWall int64
+		wantIdle    bool
+	}{
+		{"wall steps back", 100, false},
+		{"wall advances normally", 300, false},
+		{"both wall timestamps agree", 200, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := physical
+			o.idleNow = func() idleclock.Point { return now }
+			if _, err := o.SetSandboxHold(ctx, id, key, 1, nil); err != nil {
+				t.Fatal(err)
+			}
+			now = idleclock.Point{BootNS: 20, Wall: time.Unix(tc.releaseWall, 0).UTC()}
+			if _, err := o.SetSandboxHold(ctx, id, key, 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			got, err := o.TrafficStats(ctx, id, key)
+			if err != nil || got == nil || got.Services["exec"] != services["exec"] || got.Inflight != source.Inflight {
+				t.Fatalf("traffic response = %+v, %v", got, err)
+			}
+			if (got.IdleSince != nil) != tc.wantIdle || (got.IdleSince != nil && !got.IdleSince.Equal(physical.Wall)) {
+				t.Fatalf("native idle timestamp = %v", got.IdleSince)
+			}
+		})
 	}
 }

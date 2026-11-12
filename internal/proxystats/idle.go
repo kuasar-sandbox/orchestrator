@@ -67,7 +67,7 @@ func (m *MasterStats) ObserveRoute(r routesync.RouteEntry) {
 		return
 	}
 	observed := routeObservation{runID: r.RunID, state: r.State}
-	if h := r.Hold; h.Valid() {
+	if h := r.Hold; !m.physicalOnly && h.Valid() {
 		observed.holdKnown = true
 		observed.hold.egress = uint64(h.Value)
 		if h.IdleSince != nil {
@@ -87,7 +87,16 @@ func (m *MasterStats) ResetObservation() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	clear(m.routes)
+	m.physicalOnly = false
 	m.trustSince = m.now()
+}
+
+// SetHoldTraffic binds activity semantics to a validated Hello. The caller
+// begins a fresh sync before installing capabilities and publishing routes.
+func (m *MasterStats) SetHoldTraffic(negotiated bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.physicalOnly = !negotiated
 }
 
 // PauseEvidence returns only the run and worker-set baselines. The barrier

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -323,6 +324,11 @@ func (s *readinessSink) ApplyUpsert(r routesync.RouteEntry) error {
 }
 func (s *readinessSink) Bookmark() { s.Sink.Bookmark(); s.syncState(true) }
 func (s *readinessSink) InvalidateSync() {
+	// Traffic routes may keep serving through a disconnect, but the old
+	// session cannot attest to current hold activity or even its feature set.
+	if stats := s.instance.stats; stats != nil {
+		stats.ResetObservation()
+	}
 	if sink, ok := s.Sink.(routesync.InvalidatableSink); ok {
 		sink.InvalidateSync()
 	}
@@ -330,6 +336,9 @@ func (s *readinessSink) InvalidateSync() {
 }
 
 func (s *readinessSink) SetProxyCapabilities(capabilities []string) {
+	if stats := s.instance.stats; stats != nil {
+		stats.SetHoldTraffic(slices.Contains(capabilities, routesync.HoldTrafficV1))
+	}
 	s.instance.mu.Lock()
 	defer s.instance.mu.Unlock()
 	s.instance.capabilities = append([]string(nil), capabilities...)

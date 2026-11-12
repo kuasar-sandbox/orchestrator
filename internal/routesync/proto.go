@@ -52,8 +52,8 @@ import (
 // and synchronous Pause activity ACKs. Version 10 retains dead/deleting management
 // entries with parent identity/state versions; mixed peers fail closed.
 // Version 11 adds historical idle evidence and activity observations.
-// Version 12 projects the authoritative per-sandbox hold traffic service.
-const Version = 12
+// Hold traffic is an optional v11 feature negotiated at registration.
+const Version = 11
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -281,6 +281,11 @@ type Hello struct {
 // route barriers, and instance-local statistics marked during InplaceRestart.
 const InplaceRestartV1 = "inplace_restart_v1"
 
+// HoldTrafficV1 confirms that this connection carries authoritative hold
+// activity and, if MMDS is enabled, hold-traffic guest routes. Absence retains v11's
+// physical-traffic semantics; it never certifies a missing negotiated value.
+const HoldTrafficV1 = "hold_traffic_v1"
+
 // ValidateHello enforces the single supported protocol version before a client
 // processes route or command frames from the session.
 func ValidateHello(m *Msg) error {
@@ -298,10 +303,11 @@ func ValidateHello(m *Msg) error {
 // enforce combinations (a proxy without subscribe, a subscribe without proxy, etc.
 // are all the subscriber's own call).
 type Register struct {
-	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
-	Proxy     *Proxy     `json:"proxy,omitempty"`     // trusted independent proxy registration marker and stats capability
-	Telemetry *Telemetry `json:"telemetry,omitempty"` // independent HTTP query channel, leased by this connection
-	Mmds      bool       `json:"mmds,omitempty"`      // trusted proxy requests MMDS routes/values + policy projection
+	HoldTraffic bool       `json:"hold_traffic,omitempty"` // consumer understands logical hold in traffic stats; local Proxies may request its route projection
+	Subscribe   *Subscribe `json:"subscribe,omitempty"`    // route stream; nil = lease only (no routes)
+	Proxy       *Proxy     `json:"proxy,omitempty"`        // trusted independent proxy registration marker and stats capability
+	Telemetry   *Telemetry `json:"telemetry,omitempty"`    // independent HTTP query channel, leased by this connection
+	Mmds        bool       `json:"mmds,omitempty"`         // trusted proxy requests MMDS routes/values + policy projection
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
 	// string so a node owner can embed a source fingerprint and reject incremental
@@ -335,6 +341,12 @@ func (r Register) subscribes() bool { return r.Subscribe != nil }
 // handlesWake reports whether the subscriber issues Wakes (route_wake), so the
 // orchestrator acts on inbound Wake frames.
 func (r Register) handlesWake() bool { return r.Subscribe != nil && r.Subscribe.Kind == KindRouteWake }
+
+// WantsHoldTraffic is a request by a traffic-serving local Proxy, not an
+// authority grant. Observer/registry registrations cannot opt in.
+func (r Register) WantsHoldTraffic() bool {
+	return r.HoldTraffic && r.handlesWake() && r.Proxy != nil
+}
 
 // SubscribeKind is the declared subscribe kind, or "" if not subscribing (for logs).
 func (r Register) SubscribeKind() string {
