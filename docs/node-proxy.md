@@ -686,16 +686,17 @@ proxy worker ─┬─► shared route view(token identity + RunID)
               └─► master socketpair RPC(routes + values + service socket)
 ```
 
-The two-stage protocol mints a token and then uses it for either root or declared-path GET:
+The two-stage protocol mints a token and then uses it to read metadata or operate on a declared hold route:
 
 1. `PUT /latest/api/token` requires exactly one `X-metadata-token-ttl-seconds`, in `1..21600`. It finds the enriched starting/running route's FloatingIP using the request source IP. Before initial starting has a FloatingIP, only this minting path may wait for `park_timeout`. The returned HMAC token binds SID, source IP, current `RunID`, `aud=mmds`, and expiry.
 2. `GET /` revalidates signature, source, expiry, audience, and current `RunID`, then returns `{instanceID, envID, address, accessTokenHash}` (`address` is currently empty). Pause/resume changes the incarnation, invalidating previous tokens.
-3. `GET <declared-path>` performs the same authentication and then exact lookup. Undeclared routes or declared secrets without a configured value return 404; unavailable storage/sync returns 503. Static/secret Content-Type defaults to `text/plain` only at response time, without rewriting configuration.
+3. `GET <declared-path>` performs the same authentication and then exact lookup. Undeclared routes and trusted secret projections with a missing value return 404. If only secret values are unavailable, only secret reads return 503; an unavailable route declaration still fails closed. Static/secret Content-Type defaults to `text/plain` only at response time, without rewriting configuration.
 
-The deterministic per-sandbox `mmds_secret` lets different PUT/GET workers validate each other's session tokens. Request paths are neither cleaned nor redirected. Query, fragment, percent escapes, characters requiring percent encoding, empty/dot segments, backslashes, wildcards, and trailing slashes except root are rejected. GET with nonzero/unknown Content-Length, any Transfer-Encoding, or an unknown body returns 400; the handler does not probe by reading even one body byte. Built-in root matches only `/`. Every guest response includes `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+The deterministic per-sandbox `mmds_secret` lets different PUT/GET workers validate each other's session tokens. Request paths are neither cleaned nor redirected. Reads and the token endpoint reject queries. Only a PUT on a declared hold route accepts a query: one optional `if-match` decimal operand. Fragments, percent escapes in the path, characters requiring percent encoding, empty/dot segments, backslashes, wildcards, and trailing slashes except root are rejected. GET with nonzero/unknown Content-Length, any Transfer-Encoding, or an unknown body returns 400; the handler does not probe by reading even one body byte. Built-in root matches only `/`. Every guest response includes `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
-Three custom route types exist:
+Four custom route types exist:
 
+- `hold-traffic` exposes the sandbox’s shared count as decimal text. GET reads it; PUT (also lowercase `put`) sets it. Omit query parameters for an unconditional write. Build Register rejects this sandbox-only type.
 - `static` directly returns declared UTF-8 `data`.
 - `secret` retrieves current opaque bytes by the route's `secret` name. PUT replaces the whole value. DELETE commits removal before publishing an asynchronous route update; guest GET returns 404 after the Proxy projection applies it. There is no deletion barrier, cancellation of an already-resolved response, value wait or TTL. Content-Type always comes from the route.
 - `service` resolves a local Unix socket from the master's sole registry. The worker/handler creates a new `GET <exact-path> HTTP/1.1` with `Host: mmds-service` and only the additional headers `E2b-Sandbox-Id: <sid>` and `E2b-Sandbox-Service: <service>`. It sends no port and forwards no guest Host, query, body, token, Authorization, Cookie, or other guest headers. V1 relays only a valid status, bounded body, and valid Content-Type (default `text/plain`), without following redirects. Timeout maps to 504; oversized/invalid responses to 502; missing services or unreachable sockets to 503.

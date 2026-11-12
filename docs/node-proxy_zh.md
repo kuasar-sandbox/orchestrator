@@ -863,18 +863,19 @@ proxy worker ─┬─► shared route view(token identity + RunID)
 2. `GET /`:重新校验签名、来源、expiry、audience 与当前 `RunID`,返回
    `{instanceID, envID, address, accessTokenHash}`（当前 `address` 为空字符串）。pause/resume 改变 incarnation,旧 token 立即失效。
 3. `GET <declared-path>`:完成相同认证后 exact lookup;未声明或声明但未配置的 secret
-   都返回 404,store/sync 不可用返回 503。static/secret 缺省 Content-Type 在响应时才取
+   都返回 404。仅 secret 值不可用时，只有依赖它的读取返回 503；路由声明本身不可信时仍拒绝访问。static/secret 缺省 Content-Type 在响应时才取
    `text/plain`,不写回配置。
 
 MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落到不同 worker
-仍能互相验证。请求 path 不清理、不重定向:query、fragment、percent escape、需
+仍能互相验证。GET 和 token 端点不接受 query；只有已声明的 hold 写入接受一个可选的十进制参数 `if-match`。请求 path 不清理、不重定向：fragment、路径中的 percent escape、需
 percent-encode 的字符、空/dot segment、backslash、wildcard 和非 root trailing slash 均拒绝。GET 的非零/未知
 Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不读取一个 byte
 来探测 body。内置 root 只精确匹配 `/`;所有 guest 响应统一带
 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。
 
-三类自定义 route:
+四类自定义 route：
 
+- `hold-traffic`：GET 读取沙箱的共享计数，PUT（也接受小写 `put`）写入，正文与结果均为十进制文本。不带条件表示无条件赋值。Build Register 不接受这种沙箱专属类型。
 - `static`:直接返回声明的 UTF-8 `data`。
 - `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换。DELETE 先持久删除再异步发布 route,
   Proxy 投影应用后 guest GET 才返回 404;没有 deletion barrier,不取消已解析的响应,不等待 value、无 TTL。
