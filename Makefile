@@ -96,16 +96,24 @@ VERSION ?= v0.1.0
 KUASAR_PLATFORM_DIR ?= ../kuasar-sandbox
 # Explicit dependency tags select Preview inputs. Otherwise use this module's
 # declared release requirement without resolving the module graph.
-go_requirement = $(shell GOWORK=off $(GO) mod edit -json | \
+go_requirement = $$(GOWORK=off $(GO) mod edit -json | \
 	jq -er --arg path "github.com/kuasar-sandbox/$(1)" '.Require[] | select(.Path == $$path) | .Version')
 ACCELERATOR_VERSION ?= $(call go_requirement,accelerator)
 CONNECTOR_VERSION ?= $(call go_requirement,connector)
 SANDBOXER_VERSION ?= $(call go_requirement,sandboxer)
 
+# Mixed release recipes run sub-makes with the jobserver on real builds. GNU
+# Make executes recipes that directly reference $(MAKE) even under --dry-run.
+release_make = $(MAKE)
+release_recursive = $(if $(findstring n,$(filter-out -% %=%,$(firstword $(MAKEFLAGS)))),,+)
+
 release:
-	@set -e; workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
-		--root .. --owners orchestrator --version "$(VERSION)" --dependency-tag "accelerator=$(ACCELERATOR_VERSION)" --dependency-tag "connector=$(CONNECTOR_VERSION)" --dependency-tag "sandboxer=$(SANDBOXER_VERSION)")"; \
-	$(MAKE) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
+	$(release_recursive)@set -e; accelerator_tag="$(ACCELERATOR_VERSION)"; \
+	connector_tag="$(CONNECTOR_VERSION)"; \
+	sandboxer_tag="$(SANDBOXER_VERSION)"; \
+	workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
+		--root .. --owners orchestrator --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag" --dependency-tag "sandboxer=$$sandboxer_tag")"; \
+	$(release_make) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
 	rm -rf "build/release-bundle"; \
 	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
 	RELEASE_SOURCE_ROOT="$(CURDIR)" \
@@ -113,9 +121,9 @@ release:
 	RELEASE_CONNECTOR_SOURCE_DIR="$(abspath ../connector)" \
 	RELEASE_SANDBOXER_SOURCE_DIR="$(abspath ../sandboxer)" \
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
-	RELEASE_ACCELERATOR_VERSION="$(ACCELERATOR_VERSION)" \
-	RELEASE_CONNECTOR_VERSION="$(CONNECTOR_VERSION)" \
-	RELEASE_SANDBOXER_VERSION="$(SANDBOXER_VERSION)" \
+	RELEASE_ACCELERATOR_VERSION="$$accelerator_tag" \
+	RELEASE_CONNECTOR_VERSION="$$connector_tag" \
+	RELEASE_SANDBOXER_VERSION="$$sandboxer_tag" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" "build/release-bundle"
 
 test-release:

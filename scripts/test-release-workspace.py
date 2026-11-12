@@ -51,9 +51,12 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         (self.owner/'main.go').write_text('package main\nimport ("fmt"; "github.com/kuasar-sandbox/accelerator")\nfunc main(){fmt.Print(accelerator.Selected)}\n')
         self.target = 'release-runtime' if OWNER == 'guest-runtime' else 'release'
         original=(ROOT/'Makefile').read_text()
+        recursive=original[original.index('release_make ='):].split('\n\n',1)[0]
         recipe=original.split(self.target+':\n',1)[1].split('\n\n',1)[0]
         variables = 'SHELL := /bin/bash\nBINDIR := bin/x86_64\nBUILD_DIR := build/x86_64\nTARGET_ARCH := x86_64\nSANDBOXER_DIR := ../sandboxer\nENVD := native-deps/bin/x86_64/envd\nVERSION := v0.1.99\nRUNTIME_VERSION := runtime-v0.1.99\n'
-        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer']))
+        requirement=original[original.index('go_requirement ='):].split('\nACCELERATOR_VERSION',1)[0]
+        variables += 'GO := go\n'+recursive+'\n'+requirement+'\nACCELERATOR_VERSION ?= $(call go_requirement,accelerator)\n'
+        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer'])-{'accelerator'})
         build = '\n.PHONY: release release-runtime build flatten-ctl sandbox-runtime\nbuild flatten-ctl:\n\t@mkdir -p "$(BINDIR)"\n\tgo build -o "$(BINDIR)/flatten-ctl" .\n'
         build += 'sandbox-runtime:\n\t@test "$(FLATTEN_CTL)" = "$(BINDIR)/flatten-ctl"\n\t@test "$$("$(FLATTEN_CTL)")" = selected-local\n\t@cp "$(FLATTEN_CTL)" "$(BINDIR)/sandbox-runtime.bundle"\n'
         # The release recipe is copied verbatim; only costly build/package boundaries are fixtures.
@@ -207,6 +210,28 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         else:
             result=subprocess.check_output([self.make,'-s','show-envd','TARGET_ARCH=x86_64','BINDIR='+str(output)],cwd=self.owner,env=self.env,text=True)
             self.assertEqual(result,'native-deps/bin/x86_64/envd')
+
+    def test_dry_run_uses_no_selection_tools_and_preserves_artifacts(self):
+        (self.owner/'Makefile').write_bytes((ROOT/'Makefile').read_bytes())
+        tools = self.root/'recording-tools'
+        tools.mkdir()
+        for command in ('go', 'python3', 'jq', 'bash'):
+            tool = tools/command
+            tool.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$TRACE"\nexit 9\n')
+            tool.chmod(0o755)
+        trace = self.root/'dry-run-trace'
+        env = dict(self.env, TRACE=str(trace), PATH=str(tools)+os.pathsep+self.env['PATH'])
+        prior = self.owner/'build/release-bundle/prior'
+        prior.parent.mkdir(parents=True)
+        prior.write_text('preserved')
+        for version in ('v0.1.11', 'v0.1.11-preview.20261112'):
+            variable = 'RUNTIME_VERSION=runtime-' if OWNER=='guest-runtime' else 'VERSION='
+            result = subprocess.run([self.make, '-n', '-j2', self.target, variable+version, 'GO='+str(tools/'go')],
+                                    cwd=self.owner, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('go_workspace.py', result.stdout)
+            self.assertFalse(trace.exists(), trace.read_text() if trace.exists() else '')
+            self.assertEqual(prior.read_text(), 'preserved')
 
     def test_missing_tag_stops_before_build(self):
         subprocess.run(['git','-C',str(self.root/'accelerator'),'tag','-d','v0.1.10'],check=True,capture_output=True)
