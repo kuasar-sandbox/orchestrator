@@ -141,7 +141,7 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 		sink.SetProxyCapabilities(hello.Hello.ProxyCapabilities)
 	}
 	s.sink.SetPolicy(hello.Hello.Policy)
-	if s.SnapshotSlots != nil && s.reg.ResumeFrom == "" {
+	if s.SnapshotSlots != nil && (s.reg.ResumeFrom == "" || localRouteProjection(s.reg).hold) {
 		ids, capacity := s.SnapshotSlots()
 		if len(ids) > 0 {
 			if err := s.reconcileSnapshot(sctx, resp.Body, up, ids, capacity); err != nil {

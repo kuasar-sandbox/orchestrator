@@ -78,6 +78,11 @@ connected  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
   },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
+    "hold": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:00:00Z"
+    },
     "forward": {
       "parking": 0,
       "connected": 0,
@@ -109,8 +114,8 @@ connected  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
 conductor Sandbox row 推导;全零对象表示 unlimited。配置 `M` 是整个 node Proxy 对该
 Sandbox 的近似上限,`N` 个 worker 的短暂理论上界为 `M+N-1`,不是每 worker 的 `M`。
 
-e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec`,bare 是
-`forward/exec`。顶层 `inflight` 是各 service 求和。每个 service 仅在两项为零时附
+e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec/hold`,bare 是
+`forward/exec/hold`。顶层 `inflight` 是各 service 求和。 `hold.connected` 计数单位为工作项；物理连接指标和 `maxInflight` 不包含它。每个 service 仅在两项为零时附
 `idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
 starting/pausing/paused 返回 inflight 但不返回顶层 idle。接口不返回 idle bool/duration、last
 open/close、累计连接数、速率/延迟/端口明细或 worker 信息。
@@ -123,7 +128,7 @@ admission算法、误差证明、worker-local状态机、绝对快照 stream 和
 
 响应为平铺结构: `state`、`maxInflight`、`inflight`、`idleSince`、`services`、`platform`、`transit` 和 `egress`. Conductor 拥有该原生 API,按照当前 Sandbox 到 switch/port 的绑定组织既有 Proxy 观测与网络计数. `platform` 映射 connector 的 Mgmt RX/TX 包数和字节数,`transit` 映射 Transit RX/TX;两者都采用沙箱视角. 已配置且当前有效的端口返回全部四项无符号整数,包括合法的 0. 仅当 `VswitchPort`、`FloatingIP`、`InnerIP` 和 `PortMAC` 全部为空时,沙箱才返回空 `platform`/`transit` 对象,表示没有适用的当前观测. 部分网络绑定在查询任一来源前返回 503. `egress: {}` 始终表示尚无可发布的 egress 统计,不是观测到零流量. 不发布 per-service 包计数、来源分组或 network API 别名.
 
-`connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 仅描述 Proxy 已接纳 ingress;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
+`connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 覆盖 Proxy 已接纳的 ingress 和业务登记的 hold;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
 
 Conductor 每个 switch 最多批量读取 64 个当前端口,调用 connector Go `Stats(ports)`,不逐沙箱启动 CLI,不维护第二套生命周期权威. 它复用原有 allocation/detach fence;connector 复用 pin 目录共享锁、当前 pinned-map ID 和清零确认标记. 既有 Proxy stats socket 也支持有界批量. 已配置来源读取失败、清零未确认、控制锁占用、结果不完整或绑定变化时,整个读取返回 503,不会用 0 或旧样本伪装完整响应. 公开 API、可信本机 batch 与 conductor extension 共用相同领域读取. Stats 独立于 telemetry,不参与 Create/Resume readiness.
 

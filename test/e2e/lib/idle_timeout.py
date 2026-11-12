@@ -115,6 +115,55 @@ def run():
         finally:
             conn.close()
 
+    def control(method, suffix, body=None):
+        conn = HTTPConnection('127.0.0.1', int(env['PORT']), timeout=5)
+        try:
+            conn.request(method, f'/sandboxes/{sid}/{suffix}', body, headers={
+                'Host': 'api.' + env['DOMAIN'], 'X-API-KEY': env['AK'],
+                'Content-Type': 'application/json'})
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def background_hold():
+        # Only native read-only control requests are used while the guest works.
+        # They cannot create an ingress connection or wake a paused sandbox.
+        program = Path(__file__).with_name('idle_hold_guest.py').read_bytes()
+        encoded = base64.b64encode(program).decode()
+        stdout, stderr = execute(f"python3 -c 'import base64;exec(base64.b64decode(\"{encoded}\"))'")
+        assert (stdout, stderr) == (b'registered\n', b''), (stdout, stderr)
+        assert control('PUT', 'traffic/hold', '{"value":2,"ifMatch":0}') == (409, {'value': 1})
+        deadline = time.monotonic() + 5
+        while True:
+            status, stats = control('GET', 'stats/traffic')
+            if (status == 200 and stats['inflight'] == {'parking': 0, 'connected': 1}
+                    and stats['services']['hold']['connected'] == 1):
+                break
+            assert time.monotonic() < deadline, (status, stats)
+            time.sleep(.05)
+        time.sleep(timeout + .2)
+        last_positive = time.monotonic()
+        assert state()[0] == 'running' and control('GET', 'traffic/hold') == (200, {'value': 1})
+        deadline = time.monotonic() + 12
+        while True:
+            sampled = time.monotonic()
+            result = control('GET', 'traffic/hold')
+            if result == (200, {'value': 0}):
+                break
+            assert result == (200, {'value': 1}) and sampled < deadline and state()[0] == 'running', result
+            last_positive = sampled
+            time.sleep(.05)
+        # Release is after the last observed positive. The first read of zero
+        # may arrive late on a busy host, so timing from it could falsely fail.
+        pause = await_paused(last_positive)
+        assert pause >= timeout - .25, ('release inherited a stale idle deadline', pause)
+        assert control('GET', 'traffic/hold') == (200, {'value': 0})
+        status, body = control('PUT', 'traffic/hold', '{"value":1}')
+        assert status == 409 and 'value' not in body and state()[0] == 'paused'
+        assert execute('cat /tmp/idle-hold-result') == (b'completed', b'')
+        await_paused(time.monotonic())
+
     def verify(value):
         nonlocal counter, secret
         counter += 1
@@ -152,6 +201,8 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
         stdout, stderr = execute(install)
         assert stdout == b'installed\n' and not stderr
         await_paused(time.monotonic())
+        if timeout == 2:
+            background_hold()
         for mode in ('http', 'exec'):
             for _ in range(5):
                 started = time.monotonic()

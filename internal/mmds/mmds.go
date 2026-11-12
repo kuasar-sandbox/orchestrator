@@ -18,9 +18,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const (
@@ -47,16 +51,17 @@ type Source interface {
 	MmdsSecret(sandboxID string) (secret []byte, ok bool)
 	Incarnation(sandboxID string) (incarnation string, ok bool)
 	MMDSRoute(ctx context.Context, sandboxID, exactPath string) (route MMDSRoute, ok bool, err error)
+	MMDSHold(ctx context.Context, sandboxID, runID, exactPath string, value, ifMatch *int64) (actual *int64, status int)
 }
 
-// MMDSRoute is one fully resolved response. Present is meaningful only for a
-// secret route. StatusCode is meaningful only for a service route.
+// MMDSRoute describes a matched target. A service lookup cannot perform I/O
+// on the provider; ReadService is invoked only after accepting a guest GET.
 type MMDSRoute struct {
 	Type        string
 	ContentType string
 	Body        []byte
 	Present     bool
-	StatusCode  int
+	ReadService func(context.Context) mmdssvc.Result
 }
 
 type Server struct {
@@ -90,8 +95,8 @@ func (s *Server) Handler() http.Handler {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == "/latest/api/token":
 			s.putToken(w, r)
-		case r.Method == http.MethodGet:
-			s.getMeta(w, r)
+		case r.Method == http.MethodGet || holdPutCandidate(r):
+			s.metadata(w, r)
 		default:
 			http.Error(w, "", http.StatusNotFound)
 		}
@@ -181,15 +186,22 @@ func secureHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// Only declaration-backed PUTs may carry operation parameters. Built-ins,
+// normal reads and unsupported methods keep their existing query behavior.
+func holdPutCandidate(r *http.Request) bool {
+	return (r.Method == http.MethodPut || r.Method == "put") && r.URL.Path != "/" && r.URL.Path != "/latest/api/token"
+}
+
 func guardRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL == nil || r.URL.ForceQuery || r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawFragment != "" {
+		if r.URL == nil || ((r.URL.ForceQuery || r.URL.RawQuery != "") && !holdPutCandidate(r)) || r.URL.Fragment != "" || r.URL.RawFragment != "" {
 			http.Error(w, "", http.StatusBadRequest)
 			return
 		}
 		raw := r.URL.Path
+		rawTargetPath, _, _ := strings.Cut(r.RequestURI, "?")
 		if raw == "" || raw[0] != '/' || r.URL.RawPath != "" ||
-			strings.Contains(r.RequestURI, "%") || strings.ContainsAny(raw, "?#\\*") {
+			strings.Contains(rawTargetPath, "%") || strings.ContainsAny(raw, "?#\\*") {
 			http.Error(w, "", http.StatusBadRequest)
 			return
 		}
@@ -288,12 +300,13 @@ func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
-	sid, ok := s.verifyToken(r.Header.Get("X-metadata-token"), sourceIP(r.RemoteAddr))
+func (s *Server) metadata(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.verifyToken(r.Header.Get("X-metadata-token"), sourceIP(r.RemoteAddr))
 	if !ok {
 		http.Error(w, "", http.StatusUnauthorized)
 		return
 	}
+	sid := principal.SID
 	if r.URL.Path != "/" {
 		route, found, err := s.src.MMDSRoute(r.Context(), sid, r.URL.Path)
 		if err != nil {
@@ -304,6 +317,14 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !found {
+			http.Error(w, "", http.StatusNotFound)
+			return
+		}
+		if route.Type == sandboxcfg.MMDSRouteHoldTraffic {
+			s.holdTraffic(w, r, principal)
+			return
+		}
+		if r.Method != http.MethodGet {
 			http.Error(w, "", http.StatusNotFound)
 			return
 		}
@@ -325,6 +346,75 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Decimal text, with no form or JSON decoding. Bound the actual stream (not
+// the declared length) so chunked PUTs and curl -d work exactly the same way.
+const maxHoldTextBytes = 19 // decimal MaxInt64
+
+func holdDecimal(text string) (*int64, bool) {
+	if len(text) == 0 || len(text) > maxHoldTextBytes {
+		return nil, false
+	}
+	for _, c := range []byte(text) {
+		if c < '0' || c > '9' {
+			return nil, false
+		}
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return nil, false
+	}
+	return &n, true
+}
+
+func (s *Server) holdTraffic(w http.ResponseWriter, r *http.Request, principal tokenPayload) {
+	var value, ifMatch *int64
+	if r.Method != http.MethodGet {
+		if r.URL.RawQuery != "" || r.URL.ForceQuery {
+			// Exactly one pair, including after percent decoding. ParseQuery
+			// errors (including partially parsed input) must never omit CAS.
+			params, err := url.ParseQuery(r.URL.RawQuery)
+			v := params["if-match"]
+			if err != nil || len(params) != 1 || len(v) != 1 || strings.Contains(r.URL.RawQuery, "&") {
+				http.Error(w, "", http.StatusBadRequest)
+				return
+			}
+			var valid bool
+			ifMatch, valid = holdDecimal(v[0])
+			if !valid {
+				http.Error(w, "", http.StatusBadRequest)
+				return
+			}
+		}
+		if r.Body == nil {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		// An unbounded slow sender must not keep the worker waiting for a digit.
+		ctl := http.NewResponseController(w)
+		if err := ctl.SetReadDeadline(time.Now().Add(readHeaderTimeout)); err == nil {
+			defer ctl.SetReadDeadline(time.Time{})
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxHoldTextBytes+1))
+		var valid bool
+		value, valid = holdDecimal(string(body))
+		if err != nil || !valid {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+	}
+	actual, status := s.src.MMDSHold(r.Context(), principal.SID, principal.Incarnation, r.URL.Path, value, ifMatch)
+	if actual != nil && *actual >= 0 && (status == http.StatusOK || status == http.StatusConflict) {
+		s.writeBody(w, r, status, "text/plain", strconv.AppendInt(nil, *actual, 10))
+		return
+	}
+	switch status {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable:
+	default:
+		status = http.StatusServiceUnavailable
+	}
+	http.Error(w, "", status)
+}
+
 func (s *Server) writeRoute(w http.ResponseWriter, r *http.Request, route MMDSRoute) {
 	contentType := route.ContentType
 	if contentType == "" {
@@ -340,11 +430,16 @@ func (s *Server) writeRoute(w http.ResponseWriter, r *http.Request, route MMDSRo
 		}
 		s.writeBody(w, r, http.StatusOK, contentType, route.Body)
 	case "service":
-		status := route.StatusCode
+		if route.ReadService == nil {
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+		result := route.ReadService(r.Context())
+		status := result.StatusCode
 		if status < 100 || status > 599 {
 			status = http.StatusServiceUnavailable
 		}
-		s.writeBody(w, r, status, contentType, route.Body)
+		s.writeBody(w, r, status, result.ContentType, result.Body)
 	default:
 		http.Error(w, "", http.StatusServiceUnavailable)
 	}
@@ -395,35 +490,35 @@ func mintToken(payload tokenPayload, secret []byte) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(body) + "." + hex.EncodeToString(signBytes(body, secret)), nil
 }
 
-func (s *Server) verifyToken(token, currentSourceIP string) (string, bool) {
+func (s *Server) verifyToken(token, currentSourceIP string) (tokenPayload, bool) {
 	payloadEncoded, signature, found := strings.Cut(token, ".")
 	if !found || payloadEncoded == "" || signature == "" {
-		return "", false
+		return tokenPayload{}, false
 	}
 	body, err := base64.RawURLEncoding.DecodeString(payloadEncoded)
 	if err != nil {
-		return "", false
+		return tokenPayload{}, false
 	}
 	var payload tokenPayload
 	if err := json.Unmarshal(body, &payload); err != nil || payload.SID == "" {
-		return "", false
+		return tokenPayload{}, false
 	}
 	secret, ok := s.src.MmdsSecret(payload.SID)
 	if !ok {
-		return "", false
+		return tokenPayload{}, false
 	}
 	got, err := hex.DecodeString(signature)
 	if err != nil || !hmac.Equal(got, signBytes(body, secret)) {
-		return "", false
+		return tokenPayload{}, false
 	}
 	if payload.Audience != mmdsTokenAudience || payload.ExpiresUnix <= time.Now().Unix() || payload.SourceIP != currentSourceIP {
-		return "", false
+		return tokenPayload{}, false
 	}
 	incarnation, ok := s.src.Incarnation(payload.SID)
 	if !ok || incarnation != payload.Incarnation {
-		return "", false
+		return tokenPayload{}, false
 	}
-	return payload.SID, true
+	return payload, true
 }
 
 func signBytes(payload, secret []byte) []byte {

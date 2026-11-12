@@ -263,7 +263,7 @@ import json, sys
 stats, pressure = [json.load(open(path)) for path in sys.argv[1:3]]
 row = next(row for row in pressure["sandboxes"] if row["sandbox_id"] == sys.argv[3])
 services = stats.get("services", {})
-assert set(services) == {"forward", "exec"}, stats
+assert set(services) == {"forward", "exec", "hold"}, stats
 assert set(stats["inflight"]) == {"parking", "connected"}, stats
 assert all(set(item) >= {"parking", "connected"} for item in services.values()), stats
 ok = (pressure["zone"] == "critical" and row["state"] == "paused" and

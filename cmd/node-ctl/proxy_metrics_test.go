@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -89,6 +90,7 @@ func TestProxyStatsStreamAcrossProcessBoundary(t *testing.T) {
 
 	mx := metrics.New()
 	master := proxystats.NewMasterStats(mx, []string{"proxy-child"})
+	master.ObserveRoute(routesync.RouteEntry{SandboxID: "s1", RunID: "run-1", State: routesync.StateRunning, Hold: &routesync.HoldActivity{}})
 	if err := master.BeginWorker("proxy-child", 7); err != nil {
 		t.Fatal(err)
 	}

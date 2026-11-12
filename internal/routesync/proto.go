@@ -52,7 +52,8 @@ import (
 // and synchronous Pause activity ACKs. Version 10 retains dead/deleting management
 // entries with parent identity/state versions; mixed peers fail closed.
 // Version 11 adds historical idle evidence and activity observations.
-const Version = 11
+// Version 12 projects the authoritative per-sandbox hold traffic service.
+const Version = 12
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -111,6 +112,10 @@ const (
 // A credential-authorized "paused" route may make the proxy send a Wake;
 // "starting" waits passively and "running" lets it forward.
 type RouteEntry struct {
+	// Hold is a single node-authoritative contribution, never a worker flow.
+	// A missing projection is unknown; trusted zero is encoded explicitly.
+	Hold *HoldActivity `json:"hold,omitempty"`
+
 	IdleTimeout          *int64 `json:"idle_timeout,omitempty"`
 	InstanceID           string `json:"instance_id,omitempty"`
 	AutoReset            bool   `json:"auto_reset,omitempty"`
@@ -193,7 +198,7 @@ func (r *RouteEntry) UnmarshalJSON(raw []byte) error {
 	// encoding/json accepts case-insensitive field names. Do not let an alias
 	// bypass the owned projection's null/type/duplicate validation below.
 	for field := range fields {
-		for _, owned := range []string{"traffic_policy_invalid", "max_inflight"} {
+		for _, owned := range []string{"traffic_policy_invalid", "max_inflight", "hold"} {
 			if field != owned && strings.EqualFold(field, owned) {
 				return fmt.Errorf("routesync: non-canonical traffic field %q", field)
 			}

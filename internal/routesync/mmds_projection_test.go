@@ -56,7 +56,7 @@ func TestMMDSProjectionIsTrustedProxyOnly(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var wire bytes.Buffer
-			if err := writeEvent(&wire, Event{Kind: TypeUpsert, Route: route}, tt.include); err != nil {
+			if err := writeEvent(&wire, Event{Kind: TypeUpsert, Route: route}, routeProjection{hold: tt.include, mmds: tt.include}); err != nil {
 				t.Fatal(err)
 			}
 			message, err := ReadMsg(&wire)
@@ -188,7 +188,7 @@ func TestTrustedMMDSProxyAlwaysReceivesFullSnapshot(t *testing.T) {
 		Subscribe:  &Subscribe{Kind: KindRouteWake},
 		Proxy:      &Proxy{},
 		Mmds:       true,
-		ResumeFrom: MakeRevToken(source.SourceFingerprint(), 0),
+		ResumeFrom: MakeRevToken(source.SourceFingerprint(), 1),
 	}
 	go ServeAuthority(ctx, downWriter, func() {}, upReader, source, reg, nil, nil)
 

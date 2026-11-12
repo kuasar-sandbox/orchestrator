@@ -425,3 +425,32 @@ func TestNativeStatsProjectionObservationTimesZerosAndPrecision(t *testing.T) {
 		t.Fatal("native 128-bit input was changed", err)
 	}
 }
+
+func TestHoldDoesNotCountAsTelemetryConnection(t *testing.T) {
+	m := pmetric.NewMetrics()
+	row := conductorextension.SandboxStats{SandboxID: "s", Traffic: &conductorextension.TrafficStats{
+		Inflight: conductorextension.TrafficInflight{Connected: 5},
+		Services: map[string]conductorextension.ServiceTrafficStats{"forward": {Connected: 2}, "hold": {Connected: 3}},
+	}}
+	if err := appendNativeStats(m, row, "traffic", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	metrics := m.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	found := false
+	for i := 0; i < metrics.Len(); i++ {
+		gauge := metrics.At(i)
+		point := gauge.Gauge().DataPoints().At(0)
+		if v, ok := point.Attributes().Get("service"); ok && v.Str() == "hold" {
+			t.Fatal("declared work appeared as a physical service")
+		}
+		if gauge.Name() == "sandbox.traffic.inflight.connected" {
+			found = true
+			if point.DoubleValue() != 2 {
+				t.Fatalf("physical connections = %v, want 2", point.DoubleValue())
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing connected gauge")
+	}
+}

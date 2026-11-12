@@ -6,6 +6,8 @@ NATIVE_USAGE_ENABLED=false
 . "$SCRIPT_DIR/proxy_guest.sh"
 PROXY_WORKERS=2
 PROXY_PARK_TIMEOUT=10s
+MMDS_ROUTES_CONFIG="  routes:
+    enabled: true"
 write_orchestrator_config unset static
 start_orchestrator "$WORK/orch.log"
 CONDUCTOR_PID=$ORCH_PID
@@ -16,7 +18,12 @@ wait_proxy_topology_ready "$PROXY_MASTER_PID"
 # Keep the standard 2GiB Sandbox capacity and the original 10s park budget.
 build_image_template
 for IDLE_TIMEOUT in 0 2; do
+    if [ "$IDLE_TIMEOUT" = 2 ]; then
+        REQ_ATTACH_MMDS=1
+        REQ_MMDS_HEADER='{"routes":[{"path":"/work/hold","type":"hold-traffic"}]}'
+    fi
     create_guest "{\"templateID\":\"$TEMPLATE\",\"timeout\":600,\"autoPauseMemory\":false,\"idleTimeout\":$IDLE_TIMEOUT}"
+    unset REQ_ATTACH_MMDS REQ_MMDS_HEADER
     # No business call: the initial complete observation must schedule Pause.
     wait_sandbox_state "$SID" paused 1200 || fail "never-used Sandbox did not auto-pause"
     EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")"

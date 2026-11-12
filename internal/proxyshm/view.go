@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -747,12 +748,33 @@ func (v *WorkerView) MMDSRoute(ctx context.Context, sandboxID, exactPath string)
 		return mmds.MMDSRoute{Type: response.Type, ContentType: response.ContentType, Body: response.Body}, true, nil
 	case "secret":
 		return mmds.MMDSRoute{Type: response.Type, ContentType: response.ContentType, Body: response.Body, Present: response.Present}, true, nil
-	case "service":
-		result := mmdssvc.Call(ctx, response.ServiceSocket, response.Service, exactPath, sandboxID)
-		return mmds.MMDSRoute{Type: response.Type, StatusCode: result.StatusCode, ContentType: result.ContentType, Body: result.Body}, true, nil
+	case sandboxcfg.MMDSRouteService:
+		return mmds.MMDSRoute{Type: response.Type, ReadService: func(ctx context.Context) mmdssvc.Result {
+			return mmdssvc.Call(ctx, response.ServiceSocket, response.Service, exactPath, sandboxID)
+		}}, true, nil
+	case sandboxcfg.MMDSRouteHoldTraffic:
+		return mmds.MMDSRoute{Type: response.Type}, true, nil
 	default:
 		return mmds.MMDSRoute{}, false, errors.New("proxyshm: invalid MMDS RPC response")
 	}
+}
+
+// MMDSHold forwards the exact principal verified from the guest token. Never
+// substitute a new RunID from the shared table after authentication.
+func (v *WorkerView) MMDSHold(ctx context.Context, sid, runID, path string, value, ifMatch *int64) (*int64, int) {
+	if !v.MMDSAvailable() || v.mmdsClient == nil {
+		return nil, http.StatusServiceUnavailable
+	}
+	if current, ok := v.Incarnation(sid); !ok || current != runID {
+		return nil, http.StatusUnauthorized
+	}
+	ctx, cancel := context.WithTimeout(ctx, v.mmdsTimeout)
+	defer cancel()
+	response, err := v.mmdsClient.Hold(ctx, sid, runID, path, value, ifMatch)
+	if err != nil {
+		return nil, http.StatusServiceUnavailable
+	}
+	return response.HoldValue, response.HoldStatus
 }
 
 func (v *WorkerView) Policy() routesync.Policy {

@@ -1168,8 +1168,33 @@ realtime timerfd 在时钟设置时使区间失效，包括两次采样之间的
 标识。自动暂停日志记录通知延迟、idle 等待、握手/capture 耗时、结果和重试次数，
 不新增 node-link Pause 命令。
 
-service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
-bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
+`hold` 服务记录业务请求结束后仍在执行的工作数。两种 profile 都返回
+`services.hold`：`parking` 恒为零，`connected` 是业务登记的数量。
+原生统计的 `inflight.connected` 只合计一次 hold；它不占用连接配额，不是 CONNECT
+目标，也不改变物理连接指标。
+
+使用已有鉴权访问 `GET /sandboxes/{id}/traffic/hold` 可读取当前值，沙箱已暂停时也可读。
+`PUT` 正文 `{"value":1,"ifMatch":0}` 表示仅在当前值为零时替换；省略
+`ifMatch` 则直接赋值。写入成功返回 `200 {"value":1}`，条件不符返回 409
+和比较时的实际值。只有 running 沙箱接受写入；生命周期冲突返回 409，不带数值，也不唤醒沙箱。
+
+让 guest 自行登记时，在直接向节点 Create 的 MMDS 配置中显式声明
+`{"routes":[{"path":"/work/hold","type":"hold-traffic"}]}`。取得 metadata token 后：
+
+```sh
+curl -fsS -X PUT -H "X-metadata-token: $TOKEN" -d '1' \
+  'http://169.254.169.254/work/hold?if-match=0'
+```
+
+MMDS 读写使用十进制文本，只有声明了该路径的沙箱可以访问。应用应在最后一条业务连接
+结束前确认登记总数成功，并在结果可交付后再释放最后一项。正数归零会开始新的空闲区间；
+重复写入同值不会重置计时。hold 没有 TTL，残留计数由业务核对。无条件 Pause 仍可执行。
+同一本地记录的 Pause/Resume 和 Reset 保留计数；新记录（含独立 Import）从零开始。
+跨节点接续工作时，应保持一条已接纳的连接，直到目的节点确认重新登记。Conductor 与 Proxy
+需要配套升级到 routesync v12。
+
+物理 service 包括 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
+bare 使用 forward/exec。两种 profile 均另含 hold。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
 成功时在同一 worker-local entry lock 中原子执行 `parking--/connected++`;activation 或 dial
 失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 connected;只有 tracked backend
 的最终 `Close` 以 `sync.Once` 结束 connected。token 或 ExecRequest admission 失败不进入
@@ -1193,6 +1218,11 @@ bare Sandbox 空闲响应示例（不适用的 e2b 上限为零）：
   },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
+    "hold": {
+      "parking": 0,
+      "connected": 0,
+      "idleSince": "2026-08-12T14:00:00Z"
+    },
     "forward": {
       "parking": 0,
       "connected": 0,
@@ -1233,7 +1263,7 @@ RunID/profile/state 不匹配或 worker 集不可信时返回 503。state 参与
 
 响应为平铺结构: `state`、`maxInflight`、`inflight`、`idleSince`、`services`、`platform`、`transit` 和 `egress`. Conductor 拥有该原生 API,按照当前 Sandbox 到 switch/port 的绑定组织既有 Proxy 观测与网络计数. `platform` 映射 connector 的 Mgmt RX/TX 包数和字节数,`transit` 映射 Transit RX/TX;两者都采用沙箱视角. 已配置且当前有效的端口返回全部四项无符号整数,包括合法的 0. 没有 attached port 的沙箱仅在 FloatingIP、inner IP 和 port MAC 也都为空时返回空 `platform`/`transit` 对象,表示没有适用的当前观测. 已附着端口要求上述三个身份字段完整;不完整绑定在读取任一来源前返回 503. `egress: {}` 始终表示尚无可发布的 egress 统计,不是观测到零流量. 不发布 per-service 包计数、来源分组或 network API 别名.
 
-`connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 仅描述 Proxy 已接纳 ingress;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
+`connected` 替代原生 `inflight.egress` 和 `services[*].egress`,保持后端连接已建立至最终 Close 的原有含义. 顶层 `idleSince` 覆盖 Proxy 已接纳的 ingress 和业务登记的 hold;management 监控包不会刷新它,它不对沙箱计算或整个网络空闲作出结论. packets 是包数而非应用请求数;bytes 是观测帧字节而非吞吐速率. management 使用既有端口/management ingress 帧长度;transit 使用封装前或去除外层 GENEVE 头后的帧长度,保留以太网头. 不把不同观测点相加成总流量. 累计计数属于当前 attachment,端口复用后可以重置;API 不建立网络历史.
 
 Conductor 每个 switch 最多批量读取 64 个当前端口,调用 connector Go `Stats(ports)`,不逐沙箱启动 CLI,不维护第二套生命周期权威. 它复用原有 allocation/detach fence;connector 复用 pin 目录共享锁、当前 pinned-map ID 和清零确认标记. 既有 Proxy stats socket 也支持有界批量. 已配置来源读取失败、清零未确认、控制锁占用、结果不完整或绑定变化时,整个读取返回 503,不会用 0 或旧样本伪装完整响应. 公开 API、可信本机 batch 与 conductor extension 共用相同领域读取. Stats 独立于 telemetry,不参与 Create/Resume readiness.
 
@@ -1300,7 +1330,7 @@ master 把下行路由流投影到共享内存:
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
-Pause 使用 routesync v11 的 `pause_barrier{barrier_id,route}` 和
+Pause 使用 routesync v12 的 `pause_barrier{barrier_id,route}` 和
 `pause_ack{barrier_id,pause_ack}`. Conductor 固定本次开始时在线且 ready 的 Proxy 集合,
 忽略此前已断链的 Proxy, 不持久化清单; 空参与集允许继续. 各 master 先应用 `pausing`
 路由, 再通过私有控制通道同步采样所有 worker, 包括正在 drain 的 worker. Worker 在

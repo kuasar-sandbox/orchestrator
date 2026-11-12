@@ -62,30 +62,42 @@ func (m *MasterStats) ObserveRoute(r routesync.RouteEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clockLocked()
-	old := m.routeSince[r.SandboxID]
-	if r.State == routesync.StateRunning {
-		if old.runID != r.RunID || old.since.bootNS == 0 {
-			m.routeSince[r.SandboxID] = runMarker{runID: r.RunID, since: m.now()}
-		}
-	} else if r.State != routesync.StatePausing || old.runID != r.RunID {
-		delete(m.routeSince, r.SandboxID)
+	if r.State == routesync.StateDead || r.State == routesync.StateDeleting {
+		delete(m.routes, r.SandboxID)
+		return
 	}
+	observed := routeObservation{runID: r.RunID, state: r.State}
+	if h := r.Hold; h.Valid() {
+		observed.holdKnown = true
+		observed.hold.egress = uint64(h.Value)
+		if h.IdleSince != nil {
+			observed.hold.idle = timePoint{wall: h.IdleSince.UTC(), bootNS: h.IdleSinceBootNS}
+		}
+	}
+	old := m.routes[r.SandboxID]
+	if old.runID == r.RunID && (r.State == routesync.StateRunning || r.State == routesync.StatePausing) {
+		observed.since = old.since
+	}
+	if r.State == routesync.StateRunning && observed.since.bootNS == 0 {
+		observed.since = m.now()
+	}
+	m.routes[r.SandboxID] = observed
 }
 func (m *MasterStats) ResetObservation() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.routeSince = make(map[string]runMarker)
-	m.runSince = make(map[string]runMarker)
+	clear(m.routes)
 	m.trustSince = m.now()
 }
 
-// PauseEvidence uses only the durable baselines here. Counts and last-zero
-// times MUST come from synchronous Worker samples, never the async cache.
+// PauseEvidence returns only the run and worker-set baselines. The barrier
+// samples physical flows synchronously in each worker; Conductor checks hold
+// once at its authority. Neither may use the master's async stats cache.
 func (m *MasterStats) PauseEvidence(sid, run string) routesync.IdleEvidence {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clockLocked()
-	marker := m.routeSince[sid]
+	marker := m.routes[sid]
 	if !m.availableLocked() || marker.runID != run || marker.since.bootNS <= 0 {
 		return routesync.IdleEvidence{}
 	}

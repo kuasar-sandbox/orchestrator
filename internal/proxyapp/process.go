@@ -20,7 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
 
-func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) (returnErr error) {
+func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, guestHold mmdsrpc.HoldHandler, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) (returnErr error) {
 	if effective == nil || view == nil || admission == nil || stats == nil || logger == nil {
 		return fmt.Errorf("proxy worker process: unresolved startup state")
 	}
@@ -119,7 +119,7 @@ func runWorkerProcess(ctx context.Context, instance *Instance, workerIndex int, 
 	removeNotify := view.RegisterNotifyWriter(notifyWrite)
 	defer removeNotify()
 	go proxyshm.ReadWakeLoop(ctx, wakeRead, view.Wake)
-	go mmdsrpc.NewServer(mmdsRPCMaster, view.ResolveMMDS, logger).Serve()
+	go mmdsrpc.NewServer(mmdsRPCMaster, view.ResolveMMDS, logger).WithHold(ctx, guestHold).Serve()
 	if err := admission.BeginWorker(workerIndex, epoch); err != nil {
 		return err
 	}

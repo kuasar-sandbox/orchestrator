@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -342,6 +343,7 @@ func waitTraffic(t *testing.T, master *proxystats.MasterStats, predicate func(*a
 }
 
 func waitTrafficFor(t *testing.T, master *proxystats.MasterStats, sandboxID string, profile types.Profile, state types.State, predicate func(*api.TrafficStats) bool) *api.TrafficStats {
+	master.ObserveRoute(routesync.RouteEntry{SandboxID: sandboxID, RunID: "run-1", State: string(state), Hold: &routesync.HoldActivity{}})
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

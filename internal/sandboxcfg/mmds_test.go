@@ -266,3 +266,26 @@ func TestExtractMMDSPayloadLimitAppliesToEachSource(t *testing.T) {
 		t.Fatal("accepted oversized header")
 	}
 }
+
+func TestHoldRouteDeclarationAndRootReservation(t *testing.T) {
+	raw := `{"routes":[{"path":"/work/hold","type":"hold-traffic"}]}`
+	meta := map[string]string{NsMMDS: raw}
+	policy := testMMDSPolicy()
+	doc, _, err := ExtractMMDS(meta, nil, policy)
+	if err != nil || doc.RoutesJSON != raw {
+		t.Fatalf("hold route admission = %+v, %v", doc, err)
+	}
+	for _, field := range []string{`"data":""`, `"secret":""`, `"service":""`, `"content_type":""`} {
+		bad := `{"routes":[{"path":"/work/hold","type":"hold-traffic",` + field + `}]}`
+		if _, _, err := ExtractMMDS(nil, &bad, policy); err == nil {
+			t.Errorf("accepted incompatible %s", field)
+		}
+	}
+	policy.ReservedPathPrefixes = []string{"/"}
+	if _, _, err := ExtractMMDS(meta, nil, policy); err == nil {
+		t.Fatal("root reservation did not block new admission")
+	}
+	if _, err := DecodePersistedMMDSRoutes(doc.RoutesJSON); err != nil {
+		t.Fatalf("previously admitted route revoked: %v", err)
+	}
+}

@@ -125,7 +125,7 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 // and hands each to onUp. It returns when body hits EOF/error or ctx is cancelled.
 //
 // The proxy plane reaches this through ServeStream. The cluster node-link calls
-// StreamAuthority directly and is therefore forced onto the non-MMDS projection.
+// StreamAuthority directly and never receives local Proxy-only fields.
 func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
 	serveAuthority(ctx, w, flush, body, src, reg, onUp, nil, nil, log)
 }
@@ -134,16 +134,16 @@ func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	// Handshake: policy first (flush so the peer's RoundTrip returns), then the
 	// shared route-stream loop. The cluster node-link sends a NodeRegister frame
 	// instead of Hello and calls StreamAuthority directly.
-	includeMMDS := reg.Mmds && reg.Subscribe != nil && reg.Subscribe.Kind == KindRouteWake && reg.Proxy != nil
+	projection := localRouteProjection(reg)
 	policy := src.Policy()
-	if !includeMMDS {
+	if !projection.mmds {
 		policy.MMDS = nil
 	}
 	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: policy, ProxyCapabilities: capabilities}}); err != nil {
 		return
 	}
 	flush()
-	streamAuthority(ctx, w, flush, body, src, reg, onUp, nil, onSubscribed, includeMMDS, log)
+	streamAuthority(ctx, w, flush, body, src, reg, onUp, nil, onSubscribed, projection, log)
 }
 
 // StreamAuthority runs the route-stream half of an authority connection WITHOUT
@@ -160,10 +160,10 @@ func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 // alongside the route deltas rather than racing it.
 func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, log *slog.Logger) {
 	// Direct callers are the cluster node-link transport. Even if a remote peer
-	// sets the generic Register.Mmds bit, this entry point never projects node-
-	// local MMDS routes or values. The config-socket proxy path above performs
-	// its own trusted registration check before opting in.
-	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, nil, false, log)
+	// claims Proxy or MMDS capabilities, node-local hold counts, MMDS routes
+	// and values never cross the node-link. Only the local registration path
+	// above can opt into either projection.
+	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, nil, routeProjection{}, log)
 }
 
 const buildSnapshotOutboxBurst = 32
@@ -198,7 +198,7 @@ func drainBuildSnapshotOutbox(ctx context.Context, w io.Writer, flush func(), ou
 	return nil
 }
 
-func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, onSubscribed func(), includeMMDS bool, log *slog.Logger) {
+func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, onSubscribed func(), projection routeProjection, log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -247,14 +247,13 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 
 	resumed := false
-	// A trusted MMDS proxy always rebuilds its confidential heap from a full
-	// snapshot. The heap is deliberately discarded on disconnect, so an
-	// incremental replay cannot reconstruct unchanged routes or values.
-	if reg.ResumeFrom != "" && !includeMMDS {
+	// Local Proxy observations are rebuilt on BeginSync. Incremental replay
+	// alone cannot restore untouched positive holds or retained MMDS state.
+	if reg.ResumeFrom != "" && !projection.hold {
 		if rs, ok := src.(ResumableSource); ok {
 			if after, ok := CheckRevToken(reg.ResumeFrom, rs.SourceFingerprint()); ok {
 				err := rs.Replay(sctx, after, func(ev Event) error {
-					return writeEvent(w, ev, includeMMDS)
+					return writeEvent(w, ev, projection)
 				})
 				switch {
 				case err == nil:
@@ -269,7 +268,7 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 	if !resumed {
 		if err := src.Range(sctx, func(r RouteEntry) error {
-			projectMMDSRoute(&r, includeMMDS)
+			projection.apply(&r)
 			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 		}); err != nil {
 			return
@@ -313,7 +312,7 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			if err := writeEvent(w, ev, includeMMDS); err != nil {
+			if err := writeEvent(w, ev, projection); err != nil {
 				return
 			}
 			flush()
@@ -344,7 +343,7 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			if err := writeEvent(w, ev, includeMMDS); err != nil {
+			if err := writeEvent(w, ev, projection); err != nil {
 				return
 			}
 			flush()
@@ -374,18 +373,18 @@ func writeBuildEvent(w io.Writer, event BuildEvent) error {
 	}
 }
 
-func writeEvent(w io.Writer, ev Event, includeMMDS bool) error {
+func writeEvent(w io.Writer, ev Event, projection routeProjection) error {
 	m := &Msg{Type: ev.Kind}
 	switch ev.Kind {
 	case TypeUpsert:
 		r := ev.Route
-		projectMMDSRoute(&r, includeMMDS)
+		projection.apply(&r)
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID
 	case TypePauseBarrier:
 		r := ev.Route
-		projectMMDSRoute(&r, includeMMDS)
+		projection.apply(&r)
 		m.Route, m.BarrierID = &r, ev.BarrierID
 	case TypeRouteBarrier:
 		if ev.BarrierID == "" {
@@ -398,10 +397,24 @@ func writeEvent(w io.Writer, ev Event, includeMMDS bool) error {
 	return WriteMsg(w, m)
 }
 
-func projectMMDSRoute(route *RouteEntry, include bool) {
-	if route == nil || include {
-		return
+type routeProjection struct {
+	hold bool // traffic-serving local Proxy, irrespective of MMDS
+	mmds bool
+}
+
+// Node-link callers always use the empty projection. Local capabilities have
+// already been admitted by the configuration socket before ServeAuthority.
+func localRouteProjection(reg Register) routeProjection {
+	proxy := reg.handlesWake() && reg.Proxy != nil
+	return routeProjection{hold: proxy, mmds: proxy && reg.Mmds}
+}
+
+func (p routeProjection) apply(route *RouteEntry) {
+	if !p.hold {
+		route.Hold = nil
 	}
-	route.MMDSRoutes = ""
-	route.MMDSRouteSecretValues = nil
+	if !p.mmds {
+		route.MMDSRoutes = ""
+		route.MMDSRouteSecretValues = nil
+	}
 }

@@ -165,7 +165,7 @@ inflight = stats.get("inflight", {})
 if set(inflight) != {"parking", "connected"}:
     raise SystemExit(1)
 services = stats.get("services", {})
-if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
+if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec", "hold"}:
     raise SystemExit(1)
 for item in services.values():
     if set(item) - {"parking", "connected", "idleSince"} or not {"parking", "connected"} <= set(item):

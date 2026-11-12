@@ -248,8 +248,17 @@ func appendNativeStats(metrics pmetric.Metrics, row conductorextension.SandboxSt
 			add("idle_since", "s", float64(r.IdleSince.UnixNano())/1e9, observed, nil)
 		}
 		add("inflight.parking", "{connection}", float64(r.Inflight.Parking), observed, nil)
-		add("inflight.connected", "{connection}", float64(r.Inflight.Connected), observed, nil)
+		// The native traffic total includes declared background work. These
+		// existing connection gauges count physical flows only.
+		hold := r.Services["hold"].Connected
+		if hold > r.Inflight.Connected {
+			return errors.New("hold exceeds native connected total")
+		}
+		add("inflight.connected", "{connection}", float64(r.Inflight.Connected-hold), observed, nil)
 		for service, counters := range r.Services {
+			if service == "hold" {
+				continue
+			}
 			labels := map[string]string{"service": service}
 			add("service.parking", "{connection}", float64(counters.Parking), observed, labels)
 			add("service.connected", "{connection}", float64(counters.Connected), observed, labels)
