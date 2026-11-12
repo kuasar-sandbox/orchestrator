@@ -317,10 +317,14 @@ func (m *MasterStats) Available() bool {
 }
 
 // SandboxTrafficStats implements orch.SandboxTrafficProvider structurally.
-func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID string, profile types.Profile, state types.State) (result *api.TrafficStats, returnErr error) {
+func (m *MasterStats) SandboxTrafficStats(ctx context.Context, sandboxID, runID string, profile types.Profile, state types.State) (result *api.TrafficStats, returnErr error) {
+	physicalView := IsPhysicalTelemetry(ctx)
 	defer func() {
 		if result != nil && m.InplaceRestart != nil {
 			result.InplaceRestart = m.InplaceRestart()
+			if physicalView && result.InplaceRestart {
+				result.IdleSince = nil
+			}
 		}
 	}()
 	m.mu.Lock()
@@ -357,7 +361,7 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 	for _, service := range services {
 		current := aggregate.services[service]
 		if service == "hold" {
-			if m.physicalOnly {
+			if m.physicalOnly || physicalView {
 				continue
 			}
 			current = route.hold

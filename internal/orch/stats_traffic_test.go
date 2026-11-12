@@ -37,6 +37,42 @@ func (f trafficBatchFunc) SandboxTrafficStats(context.Context, string, string, t
 	return nil, errors.New("batch provider was queried per sandbox")
 }
 
+func TestPhysicalTelemetryBatchRequiresRequestedAndConfirmedView(t *testing.T) {
+	o := testOrch(t)
+	hold := int64(3)
+	sandbox := &types.Sandbox{ID: "held", State: types.StateRunning, HoldValue: &hold}
+	idle := time.Unix(100, 0).UTC()
+	physical := &api.TrafficStats{State: "running", IdleSince: &idle}
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name      string
+		ctx       context.Context
+		confirmed bool
+		sid       string
+		wantOK    bool
+	}{
+		{"confirmed physical read", proxystats.WithPhysicalTelemetry(ctx), true, sandbox.ID, true},
+		{"legacy Proxy without confirmation", proxystats.WithPhysicalTelemetry(ctx), false, sandbox.ID, false},
+		{"native read with active hold", ctx, false, sandbox.ID, false},
+		{"confirmation cannot switch a native read", ctx, true, sandbox.ID, false},
+		{"confirmation cannot bypass batch identity", proxystats.WithPhysicalTelemetry(ctx), true, "other", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			o.SetSandboxTrafficProvider(trafficBatchFunc(func(context.Context, []proxystats.TrafficQuery) ([]proxystats.BatchResult, error) {
+				return []proxystats.BatchResult{{SandboxID: tt.sid, Stats: physical, PhysicalOnly: tt.confirmed}}, nil
+			}))
+			_, rows, err := o.prepareTrafficReads(tt.ctx, []*types.Sandbox{sandbox})
+			if tt.wantOK {
+				if err != nil || len(rows) != 1 || rows[0] != physical {
+					t.Fatalf("physical row = %+v, %v", rows, err)
+				}
+			} else if !errors.Is(err, api.ErrStatsUnavailable) || rows != nil {
+				t.Fatalf("expected unavailable, got %+v, %v", rows, err)
+			}
+		})
+	}
+}
+
 func trafficBindings(t *testing.T, o *Orchestrator, count int) []string {
 	t.Helper()
 	o.cfg.Sandbox.Network.Switch = "test-traffic"

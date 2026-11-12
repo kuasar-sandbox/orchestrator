@@ -95,10 +95,17 @@ func (o *Orchestrator) prepareTrafficReads(ctx context.Context, sandboxes []*typ
 	if len(results) != len(sandboxes) {
 		return nil, nil, api.ErrStatsUnavailable
 	}
+	physicalTelemetry := proxystats.IsPhysicalTelemetry(ctx)
 	ingress := make([]*api.TrafficStats, len(results))
 	for i, row := range results {
 		if row.SandboxID != sandboxes[i].ID || row.Stats == nil {
 			return nil, nil, api.ErrStatsUnavailable
+		}
+		// Only the private reader can consume the Proxy's acknowledged
+		// physical aggregate independently of the logical hold count.
+		if physicalTelemetry && row.PhysicalOnly {
+			ingress[i] = row.Stats
+			continue
 		}
 		ingress[i], err = o.checkIngressHold(ctx, sandboxes[i], row.Stats)
 		if err != nil {

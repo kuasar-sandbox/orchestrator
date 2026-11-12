@@ -118,6 +118,7 @@ e2b 返回 `forward/e2b:envd/e2b:code-interpreter/exec`，bare 返回 `forward/e
 `idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
 starting/pausing/paused 返回 inflight 但不返回顶层 idle。接口不返回 idle bool/duration、last
 open/close、累计连接数、速率/延迟/端口明细或 worker 信息。
+旧版 Telemetry 保留 Proxy 按启动时钟确定的物理空闲起点。清零 hold 可以推迟原生 API 的空闲起点，旧版 Telemetry 中最后一次连接归零的时间仍保持原值。
 
 conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master cache,查询时不扇出 worker.master 未注册,
 route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
