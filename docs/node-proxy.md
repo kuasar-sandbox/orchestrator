@@ -943,7 +943,13 @@ running, clear it through the node API. If a legacy statistics source would
 report an active hold as idle, the node returns 503. Before downgrading the
 **Conductor** itself to a build without hold, finish or hand off outstanding
 work, or disable idle auto-pause for the affected sandboxes. The old authority
-cannot enforce a count saved by its replacement.
+cannot enforce a count saved by its replacement. A v0.1.14 Conductor also
+rejects an entire sandbox MMDS declaration if any path has type
+`hold-traffic`. Clearing the count leaves that declaration in place. If a
+sandbox needs its other custom MMDS paths during rollback, keep it on a
+hold-aware Conductor or recreate it with a v0.1.14-compatible declaration
+before the downgrade. Import restores a paused row and its existing paths;
+on a new Conductor a legacy Proxy receives only the compatible paths.
 
 The physical services are `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b uses all four; bare uses forward/exec. Both profiles also report hold when negotiated. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/connected++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending connected; only the tracked backend's final `Close`, guarded by `sync.Once`, ends connected. Token or ExecRequest rejection does not enter parking/connected or refresh sandbox activity/`idleSince`.
 

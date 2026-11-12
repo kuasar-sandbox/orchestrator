@@ -1204,6 +1204,10 @@ v0.1.14 发布版使用 v11。如果已经部署了强制使用 v12 的 main 中
 已登记的计数；所属调用方仍可通过节点 API 读取，并在沙箱运行时归零。旧统计源无法反映已有正数时，
 节点返回 503。若要把 **Conductor 本身**降级为不识别 hold 的版本，应先完成或交接已登记的工作，
 或者先关闭相应沙箱的空闲自动暂停；旧 Conductor 不会执行新版本保存的计数。
+即使计数已清零，只要有一条路径声明为 `hold-traffic`，v0.1.14 Conductor 就会忽略该沙箱的
+整份自定义 MMDS 路由声明。如果回滚期间还需要其中的其他路径，请将沙箱留在支持 hold 的
+Conductor 上，或在降级前使用 v0.1.14 支持的声明重新创建沙箱。Import 恢复暂停状态的记录及其
+既有声明；新 Conductor 向旧 Proxy 仅下发其中可识别的路径。
 
 物理 service 包括 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
 bare 使用 forward/exec。协商支持时，两种 profile 均另含 hold。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
