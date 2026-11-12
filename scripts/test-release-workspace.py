@@ -156,12 +156,36 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         self.before[module] = module.read_bytes()
         subprocess.run([go, 'work', 'init', './orchestrator'], cwd=self.root, env=env, check=True)
         work = self.root / 'go.work'
-        subprocess.run([go, 'work', 'edit', '-replace=github.com/kuasar-sandbox/accelerator@v0.1.11=./accelerator',
+        subprocess.run([go, 'work', 'edit', '-go=1.26.0',
+                        '-replace=github.com/kuasar-sandbox/accelerator@v0.1.11=./accelerator',
                         str(work)], cwd=self.root, env=env, check=True)
         before = work.read_bytes()
         subprocess.run(script, cwd=self.root, env=dict(env, GOWORK=str(work)), check=True)
         self.assertEqual(work.read_bytes(), before)
         self.assertEqual(list(self.root.glob('consumer-*.work*')), [])
+
+    def test_external_consumer_ignores_candidate_only_replaces_in_source_workspace(self):
+        private = self.root / 'only-local'
+        private.mkdir()
+        (private / 'go.mod').write_text('module example.com/only-local\n\ngo 1.26.1\n')
+        (private / 'local.go').write_text('package local\nconst V = 1\n')
+        telemetry = self.owner / 'app/telemetry'
+        telemetry.mkdir(parents=True)
+        (telemetry / 'telemetry.go').write_text(
+            'package telemetry\nimport local "example.com/only-local"\nconst Version = local.V\n')
+        module = self.owner / 'go.mod'
+        with module.open('a') as target:
+            target.write('require example.com/only-local v0.1.0\nreplace example.com/only-local => ../only-local\n')
+        self.before[module] = module.read_bytes()
+        go = shutil.which('go', path=self.env['PATH'])
+        subprocess.run([go, 'work', 'init', './orchestrator', './accelerator'], cwd=self.root,
+                       env=self.env, check=True)
+        env = dict(self.env, KUASAR_CONSUMER_GO=go, GOWORK=str(self.root / 'go.work'))
+        subprocess.run([go, 'build', './app/telemetry'], cwd=self.owner, env=env, check=True)
+        result = subprocess.run(['bash', str(ROOT/'test/source/go_consumer.sh'), str(self.owner)],
+                                cwd=self.root, env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('example.com/only-local@v0.1.0', result.stderr)
 
     @unittest.skipIf(OWNER == 'orchestrator', 'no native sub-build')
     def test_actual_native_recipe_does_not_inherit_product_output_directory(self):
