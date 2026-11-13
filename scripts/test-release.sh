@@ -146,7 +146,10 @@ fi
 bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
 
 WORKFLOW="$ROOT/.github/workflows/component-release.yml"
-grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}]' \
+grep -Fqx "$(cat <<'TITLE'
+run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}${{ inputs.runtime_version && format(',runtime={0}', inputs.runtime_version) || '' }}]
+TITLE
+)" \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
 workflow="$ROOT/.github/workflows/component-release.yml"
 for workflow in component-release.yml delete-preview.yml; do
@@ -156,7 +159,8 @@ for workflow in component-release.yml delete-preview.yml; do
 done
 [ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
-for input in accelerator_version connector_version sandboxer_version; do
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-producer.py"
+for input in accelerator_version connector_version sandboxer_version runtime_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
   grep -Fq -- "--dependency ${input%_version} \"\${{ needs.preflight.outputs.$input }}\" \"\${{ needs.preflight.outputs.${input%_version}_sha }}\"" "$WORKFLOW" \
@@ -231,11 +235,12 @@ if grep -Fq 'proxy_executable:' "$TMP/built-in-proxy.yaml"; then
   fail "built-in Proxy sentinel emitted paths.proxy_executable"
 fi
 
-mkdir -p "$TMP/bin" "$TMP/src" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer"
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer" "$TMP/guest-runtime"
 printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
 printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
 printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
-for dependency in accelerator connector sandboxer; do
+printf 'fixture guest-runtime license\n' > "$TMP/guest-runtime/LICENSE"
+for dependency in accelerator connector sandboxer guest-runtime; do
   mkdir "$TMP/$dependency/LICENSES"
   printf 'fixture nested notice for %s\n' "$dependency" > "$TMP/$dependency/LICENSES/NOTICE.txt"
   printf 'fixture attribution for %s\n' "$dependency" > "$TMP/$dependency/NOTICE"
@@ -243,9 +248,11 @@ done
 accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE LICENSES NOTICE)"
 connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE LICENSES NOTICE)"
 sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE LICENSES NOTICE)"
+runtime_sha="$(init_fixture_repo "$TMP/guest-runtime" LICENSE LICENSES NOTICE)"
 git -C "$TMP/accelerator" tag v0.1.3 "$accelerator_sha"
 git -C "$TMP/connector" tag v0.1.2 "$connector_sha"
 git -C "$TMP/sandboxer" tag v0.1.3 "$sandboxer_sha"
+git -C "$TMP/guest-runtime" tag runtime-v0.2.0 "$runtime_sha"
 fixture_root="$TMP/project"
 mkdir -p "$fixture_root/scripts" "$fixture_root/LICENSES"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
@@ -264,14 +271,15 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
 done
 mkdir -p "$fixture_root/."
 cp -a "$ROOT/deploy" "$fixture_root/deploy"
-printf 'accelerator_commit := %s\nconnector_commit := %s\nsandboxer_commit := %s\n' \
-  "$accelerator_sha" "$connector_sha" "$sandboxer_sha" > "$fixture_root/Makefile"
+printf 'accelerator_commit := %s\nconnector_commit := %s\nsandboxer_commit := %s\nruntime_commit := %s\n' \
+  "$accelerator_sha" "$connector_sha" "$sandboxer_sha" "$runtime_sha" > "$fixture_root/Makefile"
 cat >> "$fixture_root/Makefile" <<'EOF'
 .PHONY: build
 build:
 	test "$$(git -C ../accelerator rev-parse HEAD)" = "$(accelerator_commit)"
 	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
 	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
+	test "$$(git -C ../guest-runtime rev-parse HEAD)" = "$(runtime_commit)"
 	mkdir -p bin/x86_64
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
@@ -309,6 +317,9 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
   RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
+  RELEASE_GUEST_RUNTIME_SOURCE_DIR="$TMP/guest-runtime" \
+  RELEASE_GUEST_RUNTIME_SOURCE_SHA="$runtime_sha" \
+  RELEASE_GUEST_RUNTIME_VERSION=runtime-v0.2.0 \
   RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 # A current publication may bind its own binaries to its selected commit;
@@ -327,7 +338,7 @@ grep -Fq 'Go payload must be built from the clean selected commit' "$TMP/publica
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
-RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3 \
+RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3,runtime=runtime-v0.2.0 \
   "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
@@ -341,6 +352,7 @@ for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
   ./share/licenses/orchestrator/connector/LICENSE \
   ./share/licenses/orchestrator/project/LICENSE \
   ./share/licenses/orchestrator/sandboxer/LICENSE \
+  ./share/licenses/orchestrator/guest-runtime/LICENSE \
   ./share/licenses/orchestrator/go-toolchain/"$go_toolchain"/LICENSE; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
@@ -364,6 +376,9 @@ SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
   RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
+  RELEASE_GUEST_RUNTIME_SOURCE_DIR="$TMP/guest-runtime" \
+  RELEASE_GUEST_RUNTIME_SOURCE_SHA="$runtime_sha" \
+  RELEASE_GUEST_RUNTIME_VERSION=runtime-v0.2.0 \
   RELEASE_SOURCE_ROOT="$fixture_root" "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"

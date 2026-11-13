@@ -143,7 +143,7 @@ release_materials_add_go_binary() {
   awk -F '\t' '
     $2 == "dep" { module=$3 }
     $2 == "=>" && ($3 ~ /^\// || $3 ~ /^\.\.?\// || $4 == "(devel)" || $4 == "") {
-      if (module != "github.com/kuasar-sandbox/accelerator" && module != "github.com/kuasar-sandbox/connector" && module != "github.com/kuasar-sandbox/sandboxer") unsupported=1
+      if (module != "github.com/kuasar-sandbox/accelerator" && module != "github.com/kuasar-sandbox/connector" && module != "github.com/kuasar-sandbox/sandboxer" && module != "github.com/kuasar-sandbox/guest-runtime") unsupported=1
     }
     END { exit unsupported }
   ' "$raw" || fail "third-party local Go replacements are not supported in release materials; select a versioned module replacement"
@@ -323,7 +323,7 @@ release_materials_finish() {
     # have their notices collected separately. Organization membership is not
     # a license-material exemption.
     case "$module" in
-      github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer) continue ;;
+      github.com/kuasar-sandbox/accelerator|github.com/kuasar-sandbox/connector|github.com/kuasar-sandbox/sandboxer|github.com/kuasar-sandbox/guest-runtime) continue ;;
     esac
     directory="$(release_materials_go_source "$module" "$version" "$checksum")"
     directory="$(release_materials_go_license_source "$module" "$version" "$directory")"
@@ -377,7 +377,7 @@ release_materials_validate_go() (
     # notices. Other modules, including go-erofs, stay versioned dependencies.
     case "$unit:$module" in
       sandboxer:github.com/kuasar-sandbox/accelerator|sandboxer:github.com/kuasar-sandbox/connector|\
-      orchestrator:github.com/kuasar-sandbox/accelerator|orchestrator:github.com/kuasar-sandbox/connector|orchestrator:github.com/kuasar-sandbox/sandboxer|\
+      orchestrator:github.com/kuasar-sandbox/accelerator|orchestrator:github.com/kuasar-sandbox/connector|orchestrator:github.com/kuasar-sandbox/sandboxer|orchestrator:github.com/kuasar-sandbox/guest-runtime|\
       runtime:github.com/kuasar-sandbox/accelerator|runtime:github.com/kuasar-sandbox/sandboxer)
         label="${module##*/}" ;;
     esac

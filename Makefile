@@ -101,6 +101,7 @@ go_requirement = $$(GOWORK=off $(GO) mod edit -json | \
 ACCELERATOR_VERSION ?= $(call go_requirement,accelerator)
 CONNECTOR_VERSION ?= $(call go_requirement,connector)
 SANDBOXER_VERSION ?= $(call go_requirement,sandboxer)
+RUNTIME_VERSION ?= runtime-$(call go_requirement,guest-runtime)
 
 # Mixed release recipes run sub-makes with the jobserver on real builds. GNU
 # Make executes recipes that directly reference $(MAKE) even under --dry-run.
@@ -111,8 +112,9 @@ release:
 	$(release_recursive)@set -e; accelerator_tag="$(ACCELERATOR_VERSION)"; \
 	connector_tag="$(CONNECTOR_VERSION)"; \
 	sandboxer_tag="$(SANDBOXER_VERSION)"; \
+	runtime_tag="$(RUNTIME_VERSION)"; \
 	workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
-		--root .. --owners orchestrator --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag" --dependency-tag "sandboxer=$$sandboxer_tag")"; \
+		--root .. --owners orchestrator --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag" --dependency-tag "sandboxer=$$sandboxer_tag" --dependency-tag "guest-runtime=$$runtime_tag")"; \
 	$(release_make) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
 	rm -rf "build/release-bundle"; \
 	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
@@ -120,10 +122,12 @@ release:
 	RELEASE_ACCELERATOR_SOURCE_DIR="$(abspath ../accelerator)" \
 	RELEASE_CONNECTOR_SOURCE_DIR="$(abspath ../connector)" \
 	RELEASE_SANDBOXER_SOURCE_DIR="$(abspath ../sandboxer)" \
+	RELEASE_GUEST_RUNTIME_SOURCE_DIR="$(abspath ../guest-runtime)" \
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 	RELEASE_ACCELERATOR_VERSION="$$accelerator_tag" \
 	RELEASE_CONNECTOR_VERSION="$$connector_tag" \
 	RELEASE_SANDBOXER_VERSION="$$sandboxer_tag" \
+	RELEASE_GUEST_RUNTIME_VERSION="$$runtime_tag" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" "build/release-bundle"
 
 test-release:

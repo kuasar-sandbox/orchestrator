@@ -40,23 +40,23 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         goroot = subprocess.check_output(['go', 'env', 'GOROOT'], cwd=self.root, env=self.env, text=True).strip()
         self.env['PATH'] = str(Path(goroot)/'bin') + os.pathsep + os.defpath
         self.make = shutil.which('make', path=os.defpath)
-        self.deps = ['accelerator'] + (['connector'] if OWNER != 'guest-runtime' else []) + (['sandboxer'] if OWNER == 'orchestrator' else [])
+        self.deps = ['accelerator', 'connector', 'sandboxer', 'guest-runtime']
         for name in set([OWNER, 'sandboxer', *self.deps]):
             p=self.root/name; p.mkdir()
             (p/'go.mod').write_text('module github.com/kuasar-sandbox/'+name+'\n\ngo 1.26.1\n')
             (p/'.gitignore').write_text('bin/\nbuild/\npackage.json\n')
         (self.root/'accelerator/selected.go').write_text('package accelerator\nconst Selected = "selected-local"\n')
         with (self.owner/'go.mod').open('a') as f:
-            f.write('require github.com/kuasar-sandbox/accelerator v0.1.10\n')
+            f.write('require github.com/kuasar-sandbox/accelerator v0.1.10\nrequire github.com/kuasar-sandbox/guest-runtime v0.1.10 // indirect\n')
         (self.owner/'main.go').write_text('package main\nimport ("fmt"; "github.com/kuasar-sandbox/accelerator")\nfunc main(){fmt.Print(accelerator.Selected)}\n')
         self.target = 'release-runtime' if OWNER == 'guest-runtime' else 'release'
         original=(ROOT/'Makefile').read_text()
         recursive=original[original.index('release_make ='):].split('\n\n',1)[0]
         recipe=original.split(self.target+':\n',1)[1].split('\n\n',1)[0]
-        variables = 'SHELL := /bin/bash\nBINDIR := bin/x86_64\nBUILD_DIR := build/x86_64\nTARGET_ARCH := x86_64\nSANDBOXER_DIR := ../sandboxer\nENVD := native-deps/bin/x86_64/envd\nVERSION := v0.1.99\nRUNTIME_VERSION := runtime-v0.1.99\n'
+        variables = 'SHELL := /bin/bash\nBINDIR := bin/x86_64\nBUILD_DIR := build/x86_64\nTARGET_ARCH := x86_64\nSANDBOXER_DIR := ../sandboxer\nENVD := native-deps/bin/x86_64/envd\nVERSION := v0.1.99\nRUNTIME_VERSION := runtime-v0.1.10\n'
         requirement=original[original.index('go_requirement ='):].split('\nACCELERATOR_VERSION',1)[0]
         variables += 'GO := go\n'+recursive+'\n'+requirement+'\nACCELERATOR_VERSION ?= $(call go_requirement,accelerator)\n'
-        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer'])-{'accelerator'})
+        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer'])-{'accelerator','guest-runtime'})
         build = '\n.PHONY: release release-runtime build flatten-ctl sandbox-runtime\nbuild flatten-ctl:\n\t@mkdir -p "$(BINDIR)"\n\tgo build -o "$(BINDIR)/flatten-ctl" .\n'
         build += 'sandbox-runtime:\n\t@test "$(FLATTEN_CTL)" = "$(BINDIR)/flatten-ctl"\n\t@test "$$("$(FLATTEN_CTL)")" = selected-local\n\t@cp "$(FLATTEN_CTL)" "$(BINDIR)/sandbox-runtime.bundle"\n'
         # The release recipe is copied verbatim; only costly build/package boundaries are fixtures.
@@ -85,7 +85,7 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         subprocess.run(['go', 'mod', 'download', 'all'], cwd=self.owner, env=self.env,
                        check=True, capture_output=True)
         for p in repositories:
-            for args in (['init','-q'], ['add','.'], ['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture'], ['tag','v0.1.10']):
+            for args in (['init','-q'], ['add','.'], ['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture'], ['tag', 'runtime-v0.1.10' if p.name == 'guest-runtime' else 'v0.1.10']):
                 subprocess.run(['git','-C',str(p),*args], check=True, capture_output=True)
         self.before = {p: p.read_bytes() for repo in repositories for p in (repo/'go.mod', repo/'go.sum')
                        if p.exists()}
@@ -116,6 +116,8 @@ class ReleaseWorkspaceTests(unittest.TestCase):
                                          'FLATTEN_CTL=/old/flatten-ctl', 'RELEASE_BIN_DIR=/old/package')
                 self.assertEqual(package['RELEASE_BIN_DIR'],str(output))
                 self.assertEqual(package['RELEASE_SOURCE_ROOT'],str(self.owner))
+                self.assertEqual(package['RELEASE_GUEST_RUNTIME_VERSION'], 'runtime-v0.1.10')
+                self.assertEqual(package['RELEASE_GUEST_RUNTIME_SOURCE_DIR'], str(self.root/'guest-runtime'))
                 self.assertEqual(package['GOWORK'], 'off')
                 info = subprocess.check_output(['go', 'version', '-m', str(output/'flatten-ctl')],
                                                env=self.env, text=True)

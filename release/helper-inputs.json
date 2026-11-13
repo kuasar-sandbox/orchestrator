@@ -4,6 +4,7 @@
   "dependencies": [
     "accelerator",
     "connector",
+    "guest-runtime",
     "sandboxer"
   ],
   "helpers": [

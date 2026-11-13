@@ -16,6 +16,7 @@ import (
 
 func TestPauseCheckpointReturnsCaptureIDAndRejectsFullQuota(t *testing.T) {
 	o, sb, key, _, _, args := newCheckpointPauseFixture(t, checkpointOrchestratorConfig(t, config.CheckpointLocal), "")
+	diskCheckpointReleaseLifecycle(t, o)
 	ctx := context.Background()
 	id, err := o.Pause(ctx, sb.ID, key, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, Checkpoint: true})
 	if err != nil || id == "" {
