@@ -158,6 +158,7 @@ require (
 	github.com/knadh/koanf/providers/confmap v1.0.0 // indirect
 	github.com/knadh/koanf/v2 v2.3.3 // indirect
 	github.com/kuasar-sandbox/go-erofs v0.0.0-20261014160540-827da6f90114 // indirect
+	github.com/kuasar-sandbox/guest-runtime v0.2.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/lightstep/go-expohisto v1.0.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20251013123823-9fd1530e3ec3 // indirect

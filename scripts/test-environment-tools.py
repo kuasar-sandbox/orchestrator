@@ -129,7 +129,8 @@ class EnvironmentTools(unittest.TestCase):
         values = {"source_sha": "a" * 40, "version": "v1.2.3-preview.20261009.4",
                   "accelerator_version": "v2.3.4", "connector_version": "v3.4.5-preview.20261008.2",
                   "sandboxer_version": "v4.5.6", "accelerator_sha": "b" * 40,
-                  "connector_sha": "c" * 40, "sandboxer_sha": "d" * 40}
+                  "connector_sha": "c" * 40, "sandboxer_sha": "d" * 40,
+                  "runtime_version": "runtime-v5.6.7-preview.20261009.4", "runtime_sha": "e" * 40}
         program = re.sub(r"\$\{\{ needs\.preflight\.outputs\.([a-z_]+) \}\}",
                          lambda match: values[match.group(1)], "\n".join(command))
         with tempfile.TemporaryDirectory() as directory:
@@ -152,7 +153,8 @@ class EnvironmentTools(unittest.TestCase):
                     '--owners orchestrator --bound-release --version {version} '
                     '--dependency accelerator {accelerator_version} {accelerator_sha} '
                     '--dependency connector {connector_version} {connector_sha} '
-                    '--dependency sandboxer {sandboxer_version} {sandboxer_sha}" || exit 98\n'
+                    '--dependency sandboxer {sandboxer_version} {sandboxer_sha} '
+                    '--dependency guest-runtime {runtime_version} {runtime_sha}" || exit 98\n'
                     'echo "$HOME/selected.go.work"\n'
                 ).format(**values),
                 "git": "#!/bin/sh\ncase $1 in rev-parse) echo " + values["source_sha"]
@@ -163,8 +165,8 @@ class EnvironmentTools(unittest.TestCase):
                 path.write_text(contents)
                 path.chmod(0o755)
             (scripts / "release.sh").write_text(
-                'set -eu\ntest "$RELEASE_SOURCE_ROOT" = "$HOME/orchestrator"\nprintf "%s|%s|%s|%s|%s|%s\\n" "$1" "$2" "$3" '
-                '"$ACCELERATOR_VERSION" "$CONNECTOR_VERSION" "$SANDBOXER_VERSION" >> "$OBSERVED"\n')
+                'set -eu\ntest "$RELEASE_SOURCE_ROOT" = "$HOME/orchestrator"\nprintf "%s|%s|%s|%s|%s|%s|%s\\n" "$1" "$2" "$3" '
+                '"$ACCELERATOR_VERSION" "$CONNECTOR_VERSION" "$SANDBOXER_VERSION" "$RUNTIME_VERSION" >> "$OBSERVED"\n')
             observed = root / "observed"
             for arch in ("x86_64", "aarch64"):
                 with self.subTest(arch=arch):
@@ -177,7 +179,7 @@ class EnvironmentTools(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(observed.read_text().splitlines(), [
                         "|".join((operation, values["version"], arch, values["accelerator_version"],
-                                  values["connector_version"], values["sandboxer_version"]))
+                                  values["connector_version"], values["sandboxer_version"], values["runtime_version"]))
                         for operation in ("package", "validate")])
 
 

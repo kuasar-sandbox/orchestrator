@@ -152,6 +152,7 @@ package_release() {
   local version="$1" arch output="$3" archive epoch bin_dir project_sha
   local accelerator_source connector_source sandboxer_source accelerator_version connector_version sandboxer_version
   local accelerator_sha connector_sha sandboxer_sha
+  local runtime_source runtime_version runtime_sha
   arch="$(normalize_arch "$2")"
   archive="$(archive_name "$version" "$arch")"
   if [ -z "$output" ] || [ "$output" = / ] || [ "$output" = . ]; then
@@ -169,15 +170,19 @@ package_release() {
   accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
   connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
   sandboxer_source="${RELEASE_SANDBOXER_SOURCE_DIR:-$ROOT/../sandboxer}"
+  runtime_source="${RELEASE_GUEST_RUNTIME_SOURCE_DIR:-$ROOT/../guest-runtime}"
   accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
   connector_version="${RELEASE_CONNECTOR_VERSION:-${CONNECTOR_VERSION:-}}"
   sandboxer_version="${RELEASE_SANDBOXER_VERSION:-${SANDBOXER_VERSION:-}}"
+  runtime_version="${RELEASE_GUEST_RUNTIME_VERSION:-${RUNTIME_VERSION:-}}"
   [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
   [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   [[ "$sandboxer_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
     || fail "RELEASE_SANDBOXER_VERSION must identify the selected sandboxer release"
+  [[ "$runtime_version" =~ ^runtime-v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+    || fail "RELEASE_GUEST_RUNTIME_VERSION must identify the selected runtime release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" orchestrator)"
   local project_version
   project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
@@ -187,6 +192,8 @@ package_release() {
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
   sandboxer_sha="$(release_materials_resolve_git_source "$sandboxer_source" \
     "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
+  runtime_sha="$(release_materials_resolve_git_source "$runtime_source" \
+    "${RELEASE_GUEST_RUNTIME_SOURCE_SHA:-}" guest-runtime)"
   copy_file deploy/node-ctl.service deploy/node-ctl.service
   copy_file deploy/node-proxy.service deploy/node-proxy.service
   copy_file deploy/node-telemetry.service deploy/node-telemetry.service
@@ -212,11 +219,13 @@ package_release() {
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
   sandboxer_version="$(release_materials_git_version "$sandboxer_source" "$sandboxer_version" "$sandboxer_sha")"
+  runtime_version="$(release_materials_git_version "$runtime_source" "$runtime_version" "$runtime_sha")"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$accelerator_source" accelerator
   release_materials_copy_licenses "$connector_source" connector
   release_materials_copy_licenses "$sandboxer_source" sandboxer
+  release_materials_copy_licenses "$runtime_source" guest-runtime
   release_materials_record_source 'bin/*,deploy/*' orchestrator "$project_version" \
     "https://github.com/kuasar-sandbox/orchestrator/commit/$project_sha" \
     "git:$project_sha" project
@@ -229,6 +238,9 @@ package_release() {
   release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' sandboxer "$sandboxer_version" \
     "https://github.com/kuasar-sandbox/sandboxer/commit/$sandboxer_sha" \
     "git:$sandboxer_sha" sandboxer
+  release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' guest-runtime "$runtime_version" \
+    "https://github.com/kuasar-sandbox/guest-runtime/commit/$runtime_sha" \
+    "git:$runtime_sha" guest-runtime
   release_materials_add_go_binary "$STAGE/bin/node-ctl" bin/node-ctl
   release_materials_add_go_binary "$STAGE/bin/cluster-ctl" bin/cluster-ctl
   release_materials_add_go_binary "$STAGE/bin/node-stub-ctl" bin/node-stub-ctl
