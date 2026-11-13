@@ -1,5 +1,5 @@
 name: Component Release
-run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }},runtime=${{ inputs.runtime_version }}]
+run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}${{ inputs.runtime_version && format(',runtime={0}', inputs.runtime_version) || '' }}]
 'on':
   workflow_dispatch:
     inputs:
@@ -20,8 +20,8 @@ run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=$
         required: true
         type: string
       runtime_version:
-        description: Selected Runtime release providing the transitive guest-runtime Go module
-        required: true
+        description: Runtime release supplying the Guest ABI; omit for pre-migration source
+        required: false
         type: string
       source_ref:
         description: Exact source branch selected by the platform release controller
@@ -116,7 +116,7 @@ jobs:
             || { echo "connector_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N]" >&2; exit 1; }
           [[ "$SANDBOXER_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
             || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD[.N]" >&2; exit 1; }
-          [[ "$RUNTIME_VERSION" =~ ^runtime-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
+          [[ -z "$RUNTIME_VERSION" || "$RUNTIME_VERSION" =~ ^runtime-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$ ]] \
             || { echo "runtime_version must match runtime-vX.Y.Z or runtime-vX.Y.Z-preview.YYYYMMDD[.N]" >&2; exit 1; }
           bash scripts/validate-release-source.sh \
             "$SOURCE_REF" "$SOURCE_SHA" "$VERSION" orchestrator
@@ -166,14 +166,16 @@ jobs:
           release=$(gh api "repos/$repository/releases/tags/$version")
           jq -e --arg tag "$version" '.tag_name == $tag and .draft == false and .prerelease == ($tag | contains("-preview."))' <<< "$release" >/dev/null
           echo "sandboxer_sha=$sha" >> "$GITHUB_OUTPUT"
-          repository=kuasar-sandbox/guest-runtime
-          version=$RUNTIME_VERSION
-          gh api "repos/$repository" --jq 'select(.visibility == "public" and .private == false) | .full_name' | grep -Fx "$repository"
-          sha=$(python3 -B trusted/platform/release/tag_sources.py resolve runtime "$version")
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          release=$(gh api "repos/$repository/releases/tags/$version")
-          jq -e --arg tag "$version" '.tag_name == $tag and .draft == false and .prerelease == ($tag | contains("-preview."))' <<< "$release" >/dev/null
-          echo "runtime_sha=$sha" >> "$GITHUB_OUTPUT"
+          if [[ -n "$RUNTIME_VERSION" ]]; then
+            repository=kuasar-sandbox/guest-runtime
+            version=$RUNTIME_VERSION
+            gh api "repos/$repository" --jq 'select(.visibility == "public" and .private == false) | .full_name' | grep -Fx "$repository"
+            sha=$(python3 -B trusted/platform/release/tag_sources.py resolve runtime "$version")
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            release=$(gh api "repos/$repository/releases/tags/$version")
+            jq -e --arg tag "$version" '.tag_name == $tag and .draft == false and .prerelease == ($tag | contains("-preview."))' <<< "$release" >/dev/null
+            echo "runtime_sha=$sha" >> "$GITHUB_OUTPUT"
+          fi
       - name: Select immutable native Workbench images
         env:
           GH_TOKEN: ${{ github.token }}
@@ -198,7 +200,9 @@ jobs:
           dependencies+=(--dependency accelerator "$ACCELERATOR_TAG" "$ACCELERATOR_SHA")
           dependencies+=(--dependency connector "$CONNECTOR_TAG" "$CONNECTOR_SHA")
           dependencies+=(--dependency sandboxer "$SANDBOXER_TAG" "$SANDBOXER_SHA")
-          dependencies+=(--dependency runtime "$RUNTIME_TAG" "$RUNTIME_SHA")
+          if [[ -n "$RUNTIME_TAG" ]]; then
+            dependencies+=(--dependency runtime "$RUNTIME_TAG" "$RUNTIME_SHA")
+          fi
           python3 -B trusted/platform/release/producer-inputs.py freeze orchestrator "$SOURCE_REF" "$SOURCE_SHA" producer-inputs.tar --admission producer-source.tar --version "${{ steps.request.outputs.version }}" "${dependencies[@]}"
       - name: Upload Workbench selection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -237,12 +241,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for dependency in \
-            "accelerator $ACCELERATOR_VERSION" \
-            "connector $CONNECTOR_VERSION" \
-            "sandboxer $SANDBOXER_VERSION" \
-            "guest-runtime $RUNTIME_VERSION"
-          do
+          dependencies=(
+            "accelerator $ACCELERATOR_VERSION"
+            "connector $CONNECTOR_VERSION"
+            "sandboxer $SANDBOXER_VERSION"
+          )
+          if [[ -n "$RUNTIME_VERSION" ]]; then dependencies+=("guest-runtime $RUNTIME_VERSION"); fi
+          for dependency in "${dependencies[@]}"; do
             read -r repository version <<< "$dependency"
             prerelease=false
             [[ "$version" != *-preview.* ]] || prerelease=true
@@ -265,11 +270,18 @@ jobs:
       - name: Restore fixed producer inputs
         env:
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
-        run: python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar orchestrator "$SOURCE_SHA" src --dependency accelerator "${{ needs.preflight.outputs.accelerator_version }}" "${{ needs.preflight.outputs.accelerator_sha }}" --dependency connector "${{ needs.preflight.outputs.connector_version }}" "${{ needs.preflight.outputs.connector_sha }}" --dependency sandboxer "${{ needs.preflight.outputs.sandboxer_version }}" "${{ needs.preflight.outputs.sandboxer_sha }}" --dependency runtime "${{ needs.preflight.outputs.runtime_version }}" "${{ needs.preflight.outputs.runtime_sha }}"
+        run: |
+          set -euo pipefail
+          runtime=()
+          if [[ -n "$RUNTIME_VERSION" ]]; then
+            runtime+=(--dependency runtime "${{ needs.preflight.outputs.runtime_version }}" "${{ needs.preflight.outputs.runtime_sha }}")
+          fi
+          python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar orchestrator "$SOURCE_SHA" src --dependency accelerator "${{ needs.preflight.outputs.accelerator_version }}" "${{ needs.preflight.outputs.accelerator_sha }}" --dependency connector "${{ needs.preflight.outputs.connector_version }}" "${{ needs.preflight.outputs.connector_sha }}" --dependency sandboxer "${{ needs.preflight.outputs.sandboxer_version }}" "${{ needs.preflight.outputs.sandboxer_sha }}" "${runtime[@]}"
+      # Old sources retain the last trusted pre-migration packaging contract.
       - name: Check out trusted packaging tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ needs.preflight.outputs.runtime_version && github.workflow_sha || '9de9b10d6e8227a2c88042376495cc038b0f47f4' }}
           path: trusted/orchestrator
           persist-credentials: false
       - name: Stage current packaging tools outside selected product sources
@@ -295,12 +307,16 @@ jobs:
             export CONNECTOR_VERSION='${{ needs.preflight.outputs.connector_version }}'
             export SANDBOXER_VERSION='${{ needs.preflight.outputs.sandboxer_version }}'
             export RUNTIME_VERSION='${{ needs.preflight.outputs.runtime_version }}'
+            runtime=()
+            if [[ -n '${{ needs.preflight.outputs.runtime_version }}' ]]; then
+              runtime+=(--dependency guest-runtime '${{ needs.preflight.outputs.runtime_version }}' '${{ needs.preflight.outputs.runtime_sha }}')
+            fi
             GOWORK="$(python3 -B /inputs/release/ci/integration/go_workspace.py \
               --root /src --owners orchestrator --bound-release --version '${{ needs.preflight.outputs.version }}' \
               --dependency accelerator '${{ needs.preflight.outputs.accelerator_version }}' '${{ needs.preflight.outputs.accelerator_sha }}' \
               --dependency connector '${{ needs.preflight.outputs.connector_version }}' '${{ needs.preflight.outputs.connector_sha }}' \
               --dependency sandboxer '${{ needs.preflight.outputs.sandboxer_version }}' '${{ needs.preflight.outputs.sandboxer_sha }}' \
-              --dependency guest-runtime '${{ needs.preflight.outputs.runtime_version }}' '${{ needs.preflight.outputs.runtime_sha }}')"
+              "${runtime[@]}")"
             export GOWORK
             cd orchestrator
             if [ "$TARGET_ARCH" = x86_64 ]; then

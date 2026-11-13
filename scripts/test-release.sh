@@ -146,7 +146,10 @@ fi
 bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
 
 WORKFLOW="$ROOT/.github/workflows/component-release.yml"
-grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }},runtime=${{ inputs.runtime_version }}]' \
+grep -Fqx "$(cat <<'TITLE'
+run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}${{ inputs.runtime_version && format(',runtime={0}', inputs.runtime_version) || '' }}]
+TITLE
+)" \
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
 workflow="$ROOT/.github/workflows/component-release.yml"
 for workflow in component-release.yml delete-preview.yml; do
@@ -156,6 +159,7 @@ for workflow in component-release.yml delete-preview.yml; do
 done
 [ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-producer.py"
 for input in accelerator_version connector_version sandboxer_version runtime_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
