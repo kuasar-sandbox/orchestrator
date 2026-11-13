@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER = 'orchestrator'
@@ -31,7 +32,8 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.owner = self.root/OWNER
-        self.env = dict(os.environ, GOWORK='off', GOPROXY='off', GOSUMDB='off', PYTHONDONTWRITEBYTECODE='1')
+        self.env = dict(os.environ, GOENV='off', GOWORK='off', GOPROXY='off',
+                        GONOPROXY='none', GOSUMDB='off', PYTHONDONTWRITEBYTECODE='1')
         for key in list(self.env):
             if key.startswith(('RELEASE_', 'MAKE')) or key in ('MFLAGS', 'KUASAR_E2E_GO'):
                 self.env.pop(key)
@@ -49,9 +51,12 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         (self.owner/'main.go').write_text('package main\nimport ("fmt"; "github.com/kuasar-sandbox/accelerator")\nfunc main(){fmt.Print(accelerator.Selected)}\n')
         self.target = 'release-runtime' if OWNER == 'guest-runtime' else 'release'
         original=(ROOT/'Makefile').read_text()
+        recursive=original[original.index('release_make ='):].split('\n\n',1)[0]
         recipe=original.split(self.target+':\n',1)[1].split('\n\n',1)[0]
         variables = 'SHELL := /bin/bash\nBINDIR := bin/x86_64\nBUILD_DIR := build/x86_64\nTARGET_ARCH := x86_64\nSANDBOXER_DIR := ../sandboxer\nENVD := native-deps/bin/x86_64/envd\nVERSION := v0.1.99\nRUNTIME_VERSION := runtime-v0.1.99\n'
-        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer']))
+        requirement=original[original.index('go_requirement ='):].split('\nACCELERATOR_VERSION',1)[0]
+        variables += 'GO := go\n'+recursive+'\n'+requirement+'\nACCELERATOR_VERSION ?= $(call go_requirement,accelerator)\n'
+        variables += ''.join(name.upper()+'_VERSION := v0.1.10\n' for name in set(self.deps+['sandboxer'])-{'accelerator'})
         build = '\n.PHONY: release release-runtime build flatten-ctl sandbox-runtime\nbuild flatten-ctl:\n\t@mkdir -p "$(BINDIR)"\n\tgo build -o "$(BINDIR)/flatten-ctl" .\n'
         build += 'sandbox-runtime:\n\t@test "$(FLATTEN_CTL)" = "$(BINDIR)/flatten-ctl"\n\t@test "$$("$(FLATTEN_CTL)")" = selected-local\n\t@cp "$(FLATTEN_CTL)" "$(BINDIR)/sandbox-runtime.bundle"\n'
         # The release recipe is copied verbatim; only costly build/package boundaries are fixtures.
@@ -60,14 +65,36 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         (scripts/'release.sh').write_text('python3 scripts/package.py\n')
         (scripts/'package.py').write_text('import json,os,subprocess\nfrom pathlib import Path\np=Path(os.environ["RELEASE_BIN_DIR"])/"flatten-ctl"\nassert subprocess.check_output([p],text=True)=="selected-local"\nPath("package.json").write_text(json.dumps(dict(os.environ)))\n')
         (scripts/'prepare-sandbox-init.py').write_text('import argparse\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument("--output");p.add_argument("--go-toolchain-output");a,_=p.parse_known_args();f=Path(a.output);f.parent.mkdir(parents=True,exist_ok=True);f.write_text("selected-published-init");Path(a.go_toolchain_output).mkdir(exist_ok=True)\n')
-        for p in self.root.iterdir():
+        # A real file proxy serves the selected stable module. Isolate the cache
+        # so an installed public release with the same name cannot hide a mistake.
+        repositories = list(self.root.iterdir())
+        proxy = self.root / 'proxy'
+        self.env.update(GOPROXY=proxy.as_uri(), GOMODCACHE=str(self.root / 'mod-cache'))
+        for name in self.deps:
+            source = self.root / name
+            module = 'github.com/kuasar-sandbox/' + name
+            version = 'v0.1.10'
+            endpoint = proxy / module / '@v'
+            endpoint.mkdir(parents=True)
+            (endpoint / (version + '.mod')).write_bytes((source / 'go.mod').read_bytes())
+            (endpoint / (version + '.info')).write_text(json.dumps(
+                {'Version': version, 'Time': '2026-01-01T00:00:00Z'}))
+            with zipfile.ZipFile(endpoint / (version + '.zip'), 'w') as archive:
+                for item in (source / 'go.mod', *source.glob('*.go')):
+                    archive.write(item, module + '@' + version + '/' + item.name)
+        subprocess.run(['go', 'mod', 'download', 'all'], cwd=self.owner, env=self.env,
+                       check=True, capture_output=True)
+        for p in repositories:
             for args in (['init','-q'], ['add','.'], ['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture'], ['tag','v0.1.10']):
                 subprocess.run(['git','-C',str(p),*args], check=True, capture_output=True)
-        self.before={p:p.read_bytes() for p in self.root.glob('*/go.mod')}
+        self.before = {p: p.read_bytes() for repo in repositories for p in (repo/'go.mod', repo/'go.sum')
+                       if p.exists()}
 
     def tearDown(self):
         self.assertEqual({p:p.read_bytes() for p in self.before},self.before)
-        self.assertEqual(list(self.root.glob('*/go.sum')),[])
+        sources = {self.root / name for name in (OWNER, 'sandboxer', *self.deps)}
+        self.assertEqual({file for repo in sources for file in (repo/'go.mod', repo/'go.sum') if file.exists()},
+                         set(self.before))
 
     def run_release(self, *arguments, success=True):
         result=subprocess.run([self.make,self.target,'KUASAR_PLATFORM_DIR='+str(PLATFORM),*arguments],cwd=self.owner,env=self.env,text=True,capture_output=True)
@@ -89,14 +116,82 @@ class ReleaseWorkspaceTests(unittest.TestCase):
                                          'FLATTEN_CTL=/old/flatten-ctl', 'RELEASE_BIN_DIR=/old/package')
                 self.assertEqual(package['RELEASE_BIN_DIR'],str(output))
                 self.assertEqual(package['RELEASE_SOURCE_ROOT'],str(self.owner))
-                self.assertNotEqual(package['GOWORK'],override)
-                document=json.loads(subprocess.check_output(['go','work','edit','-json',package['GOWORK']],env=self.env))
-                self.assertEqual({Path(x['DiskPath']).name for x in document['Use']},set([OWNER,*self.deps]))
-                self.assertFalse(document.get('Replace'))
+                self.assertEqual(package['GOWORK'], 'off')
+                info = subprocess.check_output(['go', 'version', '-m', str(output/'flatten-ctl')],
+                                               env=self.env, text=True)
+                self.assertIn('dep\tgithub.com/kuasar-sandbox/accelerator\tv0.1.10\t', info)
                 if OWNER=='guest-runtime':
                     self.assertEqual((output/'flatten-ctl').read_bytes(),(output/'sandbox-runtime.bundle').read_bytes())
                     self.assertEqual(Path(package['RELEASE_SANDBOX_INIT_BIN']).read_text(),'selected-published-init')
                     self.assertEqual(package['RELEASE_ENVD_BIN'],str(self.owner/'native-deps/bin/x86_64/envd'))
+
+    def test_preview_uses_exact_upstream_tag_without_fetching_its_future_core(self):
+        # A not-yet-published core belongs in go.mod. Its selected Preview tag
+        # supplies the code for the build; the public proxy only has v0.1.10.
+        preview = 'v0.1.11-preview.20261112'
+        accelerator = self.root / 'accelerator'
+        subprocess.run(['git', '-C', str(accelerator), 'tag', preview], check=True)
+        module = self.owner / 'go.mod'
+        module.write_text(module.read_text().replace('accelerator v0.1.10', 'accelerator v0.1.11'))
+        self.before[module] = module.read_bytes()
+        producer = ('RUNTIME_VERSION=runtime-' if OWNER == 'guest-runtime' else 'VERSION=') + preview
+        package = self.run_release(producer, 'ACCELERATOR_VERSION=' + preview)
+        workspace = Path(package['GOWORK'])
+        document = json.loads(subprocess.check_output(['go', 'work', 'edit', '-json', workspace],
+                                                      env=self.env))
+        self.assertEqual([(workspace.parent / use['DiskPath']).resolve() for use in document['Use']],
+                         [self.owner])
+        bindings = {entry['Old']['Path']: (entry['Old'].get('Version'),
+                                            (workspace.parent / entry['New']['Path']).resolve())
+                    for entry in document.get('Replace') or []}
+        self.assertEqual(bindings, {'github.com/kuasar-sandbox/accelerator': ('v0.1.11', accelerator)})
+
+    def test_external_consumer_uses_public_stable_or_private_preview(self):
+        telemetry = self.owner / 'app/telemetry'
+        telemetry.mkdir(parents=True)
+        (telemetry / 'telemetry.go').write_text(
+            'package telemetry\nimport "github.com/kuasar-sandbox/accelerator"\nconst Version = accelerator.Selected\n')
+        script = ['bash', str(ROOT/'test/source/go_consumer.sh'), str(self.owner)]
+        go = shutil.which('go', path=self.env['PATH'])
+        env = dict(self.env, KUASAR_CONSUMER_GO=go)
+        for mode in ('off', 'auto'):
+            subprocess.run(script, cwd=self.root, env=dict(env, GOWORK=mode), check=True, capture_output=True)
+        module = self.owner / 'go.mod'
+        module.write_text(module.read_text().replace('accelerator v0.1.10', 'accelerator v0.1.11'))
+        self.before[module] = module.read_bytes()
+        subprocess.run([go, 'work', 'init', './orchestrator'], cwd=self.root, env=env, check=True)
+        work = self.root / 'go.work'
+        subprocess.run([go, 'work', 'edit', '-go=1.26.0',
+                        '-replace=github.com/kuasar-sandbox/accelerator@v0.1.11=./accelerator',
+                        str(work)], cwd=self.root, env=env, check=True)
+        before = work.read_bytes()
+        for mode in (str(work), 'auto'):
+            subprocess.run(script, cwd=self.root, env=dict(env, GOWORK=mode), check=True)
+        self.assertEqual(work.read_bytes(), before)
+        self.assertEqual(list(self.root.glob('consumer-*.work*')), [])
+
+    def test_external_consumer_ignores_candidate_only_replaces_in_source_workspace(self):
+        private = self.root / 'only-local'
+        private.mkdir()
+        (private / 'go.mod').write_text('module example.com/only-local\n\ngo 1.26.1\n')
+        (private / 'local.go').write_text('package local\nconst V = 1\n')
+        telemetry = self.owner / 'app/telemetry'
+        telemetry.mkdir(parents=True)
+        (telemetry / 'telemetry.go').write_text(
+            'package telemetry\nimport local "example.com/only-local"\nconst Version = local.V\n')
+        module = self.owner / 'go.mod'
+        with module.open('a') as target:
+            target.write('require example.com/only-local v0.1.0\nreplace example.com/only-local => ../only-local\n')
+        self.before[module] = module.read_bytes()
+        go = shutil.which('go', path=self.env['PATH'])
+        subprocess.run([go, 'work', 'init', './orchestrator', './accelerator'], cwd=self.root,
+                       env=self.env, check=True)
+        env = dict(self.env, KUASAR_CONSUMER_GO=go, GOWORK=str(self.root / 'go.work'))
+        subprocess.run([go, 'build', './app/telemetry'], cwd=self.owner, env=env, check=True)
+        result = subprocess.run(['bash', str(ROOT/'test/source/go_consumer.sh'), str(self.owner)],
+                                cwd=self.root, env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('example.com/only-local@v0.1.0', result.stderr)
 
     @unittest.skipIf(OWNER == 'orchestrator', 'no native sub-build')
     def test_actual_native_recipe_does_not_inherit_product_output_directory(self):
@@ -115,6 +210,28 @@ class ReleaseWorkspaceTests(unittest.TestCase):
         else:
             result=subprocess.check_output([self.make,'-s','show-envd','TARGET_ARCH=x86_64','BINDIR='+str(output)],cwd=self.owner,env=self.env,text=True)
             self.assertEqual(result,'native-deps/bin/x86_64/envd')
+
+    def test_dry_run_uses_no_selection_tools_and_preserves_artifacts(self):
+        (self.owner/'Makefile').write_bytes((ROOT/'Makefile').read_bytes())
+        tools = self.root/'recording-tools'
+        tools.mkdir()
+        for command in ('go', 'python3', 'jq', 'bash'):
+            tool = tools/command
+            tool.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$TRACE"\nexit 9\n')
+            tool.chmod(0o755)
+        trace = self.root/'dry-run-trace'
+        env = dict(self.env, TRACE=str(trace), PATH=str(tools)+os.pathsep+self.env['PATH'])
+        prior = self.owner/'build/release-bundle/prior'
+        prior.parent.mkdir(parents=True)
+        prior.write_text('preserved')
+        for version in ('v0.1.11', 'v0.1.11-preview.20261112'):
+            variable = 'RUNTIME_VERSION=runtime-' if OWNER=='guest-runtime' else 'VERSION='
+            result = subprocess.run([self.make, '-n', '-j2', self.target, variable+version, 'GO='+str(tools/'go')],
+                                    cwd=self.owner, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('go_workspace.py', result.stdout)
+            self.assertFalse(trace.exists(), trace.read_text() if trace.exists() else '')
+            self.assertEqual(prior.read_text(), 'preserved')
 
     def test_missing_tag_stops_before_build(self):
         subprocess.run(['git','-C',str(self.root/'accelerator'),'tag','-d','v0.1.10'],check=True,capture_output=True)
