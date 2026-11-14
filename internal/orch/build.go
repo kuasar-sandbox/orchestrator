@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"math"
 	"os"
 	"path/filepath"
@@ -110,6 +111,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	}
 	final.templateID = templateID
 	b := registeredBuildFromCandidate(bid.String(), pair, final, o.imageURIFromMask(templateID, bid.String()))
+	if err := o.prepareBuildWorkspaces(ctx, b, spec.Workspaces); err != nil {
+		return nil, err
+	}
 	b.CreatedUnix = time.Now().Unix()
 	initialMMDS, err := o.validateInitialBuildMMDS(b, final.mmds)
 	if err != nil {
@@ -375,7 +379,7 @@ func buildHasSandboxConfig(build *types.Build) bool {
 	for _, namespace := range []string{
 		sandboxcfg.NsResource, sandboxcfg.NsTraffic,
 		sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
-		sandboxcfg.NsFiles, sandboxcfg.NsMetadata,
+		sandboxcfg.NsFiles, sandboxcfg.NsMetadata, workspace.Namespace,
 	} {
 		if _, present := build.Metadata[namespace]; present {
 			return true
@@ -399,7 +403,7 @@ func buildSandboxNamespaces(metadata map[string]string) []string {
 	for _, namespace := range []string{
 		sandboxcfg.NsResource, sandboxcfg.NsTraffic, sandboxcfg.NsNetwork,
 		sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
-		sandboxcfg.NsFiles, sandboxcfg.NsMetadata,
+		sandboxcfg.NsFiles, sandboxcfg.NsMetadata, workspace.Namespace,
 	} {
 		if _, present := metadata[namespace]; present {
 			namespaces = append(namespaces, namespace)
@@ -886,6 +890,7 @@ type pendingBuild struct {
 	baseDir                string
 	sourceTemplate         bool
 	sourceHasBuildCommands bool
+	sourceHasWorkspaces    bool
 	handoff                *buildTaskHandoff
 	spec                   sandboxcfg.SandboxSpec
 	network                sandboxcfg.NetworkSpec
@@ -1257,8 +1262,9 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			copied := configsock.CloneArtifactPrepareSummary(summary)
 			preparedSummary = &copied
 			inherited = inheritedNetwork
+			pend.sourceHasWorkspaces = summary.DiskTopology.WorkspaceTopology != ""
 			pend.sourceHasBuildCommands = summary.HasBuildCommands
-			if buildProducesSandbox(b, pend.sourceHasBuildCommands) {
+			if buildProducesSandbox(b, pend.sourceHasBuildCommands) || (b.Builder.Target == nil && pend.sourceHasWorkspaces) {
 				pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
 				if err != nil {
 					return nil, buildFailed("resource_resolve", err)
@@ -1347,6 +1353,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	}
 	durable := buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest, RootSource: rootSource,
+		SourceHasWorkspaces:    pend.sourceHasWorkspaces,
 		SourceHasBuildCommands: pend.sourceHasBuildCommands,
 		Network:                pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,
@@ -1437,7 +1444,7 @@ func directImageBuildResult(build *types.Build, imageBundleLocation bool) (*buil
 	if err != nil || template.Kind != types.KindImg {
 		return nil, false, nil
 	}
-	target := types.ResolveBuildTarget(build.Builder.Target, build.StartCmd, build.ReadyCmd)
+	target := types.ResolveWorkspaceBuildTarget(build.Builder.Target, build.StartCmd, build.ReadyCmd, len(build.WorkspacePlan) > 0)
 	if target.Kind != types.BuildTargetImage {
 		return nil, false, nil
 	}
@@ -1614,6 +1621,7 @@ func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build, sourceTemplate 
 	if err != nil {
 		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
 	}
+	spec.WorkspacePlan = b.WorkspacePlan
 	phaseResources, err := o.resolveBuildExecutionResources(b.Resources)
 	if err != nil {
 		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
@@ -1638,7 +1646,7 @@ func buildProducesSandbox(build *types.Build, sourceHasCommands bool) bool {
 	if build.Builder.Target != nil {
 		return build.Builder.Target.Kind == types.BuildTargetSandbox
 	}
-	return build.Profile == types.ProfileE2B && (sourceHasCommands || build.StartCmd != "" || build.ReadyCmd != "")
+	return len(build.WorkspacePlan) > 0 || buildProducesMemorySandbox(build, sourceHasCommands)
 }
 
 // Only memory targets consume checkpoint policy and instance credentials.
@@ -1646,7 +1654,7 @@ func buildProducesMemorySandbox(build *types.Build, sourceHasCommands bool) bool
 	if build.Builder.Target != nil {
 		return build.Builder.Target.Kind == types.BuildTargetSandbox && build.Builder.Target.Memory
 	}
-	return buildProducesSandbox(build, sourceHasCommands)
+	return build.Profile == types.ProfileE2B && (sourceHasCommands || build.StartCmd != "" || build.ReadyCmd != "")
 }
 
 // resolveBuildExecutionResources derives A/B VM sizing solely from immutable
@@ -2131,6 +2139,12 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		return nil, fmt.Errorf("build: unknown profile %q", b.Profile)
 	}
 
+	if len(b.WorkspacePlan) > 0 {
+		sb := &types.Sandbox{APISecret: b.APISecret, ManifestKey: b.ManifestKey, WorkspacePlan: b.WorkspacePlan}
+		if err := o.authorizeWorkspacePlan(ctx, sb); err != nil {
+			return nil, err
+		}
+	}
 	// Presign each COPY context for the build's whole lifetime (it is signed
 	// now, when the unit starts and dials for the spec).
 	getTTL := time.Duration(o.cfg.Builder.TotalTimeoutSec+300) * time.Second
@@ -2159,6 +2173,14 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+	if len(b.WorkspacePlan) > 0 {
+		if refLocations == nil {
+			refLocations = map[string]string{}
+		}
+		if err := workspace.MergeLocations(refLocations, b.WorkspacePlan); err != nil {
+			return nil, err
 		}
 	}
 	// Publication names/URIs are NOT derived here: the builder mints the

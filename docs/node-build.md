@@ -23,8 +23,7 @@ Trigger and is therefore unsuitable for register-only explicit targets.
 Choose `BUILD_KIND=img` to publish only the image, `sbx` for cold E with portable
 Sandbox defaults, or `snp` for initialized memory S. For S, set `APP_START` and
 `APP_READY` to the actual service start and readiness commands. Explicit Image
-must not receive them. `auto` without effective commands selects Image, with
-effective start or ready selects memory S, and never selects E automatically.
+must not receive them. For `auto`, an effective start or ready command selects memory S. Without either command, a declared or inherited workspace selects cold E; otherwise the result is Image.
 This example uses the Demo's execution budget; validate admission for your node.
 
 ```python
@@ -195,7 +194,7 @@ Build registration additionally accepts build-only kuasar-sandbox.builder / X-Ku
 }
 ```
 
-Target allows image, sandbox+memory:false or sandbox+memory:true. Omission means auto; explicit null, unknown/duplicate fields or image+memory:true fails. Omitted sandbox.memory means false. Auto resolves only after source E defaults: either nonempty effective start/ready command selects memory Sandbox, otherwise Image. It never automatically selects top-level E. Explicit Image conflicts with explicit trigger start/ready and ignores inherited source commands.
+Target allows image, sandbox+memory:false or sandbox+memory:true. Omission means auto; explicit null, unknown/duplicate fields or image+memory:true fails. Omitted sandbox.memory means false. Auto includes source E defaults. An effective start or ready command selects memory Sandbox. With no effective command, a workspace selects top-level E and other builds select Image. Explicit Image conflicts with explicit trigger start/ready and ignores inherited source commands.
 
 Build resources govern execution/admission only; referer/registry govern this Build. Parsed target/build-only fields leave template metadata and persist in builds.builder_json, never in later create/resume runtime config.
 
@@ -325,7 +324,7 @@ systemctl daemon-reload
 
 Builds arrive through e2b APIs ([Build API](#build-api); there is no separate build-submission CLI), enter the builds table and are scheduled by resource pools. Each execution binds one sandbox-builder@<run-id> unit. Image pulls and build steps execute inside microVMs. Host run-builder relays artifact streams, fetches/decompresses COPY contexts and publishes outputs; therefore the boundary is guest execution of tenant build commands, not absence of tenant bytes from host userspace.
 
-Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sandbox",memory:false}` and `{kind:"sandbox",memory:true}`. The first two skip C; top-level Sandbox E is assembled from final image plus ordinary Create config without a VM. Only memory Sandbox cold-starts C and captures a Snapshot. With target omitted, run-builder reads source E's default commands task-locally, then selects memory Sandbox if either effective start/ready command is nonempty, otherwise Image. Source kind, steps, profile and other Sandbox config do not infer target.
+Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sandbox",memory:false}` and `{kind:"sandbox",memory:true}`. The first two skip C; top-level Sandbox E is assembled from final image plus ordinary Create config without a VM. Only memory Sandbox cold-starts C and captures a Snapshot. With target omitted, run-builder reads source E's default commands task-locally, then selects memory Sandbox if either effective start/ready command is nonempty. With no effective command, a declared or inherited workspace selects a disk-only Sandbox. Other builds produce an Image.
 
 Every source first becomes an image or cold Sandbox E, then A/B yields this Build's top-level image. Builds never restore source S memory/VMM state: S only locates E. Final Image/E/S must not reference source S/E, writable/data disks or memory parents. A memory result permits only the S→E relation created by this Build itself.
 
@@ -344,10 +343,7 @@ cleans owned directories after execution ownership has ended.
 Source preparation preserves a Checkpoint E layout through Open, Clone and
 Validate, including when S selects that E. Its fixed disk contents are materialized into independent Build storage before
 use, even though the Build runtime disables Checkpoint; they are not replaced
-by a blank template. Root-only E remains eligible for the existing
-Build inheritance path; source data disks retain their existing unsupported
-boundary. This backend change does not add source-memory restoration or expand
-the accepted Build topology. Startup preparation, first-access cost and ordinary
+by a blank template. Root-only E and E carrying a [workspace](sandbox-lifecycle.md#workspace-storage) can serve as build sources. The builder exports each populated workspace to preserve its contents independently of the source. An unused slot retains its geometry and mounts. Startup preparation, first-access cost and ordinary
 template copying remain separate from the named local-Pause benefit described
 in [node capture](sandbox-lifecycle.md#local-disk-checkpoints).
 

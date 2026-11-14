@@ -29,6 +29,7 @@ type buildRuntimePreparation struct {
 	SchemaVersion          int                       `json:"schema_version"`
 	PrepareDigest          string                    `json:"prepare_digest"`
 	RootSource             types.ResumeSource        `json:"root_source"`
+	SourceHasWorkspaces    bool                      `json:"source_has_workspaces,omitempty"`
 	SourceHasBuildCommands bool                      `json:"source_has_build_commands"`
 	Network                sandboxcfg.NetworkSpec    `json:"network"`
 	TemplateNetwork        sandboxcfg.NetworkSpec    `json:"template_network"`
@@ -146,7 +147,7 @@ func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (con
 	if err := validateArtifactDiskTopology(summary.DiskTopology); err != nil {
 		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template disk summary: %w", err)
 	}
-	if len(summary.DiskTopology.Disks) != 0 {
+	if len(summary.DiskTopology.Disks) != 0 && summary.DiskTopology.WorkspaceTopology == "" {
 		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: Sandbox sources with data disks are not supported")
 	}
 	return summary.Capacity, inherited, nil

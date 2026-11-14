@@ -213,6 +213,19 @@ func (p *buildPipeline) sourceStepsYAML() map[string]any {
 			"placeholder": false, "pid_namespace": "shared", "stop_signal": "", "stop_grace_period": "", "start_timeout": "",
 		},
 	}
+	if s.SourceSandboxConfig != nil {
+		// --from protects disk projections. flatten --skip-mounts excludes
+		// these private data files from the derived root image.
+		var diskMounts []rtconfig.MountConfig
+		for _, m := range s.SourceSandboxConfig.Mounts {
+			if m.Type == "disk" {
+				diskMounts = append(diskMounts, m)
+			}
+		}
+		if len(diskMounts) > 0 {
+			doc["mounts"] = diskMounts
+		}
+	}
 	if s.SourceSandboxConfig != nil && s.SourceSandboxConfig.Network.Enabled {
 		doc["network"] = p.networkDoc()
 	}

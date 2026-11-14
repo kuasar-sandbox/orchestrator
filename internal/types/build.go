@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"regexp"
 	"strings"
 )
@@ -123,6 +124,16 @@ func ResolveBuildTarget(requested *BuildTarget, startCmd, readyCmd string) Build
 	return BuildTarget{Kind: BuildTargetImage}
 }
 
+// ResolveWorkspaceBuildTarget picks a disk-only Sandbox E when an automatic
+// target needs a workspace topology and has no memory-template commands.
+func ResolveWorkspaceBuildTarget(requested *BuildTarget, startCmd, readyCmd string, hasWorkspace bool) BuildTarget {
+	target := ResolveBuildTarget(requested, startCmd, readyCmd)
+	if requested == nil && hasWorkspace && target.Kind == BuildTargetImage {
+		return BuildTarget{Kind: BuildTargetSandbox}
+	}
+	return target
+}
+
 // ArtifactKind returns the one canonical artifact kind represented by target.
 func (t BuildTarget) ArtifactKind() Kind {
 	switch {
@@ -192,16 +203,17 @@ type BuildResult struct {
 
 // Build is one template build plus its retention-bounded status/index history.
 type Build struct {
-	BuildID      string  // node or cluster Build business identity
-	TemplateID   string  // immutable transient registration handle
-	PersistID    string  // <profile>-<kind>-<base64url(portable-ref)>, set when ready
-	APISecret    string  // per-tenant API authentication root (hex)
-	ManifestKey  string  // per-tenant manifest encryption root (hex)
-	Profile      Profile // immutable output profile selected at registration
-	Kind         Kind    // terminal resolved artifact kind; empty while nonterminal
-	FromImage    string  // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
-	FromTemplate string  // base template ref (its portable config supplies the base image + start/ready defaults)
-	RegistryAuth string  // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
+	WorkspacePlan []workspace.Prepared `json:"-"`
+	BuildID       string               // node or cluster Build business identity
+	TemplateID    string               // immutable transient registration handle
+	PersistID     string               // <profile>-<kind>-<base64url(portable-ref)>, set when ready
+	APISecret     string               // per-tenant API authentication root (hex)
+	ManifestKey   string               // per-tenant manifest encryption root (hex)
+	Profile       Profile              // immutable output profile selected at registration
+	Kind          Kind                 // terminal resolved artifact kind; empty while nonterminal
+	FromImage     string               // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
+	FromTemplate  string               // base template ref (its portable config supplies the base image + start/ready defaults)
+	RegistryAuth  string               // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
 	// RegistrationImageRepo and RegistrationRegistryAuth retain the exact
 	// registry-owned cluster Register input for durable BuildID replay checks.
 	// They are node-internal, never become template metadata, and the credential

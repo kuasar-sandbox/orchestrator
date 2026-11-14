@@ -255,6 +255,46 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 
 <a id="capture-and-pause"></a>
 
+## Workspace 存储
+
+一个 workspace 将一块具名数据盘映射到 Guest 的一个或多个目录。任务可写入这些目录，暂停沙箱 A，然后把盘交给沙箱 B。B 可以选择不同的挂载路径。每个使用该盘的实例均有独立的可写层。
+
+通过现有的 `POST /sandboxes` 或 `POST /v3/templates` 声明 workspace。在 `X-Kuasar-Sandbox-Workspace` 请求头中传 JSON 数组，或将同一数组编码为 `metadata["kuasar-sandbox.workspace"]` 的字符串值。同时提供时以请求头为准。例如，以下单行数组为任务预留盘位和两个挂载目录：
+
+```json
+[{"name":"project","mounts":[{"path":"/data","subpath":"src"},{"path":"/work/results","subpath":"results"}],"slot":{}}]
+```
+
+`path` 是 Guest 内的绝对目录，`subpath` 是盘内相对目录，省略时挂载盘根。同一沙箱各盘的挂载路径不能重叠，同一块盘内的各个 `subpath` 也不能重叠。每个沙箱最多八块额外数据盘。公开的沙箱与模板 metadata 仅保留 workspace 名称和挂载拓扑。
+
+| Create 输入 | 创建结果 |
+|---|---|
+| `"slot":{}` | 预留未接盘设备和挂载路径，容量由 attach 时的实际盘决定。`"slot":{"size":"8GiB"}` 则要求实际盘容量恰好为 8 GiB。 |
+| `"disk":{}` | 使用节点配置的默认盘初始化私有数据盘。 |
+| `"disk":{"migrationToken":"…"}` | 使用相同租户凭据导入其他沙箱导出的盘，为本实例新建可写层。 |
+| `"disk":{…DiskV1…}` | 传入已授权的完整磁盘，`kind` 为 `disk`，`version` 为 `1`。用 `base` 表示最上层，`base_from_refs` 从近到远列出依赖层，也可以使用已授权的 `diff_template`。`size` 是以字节为单位的可选容量断言。 |
+| 省略两者 | 从镜像创建时预留盘位，从 SBX 或 SNP 模板创建时继承捕获的设备和数据。 |
+
+从 SBX 或 SNP 模板创建时，可按名字选择模板中的空盘位，例如 `[{"name":"project","disk":{}}]`。省略 `mounts` 即继承其挂载拓扑。conductor 收到绑定确认后才提交 `running`。已绑定的设备按捕获状态继承。新模板使用自动目标选择时，声明 workspace 且没有 start/ready 命令会生成 SBX，有此类命令则生成 SNP。
+
+| 操作 | API | node-ctl |
+|---|---|---|
+| 查看设备 | `GET /sandboxes/{id}/workspaces` | `node-ctl workspace list B --json` |
+| 对运行中沙箱的空位接盘 | `POST /sandboxes/{id}/workspaces/attach?name=project`，正文为 `{"disk":{}}`、以 `disk` 包裹的完整磁盘，或 `{"disk":{"migrationToken":"…"}}` | `node-ctl workspace attach B --name project` 使用默认盘，也可用 `--disk-spec FILE` 或 `--token-file FILE` 选择来源 |
+| 导出已暂停沙箱的一个已启用盘 | `POST /sandboxes/{id}/workspaces/export?name=project`，正文为 `{}`，返回 `{"token":"…"}` | `node-ctl workspace export A --name project`；加 `--json` 输出含 token 的 JSON 对象 |
+
+命令使用沙箱所有者的 `E2B_API_KEY`。A 同步应用写入并暂停后，可通过标准输入将盘交给 B：
+
+```bash
+set -o pipefail
+node-ctl workspace export "$A" --name project |
+  node-ctl workspace attach "$B" --name project --token-file -
+```
+
+导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 成功（204）后对应目录可访问，Guest 在首次访问时挂载文件系统。盘位未接入时访问会返回错误。
+
+列表返回 `unattached`、`attaching` 或 `attached`，容量已知时附带 `sizeBytes`。运行中的沙箱还返回 `runGeneration`。重试可用 `--if-generation G` 或 `X-Kuasar-Run-Generation: G` 固定运行代。换代返回 412，盘源或沙箱状态冲突返回 409，暂时无法确认 owner 状态时返回 503。
+
 ## Capture 与 Pause
 
 Create body 的 E2B 兼容字段 `autoPauseMemory` 使用三态解析:
@@ -895,6 +935,7 @@ JSON 对象字符串)注入,零 SDK/API 改动。这些独立的 typed 租户 sc
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
 | `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
+| `workspace` | 可移植的数据盘名称与挂载拓扑，创建时的盘源选择走私有通道。参见 [Workspace 存储](#workspace-存储)。 |
 | `mmds` | portable exact `routes` + request-scoped initial `secrets`;持久化前拆分,metadata 最终只保留 routes |
 
 字段定义随能力维护：[资源 patch 与优先级](node-resource_zh.md#request-resources)、[流量限制](node-proxy_zh.md#request-traffic)、[MMDS](node-proxy_zh.md#request-mmds)、[凭据覆盖](node-proxy_zh.md#request-credentials)、[集群系统上下文](cluster_zh.md#node-system-context)。下文定义共享输入装配、restore 与 checkpoint policy。

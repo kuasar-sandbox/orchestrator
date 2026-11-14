@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // route_link paths. Routers dial this link for group-scoped route/build
@@ -64,6 +65,7 @@ type RouteResolve struct {
 // admits portable resource and traffic plus request-scoped restore, credentials, and
 // checkpoint namespaces into it.
 type SandboxReserveReq struct {
+	Workspaces      []workspace.Entry `json:"workspaces,omitempty"`
 	Config          map[string]string `json:"config,omitempty"`
 	IdleTimeout     *int64            `json:"idle_timeout,omitempty"`
 	AutoPauseMemory *bool             `json:"auto_pause_memory,omitempty"`
@@ -264,7 +266,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	}
 	for key := range body.Config {
 		if key != sandboxcfg.NsResource && key != sandboxcfg.NsTraffic &&
-			key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials && key != sandboxcfg.NsCheckpoint {
+			key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials && key != sandboxcfg.NsCheckpoint && key != workspace.Namespace {
 			http.Error(w, fmt.Sprintf("unsupported sandbox reserve config %q", key), http.StatusBadRequest)
 			return
 		}
@@ -290,8 +292,8 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		AccessToken:       req.Header.Get("X-Access-Token"),
 		Service:           req.Header.Get("E2b-Sandbox-Service"),
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
-		Config:            body.Config,
-		AutoPauseMemory:   cloneOptionalBool(body.AutoPauseMemory), IdleTimeout: types.CloneIdleTimeout(body.IdleTimeout),
+		Config:            body.Config, Workspaces: body.Workspaces,
+		AutoPauseMemory: cloneOptionalBool(body.AutoPauseMemory), IdleTimeout: types.CloneIdleTimeout(body.IdleTimeout),
 		AutoReset: cloneOptionalBool(body.AutoReset),
 		Memory:    cloneOptionalBool(body.Memory),
 	})

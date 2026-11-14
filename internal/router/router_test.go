@@ -607,7 +607,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil, false, nil, nil)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil, false, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

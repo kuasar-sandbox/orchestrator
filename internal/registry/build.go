@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // BuildReserveResult is the registry-assigned identity + placement for a build
@@ -31,6 +32,7 @@ type BuildReserveResult struct {
 // BuildReserveReq is the router's build-register ask: the group + profile, the
 // canonical required Build resources, and portable template configuration.
 type BuildReserveReq struct {
+	Workspaces []workspace.Entry         `json:"workspaces,omitempty"`
 	Group      string                    `json:"group"`
 	BuildID    string                    `json:"build_id,omitempty"`
 	TemplateID string                    `json:"template_id,omitempty"`
@@ -68,6 +70,13 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	}
 	if !req.Profile.Valid() {
 		return nil, fmt.Errorf("registry: unknown build profile %q", req.Profile)
+	}
+	if err := workspace.CheckEnvelope(req.Metadata, req.Workspaces); err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+	}
+	workspaceDigest, err := workspace.InputDigest(req.Workspaces)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid workspace declaration", errInvalidSandboxConfig)
 	}
 	metadata, mmdsSecrets, mmdsDigest, err := normalizeBuildRegistrationMMDS(req.Metadata, req.MMDSSecrets)
 	if err != nil {
@@ -128,7 +137,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if rec, found, err := r.stores.GetBuildInGroup(ctx, req.Group, req.BuildID); err != nil {
 			return nil, err
 		} else if found {
-			if !sameBuildRegistrationDefinition(rec, req.Profile, resources, req.Metadata, req.Env, req.Secure, credentialsDigest, mmdsDigest, req.TemplateID) {
+			if rec.RegistrationWorkspacesDigest != workspaceDigest || !sameBuildRegistrationDefinition(rec, req.Profile, resources, req.Metadata, req.Env, req.Secure, credentialsDigest, mmdsDigest, req.TemplateID) {
 				return nil, fmt.Errorf("registry: build %s immutable definition conflicts with existing registration", req.BuildID)
 			}
 			if rec.State != BuildStarting && rec.RegistrationTargetSet {
@@ -136,6 +145,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			}
 			rec.registrationMMDSSecrets = cloneStringMap(mmdsSecrets)
 			rec.registrationCredentials = cloneBuildCredentials(credentials)
+			rec.registrationWorkspaces = req.Workspaces
 			// A prior dispatch had an ambiguous result. Re-establish the node
 			// ownership index and replay the exact stored intent to the same node;
 			// neither current placement nor Provider output may change it.
@@ -238,7 +248,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			RegistrationRegistryAuth:      placement.RegistryAuth,
 			State:                         BuildStarting, TemplateID: templateID,
 			registrationMMDSSecrets: cloneStringMap(mmdsSecrets),
-			registrationCredentials: cloneBuildCredentials(credentials),
+			registrationCredentials: cloneBuildCredentials(credentials), RegistrationWorkspacesDigest: workspaceDigest, registrationWorkspaces: req.Workspaces,
 		}
 		if _, inserted, err := r.stores.casRouteBuildShard(ctx, rec, 0); err != nil {
 			return nil, err
@@ -331,14 +341,21 @@ func (r *Registry) dispatchBuildRegistration(ctx context.Context, rec *BuildReco
 	if credentialsDigest != rec.RegistrationCredentialsDigest {
 		return nil, fmt.Errorf("registry: build %s credential replay values are unavailable or changed", rec.BuildID)
 	}
+	wsDigest, err := workspace.InputDigest(rec.registrationWorkspaces)
+	if err != nil || wsDigest != rec.RegistrationWorkspacesDigest {
+		return nil, errors.New("workspace registration replay values are unavailable or changed")
+	}
 	cmd := &routesync.Command{
 		CmdID: newID(), Kind: routesync.CmdBuildRegister,
 		BuildID: rec.BuildID, TemplateRef: rec.TemplateID, Profile: string(rec.Profile),
 		BuildResources: cloneBuildResources(rec.Resources), Config: cloneStringMap(rec.RegistrationConfig),
-		BuildEnv: cloneStringMap(rec.RegistrationEnv), BuildSecure: rec.RegistrationSecure,
+		Workspaces: rec.registrationWorkspaces, BuildEnv: cloneStringMap(rec.RegistrationEnv), BuildSecure: rec.RegistrationSecure,
 		BuildCredentials:     cloneBuildCredentials(rec.registrationCredentials),
 		APISecretFingerprint: rec.APISecretFingerprint, ImageRepo: rec.RegistrationImageRepo,
 		RegistryAuth: rec.RegistrationRegistryAuth, BuildMMDSSecrets: cloneStringMap(rec.registrationMMDSSecrets),
+	}
+	if err := routesync.ValidateMessage(&routesync.Msg{Type: routesync.TypeCommand, Cmd: cmd}); err != nil {
+		return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, HTTPStatus: http.StatusBadRequest, Reason: "registration exceeds node-link message limits"}, nil
 	}
 	return r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, cmd, buildRegisterAckTimeout)
 }

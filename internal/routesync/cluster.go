@@ -5,6 +5,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // Cluster node-link message types (docs/cluster.md#node-link). They extend the
@@ -225,9 +226,10 @@ type Heartbeat struct {
 // only the current delivery with its Ack; retry semantics are operation-specific.
 // Fields are populated per Kind.
 type Command struct {
-	CmdID string `json:"cmd_id"`
-	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
-	SID   string `json:"sid,omitempty"`
+	Workspaces []workspace.Entry `json:"workspaces,omitempty"`
+	CmdID      string            `json:"cmd_id"`
+	Kind       string            `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
+	SID        string            `json:"sid,omitempty"`
 	// create and lifecycle credential binding
 	TemplateRef          string                 `json:"template_ref,omitempty"`           // canonical img/sbx/snp template ref
 	Profile              string                 `json:"profile,omitempty"`                // sandbox profile; also used by build_register

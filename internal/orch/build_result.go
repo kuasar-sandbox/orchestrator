@@ -32,7 +32,15 @@ func validateBuildResult(build *types.Build, result types.BuildResult) error {
 			return fmt.Errorf("build result target %+v differs from requested target %+v", result.Target, *requested)
 		}
 	} else {
-		expected := types.ResolveBuildTarget(nil, result.StartCmd, result.ReadyCmd)
+		hasWorkspace := len(build.WorkspacePlan) > 0
+		if !hasWorkspace && build.RuntimePrepareJSON != "" {
+			prep, err := decodeBuildRuntimePreparation(build.RuntimePrepareJSON)
+			if err != nil {
+				return err
+			}
+			hasWorkspace = prep.SourceHasWorkspaces
+		}
+		expected := types.ResolveWorkspaceBuildTarget(nil, result.StartCmd, result.ReadyCmd, hasWorkspace)
 		if result.Target != expected {
 			return fmt.Errorf("build result target %+v differs from auto target %+v", result.Target, expected)
 		}

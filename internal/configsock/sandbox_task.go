@@ -127,6 +127,7 @@ func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
 		a.Network.TransitGatewayIP == b.Network.TransitGatewayIP &&
 		a.Network.TransitGeneveVNI == b.Network.TransitGeneveVNI &&
 		a.Network.TransitMAC == b.Network.TransitMAC &&
+		a.DiskTopology.WorkspaceTopology == b.DiskTopology.WorkspaceTopology &&
 		a.DiskTopology.Root == b.DiskTopology.Root &&
 		slices.Equal(a.DiskTopology.Disks, b.DiskTopology.Disks) &&
 		a.ResolutionDigest == b.ResolutionDigest &&

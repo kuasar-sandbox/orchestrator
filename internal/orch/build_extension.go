@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 type normalizedBuildRegistration struct {
@@ -150,6 +151,9 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if err := sandboxcfg.ValidateWorkspaceMetadata(spec); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -162,7 +166,8 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	target := builder.Target
 	if target == nil && profile == types.ProfileBare {
 		// Bare auto is known at registration. Keep the requested target intact.
-		target = &types.BuildTarget{Kind: types.BuildTargetImage}
+		resolved := types.ResolveWorkspaceBuildTarget(nil, "", "", metadata[workspace.Namespace] != "" && metadata[workspace.Namespace] != "[]")
+		target = &resolved
 	}
 	if err := validateBuildTargetConfig(target, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -191,7 +196,7 @@ func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[stri
 		for _, namespace := range []string{
 			sandboxcfg.NsResource, sandboxcfg.NsTraffic,
 			sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
-			sandboxcfg.NsFiles, sandboxcfg.NsMetadata, sandboxcfg.NsCheckpoint,
+			sandboxcfg.NsFiles, sandboxcfg.NsMetadata, workspace.Namespace, sandboxcfg.NsCheckpoint,
 			sandboxcfg.NsMMDS,
 		} {
 			if _, present := metadata[namespace]; present {
@@ -220,7 +225,7 @@ func validateKnownBuildTargetConfig(build *types.Build) error {
 		if build.Profile == types.ProfileE2B && build.StartCmd == "" && build.ReadyCmd == "" && buildSourceMayInheritCommands(build) {
 			return nil
 		}
-		resolved := types.ResolveBuildTarget(nil, build.StartCmd, build.ReadyCmd)
+		resolved := types.ResolveWorkspaceBuildTarget(nil, build.StartCmd, build.ReadyCmd, len(build.WorkspacePlan) > 0)
 		target = &resolved
 	}
 	return validateBuildTargetConfig(target, build.Metadata, build.Env, build.Secure,
@@ -317,7 +322,12 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		Env                  map[string]string
 		Secure               bool
 		Credentials          *sandboxcfg.Credentials
+		WorkspaceDigest      string `json:",omitempty"`
 		MMDSSecrets          map[string]string
+	}
+	workspaceDigest, err := workspace.InputDigest(command.Workspaces)
+	if err != nil {
+		return "", fmt.Errorf("build_register: invalid workspace choices")
 	}
 	payload, err := json.Marshal(identity{
 		BuildID: command.BuildID, TemplateID: command.TemplateRef, Profile: command.Profile,
@@ -326,7 +336,7 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		Resources: command.BuildResources, Config: cloneStringMap(command.Config),
 		Env: cloneStringMap(command.BuildEnv), Secure: command.BuildSecure,
 		Credentials: command.BuildCredentials,
-		MMDSSecrets: cloneStringMap(command.BuildMMDSSecrets),
+		MMDSSecrets: cloneStringMap(command.BuildMMDSSecrets), WorkspaceDigest: workspaceDigest,
 	})
 	if err != nil {
 		return "", fmt.Errorf("build_register: encode request identity: %w", err)

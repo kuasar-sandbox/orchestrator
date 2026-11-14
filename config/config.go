@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"io"
 	"net"
 	"net/url"
@@ -646,9 +647,10 @@ type ProfileNet struct {
 
 // BootConfig is the boot artifacts that define a sandbox instance.
 type BootConfig struct {
-	Kernel              string `yaml:"kernel" json:"kernel"`                               // vmlinux path
-	Runtime             string `yaml:"runtime" json:"runtime"`                             // guest runtime erofs
-	OverlayDiffTemplate string `yaml:"overlay_diff_template" json:"overlay_diff_template"` // pre-formatted ext4 seeding the cold-boot overlay upper
+	WorkspaceDefaultDisk *rtconfig.DiskV1 `yaml:"workspace_default_disk,omitempty" json:"workspace_default_disk,omitempty"`
+	Kernel               string           `yaml:"kernel" json:"kernel"`                               // vmlinux path
+	Runtime              string           `yaml:"runtime" json:"runtime"`                             // guest runtime erofs
+	OverlayDiffTemplate  string           `yaml:"overlay_diff_template" json:"overlay_diff_template"` // pre-formatted ext4 seeding the cold-boot overlay upper
 }
 
 // BuilderConfig is the build-instance settings. Durable registration/execution
@@ -1171,6 +1173,11 @@ func validateAdvertisedEndpoint(name, endpoint string) error {
 }
 
 func (c *Conductor) validateDeclarative() error {
+	if d := c.Sandbox.Boot.WorkspaceDefaultDisk; d != nil {
+		if err := d.Validate(); err != nil {
+			return fmt.Errorf("config: sandbox.boot.workspace_default_disk: %w", err)
+		}
+	}
 	if err := c.Sandbox.Timeouts.validate(); err != nil {
 		return err
 	}

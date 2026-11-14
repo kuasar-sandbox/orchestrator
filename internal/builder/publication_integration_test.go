@@ -29,6 +29,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	rtsandbox "github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -771,4 +773,98 @@ func anyStrings(value any) []string {
 		out = append(out, text)
 	}
 	return out
+}
+
+func TestWorkspaceTemplateRetainsSeedAndDerivedSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bundle bool
+	}{{"store", false}, {"bundle", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPublicationFixture(t)
+			seed := filepath.Join(t.TempDir(), "workspace.ext4")
+			content := bytes.Repeat([]byte{'W'}, 8192)
+			if err := os.WriteFile(seed, content, 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := f.pipeline(t, "workspace-parent", f.localImageRef, nil, tc.bundle)
+			p.target = types.BuildTarget{Kind: types.BuildTargetSandbox}
+			p.spec.SandboxSpec.WorkspacePlan = []workspace.Prepared{
+				{Name: "reserved", Slot: &rtconfig.DiskSlotConfig{}, Mounts: []workspace.Mount{{Path: "/project", Subpath: "project"}}},
+				{Name: "data", Mounts: []workspace.Mount{{Path: "/data"}}, Disk: &rtconfig.DiskV1{Kind: "disk", Version: 1, DiffTemplate: "file://" + seed}},
+			}
+			if err := p.prepareWorkspaces(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(seed); err != nil {
+				t.Fatal(err)
+			}
+			parent, err := p.publishSandboxTarget()
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := f.pipeline(t, "workspace-derived", f.localImageRef, p.spec.RefLocations, tc.bundle)
+			child.target = p.target
+			source, err := manifest.ParseRef(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src, err := workspacedisk.OpenLayer(child.ctx, child.artifacts.storage, source, "", child.artifacts.locations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			child.spec.SourceSandboxConfig, _, err = sandboxfile.ReadDiskTable(child.ctx, src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := src.Close(); err != nil {
+				t.Fatal(err)
+			}
+			child.spec.SourceSandboxRef = parent
+			child.spec.SandboxSpec.WorkspacePlan = []workspace.Prepared{{Name: "reserved", Disk: p.spec.SandboxSpec.WorkspacePlan[1].Disk}}
+			if err := child.prepareWorkspaces(); err != nil {
+				t.Fatal(err)
+			}
+			ref, err := child.publishSandboxTarget()
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected, err := manifest.ParseRef(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := workspacedisk.OpenLayer(child.ctx, child.artifacts.storage, selected, "", child.artifacts.locations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			cfg, _, err := sandboxfile.ReadDiskTable(child.ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			declarations, err := workspace.Captured(cfg)
+			if err != nil || len(declarations) != 2 {
+				t.Fatalf("declarations = %+v, %v", declarations, err)
+			}
+			if len(cfg.Boot.Disks) != 2 || cfg.Boot.Disks[0].Name != "reserved" || cfg.Boot.Disks[0].Binding == nil || cfg.Boot.Disks[1].Name != "data" || cfg.Boot.Disks[1].Slot != nil {
+				t.Fatalf("derived disk table: %+v", cfg.Boot.Disks)
+			}
+			for _, disk := range cfg.Boot.Disks {
+				layer, err := manifest.ParseRef(disk.Base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				file, err := workspacedisk.OpenLayer(child.ctx, child.artifacts.storage, layer, "", child.artifacts.locations)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := make([]byte, len(content))
+				n, err := file.ReadAt(child.ctx, got, 0)
+				closeErr := file.Close()
+				if n != len(got) || err != nil || closeErr != nil || !bytes.Equal(got, content) {
+					t.Fatalf("%s: n=%d read=%v close=%v", disk.Name, n, err, closeErr)
+				}
+			}
+		})
+	}
 }
