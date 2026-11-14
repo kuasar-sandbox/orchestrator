@@ -34,6 +34,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 )
 
 var version = "0.2.0-dev"
@@ -70,12 +71,16 @@ func main() {
 		err = runBuilder(os.Args[2:], log)
 	case "config":
 		err = configCmd(os.Args[2:], log)
+	case "workspace-storage":
+		err = workspacedisk.Serve(context.Background(), os.Stdin, os.Stdout)
 	case "check-snapshot-runtime":
 		err = checkSnapshotRuntimeCmd(os.Stdin, os.Stdout)
 	case "checkpoint-cleanup":
 		err = checkpointCleanupCmd(os.Args[2:])
 	case "manifest-key":
 		err = manifestKeyCmd(os.Args[2:], log)
+	case "workspace":
+		err = workspaceCmd(os.Args[2:])
 	case "export-sandbox":
 		err = exportSandboxCmd(os.Args[2:], log)
 	case "import-sandbox":
@@ -96,7 +101,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|workspace|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder|version} [args]")
 	os.Exit(2)
 }
 

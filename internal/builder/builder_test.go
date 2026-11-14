@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"gopkg.in/yaml.v3"
 )
@@ -261,6 +262,26 @@ func TestPreparedSandboxImageConfigSeedsBuildStepContext(t *testing.T) {
 	ctx := stepCtxFrom(base)
 	if ctx.env["BUILT"] != "yes" || ctx.workdir != "/home/user" || ctx.user != "1000:1000" {
 		t.Fatalf("prepared source step context = %+v", ctx)
+	}
+}
+
+func TestResolveWorkspaceTargetFromCapturedArtifact(t *testing.T) {
+	source := &rtconfig.PortableSandboxConfig{
+		Version:  2,
+		Boot:     rtconfig.PortableBootConfig{Disks: []rtconfig.PortableDiskConfig{{Name: "work", PureBlock: true}}},
+		Metadata: map[string]string{workspace.Namespace: `[{"name":"work","mounts":[{"path":"/data"}]}]`},
+		Mounts:   []rtconfig.MountConfig{{Type: "disk", Source: "work", Target: "/data"}},
+	}
+	for _, target := range []*types.BuildTarget{nil, {Kind: types.BuildTargetImage}, {Kind: types.BuildTargetSandbox}, {Kind: types.BuildTargetSandbox, Memory: true}} {
+		p := &buildPipeline{spec: &configsock.BuildSpec{RequestedTarget: target, SourceSandboxConfig: source}, startCmd: "inherited"}
+		err := p.resolveTarget()
+		if target == nil || target.Kind == types.BuildTargetImage {
+			if err == nil || !strings.Contains(err.Error(), "builder.target") {
+				t.Fatalf("worker accepted incompatible target %+v: %v", target, err)
+			}
+		} else if err != nil || p.target != *target {
+			t.Fatalf("worker changed explicit target %+v: got %+v, %v", target, p.target, err)
+		}
 	}
 }
 

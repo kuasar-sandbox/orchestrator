@@ -23,8 +23,7 @@ Trigger and is therefore unsuitable for register-only explicit targets.
 Choose `BUILD_KIND=img` to publish only the image, `sbx` for cold E with portable
 Sandbox defaults, or `snp` for initialized memory S. For S, set `APP_START` and
 `APP_READY` to the actual service start and readiness commands. Explicit Image
-must not receive them. `auto` without effective commands selects Image, with
-effective start or ready selects memory S, and never selects E automatically.
+must not receive them. When the build declares or inherits a workspace, set this example’s `BUILD_KIND` to `sbx` or `snp` so the registration request includes an explicit Sandbox target. For builds without workspaces, `auto` selects memory S when an effective start or ready command exists, or Image otherwise.
 This example uses the Demo's execution budget; validate admission for your node.
 
 ```python
@@ -108,7 +107,7 @@ These implement the e2b v2 Build-system endpoint family used by SDK Template.bui
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Register | POST /v3/templates → 202 | Body accepts name/tags/profile?/cpuCount/memoryMB/metadata?/envVars?/secure?. CPU/memory define immutable Build.Resources for admission and A/B sandbox specifications; final target Sandbox resources are resolved independently. X-Kuasar-Sandbox-Builder.resources may assert identical CPU/memory and add storage; disagreement returns 400. Builder target is register-only immutable input. X-Kuasar-Sandbox-Resource configures final template resources, not A/B. Profile defaults e2b and accepts e2b/bare. Response exposes requested target, auto when omitted |
+| Register | POST /v3/templates → 202 | Body accepts name/tags/profile?/cpuCount/memoryMB/metadata?/envVars?/secure?. CPU/memory define immutable Build.Resources for admission and A/B sandbox specifications; final target Sandbox resources are resolved independently. X-Kuasar-Sandbox-Builder.resources may assert identical CPU/memory and add storage; disagreement returns 400. Builder target is register-only immutable input. X-Kuasar-Sandbox-Resource configures final template resources, not A/B. Profile defaults e2b and accepts e2b/bare. Response exposes the requested target. A workspace declaration requires an explicit Sandbox target |
 | Trigger | POST /v2/templates/{tid}/builds/{bid} → 202 | fromImage/fromTemplate/fromImageRegistry username/password/steps/startCmd/readyCmd. Only one registered→waiting transition. Compatibility cpuCount/memoryMB may only assert registration values; increase/decrease returns 400 before credential/COPY/queue side effects. Trigger metadata, Builder/Resource and other general configuration headers are rejected. Insufficient execution capacity leaves FIFO waiting on the fixed node |
 | Status | GET /templates/{tid}/builds/{bid}/status | SDK fields, requested target, terminal derived kind, canonical resources cpuMilli/memoryBytes/storageBytes, cancelRequested/deleteRequested, executionClaimed/runID/storageEnforcement and phase name/sandboxID. In-progress SDK status remains building while retaining internal phase/claim details |
 | Files | GET /templates/{tid}/files/{hash} → 201 | Resolve tid→Build→owner, then return present/url. present skips duplicate upload; URL is a direct-bucket presigned PUT, never bytes through control plane. No files_storage returns 501; missing/non-owned tid returns 404 ([Target-aware execution and publication](#execution-and-publication)) |
@@ -195,7 +194,9 @@ Build registration additionally accepts build-only kuasar-sandbox.builder / X-Ku
 }
 ```
 
-Target allows image, sandbox+memory:false or sandbox+memory:true. Omission means auto; explicit null, unknown/duplicate fields or image+memory:true fails. Omitted sandbox.memory means false. Auto resolves only after source E defaults: either nonempty effective start/ready command selects memory Sandbox, otherwise Image. It never automatically selects top-level E. Explicit Image conflicts with explicit trigger start/ready and ignores inherited source commands.
+A build that declares at least one workspace or inherits one from its source template requires an explicit `builder.target` at registration. Set `{"kind":"sandbox","memory":false}` for a disk-only template or `{"kind":"sandbox","memory":true}` to capture memory. Omitting `target` or choosing Image fails even when start/ready commands are present. An empty workspace array leaves automatic selection available if the source also has no workspaces.
+
+For builds without workspaces, omitting the target selects memory Sandbox when either effective start/ready command is nonempty, including defaults inherited from E. Otherwise it selects Image. For an explicit Sandbox target, omitting `memory` means false. Explicit null, unknown or duplicate fields, and `image+memory:true` are invalid. An explicit Image conflicts with explicit trigger start/ready and ignores inherited source commands.
 
 Build resources govern execution/admission only; referer/registry govern this Build. Parsed target/build-only fields leave template metadata and persist in builds.builder_json, never in later create/resume runtime config.
 
@@ -325,7 +326,7 @@ systemctl daemon-reload
 
 Builds arrive through e2b APIs ([Build API](#build-api); there is no separate build-submission CLI), enter the builds table and are scheduled by resource pools. Each execution binds one sandbox-builder@<run-id> unit. Image pulls and build steps execute inside microVMs. Host run-builder relays artifact streams, fetches/decompresses COPY contexts and publishes outputs; therefore the boundary is guest execution of tenant build commands, not absence of tenant bytes from host userspace.
 
-Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sandbox",memory:false}` and `{kind:"sandbox",memory:true}`. The first two skip C; top-level Sandbox E is assembled from final image plus ordinary Create config without a VM. Only memory Sandbox cold-starts C and captures a Snapshot. With target omitted, run-builder reads source E's default commands task-locally, then selects memory Sandbox if either effective start/ready command is nonempty, otherwise Image. Source kind, steps, profile and other Sandbox config do not infer target.
+Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sandbox",memory:false}` and `{kind:"sandbox",memory:true}`. The first two skip C; top-level Sandbox E is assembled from final image plus ordinary Create config without a VM. Only memory Sandbox cold-starts C and captures a Snapshot. When run-builder reads the source E, an inherited workspace requires the Sandbox target specified at registration. A build with workspaces and an omitted target fails. For builds without workspaces, an omitted target selects memory Sandbox when either effective start/ready command is nonempty, including defaults from E, or Image otherwise.
 
 Every source first becomes an image or cold Sandbox E, then A/B yields this Build's top-level image. Builds never restore source S memory/VMM state: S only locates E. Final Image/E/S must not reference source S/E, writable/data disks or memory parents. A memory result permits only the S→E relation created by this Build itself.
 
@@ -344,10 +345,7 @@ cleans owned directories after execution ownership has ended.
 Source preparation preserves a Checkpoint E layout through Open, Clone and
 Validate, including when S selects that E. Its fixed disk contents are materialized into independent Build storage before
 use, even though the Build runtime disables Checkpoint; they are not replaced
-by a blank template. Root-only E remains eligible for the existing
-Build inheritance path; source data disks retain their existing unsupported
-boundary. This backend change does not add source-memory restoration or expand
-the accepted Build topology. Startup preparation, first-access cost and ordinary
+by a blank template. Root-only E and E carrying a [workspace](sandbox-lifecycle.md#workspace-storage) can serve as build sources. The builder exports each populated workspace to preserve its contents independently of the source. An unused slot retains its geometry and mounts. Startup preparation, first-access cost and ordinary
 template copying remain separate from the named local-Pause benefit described
 in [node capture](sandbox-lifecycle.md#local-disk-checkpoints).
 

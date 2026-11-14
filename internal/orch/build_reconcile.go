@@ -233,6 +233,7 @@ func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build)
 		runDir:                 nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID),
 		baseDir:                nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
 		sourceTemplate:         prep.sourceTemplate,
+		sourceHasWorkspaces:    durable.SourceHasWorkspaces,
 		sourceHasBuildCommands: durable.SourceHasBuildCommands,
 		spec:                   prep.spec, resources: durable.Resources, sandboxResources: durable.SandboxResources,
 		checkpointPolicy: sandboxcfg.CloneSnapshotPolicy(durable.CheckpointPolicy),
@@ -296,6 +297,7 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 	}
 	if prep.durable != nil {
 		pend.network, pend.templateNetwork, pend.resources = prep.durable.Network, prep.durable.TemplateNetwork, prep.durable.Resources
+		pend.sourceHasWorkspaces = prep.durable.SourceHasWorkspaces
 		pend.sourceHasBuildCommands = prep.durable.SourceHasBuildCommands
 		pend.sandboxResources = prep.durable.SandboxResources
 		pend.checkpointPolicy = sandboxcfg.CloneSnapshotPolicy(prep.durable.CheckpointPolicy)
@@ -461,13 +463,12 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 			accepted, err := o.fenceAcceptedBuildResult(unit, *early)
 			return accepted, "", false, nil, buildFailed("runtime", err)
 		}
-		artifactCapacity, inheritedNetwork, prepareErr := validateBuildPrepareSummary(summary)
+		artifactCapacity, inheritedNetwork, prepareErr := pend.prepareSourceSummary(summary)
 		err = prepareErr
 		if err != nil {
 			return nil, "", false, nil, buildFailed("artifact_prepare", err)
 		}
 		inherited = inheritedNetwork
-		pend.sourceHasBuildCommands = summary.HasBuildCommands
 		if buildProducesSandbox(build, pend.sourceHasBuildCommands) {
 			pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
 			if err != nil {
@@ -506,6 +507,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	}
 	durable := buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest, RootSource: rootSource,
+		SourceHasWorkspaces:    pend.sourceHasWorkspaces,
 		SourceHasBuildCommands: pend.sourceHasBuildCommands,
 		Network:                pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,

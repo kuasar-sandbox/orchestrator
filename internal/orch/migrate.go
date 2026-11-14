@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"io"
 	"os"
 	"path/filepath"
@@ -394,7 +395,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: manifest key fingerprint: %w", err)
 	}
-	metadata, err := sandboxcfg.NormalizeResourceMetadata(sb.Metadata)
+	metadata, err := sandboxcfg.NormalizeResourceMetadata(workspace.PublicMetadata(sb.Metadata))
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: portable resource metadata: %w", err)
 	}
@@ -700,6 +701,7 @@ func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, 
 // service credentials restored from KMT1 come only from their typed payload
 // fields and are validated separately.
 func migrationSandboxMetadata(metadata map[string]string) (map[string]string, error) {
+	metadata = workspace.PublicMetadata(metadata)
 	if metadata == nil {
 		return nil, nil
 	}

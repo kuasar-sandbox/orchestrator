@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // ReserveOperation selects the single lifecycle action performed by
@@ -41,6 +42,7 @@ func (op ReserveOperation) Valid() bool {
 // from its dedicated typed body, while identities and credentials use query
 // parameters and headers.
 type SandboxReserveRequest struct {
+	Workspaces        []workspace.Entry `json:"workspaces,omitempty"`
 	Operation         ReserveOperation
 	Group             string
 	RouteKey          string
@@ -79,6 +81,9 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 	if len(req.MigrationToken) > migrationtoken.MaxWireSize {
 		return nil, fmt.Errorf("%w: migration token is too large", ErrReserveBadRequest)
 	}
+	if req.Operation != ReserveCreate && req.Workspaces != nil {
+		return nil, ErrReserveBadRequest
+	}
 	switch req.Operation {
 	case ReserveCreate:
 		if req.ExpectedSandboxID != "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
@@ -93,7 +98,10 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 			autoPauseMemory = *req.AutoPauseMemory
 		}
 		autoReset := req.AutoReset != nil && *req.AutoReset
-		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config, autoPauseMemory, autoReset, req.IdleTimeout)
+		if err := workspace.CheckEnvelope(req.Config, req.Workspaces); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrReserveBadRequest, err)
+		}
+		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config, autoPauseMemory, autoReset, createOptions{req.IdleTimeout, req.Workspaces})
 	case ReserveConnect:
 		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TTLSeconds != 0 ||
 			len(req.ExecConditions) != 0 || req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 || req.AutoPauseMemory != nil || req.AutoReset != nil || req.IdleTimeout != nil {

@@ -23,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	nodestore "github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // ErrNoNode is returned when no eligible node can host a sandbox.
@@ -464,13 +465,18 @@ func (r *Registry) Stores() *Stores { return r.stores }
 
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
+type createOptions struct {
+	idleTimeout *int64
+	workspaces  []workspace.Entry
+}
+
 // reserveCreate resolves (group, route_key) to a running sandbox, placing +
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
 // report it running, single-flight per key (cluster.md).
-func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, autoPauseMemory, autoReset bool, idlePolicy ...*int64) (*ReserveResult, error) {
-	var idleTimeout *int64
-	if len(idlePolicy) > 0 {
-		idleTimeout = types.CloneIdleTimeout(idlePolicy[0])
+func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, autoPauseMemory, autoReset bool, options ...createOptions) (*ReserveResult, error) {
+	var opts createOptions
+	if len(options) > 0 {
+		opts = options[0]
 	}
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
@@ -522,7 +528,7 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		r.mu.Unlock()
 	}()
 
-	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory, autoReset, idleTimeout); err != nil {
+	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory, autoReset, opts); err != nil {
 		r.finish(key, nil, err)
 		if fence, ok := r.reserveRollbackFence(key); ok {
 			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
@@ -636,10 +642,10 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 // startReserve drives the placement + command for the leader of a single-flight.
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
-func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory, autoReset bool, idlePolicy ...*int64) error {
-	var idleTimeout *int64
-	if len(idlePolicy) > 0 {
-		idleTimeout = types.CloneIdleTimeout(idlePolicy[0])
+func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory, autoReset bool, options ...createOptions) error {
+	var opts createOptions
+	if len(options) > 0 {
+		opts = options[0]
 	}
 	if found && (rec.State == StateDead || rec.State == StateDeleting) {
 		return ErrReserveConflict
@@ -712,20 +718,25 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		copy := *rec
 		replaceReady = &copy
 	}
-	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady, autoPauseMemory, autoReset, idleTimeout)
+	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady, autoPauseMemory, autoReset, opts)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. node_list is only a catalog: the selected node owner validates its
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord, autoPauseMemory, autoReset bool, idlePolicy ...*int64) error {
-	var idleTimeout *int64
-	if len(idlePolicy) > 0 {
-		idleTimeout = types.CloneIdleTimeout(idlePolicy[0])
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord, autoPauseMemory, autoReset bool, options ...createOptions) error {
+	var opts createOptions
+	if len(options) > 0 {
+		opts = options[0]
 	}
 	if _, found := createConfig[sandboxcfg.NsCredentials]; found {
 		return errors.New("registry: create credentials were not separated from config")
+	}
+	idleTimeout := types.CloneIdleTimeout(opts.idleTimeout)
+	workspaceDigest, err := workspace.InputDigest(opts.workspaces)
+	if err != nil {
+		return fmt.Errorf("%w: invalid workspace declaration", errInvalidSandboxConfig)
 	}
 	workflowCredentials := cloneCreateCredentials(createCredentials)
 	workflowReplacement := replaceReady
@@ -765,7 +776,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return ErrReserveConflict
 		}
 		if curFound && cur.State == StatePausing {
-			return r.startReserve(ctx, group, routeKey, cur, curRev, true, createConfig, createCredentials, autoPauseMemory, autoReset, idleTimeout)
+			return r.startReserve(ctx, group, routeKey, cur, curRev, true, createConfig, createCredentials, autoPauseMemory, autoReset, opts)
 		}
 		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
 			return nil // a concurrent replacement already won; the running route finishes the Reserve
@@ -789,6 +800,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			// The first committed RESERVED row freezes the create credential
 			// selection and TTL capture policy. A retry or competing Reserve must
 			// not adopt either value from its own request after that point.
+			if cur.WorkspacesDigest != workspaceDigest {
+				// Another request owns this reservation. Wait for its authoritative route.
+				return nil
+			}
 			binding = cur
 			autoPauseMemory = cur.AutoPauseMemory
 			idleTimeout = types.CloneIdleTimeout(cur.IdleTimeout)
@@ -864,6 +879,29 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if !validNodeSandboxIdentity(sandboxID, nodeSandboxID, generation) {
 			return errors.New("registry: generated node sandbox identity is invalid")
 		}
+		stableID := sandboxID
+		if selectedReplacement != nil {
+			stableID = selectedReplacement.StableID
+		}
+		if stableID != sandboxID {
+			return errors.New("registry: stable ID does not match SandboxID")
+		}
+		cmd := &routesync.Command{
+			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
+			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config, Workspaces: opts.workspaces,
+			Cluster: &routesync.ClusterSandboxContext{
+				Group: group, RouteKey: routeKey, StableID: stableID,
+			},
+			APISecretFingerprint: placement.APISecretFingerprint,
+			AutoPauseMemory:      cloneOptionalBool(&autoPauseMemory), IdleTimeout: types.CloneIdleTimeout(idleTimeout),
+			AutoReset: cloneOptionalBool(&autoReset),
+		}
+		if err := workspace.CheckEnvelope(config, opts.workspaces); err != nil {
+			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+		}
+		if err := routesync.ValidateMessage(&routesync.Msg{Type: routesync.TypeCommand, Cmd: cmd}); err != nil {
+			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+		}
 		ref := clusterstate.NodeSandboxRef{
 			Group: group, RouteKey: routeKey, SandboxID: sandboxID,
 			SandboxGeneration: generation, NodeSandboxID: nodeSandboxID,
@@ -880,9 +918,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			State: StateReserved, NodeID: nodeID,
 			TemplateID: placement.TemplateRef, Profile: string(template.Profile),
 			APISecretFingerprint: placement.APISecretFingerprint,
-			CreateCredentials:    cloneCreateCredentials(selectedCredentials),
-			TargetPort:           placement.TargetPort,
-			AutoPauseMemory:      autoPauseMemory, IdleTimeout: types.CloneIdleTimeout(idleTimeout),
+			CreateCredentials:    cloneCreateCredentials(selectedCredentials), WorkspacesDigest: workspaceDigest,
+			TargetPort:      placement.TargetPort,
+			AutoPauseMemory: autoPauseMemory, IdleTimeout: types.CloneIdleTimeout(idleTimeout),
 			AutoReset: autoReset,
 		}
 		copyRouteCredentials(reserved, selectedReplacement)
@@ -919,23 +957,6 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return err
 		}
 
-		stableID := sandboxID
-		if selectedReplacement != nil {
-			stableID = selectedReplacement.StableID
-		}
-		if stableID != sandboxID {
-			return errors.New("registry: stable ID does not match SandboxID")
-		}
-		cmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
-			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config,
-			Cluster: &routesync.ClusterSandboxContext{
-				Group: group, RouteKey: routeKey, StableID: stableID,
-			},
-			APISecretFingerprint: placement.APISecretFingerprint,
-			AutoPauseMemory:      cloneOptionalBool(&autoPauseMemory), IdleTimeout: types.CloneIdleTimeout(idleTimeout),
-			AutoReset: cloneOptionalBool(&autoReset),
-		}
 		if r.nodeOwner == nil {
 			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
 				replaceReady, replaceReady != nil, true) {

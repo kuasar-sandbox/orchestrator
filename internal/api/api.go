@@ -24,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // configHeaderNs maps each X-Kuasar-Sandbox-<Ns> request header to the namespaced
@@ -68,6 +69,10 @@ func singleOptionalHeader(h http.Header, name string) (*string, error) {
 // whole-value header precedence. Presence is checked explicitly so an empty
 // leaf-merged header fails strict parsing instead of disappearing.
 func mergeConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
+	meta, err := workspace.WithHeader(meta, h)
+	if err != nil {
+		return nil, err
+	}
 	out, err := sandboxcfg.MergeMetadata(nil, meta)
 	if err != nil {
 		return nil, err
@@ -306,6 +311,7 @@ type BuildAuth struct {
 // is registered. The e2b-compatible HTTP boundary supplies ProfileE2B when the
 // request omits profile; downstream build records always carry it explicitly.
 type RegisterSpec struct {
+	Workspaces []workspace.Entry
 	Name       string
 	Tags       []string
 	Profile    types.Profile
@@ -339,6 +345,7 @@ type BuildLogEntry struct {
 
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
+	Workspaces      []workspace.Entry `json:"-"`
 	AutoReset       bool              `json:"autoReset,omitempty"`
 	MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
 	TemplateID      string            `json:"templateID"`
@@ -385,6 +392,7 @@ const (
 // on the target resource and treats a mismatch as not-found. Create/RegisterBuild
 // additionally require the APISecret/ManifestKey pair to be allowlisted.
 type Core interface {
+	workspaceCore
 	SandboxHoldCore
 	Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) // req.APIKey carries the key
 	Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error)
@@ -506,6 +514,9 @@ func (a *API) Handler() http.Handler {
 	// Sandbox export / import (orchestrator extension; api-key authed like the rest,
 	// so it scopes to the caller's own sandboxes). Reached over both the TLS api
 	// listener and the local control socket's api plane.
+	mux.HandleFunc("GET /sandboxes/{id}/workspaces", a.auth(a.listWorkspaces))
+	mux.HandleFunc("POST /sandboxes/{id}/workspaces/attach", a.auth(a.attachWorkspace))
+	mux.HandleFunc("POST /sandboxes/{id}/workspaces/export", a.auth(a.exportWorkspace))
 	mux.HandleFunc("POST /sandboxes/{id}/export", a.auth(a.exportSandbox))
 	mux.HandleFunc("DELETE /sandboxes/{id}/checkpoints/{checkpointID}", a.auth(a.deleteCheckpoint))
 	mux.HandleFunc("POST /sandboxes/import", a.auth(a.importSandbox))
@@ -587,6 +598,11 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	req.Metadata, err = mergeCreateConfigHeaders(req.Metadata, r.Header)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Metadata, req.Workspaces, err = workspace.Extract(req.Metadata)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid workspace declaration")
 		return
 	}
 	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
@@ -1000,8 +1016,17 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	meta, workspaces, err := workspace.Extract(meta)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid workspace declaration")
+		return
+	}
 	meta, builderOpts, err := buildcfg.Extract(meta)
 	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := types.ValidateWorkspaceBuildTarget(builderOpts.Target, len(workspaces) != 0); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1033,7 +1058,7 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
 		Name: body.Name, Tags: body.Tags, Profile: profile, Resources: resources,
 		Metadata: meta, EnvVars: body.EnvVars, Secure: body.Secure,
-		Builder: builderOpts, MMDSHeader: mmdsValue,
+		Builder: builderOpts, MMDSHeader: mmdsValue, Workspaces: workspaces,
 	})
 	if err != nil {
 		a.fail(w, err)
@@ -1441,7 +1466,7 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d["diskSizeMB"] = a.res.DiskMB
 	d["startedAt"] = isoUnix(sb.CreatedUnix)
 	d["endAt"] = isoUnix(sandboxEndUnix(sb))
-	d["metadata"] = sb.Metadata
+	d["metadata"] = workspace.PublicMetadata(sb.Metadata)
 	addSandboxTerminalFields(d, sb)
 	return d
 }
@@ -1464,7 +1489,7 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 		"envdVersion": a.envdVersion(sb),
 		"startedAt":   isoUnix(sb.CreatedUnix),
 		"endAt":       isoUnix(sandboxEndUnix(sb)),
-		"metadata":    sb.Metadata,
+		"metadata":    workspace.PublicMetadata(sb.Metadata),
 	}
 	addSandboxTerminalFields(d, sb)
 	return d
@@ -1512,6 +1537,12 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, types.ErrMemoryUnavailable.Error())
 	case errors.Is(err, types.ErrLaunchModeConflict):
 		writeErr(w, http.StatusConflict, types.ErrLaunchModeConflict.Error())
+	case errors.Is(err, ErrWorkspaceConflict):
+		writeErr(w, http.StatusConflict, ErrWorkspaceConflict.Error())
+	case errors.Is(err, ErrWorkspaceGeneration):
+		writeErr(w, http.StatusPreconditionFailed, ErrWorkspaceGeneration.Error())
+	case errors.Is(err, ErrWorkspaceUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, ErrWorkspaceUnavailable.Error())
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, 404, "not found")
 	case errors.Is(err, ErrNotAllowed):

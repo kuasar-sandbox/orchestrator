@@ -40,6 +40,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -74,13 +76,14 @@ type Result struct {
 }
 
 type buildPipeline struct {
-	parent    context.Context
-	spec      *configsock.BuildSpec
-	vmmCgroup *os.File
-	report    PhaseReporter
-	log       *slog.Logger
-	out       *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
-	profile   types.Profile
+	workspaceBindings []ctl.BindDiskRequest
+	parent            context.Context
+	spec              *configsock.BuildSpec
+	vmmCgroup         *os.File
+	report            PhaseReporter
+	log               *slog.Logger
+	out               *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
+	profile           types.Profile
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -179,6 +182,10 @@ func (p *buildPipeline) run() (res Result) {
 			}
 		}
 	}()
+
+	if err := p.prepareWorkspaces(); err != nil {
+		return fail(err)
+	}
 
 	if s.FromImage != "" {
 		if err := p.runPhase("a", p.phaseImport); err != nil {
@@ -341,6 +348,14 @@ func (p *buildPipeline) resolveTarget() error {
 			return fmt.Errorf("explicit image target conflicts with trigger start/ready commands")
 		}
 		p.startCmd, p.readyCmd = "", ""
+	}
+	captured, err := workspace.Captured(p.spec.SourceSandboxConfig)
+	if err != nil {
+		return err
+	}
+	hasWorkspace := len(p.spec.SandboxSpec.WorkspacePlan) > 0 || len(captured) > 0
+	if err := types.ValidateWorkspaceBuildTarget(p.spec.RequestedTarget, hasWorkspace); err != nil {
+		return err
 	}
 	p.target = types.ResolveBuildTarget(p.spec.RequestedTarget, p.startCmd, p.readyCmd)
 	if err := p.target.Validate(); err != nil {

@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // This file makes the orchestrator the node side of the cluster node-link
@@ -36,6 +37,13 @@ import (
 func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	// The node-link wire enforces the same complete-token bound, but keep the
 	// command entry defensive for direct callers and tests that bypass framing.
+	if cmd != nil && (cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdBuildRegister) {
+		if err := workspace.CheckEnvelope(cmd.Config, cmd.Workspaces); err != nil {
+			return reject(cmd, fmt.Errorf("%w: %v", api.ErrBadRequest, err))
+		}
+	} else if cmd != nil && cmd.Workspaces != nil {
+		return reject(cmd, api.ErrBadRequest)
+	}
 	if cmd != nil && len(cmd.MigrationToken) > migrationtoken.MaxWireSize {
 		return reject(cmd, migrationtoken.ErrTokenTooLarge)
 	}
@@ -274,6 +282,9 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 	if err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
+	if err := sandboxcfg.ValidateWorkspaceMetadata(spec); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
@@ -288,11 +299,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		if err := o.validateBuildOptions(builderOpts, false); err != nil {
 			return err
 		}
-		target := builderOpts.Target
-		if target == nil && profile == types.ProfileBare {
-			target = &types.BuildTarget{Kind: types.BuildTargetImage}
-		}
-		if err := validateBuildTargetConfig(target, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
+		if err := validateRegistrationTargetConfig(builderOpts.Target, profile, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
 			return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 		}
 	}
@@ -356,6 +363,11 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		b = modified
 		resources = b.Resources
 		mmdsDoc = final.mmds
+	}
+	if existing == nil {
+		if err := o.prepareBuildWorkspaces(ctx, b, cmd.Workspaces); err != nil {
+			return err
+		}
 	}
 	initialMMDS, err := o.validateInitialBuildMMDS(b, mmdsDoc)
 	if err != nil {

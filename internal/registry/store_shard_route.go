@@ -314,6 +314,7 @@ func stripProtectedSandboxFields(route *SandboxRecord) {
 	route.APISecretFingerprint = ""
 	route.ManifestKeyFingerprint = ""
 	route.CreateCredentials = nil
+	route.WorkspacesDigest = ""
 	route.StableID = ""
 	route.APISecret = ""
 	route.ServiceSecret = ""

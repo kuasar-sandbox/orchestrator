@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"time"
 
 	"github.com/google/uuid"
@@ -82,6 +83,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		req.AutoReset = candidate.AutoReset
 		req.IdleTimeout = types.CloneIdleTimeout(candidate.IdleTimeout)
 	}
+	normalized.Workspaces = req.Workspaces
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
 		ID: sid, StableID: identity.StableID, Template: tmpl, Pair: pair,
 		Config: normalized, Env: req.EnvVars, TimeoutSeconds: req.TimeoutSec,
@@ -129,6 +131,7 @@ func (o *Orchestrator) normalizeSandboxCreateDefinition(
 // sandboxCreateConfig is pure validation output. It keeps extracted credentials
 // separate from metadata and never mutates a request/Command to pass results.
 type sandboxCreateConfig struct {
+	Workspaces  []workspace.Entry
 	Metadata    map[string]string
 	Credentials sandboxcfg.Credentials
 }
@@ -163,6 +166,9 @@ func (o *Orchestrator) normalizeSandboxCreateConfig(profile types.Profile, metad
 	}
 	spec, err := sandboxcfg.ParseSpec(metadata)
 	if err != nil {
+		return sandboxCreateConfig{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := sandboxcfg.ValidateWorkspaceMetadata(spec); err != nil {
 		return sandboxCreateConfig{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
@@ -213,6 +219,9 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 		APISecret: spec.Pair.APISecret, ManifestKey: spec.Pair.ManifestKey,
 		Metadata: cloneStringMap(spec.Config.Metadata), Env: cloneStringMap(spec.Env),
 		CreatedUnix: now.Unix(), DeadlineUnix: now.Add(time.Duration(spec.TimeoutSeconds) * time.Second).Unix(),
+	}
+	if err := o.prepareCreateWorkspaces(ctx, sb, spec.Config.Workspaces, spec.Template.Kind == types.KindImg); err != nil {
+		return nil, nil, err
 	}
 	if spec.Cluster != nil {
 		cluster := *spec.Cluster

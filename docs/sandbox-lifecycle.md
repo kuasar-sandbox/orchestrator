@@ -223,6 +223,46 @@ The cold-image background path retains its single-stage fast path: prepare resou
 
 <a id="capture-and-pause"></a>
 
+## Workspace storage
+
+A workspace gives one named data disk one or more paths inside the guest. An application can write to these paths, pause sandbox A and pass the disk to sandbox B. B can use different guest paths. Each consumer gets its own writable layer.
+
+Declare workspaces in the existing `POST /sandboxes` or `POST /v3/templates` request. Send a JSON array in `X-Kuasar-Sandbox-Workspace`, or encode the same array as the string value of `metadata["kuasar-sandbox.workspace"]`. The header takes precedence. For example, send this array as a single-line header to reserve a device before assigning work:
+
+```json
+[{"name":"project","mounts":[{"path":"/data","subpath":"src"},{"path":"/work/results","subpath":"results"}],"slot":{}}]
+```
+
+Each `path` is an absolute guest directory. Each `subpath` is relative to the disk root. Omitting `subpath` mounts the root. Choose non-overlapping guest paths across disks and non-overlapping subpaths within each disk. A sandbox supports eight extra disks in total. Public sandbox and template metadata retain the names and mounts.
+
+| Create choice | Result |
+|---|---|
+| `"slot":{}` | Reserve an unattached device and its guest paths. The disk supplied on attach determines its size. `"slot":{"size":"8GiB"}` requires exactly that capacity. |
+| `"disk":{}` | Initialize a private disk from the node's configured default. |
+| `"disk":{"migrationToken":"…"}` | Initialize a private writer over the disk exported by another sandbox with the same tenant credentials. |
+| `"disk":{…DiskV1…}` | Use a complete authorized disk with `kind:"disk"` and `version:1`. Include `base` and any `base_from_refs` in newest-to-oldest order, or use an authorized `diff_template`. The optional `size` asserts capacity in bytes. |
+| Neither field | On an image, reserve the device. On a sandbox or snapshot template, inherit the captured device and its data. |
+
+On an SBX or SNP template, select an existing empty device by name, for example `[{"name":"project","disk":{}}]`. Omit `mounts` to inherit its topology. The conductor waits for the bind acknowledgement before reporting `running`. Use a captured attached device as it stands. When building a template that declares or inherits a workspace, specify `builder.target` at registration. For example, send `{"target":{"kind":"sandbox","memory":false}}` in the `X-Kuasar-Sandbox-Builder` header or as the string value of `metadata["kuasar-sandbox.builder"]` to produce SBX. Set `memory` to `true` for SNP. Omitting `target` fails even if a start or ready command is present.
+
+| Operation | API | node-ctl |
+|---|---|---|
+| Inspect current devices | `GET /sandboxes/{id}/workspaces` | `node-ctl workspace list B --json` |
+| Attach to an empty device in a running sandbox | `POST /sandboxes/{id}/workspaces/attach?name=project` with `{"disk":{}}`, a complete disk in `disk` or `{"disk":{"migrationToken":"…"}}` | `node-ctl workspace attach B --name project`; use `--disk-spec FILE` or `--token-file FILE` to select another source |
+| Export an attached device from a paused sandbox | `POST /sandboxes/{id}/workspaces/export?name=project` with `{}` returns `{"token":"…"}` | `node-ctl workspace export A --name project`; `--json` returns the token envelope |
+
+Use the owner's `E2B_API_KEY`. Once A has synced application writes and paused, B can receive the disk through stdin:
+
+```bash
+set -o pipefail
+node-ctl workspace export "$A" --name project |
+  node-ctl workspace attach "$B" --name project --token-file -
+```
+
+Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. B's guest paths become available after the attach acknowledgement (204). The guest mounts the filesystem on first access. An unattached path rejects access.
+
+The list reports `unattached`, `attaching` or `attached`, and `sizeBytes` when known. While running it also returns `runGeneration`. Pin a retry to this value with `--if-generation G` or `X-Kuasar-Run-Generation: G`. The API returns 412 if the generation changed, 409 for a conflicting disk or sandbox state, and 503 when it cannot confirm the owner's state.
+
 ## Capture and Pause
 
 Create autoPauseMemory has tri-state parsing:
@@ -899,6 +939,7 @@ Each instance receives configuration through reserved e2b metadata namespaces `k
 | restore | Current host prefetch policy: optional, explicit off/memory only |
 | credentials | Create-time ServiceSecret and Envd/Traffic overrides, separated from ordinary metadata and never guest config |
 | checkpoint | Host-only Create-local Pause defaults: merge_ref/drop_caches true/false/null; Sandbox row only, not runtime YAML/snapshot.cfg |
+| workspace | Portable data-disk names and mounts; create selectors are private. See [Workspace storage](#workspace-storage). |
 | mmds | Portable exact routes plus request-scoped initial secrets; split before persistence so metadata retains routes only |
 
 Field definitions follow their capability: [resource patches and precedence](node-resource.md#request-resources), [traffic limits](node-proxy.md#request-traffic), [MMDS](node-proxy.md#request-mmds), [credential overrides](node-proxy.md#request-credentials), and [cluster system context](cluster.md#node-system-context). This section defines shared input assembly, restore and checkpoint policy.

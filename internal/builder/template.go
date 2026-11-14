@@ -44,6 +44,9 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	if err := sb.waitRuntimeReady(bootCtx); err != nil {
 		return "", err
 	}
+	if err := p.bindTemplateDisks(); err != nil {
+		return "", err
+	}
 	if p.profile == types.ProfileE2B {
 		if err := p.waitEnvd(bootCtx, envdUDS); err != nil {
 			return "", err

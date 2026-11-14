@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"os"
 	"path/filepath"
 	"sort"
@@ -639,7 +640,24 @@ func summarizeDiskTopology(cfg *rtconfig.PortableSandboxConfig) (types.ArtifactD
 	topology.Disks = make([]types.ArtifactDiskShape, len(cfg.Boot.Disks))
 	for i := range cfg.Boot.Disks {
 		disk := &cfg.Boot.Disks[i]
-		topology.Disks[i] = shape(disk.Name, disk.PortableRootConfig)
+		d := shape(disk.Name, disk.PortableRootConfig)
+		d.Slot = disk.Slot != nil
+		if d.Slot {
+			d.Bound = disk.Binding != nil
+			size, err := disk.Slot.Capacity()
+			if err != nil {
+				return types.ArtifactDiskTopology{}, err
+			}
+			d.SlotSize = size
+		}
+		topology.Disks[i] = d
+	}
+	entries, err := workspace.Captured(cfg)
+	if err != nil {
+		return types.ArtifactDiskTopology{}, err
+	}
+	if len(entries) > 0 {
+		topology.WorkspaceTopology = workspace.TopologyJSON(entries)
 	}
 	return topology, nil
 }

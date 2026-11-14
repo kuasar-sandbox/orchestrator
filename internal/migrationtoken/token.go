@@ -126,6 +126,10 @@ func seal(random io.Reader, material KeyMaterial, payload MigrationTokenPayloadV
 	if err != nil {
 		return "", fmt.Errorf("%w: cannot encode JSON", ErrInvalidPayload)
 	}
+	return sealEnvelope(random, wirePrefix, key, plaintext, nil)
+}
+
+func sealEnvelope(random io.Reader, prefix string, key, plaintext, aad []byte) (string, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", ErrInvalidKeyMaterial
@@ -138,11 +142,11 @@ func seal(random io.Reader, material KeyMaterial, payload MigrationTokenPayloadV
 	if _, err := io.ReadFull(random, nonce); err != nil {
 		return "", fmt.Errorf("migrationtoken: generate nonce: %w", err)
 	}
-	sealed := gcm.Seal(nil, nonce, plaintext, nil)
+	sealed := gcm.Seal(nil, nonce, plaintext, aad)
 	wire := make([]byte, 0, len(nonce)+len(sealed))
 	wire = append(wire, nonce...)
 	wire = append(wire, sealed...)
-	token := wirePrefix + base64.RawURLEncoding.EncodeToString(wire)
+	token := prefix + base64.RawURLEncoding.EncodeToString(wire)
 	if len(token) > MaxWireSize {
 		return "", ErrTokenTooLarge
 	}
@@ -158,32 +162,9 @@ func Open(material KeyMaterial, token string) (MigrationTokenPayloadV1, error) {
 		return zero, err
 	}
 
-	encoded, ok := strings.CutPrefix(token, wirePrefix)
-	if !ok || encoded == "" {
-		return zero, ErrMalformedToken
-	}
-	if len(token) > MaxWireSize {
-		return zero, ErrTokenTooLarge
-	}
-	wire, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || base64.RawURLEncoding.EncodeToString(wire) != encoded {
-		return zero, ErrMalformedToken
-	}
-	if len(wire) < nonceSize+16 {
-		return zero, ErrMalformedToken
-	}
-
-	block, err := aes.NewCipher(key)
+	plaintext, err := openEnvelope(token, wirePrefix, key, nil)
 	if err != nil {
-		return zero, ErrInvalidKeyMaterial
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return zero, ErrInvalidKeyMaterial
-	}
-	plaintext, err := gcm.Open(nil, wire[:nonceSize], wire[nonceSize:], nil)
-	if err != nil {
-		return zero, ErrAuthentication
+		return zero, err
 	}
 	payload, err := parsePayload(plaintext)
 	if err != nil {
@@ -197,6 +178,37 @@ func Open(material KeyMaterial, token string) (MigrationTokenPayloadV1, error) {
 		return zero, ErrCredentialMismatch
 	}
 	return payload, nil
+}
+
+func openEnvelope(token, prefix string, key, aad []byte) ([]byte, error) {
+	encoded, ok := strings.CutPrefix(token, prefix)
+	if !ok || encoded == "" {
+		return nil, ErrMalformedToken
+	}
+	if len(token) > MaxWireSize {
+		return nil, ErrTokenTooLarge
+	}
+	wire, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || base64.RawURLEncoding.EncodeToString(wire) != encoded {
+		return nil, ErrMalformedToken
+	}
+	if len(wire) < nonceSize+16 {
+		return nil, ErrMalformedToken
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, ErrInvalidKeyMaterial
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, ErrInvalidKeyMaterial
+	}
+	plaintext, err := gcm.Open(nil, wire[:nonceSize], wire[nonceSize:], aad)
+	if err != nil {
+		return nil, ErrAuthentication
+	}
+	return plaintext, nil
 }
 
 // ValidateExpectations compares an already authenticated payload with trusted

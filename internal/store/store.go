@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   envd_access_token_enc    TEXT NOT NULL,
   traffic_access_token_enc TEXT NOT NULL,
   forward_access_token_enc TEXT NOT NULL,
+  workspace_plan_enc TEXT NOT NULL DEFAULT '',
   metadata_json        TEXT NOT NULL DEFAULT '{}',
   env_json             TEXT NOT NULL DEFAULT '{}',
   created_unix         INTEGER NOT NULL,
@@ -96,6 +98,13 @@ CREATE INDEX IF NOT EXISTS idx_sandboxes_ashash ON sandboxes(api_secret_hash);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_ascandidate ON sandboxes(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_sandboxes_mkhash ON sandboxes(manifest_key_hash);
 
+CREATE TABLE IF NOT EXISTS workspace_defaults (
+  sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  source_enc TEXT NOT NULL,
+  PRIMARY KEY(sandbox_id,name)
+);
 CREATE TABLE IF NOT EXISTS sandbox_checkpoints (
  sandbox_id TEXT PRIMARY KEY REFERENCES sandboxes(id) ON DELETE CASCADE,
  checkpoint_id TEXT NOT NULL,
@@ -238,6 +247,10 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	// independent additive migrations: there is no safe plaintext backfill for
 	// instance_config_enc and no legacy Build reader/writer path.
 	if err := requireColumn(ctx, db, "builds", "instance_config_enc"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "sandboxes", "workspace_plan_enc", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -583,11 +596,12 @@ func ub(s string) types.BuildOptions {
 }
 
 type buildInstanceConfig struct {
-	Env                map[string]string `json:"env,omitempty"`
-	Secure             bool              `json:"secure,omitempty"`
-	ServiceSecret      string            `json:"service_secret,omitempty"`
-	EnvdAccessToken    string            `json:"envd_access_token,omitempty"`
-	TrafficAccessToken string            `json:"traffic_access_token,omitempty"`
+	WorkspacePlan      []workspace.Prepared `json:"workspaces,omitempty"`
+	Env                map[string]string    `json:"env,omitempty"`
+	Secure             bool                 `json:"secure,omitempty"`
+	ServiceSecret      string               `json:"service_secret,omitempty"`
+	EnvdAccessToken    string               `json:"envd_access_token,omitempty"`
+	TrafficAccessToken string               `json:"traffic_access_token,omitempty"`
 }
 
 // --- sandboxes ---
@@ -598,8 +612,8 @@ const sandboxInsertSQL = `
 	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,
 	  sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
-	  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,workspace_plan_enc)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -619,6 +633,22 @@ ON CONFLICT(id) DO UPDATE SET
 
 const sandboxInsertOnlySQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO NOTHING`
+
+func workspacePlanAAD(sb *types.Sandbox) []byte {
+	binding, _ := json.Marshal([]string{"workspace-plan", sb.ID, sb.InstanceID})
+	return binding
+}
+
+func (s *Store) encryptWorkspacePlan(sb *types.Sandbox) (string, error) {
+	if len(sb.WorkspacePlan) == 0 {
+		return "", nil
+	}
+	data, err := json.Marshal(sb.WorkspacePlan)
+	if err != nil {
+		return "", err
+	}
+	return s.box.EncryptAAD(data, workspacePlanAAD(sb))
+}
 
 func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	if sb != nil {
@@ -681,6 +711,10 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encrypt forward access token: %w", err)
 	}
+	planEnc, err := s.encryptWorkspacePlan(sb)
+	if err != nil {
+		return nil, err
+	}
 	resultJSON, err := sandboxExecutionResultJSON(sb.ExecutionResult)
 	if err != nil {
 		return nil, err
@@ -697,7 +731,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
 		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix, resultRunID, resultJSON,
 		sb.PauseReason, sb.ResourceObligation, sb.PressureVersion, sb.RunningSinceUnixNano, sb.PressureSinceUnixNano,
-		sb.InstanceID, sb.AutoReset, sb.DeadRunID, sb.DeadToken, sb.ResetID, sb.ResetState, sb.ResetAutomatic, sb.ResetError, sb.AutoResetError,
+		sb.InstanceID, sb.AutoReset, sb.DeadRunID, sb.DeadToken, sb.ResetID, sb.ResetState, sb.ResetAutomatic, sb.ResetError, sb.AutoResetError, planEnc,
 	}, nil
 }
 
@@ -1086,12 +1120,16 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 			return false, errors.New("store: prepared source differs from initial template")
 		}
 	}
+	planEnc, err := s.encryptWorkspacePlan(expected)
+	if err != nil {
+		return false, err
+	}
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes SET state=?, launch_mode='', pause_reason='', resource_obligation=0, pressure_version=pressure_version+1, pressure_since_ns=0, running_since_ns=?, resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?
+		UPDATE sandboxes SET state=?, launch_mode='', pause_reason='', resource_obligation=0, pressure_version=pressure_version+1, pressure_since_ns=0, running_since_ns=?, resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?,metadata_json=?,workspace_plan_enc=?
 		 WHERE id=? AND state=? AND run_id=? AND launch_mode=? AND template_id=? AND created_unix=?
 		   AND sandbox_result_run_id=''
 		   AND resume_source_kind=? AND resume_source_ref=? AND resume_sandbox_ref=?`,
-		string(types.StateRunning), time.Now().UnixNano(), string(source.Kind), source.Ref, source.SandboxRef,
+		string(types.StateRunning), time.Now().UnixNano(), string(source.Kind), source.Ref, source.SandboxRef, mj(expected.Metadata), planEnc,
 		expected.ID, string(types.StateStarting), expected.RunID, string(expected.LaunchMode), expected.TemplateID, expected.CreatedUnix,
 		string(expected.ResumeSource.Kind), expected.ResumeSource.Ref, expected.ResumeSource.SandboxRef)
 	if err != nil {
@@ -1423,10 +1461,11 @@ var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,sta
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
-  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,hold_value`
+  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,hold_value,workspace_plan_enc`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
+	var planEnc string
 	var profile, clusterGroup, clusterRouteKey, st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
 	var resumeSourceKind, launchMode, sandboxResultRunID, sandboxResultJSON string
 	var autoPauseMemory bool
@@ -1438,7 +1477,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.IdleTimeout, &sb.MaxCheckpoints, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano,
-		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError, &sb.HoldValue); err != nil {
+		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError, &sb.HoldValue, &planEnc); err != nil {
 		return nil, err
 	}
 	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
@@ -1483,7 +1522,16 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	if err := validateSandboxLifecycle(&sb); err != nil {
 		return nil, fmt.Errorf("store: sandbox %s has invalid lifecycle state: %w", sb.ID, err)
 	}
-	sb.Metadata, sb.Env = uj(meta), uj(env)
+	sb.Metadata, sb.Env = workspace.PublicMetadata(uj(meta)), uj(env)
+	if planEnc != "" {
+		plain, err := s.box.DecryptAAD(planEnc, workspacePlanAAD(&sb))
+		if err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal(plain, &sb.WorkspacePlan); err != nil {
+			return nil, err
+		}
+	}
 	result, err := parseSandboxExecutionResult(sandboxResultJSON)
 	if err != nil {
 		return nil, fmt.Errorf("store: sandbox %s has corrupt execution result: %w", sb.ID, err)
@@ -1748,7 +1796,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		return nil, err
 	}
 	b.ExecutionClaimed = executionClaimed != 0
-	b.Metadata = uj(meta)
+	b.Metadata = workspace.PublicMetadata(uj(meta))
 	b.Builder = ub(builder)
 	plain, err := s.box.DecryptString(instanceConfigEnc)
 	if err != nil {
@@ -1758,6 +1806,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 	if err := json.Unmarshal([]byte(plain), &instance); err != nil {
 		return nil, fmt.Errorf("store: decode instance config for build %s: %w", b.BuildID, err)
 	}
+	b.WorkspacePlan = instance.WorkspacePlan
 	b.Env, b.Secure = instance.Env, instance.Secure
 	b.ServiceSecret, b.EnvdAccessToken, b.TrafficAccessToken = instance.ServiceSecret, instance.EnvdAccessToken, instance.TrafficAccessToken
 	if steps != "" && steps != "[]" {
@@ -1884,7 +1933,8 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		executionResultJSON = string(encoded)
 	}
 	instanceJSON, err := json.Marshal(buildInstanceConfig{
-		Env: b.Env, Secure: b.Secure, ServiceSecret: b.ServiceSecret,
+		WorkspacePlan: b.WorkspacePlan,
+		Env:           b.Env, Secure: b.Secure, ServiceSecret: b.ServiceSecret,
 		EnvdAccessToken: b.EnvdAccessToken, TrafficAccessToken: b.TrafficAccessToken,
 	})
 	if err != nil {

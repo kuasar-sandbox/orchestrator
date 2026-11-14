@@ -6,6 +6,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 // BuildStore is the registry-facing routing view of build execution state. Builds
@@ -56,7 +57,9 @@ type BuildRecord struct {
 	// registrationCredentials follows the same request-scoped replay boundary:
 	// only its digest is replicated, while the selected node persists the values
 	// encrypted in its Build record.
-	registrationCredentials *sandboxcfg.Credentials
+	registrationCredentials      *sandboxcfg.Credentials
+	RegistrationWorkspacesDigest string `json:"registration_workspaces_digest,omitempty"`
+	registrationWorkspaces       []workspace.Entry
 }
 
 // occupies reports whether the registry still considers the build live for node
