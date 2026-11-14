@@ -463,15 +463,13 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 			accepted, err := o.fenceAcceptedBuildResult(unit, *early)
 			return accepted, "", false, nil, buildFailed("runtime", err)
 		}
-		artifactCapacity, inheritedNetwork, prepareErr := validateBuildPrepareSummary(summary)
+		artifactCapacity, inheritedNetwork, prepareErr := pend.prepareSourceSummary(summary)
 		err = prepareErr
 		if err != nil {
 			return nil, "", false, nil, buildFailed("artifact_prepare", err)
 		}
 		inherited = inheritedNetwork
-		pend.sourceHasWorkspaces = summary.DiskTopology.WorkspaceTopology != ""
-		pend.sourceHasBuildCommands = summary.HasBuildCommands
-		if buildProducesSandbox(build, pend.sourceHasBuildCommands) || (build.Builder.Target == nil && pend.sourceHasWorkspaces) {
+		if buildProducesSandbox(build, pend.sourceHasBuildCommands) {
 			pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
 			if err != nil {
 				return nil, "", false, nil, buildFailed("resource_resolve", err)

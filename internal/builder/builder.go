@@ -354,7 +354,10 @@ func (p *buildPipeline) resolveTarget() error {
 		return err
 	}
 	hasWorkspace := len(p.spec.SandboxSpec.WorkspacePlan) > 0 || len(captured) > 0
-	p.target = types.ResolveWorkspaceBuildTarget(p.spec.RequestedTarget, p.startCmd, p.readyCmd, hasWorkspace)
+	if err := types.ValidateWorkspaceBuildTarget(p.spec.RequestedTarget, hasWorkspace); err != nil {
+		return err
+	}
+	p.target = types.ResolveBuildTarget(p.spec.RequestedTarget, p.startCmd, p.readyCmd)
 	if err := p.target.Validate(); err != nil {
 		return err
 	}

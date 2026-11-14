@@ -163,13 +163,7 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err := o.validateBuildOptions(builder, false); err != nil {
 		return nil, err
 	}
-	target := builder.Target
-	if target == nil && profile == types.ProfileBare {
-		// Bare auto is known at registration. Keep the requested target intact.
-		resolved := types.ResolveWorkspaceBuildTarget(nil, "", "", metadata[workspace.Namespace] != "" && metadata[workspace.Namespace] != "[]")
-		target = &resolved
-	}
-	if err := validateBuildTargetConfig(target, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
+	if err := validateRegistrationTargetConfig(builder.Target, profile, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	return &normalizedBuildRegistration{
@@ -180,6 +174,23 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 		env: cloneStringMap(request.Env), secure: request.Secure, builder: builder,
 		mmds: mmdsDoc, credentials: credentials,
 	}, nil
+}
+
+func validateRegistrationTargetConfig(target *types.BuildTarget, profile types.Profile, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
+	if raw, ok := metadata[workspace.Namespace]; ok {
+		entries, err := workspace.Parse(raw)
+		if err != nil {
+			return err
+		}
+		if err := types.ValidateWorkspaceBuildTarget(target, len(entries) != 0); err != nil {
+			return err
+		}
+	}
+	if target == nil && profile == types.ProfileBare {
+		resolved := types.ResolveBuildTarget(nil, "", "")
+		target = &resolved
+	}
+	return validateBuildTargetConfig(target, metadata, env, secure, mmds, credentials)
 }
 
 func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
@@ -196,7 +207,7 @@ func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[stri
 		for _, namespace := range []string{
 			sandboxcfg.NsResource, sandboxcfg.NsTraffic,
 			sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
-			sandboxcfg.NsFiles, sandboxcfg.NsMetadata, workspace.Namespace, sandboxcfg.NsCheckpoint,
+			sandboxcfg.NsFiles, sandboxcfg.NsMetadata, sandboxcfg.NsCheckpoint,
 			sandboxcfg.NsMMDS,
 		} {
 			if _, present := metadata[namespace]; present {
@@ -225,7 +236,7 @@ func validateKnownBuildTargetConfig(build *types.Build) error {
 		if build.Profile == types.ProfileE2B && build.StartCmd == "" && build.ReadyCmd == "" && buildSourceMayInheritCommands(build) {
 			return nil
 		}
-		resolved := types.ResolveWorkspaceBuildTarget(nil, build.StartCmd, build.ReadyCmd, len(build.WorkspacePlan) > 0)
+		resolved := types.ResolveBuildTarget(nil, build.StartCmd, build.ReadyCmd)
 		target = &resolved
 	}
 	return validateBuildTargetConfig(target, build.Metadata, build.Env, build.Secure,

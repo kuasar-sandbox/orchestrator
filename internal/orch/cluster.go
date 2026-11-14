@@ -299,12 +299,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		if err := o.validateBuildOptions(builderOpts, false); err != nil {
 			return err
 		}
-		target := builderOpts.Target
-		if target == nil && profile == types.ProfileBare {
-			resolved := types.ResolveWorkspaceBuildTarget(nil, "", "", len(cmd.Workspaces) > 0)
-			target = &resolved
-		}
-		if err := validateBuildTargetConfig(target, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
+		if err := validateRegistrationTargetConfig(builderOpts.Target, profile, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
 			return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 		}
 	}

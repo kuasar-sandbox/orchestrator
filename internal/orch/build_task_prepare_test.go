@@ -31,6 +31,32 @@ func validBuildPrepareSummary() configsock.ArtifactPrepareSummary {
 	}
 }
 
+func TestInheritedWorkspaceRequiresExplicitSandboxTargetAtPreparation(t *testing.T) {
+	summary := validBuildPrepareSummary()
+	summary.DiskTopology.WorkspaceTopology = `[{"name":"project","mounts":[{"path":"/project"}]}]`
+	summary.DiskTopology.Disks = []types.ArtifactDiskShape{{Name: "project", Mode: types.ArtifactDiskSingle, Slot: true}}
+	for _, requested := range []*types.BuildTarget{nil, {Kind: types.BuildTargetImage}, {Kind: types.BuildTargetSandbox}, {Kind: types.BuildTargetSandbox, Memory: true}} {
+		for _, commands := range []bool{false, true} {
+			summary.HasBuildCommands = commands
+			pending := &pendingBuild{build: &types.Build{Builder: types.BuildOptions{Target: requested}}}
+			_, _, err := pending.prepareSourceSummary(summary)
+			if requested == nil || requested.Kind == types.BuildTargetImage {
+				if err == nil || !strings.Contains(err.Error(), "builder.target") {
+					t.Fatalf("inherited workspace with target %+v, commands %t: %v", requested, commands, err)
+				}
+			} else if err != nil || !pending.sourceHasWorkspaces {
+				t.Fatalf("inherited workspace with explicit target %+v: %v", requested, err)
+			}
+		}
+	}
+	summary.DiskTopology.Disks = nil
+	summary.DiskTopology.WorkspaceTopology = "[]"
+	pending := &pendingBuild{build: &types.Build{}}
+	if _, _, err := pending.prepareSourceSummary(summary); err != nil || pending.sourceHasWorkspaces {
+		t.Fatalf("empty source workspace declarations: %v", err)
+	}
+}
+
 func TestBuildTaskHandoffIdenticalReplayReturnsOneFinalResult(t *testing.T) {
 	h := newBuildTaskHandoff(true, "", types.ResumeSource{})
 	summary := validBuildPrepareSummary()

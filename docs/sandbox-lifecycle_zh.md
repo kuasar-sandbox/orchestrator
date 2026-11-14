@@ -275,7 +275,7 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 | `"disk":{…DiskV1…}` | 传入已授权的完整磁盘，`kind` 为 `disk`，`version` 为 `1`。用 `base` 表示最上层，`base_from_refs` 从近到远列出依赖层，也可以使用已授权的 `diff_template`。`size` 是以字节为单位的可选容量断言。 |
 | 省略两者 | 从镜像创建时预留盘位，从 SBX 或 SNP 模板创建时继承捕获的设备和数据。 |
 
-从 SBX 或 SNP 模板创建时，可按名字选择模板中的空盘位，例如 `[{"name":"project","disk":{}}]`。省略 `mounts` 即继承其挂载拓扑。conductor 收到绑定确认后才提交 `running`。已绑定的设备按捕获状态继承。新模板使用自动目标选择时，声明 workspace 且没有 start/ready 命令会生成 SBX，有此类命令则生成 SNP。
+从 SBX 或 SNP 模板创建时，可按名字选择模板中的空盘位，例如 `[{"name":"project","disk":{}}]`。省略 `mounts` 即继承其挂载拓扑。conductor 收到绑定确认后才提交 `running`。已绑定的设备按捕获状态继承。构建声明或继承 workspace 的模板时，须在注册时显式指定 `builder.target`。例如，要生成 SBX，可将 `{"target":{"kind":"sandbox","memory":false}}` 放在 `X-Kuasar-Sandbox-Builder` 请求头中，或作为 `metadata["kuasar-sandbox.builder"]` 的字符串值传入。将 `memory` 设为 `true` 即可生成 SNP。即使存在 start 或 ready 命令，省略 `target` 也会报错。
 
 | 操作 | API | node-ctl |
 |---|---|---|

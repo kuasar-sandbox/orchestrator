@@ -27,12 +27,9 @@ func validateBuildResult(build *types.Build, result types.BuildResult) error {
 	if err := result.Target.Validate(); err != nil {
 		return fmt.Errorf("build result target: %w", err)
 	}
-	if requested := build.Builder.Target; requested != nil {
-		if result.Target != *requested {
-			return fmt.Errorf("build result target %+v differs from requested target %+v", result.Target, *requested)
-		}
-	} else {
-		hasWorkspace := len(build.WorkspacePlan) > 0
+	requested := build.Builder.Target
+	if requested == nil || requested.Kind == types.BuildTargetImage {
+		hasWorkspace := len(build.WorkspacePlan) != 0
 		if !hasWorkspace && build.RuntimePrepareJSON != "" {
 			prep, err := decodeBuildRuntimePreparation(build.RuntimePrepareJSON)
 			if err != nil {
@@ -40,7 +37,16 @@ func validateBuildResult(build *types.Build, result types.BuildResult) error {
 			}
 			hasWorkspace = prep.SourceHasWorkspaces
 		}
-		expected := types.ResolveWorkspaceBuildTarget(nil, result.StartCmd, result.ReadyCmd, hasWorkspace)
+		if err := types.ValidateWorkspaceBuildTarget(requested, hasWorkspace); err != nil {
+			return err
+		}
+	}
+	if requested != nil {
+		if result.Target != *requested {
+			return fmt.Errorf("build result target %+v differs from requested target %+v", result.Target, *requested)
+		}
+	} else {
+		expected := types.ResolveBuildTarget(nil, result.StartCmd, result.ReadyCmd)
 		if result.Target != expected {
 			return fmt.Errorf("build result target %+v differs from auto target %+v", result.Target, expected)
 		}

@@ -63,6 +63,9 @@ func TestWorkspaceCreateAndBuildSeparatePrivateInputs(t *testing.T) {
 			body, _ := json.Marshal(map[string]any{"cpuCount": 1, "memoryMB": 256, "metadata": map[string]string{workspace.Namespace: value, "plain": "ok"}})
 			r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
 			r.Header.Set("X-API-KEY", key)
+			if path == "/v3/templates" {
+				r.Header.Set("X-Kuasar-Sandbox-Builder", `{"target":{"kind":"sandbox"}}`)
+			}
 			if useHeader {
 				r.Header.Set(workspace.Header, declaration)
 			}
@@ -77,6 +80,24 @@ func TestWorkspaceCreateAndBuildSeparatePrivateInputs(t *testing.T) {
 			if w.Code != want || strings.Contains(w.Body.String(), token) || meta["plain"] != "ok" || meta[workspace.Namespace] != `[{"name":"w","mounts":[{"path":"/data","subpath":"project"}]}]` || len(entries) != 1 || !strings.Contains(string(entries[0].Disk), token) {
 				t.Fatalf("%s header=%t status=%d body=%s metadata=%v", path, useHeader, w.Code, w.Body, meta)
 			}
+		}
+	}
+}
+
+func TestWorkspaceRegistrationRejectsIncompatibleTarget(t *testing.T) {
+	for _, header := range []string{"", `{"target":{"kind":"image"}}`} {
+		core := new(workspaceTestCore)
+		handler, key := newSandboxContractHandler(t, core, Resources{})
+		req := httptest.NewRequest(http.MethodPost, "/v3/templates", strings.NewReader(`{"cpuCount":1,"memoryMB":256}`))
+		req.Header.Set("X-API-KEY", key)
+		req.Header.Set(workspace.Header, `[{"name":"work","mounts":[{"path":"/data"}]}]`)
+		if header != "" {
+			req.Header.Set("X-Kuasar-Sandbox-Builder", header)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "builder.target") || len(core.build.Workspaces) != 0 {
+			t.Fatalf("target %q: status %d, body %s", header, w.Code, w.Body)
 		}
 	}
 }

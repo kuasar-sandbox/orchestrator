@@ -243,7 +243,7 @@ Each `path` is an absolute guest directory. Each `subpath` is relative to the di
 | `"disk":{…DiskV1…}` | Use a complete authorized disk with `kind:"disk"` and `version:1`. Include `base` and any `base_from_refs` in newest-to-oldest order, or use an authorized `diff_template`. The optional `size` asserts capacity in bytes. |
 | Neither field | On an image, reserve the device. On a sandbox or snapshot template, inherit the captured device and its data. |
 
-On an SBX or SNP template, select an existing empty device by name, for example `[{"name":"project","disk":{}}]`. Omit `mounts` to inherit its topology. The conductor waits for the bind acknowledgement before reporting `running`. Use a captured attached device as it stands. For a new template, automatic target selection yields SBX when it carries workspaces and no start/ready command, or SNP when it has such a command.
+On an SBX or SNP template, select an existing empty device by name, for example `[{"name":"project","disk":{}}]`. Omit `mounts` to inherit its topology. The conductor waits for the bind acknowledgement before reporting `running`. Use a captured attached device as it stands. When building a template that declares or inherits a workspace, specify `builder.target` at registration. For example, send `{"target":{"kind":"sandbox","memory":false}}` in the `X-Kuasar-Sandbox-Builder` header or as the string value of `metadata["kuasar-sandbox.builder"]` to produce SBX. Set `memory` to `true` for SNP. Omitting `target` fails even if a start or ready command is present.
 
 | Operation | API | node-ctl |
 |---|---|---|

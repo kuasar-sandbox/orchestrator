@@ -1026,6 +1026,10 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := types.ValidateWorkspaceBuildTarget(builderOpts.Target, len(workspaces) != 0); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	bodyResources, err := buildcfg.ParseFirstClassResourceJSON(body.CPUCount, body.CPUCountSn, body.MemoryMB, body.MemoryMBSn)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

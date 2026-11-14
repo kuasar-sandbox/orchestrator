@@ -124,14 +124,19 @@ func ResolveBuildTarget(requested *BuildTarget, startCmd, readyCmd string) Build
 	return BuildTarget{Kind: BuildTargetImage}
 }
 
-// ResolveWorkspaceBuildTarget picks a disk-only Sandbox E when an automatic
-// target needs a workspace topology and has no memory-template commands.
-func ResolveWorkspaceBuildTarget(requested *BuildTarget, startCmd, readyCmd string, hasWorkspace bool) BuildTarget {
-	target := ResolveBuildTarget(requested, startCmd, readyCmd)
-	if requested == nil && hasWorkspace && target.Kind == BuildTargetImage {
-		return BuildTarget{Kind: BuildTargetSandbox}
+// ValidateWorkspaceBuildTarget also applies when the source artifact supplies
+// the workspace topology after registration.
+func ValidateWorkspaceBuildTarget(requested *BuildTarget, hasWorkspace bool) error {
+	if !hasWorkspace {
+		return nil
 	}
-	return target
+	if requested == nil {
+		return fmt.Errorf("workspace requires an explicit builder.target at registration: select kind=sandbox with memory=false (SBX) or memory=true (SNP)")
+	}
+	if requested.Kind != BuildTargetSandbox {
+		return fmt.Errorf("image target cannot carry workspace disks: select builder.target kind=sandbox with memory=false (SBX) or memory=true (SNP)")
+	}
+	return nil
 }
 
 // ArtifactKind returns the one canonical artifact kind represented by target.

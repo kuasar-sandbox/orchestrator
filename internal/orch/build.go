@@ -309,6 +309,9 @@ func validateBuildTriggerDefinition(build *types.Build, spec api.TriggerSpec) er
 	if err := assertBuildResources(build.Resources, spec.ResourceAssertion); err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if err := types.ValidateWorkspaceBuildTarget(build.Builder.Target, len(build.WorkspacePlan) != 0); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if !build.Profile.Valid() {
 		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, build.Profile)
 	}
@@ -1247,7 +1250,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 				}
 				return nil, buildFailed("artifact_prepare", waitErr)
 			}
-			artifactCapacity, inheritedNetwork, prepareErr := validateBuildPrepareSummary(summary)
+			artifactCapacity, inheritedNetwork, prepareErr := pend.prepareSourceSummary(summary)
 			err = prepareErr
 			if err != nil {
 				return nil, buildFailed("artifact_prepare", err)
@@ -1262,9 +1265,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			copied := configsock.CloneArtifactPrepareSummary(summary)
 			preparedSummary = &copied
 			inherited = inheritedNetwork
-			pend.sourceHasWorkspaces = summary.DiskTopology.WorkspaceTopology != ""
-			pend.sourceHasBuildCommands = summary.HasBuildCommands
-			if buildProducesSandbox(b, pend.sourceHasBuildCommands) || (b.Builder.Target == nil && pend.sourceHasWorkspaces) {
+			if buildProducesSandbox(b, pend.sourceHasBuildCommands) {
 				pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
 				if err != nil {
 					return nil, buildFailed("resource_resolve", err)
@@ -1444,7 +1445,7 @@ func directImageBuildResult(build *types.Build, imageBundleLocation bool) (*buil
 	if err != nil || template.Kind != types.KindImg {
 		return nil, false, nil
 	}
-	target := types.ResolveWorkspaceBuildTarget(build.Builder.Target, build.StartCmd, build.ReadyCmd, len(build.WorkspacePlan) > 0)
+	target := types.ResolveBuildTarget(build.Builder.Target, build.StartCmd, build.ReadyCmd)
 	if target.Kind != types.BuildTargetImage {
 		return nil, false, nil
 	}
@@ -1622,6 +1623,9 @@ func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build, sourceTemplate 
 		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
 	}
 	spec.WorkspacePlan = b.WorkspacePlan
+	if err := types.ValidateWorkspaceBuildTarget(b.Builder.Target, len(b.WorkspacePlan) != 0); err != nil {
+		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
+	}
 	phaseResources, err := o.resolveBuildExecutionResources(b.Resources)
 	if err != nil {
 		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
@@ -1646,7 +1650,7 @@ func buildProducesSandbox(build *types.Build, sourceHasCommands bool) bool {
 	if build.Builder.Target != nil {
 		return build.Builder.Target.Kind == types.BuildTargetSandbox
 	}
-	return len(build.WorkspacePlan) > 0 || buildProducesMemorySandbox(build, sourceHasCommands)
+	return buildProducesMemorySandbox(build, sourceHasCommands)
 }
 
 // Only memory targets consume checkpoint policy and instance credentials.
@@ -2139,6 +2143,9 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		return nil, fmt.Errorf("build: unknown profile %q", b.Profile)
 	}
 
+	if err := types.ValidateWorkspaceBuildTarget(b.Builder.Target, len(b.WorkspacePlan) != 0 || pend.sourceHasWorkspaces); err != nil {
+		return nil, err
+	}
 	if len(b.WorkspacePlan) > 0 {
 		sb := &types.Sandbox{APISecret: b.APISecret, ManifestKey: b.ManifestKey, WorkspacePlan: b.WorkspacePlan}
 		if err := o.authorizeWorkspacePlan(ctx, sb); err != nil {

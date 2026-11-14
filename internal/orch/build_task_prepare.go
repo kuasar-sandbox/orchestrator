@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
@@ -104,6 +105,30 @@ func validateBuildRuntimePreparation(prep buildRuntimePreparation) error {
 func fastBuildPrepareDigest(buildID string) string {
 	digest := sha256.Sum256([]byte("build-fast-v1\x00" + buildID))
 	return hex.EncodeToString(digest[:])
+}
+
+func (pend *pendingBuild) prepareSourceSummary(summary configsock.ArtifactPrepareSummary) (configsock.ArtifactCapacity, sandboxcfg.NetworkSpec, error) {
+	var entries []workspace.Entry
+	if raw := summary.DiskTopology.WorkspaceTopology; raw != "" {
+		var err error
+		entries, err = workspace.Parse(raw)
+		if err != nil {
+			return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source workspace topology: %w", err)
+		}
+	}
+	if len(entries) == 0 {
+		summary.DiskTopology.WorkspaceTopology = ""
+	}
+	capacity, network, err := validateBuildPrepareSummary(summary)
+	if err != nil {
+		return capacity, network, err
+	}
+	if err := types.ValidateWorkspaceBuildTarget(pend.build.Builder.Target, len(entries) > 0); err != nil {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, err
+	}
+	pend.sourceHasWorkspaces = len(entries) > 0
+	pend.sourceHasBuildCommands = summary.HasBuildCommands
+	return capacity, network, nil
 }
 
 func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (configsock.ArtifactCapacity, sandboxcfg.NetworkSpec, error) {

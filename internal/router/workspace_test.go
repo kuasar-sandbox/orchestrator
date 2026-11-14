@@ -53,9 +53,28 @@ func TestWorkspaceRouterKeepsSourcesOutOfPlacementConfig(t *testing.T) {
 		r := httptest.NewRequest("POST", path, strings.NewReader(`{"metadata":{"kuasar-sandbox.workspace":"shadowed"},"cpuCount":1,"memoryMB":256}`))
 		r.Host = "api.test.local"
 		r.Header.Set(workspace.Header, raw)
+		if path == "/v3/templates" {
+			r.Header.Set(HeaderBuilder, `{"target":{"kind":"sandbox"}}`)
+		}
 		r.Header.Set(HeaderGroup, "/g")
 		r.Header.Set(HeaderRouteKey, "r")
 		r.Header.Set(HeaderAPIKey, "key")
+		if path == "/v3/templates" {
+			for _, header := range []string{"", `{"target":{"kind":"image"}}`} {
+				bad := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+				bad.Host = r.Host
+				bad.Header = r.Header.Clone()
+				bad.Header.Del(HeaderBuilder)
+				if header != "" {
+					bad.Header.Set(HeaderBuilder, header)
+				}
+				w := httptest.NewRecorder()
+				rt.Handler().ServeHTTP(w, bad)
+				if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "builder.target") {
+					t.Fatalf("target %q: status %d, body %s", header, w.Code, w.Body)
+				}
+			}
+		}
 		w := httptest.NewRecorder()
 		rt.Handler().ServeHTTP(w, r)
 		if (w.Code != 201 && w.Code != 202) || strings.Contains(w.Body.String(), "kwt1.private") {

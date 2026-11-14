@@ -833,6 +833,10 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := types.ValidateWorkspaceBuildTarget(builderOpts.Target, len(entries) != 0); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	bodyResources, err := buildcfg.ParseFirstClassResourceJSON(body.CPUCount, body.CPUCountSn, body.MemoryMB, body.MemoryMBSn)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

@@ -53,7 +53,7 @@ func TestImageCreateValidatesWorkspaceTopologyAtAdmission(t *testing.T) {
 	}
 }
 
-func TestWorkspaceTemplateRegistrationRetainsDefaultAndAutoTarget(t *testing.T) {
+func TestWorkspaceTemplateRegistrationRequiresTargetAndRetainsDefault(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Sandbox.Boot.OverlayDiffTemplate = "/seeds/first.ext4"
 	ctx := context.Background()
@@ -62,7 +62,18 @@ func TestWorkspaceTemplateRegistrationRetainsDefaultAndAutoTarget(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{Name: "ws-template", Profile: types.ProfileBare, Resources: testBuildResources(), Metadata: meta, Workspaces: entries})
+	spec := api.RegisterSpec{Name: "ws-template", Resources: testBuildResources(), Metadata: meta, Workspaces: entries}
+	for _, profile := range []types.Profile{types.ProfileBare, types.ProfileE2B} {
+		spec.Profile = profile
+		for _, target := range []*types.BuildTarget{nil, {Kind: types.BuildTargetImage}} {
+			spec.Builder.Target = target
+			if _, err := o.RegisterBuild(ctx, apiKey, spec); !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "builder.target") {
+				t.Fatalf("profile=%s target=%v: %v", profile, target, err)
+			}
+		}
+	}
+	spec.Builder.Target = &types.BuildTarget{Kind: types.BuildTargetSandbox}
+	b, err := o.RegisterBuild(ctx, apiKey, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +94,30 @@ func TestWorkspaceTemplateRegistrationRetainsDefaultAndAutoTarget(t *testing.T) 
 	if err := validateBuildResult(stored, result); err != nil {
 		t.Fatal(err)
 	}
-	stored.Builder.Target = &types.BuildTarget{Kind: types.BuildTargetImage}
-	if err := validateKnownBuildTargetConfig(stored); err == nil {
-		t.Fatal("explicit IMG silently dropped workspace disks")
+	for _, requested := range []*types.BuildTarget{nil, {Kind: types.BuildTargetImage}} {
+		stored.Builder.Target = requested
+		if err := validateBuildTriggerDefinition(stored, api.TriggerSpec{}); !errors.Is(err, api.ErrBadRequest) {
+			t.Fatalf("trigger admitted stored workspace build with target %v: %v", requested, err)
+		}
+		stored.FromImage = ""
+		stored.FromTemplate = types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: result.SandboxRef}.String()
+		if got, handled, err := directImageBuildResult(stored, false); got != nil || !handled || err == nil || !strings.Contains(err.Error(), "builder.target") {
+			t.Fatalf("fast path with target %v: got %+v, handled %t, error %v", requested, got, handled, err)
+		}
+		if err := validateBuildResult(stored, result); err == nil || !strings.Contains(err.Error(), "workspace") {
+			t.Fatalf("accepted stored workspace build result with target %v: %v", requested, err)
+		}
+	}
+	for _, requested := range []*types.BuildTarget{nil, {Kind: types.BuildTargetImage}} {
+		spec.Builder.Target = requested
+		spec.Metadata = map[string]string{workspace.Namespace: "[ ]"}
+		spec.Workspaces = nil
+		spec.Profile = types.ProfileBare
+		emptyNode := testOrch(t)
+		emptyKey, _, _ := allowlistedBuildIdentity(t, emptyNode)
+		empty, err := emptyNode.RegisterBuild(ctx, emptyKey, spec)
+		if err != nil || len(empty.WorkspacePlan) != 0 {
+			t.Fatalf("empty workspace with target %v: %v", requested, err)
+		}
 	}
 }
