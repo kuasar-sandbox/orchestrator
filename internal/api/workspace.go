@@ -38,7 +38,6 @@ type workspaceCore interface {
 }
 
 func (a *API) listWorkspaces(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
 	out, err := a.core.ListWorkspaces(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()))
 	if err != nil {
 		a.fail(w, err)
@@ -75,7 +74,6 @@ func decodeWorkspaceBody(w http.ResponseWriter, r *http.Request, out any, limit 
 }
 
 func (a *API) attachWorkspace(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
 	name, ok := workspaceName(w, r)
 	if !ok {
 		return
@@ -106,7 +104,6 @@ func (a *API) attachWorkspace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) exportWorkspace(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
 	name, ok := workspaceName(w, r)
 	if !ok {
 		return

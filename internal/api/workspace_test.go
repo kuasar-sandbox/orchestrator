@@ -114,7 +114,7 @@ func TestWorkspaceOperations(t *testing.T) {
 		return w
 	}
 	w := call("GET", "", "")
-	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"runGeneration":"g","workspaces":[]}` || w.Header().Get("Cache-Control") != "no-store" {
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"runGeneration":"g","workspaces":[]}` {
 		t.Fatal(w)
 	}
 	for _, body := range []string{`null`, `{}`, `{"Disk":{}}`, `{"disk":null}`, `{"disk":"kwt1"}`, `{"disk":{"migrationToken":"s","size":2}}`, `{"disk":{},"disk":{}}`, `{"diskRef":"foo"}`} {
