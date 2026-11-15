@@ -73,10 +73,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	if err := p.Source.Validate(); err != nil {
 		return nil, fmt.Errorf("sandboxcfg: build source E: %w", err)
 	}
-	captured, err := workspace.Captured(p.Source)
-	if err != nil {
-		return nil, err
-	}
+	captured := workspace.Captured(p.Source)
 	if len(p.Source.Boot.Disks) > 0 && len(captured) == 0 || len(p.Spec.WorkspacePlan) < len(captured) {
 		return nil, fmt.Errorf("sandboxcfg: build source E data disks are not supported")
 	}
@@ -101,15 +98,12 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	sourceDisks := merged.Boot.Disks
 	merged.Boot = projected.Boot
 	if len(sourceDisks) > 0 {
-		byName := make(map[string]rtconfig.DiskConfig, len(projected.Boot.Disks))
-		for _, d := range projected.Boot.Disks {
-			byName[d.Name] = d
-		}
+		// The YAML host schema intentionally omits the authenticated binding
+		// and pure-block flag. Preserve both from the selected native E.
 		merged.Boot.Disks = sourceDisks
-		for i, d := range sourceDisks {
-			if replacement, ok := byName[d.Name]; ok {
-				merged.Boot.Disks[i] = replacement
-			}
+		for i := range sourceDisks {
+			sourceDisks[i].PureBlock = p.Source.Boot.Disks[i].PureBlock
+			sourceDisks[i].Binding = p.Source.Boot.Disks[i].Binding
 		}
 	}
 	merged.Timeouts = projected.Timeouts
@@ -138,7 +132,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 			}
 			merged.Mounts = mounts
 		}
-		if err := rtconfig.ValidateMountProjections(merged.Mounts); err != nil {
+		if err := merged.ValidateMountTopology(merged.Mounts); err != nil {
 			return nil, err
 		}
 	}

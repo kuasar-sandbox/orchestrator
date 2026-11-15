@@ -13,7 +13,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -52,7 +51,7 @@ func (o *Orchestrator) ExportWorkspace(ctx context.Context, id, apiKey, name str
 	if !ownsSandbox(sb, apiKey) {
 		return "", api.ErrNotFound
 	}
-	if !workspaceDeclared(sb, name) && (len(sb.WorkspacePlan) > 0 || sb.Metadata[workspace.Namespace] == "") {
+	if !workspaceDeclared(sb, name) && (len(sb.WorkspacePlan) > 0 || sb.State != types.StatePaused) {
 		return "", api.ErrNotFound
 	}
 	if sb.State != types.StatePaused {

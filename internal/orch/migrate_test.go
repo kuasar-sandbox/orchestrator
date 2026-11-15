@@ -21,6 +21,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -205,6 +206,30 @@ func TestMigrationTokenCarriesStrictPortableResourceAndTrafficMetadata(t *testin
 	sb.Metadata[sandboxcfg.NsResource] = `{"control":{"controller":"/run/foreign.sock"}}`
 	if _, err := o.mintSandboxToken(sb, sb.ResumeSource); err == nil || !strings.Contains(err.Error(), "node-managed") {
 		t.Fatalf("node-owned migration resource error = %v", err)
+	}
+}
+
+func TestMigrationTokenWorkspaceUsesResolvedRows(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	sb := migrationSandbox(t, dir, "workspace-token", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	sb.Metadata = map[string]string{"ordinary": "kept", workspace.Namespace: `[{"name":"orphan","mounts":[{"path":"/orphan"}],"disk":{"migrationToken":"old-token"}}]`}
+	for _, resolved := range []bool{false, true} {
+		if resolved {
+			sb.WorkspacePlan = []workspace.Prepared{{Name: "selected", Mounts: []workspace.Mount{{Path: "/real"}}}}
+		}
+		token, err := o.mintSandboxToken(sb, sb.ResumeSource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := migrationtoken.Open(migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey}, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, ok := payload.Metadata[workspace.Namespace]
+		if ok != resolved || (ok && view != workspace.Topology(sb.WorkspacePlan)) || payload.Metadata["ordinary"] != "kept" {
+			t.Fatalf("resolved %t: token metadata %+v", resolved, payload.Metadata)
+		}
 	}
 }
 

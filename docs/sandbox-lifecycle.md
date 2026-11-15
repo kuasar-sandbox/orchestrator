@@ -243,7 +243,7 @@ Each `path` is an absolute guest directory. Each `subpath` is relative to the di
 | `"disk":{…DiskV1…}` | Use a complete authorized disk with `kind:"disk"` and `version:1`. Include `base` and any `base_from_refs` in newest-to-oldest order, or use an authorized `diff_template`. The optional `size` asserts capacity in bytes. |
 | Neither field | On an image, reserve the device. On a sandbox or snapshot template, inherit the captured device and its data. |
 
-On an SBX or SNP template, select an existing empty device by name, for example `[{"name":"project","disk":{}}]`. Omit `mounts` to inherit its topology. The conductor waits for the bind acknowledgement before reporting `running`. Use a captured attached device as it stands. When building a template that declares or inherits a workspace, specify `builder.target` at registration. For example, send `{"target":{"kind":"sandbox","memory":false}}` in the `X-Kuasar-Sandbox-Builder` header or as the string value of `metadata["kuasar-sandbox.builder"]` to produce SBX. Set `memory` to `true` for SNP. Omitting `target` fails even if a start or ready command is present.
+On an SBX or SNP template, select an existing empty device by name, for example `[{"name":"project","disk":{}}]`. Omit `mounts` to inherit its topology. The conductor completes each requested host bind and waits for any pending lookup on its mount paths before reporting `running`. Use a captured attached device as it stands. When building a template that declares or inherits a workspace, specify `builder.target` at registration. For example, send `{"target":{"kind":"sandbox","memory":false}}` in the `X-Kuasar-Sandbox-Builder` header or as the string value of `metadata["kuasar-sandbox.builder"]` to produce SBX. Set `memory` to `true` for SNP. Omitting `target` fails even if a start or ready command is present.
 
 | Operation | API | node-ctl |
 |---|---|---|
@@ -259,9 +259,9 @@ node-ctl workspace export "$A" --name project |
   node-ctl workspace attach "$B" --name project --token-file -
 ```
 
-Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. B's guest paths become available after the attach acknowledgement (204). The guest mounts the filesystem on first access. An unattached path rejects access.
+Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. After attach returns 204, a new access to B’s guest path can trigger the mount even if an earlier access started while the slot was empty. The guest mounts the filesystem on access and reports filesystem or subdirectory errors to the caller.
 
-The list reports `unattached`, `attaching` or `attached`, and `sizeBytes` when known. While running it also returns `runGeneration`. Pin a retry to this value with `--if-generation G` or `X-Kuasar-Run-Generation: G`. The API returns 412 if the generation changed, 409 for a conflicting disk or sandbox state, and 503 when it cannot confirm the owner's state.
+The list reports `unattached` for an empty slot, `attaching` while the conductor completes an attach to a published disk, and `attached` for the published disk after the operation. It includes `sizeBytes` when known. Retry an attach with the same Workspace name and disk source. The API returns 409 for a conflicting disk or sandbox state and 503 when the disk state is unavailable.
 
 ## Capture and Pause
 

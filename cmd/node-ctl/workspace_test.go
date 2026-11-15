@@ -34,7 +34,7 @@ func TestWorkspaceCLIUsesControlSocketAndPipesToken(t *testing.T) {
 			w.Write(out)
 		case "/sandboxes/B/workspaces/attach":
 			body, err := io.ReadAll(r.Body)
-			if err != nil || string(body) != `{"disk":{"migrationToken":"kwt1.source"}}` || r.URL.Query().Get("name") != "project" || r.Header.Get("X-Kuasar-Run-Generation") != "r1" {
+			if err != nil || string(body) != `{"disk":{"migrationToken":"kwt1.source"}}` || r.URL.Query().Get("name") != "project" {
 				t.Errorf("bad attach, %s", body)
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -73,7 +73,7 @@ func TestWorkspaceCLIUsesControlSocketAndPipesToken(t *testing.T) {
 	}
 	writer.Close()
 	os.Stdin = in
-	if err := workspaceCmd([]string{"attach", "B", "--name", "project", "--if-generation", "r1", "--token-file", "-"}); err != nil {
+	if err := workspaceCmd([]string{"attach", "B", "--name", "project", "--token-file", "-"}); err != nil {
 		t.Fatal(err)
 	}
 }

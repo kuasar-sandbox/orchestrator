@@ -220,3 +220,42 @@ func TestOldPairSchemaRejectedWithoutBackfillOrDataDeletion(t *testing.T) {
 	}
 	db.Close()
 }
+
+func TestInitialSBXPersistsOnlyItsPreparedE(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	sb := sandboxInsertFixture("derived-sbx", 0)
+	sb.State = types.StateStarting
+	sb.LaunchMode = types.LaunchCold
+	sb.ResumeSource = types.ResumeSource{}
+	sb.RunID = "first"
+	parent := types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("1", 64)}
+	sb.TemplateID = types.TemplateID{Profile: sb.Profile, Kind: types.KindSbx, Ref: parent.Ref}.String()
+	if err := st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("2", 64)
+	derived := "file://" + key + ".sandbox@digest:" + key
+	for _, bad := range []string{"file:///tmp/" + key + ".sandbox@digest:" + key, derived + "@location:other", parent.Ref} {
+		if ok, err := st.CommitPreparedRunning(ctx, sb, parent, bad); ok || err == nil {
+			t.Fatalf("accepted %s", bad)
+		}
+	}
+	if ok, err := st.CommitPreparedRunning(ctx, sb, types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + key}, derived); ok || err == nil {
+		t.Fatal("accepted different source template")
+	}
+	if ok, err := st.CommitPreparedRunning(ctx, sb, parent, derived); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil || got.ResumeSource.Ref != derived || got.TemplateID != sb.TemplateID {
+		t.Fatalf("child=%+v: %v", got, err)
+	}
+	got.State, got.LaunchMode = types.StateStarting, types.LaunchCold
+	if err = st.Put(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := st.CommitPreparedRunning(ctx, got, got.ResumeSource, derived); ok || err == nil {
+		t.Fatal("resumed instance allowed to derive another E")
+	}
+}

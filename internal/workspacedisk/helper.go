@@ -71,10 +71,7 @@ func execute(ctx context.Context, req Request, key string) (out Result, retErr e
 		return out, err
 	}
 	defer func() { retErr = errors.Join(retErr, a.close()) }()
-	entries, err := workspace.Captured(a.config)
-	if err != nil {
-		return out, err
-	}
+	entries := workspace.Captured(a.config)
 	if req.Operation == "list" {
 		out.Entries = entries
 		out.States, err = a.inventory(ctx, entries)

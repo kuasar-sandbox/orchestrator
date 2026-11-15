@@ -183,6 +183,9 @@ func (p *buildPipeline) run() (res Result) {
 		}
 	}()
 
+	// Target publication can replace the workspace plan with immutable output refs.
+	// The steps sandbox provisions its own private disks from the original inputs.
+	stepWorkspaces := s.SandboxSpec.WorkspacePlan
 	if err := p.prepareWorkspaces(); err != nil {
 		return fail(err)
 	}
@@ -193,7 +196,7 @@ func (p *buildPipeline) run() (res Result) {
 		}
 	}
 	if len(s.Steps) > 0 || s.SourceSandboxConfig != nil {
-		if err := p.runPhase("b", p.phaseSteps); err != nil {
+		if err := p.runPhase("b", func() error { return p.phaseSteps(stepWorkspaces) }); err != nil {
 			return fail(fmt.Errorf("steps: %w", err))
 		}
 	}
@@ -349,10 +352,7 @@ func (p *buildPipeline) resolveTarget() error {
 		}
 		p.startCmd, p.readyCmd = "", ""
 	}
-	captured, err := workspace.Captured(p.spec.SourceSandboxConfig)
-	if err != nil {
-		return err
-	}
+	captured := workspace.Captured(p.spec.SourceSandboxConfig)
 	hasWorkspace := len(p.spec.SandboxSpec.WorkspacePlan) > 0 || len(captured) > 0
 	if err := types.ValidateWorkspaceBuildTarget(p.spec.RequestedTarget, hasWorkspace); err != nil {
 		return err

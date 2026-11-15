@@ -435,9 +435,7 @@ Register-time `builder.target` 明确三种结果：`{kind:"image"}`、
 冷启动 C 并捕获 Snapshot。run-builder 读取来源 E 时，继承的 workspace 要求注册时已显式选择 Sandbox 目标。带 workspace 的构建省略目标会报错。无 workspace 的构建省略目标时，任一有效 start/ready 命令非空即生成内存 Sandbox，否则生成 Image。有效命令包括来源 E 的默认值。
 
 来源统一先收敛为 image 或 cold Sandbox E，再由 A/B 得到本次 Build 的顶层 image。
-Build 从不恢复来源 Snapshot S 的 memory/VMM 状态；S 只用于找到它的 E。最终 Image/E/S
-不得引用来源 S、来源 E、来源 writable/data disk 或 memory parent，memory 结果中唯一允许的
-`S -> E` 是本次 Build 自身产生的关系。
+Build 从不恢复来源 Snapshot S 的 memory/VMM 状态；S 只用于找到它的 E。RUN/COPY 输出扁平化的根镜像。最终 Sandbox 保留目标磁盘的初始内容，包括继承的原生数据盘。步骤对挂载盘的写入只存在于 B 的私有写层。最终 S 与本次构建的 E 配对。
 
 A/B/C 沙箱使用单层可写盘（明文 raw，加密 v1），不传 `--enable-checkpoint`。
 Build 不使用业务 pause/resume，因此导入、构建步骤及最终模板准备无需承担版本化后端的
@@ -449,7 +447,7 @@ Build 不使用业务 pause/resume，因此导入、构建步骤及最终模板�
 
 来源预检经过 Open、Clone、Validate 保留 Checkpoint E 布局，从 S 选出 E 时也如此，
 即使 Build 运行期不启用 Checkpoint，也会先将来源固定磁盘内容物化到独立 Build 存储，
-根盘 E 和带 [workspace](sandbox-lifecycle_zh.md#workspace-存储) 的 E 均可作为构建来源。Builder 独立发布已接入盘的内容，保留空盘位的设备几何和挂载目录。启动准备、首次访问和普通模板复制的成本，与命名本地 Pause 的收益
+根盘 E 和带 [workspace](sandbox-lifecycle_zh.md#workspace-存储) 的 E 均可作为构建来源。Builder 发布整机 E，其中保留已接盘的初始内容、空盘位的设备几何和挂载目录。启动准备、首次访问和普通模板复制的成本，与命名本地 Pause 的收益
 分别衡量，见[节点捕获](sandbox-lifecycle_zh.md#local-disk-checkpoints)。
 
 **serve 侧(每构建一次)**:registered/waiting 阶段不建对象目录；durable execution claim
@@ -541,7 +539,7 @@ run-builder 对每阶段调用
 - **B build/materialize**(有 steps 或 source E 时):image source 以 base 镜像为 root
   (本地工件或 `manifest://`)+ builder runtime + 大可写 upper(同一 diff_template)；
   SBX/SNP source 则始终 `sandbox-ctl run --from <E>` 冷启其完整 root graph，并追加新的
-  builder upper。source 的 mounts/files/init/workload 在 B 中清空，避免为 materialize 执行一次
+  builder upper。B 保留来源磁盘的挂载，使用构建专用的 files、init 和 workload，避免为 materialize 执行一次
   后又保留给成品 Create 重复执行；其 non-boot config 另由共享 cold projection继承。
   **envd 为 app**(构建工具姿态:恒
   `-isnotfc`、不 `/init`、无 token;唯一盘足迹 `/run/e2b` 落在 tmpfs 挂载上,导出
@@ -580,7 +578,7 @@ run-builder 对每阶段调用
 读取 `sandbox_ref` 定位 E，随后与 SBX 完全相同。不会向任何 phase 传 S，不读取/预取
 memory payload，不把 memory from-refs 纳入 closure，也不存在 `run --restore`。E 的完整
 `PortableSandboxConfig` 留在 run-builder，用于 B materialization 和 sandbox target 的
-non-boot defaults；来源含任意 `boot.disks[]` 时第一版明确拒绝。
+非启动配置。来源含 Workspace 时，构建读取完整原生盘表，包括普通盘。为来源空位选盘时，B 在第一个构建步骤前调用原生接盘并捕获初始状态。
 
 fromTemplate 与 fromImage 互斥；所有 SBX/SNP source 即使没有 steps 也必须跑 B。因此
 fromTemplate 只有“无 steps 的 IMG”可零 VM 复用原 image。E metadata 中
@@ -591,8 +589,9 @@ summary 在 host Attach 前 strict 解析并按字段继承，优先级为
 IMG source 没有 artifact metadata 通道，也不从 retention-bounded Build row 回填。
 
 task-local ref-location mapping 只保留选中 E 及其 B 冷启所需 root refs；S memory-only Bundle
-locations和 source S ref 被过滤。B 导出的 image 是完整新顶层，之后顶层 E assembly 或 C 的
-`--replace-boot` 都只安装该 image，所以最终图不再携 source E/root/writable refs。若 C 的
+locations 和 source S ref 被过滤。B 导出的 image 是完整的新根镜像。顶层 E 将该镜像与目标盘表组装。
+带 Workspace 的内存目标通过私有 E 冷启动 C，其根盘只读层引用按 image policy 发布的 IMG，
+根盘可写层取自配置的 ext4 模板，额外盘沿用目标盘表和绑定记录。若 C 的
 final image 按 policy 发布成 located Bundle，builder 把该次 publication 的实际 name→directory
 mapping 加入 C argv；checkpoint publication 继续携带所有仍被 graph 引用的 mapping。
 
@@ -652,8 +651,8 @@ Image target 或顶层 E 的 Manifest-store destination。
   RunDir/BaseDir staging 完整 `.sandbox`。此 target 不启动 C，不执行 start/ready，只返回
   `sandbox_ref`。
 - **Sandbox + memory=true**：先按 image policy 发布 final IMG，并把返回的 portable ref 设为
-  C replacement boot。located IMG Bundle 的实际 location mapping 进入
-  `sandbox-ctl run --from E --replace-boot`；C cold run 后捕获 EΔ/S，再按 checkpoint policy
+  C 的根盘只读层。C 冷启动时传入 located IMG Bundle 的实际 location mapping，
+  包括从私有 E 继承初始盘表的场景。随后捕获 EΔ/S，再按 checkpoint policy
   发布，只返回 `snapshot_ref`。EΔ 保留该 IMG ref；local tarstream 与 Snapshot Bundle 都不重新
   物化或复制 portable image Bundle。不存在来源 S memory restore 或 C disk-only 分支。
 

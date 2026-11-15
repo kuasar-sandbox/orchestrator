@@ -1466,7 +1466,7 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d["diskSizeMB"] = a.res.DiskMB
 	d["startedAt"] = isoUnix(sb.CreatedUnix)
 	d["endAt"] = isoUnix(sandboxEndUnix(sb))
-	d["metadata"] = workspace.PublicMetadata(sb.Metadata)
+	d["metadata"] = workspace.SetTopology(sb.Metadata, sb.WorkspacePlan)
 	addSandboxTerminalFields(d, sb)
 	return d
 }
@@ -1489,7 +1489,7 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 		"envdVersion": a.envdVersion(sb),
 		"startedAt":   isoUnix(sb.CreatedUnix),
 		"endAt":       isoUnix(sandboxEndUnix(sb)),
-		"metadata":    workspace.PublicMetadata(sb.Metadata),
+		"metadata":    workspace.SetTopology(sb.Metadata, sb.WorkspacePlan),
 	}
 	addSandboxTerminalFields(d, sb)
 	return d
@@ -1539,8 +1539,6 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, types.ErrLaunchModeConflict.Error())
 	case errors.Is(err, ErrWorkspaceConflict):
 		writeErr(w, http.StatusConflict, ErrWorkspaceConflict.Error())
-	case errors.Is(err, ErrWorkspaceGeneration):
-		writeErr(w, http.StatusPreconditionFailed, ErrWorkspaceGeneration.Error())
 	case errors.Is(err, ErrWorkspaceUnavailable):
 		writeErr(w, http.StatusServiceUnavailable, ErrWorkspaceUnavailable.Error())
 	case errors.Is(err, ErrNotFound):

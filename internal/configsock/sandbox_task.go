@@ -5,6 +5,8 @@ import (
 	"slices"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // ArtifactPrepareSchemaVersion 5 returns the exact root S/E pair from existing
@@ -12,10 +14,10 @@ import (
 // runners cannot complete this protocol.
 const ArtifactPrepareSchemaVersion = 5
 
-// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 7
-// requires fresh Snapshot creates to check their source runtime in the tenant task.
+// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 8
+// supports adding devices before a fresh Sandbox-template cold boot.
 // ArtifactPrepareSummary and Builder retain their independent versions.
-const SandboxBootstrapVersion = 7
+const SandboxBootstrapVersion = 8
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -42,7 +44,9 @@ type ArtifactPrepareSpec struct {
 	ReadSourceImageConfig bool   `json:"read_source_image_config,omitempty"`
 	// SnapshotRuntime is set only for an initial snp Create. Existing resumes
 	// rely on restore's runtime checks; imports check before insertion.
-	SnapshotRuntime string `json:"snapshot_runtime,omitempty"`
+	SnapshotRuntime     string                 `json:"snapshot_runtime,omitempty"`
+	SBXCreateWorkspaces []workspace.Prepared   `json:"sbx_create_workspaces,omitempty"`
+	SBXCreateMounts     []rtconfig.MountConfig `json:"sbx_create_mounts,omitempty"`
 	// PreflightImageBundle is Build-only. It verifies the named-location image
 	// Bundle configuration, task customer key, and write admission before the
 	// source E/S carrier or its image is scanned.
@@ -90,6 +94,7 @@ type ArtifactNetwork struct {
 type ArtifactPrepareSummary struct {
 	RootSource         types.ResumeSource `json:"root_source"`
 	SchemaVersion      int                `json:"schema_version"`
+	DerivedSandboxRef  string             `json:"derived_sandbox_ref,omitempty"`
 	PreparedSourceKind string             `json:"prepared_source_kind"`
 	// HasBuildCommands is Build-only and gated by BuildTaskSchemaVersion 6.
 	// Source command text stays task-local; ordinary Sandbox summaries omit it.
@@ -116,7 +121,7 @@ func CloneArtifactPrepareSummary(summary ArtifactPrepareSummary) ArtifactPrepare
 // EqualArtifactPrepareSummary compares the complete immutable task handoff.
 func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
 	return a.SchemaVersion == b.SchemaVersion &&
-		a.RootSource == b.RootSource &&
+		a.RootSource == b.RootSource && a.DerivedSandboxRef == b.DerivedSandboxRef &&
 		a.PreparedSourceKind == b.PreparedSourceKind &&
 		a.HasBuildCommands == b.HasBuildCommands &&
 		equalArtifactCapacity(a.Capacity, b.Capacity) &&

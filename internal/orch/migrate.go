@@ -395,7 +395,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: manifest key fingerprint: %w", err)
 	}
-	metadata, err := sandboxcfg.NormalizeResourceMetadata(workspace.PublicMetadata(sb.Metadata))
+	metadata, err := sandboxcfg.NormalizeResourceMetadata(workspace.SetTopology(sb.Metadata, sb.WorkspacePlan))
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: portable resource metadata: %w", err)
 	}

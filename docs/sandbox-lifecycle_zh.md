@@ -275,7 +275,7 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 | `"disk":{…DiskV1…}` | 传入已授权的完整磁盘，`kind` 为 `disk`，`version` 为 `1`。用 `base` 表示最上层，`base_from_refs` 从近到远列出依赖层，也可以使用已授权的 `diff_template`。`size` 是以字节为单位的可选容量断言。 |
 | 省略两者 | 从镜像创建时预留盘位，从 SBX 或 SNP 模板创建时继承捕获的设备和数据。 |
 
-从 SBX 或 SNP 模板创建时，可按名字选择模板中的空盘位，例如 `[{"name":"project","disk":{}}]`。省略 `mounts` 即继承其挂载拓扑。conductor 收到绑定确认后才提交 `running`。已绑定的设备按捕获状态继承。构建声明或继承 workspace 的模板时，须在注册时显式指定 `builder.target`。例如，要生成 SBX，可将 `{"target":{"kind":"sandbox","memory":false}}` 放在 `X-Kuasar-Sandbox-Builder` 请求头中，或作为 `metadata["kuasar-sandbox.builder"]` 的字符串值传入。将 `memory` 设为 `true` 即可生成 SNP。即使存在 start 或 ready 命令，省略 `target` 也会报错。
+从 SBX 或 SNP 模板创建时，可按名字选择模板中的空盘位，例如 `[{"name":"project","disk":{}}]`。省略 `mounts` 即继承其挂载拓扑。conductor 完成本次请求的 Host 接盘，等待挂载路径上已开始的查找结束，再提交 `running`。已绑定的设备按捕获状态继承。构建声明或继承 workspace 的模板时，须在注册时显式指定 `builder.target`。例如，要生成 SBX，可将 `{"target":{"kind":"sandbox","memory":false}}` 放在 `X-Kuasar-Sandbox-Builder` 请求头中，或作为 `metadata["kuasar-sandbox.builder"]` 的字符串值传入。将 `memory` 设为 `true` 即可生成 SNP。即使存在 start 或 ready 命令，省略 `target` 也会报错。
 
 | 操作 | API | node-ctl |
 |---|---|---|
@@ -291,9 +291,9 @@ node-ctl workspace export "$A" --name project |
   node-ctl workspace attach "$B" --name project --token-file -
 ```
 
-导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 成功（204）后对应目录可访问，Guest 在首次访问时挂载文件系统。盘位未接入时访问会返回错误。
+导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 返回 204 后，新发起的目录访问可以直接触发挂载，即使同一目录此前已有在空盘位上发起的访问。Guest 在实际访问时挂载文件系统，并向该访问返回文件系统或子目录本身的错误。
 
-列表返回 `unattached`、`attaching` 或 `attached`，容量已知时附带 `sizeBytes`。运行中的沙箱还返回 `runGeneration`。重试可用 `--if-generation G` 或 `X-Kuasar-Run-Generation: G` 固定运行代。换代返回 412，盘源或沙箱状态冲突返回 409，暂时无法确认 owner 状态时返回 503。
+列表对空盘位返回 `unattached`。盘已发布且 conductor 仍在完成 attach 时返回 `attaching`，操作结束后对已发布的磁盘返回 `attached`。容量已知时附带 `sizeBytes`。可使用相同的 Workspace 名称和盘源重试接盘。盘源或沙箱状态冲突返回 409，暂时无法取得磁盘状态时返回 503。
 
 ## Capture 与 Pause
 

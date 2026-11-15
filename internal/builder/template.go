@@ -24,7 +24,7 @@ import (
 func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	s := p.spec
 	envdUDS := filepath.Join(p.phaseRunDir("c"), "envd.sock")
-	document, err := p.buildColdConfigYAML()
+	document, from, replace, err := p.templateBoot()
 	if err != nil {
 		return "", err
 	}
@@ -33,7 +33,7 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 		connect = []string{envdUDS + ":127.0.0.1:49983"}
 	}
 	sb, err := p.startSandboxYAML("c", document, connect,
-		s.SourceSandboxRef, s.SourceSandboxRef != "")
+		from, replace)
 	if err != nil {
 		return "", err
 	}
@@ -42,9 +42,6 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 90*time.Second)
 	defer cancelBoot()
 	if err := sb.waitRuntimeReady(bootCtx); err != nil {
-		return "", err
-	}
-	if err := p.bindTemplateDisks(); err != nil {
 		return "", err
 	}
 	if p.profile == types.ProfileE2B {
@@ -202,6 +199,9 @@ func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {
 	// which applied canonical defaults before image-default materialization.
 	// Direct package assembly receives the typed value, so apply the identical
 	// defaults here for both top-level E assembly and Phase C.
+	if err := p.resolveStagedDiskPaths(cfg); err != nil {
+		return nil, err
+	}
 	cfg.ApplyDefaults()
 	return cfg, nil
 }

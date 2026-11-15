@@ -51,6 +51,9 @@ def declared(n, first=None):
 def create(template, entries, phase, count):
     body = {"templateID": template, "timeout": 600}
     headers = {"X-Kuasar-Sandbox-Resource": '{"capacity":{"cpu":1,"memory":"512MiB"}}'}
+    # Keep the bare fixture's application mount namespace alive for native exec.
+    if template == image:
+        headers["X-Kuasar-Sandbox-Launch"] = json.dumps({"exec": "/bin/sleep", "args": ["3600"]})
     if entries is not None:
         headers["X-Kuasar-Sandbox-Workspace"] = json.dumps(entries)
     start = time.monotonic()
@@ -75,7 +78,7 @@ def control(sid, name, op, body=None, **kw):
 
 def states(sid):
     listing = request("GET", f"/sandboxes/{sid}/workspaces")
-    return listing.get("runGeneration"), {x["name"]: x for x in listing["workspaces"]}
+    return {x["name"]: x for x in listing["workspaces"]}
 
 
 def guest(sid, cmd, label=None):
@@ -103,16 +106,72 @@ def delete(sid):
 
 
 def attach(sid, token, label):
-    gen, disks = states(sid)
+    disks = states(sid)
     assert disks["project"]["state"] == "unattached"
-    control(sid, "project", "attach", {"disk": {}}, status=412, headers={"X-Kuasar-Run-Generation": gen + "-stale"})
     start = time.monotonic()
     subprocess.run([bin_dir / "node-ctl", "workspace", "attach", sid, "--name", "project",
-                    "--if-generation", gen, "--token-file", "-"], input=token.encode(), check=True, timeout=90)
+                    "--token-file", "-"], input=token.encode(), check=True, timeout=90)
     record("attach", start, source=label)
-    assert states(sid)[1]["project"]["state"] == "attached"
+    assert states(sid)["project"]["state"] == "attached"
     control(sid, "project", "attach", {"disk": {"migrationToken": token}}, status=204)
     control(sid, "project", "attach", {"disk": {}}, status=409)
+
+
+def sbx_append():
+    source = create(image, declared(1, {"disk": {}}), "sbx-source", 1)
+    guest(source, "echo parent > /data/value; sync")
+    pause(source, False)
+    template = template_of(source)
+    delete(source)
+
+    extra = [{"name": "extra", "mounts": [{"path": "/extra"}], "disk": {}},
+             {"name": "later", "mounts": [{"path": "/later"}], "slot": {}}]
+    child = create(template, extra, "sbx-append", 3)
+    assert states(child)["later"]["state"] == "unattached"
+    control(child, "later", "attach", {"disk": {}}, status=204)
+    guest(child, 'test "$(cat /data/value)" = parent; echo child > /data/value; '
+                 'echo extra > /extra/value; echo later > /later/value; sync')
+    pause(child, True)
+    assert states(child)["extra"]["state"] == "attached"
+    request("POST", f"/sandboxes/{child}/connect", {})
+    guest(child, 'test "$(cat /data/value)" = child; test "$(cat /extra/value)" = extra; '
+                 'test "$(cat /later/value)" = later')
+    delete(child)
+    sibling = create(template, None, "sbx-parent-reused", 1)
+    guest(sibling, 'test "$(cat /data/value)" = parent; test ! -e /extra/value; test ! -e /later/value')
+    delete(sibling)
+
+
+def build_steps():
+    cpu = int(os.environ["BUILDER_CPU"])
+    target = {"kind": "sandbox", "memory": False}
+    headers = {
+        "X-Kuasar-Sandbox-Workspace": json.dumps(declared(1, {"disk": {}})),
+        "X-Kuasar-Sandbox-Resource": '{"capacity":{"cpu":1,"memory":"512MiB"}}',
+        "X-Kuasar-Sandbox-Builder": json.dumps({
+            "target": target, "resources": {"cpu": cpu, "memory": "6GiB", "storage": "4GiB"}}),
+    }
+    build = request("POST", "/v3/templates", {"name": "workspace-steps", "profile": "bare",
+                    "cpuCount": cpu, "memoryMB": 6144}, headers=headers, status=202)
+    tid, bid = build["templateID"], build["buildID"]
+    steps = [{"type": "RUN", "args": ["echo first > /data/build-only; echo root > /workspace-step"]},
+             {"type": "RUN", "args": ['test "$(cat /data/build-only)" = first; echo second >> /workspace-step']}]
+    request("POST", f"/v2/templates/{tid}/builds/{bid}", {"fromTemplate": image, "steps": steps}, status=202)
+    deadline = time.monotonic() + 480
+    while time.monotonic() < deadline:
+        result = request("GET", f"/templates/{tid}/builds/{bid}/status")
+        if result["status"] == "ready":
+            break
+        if result["status"] == "error":
+            raise AssertionError(f"workspace build {bid} failed: {result.get('logs', [])}")
+        time.sleep(1)
+    else:
+        raise TimeoutError(f"workspace build {bid} did not complete")
+    assert result["kind"] == "sbx"
+    child = create(result["templateID"], None, "workspace-build", 1)
+    guest(child, 'test "$(head -1 /workspace-step)" = root; test "$(tail -1 /workspace-step)" = second; '
+                 'test ! -e /data/build-only; echo final > /data/final')
+    delete(child)
 
 
 def handoff():
@@ -122,7 +181,7 @@ def handoff():
     guest(source, "echo source > /data/value; echo result > /output/value; sync")
     control(source, "project", "export", {}, status=409)
     pause(source, True)
-    assert states(source)[1]["project"]["state"] == "attached"
+    assert states(source)["project"]["state"] == "attached"
     control(source, "project", "attach", {"disk": {}}, status=409)
     token = subprocess.check_output([bin_dir / "node-ctl", "workspace", "export", source, "--name", "project"], text=True).strip()
     assert token.startswith("kwt1.")
@@ -138,14 +197,14 @@ def handoff():
     for n in [0, 1, 8]:
         seed = create(image, declared(n) if n else None, "img", n)
         if n:
-            assert all(x["state"] == "unattached" for x in states(seed)[1].values())
+            assert all(x["state"] == "unattached" for x in states(seed).values())
         pause(seed, True)
         if n:
             control(seed, "project", "export", {}, status=409)
         template = template_of(seed)
         delete(seed)
         restored = create(template, None, "snp", n)
-        assert len(states(restored)[1]) == n
+        assert len(states(restored)) == n
         if n:
             attach(restored, token, "snp-" + str(n))
             guest(restored, "test \"$(cat /data/value)\" = source; test \"$(cat /output/value)\" = result; echo private-c > /data/value", f"snp-{n}")
@@ -160,6 +219,8 @@ def handoff():
 
 try:
     handoff()
+    sbx_append()
+    build_steps()
 finally:
     for remaining in list(live):
         try:

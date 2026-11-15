@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -28,11 +29,13 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
+	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	rtsandbox "github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"google.golang.org/grpc"
@@ -825,6 +828,21 @@ func TestWorkspaceTemplateRetainsSeedAndDerivedSlot(t *testing.T) {
 			if err := child.prepareWorkspaces(); err != nil {
 				t.Fatal(err)
 			}
+			if len(child.workspaceBindings) != 1 || child.workspaceBindings[0].SlotName != "reserved" {
+				t.Fatal("selected slot missing from native bind plan")
+			}
+			// The real steps sandbox returns this bound disk in its whole-E capture.
+			// Substitute that capture boundary while exercising both public storage targets.
+			captured, err := child.spec.SourceSandboxConfig.Clone()
+			if err != nil {
+				t.Fatal(err)
+			}
+			captured.Boot.Disks[0].PortableRootConfig = captured.Boot.Disks[1].PortableRootConfig
+			captured.Boot.Disks[0].PureBlock = true
+			captured.Boot.Disks[0].Binding = &rtconfig.SlotBinding{ID: "capture-binding", SourceID: "native-source", SizeBytes: int64(len(content))}
+			if err := child.acceptSelectedSlots(captured); err != nil {
+				t.Fatal(err)
+			}
 			ref, err := child.publishSandboxTarget()
 			if err != nil {
 				t.Fatal(err)
@@ -842,19 +860,25 @@ func TestWorkspaceTemplateRetainsSeedAndDerivedSlot(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			declarations, err := workspace.Captured(cfg)
-			if err != nil || len(declarations) != 2 {
-				t.Fatalf("declarations = %+v, %v", declarations, err)
+			declarations := workspace.Captured(cfg)
+			if len(declarations) != 2 {
+				t.Fatalf("declarations = %+v", declarations)
 			}
 			if len(cfg.Boot.Disks) != 2 || cfg.Boot.Disks[0].Name != "reserved" || cfg.Boot.Disks[0].Binding == nil || cfg.Boot.Disks[1].Name != "data" || cfg.Boot.Disks[1].Slot != nil {
 				t.Fatalf("derived disk table: %+v", cfg.Boot.Disks)
 			}
-			for _, disk := range cfg.Boot.Disks {
+			// A Bundle may be the only carrier for its member manifests.
+			stage := t.TempDir()
+			standalone, err := taskartifact.StageDiskTable(child.ctx, ref, child.artifacts.storage, child.artifacts.locations, stage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, disk := range standalone.Boot.Disks {
 				layer, err := manifest.ParseRef(disk.Base)
 				if err != nil {
 					t.Fatal(err)
 				}
-				file, err := workspacedisk.OpenLayer(child.ctx, child.artifacts.storage, layer, "", child.artifacts.locations)
+				file, err := workspacedisk.OpenLayer(child.ctx, child.artifacts.storage, layer, stage, child.artifacts.locations)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -866,5 +890,97 @@ func TestWorkspaceTemplateRetainsSeedAndDerivedSlot(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestImageStepsProvisionPrivateWorkspaceDisk(t *testing.T) {
+	seedDir := t.TempDir()
+	seed := filepath.Join(seedDir, "data.ext4")
+	initial := bytes.Repeat([]byte{'A'}, 8192)
+	if err := os.WriteFile(seed, initial, 0600); err != nil {
+		t.Fatal(err)
+	}
+	plan := []workspace.Prepared{
+		{Name: "data", Disk: &rtconfig.DiskV1{Kind: "disk", Version: 1, DiffTemplate: "file://data.ext4@location:seeds"}, RefLocations: rtconfig.RefLocations{"seeds": seedDir}, Mounts: []workspace.Mount{{Path: "/project", Subpath: "project"}, {Path: "/output", Subpath: "out"}}},
+		{Name: "reserved", Slot: &rtconfig.DiskSlotConfig{}, Mounts: []workspace.Mount{{Path: "/reserved"}}},
+	}
+	locations := map[string]string{}
+	if err := workspace.MergeLocations(locations, plan); err != nil {
+		t.Fatal(err)
+	}
+	f := newPublicationFixture(t)
+	p := f.pipeline(t, "workspace-image-steps", f.localImageRef, locations, false)
+	p.target = types.BuildTarget{Kind: types.BuildTargetSandbox}
+	p.spec.SandboxSpec.WorkspacePlan = plan
+	if err := p.prepareWorkspaces(); err != nil {
+		t.Fatal(err)
+	}
+	stepDoc := mustStepsYAML(t, p, plan)
+	raw, err := yaml.Marshal(stepDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := rtconfig.LoadConfigBytes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Boot.Disks) != 2 || !cfg.Boot.Disks[1].Unbound() || cfg.Boot.Disks[0].Disk == nil || cfg.Boot.Disks[0].Disk.DiffTemplate != plan[0].Disk.DiffTemplate || cfg.Boot.Disks[0].Diff != "" {
+		t.Fatalf("steps boot.disks = %+v", cfg.Boot.Disks)
+	}
+	wantMounts := []rtconfig.MountConfig{{Type: "disk", Source: "data", Target: "/project", Subpath: "project"}, {Type: "disk", Source: "data", Target: "/output", Subpath: "out"}, {Type: "disk", Source: "reserved", Target: "/reserved"}}
+	if !slices.Equal(cfg.Mounts, wantMounts) {
+		t.Fatalf("steps mounts = %+v", cfg.Mounts)
+	}
+	args := phaseSandboxRunArgs(p.spec, "b", phaseSandboxID("b", p.spec.BuildID), "sandbox.yaml", nil, "", false)
+	if !argumentPair(args, "--ref-location", "seeds="+locations["seeds"]) {
+		t.Fatalf("steps argv = %q", args)
+	}
+	base, size, template, err := rtsandbox.OpenDiskV1Source(p.ctx, *cfg.Boot.Disks[0].Disk, p.artifacts.storage, p.artifacts.locations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if template != "file://"+seed || size != int64(len(initial)) || base != nil {
+		t.Fatalf("steps source = (%v, %d, %q)", base, size, template)
+	}
+	writerPath := filepath.Join(t.TempDir(), "steps.diff")
+	init, err := rtsandbox.PrepareDiff(writerPath, template, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := diffstore.OpenDisk(writerPath, base, init)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	written := bytes.Repeat([]byte{'B'}, 4096)
+	if _, err := writer.WriteAt(written, 0); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(written))
+	if _, err := writer.ReadAt(got, 0); err != nil || !bytes.Equal(got, written) {
+		t.Fatalf("steps writer lost earlier write: %v", err)
+	}
+	if got, err := os.ReadFile(seed); err != nil || !bytes.Equal(got, initial) {
+		t.Fatalf("steps writer changed seed: %v", err)
+	}
+	target, _, _, err := rtsandbox.OpenDiskV1Source(p.ctx, *p.spec.SandboxSpec.WorkspacePlan[0].Disk, p.artifacts.storage, p.artifacts.locations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := target.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := target.ReadAt(got, 0); err != nil || !bytes.Equal(got, initial[:len(got)]) {
+		t.Fatalf("target contains steps writes: %v", err)
+	}
+	plain := mustStepsYAML(t, p, nil)
+	if _, ok := plain["mounts"]; ok || plain["boot"].(map[string]any)["disks"] != nil {
+		t.Fatalf("workspace-free steps introduced disks: %v", plain)
 	}
 }

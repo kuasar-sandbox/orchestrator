@@ -13,11 +13,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
-const RunGenerationHeader = "X-Kuasar-Run-Generation"
-
 var (
 	ErrWorkspaceConflict    = errors.New("conflicting workspace state or source")
-	ErrWorkspaceGeneration  = errors.New("sandbox run generation changed")
 	ErrWorkspaceUnavailable = errors.New("workspace state temporarily unavailable")
 )
 
@@ -28,12 +25,11 @@ type WorkspaceStatus struct {
 	SizeBytes *int64            `json:"sizeBytes,omitempty"`
 }
 type WorkspaceList struct {
-	RunGeneration string            `json:"runGeneration,omitempty"`
-	Workspaces    []WorkspaceStatus `json:"workspaces"`
+	Workspaces []WorkspaceStatus `json:"workspaces"`
 }
 type workspaceCore interface {
 	ListWorkspaces(context.Context, string, string) (WorkspaceList, error)
-	AttachWorkspace(context.Context, string, string, string, string, json.RawMessage) error
+	AttachWorkspace(context.Context, string, string, string, json.RawMessage) error
 	ExportWorkspace(context.Context, string, string, string) (string, error)
 }
 
@@ -78,15 +74,6 @@ func (a *API) attachWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	gen, err := singleOptionalHeader(r.Header, RunGenerationHeader)
-	if err != nil || (gen != nil && *gen == "") {
-		writeErr(w, 400, "invalid run generation")
-		return
-	}
-	generation := ""
-	if gen != nil {
-		generation = *gen
-	}
 	var body map[string]json.RawMessage
 	if !decodeWorkspaceBody(w, r, &body, maxCreateRequestBytes) {
 		return
@@ -96,7 +83,7 @@ func (a *API) attachWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid workspace disk")
 		return
 	}
-	if err = a.core.AttachWorkspace(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), name, generation, disk); err != nil {
+	if err := a.core.AttachWorkspace(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), name, disk); err != nil {
 		a.fail(w, err)
 		return
 	}

@@ -482,7 +482,7 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 		spec: &configsock.BuildSpec{Paths: configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"}},
 	}
 
-	stepsLaunch := p.stepsYAML()["launch"].(map[string]any)
+	stepsLaunch := mustStepsYAML(t, p, nil)["launch"].(map[string]any)
 	if got := stepsLaunch["cgroup_control"]; got != true {
 		t.Fatalf("steps launch.cgroup_control = %#v, want true", got)
 	}
@@ -531,7 +531,7 @@ func TestBuildAndTargetResourcesRemainSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	phaseB := p.stepsYAML()
+	phaseB := mustStepsYAML(t, p, nil)
 	for phase, doc := range map[string]map[string]any{"a": phaseA, "b": phaseB} {
 		got, ok := doc["resources"].(rtconfig.ResourcesConfig)
 		if !ok || !reflect.DeepEqual(got, resources) {
@@ -803,7 +803,7 @@ func TestStepsYAMLOmitsFlattenConfigFiles(t *testing.T) {
 		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
 		Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", BuilderDiffTpl: "/d"},
 	}}
-	doc := p.stepsYAML()
+	doc := mustStepsYAML(t, p, nil)
 	if files, ok := doc["files"]; ok {
 		for _, f := range files.([]map[string]any) {
 			if f["path"] == guestCACert || f["path"] == guestFlattenCfg {
@@ -857,4 +857,13 @@ func TestFlattenConfigArgForSkipVerify(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("flattenConfigArg() = %v, want %v", got, want)
 	}
+}
+
+func mustStepsYAML(t *testing.T, p *buildPipeline, plan []workspace.Prepared) map[string]any {
+	t.Helper()
+	doc, err := p.stepsYAML(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc
 }

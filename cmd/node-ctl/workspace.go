@@ -25,7 +25,7 @@ func workspaceCmd(args []string) error {
 	sid, rest := leadingPositional(args[1:])
 	fs := flag.NewFlagSet("workspace "+action, flag.ContinueOnError)
 	socket := fs.String("socket", "", "control socket (or NODE_CTL_SOCKET)")
-	var name, generation, tokenFile, diskFile string
+	var name, tokenFile, diskFile string
 	var asJSON bool
 	timeout := 30 * time.Second
 	switch action {
@@ -37,7 +37,6 @@ func workspaceCmd(args []string) error {
 		fs.DurationVar(&timeout, "timeout", 20*time.Minute, "maximum export request duration")
 	case "attach":
 		fs.StringVar(&name, "name", "", "workspace name")
-		fs.StringVar(&generation, "if-generation", "", "require this run generation")
 		fs.StringVar(&diskFile, "disk-spec", "", "DiskV1 JSON file, or - for stdin")
 		fs.StringVar(&tokenFile, "token-file", "", "migration token file, or - for stdin")
 	default:
@@ -73,9 +72,6 @@ func workspaceCmd(args []string) error {
 		body = struct{}{}
 	}
 	if action == "attach" {
-		if generation != "" {
-			headers[api.RunGenerationHeader] = generation
-		}
 		disk, err := workspaceDiskInput(diskFile, tokenFile)
 		if err != nil {
 			return err

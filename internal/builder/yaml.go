@@ -10,6 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -152,17 +153,17 @@ func (p *buildPipeline) rootDoc(diffTpl string) map[string]any {
 // build tool, not a tenant data plane: always -isnotfc, never
 // /init-armed (its in-memory state dies with the phase; its only disk
 // footprint, /run/e2b, sits on a tmpfs mount the export skips).
-func (p *buildPipeline) stepsYAML() map[string]any {
+func (p *buildPipeline) stepsYAML(plan []workspace.Prepared) (map[string]any, error) {
 	s := p.spec
+	boot := map[string]any{
+		"kernel": "file://" + s.Paths.Kernel, "runtime": "file://" + s.Paths.Runtime,
+		"root": p.rootDoc("file://" + s.Paths.BuilderDiffTpl),
+	}
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
 		"timeouts":  s.RuntimeTimeouts,
 		"network":   p.networkDoc(),
-		"boot": map[string]any{
-			"kernel":  "file://" + s.Paths.Kernel,
-			"runtime": "file://" + s.Paths.Runtime,
-			"root":    p.rootDoc("file://" + s.Paths.BuilderDiffTpl),
-		},
+		"boot":      boot,
 		"launch": map[string]any{
 			"exec":           "/opt/sandbox-runtime/bin/envd",
 			"args":           []string{"-isnotfc", "-port", "49983"},
@@ -178,7 +179,15 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 	if f := p.dnsFiles(); f != nil {
 		doc["files"] = f
 	}
-	return doc
+	if len(plan) != 0 {
+		var disks rtconfig.SandboxConfig
+		if err := workspace.ApplyImage(&disks, plan); err != nil {
+			return nil, err
+		}
+		boot["disks"] = disks.Boot.Disks
+		doc["mounts"] = disks.Mounts
+	}
+	return doc, nil
 }
 
 // sourceStepsYAML is a host/instance overlay for a cold run --from E. It keeps

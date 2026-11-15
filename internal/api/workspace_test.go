@@ -14,12 +14,11 @@ import (
 
 type workspaceTestCore struct {
 	Core
-	create     CreateReq
-	build      RegisterSpec
-	calls      int
-	generation string
-	disk       string
-	opErr      error
+	create CreateReq
+	build  RegisterSpec
+	calls  int
+	disk   string
+	opErr  error
 }
 
 func (c *workspaceTestCore) Create(_ context.Context, r CreateReq) (*types.Sandbox, error) {
@@ -31,14 +30,13 @@ func (c *workspaceTestCore) RegisterBuild(_ context.Context, _ string, r Registe
 	return &types.Build{TemplateID: "transient-1", BuildID: "b"}, nil
 }
 func (c *workspaceTestCore) ListWorkspaces(context.Context, string, string) (WorkspaceList, error) {
-	return WorkspaceList{RunGeneration: "g"}, c.opErr
+	return WorkspaceList{}, c.opErr
 }
-func (c *workspaceTestCore) AttachWorkspace(_ context.Context, id, key, name, generation string, disk json.RawMessage) error {
+func (c *workspaceTestCore) AttachWorkspace(_ context.Context, id, key, name string, disk json.RawMessage) error {
 	if id != "sb" || key == "" || name != "w" {
 		return ErrNotFound
 	}
 	c.calls++
-	c.generation = generation
 	c.disk = string(disk)
 	return c.opErr
 }
@@ -108,13 +106,12 @@ func TestWorkspaceOperations(t *testing.T) {
 	call := func(method, part, body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, "/sandboxes/sb/workspaces"+part, strings.NewReader(body))
 		r.Header.Set("X-API-KEY", key)
-		r.Header.Set(RunGenerationHeader, "g")
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		return w
 	}
 	w := call("GET", "", "")
-	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"runGeneration":"g","workspaces":[]}` {
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"workspaces":[]}` {
 		t.Fatal(w)
 	}
 	for _, body := range []string{`null`, `{}`, `{"Disk":{}}`, `{"disk":null}`, `{"disk":"kwt1"}`, `{"disk":{"migrationToken":"s","size":2}}`, `{"disk":{},"disk":{}}`, `{"diskRef":"foo"}`} {
@@ -125,10 +122,10 @@ func TestWorkspaceOperations(t *testing.T) {
 	if core.calls != 0 {
 		t.Fatal("invalid input dispatched")
 	}
-	if w := call("POST", "/attach?trace=abc&name=w", `{"disk":{}}`); w.Code != 204 || w.Body.Len() != 0 || core.generation != "g" || core.disk != "{}" {
+	if w := call("POST", "/attach?trace=abc&name=w", `{"disk":{}}`); w.Code != 204 || w.Body.Len() != 0 || core.disk != "{}" {
 		t.Fatal(w)
 	}
-	for err, want := range map[error]int{ErrWorkspaceGeneration: 412, ErrWorkspaceConflict: 409, ErrWorkspaceUnavailable: 503, ErrNotFound: 404, ErrNotAllowed: 403} {
+	for err, want := range map[error]int{ErrWorkspaceConflict: 409, ErrWorkspaceUnavailable: 503, ErrNotFound: 404, ErrNotAllowed: 403} {
 		core.opErr = err
 		if w := call("POST", "/attach?name=w", `{"disk":{}}`); w.Code != want {
 			t.Fatalf("%v got %d", err, w.Code)
@@ -149,13 +146,20 @@ func TestWorkspaceLegacyMetadataIsSafe(t *testing.T) {
 	meta := map[string]string{"owner": "ok", workspace.Namespace: `[{"name":"w","mounts":[{"path":"/data"}],"disk":{"oldSource":"private-token"}}]`}
 	c := &sandboxContractCoreStub{sandbox: &types.Sandbox{ID: "sb", Profile: types.ProfileBare, Metadata: meta}}
 	h, key := newSandboxContractHandler(t, c, Resources{})
-	for _, p := range []string{"/sandboxes/sb", "/v2/sandboxes"} {
-		r := httptest.NewRequest("GET", p, nil)
-		r.Header.Set("X-API-KEY", key)
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		if w.Code != 200 || !strings.Contains(w.Body.String(), "/data") || strings.Contains(w.Body.String(), "private-token") {
-			t.Fatal(w)
+	for _, withPlan := range []bool{false, true} {
+		if withPlan {
+			c.sandbox.WorkspacePlan = []workspace.Prepared{{Name: "project", Mounts: []workspace.Mount{{Path: "/actual"}}}}
+		}
+		for _, p := range []string{"/sandboxes/sb", "/v2/sandboxes"} {
+			r := httptest.NewRequest("GET", p, nil)
+			r.Header.Set("X-API-KEY", key)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			response := w.Body.String()
+			if w.Code != 200 || !strings.Contains(response, `"owner":"ok"`) || strings.Contains(response, "/data") || strings.Contains(response, "private-token") ||
+				strings.Contains(response, workspace.Namespace) != withPlan || strings.Contains(response, "/actual") != withPlan {
+				t.Fatalf("resolved plan %t, GET %s: %s", withPlan, p, response)
+			}
 		}
 	}
 	if !strings.Contains(meta[workspace.Namespace], "private-token") {

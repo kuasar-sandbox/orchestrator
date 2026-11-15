@@ -9,6 +9,6 @@ wait_mmds_listener
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/workspace.image" --no-progress
 ROOT=$(MANIFEST_KEY="$MK" "$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/workspace.image")
 [[ "$ROOT" =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid image root"
-export WORKSPACE_IMAGE_ROOT="$ROOT" E2B_API_KEY="$AK" NODE_CTL_SOCKET="$WORK/node-ctl.socket"
+export WORKSPACE_IMAGE_ROOT="$ROOT" E2B_API_KEY="$AK" NODE_CTL_SOCKET="$WORK/node-ctl.socket" BUILDER_CPU
 python3 "$SCRIPT_DIR/workspace_handoff.py" "$PORT" "$DOMAIN" "$BIN" "$PROXY_PORT" "$CASE_OUT"
 echo "PASS orchestrator.workspace.sh"

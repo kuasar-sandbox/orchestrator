@@ -87,8 +87,8 @@ func (o *Orchestrator) authorizeWorkspacePlan(ctx context.Context, sb *types.San
 }
 
 // resolveCapturedWorkspaces runs after the task has read the exact paired E.
-// A fresh template Create may choose sources only for its empty slots;
-// every resume inherits the saved media and must not replay a former Create.
+// A Create may select a source for an existing empty slot. Additional devices
+// on fresh SBX are resolved separately; a resume inherits all saved media.
 func resolveCapturedWorkspaces(topology types.ArtifactDiskTopology, choices []workspace.Prepared) (plan, bind []workspace.Prepared, err error) {
 	var entries []workspace.Entry
 	if topology.WorkspaceTopology != "" {
@@ -125,6 +125,7 @@ func resolveCapturedWorkspaces(topology types.ArtifactDiskTopology, choices []wo
 					}
 				}
 				if p.Disk != nil {
+					p.Mounts = e.Mounts
 					bind = append(bind, p)
 				}
 			}

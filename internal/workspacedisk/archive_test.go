@@ -40,7 +40,7 @@ func TestWorkspaceSavedDiskHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	mounts := []rtconfig.MountConfig{{Type: "disk", Source: "work", Target: "/data", Subpath: "project"}, {Type: "disk", Source: "work", Target: "/output", Subpath: "out"}, {Type: "disk", Source: "reserved", Target: "/reserved"}}
-	declarations := `[{"name":"work","mounts":[{"path":"/data","subpath":"project"},{"path":"/output","subpath":"out"}]},{"name":"reserved","mounts":[{"path":"/reserved"}]}]`
+	declarations := `[{"name":"work","mounts":[{"path":"/data","subpath":"project"},{"path":"/output","subpath":"out"}]},{"name":"reserved","mounts":[{"path":"/reserved"}]},{"name":"orphan","mounts":[{"path":"/stale"}],"disk":{"migrationToken":"ignored"}}]`
 	cfg := rtconfig.PortableSandboxConfig{
 		Version: 2, Resources: rtconfig.PortableResourcesConfig{Capacity: rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"}, Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "1GiB"}},
 		Boot:   rtconfig.PortableBootConfig{Kernel: "file://kernel@digest:" + key, Runtime: "file://runtime@digest:" + key, Root: rtconfig.PortableRootConfig{Base: "self"}, Disks: []rtconfig.PortableDiskConfig{{Name: "work", PureBlock: true, PortableRootConfig: rtconfig.PortableRootConfig{Base: base}}, {Name: "reserved", Slot: &rtconfig.DiskSlotConfig{}}}},
@@ -62,12 +62,40 @@ func TestWorkspaceSavedDiskHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := Request{Operation: "list", Source: ref, SourceDir: source, ManifestConfig: configPath, RefLocationParent: "file://" + filepath.Join(dir, "node-a"), Publication: "sandbox-a"}
+	t.Run("ordinary disk without a Workspace view", func(t *testing.T) {
+		ordinaryConfig := cfg
+		ordinaryConfig.Metadata = nil
+		ordinary, err := rtconfig.MarshalPortableSandboxConfig(&ordinaryConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, err := sandboxfile.BuildSource(sparse.Dense(bytes.NewReader(data), uint64(len(data))), nil, ordinary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := req
+		r.Source, _, err = sink.AbsorbSandbox(ctx, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l, err := execute(ctx, r, key)
+		if err != nil || len(l.Entries) != 0 || len(l.States) != 0 {
+			t.Fatalf("workspace-free E list: %+v, %v", l, err)
+		}
+		r.Operation, r.Name = "export", "work"
+		if _, err = execute(ctx, r, key); !errors.Is(err, artifact.ErrDiskNotFound) {
+			t.Fatalf("ordinary data disk export: %v", err)
+		}
+	})
 	list, err := execute(ctx, req, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(list.States) != 2 || list.States[0].Name != "work" || list.States[0].SizeBytes == nil || *list.States[0].SizeBytes != 8192 || list.States[1].State != "unbound" || list.States[1].SizeBytes != nil {
 		t.Fatal(list)
+	}
+	if len(list.Entries) != 2 || list.Entries[0].Name != "work" || list.Entries[1].Name != "reserved" || list.Entries[0].Mounts[1].Path != "/output" {
+		t.Fatalf("archived view did not match its native disks and mounts: %+v", list.Entries)
 	}
 	req.Operation = "export"
 	req.Name = "reserved"

@@ -807,6 +807,52 @@ func TestSummarizeDiskTopologyMarksDirectEROFSAsNeedingActiveUpper(t *testing.T)
 	}
 }
 
+func TestSummarizeDiskTopologyDoesNotDependOnWorkspaceView(t *testing.T) {
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const namespace = "kuasar-sandbox.workspace"
+	const view = `[{"name":"data","mounts":[{"path":"/data"}]}]`
+	cfg := &sandboxconfig.PortableSandboxConfig{
+		Version: 2,
+		Resources: sandboxconfig.PortableResourcesConfig{
+			Capacity:    sandboxconfig.CapacityConfig{CPU: 1, Memory: "64MiB"},
+			Allocatable: sandboxconfig.AllocatableConfig{CPU: 1, Memory: "64MiB"},
+		},
+		Boot: sandboxconfig.PortableBootConfig{
+			Kernel: "file://vmlinux@digest:" + digest, Runtime: "file://runtime@digest:" + digest,
+			Root:  sandboxconfig.PortableRootConfig{Base: "self"},
+			Disks: []sandboxconfig.PortableDiskConfig{{Name: "data", Slot: &sandboxconfig.DiskSlotConfig{}}},
+		},
+		Mounts: []sandboxconfig.MountConfig{{Type: "disk", Source: "data", Target: "/data"}},
+		Launch: sandboxconfig.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
+	}
+	for _, tc := range []struct{ name, raw, want string }{
+		{"absent", "", ""}, {"valid", view, view}, {"malformed", "bad-json", ""},
+		{"unknown disk", `[{"name":"other","mounts":[{"path":"/data"}]}]`, ""},
+		{"stale path", `[{"name":"data","mounts":[{"path":"/old"}]}]`, ""},
+		{"valid and orphaned at same path", `[{"name":"other","mounts":[{"path":"/data"}]},{"name":"data","mounts":[{"path":"/data"}]}]`, view},
+		{"malformed entry between valid and stale", `[{"name":"data","mounts":[{"path":"/data"}]},42,{"name":"old","mounts":"invalid"}]`, view},
+		{"duplicate name", `[{"name":"data","mounts":[{"path":"/data"}]},{"name":"data","mounts":[{"path":"/old"}]}]`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg.Metadata = nil
+			if tc.raw != "" {
+				cfg.Metadata = map[string]string{namespace: tc.raw}
+			}
+			got, err := summarizeDiskTopology(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Disks) != 1 || got.Disks[0].Name != "data" || !got.Disks[0].Slot || got.WorkspaceTopology != tc.want {
+				t.Fatalf("unexpected disk inventory or Workspace view: %+v", got)
+			}
+		})
+	}
+	cfg.Mounts[0].Source = "missing"
+	if _, err := summarizeDiskTopology(cfg); err == nil {
+		t.Fatal("invalid native mount passed validation")
+	}
+}
+
 func TestPrepareRejectsSourceRoleAndModeMismatch(t *testing.T) {
 	_, _, sandboxPath, _, snapshotPath := writeTaskLocalArtifacts(t,
 		"resources:\n  capacity: {cpu: 1, memory: 64MiB}\nboot: {}\n", nil, false)

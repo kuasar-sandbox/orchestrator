@@ -10,7 +10,7 @@ import (
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
-// WorkspaceDefault is the first default selected for this slot in this run.
+// WorkspaceDefault is the first default selected for the slot in this sandbox instance.
 // Other sources already identify their disk explicitly; the owner arbitrates
 // concurrent binds and records the actual device state and private writer.
 type WorkspaceDefault struct {
@@ -18,27 +18,27 @@ type WorkspaceDefault struct {
 	Locations rtconfig.RefLocations
 }
 
-var ErrWorkspaceGeneration = errors.New("workspace run changed")
+var ErrWorkspaceUnavailable = errors.New("workspace sandbox is not the current running instance")
 
-func (s *Store) WorkspaceDefault(ctx context.Context, id, instance, run, name string, candidate *WorkspaceDefault) (*WorkspaceDefault, error) {
+func (s *Store) WorkspaceDefault(ctx context.Context, id, instance, name string, candidate *WorkspaceDefault) (*WorkspaceDefault, error) {
 	// The primary key bounds storage to one intent per slot; deleting the
-	// parent also deletes all intents. A resume can never replay an old intent.
+	// parent also deletes all intents. Resume reuses the same disk selection.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	var current string
-	err = tx.QueryRowContext(ctx, `SELECT run_id FROM sandboxes WHERE id=? AND instance_id=? AND state='running' AND run_id<>'' AND run_id<>dead_run_id AND run_id<>sandbox_result_run_id`, id, instance).Scan(&current)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && current != run {
-		return nil, ErrWorkspaceGeneration
+	var found int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM sandboxes WHERE id=? AND instance_id=? AND state='running'`, id, instance).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrWorkspaceUnavailable
 	}
 	if err != nil {
 		return nil, err
 	}
-	aad, _ := json.Marshal([]string{"workspace-default", id, instance, run, name})
+	aad, _ := json.Marshal([]string{"workspace-default", id, instance, name})
 	var enc string
-	err = tx.QueryRowContext(ctx, `SELECT source_enc FROM workspace_defaults WHERE sandbox_id=? AND name=? AND run_id=?`, id, name, run).Scan(&enc)
+	err = tx.QueryRowContext(ctx, `SELECT source_enc FROM workspace_defaults WHERE sandbox_id=? AND name=?`, id, name).Scan(&enc)
 	if err == nil {
 		raw, err := s.box.DecryptAAD(enc, aad)
 		if err != nil {
@@ -62,8 +62,7 @@ func (s *Store) WorkspaceDefault(ctx context.Context, id, instance, run, name st
 	if err != nil {
 		return nil, err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO workspace_defaults(sandbox_id,name,run_id,source_enc) VALUES(?,?,?,?)
-	 ON CONFLICT(sandbox_id,name) DO UPDATE SET run_id=excluded.run_id,source_enc=excluded.source_enc`, id, name, run, enc)
+	_, err = tx.ExecContext(ctx, `INSERT INTO workspace_defaults(sandbox_id,name,source_enc) VALUES(?,?,?)`, id, name, enc)
 	if err != nil {
 		return nil, err
 	}

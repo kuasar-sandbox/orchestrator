@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -27,7 +28,7 @@ func TestWorkspacePlanPrivateAndLegacyMetadata(t *testing.T) {
 		t.Fatalf("plan not confidential")
 	}
 	got, err := st.Get(ctx, sb.ID)
-	if err != nil || !reflect.DeepEqual(got.WorkspacePlan, sb.WorkspacePlan) {
+	if err != nil || !reflect.DeepEqual(got.WorkspacePlan, sb.WorkspacePlan) || got.Metadata[workspace.Namespace] != workspace.Topology(sb.WorkspacePlan) {
 		t.Fatalf("store round trip: %v %v", got, err)
 	}
 	other := sandboxInsertFixture("different-workspace-owner", 1)
@@ -44,7 +45,29 @@ func TestWorkspacePlanPrivateAndLegacyMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err = st.Get(ctx, sb.ID)
-	if err != nil || len(got.WorkspacePlan) != 0 || got.Metadata[workspace.Namespace] != sb.Metadata[workspace.Namespace] {
+	if err != nil || len(got.WorkspacePlan) != 0 || got.Metadata[workspace.Namespace] != "" {
 		t.Fatalf("legacy row: %+v %v", got, err)
+	}
+}
+
+func TestBuildWorkspaceMetadataRequiresResolvedPlan(t *testing.T) {
+	st := testStore(t)
+	b := buildTriggerFixture("legacy-workspace-template", types.BuildRegistered)
+	b.Metadata[workspace.Namespace] = `[{"name":"orphan","mounts":[{"path":"/stale"}],"disk":{"migrationToken":"legacy-secret"}}]`
+	for _, withPlan := range []bool{false, true} {
+		if withPlan {
+			b.WorkspacePlan = []workspace.Prepared{{Name: "project", Mounts: []workspace.Mount{{Path: "/project"}}}}
+		}
+		if err := st.PutBuild(t.Context(), b); err != nil {
+			t.Fatal(err)
+		}
+		read, err := st.GetBuild(t.Context(), b.BuildID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, ok := read.Metadata[workspace.Namespace]
+		if ok != withPlan || (withPlan && view != workspace.Topology(b.WorkspacePlan)) || read.Metadata["original"] != "metadata" {
+			t.Fatalf("resolved plan %t: published build metadata %+v", withPlan, read.Metadata)
+		}
 	}
 }

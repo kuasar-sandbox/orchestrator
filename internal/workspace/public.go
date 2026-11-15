@@ -8,8 +8,6 @@ import (
 	"errors"
 	"maps"
 	"net/http"
-
-	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
 
 // PublicMetadata projects records written by older nodes before exposing them.
@@ -20,22 +18,10 @@ func PublicMetadata(meta map[string]string) map[string]string {
 		return meta
 	}
 	clean := maps.Clone(meta)
-	// Older nodes persisted arbitrary metadata values, including disk formats
-	// unknown to this node. Decode only the topology, then validate it.
-	var topology []struct {
-		Name   string  `json:"name"`
-		Mounts []Mount `json:"mounts,omitempty"`
-	}
-	var entries []Entry
-	err := strictjson.DecodeAllowUnknown([]byte(raw), &topology)
-	if err == nil && topology != nil {
-		projected, _ := json.Marshal(topology)
-		entries, err = Parse(string(projected))
-	}
-	if err != nil || topology == nil {
-		delete(clean, Namespace)
-	} else {
+	if entries := savedViews(raw, nil); entries != nil {
 		clean[Namespace] = TopologyJSON(entries)
+	} else {
+		delete(clean, Namespace)
 	}
 	return clean
 }

@@ -91,6 +91,7 @@ type Orchestrator struct {
 	diskReleaseActive map[string]*diskCheckpointReleaseWork
 	exports           exportAttemptGroup // publish/finalize owners that Resume may preempt or detach
 	lifecycle         keyedLockGroup     // serialize lifecycle mutations for one sid
+	workspaceAttaches sync.Map           // (parent instance, workspace name) -> in-flight attach
 
 	deleteMu            sync.Mutex
 	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
@@ -2479,6 +2480,10 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		MaxRefs:                  maxRequiredArtifactRefs,
 		AbsoluteDeadlineUnixNano: deadlineUnixNano,
 	}
+	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindSbx && sb.LaunchMode == types.LaunchCold && len(sb.WorkspacePlan) > 0 {
+		response.Prepare.SBXCreateWorkspaces = sb.WorkspacePlan
+		response.Prepare.SBXCreateMounts = cfgSpec.Mounts
+	}
 	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindSnp && sb.LaunchMode == types.LaunchMemory {
 		runtimePath, err := filepath.Abs(o.runtimeFileFor(tmpl.Profile))
 		if err != nil {
@@ -2524,7 +2529,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 	if err != nil {
 		return nil, configsock.RejectArtifactPrepare(err)
 	}
-	if err := validatePreparedPair(summary, sandboxcfg.SourceForLaunch(sb, tmpl)); err != nil {
+	if err := validateSandboxPreparedPair(summary, sb, tmpl); err != nil {
 		return nil, configsock.RejectArtifactPrepare(err)
 	}
 	replay, err := attempt.SubmitPrepare(runID, summary)
@@ -2545,7 +2550,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 	}
 	if current == nil || current.RunID != runID || (current.State != types.StateStarting && current.State != types.StateRunning) ||
 		current.TemplateID != sb.TemplateID || current.CreatedUnix != sb.CreatedUnix ||
-		validatePreparedPair(summary, sandboxcfg.SourceForLaunch(current, tmpl)) != nil {
+		validateSandboxPreparedPair(summary, current, tmpl) != nil {
 		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
 	}
 	return final, nil

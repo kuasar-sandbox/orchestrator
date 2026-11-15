@@ -101,7 +101,6 @@ CREATE INDEX IF NOT EXISTS idx_sandboxes_mkhash ON sandboxes(manifest_key_hash);
 CREATE TABLE IF NOT EXISTS workspace_defaults (
   sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  run_id TEXT NOT NULL,
   source_enc TEXT NOT NULL,
   PRIMARY KEY(sandbox_id,name)
 );
@@ -1105,7 +1104,7 @@ func (s *Store) CommitStartingRunning(ctx context.Context, id, runID string) (bo
 // CommitPreparedRunning atomically accepts the complete source confirmed by
 // this starting runner. Initial template admission has an empty durable source;
 // existing sources must match the entire pair and may never acquire another E.
-func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandbox, source types.ResumeSource) (bool, error) {
+func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandbox, source types.ResumeSource, derived ...string) (bool, error) {
 	if expected == nil || expected.State != types.StateStarting || expected.RunID == "" || !source.Valid() {
 		return false, errors.New("store: invalid prepared starting source")
 	}
@@ -1119,6 +1118,15 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 				(tmpl.Kind == types.KindSbx && source.Kind == types.ResumeSourceSandbox && expected.LaunchMode == types.LaunchCold)) {
 			return false, errors.New("store: prepared source differs from initial template")
 		}
+	}
+	if len(derived) > 1 {
+		return false, errors.New("multiple derived SBX artifacts")
+	}
+	if len(derived) == 1 && derived[0] != "" {
+		if !expected.ResumeSource.Empty() || expected.LaunchMode != types.LaunchCold || source.Kind != types.ResumeSourceSandbox || !types.IsPreparedSandboxRef(derived[0]) {
+			return false, errors.New("invalid derived artifact for sandbox launch")
+		}
+		source.Ref = derived[0]
 	}
 	planEnc, err := s.encryptWorkspacePlan(expected)
 	if err != nil {
@@ -1522,7 +1530,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	if err := validateSandboxLifecycle(&sb); err != nil {
 		return nil, fmt.Errorf("store: sandbox %s has invalid lifecycle state: %w", sb.ID, err)
 	}
-	sb.Metadata, sb.Env = workspace.PublicMetadata(uj(meta)), uj(env)
+	sb.Metadata, sb.Env = uj(meta), uj(env)
 	if planEnc != "" {
 		plain, err := s.box.DecryptAAD(planEnc, workspacePlanAAD(&sb))
 		if err != nil {
@@ -1532,6 +1540,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 			return nil, err
 		}
 	}
+	sb.Metadata = workspace.SetTopology(sb.Metadata, sb.WorkspacePlan)
 	result, err := parseSandboxExecutionResult(sandboxResultJSON)
 	if err != nil {
 		return nil, fmt.Errorf("store: sandbox %s has corrupt execution result: %w", sb.ID, err)
@@ -1796,7 +1805,6 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		return nil, err
 	}
 	b.ExecutionClaimed = executionClaimed != 0
-	b.Metadata = workspace.PublicMetadata(uj(meta))
 	b.Builder = ub(builder)
 	plain, err := s.box.DecryptString(instanceConfigEnc)
 	if err != nil {
@@ -1807,6 +1815,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		return nil, fmt.Errorf("store: decode instance config for build %s: %w", b.BuildID, err)
 	}
 	b.WorkspacePlan = instance.WorkspacePlan
+	b.Metadata = workspace.SetTopology(uj(meta), b.WorkspacePlan)
 	b.Env, b.Secure = instance.Env, instance.Secure
 	b.ServiceSecret, b.EnvdAccessToken, b.TrafficAccessToken = instance.ServiceSecret, instance.EnvdAccessToken, instance.TrafficAccessToken
 	if steps != "" && steps != "[]" {

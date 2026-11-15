@@ -2,7 +2,6 @@ package builder
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -337,32 +336,12 @@ func (p *buildPipeline) publishSandboxTarget() (ref string, retErr error) {
 			ref = ""
 		}
 	}()
-	cfg, err := p.buildColdConfig()
+	cfg, portable, err := p.sandboxAssembly(image)
 	if err != nil {
 		return "", err
 	}
-	opener := rtsandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		return p.artifacts.storage.OpenFileWithLocations(ctx, path, ref, p.artifacts.locations)
-	})
-	portable, err := rtsandbox.PrepareSandboxEConfig(
-		p.ctx, cfg, image.ImageConfig, p.artifacts.locations,
-		p.artifacts.storage.LocalCodec(), p.artifacts.storage.LocalRequired(), opener,
-	)
-	if err != nil {
-		return "", fmt.Errorf("build publication: prepare top-level Sandbox E: %w", err)
-	}
-	// Direct E assembly has no running owner. Install the immutable published
-	// medium in each retained slot before serializing the authenticated disk table.
-	for _, binding := range p.workspaceBindings {
-		for i := range portable.Boot.Disks {
-			d := &portable.Boot.Disks[i]
-			if d.Name != binding.SlotName {
-				continue
-			}
-			disk := binding.Disk
-			d.Base, d.BaseFromRefs, d.PureBlock = disk.Base, disk.BaseFromRefs, true
-			d.Binding = &rtconfig.SlotBinding{ID: rand.Text(), SourceID: disk.Identity(), SizeBytes: *disk.Size}
-		}
+	if len(p.spec.SandboxSpec.WorkspacePlan) != 0 {
+		return p.publishWorkspaceTarget(image, cfg, portable)
 	}
 	source, err := rtsandbox.AssembleSandboxE(p.ctx, image, portable)
 	if err != nil {
@@ -384,4 +363,22 @@ func (p *buildPipeline) allowsImportRefererManifestWriteback() bool {
 	// publishing its local source IMG solely for referer writeback would restore
 	// the forbidden intermediate IMG Manifest.
 	return p.target.Kind != types.BuildTargetSandbox || p.target.Memory
+}
+
+func (p *buildPipeline) sandboxAssembly(image *sandboxfile.FlattenedImage) (*rtconfig.SandboxConfig, *rtconfig.PortableSandboxConfig, error) {
+	cfg, err := p.buildColdConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	opener := rtsandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
+		return p.artifacts.storage.OpenFileWithLocations(ctx, path, ref, p.artifacts.locations)
+	})
+	portable, err := rtsandbox.PrepareSandboxEConfig(
+		p.ctx, cfg, image.ImageConfig, p.artifacts.locations,
+		p.artifacts.storage.LocalCodec(), p.artifacts.storage.LocalRequired(), opener,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build publication: prepare top-level Sandbox E: %w", err)
+	}
+	return cfg, portable, nil
 }

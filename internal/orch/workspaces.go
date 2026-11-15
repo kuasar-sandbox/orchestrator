@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspaceprobe"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
@@ -45,11 +46,19 @@ func (o *Orchestrator) diskSocket(sb *types.Sandbox) string {
 	return filepath.Join(nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sb.ID), "ctl.sock")
 }
 
-func (o *Orchestrator) bindWorkspaceDisk(ctx context.Context, sb *types.Sandbox, name string, d rtconfig.DiskV1, locations rtconfig.RefLocations) error {
-	if sb.RunID == "" {
-		return api.ErrWorkspaceUnavailable
+type workspaceAttachKey struct {
+	parent, name string
+}
+
+func (o *Orchestrator) bindWorkspaceDisk(ctx context.Context, sb *types.Sandbox, entry workspace.Prepared, d rtconfig.DiskV1, locations rtconfig.RefLocations) error {
+	if err := ctl.BindDisk(ctx, o.diskSocket(sb), ctl.BindDiskRequest{SlotName: entry.Name, Disk: d, RefLocations: locations}); err != nil {
+		return err
 	}
-	return ctl.BindDisk(ctx, o.diskSocket(sb), ctl.BindDiskRequest{ExpectedRun: sb.RunID, SlotName: name, Disk: d, RefLocations: locations})
+	targets := make([]string, 0, len(entry.Mounts))
+	for _, mount := range entry.Mounts {
+		targets = append(targets, mount.Path)
+	}
+	return workspaceprobe.Drain(ctx, o.executables.SandboxCtl(), nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot), sb.ID, targets)
 }
 
 func workspaceDeclared(sb *types.Sandbox, name string) bool {
@@ -61,14 +70,7 @@ func workspaceDeclared(sb *types.Sandbox, name string) bool {
 	return false
 }
 
-func workspaceChanged(conditional bool) error {
-	if conditional {
-		return api.ErrWorkspaceGeneration
-	}
-	return api.ErrWorkspaceConflict
-}
-
-func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name, generation string, input json.RawMessage) error {
+func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name string, input json.RawMessage) error {
 	ctx, finish, err := o.workspaceOperation(ctx)
 	if err != nil {
 		return err
@@ -83,13 +85,11 @@ func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name, ge
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
-	if generation != "" && generation != sb.RunID {
-		return api.ErrWorkspaceGeneration
-	}
-	if !workspaceDeclared(sb, name) {
+	i := slices.IndexFunc(sb.WorkspacePlan, func(entry workspace.Prepared) bool { return entry.Name == name })
+	if i < 0 {
 		return api.ErrNotFound
 	}
-	if !holdRunning(sb) {
+	if sb.State != types.StateRunning {
 		return api.ErrWorkspaceConflict
 	}
 
@@ -100,9 +100,9 @@ func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name, ge
 	var d rtconfig.DiskV1
 	var locations rtconfig.RefLocations
 	if len(fields) == 0 {
-		fixed, err := o.st.WorkspaceDefault(ctx, id, sb.InstanceID, sb.RunID, name, nil)
-		if errors.Is(err, store.ErrWorkspaceGeneration) {
-			return workspaceChanged(generation != "")
+		fixed, err := o.st.WorkspaceDefault(ctx, id, sb.InstanceID, name, nil)
+		if errors.Is(err, store.ErrWorkspaceUnavailable) {
+			return api.ErrWorkspaceConflict
 		}
 		if err != nil {
 			return err
@@ -112,9 +112,9 @@ func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name, ge
 			if err != nil {
 				return err
 			}
-			fixed, err = o.st.WorkspaceDefault(ctx, id, sb.InstanceID, sb.RunID, name, &store.WorkspaceDefault{Disk: d, Locations: locations})
-			if errors.Is(err, store.ErrWorkspaceGeneration) {
-				return workspaceChanged(generation != "")
+			fixed, err = o.st.WorkspaceDefault(ctx, id, sb.InstanceID, name, &store.WorkspaceDefault{Disk: d, Locations: locations})
+			if errors.Is(err, store.ErrWorkspaceUnavailable) {
+				return api.ErrWorkspaceConflict
 			}
 			if err != nil {
 				return err
@@ -127,7 +127,10 @@ func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name, ge
 			return err
 		}
 	}
-	err = o.bindWorkspaceDisk(ctx, sb, name, d, locations)
+	key := workspaceAttachKey{sb.InstanceID, name}
+	o.workspaceAttaches.Store(key, struct{}{})
+	defer o.workspaceAttaches.Delete(key)
+	err = o.bindWorkspaceDisk(ctx, sb, sb.WorkspacePlan[i], d, locations)
 	if err == nil {
 		return nil
 	}
@@ -139,15 +142,7 @@ func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name, ge
 		return api.ErrNotAllowed
 	case errors.Is(err, ctl.ErrDiskInvalid):
 		return api.ErrBadRequest
-	case errors.Is(err, ctl.ErrDiskCapacity), errors.Is(err, ctl.ErrDiskUnsupported):
-		return api.ErrWorkspaceConflict
-	case errors.Is(err, ctl.ErrDiskConflict):
-		// Conflict also covers a different source already bound to this slot.
-		// Ask the owner which generation it serves to distinguish that case.
-		report, e := ctl.ListDataDisks(ctx, o.diskSocket(sb), "")
-		if e == nil && report.RunID != sb.RunID {
-			return workspaceChanged(generation != "")
-		}
+	case errors.Is(err, ctl.ErrDiskCapacity), errors.Is(err, ctl.ErrDiskUnsupported), errors.Is(err, ctl.ErrDiskConflict):
 		return api.ErrWorkspaceConflict
 	default:
 		return api.ErrWorkspaceUnavailable
@@ -170,24 +165,33 @@ func (o *Orchestrator) ListWorkspaces(ctx context.Context, id, apiKey string) (a
 	}
 	var disks []ctl.DiskState
 	out.Workspaces = []api.WorkspaceStatus{}
-	switch {
-	case holdRunning(sb):
-		out.RunGeneration = sb.RunID
+	switch sb.State {
+	case types.StateRunning:
 		if len(sb.WorkspacePlan) == 0 {
 			return out, nil
 		}
-		report, err := ctl.ListDataDisks(ctx, o.diskSocket(sb), sb.RunID)
+		report, err := ctl.ListDataDisks(ctx, o.diskSocket(sb))
 		if err != nil {
 			if ctx.Err() != nil {
 				return out, ctx.Err()
 			}
 			return out, api.ErrWorkspaceUnavailable
 		}
-		disks = report.Disks
-	case sb.State == types.StatePaused:
-		if len(sb.WorkspacePlan) == 0 && sb.Metadata[workspace.Namespace] == "" {
-			return out, nil
+		// The read may overlap a pause, delete or replacement. Validate the
+		// original parent before returning mount paths and capacity.
+		current, err := o.st.Get(ctx, id)
+		if err != nil {
+			return out, err
 		}
+		if !ownsSandbox(current, apiKey) || sb.InstanceID != current.InstanceID {
+			return out, api.ErrNotFound
+		}
+		if current.State != types.StateRunning {
+			return out, api.ErrWorkspaceUnavailable
+		}
+		disks = report.Disks
+	case types.StatePaused:
+		// Imported and legacy rows may only carry the resolved view in their E.
 		guard, unlock, err := o.lockLifecycleMutation(ctx, id)
 		if err != nil {
 			return out, err
@@ -226,10 +230,11 @@ func (o *Orchestrator) ListWorkspaces(ctx context.Context, id, apiKey string) (a
 		switch d.State {
 		case "unbound":
 			s.State = "unattached"
-		case "published_pending_guest":
-			s.State = "attaching"
 		case "ready":
 			s.State = "attached"
+			if _, active := o.workspaceAttaches.Load(workspaceAttachKey{sb.InstanceID, decl.Name}); active && sb.State == types.StateRunning {
+				s.State = "attaching"
+			}
 		default:
 			return out, api.ErrWorkspaceUnavailable
 		}
