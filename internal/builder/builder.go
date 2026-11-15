@@ -40,6 +40,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -74,13 +76,14 @@ type Result struct {
 }
 
 type buildPipeline struct {
-	parent    context.Context
-	spec      *configsock.BuildSpec
-	vmmCgroup *os.File
-	report    PhaseReporter
-	log       *slog.Logger
-	out       *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
-	profile   types.Profile
+	workspaceBindings []ctl.BindDiskRequest
+	parent            context.Context
+	spec              *configsock.BuildSpec
+	vmmCgroup         *os.File
+	report            PhaseReporter
+	log               *slog.Logger
+	out               *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
+	profile           types.Profile
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -180,13 +183,20 @@ func (p *buildPipeline) run() (res Result) {
 		}
 	}()
 
+	// Target publication can replace the workspace plan with immutable output refs.
+	// The steps sandbox provisions its own private disks from the original inputs.
+	stepWorkspaces := s.SandboxSpec.WorkspacePlan
+	if err := p.prepareWorkspaces(); err != nil {
+		return fail(err)
+	}
+
 	if s.FromImage != "" {
 		if err := p.runPhase("a", p.phaseImport); err != nil {
 			return fail(fmt.Errorf("import: %w", err))
 		}
 	}
 	if len(s.Steps) > 0 || s.SourceSandboxConfig != nil {
-		if err := p.runPhase("b", p.phaseSteps); err != nil {
+		if err := p.runPhase("b", func() error { return p.phaseSteps(stepWorkspaces) }); err != nil {
 			return fail(fmt.Errorf("steps: %w", err))
 		}
 	}
@@ -341,6 +351,11 @@ func (p *buildPipeline) resolveTarget() error {
 			return fmt.Errorf("explicit image target conflicts with trigger start/ready commands")
 		}
 		p.startCmd, p.readyCmd = "", ""
+	}
+	captured := workspace.Captured(p.spec.SourceSandboxConfig)
+	hasWorkspace := len(p.spec.SandboxSpec.WorkspacePlan) > 0 || len(captured) > 0
+	if err := types.ValidateWorkspaceBuildTarget(p.spec.RequestedTarget, hasWorkspace); err != nil {
+		return err
 	}
 	p.target = types.ResolveBuildTarget(p.spec.RequestedTarget, p.startCmd, p.readyCmd)
 	if err := p.target.Validate(); err != nil {

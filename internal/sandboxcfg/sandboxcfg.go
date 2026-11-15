@@ -8,6 +8,7 @@ package sandboxcfg
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"net"
 	"os"
 	"strings"
@@ -74,11 +75,12 @@ func (t TapFD) runtime() rtconfig.TapFDConfig {
 // kuasar-sandbox.<ns> metadata keys. It excludes node-managed fields (boot,
 // resources.control, network.tapfd) — those are the orchestrator's.
 type SandboxSpec struct {
-	Resource ResourcePatch
-	Traffic  TrafficPatch
-	Network  NetworkSpec
-	Restore  RestoreSpec
-	Launch   *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
+	WorkspacePlan []workspace.Prepared `json:"workspace_plan,omitempty"`
+	Resource      ResourcePatch
+	Traffic       TrafficPatch
+	Network       NetworkSpec
+	Restore       RestoreSpec
+	Launch        *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
 	// LaunchCgroupControl preserves whether the boolean was explicitly present.
 	// LaunchConfig alone cannot distinguish an omitted value from false when a
 	// source Sandbox contributes lower-priority launch defaults.
@@ -160,6 +162,15 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// ValidateWorkspaceMetadata keeps the disk-authority marker out of public
+// metadata passthrough. Legacy sandbox rows can still be resumed.
+func ValidateWorkspaceMetadata(spec SandboxSpec) error {
+	if _, present := spec.Metadata[workspace.Namespace]; present {
+		return fmt.Errorf("sandboxcfg: %s is reserved for disk topology", workspace.Namespace)
+	}
+	return nil
 }
 
 // NormalizeRestoreMetadata validates and canonicalizes only the restore
@@ -531,6 +542,9 @@ func (p Params) buildImageColdConfig() (*rtconfig.SandboxConfig, error) {
 
 	// --- metadata: tenant passthrough + the resolved logical network ---
 	c.Metadata = p.buildMetadata()
+	if err := workspace.ApplyImage(c, p.Spec.WorkspacePlan); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -570,7 +584,14 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 		c.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)
 		c.Files = append([]rtconfig.FileConfig(nil), p.Spec.Files...)
 		c.Init = append([]rtconfig.InitConfig(nil), p.Spec.Init...)
-		c.Metadata = p.buildMetadata()
+		c.Metadata = workspace.SetTopology(p.buildMetadata(), p.Spec.WorkspacePlan)
+		if len(c.Mounts) > 0 {
+			for _, e := range p.Spec.WorkspacePlan {
+				for _, m := range e.Mounts {
+					c.Mounts = append(c.Mounts, rtconfig.MountConfig{Type: "disk", Source: e.Name, Target: m.Path, Subpath: m.Subpath})
+				}
+			}
+		}
 	}
 	return c, nil
 }
@@ -630,6 +651,10 @@ func (p Params) buildArtifactHostBoot() (hostBootConfig, error) {
 			return hostBootConfig{}, fmt.Errorf("sandboxcfg: duplicate artifact data disk name %q", shape.Name)
 		}
 		seen[shape.Name] = struct{}{}
+		if shape.Slot {
+			boot.Disks[i] = hostActiveDiskConfig{Name: shape.Name}
+			continue
+		}
 		active, err := p.hostActiveRoot(shape)
 		if err != nil {
 			return hostBootConfig{}, fmt.Errorf("sandboxcfg: artifact data disk %q: %w", shape.Name, err)
@@ -751,7 +776,9 @@ func ValidateLaunchForProfile(profile types.Profile, launch *rtconfig.LaunchConf
 func (p Params) buildMetadata() map[string]string {
 	m := map[string]string{}
 	for k, v := range p.Spec.Metadata {
-		m[k] = v
+		if k != workspace.Namespace {
+			m[k] = v
+		}
 	}
 	if !p.Network.IsZero() {
 		if nb, err := json.Marshal(p.Network); err == nil {

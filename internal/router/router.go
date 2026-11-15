@@ -41,6 +41,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
@@ -349,6 +350,13 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var autoPauseMemory, autoReset *bool
 	var idleTimeout *int64
 	createConfig, err := createSandboxPolicies(w, r, &autoPauseMemory, &idleTimeout, &autoReset)
+	var entries []workspace.Entry
+	if err == nil {
+		createConfig, entries, err = workspace.Extract(createConfig)
+		if err != nil {
+			err = errors.New("invalid workspace declaration")
+		}
+	}
 	if err != nil {
 		status := http.StatusBadRequest
 		var maxBytesErr *http.MaxBytesError
@@ -360,7 +368,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := rt.routeLinkReserve(
 		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, autoReset, nil, nil,
-		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, idleTimeout,
+		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, createWireOptions{idleTimeout: idleTimeout, workspaces: entries},
 	)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
@@ -463,7 +471,15 @@ func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemo
 	if len(autoReset) > 0 && autoReset[0] != nil {
 		*autoReset[0] = sandboxcfg.CloneBool(body.AutoReset)
 	}
+	var err error
+	body.Metadata, err = workspace.WithHeader(body.Metadata, r.Header)
+	if err != nil {
+		return nil, err
+	}
 	selected := map[string]string{}
+	if raw, ok := body.Metadata[workspace.Namespace]; ok {
+		selected[workspace.Namespace] = raw
+	}
 	var bodyResource map[string]string
 	if raw, ok := body.Metadata[sandboxcfg.NsResource]; ok {
 		bodyResource = map[string]string{sandboxcfg.NsResource: raw}
@@ -590,6 +606,10 @@ func mergeBuildRegistrationHeaders(metadata map[string]string, header http.Heade
 	}
 	if _, present := metadata[sandboxcfg.NsIdentity]; present {
 		return nil, fmt.Errorf("%s is not valid for template builds", sandboxcfg.NsIdentity)
+	}
+	metadata, err := workspace.WithHeader(metadata, header)
+	if err != nil {
+		return nil, err
 	}
 	out, err := sandboxcfg.MergeMetadata(nil, metadata)
 	if err != nil {
@@ -762,6 +782,11 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	metadata, entries, err := workspace.Extract(metadata)
+	if err != nil {
+		http.Error(w, "invalid workspace declaration", 400)
+		return
+	}
 	var mmdsHeader *string
 	if values, present := r.Header[http.CanonicalHeaderKey(HeaderMMDS)]; present {
 		if len(values) != 1 {
@@ -808,6 +833,10 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := types.ValidateWorkspaceBuildTarget(builderOpts.Target, len(entries) != 0); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	bodyResources, err := buildcfg.ParseFirstClassResourceJSON(body.CPUCount, body.CPUCountSn, body.MemoryMB, body.MemoryMBSn)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -848,7 +877,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := rt.routeLinkReserveBuild(
 		r.Context(), group, profile, resources, metadata, body.EnvVars, body.Secure,
-		credentialEnvelope, mmdsSecrets,
+		credentialEnvelope, mmdsSecrets, entries,
 	)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
@@ -2011,6 +2040,11 @@ func randomHexID() string {
 
 // --- control client ---
 
+type createWireOptions struct {
+	idleTimeout *int64
+	workspaces  []workspace.Entry
+}
+
 func (rt *Router) routeLinkReserve(
 	ctx context.Context,
 	operation, group, routeKey, sandboxID string,
@@ -2019,7 +2053,7 @@ func (rt *Router) routeLinkReserve(
 	autoPauseMemory, autoReset, memory *bool,
 	execSession *registry.SandboxReserveExecSessionReq,
 	headers map[string]string,
-	idlePolicy ...*int64,
+	opts ...createWireOptions,
 ) (*reserveResult, error) {
 	query := url.Values{
 		"operation": []string{operation},
@@ -2037,12 +2071,12 @@ func (rt *Router) routeLinkReserve(
 	}
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte
-	var idleTimeout *int64
-	if len(idlePolicy) > 0 {
-		idleTimeout = types.CloneIdleTimeout(idlePolicy[0])
+	var create createWireOptions
+	if len(opts) > 0 {
+		create = opts[0]
 	}
 	if operation == "create" {
-		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, IdleTimeout: idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
+		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, Workspaces: create.workspaces, IdleTimeout: create.idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
 		if headers == nil {
 			headers = map[string]string{}
 		}
@@ -2067,7 +2101,7 @@ func (rt *Router) routeLinkReserve(
 	return &res, nil
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, secure bool, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, secure bool, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string, entries []workspace.Entry) (*buildReserveResult, error) {
 	var wireResources *routesync.BuildResources
 	if resources != nil {
 		wireResources = &routesync.BuildResources{
@@ -2077,7 +2111,7 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 	reqBody, _ := json.Marshal(registry.BuildReserveReq{
 		Group: group, BuildID: "bld-" + randomHexID(), TemplateID: "transient-" + randomHexID(),
 		Profile: profile, Resources: wireResources,
-		Metadata: metadata, Env: env, Secure: secure, Credentials: credentials, MMDSSecrets: mmdsSecrets,
+		Metadata: metadata, Env: env, Secure: secure, Credentials: credentials, MMDSSecrets: mmdsSecrets, Workspaces: entries,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {

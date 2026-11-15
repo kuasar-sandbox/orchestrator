@@ -336,19 +336,12 @@ func (p *buildPipeline) publishSandboxTarget() (ref string, retErr error) {
 			ref = ""
 		}
 	}()
-	cfg, err := p.buildColdConfig()
+	cfg, portable, err := p.sandboxAssembly(image)
 	if err != nil {
 		return "", err
 	}
-	opener := rtsandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
-		return p.artifacts.storage.OpenFileWithLocations(ctx, path, ref, p.artifacts.locations)
-	})
-	portable, err := rtsandbox.PrepareSandboxEConfig(
-		p.ctx, cfg, image.ImageConfig, p.artifacts.locations,
-		p.artifacts.storage.LocalCodec(), p.artifacts.storage.LocalRequired(), opener,
-	)
-	if err != nil {
-		return "", fmt.Errorf("build publication: prepare top-level Sandbox E: %w", err)
+	if len(p.spec.SandboxSpec.WorkspacePlan) != 0 {
+		return p.publishWorkspaceTarget(image, cfg, portable)
 	}
 	source, err := rtsandbox.AssembleSandboxE(p.ctx, image, portable)
 	if err != nil {
@@ -370,4 +363,22 @@ func (p *buildPipeline) allowsImportRefererManifestWriteback() bool {
 	// publishing its local source IMG solely for referer writeback would restore
 	// the forbidden intermediate IMG Manifest.
 	return p.target.Kind != types.BuildTargetSandbox || p.target.Memory
+}
+
+func (p *buildPipeline) sandboxAssembly(image *sandboxfile.FlattenedImage) (*rtconfig.SandboxConfig, *rtconfig.PortableSandboxConfig, error) {
+	cfg, err := p.buildColdConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	opener := rtsandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
+		return p.artifacts.storage.OpenFileWithLocations(ctx, path, ref, p.artifacts.locations)
+	})
+	portable, err := rtsandbox.PrepareSandboxEConfig(
+		p.ctx, cfg, image.ImageConfig, p.artifacts.locations,
+		p.artifacts.storage.LocalCodec(), p.artifacts.storage.LocalRequired(), opener,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build publication: prepare top-level Sandbox E: %w", err)
+	}
+	return cfg, portable, nil
 }

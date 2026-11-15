@@ -2256,9 +2256,9 @@ node TTL deletes history; BuildDelete removes projection/ref
 control HTTP 只缓存并拨该地址.结果不保留旧 `DataEndpoint` alias,BuildRecord 也不复制 endpoint.
 
 北向 `/v3/templates` 将省略的 profile 按 e2b 端点语义解析为 `e2b`;进入集群内部后 profile 必须
-显式存在。`X-Kuasar-Sandbox-Builder.target` 是 register-only immutable 定义：Image、top-level
+显式存在。`builder.target` 通过 `X-Kuasar-Sandbox-Builder` 请求头或 `metadata["kuasar-sandbox.builder"]` 提供，注册后不可更改：Image、top-level
 Sandbox E、memory Sandbox 三种 target 均随 canonical builder JSON、Registry replay identity、
-`build_register` 和节点 Build row 传递；省略时只由 worker 根据最终 effective start/ready 自动解析。
+`build_register` 和节点 Build row 传递；构建声明或从来源模板继承 workspace 时，须在注册时显式指定 Sandbox 目标。无 workspace 的构建可以省略目标，由 worker 根据最终生效的 start/ready 命令自动选择。
 route owner 将 profile、target/config identity 与 placement 返回的 `APISecretFingerprint` 持久化进
 BuildRecord,并随 `build_register` 下发,节点按该完整指纹从同一凭据对写入本地 build,同时将
 profile 写入 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bare build 可选择三种 target，

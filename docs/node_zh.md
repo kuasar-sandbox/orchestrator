@@ -393,6 +393,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
 | `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl([guest profile:envd 与工具链](#guest-runtime)) |
 | `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏文件提供;restore 不需要(overlay 链来自快照) |
+| `sandbox.boot.workspace_default_disk` | 可选 | workspace 的 `disk:{}` 使用的完整 DiskV1。省略时，新盘以 `overlay_diff_template` 为 ext4 初始内容。示例为 `{kind: disk, version: 1, diff_template: file:///srv/kuasar/workspace.ext4}`。公开内联 raw 种子须与节点显式配置的具名位置种子一致。 |
 
 新建 `sandbox.boot.overlay_diff_template` 和 `builder.diff_template` 时，使用
 `mkfs.ext4 -O ^has_journal`，避免可丢弃工作盘的文件系统 journal 占用及元数据

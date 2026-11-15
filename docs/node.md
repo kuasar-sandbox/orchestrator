@@ -297,6 +297,7 @@ The following table owns shared node-service fields. Capability-specific configu
 | `sandbox.boot.kernel` | — | vmlinux path |
 | `sandbox.boot.runtime` | — | Single guest runtime Bundle: offset-zero EROFS plus digest-marker ZIP, containing envd and flatten-ctl ([Guest profiles: envd and the toolchain](#guest-runtime)) |
 | `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with `mkfs.ext4 -O ^has_journal`. Restore obtains the layer graph from artifacts |
+| `sandbox.boot.workspace_default_disk` | optional | Complete DiskV1 used for workspace `disk:{}`. When omitted, each new workspace uses `overlay_diff_template` as its ext4 seed. Example: `{kind: disk, version: 1, diff_template: file:///srv/kuasar/workspace.ext4}`. Public inline raw seeds must match an explicitly configured named-location seed. |
 
 For new `sandbox.boot.overlay_diff_template` and `builder.diff_template` files,
 use `mkfs.ext4 -O ^has_journal` to avoid filesystem journal capacity and metadata

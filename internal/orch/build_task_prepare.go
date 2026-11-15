@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
@@ -29,6 +30,7 @@ type buildRuntimePreparation struct {
 	SchemaVersion          int                       `json:"schema_version"`
 	PrepareDigest          string                    `json:"prepare_digest"`
 	RootSource             types.ResumeSource        `json:"root_source"`
+	SourceHasWorkspaces    bool                      `json:"source_has_workspaces,omitempty"`
 	SourceHasBuildCommands bool                      `json:"source_has_build_commands"`
 	Network                sandboxcfg.NetworkSpec    `json:"network"`
 	TemplateNetwork        sandboxcfg.NetworkSpec    `json:"template_network"`
@@ -105,6 +107,30 @@ func fastBuildPrepareDigest(buildID string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func (pend *pendingBuild) prepareSourceSummary(summary configsock.ArtifactPrepareSummary) (configsock.ArtifactCapacity, sandboxcfg.NetworkSpec, error) {
+	var entries []workspace.Entry
+	if raw := summary.DiskTopology.WorkspaceTopology; raw != "" {
+		var err error
+		entries, err = workspace.Parse(raw)
+		if err != nil {
+			return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source workspace topology: %w", err)
+		}
+	}
+	if len(entries) == 0 {
+		summary.DiskTopology.WorkspaceTopology = ""
+	}
+	capacity, network, err := validateBuildPrepareSummary(summary)
+	if err != nil {
+		return capacity, network, err
+	}
+	if err := types.ValidateWorkspaceBuildTarget(pend.build.Builder.Target, len(entries) > 0); err != nil {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, err
+	}
+	pend.sourceHasWorkspaces = len(entries) > 0
+	pend.sourceHasBuildCommands = summary.HasBuildCommands
+	return capacity, network, nil
+}
+
 func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (configsock.ArtifactCapacity, sandboxcfg.NetworkSpec, error) {
 	if summary.SchemaVersion != configsock.ArtifactPrepareSchemaVersion {
 		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: unsupported artifact prepare schema %d", summary.SchemaVersion)
@@ -146,7 +172,7 @@ func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (con
 	if err := validateArtifactDiskTopology(summary.DiskTopology); err != nil {
 		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template disk summary: %w", err)
 	}
-	if len(summary.DiskTopology.Disks) != 0 {
+	if len(summary.DiskTopology.Disks) != 0 && summary.DiskTopology.WorkspaceTopology == "" {
 		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: Sandbox sources with data disks are not supported")
 	}
 	return summary.Capacity, inherited, nil

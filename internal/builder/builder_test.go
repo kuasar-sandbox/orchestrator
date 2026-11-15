@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"gopkg.in/yaml.v3"
 )
@@ -264,6 +265,26 @@ func TestPreparedSandboxImageConfigSeedsBuildStepContext(t *testing.T) {
 	}
 }
 
+func TestResolveWorkspaceTargetFromCapturedArtifact(t *testing.T) {
+	source := &rtconfig.PortableSandboxConfig{
+		Version:  2,
+		Boot:     rtconfig.PortableBootConfig{Disks: []rtconfig.PortableDiskConfig{{Name: "work", PureBlock: true}}},
+		Metadata: map[string]string{workspace.Namespace: `[{"name":"work","mounts":[{"path":"/data"}]}]`},
+		Mounts:   []rtconfig.MountConfig{{Type: "disk", Source: "work", Target: "/data"}},
+	}
+	for _, target := range []*types.BuildTarget{nil, {Kind: types.BuildTargetImage}, {Kind: types.BuildTargetSandbox}, {Kind: types.BuildTargetSandbox, Memory: true}} {
+		p := &buildPipeline{spec: &configsock.BuildSpec{RequestedTarget: target, SourceSandboxConfig: source}, startCmd: "inherited"}
+		err := p.resolveTarget()
+		if target == nil || target.Kind == types.BuildTargetImage {
+			if err == nil || !strings.Contains(err.Error(), "builder.target") {
+				t.Fatalf("worker accepted incompatible target %+v: %v", target, err)
+			}
+		} else if err != nil || p.target != *target {
+			t.Fatalf("worker changed explicit target %+v: got %+v, %v", target, p.target, err)
+		}
+	}
+}
+
 func TestResolveTargetUsesOnlyEffectiveCommandsAndExplicitTarget(t *testing.T) {
 	image := types.BuildTarget{Kind: types.BuildTargetImage}
 	topLevelSandbox := types.BuildTarget{Kind: types.BuildTargetSandbox}
@@ -461,7 +482,7 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 		spec: &configsock.BuildSpec{Paths: configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"}},
 	}
 
-	stepsLaunch := p.stepsYAML()["launch"].(map[string]any)
+	stepsLaunch := mustStepsYAML(t, p, nil)["launch"].(map[string]any)
 	if got := stepsLaunch["cgroup_control"]; got != true {
 		t.Fatalf("steps launch.cgroup_control = %#v, want true", got)
 	}
@@ -510,7 +531,7 @@ func TestBuildAndTargetResourcesRemainSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	phaseB := p.stepsYAML()
+	phaseB := mustStepsYAML(t, p, nil)
 	for phase, doc := range map[string]map[string]any{"a": phaseA, "b": phaseB} {
 		got, ok := doc["resources"].(rtconfig.ResourcesConfig)
 		if !ok || !reflect.DeepEqual(got, resources) {
@@ -782,7 +803,7 @@ func TestStepsYAMLOmitsFlattenConfigFiles(t *testing.T) {
 		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
 		Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", BuilderDiffTpl: "/d"},
 	}}
-	doc := p.stepsYAML()
+	doc := mustStepsYAML(t, p, nil)
 	if files, ok := doc["files"]; ok {
 		for _, f := range files.([]map[string]any) {
 			if f["path"] == guestCACert || f["path"] == guestFlattenCfg {
@@ -836,4 +857,13 @@ func TestFlattenConfigArgForSkipVerify(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("flattenConfigArg() = %v, want %v", got, want)
 	}
+}
+
+func mustStepsYAML(t *testing.T, p *buildPipeline, plan []workspace.Prepared) map[string]any {
+	t.Helper()
+	doc, err := p.stepsYAML(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc
 }

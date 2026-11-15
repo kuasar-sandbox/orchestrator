@@ -27,7 +27,21 @@ func validateBuildResult(build *types.Build, result types.BuildResult) error {
 	if err := result.Target.Validate(); err != nil {
 		return fmt.Errorf("build result target: %w", err)
 	}
-	if requested := build.Builder.Target; requested != nil {
+	requested := build.Builder.Target
+	if requested == nil || requested.Kind == types.BuildTargetImage {
+		hasWorkspace := len(build.WorkspacePlan) != 0
+		if !hasWorkspace && build.RuntimePrepareJSON != "" {
+			prep, err := decodeBuildRuntimePreparation(build.RuntimePrepareJSON)
+			if err != nil {
+				return err
+			}
+			hasWorkspace = prep.SourceHasWorkspaces
+		}
+		if err := types.ValidateWorkspaceBuildTarget(requested, hasWorkspace); err != nil {
+			return err
+		}
+	}
+	if requested != nil {
 		if result.Target != *requested {
 			return fmt.Errorf("build result target %+v differs from requested target %+v", result.Target, *requested)
 		}

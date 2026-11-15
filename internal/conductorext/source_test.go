@@ -16,7 +16,26 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
+
+func TestExtensionWorkspaceMetadataUsesResolvedPlan(t *testing.T) {
+	metadata := map[string]string{workspace.Namespace: `[{"name":"orphan","mounts":[{"path":"/stale"}],"disk":{"migrationToken":"old-secret"}}]`, "other": "value"}
+	sb := &types.Sandbox{Metadata: metadata}
+	b := &types.Build{Metadata: metadata}
+	for _, resolved := range []bool{false, true} {
+		if resolved {
+			sb.WorkspacePlan = []workspace.Prepared{{Name: "project", Mounts: []workspace.Mount{{Path: "/actual"}}}}
+			b.WorkspacePlan = sb.WorkspacePlan
+		}
+		for _, view := range []map[string]string{ProjectSandbox(sb).Metadata, ProjectBuild(b).Metadata} {
+			topology, ok := view[workspace.Namespace]
+			if ok != resolved || (ok && topology != workspace.Topology(sb.WorkspacePlan)) || view["other"] != "value" {
+				t.Fatalf("resolved %t: extension view %v", resolved, view)
+			}
+		}
+	}
+}
 
 func TestSourcesGetReturnIndependentRedactedViews(t *testing.T) {
 	storage := testStore(t)

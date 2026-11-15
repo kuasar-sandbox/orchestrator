@@ -104,6 +104,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 			return nil, nil, fmt.Errorf("%w: extension changed cluster-owned autoReset policy", api.ErrBadRequest)
 		}
 	}
+	normalized.Workspaces = cmd.Workspaces
 	normalized.Metadata = clusterSandboxMetadata(normalized.Metadata)
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
 		ID: cmd.SID, StableID: cmd.Cluster.StableID,

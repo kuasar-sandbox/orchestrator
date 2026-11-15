@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -182,7 +184,48 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if err != nil {
 		return launchFailed("artifact_prepare", err)
 	}
-	if artifactTopologyNeedsTemplate(summary.DiskTopology) && strings.TrimSpace(o.cfg.Sandbox.Boot.OverlayDiffTemplate) == "" {
+	var choices []workspace.Prepared
+	if sb.ResumeSource.Empty() {
+		choices = sb.WorkspacePlan
+	}
+	var added []workspace.Prepared
+	if tmpl.Kind == types.KindSbx && sb.LaunchMode == types.LaunchCold && len(choices) > 0 {
+		var entries []workspace.Entry
+		if raw := summary.DiskTopology.WorkspaceTopology; raw != "" {
+			entries, err = workspace.Parse(raw)
+			if err != nil {
+				return launchFailed("artifact_prepare", err)
+			}
+		}
+		var names []string
+		for _, d := range summary.DiskTopology.Disks {
+			names = append(names, d.Name)
+		}
+		added, err = workspace.AdditionalDevices(names, entries, choices)
+		if err != nil {
+			return launchFailed("artifact_prepare", err)
+		}
+	}
+	if (len(added) > 0) != (summary.DerivedSandboxRef != "") || (len(added) > 0 && !types.IsPreparedSandboxRef(summary.DerivedSandboxRef)) {
+		return launchFailed("artifact_prepare", errors.New("SBX create lacks a matching instance artifact"))
+	}
+	originalChoices := slices.DeleteFunc(slices.Clone(choices), func(p workspace.Prepared) bool {
+		return slices.ContainsFunc(added, func(a workspace.Prepared) bool { return a.Name == p.Name })
+	})
+	effective, binds, err := resolveCapturedWorkspaces(summary.DiskTopology, originalChoices)
+	if err != nil {
+		return launchFailed("artifact_prepare", err)
+	}
+	effectiveDisks := configsock.CloneArtifactPrepareSummary(summary).DiskTopology
+	for _, a := range added {
+		effective = append(effective, workspace.Prepared{Name: a.Name, Mounts: a.Mounts})
+		d := types.ArtifactDiskShape{Name: a.Name, Mode: types.ArtifactDiskSingle, HasActiveBase: a.Disk != nil, Slot: a.Disk == nil}
+		if a.Slot != nil {
+			d.SlotSize, _ = a.Slot.Capacity()
+		}
+		effectiveDisks.Disks = append(effectiveDisks.Disks, d)
+	}
+	if artifactTopologyNeedsTemplate(effectiveDisks) && strings.TrimSpace(o.cfg.Sandbox.Boot.OverlayDiffTemplate) == "" {
 		return launchFailed("artifact_prepare", errors.New("orch: artifact disk topology requires sandbox.boot.overlay_diff_template"))
 	}
 	hostPrepareStarted := time.Now()
@@ -308,7 +351,12 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
 	}
 	p := o.sandboxParams(sb, tmpl, preparation.Spec, network, resources)
-	p.ArtifactDisks = summary.DiskTopology
+	p.ArtifactDisks = effectiveDisks
+	if len(added) > 0 {
+		// The task merged the requested mounts with all source disk mounts in E.
+		p.Spec.Mounts = nil
+	}
+	p.Spec.WorkspacePlan = effective
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		unlock()
 		return launchFailed("config_write", err)
@@ -342,6 +390,11 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
+	for _, b := range binds {
+		if err := o.bindWorkspaceDisk(launchCtx, sb, b, *b.Disk, b.RefLocations); err != nil {
+			return launchFailed("workspace_attach", err)
+		}
+	}
 	if tmpl.Profile == types.ProfileE2B {
 		envdStarted := time.Now()
 		err = o.envdInit(launchCtx, sb)
@@ -353,7 +406,13 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 
 	unlock = o.lifecycle.Lock(sb.ID)
 	defer unlock()
-	changed, err = o.st.CommitPreparedRunning(launchCtx, sb, summary.RootSource)
+	sb.WorkspacePlan = effective
+	sb.Metadata = workspace.SetTopology(sb.Metadata, effective)
+	committedSource := summary.RootSource
+	if summary.DerivedSandboxRef != "" {
+		committedSource.Ref = summary.DerivedSandboxRef
+	}
+	changed, err = o.st.CommitPreparedRunning(launchCtx, sb, summary.RootSource, summary.DerivedSandboxRef)
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: commit launch %s: %w", sb.ID, err))
 	}
@@ -369,7 +428,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		cached.PressureVersion++
 		cached.RunningSinceUnixNano = time.Now().UnixNano()
 		cached.PressureSinceUnixNano = 0
-		cached.ResumeSource = summary.RootSource
+		cached.WorkspacePlan = effective
+		cached.Metadata = workspace.SetTopology(cached.Metadata, effective)
+		cached.ResumeSource = committedSource
 		cached.RunID = sb.RunID
 		cached.LaunchMode = ""
 	})
@@ -380,12 +441,12 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		running.PressureVersion = sb.PressureVersion + 1
 		running.RunningSinceUnixNano = time.Now().UnixNano()
 		running.PressureSinceUnixNano = 0
-		running.ResumeSource = summary.RootSource
+		running.ResumeSource = committedSource
 		running.LaunchMode = ""
 		o.cache(running)
 	}
 	sb.State = types.StateRunning
-	sb.ResumeSource = summary.RootSource
+	sb.ResumeSource = committedSource
 	sb.LaunchMode = ""
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
@@ -413,6 +474,19 @@ func validatePreparedPair(summary configsock.ArtifactPrepareSummary, expected ty
 		return errors.New("orch: prepared root pair conflicts with the accepted source")
 	}
 	return nil
+}
+
+// Replayed preparation can reach the provider just after the owner committed
+// the child E. Authenticate both the original template and that durable child.
+func validateSandboxPreparedPair(summary configsock.ArtifactPrepareSummary, sb *types.Sandbox, tmpl types.TemplateID) error {
+	if sb.State == types.StateRunning && summary.DerivedSandboxRef != "" {
+		if tmpl.Kind != types.KindSbx || summary.RootSource != (types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: tmpl.Ref}) ||
+			!types.IsPreparedSandboxRef(summary.DerivedSandboxRef) || sb.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: summary.DerivedSandboxRef}) {
+			return errLaunchOwnershipLost
+		}
+		return nil
+	}
+	return validatePreparedPair(summary, sandboxcfg.SourceForLaunch(sb, tmpl))
 }
 
 func validateArtifactPrepareSummary(summary configsock.ArtifactPrepareSummary, mode types.LaunchMode) (rtconfig.CapacityConfig, sandboxcfg.NetworkSpec, error) {
@@ -478,7 +552,7 @@ func artifactTopologyNeedsTemplate(topology types.ArtifactDiskTopology) bool {
 		return true
 	}
 	for _, disk := range topology.Disks {
-		if !disk.HasActiveBase {
+		if !disk.Slot && !disk.HasActiveBase {
 			return true
 		}
 	}

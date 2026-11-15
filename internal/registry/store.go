@@ -70,6 +70,7 @@ type NodeRecord struct {
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
+	WorkspacesDigest       string                    `json:"workspaces_digest,omitempty"`
 	InstanceID             string                    `json:"instance_id,omitempty"`
 	StateVersion           uint64                    `json:"state_version,omitempty"`
 	Group                  string                    `json:"group"`

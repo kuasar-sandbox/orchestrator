@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"regexp"
 	"strings"
 
@@ -104,6 +105,9 @@ func (m ArtifactDiskMode) Valid() bool {
 // refs. HasActiveBase means the portable graph supplies a captured ext4 base;
 // false requires the node's formatted diff template.
 type ArtifactDiskShape struct {
+	Slot          bool             `json:"slot,omitempty"`
+	Bound         bool             `json:"bound,omitempty"`
+	SlotSize      int64            `json:"slot_size,omitempty"`
 	Name          string           `json:"name,omitempty"`
 	Mode          ArtifactDiskMode `json:"mode"`
 	HasActiveBase bool             `json:"has_active_base"`
@@ -113,8 +117,9 @@ type ArtifactDiskShape struct {
 // the generated host document against the same PortableSandboxConfig before
 // applying any binding.
 type ArtifactDiskTopology struct {
-	Root  ArtifactDiskShape   `json:"root"`
-	Disks []ArtifactDiskShape `json:"disks,omitempty"`
+	WorkspaceTopology string              `json:"workspace_topology,omitempty"`
+	Root              ArtifactDiskShape   `json:"root"`
+	Disks             []ArtifactDiskShape `json:"disks,omitempty"`
 }
 
 // ResumeMode is an admission request. Auto resolves against the durable source.
@@ -370,6 +375,7 @@ type SandboxCheckpoint struct {
 
 // Sandbox pressure fields are node-owned lifecycle state, never user metadata.
 type Sandbox struct {
+	WorkspacePlan []workspace.Prepared `json:"-"`
 	// HoldValue is node-local runtime state. nil means the known initial zero;
 	// it is never copied to a new sandbox, template or migration token.
 	HoldValue *int64 `json:"-"`

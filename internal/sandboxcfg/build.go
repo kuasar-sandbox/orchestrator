@@ -3,6 +3,8 @@ package sandboxcfg
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"slices"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -71,7 +73,8 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	if err := p.Source.Validate(); err != nil {
 		return nil, fmt.Errorf("sandboxcfg: build source E: %w", err)
 	}
-	if len(p.Source.Boot.Disks) != 0 {
+	captured := workspace.Captured(p.Source)
+	if len(p.Source.Boot.Disks) > 0 && len(captured) == 0 || len(p.Spec.WorkspacePlan) < len(captured) {
 		return nil, fmt.Errorf("sandboxcfg: build source E data disks are not supported")
 	}
 
@@ -92,7 +95,17 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	// interface name is portable source topology. Build Register has no second
 	// interface authority, so retain it exactly as ordinary run --from does.
 	merged.Network.Interface = p.Source.Network.Interface
+	sourceDisks := merged.Boot.Disks
 	merged.Boot = projected.Boot
+	if len(sourceDisks) > 0 {
+		// The YAML host schema intentionally omits the authenticated binding
+		// and pure-block flag. Preserve both from the selected native E.
+		merged.Boot.Disks = sourceDisks
+		for i := range sourceDisks {
+			sourceDisks[i].PureBlock = p.Source.Boot.Disks[i].PureBlock
+			sourceDisks[i].Binding = p.Source.Boot.Disks[i].Binding
+		}
+	}
 	merged.Timeouts = projected.Timeouts
 	merged.Restore = projected.Restore
 	merged.EphemeralFiles = projected.EphemeralFiles
@@ -107,6 +120,22 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	if p.NamespacePresent[NsMounts] {
 		merged.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)
 	}
+	if len(captured) > 0 {
+		// Disk projections are source-owned, including disk ordinals unrelated to
+		// workspaces. Keep their relative order when replacing non-disk mounts.
+		if p.NamespacePresent[NsMounts] {
+			mounts := slices.Clone(merged.Mounts)
+			for _, m := range p.Source.Mounts {
+				if m.Type == "disk" {
+					mounts = append(mounts, m)
+				}
+			}
+			merged.Mounts = mounts
+		}
+		if err := merged.ValidateMountTopology(merged.Mounts); err != nil {
+			return nil, err
+		}
+	}
 	if p.NamespacePresent[NsFiles] {
 		merged.Files = append([]rtconfig.FileConfig(nil), p.Spec.Files...)
 	}
@@ -116,6 +145,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	if p.NamespacePresent[NsMetadata] {
 		merged.Metadata = mergeStr(nil, p.Spec.Metadata)
 	}
+	merged.Metadata = workspace.SetTopology(merged.Metadata, p.Spec.WorkspacePlan)
 	if !p.Network.IsZero() {
 		network, err := json.Marshal(p.Network)
 		if err != nil {

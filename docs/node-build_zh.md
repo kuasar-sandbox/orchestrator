@@ -21,8 +21,7 @@
 
 选择 `BUILD_KIND=img` 仅发布镜像，`sbx` 发布带 portable 默认值的冷 E，`snp`
 发布初始化内存 S。S 需设置实际服务 `APP_START` 和 `APP_READY`；显式 Image
-不能传入这些命令。auto 无有效命令时选 Image，有有效 start 或 ready 时选内存
-S，永不自动选 E。本例使用 Demo 执行预算，请按节点检查准入。
+不能传入这些命令。构建声明或继承 workspace 时，将本例的 `BUILD_KIND` 设为 `sbx` 或 `snp`，注册请求就会包含显式的 Sandbox 目标。无 workspace 的构建可使用 auto，有有效 start 或 ready 命令时选内存 S，否则选 Image。本例使用 Demo 执行预算，请按节点检查准入。
 
 ```python
 import json, os, time, urllib.request
@@ -113,7 +112,7 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应暴露 requested `target`(省略即 auto) |
+| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应返回请求的 `target`。声明了 workspace 时须显式指定 Sandbox 目标 |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段, requested `target`, 终态 derived `kind`, 及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`, `cancelRequested`, `deleteRequested`, `executionClaimed`, `runID`, `storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [按目标执行与发布](#execution-and-publication) |
@@ -202,11 +201,9 @@ resolved execution。仅缺少当前 schema marker 的不兼容开发数据库�
 }
 ```
 
-`target` 只接受 `{kind:"image"}`、`{kind:"sandbox",memory:false}`、
-`{kind:"sandbox",memory:true}`；省略表示 auto，显式 `null`、unknown/duplicate 字段、
-`image+memory:true` 均拒绝。`sandbox.memory` 省略等同 false。Auto 只在解析来源 E 默认值后按
-effective start/ready 决定：任一非空即 memory Sandbox，否则 Image；永不自动生成
-top-level Sandbox E。显式 Image 与本次 trigger 显式 start/ready 冲突，来源 E 的命令则被忽略。
+构建声明了至少一个 workspace，或从来源模板继承了 workspace 时，须在注册时显式指定 `builder.target`。要生成仅含磁盘的模板，使用 `{"kind":"sandbox","memory":false}`；要保存内存，使用 `{"kind":"sandbox","memory":true}`。即使存在 start/ready 命令，省略 `target` 或选择 Image 都会报错。传入空 workspace 数组且来源也没有 workspace 时，仍可使用自动选择。
+
+无 workspace 的构建省略目标时，会计入来源 E 的默认命令。任一有效 start/ready 命令非空时生成内存 Sandbox，否则生成 Image。显式选择 Sandbox 时，省略 `memory` 等同于 false。显式 `null`、未知或重复字段、`image+memory:true` 均无效。显式 Image 与本次 trigger 显式 start/ready 冲突，并忽略来源 E 的命令。
 
 其中 `resources` 只定义 Build execution/admission resources,referer/registry 只控制本次模板构建。
 target 和这些 build-only 字段解析后均从模板 metadata 中剥离,
@@ -435,14 +432,10 @@ storageEnforcement: admission-only 语义保留. 旧 writer 仍引用已删除�
 Register-time `builder.target` 明确三种结果：`{kind:"image"}`、
 `{kind:"sandbox",memory:false}`、`{kind:"sandbox",memory:true}`。前两者不运行 C；
 顶层 Sandbox E 由 final image + 普通 Create config 无 VM 组装。只有 memory Sandbox
-冷启动 C 并捕获 Snapshot。省略 target 时，run-builder 在 task-local 读取来源 E
-默认命令后，只按 effective start/ready 是否任一非空选择 memory Sandbox 或 Image。
-source kind、steps、profile 和其它 Sandbox config 都不参与推导。
+冷启动 C 并捕获 Snapshot。run-builder 读取来源 E 时，继承的 workspace 要求注册时已显式选择 Sandbox 目标。带 workspace 的构建省略目标会报错。无 workspace 的构建省略目标时，任一有效 start/ready 命令非空即生成内存 Sandbox，否则生成 Image。有效命令包括来源 E 的默认值。
 
 来源统一先收敛为 image 或 cold Sandbox E，再由 A/B 得到本次 Build 的顶层 image。
-Build 从不恢复来源 Snapshot S 的 memory/VMM 状态；S 只用于找到它的 E。最终 Image/E/S
-不得引用来源 S、来源 E、来源 writable/data disk 或 memory parent，memory 结果中唯一允许的
-`S -> E` 是本次 Build 自身产生的关系。
+Build 从不恢复来源 Snapshot S 的 memory/VMM 状态；S 只用于找到它的 E。RUN/COPY 输出扁平化的根镜像。最终 Sandbox 保留目标磁盘的初始内容，包括继承的原生数据盘。步骤对挂载盘的写入只存在于 B 的私有写层。最终 S 与本次构建的 E 配对。
 
 A/B/C 沙箱使用单层可写盘（明文 raw，加密 v1），不传 `--enable-checkpoint`。
 Build 不使用业务 pause/resume，因此导入、构建步骤及最终模板准备无需承担版本化后端的
@@ -454,9 +447,7 @@ Build 不使用业务 pause/resume，因此导入、构建步骤及最终模板�
 
 来源预检经过 Open、Clone、Validate 保留 Checkpoint E 布局，从 S 选出 E 时也如此，
 即使 Build 运行期不启用 Checkpoint，也会先将来源固定磁盘内容物化到独立 Build 存储，
-不会用空白模板替换。仅根盘的 E 继续支持既有 Build 继承路径；
-来源数据盘保留原有不支持的边界。本次后端变更不增加来源内存恢复，也不扩大 Build
-接受的磁盘拓扑。启动准备、首次访问和普通模板复制的成本，与命名本地 Pause 的收益
+根盘 E 和带 [workspace](sandbox-lifecycle_zh.md#workspace-存储) 的 E 均可作为构建来源。Builder 发布整机 E，其中保留已接盘的初始内容、空盘位的设备几何和挂载目录。启动准备、首次访问和普通模板复制的成本，与命名本地 Pause 的收益
 分别衡量，见[节点捕获](sandbox-lifecycle_zh.md#local-disk-checkpoints)。
 
 **serve 侧(每构建一次)**:registered/waiting 阶段不建对象目录；durable execution claim
@@ -548,7 +539,7 @@ run-builder 对每阶段调用
 - **B build/materialize**(有 steps 或 source E 时):image source 以 base 镜像为 root
   (本地工件或 `manifest://`)+ builder runtime + 大可写 upper(同一 diff_template)；
   SBX/SNP source 则始终 `sandbox-ctl run --from <E>` 冷启其完整 root graph，并追加新的
-  builder upper。source 的 mounts/files/init/workload 在 B 中清空，避免为 materialize 执行一次
+  builder upper。B 保留来源磁盘的挂载，使用构建专用的 files、init 和 workload，避免为 materialize 执行一次
   后又保留给成品 Create 重复执行；其 non-boot config 另由共享 cold projection继承。
   **envd 为 app**(构建工具姿态:恒
   `-isnotfc`、不 `/init`、无 token;唯一盘足迹 `/run/e2b` 落在 tmpfs 挂载上,导出
@@ -587,7 +578,7 @@ run-builder 对每阶段调用
 读取 `sandbox_ref` 定位 E，随后与 SBX 完全相同。不会向任何 phase 传 S，不读取/预取
 memory payload，不把 memory from-refs 纳入 closure，也不存在 `run --restore`。E 的完整
 `PortableSandboxConfig` 留在 run-builder，用于 B materialization 和 sandbox target 的
-non-boot defaults；来源含任意 `boot.disks[]` 时第一版明确拒绝。
+非启动配置。来源含 Workspace 时，构建读取完整原生盘表，包括普通盘。为来源空位选盘时，B 在第一个构建步骤前调用原生接盘并捕获初始状态。
 
 fromTemplate 与 fromImage 互斥；所有 SBX/SNP source 即使没有 steps 也必须跑 B。因此
 fromTemplate 只有“无 steps 的 IMG”可零 VM 复用原 image。E metadata 中
@@ -598,8 +589,9 @@ summary 在 host Attach 前 strict 解析并按字段继承，优先级为
 IMG source 没有 artifact metadata 通道，也不从 retention-bounded Build row 回填。
 
 task-local ref-location mapping 只保留选中 E 及其 B 冷启所需 root refs；S memory-only Bundle
-locations和 source S ref 被过滤。B 导出的 image 是完整新顶层，之后顶层 E assembly 或 C 的
-`--replace-boot` 都只安装该 image，所以最终图不再携 source E/root/writable refs。若 C 的
+locations 和 source S ref 被过滤。B 导出的 image 是完整的新根镜像。顶层 E 将该镜像与目标盘表组装。
+带 Workspace 的内存目标通过私有 E 冷启动 C，其根盘只读层引用按 image policy 发布的 IMG，
+根盘可写层取自配置的 ext4 模板，额外盘沿用目标盘表和绑定记录。若 C 的
 final image 按 policy 发布成 located Bundle，builder 把该次 publication 的实际 name→directory
 mapping 加入 C argv；checkpoint publication 继续携带所有仍被 graph 引用的 mapping。
 
@@ -659,8 +651,8 @@ Image target 或顶层 E 的 Manifest-store destination。
   RunDir/BaseDir staging 完整 `.sandbox`。此 target 不启动 C，不执行 start/ready，只返回
   `sandbox_ref`。
 - **Sandbox + memory=true**：先按 image policy 发布 final IMG，并把返回的 portable ref 设为
-  C replacement boot。located IMG Bundle 的实际 location mapping 进入
-  `sandbox-ctl run --from E --replace-boot`；C cold run 后捕获 EΔ/S，再按 checkpoint policy
+  C 的根盘只读层。C 冷启动时传入 located IMG Bundle 的实际 location mapping，
+  包括从私有 E 继承初始盘表的场景。随后捕获 EΔ/S，再按 checkpoint policy
   发布，只返回 `snapshot_ref`。EΔ 保留该 IMG ref；local tarstream 与 Snapshot Bundle 都不重新
   物化或复制 portable image Bundle。不存在来源 S memory restore 或 C disk-only 分支。
 

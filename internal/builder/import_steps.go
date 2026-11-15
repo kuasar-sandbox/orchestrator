@@ -23,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"gopkg.in/yaml.v3"
 )
 
@@ -324,7 +325,7 @@ func stepCtxFrom(base map[string]any) *stepCtx {
 	return c
 }
 
-func (p *buildPipeline) phaseSteps() (retErr error) {
+func (p *buildPipeline) phaseSteps(stepWorkspaces []workspace.Prepared) (retErr error) {
 	s := p.spec
 	baseCfg, err := p.readBaseRuntimeConfig()
 	if err != nil {
@@ -342,7 +343,11 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 		sb, err = p.startSandboxYAML("b", document,
 			[]string{envdUDS + ":127.0.0.1:49983"}, s.SourceSandboxRef, false)
 	} else {
-		sb, err = p.startSandbox("b", p.stepsYAML(),
+		document, yamlErr := p.stepsYAML(stepWorkspaces)
+		if yamlErr != nil {
+			return yamlErr
+		}
+		sb, err = p.startSandbox("b", document,
 			[]string{envdUDS + ":127.0.0.1:49983"})
 	}
 	if err != nil {
@@ -352,6 +357,9 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 90*time.Second)
 	defer cancelBoot()
 	if err := sb.waitRuntimeReady(bootCtx); err != nil {
+		return err
+	}
+	if err := p.captureSelectedSlots(sb); err != nil {
 		return err
 	}
 	if err := p.waitEnvd(bootCtx, envdUDS); err != nil {

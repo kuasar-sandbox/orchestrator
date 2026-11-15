@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"os"
 	"path/filepath"
 	"sort"
@@ -101,6 +102,9 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	}
 	if spec.SnapshotRuntime != "" && (sourceKind != types.ResumeSourceSnapshot || launchMode != types.LaunchMemory) {
 		return nil, errors.New("task artifact prepare: runtime admission requires a memory Snapshot create")
+	}
+	if len(spec.SBXCreateWorkspaces) != 0 && (sourceKind != types.ResumeSourceSandbox || launchMode != types.LaunchCold) {
+		return nil, errors.New("workspace append requires a fresh SBX cold create")
 	}
 	maxRefs := spec.MaxRefs
 	if maxRefs == 0 {
@@ -347,6 +351,46 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		}
 	}
 
+	var derivedRef string
+	if len(spec.SBXCreateWorkspaces) != 0 {
+		storage, err := artifact.NewProcessStorage(manifestCfg)
+		if err != nil {
+			return nil, err
+		}
+		var child *rtconfig.PortableSandboxConfig
+		derivedRef, child, err = prepareWorkspaceSandbox(ctx, spec, topology, storage, pathLocations, bundleRefs)
+		err = errors.Join(err, storage.Close())
+		if err != nil {
+			return nil, err
+		}
+		if derivedRef != "" {
+			prepared.Ref = derivedRef
+			sourceSandboxConfig = child
+			refs = append(portableArtifactRefs(child), derivedRef)
+			requiredRefs, err = canonicalRefs(refs, maxRefs)
+			if err != nil {
+				return nil, err
+			}
+			// Previously selected carrier locations may be needed to resolve
+			// Bundle members. Publish only locations still reachable from the child.
+			reachable := map[string]bool{}
+			for _, raw := range requiredRefs {
+				name, err := refLocationName(raw)
+				if err != nil {
+					return nil, err
+				}
+				reachable[name] = true
+				if err := addLocation("derived E", name); err != nil {
+					return nil, err
+				}
+			}
+			for name := range uriLocations {
+				if !reachable[name] {
+					delete(uriLocations, name)
+				}
+			}
+		}
+	}
 	names := make([]string, 0, len(uriLocations))
 	for name := range uriLocations {
 		names = append(names, name)
@@ -391,6 +435,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		SourceImageConfig:   append([]byte(nil), sourceImageConfig...),
 		Summary: configsock.ArtifactPrepareSummary{
 			RootSource:         rootSource,
+			DerivedSandboxRef:  derivedRef,
 			SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 			PreparedSourceKind: string(prepared.Kind), Capacity: capacity,
 			HasBuildCommands: hasBuildCommands,
@@ -639,7 +684,22 @@ func summarizeDiskTopology(cfg *rtconfig.PortableSandboxConfig) (types.ArtifactD
 	topology.Disks = make([]types.ArtifactDiskShape, len(cfg.Boot.Disks))
 	for i := range cfg.Boot.Disks {
 		disk := &cfg.Boot.Disks[i]
-		topology.Disks[i] = shape(disk.Name, disk.PortableRootConfig)
+		d := shape(disk.Name, disk.PortableRootConfig)
+		d.Slot = disk.Slot != nil
+		if d.Slot {
+			d.Bound = disk.Binding != nil
+			size, err := disk.Slot.Capacity()
+			if err != nil {
+				return types.ArtifactDiskTopology{}, err
+			}
+			d.SlotSize = size
+		}
+		topology.Disks[i] = d
+	}
+	// A stale presentation in historical metadata must not invalidate the
+	// native disk layout used for cold start and memory restore.
+	if entries := workspace.Captured(cfg); len(entries) > 0 {
+		topology.WorkspaceTopology = workspace.TopologyJSON(entries)
 	}
 	return topology, nil
 }

@@ -4,6 +4,7 @@ import (
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
@@ -15,7 +16,7 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		PressureVersion: sandbox.PressureVersion, RunningSinceUnixNano: sandbox.RunningSinceUnixNano,
 		ID: sandbox.ID, StableID: sandbox.StableID(), Profile: conductorextension.Profile(sandbox.Profile),
 		TemplateID: sandbox.TemplateID, State: conductorextension.SandboxState(sandbox.State), RunID: sandbox.RunID,
-		CreatedUnix: sandbox.CreatedUnix, DeadlineUnix: sandbox.DeadlineUnix, Metadata: cloneMap(sandbox.Metadata),
+		CreatedUnix: sandbox.CreatedUnix, DeadlineUnix: sandbox.DeadlineUnix, Metadata: cloneMap(workspace.SetTopology(sandbox.Metadata, sandbox.WorkspacePlan)),
 		RunDir: sandbox.RunDir, BaseDir: sandbox.BaseDir, EnvdUDS: sandbox.EnvdUDS, CIUDS: sandbox.CiUDS,
 		FloatingIP: sandbox.FloatingIP, InnerIP: sandbox.InnerIP, VSwitchPort: sandbox.VswitchPort,
 		PortMAC:          sandbox.PortMAC,
@@ -65,7 +66,7 @@ func projectBuild(build *types.Build) conductorextension.BuildView {
 		FromImage: build.FromImage, FromTemplate: build.FromTemplate,
 		Resources: conductorextension.BuildResources{CPU: build.Resources.CPU, Memory: build.Resources.Memory, Storage: build.Resources.Storage},
 		Steps:     projectSteps(build.Steps), StartCommand: build.StartCmd, ReadyCommand: build.ReadyCmd,
-		Metadata: cloneMap(build.Metadata), Builder: projectBuildOptions(build.Builder),
+		Metadata: cloneMap(workspace.SetTopology(build.Metadata, build.WorkspacePlan)), Builder: projectBuildOptions(build.Builder),
 		RunID: build.RunID, ExecutionClaimed: build.ExecutionClaimed,
 		Phase: build.Phase, PhaseSandboxID: build.PhaseSandboxID,
 		RuntimeVSwitchPort: build.RuntimeVswitchPort, RuntimeFloatingIP: build.RuntimeFloatingIP,
