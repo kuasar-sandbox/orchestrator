@@ -234,10 +234,14 @@ sandbox:
 
 Defaults are false, `1s` and `5m`. Durations must be positive Go durations,
 flush must be at least sample, and twice sample must fit the native signed
-duration range. Validation also applies when disabled. Explicit null, wrong
-types, unknown/duplicate keys and YAML merge keys are rejected. Clone,
+duration range. Validation also applies when disabled. Single-file loading and
+direct `DecodeConductor` reject explicit null, wrong types, unknown/duplicate
+keys and merge keys within `usage`. With multiple `PATH[:PATH...]` inputs,
+file-local YAML merges are resolved first, later null mapping values delete
+inherited keys, and the merged `usage` is then validated. First-file nulls remain
+values; duplicate keys are rejected in each file before merging. Clone,
 diagnostic output, external conductor bootstrap and final Configure-hook
-validation preserve the same policy.
+validation preserve the resulting policy.
 
 Conductor passes this node policy to image cold start, `run --from` and
 `run --restore`. Usage is host policy and is absent from portable E/S
@@ -307,7 +311,7 @@ Conductor constructs independent journald targets for runtime component diagnost
 | `build` | Build phases/run-builder | App stdio, milestones, envd RUN replay and flatten progress | SDK and host; complete reading/pagination/failure rules in [Target-aware execution and publication](node-build.md#execution-and-publication) |
 | `console` | Runner/Build phase `--console` | Guest kernel dmesg | Host only; excluded from SDK Build logs |
 
-Native streams write directly to journal without temporary log files. Run-builder milestones and envd RUN replay use pure-Go `go-systemd/journal`. `--log-to` does not replace original process stderr: early CLI output, CH stderr, panics and failed-send fallback retain their existing sinks. Builder units set `LogRateLimitIntervalSec=0`; runners keep default rate limits. Neither policy guarantees lossless storage under journal/storage failure, exactly-once durability or nonblocking sends.
+Native streams write directly to journal without temporary log files. Run-builder milestones and envd RUN replay use pure-Go `go-systemd/journal`. `--log-to` does not replace original process stderr: early CLI output, CH stderr and panics retain their existing sinks. Send failures follow the [output-specific rules below](#journal-boundaries-and-verification). Builder units set `LogRateLimitIntervalSec=0`; runners keep default rate limits. Neither policy guarantees lossless storage under journal/storage failure, exactly-once durability or nonblocking sends.
 
 <a id="journal-ownership-and-output-targets"></a>
 
@@ -397,9 +401,19 @@ existing secret delivery path and is never included in output targets.
 process descriptors or capture Cloud Hypervisor stderr, runtime panics,
 node-ctl pre-exec messages or systemd events.
 
-Native sends are synchronous and best-effort. Successful sends are not copied
-to stderr; failed sends fall back to the original sink. No exactly-once durable
-logging or zero-blocking guarantee is implied.
+Delivery depends on the writer and selected sandboxer version. In versions with
+[separate diagnostic sending](https://github.com/kuasar-sandbox/sandboxer/pull/431),
+app stdio and console retain synchronous backpressure and best-effort fallback
+to their original sink on send failure. Explicit `--log-to` uses
+`OpenDiagnostic`: congestion or send failure drops the affected message without
+synchronous stderr fallback. Older binaries retain their version's delivery
+behavior; orchestrator's Go module pin alone does not identify the external
+`sandbox-ctl` executable.
+
+Run-builder's own writer selects stderr only when `journal.Enabled()` is false
+at construction. After selecting journal, it ignores later `journal.Send` errors
+without switching to stderr. Successful journal sends are not copied to stderr.
+No exactly-once durable logging or zero-blocking guarantee is implied.
 
 Tests cover generated runner/Build arguments, fallback and independent StableID,
 resume/import/new-object isolation, escaping and file/capture preservation.
