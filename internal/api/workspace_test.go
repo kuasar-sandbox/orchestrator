@@ -125,7 +125,7 @@ func TestWorkspaceOperations(t *testing.T) {
 	if core.calls != 0 {
 		t.Fatal("invalid input dispatched")
 	}
-	if w := call("POST", "/attach?name=w", `{"disk":{}}`); w.Code != 204 || w.Body.Len() != 0 || core.generation != "g" || core.disk != "{}" {
+	if w := call("POST", "/attach?trace=abc&name=w", `{"disk":{}}`); w.Code != 204 || w.Body.Len() != 0 || core.generation != "g" || core.disk != "{}" {
 		t.Fatal(w)
 	}
 	for err, want := range map[error]int{ErrWorkspaceGeneration: 412, ErrWorkspaceConflict: 409, ErrWorkspaceUnavailable: 503, ErrNotFound: 404, ErrNotAllowed: 403} {
@@ -135,10 +135,10 @@ func TestWorkspaceOperations(t *testing.T) {
 		}
 	}
 	core.opErr = nil
-	if w := call("POST", "/export?name=w", `{}`); w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"token":"kwt1.token"}` {
+	if w := call("POST", "/export?name=w&trace=abc&trace=def", `{}`); w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"token":"kwt1.token"}` {
 		t.Fatal(w)
 	}
-	for _, args := range [][2]string{{"/export?name=w&name=x", "{}"}, {"/export", "{}"}, {"/export?name=w", `{"keepSource":false}`}} {
+	for _, args := range [][2]string{{"/export?name=w&name=x", "{}"}, {"/export?trace=abc", "{}"}, {"/export?name=&trace=abc", "{}"}, {"/export?name=w", `{"keepSource":false}`}} {
 		if w := call("POST", args[0], args[1]); w.Code != 400 {
 			t.Fatal(w)
 		}

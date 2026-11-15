@@ -53,7 +53,7 @@ func (a *API) listWorkspaces(w http.ResponseWriter, r *http.Request) {
 func workspaceName(w http.ResponseWriter, r *http.Request) (string, bool) {
 	q, err := url.ParseQuery(r.URL.RawQuery)
 	names := q["name"]
-	if err != nil || len(q) != 1 || len(names) != 1 || names[0] == "" {
+	if err != nil || len(names) != 1 || names[0] == "" {
 		writeErr(w, 400, "one workspace name is required")
 		return "", false
 	}
