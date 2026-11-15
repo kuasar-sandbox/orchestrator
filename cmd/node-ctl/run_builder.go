@@ -43,6 +43,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -181,13 +182,9 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 	spec.Env = mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	if prepared != nil {
-		if prepared.PreparedSource.Kind != types.ResumeSourceSandbox || !prepared.PreparedSource.Valid() || prepared.SourceSandboxConfig == nil {
-			return fmt.Errorf("prepared build source is not a complete Sandbox E")
+		if err := applyPreparedBuildSource(spec, prepared); err != nil {
+			return err
 		}
-		spec.SourceSandboxRef = prepared.PreparedSource.Ref
-		spec.SourceSandboxConfig = prepared.SourceSandboxConfig
-		spec.SourceImageConfig = append([]byte(nil), prepared.SourceImageConfig...)
-		spec.RefLocations = prepared.RefLocationURIs
 	}
 	if !filepath.IsAbs(spec.RunDir) || !filepath.IsAbs(spec.BaseDir) {
 		return fmt.Errorf("final build spec requires absolute run_dir and base_dir")
@@ -214,6 +211,26 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if res.Error != "" {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
+	return nil
+}
+
+func applyPreparedBuildSource(spec *configsock.BuildSpec, prepared *taskartifact.Result) error {
+	if prepared.PreparedSource.Kind != types.ResumeSourceSandbox || !prepared.PreparedSource.Valid() || prepared.SourceSandboxConfig == nil {
+		return fmt.Errorf("prepared build source is not a complete Sandbox E")
+	}
+	// The prepared source closure and independently selected disks can name different locations.
+	locations := make(map[string]string, len(prepared.RefLocationURIs)+len(spec.RefLocations))
+	maps.Copy(locations, prepared.RefLocationURIs)
+	for name, uri := range spec.RefLocations {
+		if source, ok := locations[name]; ok && source != uri {
+			return fmt.Errorf("conflicting named location %q in prepared build source", name)
+		}
+		locations[name] = uri
+	}
+	spec.SourceSandboxRef = prepared.PreparedSource.Ref
+	spec.SourceSandboxConfig = prepared.SourceSandboxConfig
+	spec.SourceImageConfig = append([]byte(nil), prepared.SourceImageConfig...)
+	spec.RefLocations = locations
 	return nil
 }
 

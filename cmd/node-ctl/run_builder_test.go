@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -14,6 +15,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestBuilderAssignmentPidfileMatchesBuildSpecRuntimeIdentity(t *testing.T) {
@@ -157,4 +161,30 @@ func TestInstallBuildTaskEnvironmentKeepsRegistryCredentialsNonAmbient(t *testin
 	if got := mergeAuthoritativeEnv(nil, bootstrapEnv)["FLATTEN_REGISTRY_TOKEN"]; got != "task-token" {
 		t.Fatalf("registry credential was not retained for explicit spec use: %q", got)
 	}
+}
+
+func TestPreparedBuildSourceKeepsSelectedDiskLocations(t *testing.T) {
+	const sourceURI = "file:///checkpoint/base"
+	const donorURI = "file:///checkpoint/donor"
+	const sharedURI = "file:///checkpoint/shared"
+	prepared := &taskartifact.Result{
+		PreparedSource:      types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "file://base/sandbox"},
+		SourceSandboxConfig: &rtconfig.PortableSandboxConfig{},
+		RefLocationURIs:     map[string]string{"base": sourceURI, "shared": sharedURI},
+	}
+	t.Run("inherited slot with independently selected disk", func(t *testing.T) {
+		spec := &configsock.BuildSpec{RefLocations: map[string]string{"shared": sharedURI, "donor": donorURI}}
+		if err := applyPreparedBuildSource(spec, prepared); err != nil {
+			t.Fatal(err)
+		}
+		if want := map[string]string{"base": sourceURI, "shared": sharedURI, "donor": donorURI}; !maps.Equal(spec.RefLocations, want) {
+			t.Errorf("build locations = %v, want %v", spec.RefLocations, want)
+		}
+	})
+	t.Run("conflicting location", func(t *testing.T) {
+		spec := &configsock.BuildSpec{RefLocations: map[string]string{"base": donorURI}}
+		if err := applyPreparedBuildSource(spec, prepared); err == nil || !strings.Contains(err.Error(), "base") {
+			t.Fatalf("conflicting location error = %v, want the conflicting name", err)
+		}
+	})
 }
