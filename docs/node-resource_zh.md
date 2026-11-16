@@ -292,6 +292,7 @@ settled policy 需要 balloon(`capacity.memory > allocatable.memory`)时最终 Y
 | `resource_listen.pools[].name` | 必填且唯一 | 非空，匹配 `[a-zA-Z0-9][a-zA-Z0-9_.-]*`；标识一个资源预算 |
 | `resource_listen.pools[].capacity.{cpu,memory}` | 缺省维度无限 | 正值的声明 Capacity 调度上限；CPU 支持小数核，memory 为正大小 |
 | `resource_listen.pools[].allocatable.memory` | 多池必填 | 正值净运行内存；单池可沿用旧推导公式 |
+| `resource_listen.pools[].cache_capacity` | 可省略 | 可选的 `diff_cow` 缓存总授额上限；与 `allocatable.memory` 共用额度，不提前划分独立内存池 |
 | `resource_listen.pools[].allocatable.cpu` | 继承 capacity CPU；两者均省略则无有限分母 | CPU 使用率/水位记账分母，不新增运行 CPU 硬准入 |
 | `resource_listen.pools[].watermarks.{cpu,memory}` | 按叶子继承 | low/high/emergency factor 可分别覆盖节点策略；其他维度拒绝 |
 | `resource_listen.pools[].unit_dropins` | 无 | 外部 unit 放置片段的绝对路径，复制到托管命名空间 |
@@ -978,3 +979,16 @@ pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure even
 - `sandboxer/pkg/resource`
 - `internal/nodectl`
 - `internal/sandboxcfg/resource.go`
+
+
+### diff_cow 弹性缓存额度
+
+支持 `cache_budget_v1` 的沙箱将 `resources.diff_cow.cache_size` 作为可达上限。
+启动准入原子核准 Guest 初始内存与最小缓存额度；运行中缓存按使用量申请增加，
+申请同时受资源池剩余运行内存和可选 `cache_capacity` 约束，且不能占用 Guest 应急额度。
+缓存内存仍由 `sandbox-ctl` 在原有 `ctl/` cgroup 分配，不修改 Guest balloon 和 `vmm/` 控制。
+
+缓存容量不足时，原有 LRU/脏页回写行为继续工作；节点可要求其他沙箱按 LRU
+缩减 clean 缓存。只有宿主物理页实际释放且节点确认返回，才能再次授予其他沙箱。
+重启恢复阶段，控制器先按该沙箱的缓存最大值保守占账，随后由授权的
+`StateSync` 报告实际额度并恢复正常记账。旧版对端未协商该特性时仍使用原有缓存行为。

@@ -134,11 +134,18 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 				break
 			}
 			lease.ControllerSocket = controllerSocket
+			cacheMaximum, cacheErr := resource.CacheMaximumFromFeatures(lease.ClientFeatures)
+			if cacheErr != nil {
+				if err := i.installUnknownLease(state, path, owner, cacheErr); err != nil {
+					return err
+				}
+				break
+			}
 			err = state.InstallProvisional(ProvisionalSpec{
 				SandboxID: lease.SandboxID, PeerPID: owner, CgroupPath: lease.CgroupPath,
 				Capacity:              Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
 				ConfiguredAllocatable: Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
-				ReservationMemory:     lease.CapacityMemory, InitialBudget: lease.CapacityMemory,
+				ReservationMemory:     lease.CapacityMemory, CacheReservation: cacheMaximum, CacheMax: cacheMaximum, InitialBudget: lease.CapacityMemory,
 				RecoverySource: RecoveryLease, RecoveryKey: "lease:" + entry.Name(),
 				LeasePath: path, ClientFeatures: lease.ClientFeatures,
 			})

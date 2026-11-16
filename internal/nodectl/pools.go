@@ -40,6 +40,7 @@ func NewPoolState(resolved *Resolved) *State {
 		p := NewState(cfg.Allocatable.MemoryBytes, 0, 0, 0, cfg.Watermarks)
 		p.AllocatablePool = cfg.Allocatable
 		p.PoolName, p.CapacityLimit, p.CPUWatermarks = cfg.Name, cfg.Capacity, cfg.CPUWatermarks
+		p.CachePoolCapacity = cfg.CacheCapacity
 		p.placements = map[string]Placement{}
 		p.initPressureLocked()
 		p.pressureWake = root.pressureWake

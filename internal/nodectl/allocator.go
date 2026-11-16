@@ -185,3 +185,44 @@ func (a *Allocator) CleanupHistory(token string) {
 	defer a.mu.Unlock()
 	delete(a.history, token)
 }
+
+// GrantUnits reserves cache in whole physical-budget units. It shares the
+// existing nonemergency token bucket with Guest growth, but never consumes
+// tokens for a sub-unit grant that the cache cannot use.
+func (a *Allocator) GrantUnits(token string, requested, headroom, unit uint64) GrantDecision {
+	if a == nil || unit == 0 {
+		return GrantDecision{CooldownMs: 200}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.refillLocked()
+	if requested == 0 || headroom == 0 || a.policy.MemoryGrantPerSecBytes == 0 {
+		return GrantDecision{CooldownMs: 200}
+	}
+	limit := min(requested, headroom, a.bucketCapacity())
+	if a.policy.MaxGrantStep > 0 {
+		limit = min(limit, a.policy.MaxGrantStep)
+	}
+	// One final, explicitly requested sub-unit tail is legal for a maximum
+	// cache_size that is not a whole multiple of the unit.
+	if limit >= unit {
+		limit -= limit % unit
+	} else if limit != requested {
+		limit = 0
+	}
+	if float64(limit) > a.tokens {
+		can := uint64(a.tokens)
+		if can >= unit {
+			can -= can % unit
+		} else if limit != requested {
+			can = 0
+		}
+		limit = min(limit, can)
+	}
+	if limit == 0 {
+		return GrantDecision{CooldownMs: 200}
+	}
+	a.tokens -= float64(limit)
+	a.recordGrantLocked(token, limit)
+	return GrantDecision{GrantedDelta: limit, CooldownMs: 200}
+}

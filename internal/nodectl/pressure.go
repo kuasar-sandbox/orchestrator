@@ -659,18 +659,26 @@ func (e *AdmissionWaitError) Error() string {
 }
 
 func (s *State) AnalyzeLaunch(sid string, budget uint64, launch LaunchAdmission) Outcome {
+	return s.AnalyzeLaunchWithCache(sid, budget, 0, launch)
+}
+
+func (s *State) AnalyzeLaunchWithCache(sid string, budget, cache uint64, launch LaunchAdmission) Outcome {
 	if p := s.forSID(sid); p != s {
-		return p.AnalyzeLaunch(sid, budget, launch)
+		return p.AnalyzeLaunchWithCache(sid, budget, cache, launch)
 	}
 	if s.pools != nil {
 		return Outcome{Status: OutcomeLongTermReject, RejectCode: "pool_identity", RejectMsg: "resource pool identity unavailable"}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.admissionBudgetLocked(sid, budget, launch)
+	return s.admissionWithCacheLocked(sid, budget, cache, launch)
 }
 
 func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAdmission) Outcome {
+	return s.admissionWithCacheLocked(sid, budget, 0, launch)
+}
+
+func (s *State) admissionWithCacheLocked(sid string, budget, cache uint64, launch LaunchAdmission) Outcome {
 	s.initPressureLocked()
 	now := s.pressure.clock()
 	s.advancePressureLocked(now)
@@ -680,12 +688,17 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 	}
 	startup := s.startupPoolBytesLocked()
-	if budget == 0 || pool == 0 || budget > pool {
+	if cache > 0 && s.CachePoolCapacity > 0 && cache > s.CachePoolCapacity {
+		return Outcome{Status: OutcomePreCheckReject, RejectCode: "cache_exceeds_pool_capacity",
+			RejectMsg: "initial cache budget exceeds resource pool cache_capacity"}
+	}
+	if budget == 0 || pool == 0 || budget > pool || cache > pool-budget {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_node_capacity", RejectMsg: "initial budget exceeds node pool"}
 	}
 	// Background work waits for actual budget; it never creates pressure demand.
 	if backgroundRecovery {
-		if s.reservedMemory > pool || budget > pool-s.reservedMemory {
+		if s.reservedMemory > pool || budget > pool-s.reservedMemory ||
+			cache > pool-s.reservedMemory-budget {
 			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 		}
 	}
@@ -713,7 +726,9 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 	} else {
 		available = 0
 	}
-	if budget > available {
+	if budget > available || cache > available-budget ||
+		(cache > 0 && s.CachePoolCapacity > 0 &&
+			(s.reservedCache >= s.CachePoolCapacity || cache > s.CachePoolCapacity-s.reservedCache)) {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
 	}
 	if s.pressure.exclusive != "" && s.pressure.exclusive != sid {
