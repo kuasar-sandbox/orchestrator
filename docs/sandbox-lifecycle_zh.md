@@ -273,7 +273,9 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 | `"disk":{}` | 使用节点配置的默认盘初始化私有数据盘。 |
 | `"disk":{"migrationToken":"…"}` | 使用相同租户凭据导入其他沙箱导出的盘，为本实例新建可写层。 |
 | `"disk":{…DiskV1…}` | 传入已授权的完整磁盘，`kind` 为 `disk`，`version` 为 `1`。用 `base` 表示最上层，`base_from_refs` 从近到远列出依赖层，也可以使用已授权的 `diff_template`。`size` 是以字节为单位的可选容量断言。 |
-| 省略两者 | 从镜像创建时预留盘位，从 SBX 或 SNP 模板创建时继承捕获的设备和数据。 |
+| 省略两者 | 从镜像创建时预留动态盘位（`"slot":{}`），从 SBX 或 SNP 模板创建时继承捕获的设备和数据。 |
+
+固定和动态盘位都需要 Guest 内核支持 autofs，才能在首次访问目录时挂载磁盘。动态盘位的初始容量为零。如果 VMM 不通知 Guest 容量变化，运行中的 Guest 内核需要在打开设备时重读容量。缺少这项支持时，attach 可能成功，但首次访问 workspace 目录会失败。若 Guest 内核缺少这项支持或其能力未知，建议使用与待接入磁盘容量相同的固定盘位。[动态盘位的内核支持](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
 
 从 SBX 或 SNP 模板创建时，可按名字选择模板中的空盘位，例如 `[{"name":"project","disk":{}}]`。省略 `mounts` 即继承其挂载拓扑。conductor 完成本次请求的 Host 接盘，等待挂载路径上已开始的查找结束，再提交 `running`。已绑定的设备按捕获状态继承。构建声明或继承 workspace 的模板时，须在注册时显式指定 `builder.target`。例如，要生成 SBX，可将 `{"target":{"kind":"sandbox","memory":false}}` 放在 `X-Kuasar-Sandbox-Builder` 请求头中，或作为 `metadata["kuasar-sandbox.builder"]` 的字符串值传入。将 `memory` 设为 `true` 即可生成 SNP。即使存在 start 或 ready 命令，省略 `target` 也会报错。
 

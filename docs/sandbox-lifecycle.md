@@ -241,7 +241,9 @@ Each `path` is an absolute guest directory. Each `subpath` is relative to the di
 | `"disk":{}` | Initialize a private disk from the node's configured default. |
 | `"disk":{"migrationToken":"…"}` | Initialize a private writer over the disk exported by another sandbox with the same tenant credentials. |
 | `"disk":{…DiskV1…}` | Use a complete authorized disk with `kind:"disk"` and `version:1`. Include `base` and any `base_from_refs` in newest-to-oldest order, or use an authorized `diff_template`. The optional `size` asserts capacity in bytes. |
-| Neither field | On an image, reserve the device. On a sandbox or snapshot template, inherit the captured device and its data. |
+| Neither field | On an image, reserve a dynamic slot (`"slot":{}`). On a sandbox or snapshot template, inherit the captured device and its data. |
+
+Both fixed and dynamic slots need autofs in the guest kernel to mount the disk on first access. A dynamic slot starts at zero capacity. If the VMM does not notify the guest of a capacity change, the running guest kernel must reread the device capacity on open. Without that support, attach can succeed while the first access to a workspace path fails. If the guest kernel lacks this support or its capabilities are unknown, use a fixed slot sized to match the disk you will attach. [Kernel support for dynamic slots](https://github.com/kuasar-sandbox/guest-runtime/pull/134).
 
 On an SBX or SNP template, select an existing empty device by name, for example `[{"name":"project","disk":{}}]`. Omit `mounts` to inherit its topology. The conductor completes each requested host bind and waits for any pending lookup on its mount paths before reporting `running`. Use a captured attached device as it stands. When building a template that declares or inherits a workspace, specify `builder.target` at registration. For example, send `{"target":{"kind":"sandbox","memory":false}}` in the `X-Kuasar-Sandbox-Builder` header or as the string value of `metadata["kuasar-sandbox.builder"]` to produce SBX. Set `memory` to `true` for SNP. Omitting `target` fails even if a start or ready command is present.
 
