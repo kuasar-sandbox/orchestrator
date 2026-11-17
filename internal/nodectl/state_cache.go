@@ -160,6 +160,20 @@ func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage ui
 	if shortage == 0 {
 		return false
 	}
+	// Pending reclaim targets remain charged. They will release ordinary
+	// memory and cache-subpool capacity when completed, so avoid requesting
+	// the same shortage from every other donor during repeated retries.
+	// This is planning credit only; admission and grants still use current
+	// reservations and never spend unacknowledged bytes.
+	for _, candidate := range s.bySID {
+		if candidate.CacheReclaimTarget > 0 && candidate.CacheReclaimTarget < candidate.CacheReservation {
+			pending := candidate.CacheReservation - candidate.CacheReclaimTarget
+			if pending >= shortage {
+				return false
+			}
+			shortage -= pending
+		}
+	}
 	var donor *Reservation
 	for _, candidate := range s.bySID {
 		if candidate.SandboxID == excludeSID || candidate.Provisional ||

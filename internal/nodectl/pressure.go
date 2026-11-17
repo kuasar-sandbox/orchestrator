@@ -769,7 +769,19 @@ func (s *State) admissionWithCacheLocked(sid string, budget, cache uint64, launc
 	} else {
 		available = 0
 	}
-	if budget > available || cache > available-budget ||
+	// A saved-source Guest may use emergency headroom, but its *initial
+	// cache grant* remains discretionary and must fit the nonemergency
+	// balance, just like every later cache request.
+	cacheAvailable := available
+	if launch.SavedSource {
+		emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+		if cacheAvailable > emergency {
+			cacheAvailable -= emergency
+		} else {
+			cacheAvailable = 0
+		}
+	}
+	if budget > available || cache > available-budget || cache > cacheAvailable ||
 		(cache > 0 && s.CachePoolCapacity > 0 &&
 			(s.reservedCache >= s.CachePoolCapacity || cache > s.CachePoolCapacity-s.reservedCache)) {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}

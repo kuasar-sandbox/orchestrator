@@ -1236,6 +1236,10 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 		minimum = max(minimum, min(remaining, allocator.policy.MinGrantStep))
 	}
 	if remaining <= capRoom && current <= pool && remaining <= pool-current && headroom < minimum && executableAfter == executableBefore && decision.GrantedDelta < requested {
+		// A real Guest-growth shortage gets first opportunity to reclaim
+		// borrowed clean cache, before ordinary pressure escalation may
+		// request a pause. Targets remain charged until their owners return.
+		s.requestCacheDonorLocked(r.SandboxID, 0, minimum-headroom, true)
 		protect := min(remaining, missingStep)
 		s.failDemandLocked(key, r.SandboxID, r.Token, protect, executableAfter, false, s.pressure.clock())
 	} else if decision.GrantedDelta == requested || executableAfter > executableBefore || headroom >= minimum {

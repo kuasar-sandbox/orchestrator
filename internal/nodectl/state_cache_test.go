@@ -329,3 +329,100 @@ func TestCacheBlockedInitialAdmissionRequestsDonorReclaim(t *testing.T) {
 		t.Fatalf("cache accounting did not transfer between sandboxes: %d", s.reservedCache)
 	}
 }
+
+// Guest resume can use an emergency memory reserve, but a discretionary
+// cache grant must never use that exemption.
+func TestSavedSourceInitialCacheCannotUseGuestEmergencyMemory(t *testing.T) {
+	const miB = uint64(1 << 20)
+	s := makeState(4<<30, 0)
+	pool := s.AllocatablePool.MemoryBytes
+	emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+	if emergency < 16*miB {
+		t.Fatalf("test pool has insufficient emergency reserve %d", emergency)
+	}
+	s.mu.Lock()
+	s.reservedMemory = pool - emergency
+	s.mu.Unlock()
+	resume := LaunchAdmission{Operation: OperationResume, SavedSource: true, Accepted: true, Identity: "resume-with-cache"}
+	guest := emergency - 8*miB
+	if got := s.AnalyzeLaunchWithCache("saved", guest, 0, resume); got.Status != OutcomeAdmitted {
+		t.Fatalf("saved-source Guest lost existing emergency exemption: %+v", got)
+	}
+	if got := s.AnalyzeLaunchWithCache("saved", guest, 8*miB, resume); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+		t.Fatalf("saved-source cache improperly consumed emergency memory: %+v", got)
+	}
+}
+
+func TestPendingReclaimDoesNotEvictMultipleDonorsForSameShortage(t *testing.T) {
+	const miB = uint64(1 << 20)
+	s := makeState(4<<30, 0)
+	s.Wm.StartupFactor = .5
+	s.CachePoolCapacity = 72 * miB
+	a := allocatorCacheTest()
+	donors := []string{
+		admitCacheTest(t, s, "donor-a", 1<<30),
+		admitCacheTest(t, s, "donor-b", 1<<30),
+		admitCacheTest(t, s, "donor-c", 1<<30),
+	}
+	for _, donor := range donors {
+		if result := mustCacheGrant(t, s, donor, 0, 24*miB, 1<<30, a); result.GrantedDelta != 24*miB {
+			t.Fatalf("grant donor %s: %+v", donor, result)
+		}
+	}
+	wait := LaunchAdmission{Operation: OperationCreate, Identity: "admit-cache-pending"}
+	for round := 0; round < 5; round++ {
+		s.RecordAdmissionWaitWithCache("wait", wait, 64*miB, 8*miB)
+	}
+	targetCount := 0
+	targetIndex := -1
+	for i, donor := range donors {
+		target, found := s.CacheTarget(donor)
+		if !found {
+			t.Fatalf("lost donor %s", donor)
+		}
+		if target != 0 {
+			targetCount++
+			targetIndex = i
+			if target != 16*miB {
+				t.Fatalf("unexpected reclaim amount for donor %s: %d", donor, target)
+			}
+		}
+	}
+	if targetCount != 1 || s.reservedCache != 72*miB {
+		t.Fatalf("five identical retries overreclaimed %d donors or changed reservation %d", targetCount, s.reservedCache)
+	}
+	_ = mustCacheGrant(t, s, donors[targetIndex], 16*miB, 0, 1<<30, a)
+	if got := s.AnalyzeLaunchWithCache("wait", 64*miB, 8*miB, wait); got.Status != OutcomeAdmitted {
+		t.Fatalf("pending reclaim did not satisfy original admission: %+v", got)
+	}
+}
+
+func TestGuestGrowthShortageTriggersCacheReclaimBeforePause(t *testing.T) {
+	const miB = uint64(1 << 20)
+	s := makeState(4<<30, 0)
+	a := allocatorCacheTest()
+	donor := admitCacheTest(t, s, "cache-donor", 1<<30)
+	growing := admitCacheTest(t, s, "guest-growing", 1<<30)
+	if result := mustCacheGrant(t, s, donor, 0, 128*miB, 1<<30, a); result.GrantedDelta != 128*miB {
+		t.Fatalf("donor setup grant: %+v", result)
+	}
+	// Simulate the pool's net runtime headroom being fully used while
+	// retaining existing charged reservations (e.g. a smaller live pool).
+	s.mu.Lock()
+	s.AllocatablePool.MemoryBytes = s.reservedMemory
+	s.mu.Unlock()
+	result, found, err := s.ReconcileAndGrant(growing, 256*miB, 64*miB, UrgencyNormal, a)
+	if err != nil || !found {
+		t.Fatalf("Guest growth reconcile: %+v found=%v err=%v", result, found, err)
+	}
+	if result.Decision.GrantedDelta != 0 {
+		t.Fatalf("Guest budget unexpectedly granted without available pool memory: %+v", result.Decision)
+	}
+	target, exists := s.CacheTarget(donor)
+	if !exists || target >= 128*miB || target == 0 {
+		t.Fatalf("Guest shortage failed to request donor cache shrink: %d found=%v", target, exists)
+	}
+	if s.reservedCache != 128*miB {
+		t.Fatalf("node freed pending donor target without physical return: %d", s.reservedCache)
+	}
+}
