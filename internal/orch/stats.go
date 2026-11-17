@@ -79,6 +79,8 @@ func (o *Orchestrator) readResourceStats(ctx context.Context, sb *types.Sandbox)
 	return stats, nil
 }
 
+var errStatsBindingChanged = fmt.Errorf("%w: sandbox ownership changed", api.ErrStatsUnavailable)
+
 // Keep the existing object/run fence internal. A read racing pause, deletion,
 // restart or binding reuse cannot publish the former runtime as the current one.
 // Paused replacements may share paths, an empty RunID and CreatedUnix; retain
@@ -93,7 +95,7 @@ func (o *Orchestrator) statsBindingCurrent(ctx context.Context, expected *types.
 		current.Profile != expected.Profile || current.StableIDValue != expected.StableIDValue || !sameClusterSandboxOwner(current.Cluster, expected.Cluster) ||
 		current.APISecret != expected.APISecret || current.ManifestKey != expected.ManifestKey || current.ServiceSecret != expected.ServiceSecret ||
 		current.EnvdAccessToken != expected.EnvdAccessToken || current.TrafficAccessToken != expected.TrafficAccessToken || current.ForwardAccessToken != expected.ForwardAccessToken {
-		return api.ErrStatsUnavailable
+		return errStatsBindingChanged
 	}
 	return nil
 }

@@ -60,6 +60,8 @@ type ArtifactPrepareSpec struct {
 type SandboxTaskSpec struct {
 	SandboxID string               `json:"sandbox_id"`
 	RunID     string               `json:"run_id"`
+	StableID  string               `json:"stable_id,omitempty"`
+	BaseDir   string               `json:"base_dir,omitempty"`
 	Workdir   string               `json:"workdir"`
 	Env       map[string]string    `json:"env,omitempty"`
 	Final     *LaunchSpec          `json:"final,omitempty"`

@@ -30,6 +30,9 @@ func TestCollectorDeploymentExamplesStart(t *testing.T) {
 			cfg.Local.Path = filepath.Join(t.TempDir(), "db")
 			otlp := cfg.Collector["receivers"].(map[string]any)["sandboxotlp"].(map[string]any)
 			otlp["http_listen"], otlp["grpc_listen"] = "127.0.0.1:0", "127.0.0.1:0"
+			host := cfg.Collector["receivers"].(map[string]any)["otlp/host"].(map[string]any)
+			httpHost := host["protocols"].(map[string]any)["http"].(map[string]any)
+			httpHost["endpoint"] = filepath.Join(t.TempDir(), "host.sock")
 			if err := config.ValidateTelemetryFinal(cfg); err != nil {
 				t.Fatal(err)
 			}

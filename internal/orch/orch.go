@@ -56,6 +56,7 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
+	hostObserver *conductorHostObserver // wired during startup, before reconciliation
 	holdMu       sync.Mutex
 	holds        map[string]holdProjection
 	holdRecovery idleclock.Point
@@ -852,7 +853,7 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 	}
 }
 
-func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, includeLocal bool) error {
+func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, sb *types.Sandbox, includeLocal bool) error {
 	if p.unit == "" && p.runID != "" && !p.runnerFenced {
 		unit, err := o.resolveRunUnit(ctx, runKindSandbox, p.runID)
 		if err != nil {
@@ -891,7 +892,7 @@ func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, inclu
 		p.runnerFenced = true
 	}
 	if p.port != "" && !p.portDetached {
-		if err := o.detachSandboxPort(ctx, p.port); err != nil {
+		if err := o.detachSandboxPort(ctx, p.port, sb); err != nil {
 			return err
 		}
 		p.portDetached = true
@@ -926,7 +927,7 @@ func (o *Orchestrator) stepLaunchCleanup(ctx context.Context, attempt *launchAtt
 		attempt.cleanup = &launchCleanupProgress{}
 	}
 	attempt.cleanup.merge(o, attempt, sb)
-	return attempt.cleanup.step(ctx, o, includeLocal)
+	return attempt.cleanup.step(ctx, o, sb, includeLocal)
 }
 
 func nextLaunchCleanupRetry(delay time.Duration) time.Duration {
@@ -1567,7 +1568,8 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		return err
 	}
 	defer release()
-	if runID := sb.RunID; runID != "" {
+	runID := sb.RunID
+	if runID != "" {
 		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
 			return err
 		}
@@ -1583,7 +1585,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 	}
 	if port := sb.VswitchPort; port != "" {
 		o.networkAllocationMu.Lock()
-		detachErr := o.vs.Detach(ctx, port)
+		detachErr := o.detachObservedSandboxPortLocked(ctx, port, sb, runID)
 		if detachErr != nil && !errors.Is(detachErr, vswitch.ErrPortNotAttached) {
 			o.networkAllocationMu.Unlock()
 			return fmt.Errorf("orch: detach paused port %s: %w", port, detachErr)
@@ -2440,6 +2442,8 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 	response := &configsock.SandboxTaskSpec{
 		SandboxID: sandboxID,
 		RunID:     runID,
+		StableID:  sb.StableID(),
+		BaseDir:   sb.BaseDir,
 		Workdir:   sb.RunDir,
 		Env:       sandboxTaskEnv(sb),
 	}
@@ -3163,7 +3167,7 @@ func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types
 		progress.runID = sb.RunID
 		progress.unit = o.runnerUnit(sb.RunID)
 	}
-	if err := progress.step(ctx, o, true); err != nil {
+	if err := progress.step(ctx, o, sb, true); err != nil {
 		return err
 	}
 	o.uncache(sb.ID)

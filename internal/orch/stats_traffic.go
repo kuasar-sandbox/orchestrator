@@ -14,6 +14,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
+var errNetworkBinding = fmt.Errorf("%w: sandbox network binding changed or incomplete", api.ErrStatsUnavailable)
+
 type networkStatsReader interface {
 	Stats(context.Context, []int) (*connector.StatsOutput, error)
 }
@@ -23,8 +25,10 @@ type ingressBatchReader interface {
 }
 
 type trafficNetwork struct {
-	platform api.TrafficCounters
-	transit  api.TrafficCounters
+	portMAC    string
+	generation uint32
+	platform   api.TrafficCounters
+	transit    api.TrafficCounters
 }
 
 func (o *Orchestrator) acquireStatsSlot(ctx context.Context) (func(), error) {
@@ -116,22 +120,28 @@ func (o *Orchestrator) prepareTrafficReads(ctx context.Context, sandboxes []*typ
 }
 
 func (o *Orchestrator) readNetworkTraffic(ctx context.Context, sandboxes []*types.Sandbox) ([]trafficNetwork, error) {
+	return o.readNetworkTrafficWithFence(ctx, sandboxes, false)
+}
+
+// Cleanup already holds the allocation fence. It can skip a saturated stats
+// budget immediately, avoiding lock inversion with a normal stats reader.
+func (o *Orchestrator) readNetworkTrafficWithFence(ctx context.Context, sandboxes []*types.Sandbox, fenceHeld bool) ([]trafficNetwork, error) {
 	result := make([]trafficNetwork, len(sandboxes))
 	ports := make([]int, 0, len(sandboxes))
 	indices := make(map[int]int, len(sandboxes))
 	for i, sb := range sandboxes {
 		if sb.VswitchPort == "" {
 			if sb.FloatingIP != "" || sb.InnerIP != "" || sb.PortMAC != "" {
-				return nil, api.ErrStatsUnavailable
+				return nil, errNetworkBinding
 			}
 			continue // No attached port: empty observations, not observed zero.
 		}
 		port, err := strconv.ParseUint(sb.VswitchPort, 10, 32)
 		if err != nil || port == 0 || port > 4096 || sb.FloatingIP == "" || sb.InnerIP == "" || sb.PortMAC == "" {
-			return nil, api.ErrStatsUnavailable
+			return nil, errNetworkBinding
 		}
 		if _, found := indices[int(port)]; found {
-			return nil, api.ErrStatsUnavailable
+			return nil, errNetworkBinding
 		}
 		indices[int(port)] = i
 		ports = append(ports, int(port))
@@ -143,26 +153,36 @@ func (o *Orchestrator) readNetworkTraffic(ctx context.Context, sandboxes []*type
 	if !ok || o.cfg.Sandbox.Network.Switch == "" {
 		return nil, api.ErrStatsUnavailable
 	}
-	release, err := o.acquireStatsSlot(ctx)
-	if err != nil {
-		return nil, err
+	if fenceHeld {
+		select {
+		case o.nativeStatsSlots <- struct{}{}:
+			defer func() { <-o.nativeStatsSlots }()
+		default:
+			return nil, api.ErrStatsUnavailable
+		}
+	} else {
+		release, err := o.acquireStatsSlot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if !o.networkAllocationMu.TryLock() {
+			return nil, api.ErrStatsUnavailable
+		}
+		defer o.networkAllocationMu.Unlock()
 	}
-	defer release()
-	// Reuse the lifecycle's allocation/detach fence. Do not wait behind device
-	// moves, and never hold this lock while querying the Proxy or an exporter.
-	if !o.networkAllocationMu.TryLock() {
-		return nil, api.ErrStatsUnavailable
-	}
-	defer o.networkAllocationMu.Unlock()
 	for _, sb := range sandboxes {
 		if _, pending := o.detachedPortsPending[sb.VswitchPort]; pending {
-			return nil, api.ErrStatsUnavailable
+			return nil, errNetworkBinding
 		}
 		if err := o.statsBindingCurrent(ctx, sb); err != nil {
 			return nil, err
 		}
 	}
 	observed, err := reader.Stats(ctx, ports)
+	if errors.Is(err, connector.ErrPortNotAttached) {
+		return nil, errNetworkBinding
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: connector stats: %v", api.ErrStatsUnavailable, err)
 	}
@@ -172,14 +192,15 @@ func (o *Orchestrator) readNetworkTraffic(ctx context.Context, sandboxes []*type
 	for _, row := range observed.Ports {
 		i, found := indices[int(row.Port)]
 		if !found || row.FloatingIP != sandboxes[i].FloatingIP {
-			return nil, api.ErrStatsUnavailable
+			return nil, errNetworkBinding
 		}
 		ip, _, err := net.ParseCIDR(sandboxes[i].InnerIP)
 		if err != nil || !ip.Equal(net.ParseIP(row.InnerIP)) {
-			return nil, api.ErrStatsUnavailable
+			return nil, errNetworkBinding
 		}
 		delete(indices, int(row.Port))
 		result[i] = trafficNetwork{
+			portMAC: row.PortMAC, generation: row.Generation,
 			platform: api.TrafficCounters{RXPackets: &row.MgmtRxPackets, RXBytes: &row.MgmtRxBytes, TXPackets: &row.MgmtTxPackets, TXBytes: &row.MgmtTxBytes},
 			transit:  api.TrafficCounters{RXPackets: &row.TransitRxPackets, RXBytes: &row.TransitRxBytes, TXPackets: &row.TransitTxPackets, TXBytes: &row.TransitTxBytes},
 		}

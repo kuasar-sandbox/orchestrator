@@ -7,7 +7,13 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-UMask=0077
+# Host OTLP is group-local; the public Guest OTLP uses independent TCP listeners.
+# Install deploy/node-telemetry.sysusers.conf and grant trusted Host services
+# supplementary membership in kuasar-telemetry.
+Group=kuasar-telemetry
+RuntimeDirectory=sandbox-telemetry
+RuntimeDirectoryMode=0770
+UMask=0007
 ExecStart=/usr/bin/node-ctl telemetry serve --config=/etc/node-ctl/telemetry.yaml
 Restart=always
 RestartSec=1
