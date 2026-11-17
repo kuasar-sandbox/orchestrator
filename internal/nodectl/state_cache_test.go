@@ -435,30 +435,43 @@ func TestPendingReclaimDoesNotEvictMultipleDonorsForSameShortage(t *testing.T) {
 
 func TestGuestGrowthShortageTriggersCacheReclaimBeforePause(t *testing.T) {
 	const miB = uint64(1 << 20)
-	s := makeState(4<<30, 0)
-	a := allocatorCacheTest()
-	donor := admitCacheTest(t, s, "cache-donor", 1<<30)
-	growing := admitCacheTest(t, s, "guest-growing", 1<<30)
-	if result := mustCacheGrant(t, s, donor, 0, 128*miB, 1<<30, a); result.GrantedDelta != 128*miB {
-		t.Fatalf("donor setup grant: %+v", result)
-	}
-	// Simulate the pool's net runtime headroom being fully used while
-	// retaining existing charged reservations (e.g. a smaller live pool).
-	s.mu.Lock()
-	s.AllocatablePool.MemoryBytes = s.reservedMemory
-	s.mu.Unlock()
-	result, found, err := s.ReconcileAndGrant(growing, 256*miB, 64*miB, UrgencyNormal, a)
-	if err != nil || !found {
-		t.Fatalf("Guest growth reconcile: %+v found=%v err=%v", result, found, err)
-	}
-	if result.Decision.GrantedDelta != 0 {
-		t.Fatalf("Guest budget unexpectedly granted without available pool memory: %+v", result.Decision)
-	}
-	target, exists := s.CacheTarget(donor)
-	if !exists || target >= 128*miB || target == 0 {
-		t.Fatalf("Guest shortage failed to request donor cache shrink: %d found=%v", target, exists)
-	}
-	if s.reservedCache != 128*miB {
-		t.Fatalf("node freed pending donor target without physical return: %d", s.reservedCache)
+	for _, source := range []string{"other sandbox", "own sandbox"} {
+		t.Run(source, func(t *testing.T) {
+			s := makeState(4<<30, 0)
+			s.Wm.EmergencyFactor = 0
+			a := allocatorCacheTest()
+			growing := admitCacheTest(t, s, "guest-growing", 1<<30)
+			donor := growing
+			if source == "other sandbox" {
+				donor = admitCacheTest(t, s, "cache-donor", 1<<30)
+			}
+			if grant := mustCacheGrant(t, s, donor, 0, 128*miB, 1<<30, a); grant.GrantedDelta != 128*miB {
+				t.Fatalf("donor setup grant: %+v", grant)
+			}
+			// Set the pool to its current charge so only actual returns can fund growth.
+			s.AllocatablePool.MemoryBytes = s.reservedMemory
+			request := func() uint64 {
+				t.Helper()
+				result, found, err := s.ReconcileAndGrant(growing, 256*miB, 64*miB, UrgencyNormal, a)
+				if err != nil || !found {
+					t.Fatalf("Guest growth reconcile: %+v found=%v err=%v", result, found, err)
+				}
+				return result.Decision.GrantedDelta
+			}
+			if delta := request(); delta != 0 {
+				t.Fatalf("Guest received %d bytes from a full pool", delta)
+			}
+			target, found := s.CacheTarget(donor)
+			if !found || target == 0 || target >= 128*miB {
+				t.Fatalf("Guest shortage failed to request donor cache shrink: %d found=%v", target, found)
+			}
+			if s.reservedCache != 128*miB {
+				t.Fatalf("node freed pending donor target without physical return: %d", s.reservedCache)
+			}
+			mustCacheGrant(t, s, donor, target, 0, 1<<30, a)
+			if delta := request(); delta != 128*miB-target {
+				t.Fatalf("Guest received %d bytes after donor returned %d", delta, 128*miB-target)
+			}
+		})
 	}
 }

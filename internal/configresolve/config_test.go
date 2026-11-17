@@ -19,23 +19,26 @@ func TestEncryptionKeySpecEnvironmentOverridesYAMLOnlyAtRuntimeResolution(t *tes
 }
 
 func TestDiffCOWPolicyAdaptersPreservePresenceAndOwnership(t *testing.T) {
-	cache, dirty, discard := "128MiB", "32MiB", "manual"
-	in := publicconfig.ResourcesConfig{DiffCOW: &publicconfig.ResourceDiffCOW{CacheSize: &cache, MaxDirtySize: &dirty, Discard: &discard}}
+	cache, dirty, idle, discard := "128MiB", "32MiB", "25s", "manual"
+	in := publicconfig.ResourcesConfig{DiffCOW: &publicconfig.ResourceDiffCOW{CacheSize: &cache, MaxDirtySize: &dirty, CacheIdleAfter: &idle, Discard: &discard}}
 	policy := SandboxResources(in)
 	out := PublicSandboxResources(policy)
-	if *out.DiffCOW.CacheSize != cache || *out.DiffCOW.MaxDirtySize != dirty || *out.DiffCOW.Discard != discard ||
+	if out.DiffCOW.CacheIdleAfter == nil || *out.DiffCOW.CacheIdleAfter != idle ||
+		out.DiffCOW.CacheIdleAfter == policy.DiffCOW.CacheIdleAfter || policy.DiffCOW.CacheIdleAfter == &idle ||
+		*out.DiffCOW.CacheSize != cache || *out.DiffCOW.MaxDirtySize != dirty || *out.DiffCOW.Discard != discard ||
 		out.DiffCOW.CacheSize == policy.DiffCOW.CacheSize || out.DiffCOW.MaxDirtySize == policy.DiffCOW.MaxDirtySize ||
 		out.DiffCOW.Discard == policy.DiffCOW.Discard ||
 		policy.DiffCOW.CacheSize == &cache || policy.DiffCOW.MaxDirtySize == &dirty || policy.DiffCOW.Discard == &discard {
 		t.Fatalf("adapter lost or shared leaves: %+v", out.DiffCOW)
 	}
 	in.DiffCOW.MaxDirtySize = nil
-	if got := MaterializedSandboxResources(in).DiffCOW; got == nil || got.MaxDirtySize != nil || *got.CacheSize != cache || *got.Discard != discard {
+	if got := MaterializedSandboxResources(in).DiffCOW; got == nil || got.MaxDirtySize != nil || got.CacheIdleAfter == nil || *got.CacheIdleAfter != idle || *got.CacheSize != cache || *got.Discard != discard {
 		t.Fatalf("diagnostic policy = %+v", got)
 	}
 	in.DiffCOW.CacheSize = nil
 	in.DiffCOW.Discard = nil
-	if got := MaterializedSandboxResources(in).DiffCOW; got == nil || got.CacheSize != nil || got.MaxDirtySize != nil || got.Discard != nil {
+	in.DiffCOW.CacheIdleAfter = nil
+	if got := MaterializedSandboxResources(in).DiffCOW; got == nil || got.CacheSize != nil || got.MaxDirtySize != nil || got.CacheIdleAfter != nil || got.Discard != nil {
 		t.Fatalf("empty mapping = %+v", got)
 	}
 	if got := MaterializedSandboxResources(publicconfig.ResourcesConfig{}).DiffCOW; got != nil {
