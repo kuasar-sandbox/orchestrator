@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -203,5 +204,51 @@ func TestCacheInitialAdmitReplayIsIdempotent(t *testing.T) {
 	}
 	if r := reservationForTest(t, s, "replay-cache"); r.CacheReservation != 8<<20 {
 		t.Fatalf("cache grant changed after replay %+v", r)
+	}
+}
+
+// Test the exact compact E2E admission budget after accounting for the
+// additional 8MiB physical diff_cow grant per sandbox. The old 400MiB
+// fixture cannot admit four; 432MiB admits four but still rejects a fifth.
+func TestCacheCompactAdmissionFourButNotFive(t *testing.T) {
+	const miB = uint64(1 << 20)
+	for _, tc := range []struct {
+		physicalMiB  int
+		wantAdmitted int
+	}{
+		{400, 3}, {432, 4},
+	} {
+		t.Run(fmt.Sprintf("%dMiB", tc.physicalMiB), func(t *testing.T) {
+			s := makeState(uint64(tc.physicalMiB)*miB, 80*miB)
+			s.Wm.StartupFactor = 1
+			admitted := 0
+			for i := 1; i <= 5; i++ {
+				sid := fmt.Sprintf("resource-admission-%d", i)
+				launch := LaunchAdmission{Operation: OperationCreate}
+				result := s.AnalyzeLaunchWithCache(sid, 64*miB, 8*miB, launch)
+				if result.Status != OutcomeAdmitted {
+					break
+				}
+				_, _, err := s.Admit(AdmitSpec{
+					SandboxID: sid, Token: "token-" + sid, CgroupPath: "/cg/" + sid,
+					Capacity:              Resources{MemoryBytes: 256 * miB, CPUMilli: 1000},
+					ConfiguredAllocatable: Resources{MemoryBytes: 64 * miB, CPUMilli: 1000},
+					InitialBudget:         64 * miB, InitialCache: 8 * miB, CacheMax: 32 * miB,
+					ClientFeatures: []string{resource.FeatureCacheBudgetV1},
+					Admission:      &launch,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				admitted++
+			}
+			if admitted != tc.wantAdmitted {
+				t.Fatalf("admitted %d, want %d under %dMiB physical memory", admitted, tc.wantAdmitted, tc.physicalMiB)
+			}
+			want := uint64(admitted) * 72 * miB
+			if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != want {
+				t.Fatalf("reserved %d, want Guest+cache %d", got, want)
+			}
+		})
 	}
 }
