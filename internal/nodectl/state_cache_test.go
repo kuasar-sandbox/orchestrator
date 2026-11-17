@@ -252,3 +252,80 @@ func TestCacheCompactAdmissionFourButNotFive(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheGrantCannotSpendProtectedGuestHeadroom(t *testing.T) {
+	const miB = uint64(1 << 20)
+	s := makeState(4<<30, 0)
+	token := admitCacheTest(t, s, "cache-borrower", 1<<30)
+	a := allocatorCacheTest()
+	baseline := s.ResourceSnapshot().Reserved.MemoryBytes
+	pool := s.AllocatablePool.MemoryBytes
+	emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+	available := pool - baseline - emergency
+	if available < 32*miB {
+		t.Fatalf("unexpected available memory %d", available)
+	}
+	s.mu.Lock()
+	s.initPressureLocked()
+	now := s.pressure.clock()
+	s.failDemandLocked("grow:protected", "protected", "guest-protected", available, 0, false, now)
+	s.mu.Unlock()
+	deny := mustCacheGrant(t, s, token, 0, 8*miB, 1<<30, a)
+	if deny.GrantedDelta != 0 || s.reservedCache != 0 {
+		t.Fatalf("cache spent protected Guest reservation: %+v reservedCache=%d", deny, s.reservedCache)
+	}
+	s.ForgetDemand("grow:protected")
+	grant := mustCacheGrant(t, s, token, 0, 8*miB, 1<<30, a)
+	if grant.GrantedDelta != 8*miB {
+		t.Fatalf("cache remained blocked after protected demand cleared: %+v", grant)
+	}
+}
+
+func TestCacheBlockedInitialAdmissionRequestsDonorReclaim(t *testing.T) {
+	const miB = uint64(1 << 20)
+	s := makeState(4<<30, 0)
+	s.Wm.StartupFactor = 0.50
+	s.CachePoolCapacity = 16 * miB
+	allocator := allocatorCacheTest()
+	donor := admitCacheTest(t, s, "donor", 1<<30)
+	if got := mustCacheGrant(t, s, donor, 0, 16*miB, 1<<30, allocator); got.GrantedDelta != 16*miB {
+		t.Fatalf("donor grant: %+v", got)
+	}
+	wait := LaunchAdmission{Operation: OperationCreate, Identity: "admit-cache-attempt"}
+	oc := s.AnalyzeLaunchWithCache("waiting", 64*miB, 8*miB, wait)
+	if oc.Status != OutcomeShortTermBlock || oc.Block != BlockedByMainBudget {
+		t.Fatalf("cache-cap-only admission did not block: %+v", oc)
+	}
+	s.RecordAdmissionWaitWithCache("waiting", wait, 64*miB, 8*miB)
+	target, found := s.CacheTarget(donor)
+	if !found || target != 8*miB {
+		t.Fatalf("queued sandbox did not trigger donor reclaim: %d found=%v", target, found)
+	}
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 272*miB {
+		t.Fatalf("reclaim directive prematurely returned donor memory: %d", got)
+	}
+	if demand := s.PressureSnapshot().Demands; len(demand) != 0 {
+		t.Fatalf("cache-only shortage fabricated Guest pressure demand: %+v", demand)
+	}
+	// Donor has actually released host pages, then reports a smaller
+	// trusted baseline. Node reuses only that confirmed balance.
+	if result := mustCacheGrant(t, s, donor, 8*miB, 0, 1<<30, allocator); result.Reservation != 8*miB {
+		t.Fatalf("donor failed to return physical memory: %+v", result)
+	}
+	if got := s.AnalyzeLaunchWithCache("waiting", 64*miB, 8*miB, wait); got.Status != OutcomeAdmitted {
+		t.Fatalf("queued admission still blocked after confirmed return: %+v", got)
+	}
+	_, _, err := s.Admit(AdmitSpec{
+		SandboxID: "waiting", Token: "waiting-token", CgroupPath: "/cg/waiting",
+		Capacity:              Resources{MemoryBytes: 256 * miB, CPUMilli: 1000},
+		ConfiguredAllocatable: Resources{MemoryBytes: 64 * miB, CPUMilli: 1000},
+		InitialBudget:         64 * miB, InitialCache: 8 * miB, CacheMax: 256 * miB,
+		ClientFeatures: []string{resource.FeatureCacheBudgetV1}, Admission: &wait,
+	})
+	if err != nil {
+		t.Fatalf("reclaimed bytes not available for waiting Admit: %v", err)
+	}
+	if s.reservedCache != 16*miB {
+		t.Fatalf("cache accounting did not transfer between sandboxes: %d", s.reservedCache)
+	}
+}

@@ -482,7 +482,7 @@ func (a *AdmissionController) analyzePending(p *PendingAdmit) Outcome {
 	}
 	oc := a.analyzeLaunch(p.req, launch)
 	if oc.Status == OutcomeShortTermBlock {
-		a.state.RecordAdmissionWait(p.req.SandboxID, launch, initialReservationBudget(p.req))
+		a.state.RecordAdmissionWaitWithCache(p.req.SandboxID, launch, initialReservationBudget(p.req), p.req.CacheInitial)
 	}
 	return oc
 }

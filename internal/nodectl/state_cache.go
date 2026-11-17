@@ -95,6 +95,14 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 	if pool > s.reservedMemory && pool-s.reservedMemory > emergency {
 		headroom = pool - s.reservedMemory - emergency
 	}
+	// Guest growth and pending recovery take precedence over discretionary
+	// cache grants. Reuse the existing beneficiary-protection calculation.
+	protected := s.protectedLocked("cache:" + r.SandboxID)
+	if protected >= headroom {
+		headroom = 0
+	} else {
+		headroom -= protected
+	}
 	if s.CachePoolCapacity > 0 {
 		if s.reservedCache >= s.CachePoolCapacity {
 			headroom = 0
@@ -138,29 +146,50 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 	if now.Sub(demand.since) < 400*time.Millisecond {
 		return out, true, nil
 	}
-	// Persistent failed requests can be served by reclaiming borrowed cache
-	// from the largest other sandbox. A directive is NOT a released grant.
-	// The current memory charge remains until the donor explicitly returns.
-	minimum := cacheBudgetUnit
+	// Persistent failed requests may borrow from another sandbox. A target
+	// remains charged until its owner has actually returned physical pages.
+	s.requestCacheDonorLocked(r.SandboxID, r.CacheReservation, remaining, false)
+	return out, true, nil
+}
+
+// requestCacheDonorLocked assigns a target only; it never credits bytes to
+// a waiting sandbox or decrements the donor's existing reservation. Queued
+// admission is prioritized over optional cache growth, so it need not have
+// a smaller existing cache reservation than the donor.
+func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage uint64, admission bool) bool {
+	if shortage == 0 {
+		return false
+	}
 	var donor *Reservation
 	for _, candidate := range s.bySID {
-		if candidate == r || candidate.Provisional || candidate.CacheReclaimTarget != 0 ||
-			candidate.CacheReservation <= minimum || candidate.CacheReservation <= r.CacheReservation+minimum {
+		if candidate.SandboxID == excludeSID || candidate.Provisional ||
+			candidate.CacheReclaimTarget != 0 || candidate.CacheReservation <= cacheBudgetUnit {
+			continue
+		}
+		if !admission && candidate.CacheReservation <= borrower+cacheBudgetUnit {
 			continue
 		}
 		if donor == nil || candidate.CacheReservation > donor.CacheReservation {
 			donor = candidate
 		}
 	}
-	if donor != nil {
-		drop := min(remaining, donor.CacheReservation-minimum)
-		drop -= drop % cacheBudgetUnit
-		if drop == 0 {
-			drop = min(cacheBudgetUnit, donor.CacheReservation-minimum)
-		}
-		donor.CacheReclaimTarget = donor.CacheReservation - drop
+	if donor == nil {
+		return false
 	}
-	return out, true, nil
+	available := donor.CacheReservation - cacheBudgetUnit
+	drop := min(shortage, available)
+	// Active cache reclaims whole accounting units, except a final
+	// configured sub-unit tail that can be reclaimed as one ordinary unit.
+	if drop < cacheBudgetUnit {
+		drop = min(cacheBudgetUnit, available)
+	} else {
+		drop -= drop % cacheBudgetUnit
+	}
+	if drop == 0 {
+		return false
+	}
+	donor.CacheReclaimTarget = donor.CacheReservation - drop
+	return true
 }
 
 // CacheReclaimTarget is the controller's latest absolute target, not a forced

@@ -520,18 +520,23 @@ func (s *State) competingExecutableDemandLocked(sid string, now time.Time) bool 
 }
 
 func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budget uint64) {
+	s.RecordAdmissionWaitWithCache(sid, admission, budget, 0)
+}
+
+func (s *State) RecordAdmissionWaitWithCache(sid string, admission LaunchAdmission, budget, cache uint64) {
 	if p := s.forSID(sid); p != s {
-		p.RecordAdmissionWait(sid, admission, budget)
+		p.RecordAdmissionWaitWithCache(sid, admission, budget, cache)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
 	if budget == 0 || budget > s.AllocatablePool.MemoryBytes ||
+		cache > s.AllocatablePool.MemoryBytes-budget ||
 		(!admission.Accepted && !OperationAllowed(s.pressure.record.Zone, admission.Operation)) {
 		return
 	}
-	oc := s.admissionBudgetLocked(sid, budget, admission)
+	oc := s.admissionWithCacheLocked(sid, budget, cache, admission)
 	if admission.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid {
 		if d := s.pressure.demands["admit:"+sid]; d != nil && d.identity == admission.Identity {
 			s.clearDemandLocked("admit:" + sid)
@@ -550,7 +555,45 @@ func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budge
 		return
 	}
 	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByMainBudget {
-		s.failDemandLocked("admit:"+sid, sid, admission.Identity, budget, 0, admission.Operation != OperationCreate, s.pressure.clock())
+		// A queued launch is a real executable request, unlike a speculative
+		// cache grow. If cache borrowers are blocking its Guest startup or
+		// initial cache grant, request a donor now, then use the existing
+		// Release / budget-return wakeup to retry the admission queue.
+		pool := s.AllocatablePool.MemoryBytes
+		available := uint64(0)
+		if pool > s.reservedMemory {
+			available = pool - s.reservedMemory
+		}
+		if !admission.SavedSource {
+			emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+			if available > emergency {
+				available -= emergency
+			} else {
+				available = 0
+			}
+		}
+		protected := s.protectedLocked("admit:" + sid)
+		if protected >= available {
+			available = 0
+		} else {
+			available -= protected
+		}
+		required := budget + cache
+		memoryShortage := uint64(0)
+		if required > available {
+			memoryShortage = required - available
+		}
+		cacheShortage := uint64(0)
+		if cache > 0 && s.CachePoolCapacity > 0 &&
+			s.reservedCache+cache > s.CachePoolCapacity {
+			cacheShortage = s.reservedCache + cache - s.CachePoolCapacity
+		}
+		s.requestCacheDonorLocked(sid, 0, max(memoryShortage, cacheShortage), true)
+		// A cache-specific cap is not itself a Guest memory shortage and must
+		// not fabricate Guest pressure/balloon demand.
+		if memoryShortage > 0 {
+			s.failDemandLocked("admit:"+sid, sid, admission.Identity, required, 0, admission.Operation != OperationCreate, s.pressure.clock())
+		}
 		return
 	}
 	// A saved-source resume waiting for a startup slot or rate token retains

@@ -327,7 +327,7 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 
 	case OutcomeShortTermBlock:
-		s.State.RecordAdmissionWait(req.SandboxID, launch, initialReservationBudget(req))
+		s.State.RecordAdmissionWaitWithCache(req.SandboxID, launch, initialReservationBudget(req), req.CacheInitial)
 		_, ok := s.Admission.Enqueue(req, conn, peerPID)
 		if !ok {
 			s.State.ForgetAdmissionWait(req.SandboxID, launch.Identity)
