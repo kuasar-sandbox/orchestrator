@@ -25,3 +25,42 @@ func TestResourceGroupsDoNotInventSandboxIdentityForNode(t *testing.T) {
 		}
 	}
 }
+
+func TestResourceGroupsPreserveGuestReservationWithHostCache(t *testing.T) {
+	state := nodectl.NewState(8<<30, 8000, 0, 0, nodectl.Watermarks{})
+	const guestMemory = uint64(256 << 20)
+	const cacheMemory = uint64(64 << 20)
+	observed := time.Now()
+	err := state.InstallProvisional(nodectl.ProvisionalSpec{
+		SandboxID: "cache-owner", RecoveryKey: "test-recovery",
+		Capacity:          nodectl.Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		ReservationMemory: guestMemory, InitialBudget: guestMemory,
+		CacheReservation: cacheMemory, CacheMax: cacheMemory,
+		ClientFeatures: []string{nodectl.FeatureCacheBudgetV1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, sandbox := map[string]float64{}, map[string]float64{}
+	for _, group := range hostResourceGroups(state, observed) {
+		target := node
+		if group.Resource["sandbox.id"] == "cache-owner" {
+			target = sandbox
+		}
+		for _, sample := range group.Samples {
+			target[sample.Name] = sample.Value
+			if !sample.Timestamp.Equal(observed) {
+				t.Fatalf("observation timestamp changed: %v", sample.Timestamp)
+			}
+		}
+	}
+	if got := node["node.resource.memory.reserved"]; got != float64(guestMemory+cacheMemory) {
+		t.Fatalf("node pool omitted host cache: got %v, want %v", got, guestMemory+cacheMemory)
+	}
+	if got := sandbox["sandbox.resource.memory.reserved"]; got != float64(guestMemory) {
+		t.Fatalf("Guest reservation includes host cache: got %v, want %v", got, guestMemory)
+	}
+	if got := sandbox["sandbox.resource.cpu.reserved"]; got != 1 {
+		t.Fatalf("startup CPU fallback: got %v, want 1 core", got)
+	}
+}
