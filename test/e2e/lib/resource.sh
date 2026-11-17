@@ -116,7 +116,10 @@ resource_write_controller() {
     local output="$1" compact="${2:-false}"
     local physical_memory=4GiB host_memory=512MiB host_cpu=1 startup_factor=0.50 ttl=120s
     if [ "$compact" = true ]; then
-        physical_memory=400MiB; host_memory=80MiB; host_cpu=0.5; startup_factor=1.00; ttl=60s
+        # Four 64MiB Guest startup reservations now also require four
+        # 4MiB initial diff_cow cache grants. Preserve the original test
+        # contract: four fit below emergency headroom, the fifth is denied.
+        physical_memory=432MiB; host_memory=80MiB; host_cpu=0.5; startup_factor=1.00; ttl=60s
     fi
     cat >"$output" <<EOF
 api: { domain: resource.e2e.local, listen: "127.0.0.1:0" }

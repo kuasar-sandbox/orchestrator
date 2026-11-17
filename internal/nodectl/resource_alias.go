@@ -29,22 +29,25 @@ const (
 	MaxMessageBytes          = resource.MaxMessageBytes
 	DefaultAdminListPageSize = resource.DefaultAdminListPageSize
 
-	TypeAdmit          = resource.TypeAdmit
-	TypeAdmitResponse  = resource.TypeAdmitResponse
-	TypeSettled        = resource.TypeSettled
-	TypeRequestBudget  = resource.TypeRequestBudget
-	TypeBudgetResponse = resource.TypeBudgetResponse
-	TypeOOMReport      = resource.TypeOOMReport
-	TypeHeartbeat      = resource.TypeHeartbeat
-	TypeRelease        = resource.TypeRelease
-	TypeAck            = resource.TypeAck
-	TypeStateSync      = resource.TypeStateSync
-	TypeError          = resource.TypeError
-	TypeAdminDrain     = resource.TypeAdminDrain
-	TypeAdminStatus    = resource.TypeAdminStatus
-	TypeAdminList      = resource.TypeAdminList
+	TypeAdmit               = resource.TypeAdmit
+	TypeAdmitResponse       = resource.TypeAdmitResponse
+	TypeSettled             = resource.TypeSettled
+	TypeRequestBudget       = resource.TypeRequestBudget
+	TypeBudgetResponse      = resource.TypeBudgetResponse
+	TypeRequestCacheBudget  = resource.TypeRequestCacheBudget
+	TypeCacheBudgetResponse = resource.TypeCacheBudgetResponse
+	TypeOOMReport           = resource.TypeOOMReport
+	TypeHeartbeat           = resource.TypeHeartbeat
+	TypeRelease             = resource.TypeRelease
+	TypeAck                 = resource.TypeAck
+	TypeStateSync           = resource.TypeStateSync
+	TypeError               = resource.TypeError
+	TypeAdminDrain          = resource.TypeAdminDrain
+	TypeAdminStatus         = resource.TypeAdminStatus
+	TypeAdminList           = resource.TypeAdminList
 
-	FeatureStateSyncV1 = resource.FeatureStateSyncV1
+	FeatureStateSyncV1   = resource.FeatureStateSyncV1
+	FeatureCacheBudgetV1 = resource.FeatureCacheBudgetV1
 
 	StatusAdmitted = resource.StatusAdmitted
 	StatusQueued   = resource.StatusQueued

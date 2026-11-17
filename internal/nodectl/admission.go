@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 // AdmissionPolicy bounds how new sandboxes are admitted.
@@ -479,7 +482,7 @@ func (a *AdmissionController) analyzePending(p *PendingAdmit) Outcome {
 	}
 	oc := a.analyzeLaunch(p.req, launch)
 	if oc.Status == OutcomeShortTermBlock {
-		a.state.RecordAdmissionWait(p.req.SandboxID, launch, initialReservationBudget(p.req))
+		a.state.RecordAdmissionWaitWithCache(p.req.SandboxID, launch, initialReservationBudget(p.req), p.req.CacheInitial)
 	}
 	return oc
 }
@@ -507,6 +510,13 @@ func (a *AdmissionController) analyzeLaunch(req *Message, launch LaunchAdmission
 		}
 	}
 
+	leaseCacheMaximum, cacheFeatureErr := resource.CacheMaximumFromFeatures(req.ClientFeatures)
+	if cacheFeatureErr != nil || leaseCacheMaximum != req.CacheMaximum ||
+		req.CacheInitial > req.CacheMaximum ||
+		req.CacheInitial > 0 && !slices.Contains(req.ClientFeatures, FeatureCacheBudgetV1) ||
+		req.CacheInitial%4096 != 0 {
+		return Outcome{Status: OutcomePreCheckReject, RejectCode: "invalid_cache_initial", RejectMsg: "invalid initial cache reservation"}
+	}
 	if launch.SavedSource && req.AllocatableAtSnapshot == 0 {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "invalid_snapshot_budget", RejectMsg: "saved-source launch requires BudgetAtSnapshot"}
 	}
@@ -525,7 +535,7 @@ func (a *AdmissionController) analyzeLaunch(req *Message, launch LaunchAdmission
 		}
 	}
 
-	oc := a.state.AnalyzeLaunch(req.SandboxID, initialBudget, launch)
+	oc := a.state.AnalyzeLaunchWithCache(req.SandboxID, initialBudget, req.CacheInitial, launch)
 	if oc.Status != OutcomeAdmitted {
 		return oc
 	}

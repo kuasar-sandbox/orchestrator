@@ -369,3 +369,32 @@ func TestResourcePoolLateAdmissionCancellationDoesNotProtectOldPool(t *testing.T
 		t.Fatal("late cancellation leaked old protection or cancelled successor")
 	}
 }
+
+// A cache limit is an additional cap on grants within an existing resource
+// pool, not a preallocated memory pool or a deduction from allocatable.memory.
+func TestResourcePoolOptionalCacheCapacity(t *testing.T) {
+	maxCache := "256MiB"
+	cfg := &config.ResourceListenConfig{
+		Pools: []config.ResourcePoolConfig{{Name: "default", CacheCapacity: &maxCache}},
+	}
+	cfg.Resources.PhysicalMemory = "4GiB"
+	cfg.Resources.HostReserved.Memory = "1GiB"
+	resolved, err := Resolve(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved.Pools) != 1 || resolved.Pools[0].CacheCapacity != 256*poolMiB {
+		t.Fatalf("cache capacity not resolved: %+v", resolved.Pools)
+	}
+	state := NewPoolState(resolved)
+	if state.CachePoolCapacity != 256*poolMiB {
+		t.Fatalf("wrong cache cap %d", state.CachePoolCapacity)
+	}
+	if state.AllocatablePool.MemoryBytes != resolved.Pools[0].Allocatable.MemoryBytes {
+		t.Fatalf("cache cap reduced the normal resource pool")
+	}
+	maxCache = "invalid"
+	if err := cfg.ValidatePools(); err == nil {
+		t.Fatal("invalid cache limit accepted")
+	}
+}

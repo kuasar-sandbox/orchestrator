@@ -27,6 +27,14 @@ func (c *ResourceDiffCOW) UnmarshalYAML(node *yaml.Node) error {
 	for field, value := range fields {
 		switch field {
 		case "cache_size", "max_dirty_size":
+		case "cache_idle_after":
+			var decoded any
+			if err := value.Decode(&decoded); err != nil {
+				return fmt.Errorf("sandbox.resources.diff_cow.cache_idle_after: %w", err)
+			}
+			if _, ok := decoded.(string); !ok {
+				return fmt.Errorf("sandbox.resources.diff_cow.cache_idle_after must be a positive duration")
+			}
 		case "discard":
 			var decoded any
 			if err := value.Decode(&decoded); err != nil {

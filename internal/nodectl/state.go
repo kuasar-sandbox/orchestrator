@@ -100,7 +100,13 @@ type Reservation struct {
 	// becomes zero at Settled without changing ReservationMemory.
 	ConfiguredAllocatable Resources `json:"configured_allocatable"`
 	ReservationMemory     uint64    `json:"reservation_memory"`
-	InitialBudget         uint64    `json:"initial_budget,omitempty"`
+	// CacheReservation is host cache memory (not Guest Budget/Capacity).
+	CacheReservation      uint64 `json:"cache_reservation,omitempty"`
+	CacheMax              uint64 `json:"cache_max,omitempty"`
+	CacheReclaimTarget    uint64 `json:"cache_reclaim_target,omitempty"`
+	CacheReclaimSeq       uint64 `json:"cache_reclaim_seq,omitempty"`
+	cacheReclaimUpdatedAt time.Time
+	InitialBudget         uint64 `json:"initial_budget,omitempty"`
 
 	Stage                 string    `json:"stage"`
 	StageEnteredAt        time.Time `json:"stage_entered_at"`
@@ -144,6 +150,11 @@ const (
 
 // State is a rebuildable in-memory view. All aggregate fields are updated in
 // the same critical section as their reservation transition.
+type cacheDemandAge struct {
+	since time.Time
+	last  time.Time
+}
+
 type State struct {
 	mu sync.Mutex
 	// A multi-pool State routes the existing controller's operations to ledgers.
@@ -161,13 +172,16 @@ type State struct {
 	tokenToSID  map[string]string
 	cgroupToSID map[string]string
 
-	reservedMemory   uint64
-	allocatedCPU     uint64
-	startupInFlight  uint64
-	provisionalCount int
-	unknownCount     int
-	pressure         pressureState
-	pressureWake     chan struct{}
+	reservedMemory    uint64
+	reservedCache     uint64
+	cacheDemandSince  map[string]cacheDemandAge
+	CachePoolCapacity uint64
+	allocatedCPU      uint64
+	startupInFlight   uint64
+	provisionalCount  int
+	unknownCount      int
+	pressure          pressureState
+	pressureWake      chan struct{}
 
 	NodeBudget        Resources
 	HostReserved      Resources
@@ -189,7 +203,7 @@ func NewState(physicalMem uint64, physicalCPUMilli uint64,
 		NodeBudget: node, HostReserved: host, OperationalMargin: margin,
 		AllocatablePool: budget.Sub(margin), Wm: wm,
 		bySID: make(map[string]*Reservation), tokenToSID: make(map[string]string),
-		cgroupToSID: make(map[string]string),
+		cgroupToSID: make(map[string]string), cacheDemandSince: make(map[string]cacheDemandAge),
 	}
 }
 
@@ -332,7 +346,11 @@ func (s *State) resourceSnapshotLocked() ResourceSnapshot {
 }
 
 func (s *State) addAggregatesLocked(r *Reservation) error {
-	mem, err := checkedAggregateAdd(s.reservedMemory, r.ReservationMemory, "memory reservation")
+	charge, err := reservationMemoryCharge(r)
+	if err != nil {
+		return err
+	}
+	mem, err := checkedAggregateAdd(s.reservedMemory, charge, "memory reservation")
 	if err != nil {
 		return err
 	}
@@ -344,7 +362,11 @@ func (s *State) addAggregatesLocked(r *Reservation) error {
 	if err != nil {
 		return err
 	}
-	s.reservedMemory, s.allocatedCPU, s.startupInFlight = mem, cpu, startup
+	cacheTotal, err := checkedAggregateAdd(s.reservedCache, r.CacheReservation, "cache reservation")
+	if err != nil {
+		return err
+	}
+	s.reservedMemory, s.allocatedCPU, s.startupInFlight, s.reservedCache = mem, cpu, startup, cacheTotal
 	if r.Provisional {
 		s.provisionalCount++
 	}
@@ -370,6 +392,13 @@ func runtimeCPU(r *Reservation) uint64 {
 		return r.ConfiguredAllocatable.CPUMilli
 	}
 	return r.Capacity.CPUMilli
+}
+
+func reservationMemoryCharge(r *Reservation) (uint64, error) {
+	if r == nil {
+		return 0, nil
+	}
+	return checkedAggregateAdd(r.ReservationMemory, r.CacheReservation, "sandbox total memory")
 }
 
 func aggregateStartupCharge(r *Reservation) uint64 {
@@ -411,7 +440,11 @@ func (s *State) validateAggregateReplacementLocked(remove []*Reservation, add *R
 		}
 		seen[r] = struct{}{}
 		var err error
-		if mem, err = checkedAggregateSub(mem, r.ReservationMemory, "memory reservation"); err != nil {
+		charge, chargeErr := reservationMemoryCharge(r)
+		if chargeErr != nil {
+			return chargeErr
+		}
+		if mem, err = checkedAggregateSub(mem, charge, "memory reservation"); err != nil {
 			return err
 		}
 		if cpu, err = checkedAggregateSub(cpu, runtimeCPU(r), "CPU allocation"); err != nil {
@@ -435,7 +468,11 @@ func (s *State) validateAggregateReplacementLocked(remove []*Reservation, add *R
 	}
 	var err error
 	if add != nil {
-		if mem, err = checkedAggregateAdd(mem, add.ReservationMemory, "memory reservation"); err != nil {
+		charge, chargeErr := reservationMemoryCharge(add)
+		if chargeErr != nil {
+			return chargeErr
+		}
+		if mem, err = checkedAggregateAdd(mem, charge, "memory reservation"); err != nil {
 			return err
 		}
 		if cpu, err = checkedAggregateAdd(cpu, runtimeCPU(add), "CPU allocation"); err != nil {
@@ -469,7 +506,11 @@ func (s *State) replaceReservationMemoryLocked(r *Reservation, memory uint64) er
 }
 
 func (s *State) removeAggregatesLocked(r *Reservation) error {
-	mem, err := checkedAggregateSub(s.reservedMemory, r.ReservationMemory, "memory reservation")
+	charge, err := reservationMemoryCharge(r)
+	if err != nil {
+		return err
+	}
+	mem, err := checkedAggregateSub(s.reservedMemory, charge, "memory reservation")
 	if err != nil {
 		return err
 	}
@@ -488,7 +529,11 @@ func (s *State) removeAggregatesLocked(r *Reservation) error {
 	if unknown && s.unknownCount <= 0 {
 		return fmt.Errorf("unknown reservation aggregate underflow")
 	}
-	s.reservedMemory, s.allocatedCPU, s.startupInFlight = mem, cpu, startup
+	cacheTotal, err := checkedAggregateSub(s.reservedCache, r.CacheReservation, "cache reservation")
+	if err != nil {
+		return err
+	}
+	s.reservedMemory, s.allocatedCPU, s.startupInFlight, s.reservedCache = mem, cpu, startup, cacheTotal
 	if r.Provisional {
 		s.provisionalCount--
 	}
@@ -531,6 +576,9 @@ func (s *State) detachLocked(sid string, released bool) (*Reservation, error) {
 		s.pressure.cleanup--
 	}
 	s.clearDemandLocked("grow:" + sid)
+	if r.Token != "" {
+		delete(s.cacheDemandSince, r.Token)
+	}
 	if released && s.pressure.exclusive == sid {
 		s.pressure.exclusive = ""
 	}
@@ -592,7 +640,9 @@ func validateReservation(r *Reservation) error {
 	if r == nil || r.SandboxID == "" {
 		return fmt.Errorf("reservation sandbox id is required")
 	}
-	if r.ReservationMemory > r.Capacity.MemoryBytes || r.ConfiguredAllocatable.MemoryBytes > r.Capacity.MemoryBytes ||
+	if r.CacheReservation > r.CacheMax ||
+		(r.CacheMax > 0 && !resource.HasFeature(r.ClientFeatures, resource.FeatureCacheBudgetV1)) ||
+		r.ReservationMemory > r.Capacity.MemoryBytes || r.ConfiguredAllocatable.MemoryBytes > r.Capacity.MemoryBytes ||
 		r.ConfiguredAllocatable.CPUMilli > r.Capacity.CPUMilli || r.InitialBudget > r.Capacity.MemoryBytes {
 		return fmt.Errorf("reservation resources exceed capacity")
 	}
@@ -606,6 +656,8 @@ type ProvisionalSpec struct {
 	Capacity              Resources
 	ConfiguredAllocatable Resources
 	ReservationMemory     uint64
+	CacheReservation      uint64
+	CacheMax              uint64
 	InitialBudget         uint64
 	RecoverySource        string
 	RecoveryKey           string
@@ -663,7 +715,7 @@ func (s *State) InstallProvisional(spec ProvisionalSpec) error {
 	r := &Reservation{
 		SandboxID: spec.SandboxID, PeerPID: spec.PeerPID, CgroupPath: spec.CgroupPath,
 		Capacity: spec.Capacity, ConfiguredAllocatable: spec.ConfiguredAllocatable,
-		ReservationMemory: spec.ReservationMemory, InitialBudget: spec.InitialBudget, Stage: StageStartup,
+		ReservationMemory: spec.ReservationMemory, CacheReservation: spec.CacheReservation, CacheMax: spec.CacheMax, InitialBudget: spec.InitialBudget, Stage: StageStartup,
 		StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
 		Provisional: true, RecoverySource: spec.RecoverySource,
 		RecoveryKey: spec.RecoveryKey, LeasePath: spec.LeasePath,
@@ -695,6 +747,8 @@ type AdmitSpec struct {
 	Capacity              Resources
 	ConfiguredAllocatable Resources
 	InitialBudget         uint64
+	CacheMax              uint64
+	InitialCache          uint64
 	Token                 string
 	LeasePath             string
 	ClientFeatures        []string
@@ -718,15 +772,16 @@ func (s *State) CanReplayAdmit(spec AdmitSpec) bool {
 	defer s.mu.Unlock()
 	r := s.bySID[spec.SandboxID]
 	if r == nil || r.PeerPID != spec.PeerPID || r.CgroupPath != spec.CgroupPath ||
-		r.Capacity != spec.Capacity || r.ConfiguredAllocatable != spec.ConfiguredAllocatable ||
+		r.Capacity != spec.Capacity || r.ConfiguredAllocatable != spec.ConfiguredAllocatable || r.CacheMax != spec.CacheMax ||
 		!slices.Equal(r.ClientFeatures, spec.ClientFeatures) {
 		return false
 	}
 	if r.Provisional {
-		return spec.InitialBudget <= r.ReservationMemory
+		return spec.InitialBudget <= r.ReservationMemory &&
+			spec.InitialCache <= r.CacheReservation
 	}
 	return r.Stage == StageAdmitted && r.ReservationMemory == spec.InitialBudget &&
-		r.InitialBudget == spec.InitialBudget
+		r.CacheReservation == spec.InitialCache && r.InitialBudget == spec.InitialBudget
 }
 
 // Admit atomically replaces a matching provisional reservation or creates a
@@ -749,6 +804,8 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
 		CgroupPath: spec.CgroupPath, Capacity: spec.Capacity, ConfiguredAllocatable: spec.ConfiguredAllocatable,
 		ReservationMemory: spec.InitialBudget,
+		CacheReservation:  spec.InitialCache,
+		CacheMax:          spec.CacheMax,
 		InitialBudget:     spec.InitialBudget,
 		Stage:             StageAdmitted, StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
 		RecoverySource: RecoveryAdmit, LeasePath: spec.LeasePath,
@@ -769,7 +826,7 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	}
 	var oldConn net.Conn
 	if s.bySID[spec.SandboxID] == nil && spec.Admission != nil {
-		oc := s.admissionBudgetLocked(spec.SandboxID, spec.InitialBudget, *spec.Admission)
+		oc := s.admissionWithCacheLocked(spec.SandboxID, spec.InitialBudget, spec.InitialCache, *spec.Admission)
 		if oc.Status != OutcomeAdmitted {
 			return Reservation{}, nil, &AdmissionWaitError{Outcome: oc}
 		}
@@ -799,6 +856,7 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 			existing.Capacity != spec.Capacity || existing.ConfiguredAllocatable != spec.ConfiguredAllocatable ||
 			existing.ReservationMemory != spec.InitialBudget ||
 			existing.InitialBudget != spec.InitialBudget ||
+			existing.CacheReservation != spec.InitialCache || existing.CacheMax != spec.CacheMax ||
 			!slices.Equal(existing.ClientFeatures, spec.ClientFeatures) {
 			return Reservation{}, nil, fmt.Errorf("sandbox %q already admitted with a different session contract", spec.SandboxID)
 		}
@@ -851,6 +909,8 @@ type SyncSpec struct {
 	Capacity              Resources
 	ConfiguredAllocatable Resources
 	ReservationMemory     uint64
+	CacheReservation      uint64
+	CacheMax              uint64
 	Settled               bool
 	HostMemoryCurrent     uint64
 	Token                 string
@@ -876,7 +936,9 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	if p := s.forSID(spec.SandboxID); p != s {
 		return p.Sync(spec)
 	}
-	if spec.SandboxID == "" || spec.Token == "" || spec.ReservationMemory == 0 || spec.ReservationMemory > spec.Capacity.MemoryBytes {
+	if spec.SandboxID == "" || spec.Token == "" || spec.ReservationMemory == 0 || spec.ReservationMemory > spec.Capacity.MemoryBytes ||
+		spec.CacheReservation > spec.CacheMax ||
+		(spec.CacheReservation > 0 && !resource.HasFeature(spec.ClientFeatures, resource.FeatureCacheBudgetV1)) {
 		return Reservation{}, nil, fmt.Errorf("invalid state sync")
 	}
 	if spec.Now.IsZero() {
@@ -891,7 +953,7 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	r := &Reservation{
 		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
 		CgroupPath: spec.CgroupPath, Capacity: spec.Capacity, ConfiguredAllocatable: spec.ConfiguredAllocatable,
-		ReservationMemory: spec.ReservationMemory, InitialBudget: initialBudget,
+		ReservationMemory: spec.ReservationMemory, CacheReservation: spec.CacheReservation, CacheMax: spec.CacheMax, InitialBudget: initialBudget,
 		Stage: stage, StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
 		RecoverySource: RecoverySynced, LeasePath: spec.LeasePath,
 		ClientFeatures: append([]string(nil), spec.ClientFeatures...), Conn: spec.Conn,
@@ -958,13 +1020,21 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 		}
 		seenReplacement[replaced] = struct{}{}
 		var addErr error
-		replacedMemory, addErr = checkedAggregateAdd(replacedMemory, replaced.ReservationMemory, "state sync replacement")
+		charge, chargeErr := reservationMemoryCharge(replaced)
+		if chargeErr != nil {
+			return Reservation{}, oldConns, chargeErr
+		}
+		replacedMemory, addErr = checkedAggregateAdd(replacedMemory, charge, "state sync replacement")
 		if addErr != nil {
 			return Reservation{}, oldConns, addErr
 		}
 	}
-	if r.ReservationMemory > replacedMemory {
-		return Reservation{}, oldConns, fmt.Errorf("state sync reservation %d exceeds recovered charge %d", r.ReservationMemory, replacedMemory)
+	syncTotal, err := reservationMemoryCharge(r)
+	if err != nil {
+		return Reservation{}, oldConns, err
+	}
+	if syncTotal > replacedMemory {
+		return Reservation{}, oldConns, fmt.Errorf("state sync total reservation %d exceeds recovered charge %d", syncTotal, replacedMemory)
 	}
 	if err := s.validateAggregateReplacementLocked(replacements, r); err != nil {
 		return Reservation{}, oldConns, err
@@ -1080,11 +1150,19 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 	if carry != 0 || baseReservation > r.Capacity.MemoryBytes {
 		return GrantResult{}, true, fmt.Errorf("reconciled reservation overflows capacity")
 	}
-	reservedWithoutCurrent, err := checkedAggregateSub(s.reservedMemory, oldReservation, "memory reservation")
+	oldTotal, err := reservationMemoryCharge(r)
 	if err != nil {
 		return GrantResult{}, true, err
 	}
-	baseReserved, err := checkedAggregateAdd(reservedWithoutCurrent, baseReservation, "memory reservation")
+	reservedWithoutCurrent, err := checkedAggregateSub(s.reservedMemory, oldTotal, "memory reservation")
+	if err != nil {
+		return GrantResult{}, true, err
+	}
+	baseTotal, err := checkedAggregateAdd(baseReservation, r.CacheReservation, "memory reservation")
+	if err != nil {
+		return GrantResult{}, true, err
+	}
+	baseReserved, err := checkedAggregateAdd(reservedWithoutCurrent, baseTotal, "memory reservation")
 	if err != nil {
 		return GrantResult{}, true, err
 	}
@@ -1160,6 +1238,9 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 		minimum = max(minimum, min(remaining, allocator.policy.MinGrantStep))
 	}
 	if remaining <= capRoom && current <= pool && remaining <= pool-current && headroom < minimum && executableAfter == executableBefore && decision.GrantedDelta < requested {
+		// Guest growth may draw on any cache, including this sandbox's own.
+		// A requested return stays charged until its owner reports it.
+		s.requestCacheDonorLocked("", minimum-headroom)
 		protect := min(remaining, missingStep)
 		s.failDemandLocked(key, r.SandboxID, r.Token, protect, executableAfter, false, s.pressure.clock())
 	} else if decision.GrantedDelta == requested || executableAfter > executableBefore || headroom >= minimum {
@@ -1199,6 +1280,7 @@ func (s *State) Heartbeat(token string, hostMemoryCurrent uint64, now time.Time)
 	if r == nil {
 		return Reservation{}, false
 	}
+	r.expireCacheReclaim(now)
 	r.LastHeartbeatAt = now
 	if hostMemoryCurrent > 0 {
 		r.LastHostMemoryCurrent, r.LastReportAt = hostMemoryCurrent, now

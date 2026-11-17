@@ -24,6 +24,9 @@ type ResourcePoolConfig struct {
 	Allocatable ResourceAllocatable                    `yaml:"allocatable,omitempty" json:"allocatable,omitempty"`
 	Watermarks  map[string]ResourceDimensionWatermarks `yaml:"watermarks,omitempty" json:"watermarks,omitempty"`
 	UnitDropins []string                               `yaml:"unit_dropins,omitempty" json:"unit_dropins,omitempty"`
+	// CacheCapacity caps granted diff_cow cache memory within this resource
+	// pool; omission means no cache-specific cap beyond allocatable.memory.
+	CacheCapacity *string `yaml:"cache_capacity,omitempty" json:"cache_capacity,omitempty"`
 }
 
 // Pointers preserve explicit zero thresholds and partial dimension overrides.
@@ -53,6 +56,7 @@ func cloneResourcePools(in []ResourcePoolConfig) []ResourcePoolConfig {
 		p.Capacity.CPU, p.Capacity.Memory = clonePtr(p.Capacity.CPU), clonePtr(p.Capacity.Memory)
 		p.Allocatable.CPU, p.Allocatable.Memory = clonePtr(p.Allocatable.CPU), clonePtr(p.Allocatable.Memory)
 		p.UnitDropins = slices.Clone(p.UnitDropins)
+		p.CacheCapacity = clonePtr(p.CacheCapacity)
 		if p.Watermarks != nil {
 			p.Watermarks = make(map[string]ResourceDimensionWatermarks, len(in[i].Watermarks))
 			for k, w := range in[i].Watermarks {
@@ -126,6 +130,12 @@ func (r *ResourceListenConfig) ValidatePools() error {
 			return fmt.Errorf("config: invalid or duplicate resource pool name %q", p.Name)
 		}
 		seen[p.Name] = true
+		if p.CacheCapacity != nil {
+			n, err := util.ParseSize(*p.CacheCapacity)
+			if err != nil || n == 0 {
+				return fmt.Errorf("config: resource pool %s cache_capacity must be a positive size", p.Name)
+			}
+		}
 		if len(r.Pools) > 1 && p.Allocatable.Memory == nil {
 			return fmt.Errorf("config: resource pool %s requires allocatable.memory", p.Name)
 		}

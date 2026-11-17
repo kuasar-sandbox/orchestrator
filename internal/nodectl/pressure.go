@@ -520,18 +520,23 @@ func (s *State) competingExecutableDemandLocked(sid string, now time.Time) bool 
 }
 
 func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budget uint64) {
+	s.RecordAdmissionWaitWithCache(sid, admission, budget, 0)
+}
+
+func (s *State) RecordAdmissionWaitWithCache(sid string, admission LaunchAdmission, budget, cache uint64) {
 	if p := s.forSID(sid); p != s {
-		p.RecordAdmissionWait(sid, admission, budget)
+		p.RecordAdmissionWaitWithCache(sid, admission, budget, cache)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initPressureLocked()
 	if budget == 0 || budget > s.AllocatablePool.MemoryBytes ||
+		cache > s.AllocatablePool.MemoryBytes-budget ||
 		(!admission.Accepted && !OperationAllowed(s.pressure.record.Zone, admission.Operation)) {
 		return
 	}
-	oc := s.admissionBudgetLocked(sid, budget, admission)
+	oc := s.admissionWithCacheLocked(sid, budget, cache, admission)
 	if admission.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid {
 		if d := s.pressure.demands["admit:"+sid]; d != nil && d.identity == admission.Identity {
 			s.clearDemandLocked("admit:" + sid)
@@ -550,7 +555,60 @@ func (s *State) RecordAdmissionWait(sid string, admission LaunchAdmission, budge
 		return
 	}
 	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByMainBudget {
-		s.failDemandLocked("admit:"+sid, sid, admission.Identity, budget, 0, admission.Operation != OperationCreate, s.pressure.clock())
+		// A queued launch is a real executable request, unlike a speculative
+		// cache grow. If cache borrowers are blocking its Guest startup or
+		// initial cache grant, request a donor now, then use the existing
+		// Release / budget-return wakeup to retry the admission queue.
+		pool := s.AllocatablePool.MemoryBytes
+		available := uint64(0)
+		if pool > s.reservedMemory {
+			available = pool - s.reservedMemory
+		}
+		if !admission.SavedSource {
+			emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+			if available > emergency {
+				available -= emergency
+			} else {
+				available = 0
+			}
+		}
+		protected := s.protectedLocked("admit:" + sid)
+		if protected >= available {
+			available = 0
+		} else {
+			available -= protected
+		}
+		required := budget + cache
+		memoryShortage := uint64(0)
+		if required > available {
+			memoryShortage = required - available
+		}
+		cacheShortage := uint64(0)
+		if cache > 0 && s.CachePoolCapacity > 0 &&
+			s.reservedCache+cache > s.CachePoolCapacity {
+			cacheShortage = s.reservedCache + cache - s.CachePoolCapacity
+		}
+		if admission.SavedSource && cache > 0 {
+			// Saved-source Guest memory may spend emergency headroom, but
+			// its initial cache must not. An admission can therefore be
+			// blocked solely by this cache restriction even when its total
+			// Guest+cache request fits the emergency-inclusive balance.
+			// Include that deficit when selecting a clean-cache donor.
+			emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+			cacheAvailable := uint64(0)
+			if available > emergency {
+				cacheAvailable = available - emergency
+			}
+			if cache > cacheAvailable {
+				cacheShortage = max(cacheShortage, cache-cacheAvailable)
+			}
+		}
+		s.requestCacheDonorLocked(sid, max(memoryShortage, cacheShortage))
+		// A cache-specific cap is not itself a Guest memory shortage and must
+		// not fabricate Guest pressure/balloon demand.
+		if memoryShortage > 0 {
+			s.failDemandLocked("admit:"+sid, sid, admission.Identity, required, 0, admission.Operation != OperationCreate, s.pressure.clock())
+		}
 		return
 	}
 	// A saved-source resume waiting for a startup slot or rate token retains
@@ -659,18 +717,26 @@ func (e *AdmissionWaitError) Error() string {
 }
 
 func (s *State) AnalyzeLaunch(sid string, budget uint64, launch LaunchAdmission) Outcome {
+	return s.AnalyzeLaunchWithCache(sid, budget, 0, launch)
+}
+
+func (s *State) AnalyzeLaunchWithCache(sid string, budget, cache uint64, launch LaunchAdmission) Outcome {
 	if p := s.forSID(sid); p != s {
-		return p.AnalyzeLaunch(sid, budget, launch)
+		return p.AnalyzeLaunchWithCache(sid, budget, cache, launch)
 	}
 	if s.pools != nil {
 		return Outcome{Status: OutcomeLongTermReject, RejectCode: "pool_identity", RejectMsg: "resource pool identity unavailable"}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.admissionBudgetLocked(sid, budget, launch)
+	return s.admissionWithCacheLocked(sid, budget, cache, launch)
 }
 
 func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAdmission) Outcome {
+	return s.admissionWithCacheLocked(sid, budget, 0, launch)
+}
+
+func (s *State) admissionWithCacheLocked(sid string, budget, cache uint64, launch LaunchAdmission) Outcome {
 	s.initPressureLocked()
 	now := s.pressure.clock()
 	s.advancePressureLocked(now)
@@ -680,12 +746,17 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 	}
 	startup := s.startupPoolBytesLocked()
-	if budget == 0 || pool == 0 || budget > pool {
+	if cache > 0 && s.CachePoolCapacity > 0 && cache > s.CachePoolCapacity {
+		return Outcome{Status: OutcomePreCheckReject, RejectCode: "cache_exceeds_pool_capacity",
+			RejectMsg: "initial cache budget exceeds resource pool cache_capacity"}
+	}
+	if budget == 0 || pool == 0 || budget > pool || cache > pool-budget {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_node_capacity", RejectMsg: "initial budget exceeds node pool"}
 	}
 	// Background work waits for actual budget; it never creates pressure demand.
 	if backgroundRecovery {
-		if s.reservedMemory > pool || budget > pool-s.reservedMemory {
+		if s.reservedMemory > pool || budget > pool-s.reservedMemory ||
+			cache > pool-s.reservedMemory-budget {
 			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 		}
 	}
@@ -713,7 +784,21 @@ func (s *State) admissionBudgetLocked(sid string, budget uint64, launch LaunchAd
 	} else {
 		available = 0
 	}
-	if budget > available {
+	// A saved-source Guest may use emergency headroom, but its *initial
+	// cache grant* remains discretionary and must fit the nonemergency
+	// balance, just like every later cache request.
+	cacheAvailable := available
+	if launch.SavedSource {
+		emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+		if cacheAvailable > emergency {
+			cacheAvailable -= emergency
+		} else {
+			cacheAvailable = 0
+		}
+	}
+	if budget > available || cache > available-budget || cache > cacheAvailable ||
+		(cache > 0 && s.CachePoolCapacity > 0 &&
+			(s.reservedCache >= s.CachePoolCapacity || cache > s.CachePoolCapacity-s.reservedCache)) {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
 	}
 	if s.pressure.exclusive != "" && s.pressure.exclusive != sid {

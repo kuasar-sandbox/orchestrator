@@ -243,6 +243,7 @@ The two pool levels have distinct configuration and accounting:
 | `resource_listen.pools[].name` | Required, unique | Nonempty name matching `[a-zA-Z0-9][a-zA-Z0-9_.-]*`; identifies one resource budget |
 | `resource_listen.pools[].capacity.{cpu,memory}` | Omitted dimension is unlimited | Positive declared-Capacity scheduling envelope; CPU may use fractional cores, memory a positive size |
 | `resource_listen.pools[].allocatable.memory` | Required with multiple pools | Positive net runtime memory; a sole pool may use the legacy derived budget |
+| `resource_listen.pools[].cache_capacity` | Optional | Upper bound on granted diff_cow cache in this existing pool; it is an additional cap and does not pre-reserve separate memory |
 | `resource_listen.pools[].allocatable.cpu` | Inherits capacity CPU; both omitted means no finite denominator | Positive CPU accounting denominator for utilization/watermarks; no separate runtime CPU admission gate |
 | `resource_listen.pools[].watermarks.{cpu,memory}` | Per-leaf inheritance | Optional low/high/emergency factors override the node policy; other dimensions are rejected |
 | `resource_listen.pools[].unit_dropins` | None | Absolute paths to externally supplied unit-placement fragments copied into the managed namespace |
@@ -1012,3 +1013,31 @@ Lifecycle cumulative usage is read through [native stats/usage](observability.md
 - [sandboxer/pkg/resource](https://github.com/kuasar-sandbox/sandboxer/tree/main/pkg/resource).
 - [internal/nodectl](../internal/nodectl).
 - [internal/sandboxcfg/resource.go](../internal/sandboxcfg/resource.go).
+
+
+### Elastic diff_cow cache memory
+
+A sandbox negotiating `cache_budget_v1` retains its configured
+`resources.diff_cow.cache_size` as its ceiling. The node atomically
+admits its Guest startup reservation and small initial cache grant.
+Later cache requests consume the same resource-pool memory headroom,
+also obey the optional `cache_capacity` cap, and cannot use Guest emergency
+memory. The cache remains owned by `sandbox-ctl` in `ctl/` with no new
+cgroup hierarchy or Guest balloon changes.
+
+When a cache grant is denied, existing clean LRU eviction and dirty writeback
+continue. A node reclaim target is advisory until the sandbox has safely
+evicted clean pages, physically returned their memory, and acknowledged the
+smaller reservation. On node-controller restart, recovery provisionally charges
+the configured cache maximum until an authenticated StateSync confirms the
+current grant. Older peers retain the original fixed cache behavior.
+
+Initial and runtime cache grants use 4 MiB units, with a page-aligned tail for
+smaller configured limits. Set `resources.diff_cow.cache_idle_after` (default
+`10s`) to choose how long an untouched Clean page takes to count as idle. The
+page can still be hit, which removes it from the idle count. When idle Clean
+bytes and unused buffers together reach 4 MiB, the sandbox starts a gentle
+asynchronous reclaim attempt. Under contention, the node asks a sandbox with a
+large cache reservation to run the same worker. It returns unused buffers
+first, then takes Clean pages in LRU order. An attempt can return fewer bytes
+than requested, including zero. The node credits only confirmed returns.

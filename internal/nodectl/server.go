@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/unixcred"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 // Server is the controller daemon's RPC face. It accepts UDS
@@ -233,6 +234,8 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 		return s.handleSettled(req, *token)
 	case TypeRequestBudget:
 		return s.handleRequestBudget(req, *token)
+	case TypeRequestCacheBudget:
+		return s.handleRequestCacheBudget(req, *token)
 	case TypeOOMReport:
 		return s.handleOOMReport(req, *token)
 	case TypeHeartbeat:
@@ -324,7 +327,7 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 
 	case OutcomeShortTermBlock:
-		s.State.RecordAdmissionWait(req.SandboxID, launch, initialReservationBudget(req))
+		s.State.RecordAdmissionWaitWithCache(req.SandboxID, launch, initialReservationBudget(req), req.CacheInitial)
 		_, ok := s.Admission.Enqueue(req, conn, peerPID)
 		if !ok {
 			s.State.ForgetAdmissionWait(req.SandboxID, launch.Identity)
@@ -416,6 +419,8 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 		Token:               t,
 		Status:              StatusAdmitted,
 		GrantedInitialAlloc: spec.InitialBudget,
+		GrantedInitialCache: spec.InitialCache,
+		ClientFeatures:      featureResponse(req.ClientFeatures),
 	}, nil
 }
 
@@ -426,6 +431,8 @@ func admitSpecFromRequest(conn net.Conn, peerPID int, req *Message) AdmitSpec {
 		Capacity:              Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: cpuMilliCeil(float64(req.CapacityCPU))},
 		ConfiguredAllocatable: Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: cpuMilliCeil(req.FloorCPU)},
 		InitialBudget:         initialBudget,
+		CacheMax:              req.CacheMaximum,
+		InitialCache:          req.CacheInitial,
 		ClientFeatures:        req.ClientFeatures, Conn: conn,
 	}
 }
@@ -445,6 +452,16 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 		return &Message{Type: TypeError, Msg: "state sync identity: " + err.Error()}
 	}
 	l := live.Lease
+	cacheMaximum, err := resource.CacheMaximumFromFeatures(l.ClientFeatures)
+	if err != nil {
+		return &Message{Type: TypeError, Msg: "invalid cache maximum in live lease"}
+	}
+	if req.AppliedCacheMaximum != cacheMaximum {
+		return &Message{Type: TypeError, Msg: "state sync cache maximum differs from live lease"}
+	}
+	if req.AppliedCacheReservation > cacheMaximum {
+		return &Message{Type: TypeError, Msg: "state sync cache reservation exceeds lease maximum"}
+	}
 	if req.AppliedAllocatableMemory == 0 || req.AppliedAllocatableMemory > l.CapacityMemory {
 		return &Message{Type: TypeError, Msg: "state sync reservation outside (0, capacity]"}
 	}
@@ -455,6 +472,8 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 		Capacity:              Resources{MemoryBytes: l.CapacityMemory, CPUMilli: l.CapacityCPUMilli},
 		ConfiguredAllocatable: Resources{MemoryBytes: l.FloorMemory, CPUMilli: l.FloorCPUMilli},
 		ReservationMemory:     req.AppliedAllocatableMemory,
+		CacheReservation:      req.AppliedCacheReservation,
+		CacheMax:              req.AppliedCacheMaximum,
 		Settled:               req.Settled, HostMemoryCurrent: req.CurrentRSS,
 		LeasePath: live.Path, ClientFeatures: l.ClientFeatures, Conn: conn,
 	})
@@ -472,7 +491,7 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 	}
 	*token = newToken
 	s.Logf("state sync sid=%s pid=%d settled=%v reservation=%d", res.SandboxID, res.PeerPID, req.Settled, res.ReservationMemory)
-	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory}
+	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res)}
 }
 
 func (s *Server) handleSettled(req *Message, token string) *Message {
@@ -549,7 +568,7 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 	// Heartbeat is a consistency echo. Only sandbox-originated RequestBudget
 	// and StateSync may change this reservation; the response is never a
 	// balloon/cgroup command.
-	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory}
+	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res)}
 }
 
 func (s *Server) handleRelease(req *Message, token string) *Message {
@@ -787,4 +806,38 @@ func (i *IdleSweeper) sweep() {
 		// Headroom may have just opened up — wake admission worker.
 		i.Admission.PushWake()
 	}
+}
+
+// Cache grants use the same admission mutex as Guest growth, so a new sandbox
+// and a cache borrower cannot spend the same pool headroom.
+func (s *Server) handleRequestCacheBudget(req *Message, token string) *Message {
+	if s.Admission != nil {
+		s.Admission.queueMu.Lock()
+		defer s.Admission.queueMu.Unlock()
+	}
+	result, found, err := s.State.ReconcileCacheBudgetWithAck(token, req.CacheCurrent, req.CacheRequested, req.CacheMaximum, req.CacheReclaimDone, s.Allocator)
+	if !found {
+		return &Message{Type: TypeError, Msg: "no precise cache reservation"}
+	}
+	if err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
+	}
+	if s.Admission != nil {
+		s.Admission.PushWake()
+	}
+	return &Message{
+		Type: TypeCacheBudgetResponse, CacheGranted: result.GrantedDelta,
+		CacheReservation: result.Reservation, CacheReclaimTarget: result.ReclaimTarget, CacheReclaimSeq: result.ReclaimSeq,
+		CooldownMs: result.CooldownMs,
+	}
+}
+
+// The node advertises a feature only when the client requested it.
+func featureResponse(features []string) []string {
+	for _, feature := range features {
+		if feature == FeatureCacheBudgetV1 {
+			return []string{FeatureCacheBudgetV1}
+		}
+	}
+	return nil
 }
