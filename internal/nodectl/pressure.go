@@ -588,6 +588,21 @@ func (s *State) RecordAdmissionWaitWithCache(sid string, admission LaunchAdmissi
 			s.reservedCache+cache > s.CachePoolCapacity {
 			cacheShortage = s.reservedCache + cache - s.CachePoolCapacity
 		}
+		if admission.SavedSource && cache > 0 {
+			// Saved-source Guest memory may spend emergency headroom, but
+			// its initial cache must not. An admission can therefore be
+			// blocked solely by this cache restriction even when its total
+			// Guest+cache request fits the emergency-inclusive balance.
+			// Include that deficit when selecting a clean-cache donor.
+			emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+			cacheAvailable := uint64(0)
+			if available > emergency {
+				cacheAvailable = available - emergency
+			}
+			if cache > cacheAvailable {
+				cacheShortage = max(cacheShortage, cache-cacheAvailable)
+			}
+		}
 		s.requestCacheDonorLocked(sid, 0, max(memoryShortage, cacheShortage), true)
 		// A cache-specific cap is not itself a Guest memory shortage and must
 		// not fabricate Guest pressure/balloon demand.

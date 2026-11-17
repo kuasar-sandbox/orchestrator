@@ -353,6 +353,39 @@ func TestSavedSourceInitialCacheCannotUseGuestEmergencyMemory(t *testing.T) {
 	}
 }
 
+func TestSavedSourceInitialCacheShortageRequestsDonor(t *testing.T) {
+	const miB = uint64(1 << 20)
+	s := makeState(4<<30, 0)
+	pool := s.AllocatablePool.MemoryBytes
+	emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
+	if emergency < 16*miB {
+		t.Fatalf("insufficient emergency headroom: %d", emergency)
+	}
+	a := allocatorCacheTest()
+	donor := admitCacheTest(t, s, "cache-donor", 1<<30)
+	if got := mustCacheGrant(t, s, donor, 0, 16*miB, 1<<30, a); got.GrantedDelta != 16*miB {
+		t.Fatalf("donor grant: %+v", got)
+	}
+	// Leave only emergency memory free. Guest resume is entitled to use it,
+	// while its initial cache needs the donor to return physical memory.
+	s.mu.Lock()
+	s.reservedMemory = pool - emergency
+	s.mu.Unlock()
+	resume := LaunchAdmission{Operation: OperationResume, SavedSource: true, Accepted: true, Identity: "saved-cache-wait"}
+	guest := emergency - 8*miB
+	if got := s.AnalyzeLaunchWithCache("saved", guest, 8*miB, resume); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+		t.Fatalf("expected cache-only shortage: %+v", got)
+	}
+	s.RecordAdmissionWaitWithCache("saved", resume, guest, 8*miB)
+	target, found := s.CacheTarget(donor)
+	if !found || target != 8*miB {
+		t.Fatalf("cache-only saved-source wait did not request donor reclaim: target=%d found=%v", target, found)
+	}
+	if got := s.reservedCache; got != 16*miB {
+		t.Fatalf("unacknowledged reclaim prematurely returned memory: %d", got)
+	}
+}
+
 func TestPendingReclaimDoesNotEvictMultipleDonorsForSameShortage(t *testing.T) {
 	const miB = uint64(1 << 20)
 	s := makeState(4<<30, 0)
