@@ -117,7 +117,7 @@ resource_write_controller() {
     local physical_memory=4GiB host_memory=512MiB host_cpu=1 startup_factor=0.50 ttl=120s
     if [ "$compact" = true ]; then
         # Four 64MiB Guest startup reservations now also require four
-        # 8MiB initial diff_cow cache grants. Preserve the original test
+        # 4MiB initial diff_cow cache grants. Preserve the original test
         # contract: four fit below emergency headroom, the fifth is denied.
         physical_memory=432MiB; host_memory=80MiB; host_cpu=0.5; startup_factor=1.00; ttl=60s
     fi

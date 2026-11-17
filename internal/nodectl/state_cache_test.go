@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -13,8 +14,10 @@ const testCacheMiB = uint64(1 << 20)
 func admitCacheTest(t *testing.T, s *State, sid string, maximum uint64) string {
 	t.Helper()
 	token := "token-" + sid
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
 	_, _, err := s.Admit(AdmitSpec{
-		SandboxID: sid, Token: token, CgroupPath: "/cg/" + sid,
+		SandboxID: sid, Token: token, CgroupPath: "/cg/" + sid, Conn: server,
 		Capacity:              Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
 		ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20, CPUMilli: 1000},
 		InitialBudget:         256 << 20, CacheMax: maximum,

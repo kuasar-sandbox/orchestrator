@@ -603,7 +603,7 @@ func (s *State) RecordAdmissionWaitWithCache(sid string, admission LaunchAdmissi
 				cacheShortage = max(cacheShortage, cache-cacheAvailable)
 			}
 		}
-		s.requestCacheDonorLocked(sid, 0, max(memoryShortage, cacheShortage), true)
+		s.requestCacheDonorLocked(sid, max(memoryShortage, cacheShortage))
 		// A cache-specific cap is not itself a Guest memory shortage and must
 		// not fabricate Guest pressure/balloon demand.
 		if memoryShortage > 0 {

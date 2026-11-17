@@ -101,10 +101,12 @@ type Reservation struct {
 	ConfiguredAllocatable Resources `json:"configured_allocatable"`
 	ReservationMemory     uint64    `json:"reservation_memory"`
 	// CacheReservation is host cache memory (not Guest Budget/Capacity).
-	CacheReservation   uint64 `json:"cache_reservation,omitempty"`
-	CacheMax           uint64 `json:"cache_max,omitempty"`
-	CacheReclaimTarget uint64 `json:"cache_reclaim_target,omitempty"`
-	InitialBudget      uint64 `json:"initial_budget,omitempty"`
+	CacheReservation      uint64 `json:"cache_reservation,omitempty"`
+	CacheMax              uint64 `json:"cache_max,omitempty"`
+	CacheReclaimTarget    uint64 `json:"cache_reclaim_target,omitempty"`
+	CacheReclaimSeq       uint64 `json:"cache_reclaim_seq,omitempty"`
+	cacheReclaimUpdatedAt time.Time
+	InitialBudget         uint64 `json:"initial_budget,omitempty"`
 
 	Stage                 string    `json:"stage"`
 	StageEnteredAt        time.Time `json:"stage_entered_at"`
@@ -1239,7 +1241,7 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 		// A real Guest-growth shortage gets first opportunity to reclaim
 		// borrowed clean cache, before ordinary pressure escalation may
 		// request a pause. Targets remain charged until their owners return.
-		s.requestCacheDonorLocked(r.SandboxID, 0, minimum-headroom, true)
+		s.requestCacheDonorLocked(r.SandboxID, minimum-headroom)
 		protect := min(remaining, missingStep)
 		s.failDemandLocked(key, r.SandboxID, r.Token, protect, executableAfter, false, s.pressure.clock())
 	} else if decision.GrantedDelta == requested || executableAfter > executableBefore || headroom >= minimum {
@@ -1279,6 +1281,7 @@ func (s *State) Heartbeat(token string, hostMemoryCurrent uint64, now time.Time)
 	if r == nil {
 		return Reservation{}, false
 	}
+	r.expireCacheReclaim(now)
 	r.LastHeartbeatAt = now
 	if hostMemoryCurrent > 0 {
 		r.LastHostMemoryCurrent, r.LastReportAt = hostMemoryCurrent, now

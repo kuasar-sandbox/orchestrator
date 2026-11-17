@@ -8,7 +8,13 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
-const cacheBudgetUnit = uint64(8 << 20)
+const (
+	cacheBudgetUnit = uint64(4 << 20)
+	// Leave time for an idle sandbox to receive a request on a heartbeat.
+	// After this window other donors can help, even if the owner never replies.
+	cacheReclaimPlanWindow = 30 * time.Second
+	cacheReclaimRetryDelay = 2 * time.Second
+)
 
 // CacheGrantResult has an absolute controller baseline so retries after lost
 // replies can reconcile without treating allocated cache as Guest memory.
@@ -16,6 +22,7 @@ type CacheGrantResult struct {
 	GrantedDelta  uint64
 	Reservation   uint64
 	ReclaimTarget uint64
+	ReclaimSeq    uint64
 	CooldownMs    int64
 }
 
@@ -47,8 +54,14 @@ func (s *State) changeCacheLocked(r *Reservation, current uint64) error {
 // emergency capacity or the Guest balloon step. current is a safe, physically
 // completed cache baseline; it cannot exceed a previously granted amount.
 func (s *State) ReconcileCacheBudget(token string, current, requested, maximum uint64, allocator *Allocator) (CacheGrantResult, bool, error) {
+	return s.ReconcileCacheBudgetWithAck(token, current, requested, maximum, 0, allocator)
+}
+
+// ReconcileCacheBudgetWithAck accepts a completed reclaim attempt even if
+// nothing was safely releasable. Node requested amounts are advisory.
+func (s *State) ReconcileCacheBudgetWithAck(token string, current, requested, maximum, doneSeq uint64, allocator *Allocator) (CacheGrantResult, bool, error) {
 	if p := s.forToken(token); p != s {
-		return p.ReconcileCacheBudget(token, current, requested, maximum, allocator)
+		return p.ReconcileCacheBudgetWithAck(token, current, requested, maximum, doneSeq, allocator)
 	}
 	if s.poolAllocator != nil {
 		allocator = s.poolAllocator
@@ -74,10 +87,17 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 	if err := s.changeCacheLocked(r, current); err != nil {
 		return CacheGrantResult{}, true, err
 	}
-	if r.CacheReclaimTarget != 0 && current <= r.CacheReclaimTarget {
+	now := time.Now()
+	r.expireCacheReclaim(now)
+	if r.CacheReclaimTarget != 0 && (current <= r.CacheReclaimTarget ||
+		doneSeq != 0 && doneSeq == r.CacheReclaimSeq) {
 		r.CacheReclaimTarget = 0
+		r.cacheReclaimUpdatedAt = now
 	}
 	out := CacheGrantResult{Reservation: current, ReclaimTarget: r.CacheReclaimTarget, CooldownMs: 200}
+	if r.CacheReclaimTarget != 0 {
+		out.ReclaimSeq = r.CacheReclaimSeq
+	}
 	if requested == 0 {
 		delete(s.cacheDemandSince, token)
 		return out, true, nil
@@ -133,7 +153,6 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 	if s.cacheDemandSince == nil {
 		s.cacheDemandSince = make(map[string]cacheDemandAge)
 	}
-	now := time.Now()
 	demand, found := s.cacheDemandSince[token]
 	// A burst that ended before a later request must not inherit the old
 	// wait age and immediately evict another active sandbox's cache.
@@ -148,7 +167,7 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 	}
 	// Persistent failed requests may borrow from another sandbox. A target
 	// remains charged until its owner has actually returned physical pages.
-	s.requestCacheDonorLocked(r.SandboxID, r.CacheReservation, remaining, false)
+	s.requestCacheDonorLocked(r.SandboxID, remaining)
 	return out, true, nil
 }
 
@@ -156,7 +175,7 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 // a waiting sandbox or decrements the donor's existing reservation. Queued
 // admission is prioritized over optional cache growth, so it need not have
 // a smaller existing cache reservation than the donor.
-func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage uint64, admission bool) bool {
+func (s *State) requestCacheDonorLocked(excludeSID string, shortage uint64) bool {
 	if shortage == 0 {
 		return false
 	}
@@ -165,7 +184,12 @@ func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage ui
 	// the same shortage from every other donor during repeated retries.
 	// This is planning credit only; admission and grants still use current
 	// reservations and never spend unacknowledged bytes.
+	now := time.Now()
 	for _, candidate := range s.bySID {
+		candidate.expireCacheReclaim(now)
+		if candidate.Conn == nil {
+			continue
+		}
 		if candidate.CacheReclaimTarget > 0 && candidate.CacheReclaimTarget < candidate.CacheReservation {
 			pending := candidate.CacheReservation - candidate.CacheReclaimTarget
 			if pending >= shortage {
@@ -176,11 +200,13 @@ func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage ui
 	}
 	var donor *Reservation
 	for _, candidate := range s.bySID {
-		if candidate.SandboxID == excludeSID || candidate.Provisional ||
+		if candidate.SandboxID == excludeSID || candidate.Provisional || candidate.Conn == nil ||
 			candidate.CacheReclaimTarget != 0 || candidate.CacheReservation <= cacheBudgetUnit {
 			continue
 		}
-		if !admission && candidate.CacheReservation <= borrower+cacheBudgetUnit {
+		// A completed (possibly zero-byte) attempt must allow another donor
+		// to be tried, rather than repeatedly targeting the largest holder.
+		if now.Sub(candidate.cacheReclaimUpdatedAt) < cacheReclaimRetryDelay {
 			continue
 		}
 		if donor == nil || candidate.CacheReservation > donor.CacheReservation {
@@ -192,8 +218,8 @@ func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage ui
 	}
 	available := donor.CacheReservation - cacheBudgetUnit
 	drop := min(shortage, available)
-	// Active cache reclaims whole accounting units, except a final
-	// configured sub-unit tail that can be reclaimed as one ordinary unit.
+	// Keep the suggested amount in complete accounting units where possible.
+	// The sandbox may return fewer bytes, including zero.
 	if drop < cacheBudgetUnit {
 		drop = min(cacheBudgetUnit, available)
 	} else {
@@ -203,7 +229,31 @@ func (s *State) requestCacheDonorLocked(excludeSID string, borrower, shortage ui
 		return false
 	}
 	donor.CacheReclaimTarget = donor.CacheReservation - drop
+	donor.cacheReclaimUpdatedAt = now
+	if donor.CacheReclaimSeq == 0 {
+		// Unique even after an independent node process restart.
+		donor.CacheReclaimSeq = uint64(now.UnixNano())
+	} else {
+		donor.CacheReclaimSeq++
+	}
 	return true
+}
+
+// Retire an unanswered suggestion without touching the reservation. Older
+// clients can report their physical balance but cannot acknowledge a shortfall.
+func (r *Reservation) expireCacheReclaim(now time.Time) {
+	if r.CacheReclaimTarget != 0 && now.Sub(r.cacheReclaimUpdatedAt) >= cacheReclaimPlanWindow {
+		r.CacheReclaimTarget = 0
+		r.cacheReclaimUpdatedAt = now
+	}
+}
+
+// cachePendingReclaimSeq hides the last sequence after a completed request.
+func cachePendingReclaimSeq(r Reservation) uint64 {
+	if r.CacheReclaimTarget == 0 {
+		return 0
+	}
+	return r.CacheReclaimSeq
 }
 
 // CacheReclaimTarget is the controller's latest absolute target, not a forced

@@ -491,7 +491,7 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 	}
 	*token = newToken
 	s.Logf("state sync sid=%s pid=%d settled=%v reservation=%d", res.SandboxID, res.PeerPID, req.Settled, res.ReservationMemory)
-	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget}
+	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res)}
 }
 
 func (s *Server) handleSettled(req *Message, token string) *Message {
@@ -568,7 +568,7 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 	// Heartbeat is a consistency echo. Only sandbox-originated RequestBudget
 	// and StateSync may change this reservation; the response is never a
 	// balloon/cgroup command.
-	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget}
+	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res)}
 }
 
 func (s *Server) handleRelease(req *Message, token string) *Message {
@@ -815,7 +815,7 @@ func (s *Server) handleRequestCacheBudget(req *Message, token string) *Message {
 		s.Admission.queueMu.Lock()
 		defer s.Admission.queueMu.Unlock()
 	}
-	result, found, err := s.State.ReconcileCacheBudget(token, req.CacheCurrent, req.CacheRequested, req.CacheMaximum, s.Allocator)
+	result, found, err := s.State.ReconcileCacheBudgetWithAck(token, req.CacheCurrent, req.CacheRequested, req.CacheMaximum, req.CacheReclaimDone, s.Allocator)
 	if !found {
 		return &Message{Type: TypeError, Msg: "no precise cache reservation"}
 	}
@@ -827,7 +827,7 @@ func (s *Server) handleRequestCacheBudget(req *Message, token string) *Message {
 	}
 	return &Message{
 		Type: TypeCacheBudgetResponse, CacheGranted: result.GrantedDelta,
-		CacheReservation: result.Reservation, CacheReclaimTarget: result.ReclaimTarget,
+		CacheReservation: result.Reservation, CacheReclaimTarget: result.ReclaimTarget, CacheReclaimSeq: result.ReclaimSeq,
 		CooldownMs: result.CooldownMs,
 	}
 }

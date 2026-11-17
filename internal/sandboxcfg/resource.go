@@ -48,9 +48,10 @@ type StartupPatch struct {
 // explicitly configured by the operator or tenant. Derived limits belong to
 // the final runtime config.
 type DiffCOWPatch struct {
-	CacheSize    *string `json:"cache_size,omitempty" yaml:"cache_size,omitempty"`
-	MaxDirtySize *string `json:"max_dirty_size,omitempty" yaml:"max_dirty_size,omitempty"`
-	Discard      *string `json:"discard,omitempty" yaml:"discard,omitempty"`
+	CacheSize      *string `json:"cache_size,omitempty" yaml:"cache_size,omitempty"`
+	MaxDirtySize   *string `json:"max_dirty_size,omitempty" yaml:"max_dirty_size,omitempty"`
+	CacheIdleAfter *string `json:"cache_idle_after,omitempty" yaml:"cache_idle_after,omitempty"`
+	Discard        *string `json:"discard,omitempty" yaml:"discard,omitempty"`
 }
 
 // NodeResourcePolicy is conductor-owned policy, deliberately narrower than
@@ -328,6 +329,8 @@ func parseDiffCOWPatch(path string, raw json.RawMessage) (*DiffCOWPatch, error) 
 			out.CacheSize = &value
 		case "max_dirty_size":
 			out.MaxDirtySize = &value
+		case "cache_idle_after":
+			out.CacheIdleAfter = &value
 		case "discard":
 			out.Discard = &value
 		default:
@@ -356,6 +359,12 @@ func (p *DiffCOWPatch) runtimeConfig(root string) (rtconfig.DiffCOWConfig, error
 			return cfg, fmt.Errorf("%s.diff_cow.max_dirty_size must not be empty", root)
 		}
 		cfg.MaxDirtySize = *p.MaxDirtySize
+	}
+	if p.CacheIdleAfter != nil {
+		if *p.CacheIdleAfter == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.cache_idle_after must not be empty", root)
+		}
+		cfg.CacheIdleAfter = *p.CacheIdleAfter
 	}
 	if p.Discard != nil {
 		if *p.Discard == "" {
@@ -397,6 +406,9 @@ func mergeDiffCOW(base, over *DiffCOWPatch) *DiffCOWPatch {
 		}
 		if layer.MaxDirtySize != nil {
 			out.MaxDirtySize = stringPtr(*layer.MaxDirtySize)
+		}
+		if layer.CacheIdleAfter != nil {
+			out.CacheIdleAfter = stringPtr(*layer.CacheIdleAfter)
 		}
 		if layer.Discard != nil {
 			out.Discard = stringPtr(*layer.Discard)

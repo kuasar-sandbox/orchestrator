@@ -96,7 +96,7 @@ func (c *Conductor) Clone() *Conductor {
 	out.Sandbox.Resources.Allocatable.Memory = clonePtr(c.Sandbox.Resources.Allocatable.Memory)
 	if cow := c.Sandbox.Resources.DiffCOW; cow != nil {
 		out.Sandbox.Resources.DiffCOW = &ResourceDiffCOW{
-			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), Discard: clonePtr(cow.Discard),
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
 		}
 	}
 	if c.Sandbox.Resources.Startup != nil {
@@ -476,9 +476,10 @@ type ResourcesConfig struct {
 // shared by a sandbox's writable disks. An omitted dirty limit follows the final
 // cache size after request overrides; an omitted Discard means auto.
 type ResourceDiffCOW struct {
-	CacheSize    *string `yaml:"cache_size,omitempty" json:"cache_size,omitempty"`
-	MaxDirtySize *string `yaml:"max_dirty_size,omitempty" json:"max_dirty_size,omitempty"`
-	Discard      *string `yaml:"discard,omitempty" json:"discard,omitempty"`
+	CacheSize      *string `yaml:"cache_size,omitempty" json:"cache_size,omitempty"`
+	MaxDirtySize   *string `yaml:"max_dirty_size,omitempty" json:"max_dirty_size,omitempty"`
+	CacheIdleAfter *string `yaml:"cache_idle_after,omitempty" json:"cache_idle_after,omitempty"`
+	Discard        *string `yaml:"discard,omitempty" json:"discard,omitempty"`
 }
 
 // UnmarshalJSON preserves the public schema's strict nested JSON decoding.
@@ -563,7 +564,7 @@ func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 	}
 	if cow := r.DiffCOW; cow != nil {
 		policy.DiffCOW = &sandboxcfg.DiffCOWPatch{
-			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), Discard: clonePtr(cow.Discard),
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
 		}
 	}
 	return policy
@@ -573,7 +574,7 @@ func (r *ResourcesConfig) setNodeResourcePolicy(policy sandboxcfg.NodeResourcePo
 	r.DiffCOW = nil
 	if cow := policy.DiffCOW; cow != nil {
 		r.DiffCOW = &ResourceDiffCOW{
-			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), Discard: clonePtr(cow.Discard),
+			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
 		}
 	}
 	r.Capacity = ResourceCapacity{CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory}

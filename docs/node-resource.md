@@ -1031,3 +1031,13 @@ evicted clean pages, physically returned their memory, and acknowledged the
 smaller reservation. On node-controller restart, recovery provisionally charges
 the configured cache maximum until an authenticated StateSync confirms the
 current grant. Older peers retain the original fixed cache behavior.
+
+Initial and runtime cache grants use 4 MiB units, with a page-aligned tail for
+smaller configured limits. Set `resources.diff_cow.cache_idle_after` (default
+`10s`) to choose how long an untouched Clean page takes to count as idle. The
+page can still be hit, which removes it from the idle count. When idle Clean
+bytes and unused buffers together reach 4 MiB, the sandbox starts a gentle
+asynchronous reclaim attempt. Under contention, the node asks a sandbox with a
+large cache reservation to run the same worker. It returns unused buffers
+first, then takes Clean pages in LRU order. An attempt can return fewer bytes
+than requested, including zero. The node credits only confirmed returns.
