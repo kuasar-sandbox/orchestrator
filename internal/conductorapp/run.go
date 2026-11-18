@@ -76,6 +76,8 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	core.SetExecutables(executables)
 	core.SetMetrics(mx)
 	core.SetLifecycleContext(ctx)
+	stopHostObservations := core.StartHostObservations(ctx, logger)
+	defer stopHostObservations()
 	core.SetProxyRouteBarrierCoordinator(plugins)
 	if resolvedResources != nil {
 		core.SetResourceControllerSocketIdentity(resolvedResources.SocketIdentity)
@@ -122,6 +124,13 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 			return fmt.Errorf("resource_listen: %w", err)
 		}
 		core.SetResourceProbe(probe)
+		if p, ok := probe.(ResourceProbe); ok {
+			nodeID := cfg.Cluster.NodeID
+			if nodeID == "" {
+				nodeID, _ = os.Hostname()
+			}
+			go runHostResourceMetrics(ctx, p.state, nodeID, logger)
+		}
 		if provider, ok := probe.(orch.SandboxResourceProvider); ok {
 			core.SetSandboxResourceProvider(provider)
 		}

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,14 +31,23 @@ import (
 // optional task-local artifact preparation, and starts the sandbox-ctl child.
 // runAssignedSandbox has locked the run pidfile before this function is called.
 func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
+	// Keep a registered signal channel across the handoff from preparation to
+	// the runtime, including the file baseline read before Start.
+	stopSignals := make(chan os.Signal, 2)
+	signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(stopSignals)
+	var metricsIdentity runnerMetricsIdentity
 	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
 		prepareArtifact: taskartifact.Prepare,
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
 		chdir:           os.Chdir,
+		captureIdentity: func(spec *configsock.SandboxTaskSpec) {
+			metricsIdentity = runnerMetricsIdentity{sandboxID: sandboxID, stableID: spec.StableID, runID: runID, baseDir: spec.BaseDir, runDir: spec.Workdir}
+		},
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
-			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready)
+			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log)
 		},
 		log: log,
 	})
@@ -60,6 +70,7 @@ type taskLaunchOps struct {
 	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
 	setenv          func(string, string) error
 	chdir           func(string) error
+	captureIdentity func(*configsock.SandboxTaskSpec)
 	startChild      func(string, []string, []string, *os.File, *os.File) error
 	log             *slog.Logger
 }
@@ -80,6 +91,9 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	}
 	if bootstrap.SandboxID != sandboxID || bootstrap.RunID != runID {
 		return fmt.Errorf("sandbox task bootstrap identity mismatch")
+	}
+	if ops.captureIdentity != nil {
+		ops.captureIdentity(bootstrap)
 	}
 	if (bootstrap.Final == nil) == (bootstrap.Prepare == nil) {
 		return fmt.Errorf("sandbox task bootstrap must contain exactly one of final or prepare")
@@ -349,7 +363,16 @@ type sandboxRunReportedError struct{ err error }
 func (e sandboxRunReportedError) Error() string { return e.err.Error() }
 func (e sandboxRunReportedError) Unwrap() error { return e.err }
 
-func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File) error {
+func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File, metricID runnerMetricsIdentity, stopSignals <-chan os.Signal, log *slog.Logger) error {
+	metrics := newRunnerMetrics(metricID, log)
+	if metrics != nil {
+		metrics.captureUsageBaseline(context.Background())
+	}
+	select {
+	case <-stopSignals:
+		return context.Canceled
+	default:
+	}
 	cmd := exec.Command(path)
 	cmd.Args = argv
 	cmd.Env = env
@@ -363,7 +386,30 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 		}
 		return sandboxRunReportedError{err: err}
 	}
+	// A group stop may race fork itself and miss the new child. Hand off
+	// signals observed during Start; after Start systemd signals it directly.
+	select {
+	case sig := <-stopSignals:
+		_ = cmd.Process.Signal(sig)
+	default:
+	}
+	var stop context.CancelFunc
+	var sampled chan struct{}
+	if metrics != nil {
+		var sampleCtx context.Context
+		sampleCtx, stop = context.WithCancel(context.Background())
+		defer stop()
+		sampled = make(chan struct{})
+		go metrics.sampleUntil(sampleCtx, sampled)
+	}
 	err := cmd.Wait()
+	if metrics != nil {
+		stop()
+		<-sampled
+		finalCtx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		metrics.usageSample(finalCtx, true)
+		cancel()
+	}
 	result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultRun, err)
 	if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
 		return sandboxRunReportedError{err: errors.Join(err, reportErr)}

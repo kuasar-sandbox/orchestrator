@@ -280,7 +280,7 @@ func (o *Orchestrator) clearRunningSandboxNetwork(ctx context.Context, sb *types
 	o.networkAllocationMu.Lock()
 	defer o.networkAllocationMu.Unlock()
 
-	if err := o.vs.Detach(ctx, port); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
+	if err := o.detachObservedSandboxPortLocked(ctx, port, sb, sb.RunID); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
 		return fmt.Errorf("detach sandbox port %s: %w", port, err)
 	}
 	if o.detachedPortsPending == nil {
@@ -582,7 +582,7 @@ func (o *Orchestrator) clearDeletingSandboxNetwork(ctx context.Context, sb *type
 	o.networkAllocationMu.Lock()
 	defer o.networkAllocationMu.Unlock()
 
-	if err := o.vs.Detach(ctx, port); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
+	if err := o.detachObservedSandboxPortLocked(ctx, port, sb, sb.RunID); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
 		return fmt.Errorf("detach sandbox port %s: %w", port, err)
 	}
 	if o.detachedPortsPending == nil {
@@ -716,10 +716,10 @@ func (o *Orchestrator) sandboxUnitActive(ctx context.Context, unit string) (bool
 // detachSandboxPort keeps allocation excluded until its caller durably clears
 // the corresponding owner. Without this fence, a later retry could detach a
 // connector slot that had already been reassigned to another owner.
-func (o *Orchestrator) detachSandboxPort(ctx context.Context, port string) error {
+func (o *Orchestrator) detachSandboxPort(ctx context.Context, port string, sb *types.Sandbox) error {
 	o.networkAllocationMu.Lock()
 	defer o.networkAllocationMu.Unlock()
-	if err := o.vs.Detach(ctx, port); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
+	if err := o.detachObservedSandboxPortLocked(ctx, port, sb, sb.RunID); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
 		return fmt.Errorf("detach sandbox port %s: %w", port, err)
 	}
 	if o.detachedPortsPending == nil {

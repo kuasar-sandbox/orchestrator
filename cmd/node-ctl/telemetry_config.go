@@ -70,10 +70,9 @@ collector:
       collection_interval: 5s
       timeout: 1s
       concurrency: 64
-    sandboxstats:
-      resource_interval: 5s
-      traffic_interval: 10s
-      usage_interval: 1m
+    otlp/host:
+      protocols:
+        http: {transport: unix, endpoint: /run/sandbox-telemetry/host.sock}
     sandboxotlp:
       grpc_listen: ":4317"
       http_listen: ":4318"
@@ -95,7 +94,7 @@ collector:
       metrics: {level: none}
     pipelines:
       metrics:
-        receivers: [envd, sandboxstats, sandboxotlp]
+        receivers: [envd, sandboxotlp, otlp/host]
         processors: [batch]
         exporters: [sandboxlocal]
 # See docs/observability.md#telemetry for Collector pipelines and query backends.

@@ -434,13 +434,14 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 
 每条命令使用独立服务。Conductor 拥有生命周期、API 鉴权、ownership 和 Plugin registry。
 Proxy 负责沙箱应用数据转发、MMDS 与即时 traffic observation。Telemetry 拥有自身的
-RouteEntry view、envd scrape、sandbox-facing OTLP metrics ingress、可信身份 enrichment、
+Guest RouteEntry view、envd scrape、Guest OTLP 身份映射，以及独立的可信 Host OTLP 接入、
 Collector pipeline、可选本地 TSDB、独立 exporter 与查询 backend、历史查询及 E2B 转换。它不扩大 resource
 controller，不改变 checkpoint 或生命周期策略。
 
 ```text
 Conductor Plugin Plane -> full RouteEntry -> Telemetry view
-Conductor config_socket -> native stats -> sandboxstats receiver
+Host components (Runner / Conductor / Proxy / Connector / Cache / Store)
+  -> OTLP/HTTP over Host UDS -> otlp/host receiver
 Envd UDS -> envd receiver
 Guest -> connector management -> sandboxotlp receiver
                 |
@@ -470,9 +471,11 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 独立组件拥有自身 strict config schema 和 `paths.telemetry_executable` static bootstrap
 入口。以固定 Plugin ID `telemetry` 注册，订阅 `Kind: route`；只有同时选定 Reader 和 HTTP handler
 时才注册独立 query UDS. 写入与查询独立; query-only 不要求 Collector 或 local TSDB.它不加入 Create/Resume readiness，也不调用 Wake。
-原生 Collector 配置选择 envd、sandboxstats、sandboxotlp receiver, 标准 processor、
-exporter、connector、extension 及多 pipeline. Sandboxstats 只经 conductor config_socket
-上的当前 telemetry lease 读取, 原生 stats 不依赖 telemetry. Local TSDB、Prometheus、ClickHouse reader、直接 sandbox OTLP 网络、E2B step/MAX 与
+默认 Collector 配置选择 Guest 的 envd、sandboxotlp 和独立 Host 的 otlp/host receiver，
+支持标准 processor、exporter、connector、extension 及多 pipeline。
+Host 节点组件自主采集并携带身份，通过 OTLP 主动上报；Telemetry 不通过沙箱路由
+轮询 Host 原生统计。旧版 sandboxstats receiver 仍可显式配置用于兼容，
+原生 stats 诊断接口本身仍独立可用。 Local TSDB、Prometheus、ClickHouse reader、直接 sandbox OTLP 网络、E2B step/MAX 与
 boundary 契约见 [Telemetry](#telemetry)。`deploy/node-telemetry.service` 与
 conductor/Proxy 并列部署，不作为它们的 required dependency。
 
@@ -895,7 +898,7 @@ UDS、本地 generation 与 SandboxID，不能把一个 sandbox 的 UDS connecti
 
 | 类别 | 发行包内组件 type | 版本 |
 |---|---|---|
-| Receiver | `envd`、`sandboxstats`、`sandboxotlp` | 当前 orchestrator 源码 |
+| Guest receiver / 兼容 receiver | `envd`、`sandboxotlp`、`sandboxstats`（旧 Host 拉取兼容） | 当前 orchestrator 源码 |
 | 基础设施 receiver | `otlp` | Collector 0.145.0 |
 | Processor | `batch`、`memory_limiter` | Collector 0.145.0 |
 | Processor | `filter`、`transform` | contrib 0.145.0 |
@@ -919,11 +922,40 @@ pipeline; 只有沙箱业务 receiver 专门处理 metrics. 不增加 logs/trace
 是否将 receiver 接入 pipeline 决定是否运行. 参见完整[本地部署](../deploy/telemetry.example.yaml)
 和[双 sink 配置](../deploy/telemetry-fanout.example.yaml).
 
+<a id="host-otlp-receiver"></a>
+
+#### Host OTLP 主动上报
+
+Telemetry 配置模板将标准 Collector 接收器 `otlp/host` 通过 HTTP Unix Socket
+接入 `/run/sandbox-telemetry/host.sock`。可信生产者在 OTLP Resource 中填写已知身份。
+Guest OTLP 和 envd 继续使用管理网络和路由身份。沙箱路由删除后，Host 入口仍可接收观测。
+
+| 来源 | 上报内容 |
+| --- | --- |
+| `runner` | 当前运行的 VMM 资源和跨运行累计的原生 Usage。子进程退出后，Runner 在报告运行结果前读取最后一个 checkpoint。 |
+| `conductor` | 节点和资源池容量、沙箱预留、生命周期变化，以及能归属到具体沙箱、交换机、端口及绑定代次的网络计数。 |
+| `proxy` | 各服务的物理连接、接入限额、空闲时间，以及协商启用的逻辑 hold 计数 `sandbox.traffic.hold.connected`。 |
+| `connector` | 交换机容量，以及带绑定代次的原生端口计数。 |
+| `cache`、`store` | 节点级共享服务的请求、字节、错误、延迟和使用情况。 |
+
+Runner 上报的 CPU 与内存积分均为原生 `saved_utc_ns` 时刻的累计快照。计算区间用量时，
+应对同一累计流中口径一致的前后快照求差。新沙箱的首条记录也可能就是终态。
+可通过 `usage.complete`、覆盖时长与 `sandbox.usage.unknown_tail` 判断缺测。
+终态本机发送设有截止时间，进程或节点异常、接收器停机仍可能造成缺测。
+沙箱硬删除后，可在配置的 exporter 或下游存储中按原沙箱 ID 核对历史观测。
+
+升级已有节点时，先在 metrics pipeline 加入 `otlp/host`，再更新 Host 生产者，
+将看板和导出规则按指标切换到对应的 `sandbox.telemetry.source`。切换完成后从同一
+pipeline 移除 `sandboxstats`，过渡期内分别读取新旧来源。安装
+`deploy/node-telemetry.sysusers.conf` 创建 `kuasar-telemetry` 组。服务负责创建
+受限的 Socket 目录，非 root 的可信生产者通过 `SupplementaryGroups=kuasar-telemetry`
+接入。独立查询 Socket 的权限为 0600。
+
 <a id="native-sandboxstats-receiver"></a>
 
-#### 原生 sandboxstats receiver
+#### 旧版 Host 拉取兼容：sandboxstats receiver
 
-`sandboxstats` 从同一 RouteEntry view 发现精确 SandboxID, 调用 conductor 现有
+仅在显式启用旧版 Host 拉取配置时，`sandboxstats` 从同一 RouteEntry view 发现精确 SandboxID, 调用 conductor 现有
 `config_socket` 的批量适配. 当前 telemetry lease 和真实 peer PID 授权该读取;
 连接 UDS 不等于取得普通租户 API 权限. 它不收集租户 API key, 不持有 sandbox ctl
 client、不读取 usage 文件、不维护第二套 port 绑定. Conductor 组织原生来源, 保留

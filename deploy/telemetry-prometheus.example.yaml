@@ -25,7 +25,9 @@ query:
 collector:
   receivers:
     envd: {collection_interval: 5s}
-    sandboxstats: {resource_interval: 5s, traffic_interval: 10s, usage_interval: 1m}
+    otlp/host:
+      protocols:
+        http: {transport: unix, endpoint: /run/sandbox-telemetry/host.sock}
     sandboxotlp: {http_listen: ':4318', grpc_listen: ':4317'}
   processors:
     batch: {timeout: 1s, send_batch_size: 8192, send_batch_max_size: 8192}
@@ -40,4 +42,4 @@ collector:
   service:
     telemetry: {metrics: {level: none}}
     pipelines:
-      metrics: {receivers: [envd, sandboxstats, sandboxotlp], processors: [batch], exporters: [prometheusremotewrite]}
+      metrics: {receivers: [envd, sandboxotlp, otlp/host], processors: [batch], exporters: [prometheusremotewrite]}

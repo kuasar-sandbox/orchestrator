@@ -463,13 +463,14 @@ node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
 Run each command in its own service. Conductor owns lifecycle, API authentication,
 ownership and the Plugin registry. Proxy owns sandbox application data forwarding,
 MMDS and instantaneous traffic observations. Telemetry owns its RouteEntry view,
-envd scrape, sandbox-facing OTLP metrics ingress, trusted identity enrichment,
-Collector pipelines, optional local TSDB, exporters, query backends and HTTP adapters.
+envd scrape, sandbox-facing OTLP metrics ingress and identity enrichment,
+independent trusted Host OTLP ingress, Collector pipelines, optional local TSDB, exporters, query backends and HTTP adapters.
 It does not expand the resource controller or change checkpoint/lifecycle policy.
 
 ```text
 Conductor Plugin Plane -> full RouteEntry -> Telemetry view
-Conductor config_socket -> native stats -> sandboxstats receiver
+Host components (Runner / Conductor / Proxy / Connector / Cache / Store)
+  -> OTLP/HTTP over Host UDS -> otlp/host receiver
 Envd UDS -> envd receiver
 Guest -> connector management -> sandboxotlp receiver
                 |
@@ -502,10 +503,13 @@ This is an independent component with its own strict config schema and
 ID `telemetry`, subscribes with `Kind: route`, and registers a separate HTTP
 query UDS only when a Reader and HTTP handler are selected. Writes and reads
 are independent; query-only requires neither Collector nor local TSDB. It does not join Create/Resume
-readiness or call Wake. Native Collector configuration selects envd, sandboxstats
-and sandboxotlp receivers, standard processors/exporters/connectors/extensions
-and multiple pipelines. Sandboxstats uses only the current telemetry lease on
-conductor config_socket; native stats remain independent of telemetry. Local TSDB, Prometheus and ClickHouse readers, direct
+readiness or call Wake. The default Collector configuration connects Guest
+envd/sandboxotlp and a separate trusted Host otlp/host receiver, together with
+standard processors, exporters, connectors, extensions and pipelines.
+Host node components push their own metrics and ownership attributes over OTLP;
+Telemetry no longer discovers Host sampling targets through sandbox routes.
+The older sandboxstats pull receiver remains an explicit compatibility option;
+native stats diagnostic APIs remain independent of Telemetry. Local TSDB, Prometheus and ClickHouse readers, direct
 sandbox OTLP networking, E2B steps/MAX behavior and bounds are specified in
 [Telemetry](#telemetry). Use `deploy/node-telemetry.service` alongside, not as
 a required dependency of, conductor/Proxy.
@@ -1008,7 +1012,7 @@ options are not silently translated into a smaller routing language.
 
 | Category | Included component types | Version |
 |---|---|---|
-| Receivers | `envd`, `sandboxstats`, `sandboxotlp` | This orchestrator source |
+| Guest and compatibility receivers | `envd`, `sandboxotlp`, `sandboxstats` (legacy Host pull) | This orchestrator source |
 | Infrastructure receiver | `otlp` | Collector 0.145.0 |
 | Processors | `batch`, `memory_limiter` | Collector 0.145.0 |
 | Processors | `filter`, `transform` | contrib 0.145.0 |
@@ -1036,11 +1040,46 @@ explicitly connect them in `service.pipelines`. Envd options are now
 from a pipeline to select it. See the complete [local deployment](../deploy/telemetry.example.yaml)
 and [two-sink configuration](../deploy/telemetry-fanout.example.yaml).
 
+<a id="host-otlp-receiver"></a>
+
+#### Trusted Host OTLP receiver
+
+The configuration template connects the standard Collector receiver `otlp/host` to
+`/run/sandbox-telemetry/host.sock` with the Unix HTTP transport. Trusted producers
+supply their known identity in OTLP Resource attributes. Guest OTLP and envd keep
+their existing management-network and route identity. The Host receiver accepts
+observations after a sandbox route has been removed.
+
+| Source | Observations |
+| --- | --- |
+| `runner` | VMM resources for the current run and native saved Usage across runs. The runner reads the last checkpoint after the child exits and before reporting the run result. |
+| `conductor` | Node and pool resources, sandbox reservations, lifecycle transitions, and sandbox network counters for the observed switch, port and attachment generation. |
+| `proxy` | Physical traffic by service, admission limits, idle time, and the negotiated logical hold count in `sandbox.traffic.hold.connected`. |
+| `connector` | Switch capacity and native port counters with attachment generation. |
+| `cache`, `store` | Shared service requests, bytes, errors, latency and utilization. These sources report at node scope. |
+
+Runner CPU and memory integrals are cumulative snapshots at the native `saved_utc_ns`.
+For a span of use, subtract compatible successive snapshots in the same logical
+usage stream. On a new sandbox the first checkpoint may also be its final one.
+Inspect `usage.complete`, coverage and `sandbox.usage.unknown_tail` for gaps.
+The final local export has a bounded deadline. Process or node loss and receiver
+outages can still leave gaps. After hard deletion, use the configured exporter
+or its downstream store to inspect observations by the original sandbox ID.
+
+For an existing deployment, add `otlp/host` to the metrics pipeline, update the
+Host binaries, then update dashboards and exporters to select the new
+`sandbox.telemetry.source` for each metric. Remove `sandboxstats` from that
+pipeline when those producers are in place. During overlap, keep the legacy
+and new series distinct. Install `deploy/node-telemetry.sysusers.conf` to create
+the `kuasar-telemetry` group. The service creates its restricted socket
+directory, and trusted non-root producers use `SupplementaryGroups=kuasar-telemetry`.
+The query socket retains mode 0600.
+
 <a id="native-sandboxstats-receiver"></a>
 
-#### Native sandboxstats receiver
+#### Legacy Host pull compatibility: sandboxstats receiver
 
-`sandboxstats` discovers exact SandboxIDs from the same RouteEntry view and calls
+When explicitly enabled for legacy Host collection, `sandboxstats` discovers exact SandboxIDs from the same RouteEntry view and calls
 conductor's existing `config_socket` batch adaptation. The current telemetry
 lease and actual peer PID authorize that read; connecting to a UDS does not grant
 ordinary tenant API permissions. It needs no tenant API-key collection and has

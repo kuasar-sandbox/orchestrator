@@ -64,6 +64,8 @@ func TestRemoteDeploymentExamplesIntegration(t *testing.T) {
 			requireNoQueryError(t, listener.Close())
 			otlp := cfg.Collector["receivers"].(map[string]any)["sandboxotlp"].(map[string]any)
 			otlp["http_listen"], otlp["grpc_listen"] = address, "127.0.0.1:0"
+			host := cfg.Collector["receivers"].(map[string]any)["otlp/host"].(map[string]any)
+			host["protocols"].(map[string]any)["http"].(map[string]any)["endpoint"] = filepath.Join(t.TempDir(), "host.sock")
 			requireNoQueryError(t, config.ValidateTelemetryFinal(cfg))
 			view := NewView(1)
 			defer view.InvalidateSync()

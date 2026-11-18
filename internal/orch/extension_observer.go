@@ -1,6 +1,8 @@
 package orch
 
 import (
+	"time"
+
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -32,6 +34,9 @@ func (o *Orchestrator) observeSandboxUpsert(sandbox *types.Sandbox) {
 }
 
 func (o *Orchestrator) observeSandboxDelete(sandbox *types.Sandbox) {
+	if h := o.hostObserver; h != nil && sandbox != nil {
+		h.offer(sandboxStateObservation(sandbox, "deleted", time.Now()))
+	}
 	o.observeDeletedPressureSandbox(sandbox)
 	if o.extensionObserver != nil {
 		o.extensionObserver.SandboxDelete(sandbox)

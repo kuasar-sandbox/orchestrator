@@ -316,11 +316,15 @@ func (o *Orchestrator) publishUpsert(sb *types.Sandbox) {
 	defer o.holdMu.Unlock()
 	route.Hold = o.projectHoldLocked(sb)
 	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: route})
+	o.observeHostStateLocked(sb)
 }
 
 func (o *Orchestrator) publishDelete(sid string) {
 	o.holdMu.Lock()
 	delete(o.holds, sid)
+	if h := o.hostObserver; h != nil {
+		delete(h.states, sid)
+	}
 	o.holdMu.Unlock()
 	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
 }
