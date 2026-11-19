@@ -24,7 +24,7 @@ func TestRuntimeStartupBudgetReachesEveryBuildPhase(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for name, doc := range map[string]map[string]any{"import": a, "steps": mustStepsYAML(t, p, nil), "source_steps": p.sourceStepsYAML()} {
+			for name, doc := range map[string]map[string]any{"import": a, "steps": mustStepsYAML(t, p, nil), "source_steps": mustSourceStepsYAML(t, p)} {
 				body, err := yaml.Marshal(doc)
 				if err != nil {
 					t.Fatal(err)

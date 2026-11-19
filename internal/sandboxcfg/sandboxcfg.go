@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"gopkg.in/yaml.v3"
@@ -367,7 +368,7 @@ type Params struct {
 	ArtifactDisks  types.ArtifactDiskTopology // task-projected shape for host-owned active bindings
 	Runtime        string                     // erofs path (file path, no scheme)
 	Kernel         string                     // vmlinux path
-	OverlayDiffTpl string                     // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
+	OverlayDiffTpl string                     // template URI or legacy host path for the cold-boot ext4 upper
 	TapFD          TapFD
 	EnvVars        map[string]string        // create-time launch env
 	Resources      rtconfig.ResourcesConfig // fully resolved node + tenant + restore policy
@@ -515,10 +516,13 @@ func (p Params) buildImageColdConfig() (*rtconfig.SandboxConfig, error) {
 	if p.RestoreRef() != "" {
 		c.Restore.Prefetch = p.Spec.Restore.Prefetch
 	}
-	// Cold boot needs a pre-formatted ext4 source for the writable upper; restore
+	// Cold boot needs an ext4 template source for the writable upper; restore
 	// gets the overlay chain from the snapshot.
 	if p.RestoreRef() == "" && p.OverlayDiffTpl != "" {
-		c.Boot.Root.Overlay.DiffTemplate = "file://" + p.OverlayDiffTpl
+		c.Boot.Root.Overlay.DiffTemplate, err = difftemplate.Normalize(p.OverlayDiffTpl)
+		if err != nil {
+			return nil, fmt.Errorf("overlay_diff_template: %w", err)
+		}
 	}
 
 	// --- network (guest side) ---
@@ -673,7 +677,11 @@ func (p Params) hostActiveRoot(shape types.ArtifactDiskShape) (hostActiveRootCon
 		if p.OverlayDiffTpl == "" {
 			return hostActiveRootConfig{}, fmt.Errorf("formatted diff template is required without an active artifact base")
 		}
-		template = "file://" + p.OverlayDiffTpl
+		var err error
+		template, err = difftemplate.Normalize(p.OverlayDiffTpl)
+		if err != nil {
+			return hostActiveRootConfig{}, fmt.Errorf("overlay_diff_template: %w", err)
+		}
 	}
 	switch shape.Mode {
 	case types.ArtifactDiskSingle:

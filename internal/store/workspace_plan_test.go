@@ -71,3 +71,23 @@ func TestBuildWorkspaceMetadataRequiresResolvedPlan(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkspacePendingDefaultPlanRoundTrip(t *testing.T) {
+	st := testStore(t)
+	sb := sandboxInsertFixture("pending-workspace", 0)
+	sb.WorkspacePlan = []workspace.Prepared{{Name: "project", Mounts: []workspace.Mount{{Path: "/data"}}, DefaultFromSlot: true}}
+	if err := st.InsertSandbox(t.Context(), sb); err != nil {
+		t.Fatal(err)
+	}
+	read, err := st.Get(t.Context(), sb.ID)
+	if err != nil || !reflect.DeepEqual(read.WorkspacePlan, sb.WorkspacePlan) {
+		t.Fatalf("pending default lost during recovery: %+v %v", read, err)
+	}
+	if strings.Contains(read.Metadata[workspace.Namespace], "defaultFromSlot") || strings.Contains(read.Metadata[workspace.Namespace], "disk") {
+		t.Fatalf("private pending choice escaped into metadata: %s", read.Metadata[workspace.Namespace])
+	}
+	selected, err := read.WorkspacePlan[0].ResolveDefault(16 << 20)
+	if err != nil || selected.Disk == nil || selected.Disk.DiffTemplate != "mkfs://ext4?size=16777216" {
+		t.Fatalf("recovered default cannot be resolved: %+v %v", selected, err)
+	}
+}

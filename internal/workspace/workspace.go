@@ -32,12 +32,33 @@ type Entry struct {
 // Prepared holds the fixed private create choice after token resolution.
 // An entry with no choice inherits a captured device or reserves a new slot.
 type Prepared struct {
-	Name            string                   `json:"name"`
-	Mounts          []Mount                  `json:"mounts,omitempty"`
-	Slot            *rtconfig.DiskSlotConfig `json:"slot,omitempty"`
-	Disk            *rtconfig.DiskV1         `json:"disk,omitempty"`
-	AuthorizeLayers bool                     `json:"authorizeLayers,omitempty"`
-	RefLocations    rtconfig.RefLocations    `json:"refLocations,omitempty"`
+	Name   string                   `json:"name"`
+	Mounts []Mount                  `json:"mounts,omitempty"`
+	Slot   *rtconfig.DiskSlotConfig `json:"slot,omitempty"`
+	Disk   *rtconfig.DiskV1         `json:"disk,omitempty"`
+	// DefaultFromSlot preserves an explicit disk:{} request admitted without a
+	// node template. Resolve it only against the selected, unbound fixed slot.
+	DefaultFromSlot bool                  `json:"defaultFromSlot,omitempty"`
+	AuthorizeLayers bool                  `json:"authorizeLayers,omitempty"`
+	RefLocations    rtconfig.RefLocations `json:"refLocations,omitempty"`
+}
+
+// ResolveDefault fixes a pending default after the target's authenticated
+// geometry is available. A nonpositive capacity is a dynamic/unknown slot,
+// never a size from which to invent a filesystem.
+func (p Prepared) ResolveDefault(capacity int64) (Prepared, error) {
+	if !p.DefaultFromSlot {
+		return p, nil
+	}
+	if p.Disk != nil || p.Slot != nil || capacity <= 0 {
+		return p, fmt.Errorf("workspace %q: default disk requires a template or a fixed target slot capacity", p.Name)
+	}
+	disk, err := (rtconfig.DiskV1{Kind: "disk", Version: 1, Size: &capacity}).NormalizeCreate()
+	if err != nil {
+		return p, fmt.Errorf("workspace %q: %w", p.Name, err)
+	}
+	p.Disk, p.DefaultFromSlot = &disk, false
+	return p, nil
 }
 
 func Parse(raw string) ([]Entry, error) {
@@ -202,6 +223,9 @@ func ApplyImage(c *rtconfig.SandboxConfig, plan []Prepared) error {
 		}
 	}
 	for _, p := range plan {
+		if p.DefaultFromSlot {
+			return fmt.Errorf("workspace %q: default disk requires a template or a fixed target slot capacity", p.Name)
+		}
 		if used[p.Name] || len(p.Mounts) == 0 {
 			return fmt.Errorf("workspace %q: duplicate disk name or missing mounts", p.Name)
 		}
@@ -369,6 +393,9 @@ func AdditionalDevices(disks []string, captured []Entry, choices []Prepared) ([]
 	for _, p := range choices {
 		if presented[p.Name] {
 			continue
+		}
+		if p.DefaultFromSlot {
+			return nil, fmt.Errorf("workspace %q: default disk requires a template or a fixed target slot capacity", p.Name)
 		}
 		if names[p.Name] || len(p.Mounts) == 0 {
 			return nil, fmt.Errorf("workspace %q: disk name exists or new mounts are missing", p.Name)

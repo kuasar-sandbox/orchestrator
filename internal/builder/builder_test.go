@@ -600,7 +600,7 @@ func TestSourceStepsYAMLClearsPersistentActions(t *testing.T) {
 	p := &buildPipeline{spec: &configsock.BuildSpec{
 		Paths: configsock.BuildPaths{Kernel: "/k", Runtime: "/r", BuilderDiffTpl: "/d"},
 	}}
-	doc := p.sourceStepsYAML()
+	doc := mustSourceStepsYAML(t, p)
 	for _, field := range []string{"mounts", "files", "init"} {
 		values, ok := doc[field].([]any)
 		if !ok || len(values) != 0 {
@@ -862,6 +862,15 @@ func TestFlattenConfigArgForSkipVerify(t *testing.T) {
 func mustStepsYAML(t *testing.T, p *buildPipeline, plan []workspace.Prepared) map[string]any {
 	t.Helper()
 	doc, err := p.stepsYAML(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+func mustSourceStepsYAML(t *testing.T, p *buildPipeline) map[string]any {
+	t.Helper()
+	doc, err := p.sourceStepsYAML()
 	if err != nil {
 		t.Fatal(err)
 	}

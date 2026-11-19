@@ -2397,6 +2397,11 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
+	if sandboxcfg.SourceForLaunch(sb, tmpl).Empty() {
+		if err := o.addDiffTemplateLocation(locations, o.cfg.Sandbox.Boot.OverlayDiffTemplate); err != nil {
+			return nil, "", false, err
+		}
+	}
 	spec := o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)
 	spec.Env = sandboxTaskEnv(sb)
 	return spec, sb.PidFile(), true, nil
@@ -2451,6 +2456,9 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 	if source.Empty() {
 		locations, err := o.imageRefLocations(tmpl.Ref, sb.WorkspacePlan)
 		if err != nil {
+			return nil, false, err
+		}
+		if err := o.addDiffTemplateLocation(locations, o.cfg.Sandbox.Boot.OverlayDiffTemplate); err != nil {
 			return nil, false, err
 		}
 		response.Final = o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)

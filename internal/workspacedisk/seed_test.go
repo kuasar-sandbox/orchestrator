@@ -3,12 +3,20 @@ package workspacedisk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -152,5 +160,129 @@ func TestFreezeSeedAtNativeLayerLimit(t *testing.T) {
 		if !bytes.Equal(got[start:end], want[start:end]) {
 			t.Fatalf("page %d first byte %#x, want %#x", page, got[start], want[start])
 		}
+	}
+}
+
+func TestFreezeGeneratedSeedProducesReusableContent(t *testing.T) {
+	storage, err := artifact.NewProcessStorage(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	size := int64(16 << 20)
+	var identity string
+	for _, input := range []rtconfig.DiskV1{
+		{Kind: "disk", Version: 1, Size: &size},
+		{Kind: "disk", Version: 1, DiffTemplate: "mkfs://ext4?size=16MiB"},
+	} {
+		frozen, err := FreezeSeed(t.Context(), input, storage, nil, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frozen.DiffTemplate != "" || frozen.Base == "" || frozen.Size == nil || *frozen.Size != size || len(frozen.BaseFromRefs) != 0 {
+			t.Fatalf("generated source was not frozen into immutable content: %+v", frozen)
+		}
+		if identity != "" && frozen.Identity() != identity {
+			t.Fatal("equivalent generated requests did not deduplicate to the same content identity")
+		}
+		identity = frozen.Identity()
+		base, actual, seed, err := sandbox.OpenDiskV1Source(t.Context(), frozen, storage, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual != size || seed != "" || base == nil {
+			t.Fatalf("reopened frozen disk = %v, %d, %q", base, actual, seed)
+		}
+		magic := make([]byte, 2)
+		_, readErr := base.ReadAt(magic, 1024+0x38)
+		closeErr := base.Close()
+		if readErr != nil || closeErr != nil || !bytes.Equal(magic, []byte{0x53, 0xef}) {
+			t.Fatalf("frozen filesystem content: magic=%x read=%v close=%v", magic, readErr, closeErr)
+		}
+	}
+}
+
+type retrySeedFetcher struct {
+	readStarted chan struct{}
+	readOnce    sync.Once
+	opens       atomic.Int32
+	closes      atomic.Int32
+	recovered   atomic.Bool
+}
+
+func (f *retrySeedFetcher) OpenManifest(ctx context.Context, key store.ContentKey) (fetch.Stream, error) {
+	return f.OpenVerifiedManifest(ctx, key)
+}
+
+func (f *retrySeedFetcher) OpenVerifiedManifest(context.Context, store.ContentKey) (fetch.Stream, error) {
+	f.opens.Add(1)
+	data := make([]byte, 16<<10)
+	copy(data[1024+0x38:], []byte{0x53, 0xef})
+	return &retrySeedStream{Source: sparse.Dense(bytes.NewReader(data), uint64(len(data))), owner: f}, nil
+}
+
+type retrySeedStream struct {
+	sparse.Source
+	owner *retrySeedFetcher
+}
+
+func (s *retrySeedStream) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
+	if s.owner.recovered.Load() {
+		return s.Source.ReadAt(ctx, p, off)
+	}
+	s.owner.readOnce.Do(func() { close(s.owner.readStarted) })
+	return 0, readerr.Mark(errors.New("temporary seed source failure"), true)
+}
+
+func (s *retrySeedStream) Close() error {
+	s.owner.closes.Add(1)
+	return nil
+}
+
+func TestFreezeSeedCancellationDiscardsRetryingTemporaryWriter(t *testing.T) {
+	fetcher := &retrySeedFetcher{readStarted: make(chan struct{})}
+	storage, err := artifact.NewProcessStorageWithLocalAccess(nil, nil, nil, false, fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	defer fetcher.recovered.Store(true)
+	dir := t.TempDir()
+	result := make(chan error, 1)
+	go func() {
+		_, err := FreezeSeed(ctx, rtconfig.DiskV1{Kind: "disk", Version: 1, DiffTemplate: "manifest://" + strings.Repeat("1", 64)}, storage, nil, dir)
+		result <- err
+	}()
+	select {
+	case <-fetcher.readStarted:
+	case err := <-result:
+		t.Fatalf("seed returned before materialization attempted a read: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("seed never attempted materialization")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled seed returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		// Release a broken implementation's retained retry before failing, so
+		// the regression does not leave a materializer running after the test.
+		fetcher.recovered.Store(true)
+		select {
+		case <-result:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("seed cancellation waited for its temporary source to recover")
+	}
+	if fetcher.opens.Load() < 2 || fetcher.closes.Load() != fetcher.opens.Load() {
+		t.Fatalf("opened %d seed probes/readers, closed %d", fetcher.opens.Load(), fetcher.closes.Load())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("canceled seed left staging content: %v %v", entries, err)
 	}
 }

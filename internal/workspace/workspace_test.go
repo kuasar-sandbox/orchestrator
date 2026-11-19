@@ -161,3 +161,17 @@ func TestAdditionalSBXDevicesOnlyUseNewNamesInDeclarationOrder(t *testing.T) {
 		t.Fatal("accepted ninth disk")
 	}
 }
+
+func TestPendingDefaultCannotBecomeAnUnboundNewDevice(t *testing.T) {
+	pending := Prepared{Name: "project", Mounts: []Mount{{Path: "/data"}}, DefaultFromSlot: true}
+	if err := ApplyImage(&rtconfig.SandboxConfig{}, []Prepared{pending}); err == nil {
+		t.Fatal("unresolved default became an image slot")
+	}
+	if _, err := AdditionalDevices(nil, nil, []Prepared{pending}); err == nil {
+		t.Fatal("unresolved default became an added SBX slot")
+	}
+	captured := []Entry{{Name: "project", Mounts: pending.Mounts}}
+	if added, err := AdditionalDevices([]string{"project"}, captured, []Prepared{pending}); err != nil || len(added) != 0 {
+		t.Fatalf("captured target did not retain pending resolution: %v %v", added, err)
+	}
+}
