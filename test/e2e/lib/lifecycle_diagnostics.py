@@ -1,5 +1,6 @@
 """Bounded, read-only evidence for failed idle/pressure Pause/Wake cases."""
 from collections import deque
+import errno
 import json
 import os
 from pathlib import Path
@@ -98,17 +99,35 @@ def held_memory_fault(message):
 
 def memory_page_trace(message):
     """Accept only the one-page trace schema, never arbitrary runtime fields."""
+    if not isinstance(message, str):
+        return None
     _, marker, payload = message.partition(TRACE_PREFIX)
     if not marker or len(message) >= MAX_FIELD:
         return None
+
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError('duplicate trace field')
+            result[key] = item
+        return result
+
     try:
-        value = json.loads(payload)
-    except ValueError:
+        if len(message.encode('utf-8')) >= MAX_FIELD:
+            return None
+        value = json.loads(payload, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError, RecursionError):
         return None
     if not isinstance(value, dict):
         return None
+    version = value.get('v')
+    if type(version) is not int or version not in (1, 2):
+        return None
     event = value.get('event')
     fields = {'v', 'page', 'seq', 'event'}
+    if version == 2:
+        fields |= {'elapsed_ns', 'pid', 'handler'}
     if event == 'summary':
         fields |= {'recorded', 'dropped'}
     elif event in ('seed', 'fault', 'source', 'copy', 'zero', 'remove', 'load-hit'):
@@ -117,6 +136,22 @@ def memory_page_trace(message):
             fields.add('kind')
         elif event in ('copy', 'zero'):
             fields |= {'sha256', 'non_ff', 'done', 'errno'}
+        elif event == 'remove' and version == 2:
+            fields.add('kernel_event')
+    elif event == 'register' and version == 2:
+        fields |= {'start', 'length', 'state', 'uffd_fd', 'backend_va', 'memfd_fd',
+                   'memfd_dev', 'memfd_ino', 'memfd_size', 'kernel_release',
+                   'ch_va', 'ch_pid', 'peer_errno', 'memfd_errno', 'kernel_errno', 'maps_errno'}
+        if value.get('maps_errno') == 0:
+            fields |= {'maps_va', 'maps_size', 'maps_offset', 'maps_dev', 'maps_ino', 'maps_match'}
+    elif event == 'observe' and version == 2:
+        fields |= {'start', 'length', 'state', 'phase', 'mincore_errno',
+                   'seek_data_offset', 'seek_hole_offset', 'seek_data_errno', 'seek_hole_errno'}
+        if value.get('mincore_errno') == 0:
+            fields.add('resident')
+        if (value.get('seek_hole_errno') == 0
+                and value.get('seek_data_errno') in (0, errno.ENXIO)):
+            fields.add('extent_data')
     else:
         return None
     if set(value) != fields:
@@ -126,8 +161,11 @@ def memory_page_trace(message):
         return type(value.get(key)) is int and low <= value[key] <= high
 
     maximum = (1 << 64) - 1
-    if (not integer('v', 1, 1) or not integer('page', TRACE_PAGE, TRACE_PAGE)
-            or not integer('seq', 1, maximum)):
+    if not integer('page', TRACE_PAGE, TRACE_PAGE) or not integer('seq', 1, maximum):
+        return None
+    if version == 2 and (not integer('elapsed_ns', 0, maximum)
+                         or not integer('pid', 1, (1 << 31) - 1)
+                         or not integer('handler', 1, maximum)):
         return None
     if event == 'summary':
         if (not integer('recorded', 0, MAX_TRACE_RECORDS) or not integer('dropped', 0, maximum)
@@ -148,6 +186,43 @@ def memory_page_trace(message):
                 or not integer('done', -(1 << 63), (1 << 63) - 1)
                 or not integer('errno', -1, 4095)):
             return None
+        if event == 'remove' and version == 2 and value['kernel_event'] not in ('remove', 'unmap'):
+            return None
+        if event == 'register':
+            if (not integer('uffd_fd', 1, (1 << 31) - 1)
+                    or not integer('memfd_fd', 1, (1 << 31) - 1)
+                    or not integer('ch_pid', 0, (1 << 31) - 1)
+                    or any(not integer(key, 0, maximum) for key in (
+                        'backend_va', 'memfd_dev', 'memfd_ino', 'memfd_size', 'ch_va'))
+                    or any(not integer(key, -1, 4095) for key in (
+                        'peer_errno', 'memfd_errno', 'kernel_errno', 'maps_errno'))):
+                return None
+            release = value['kernel_release']
+            if (not isinstance(release, str) or len(release) > 64
+                    or (value['kernel_errno'] == 0 and not release)
+                    or (value['kernel_errno'] != 0 and release != '')):
+                return None
+            if value['maps_errno'] == 0 and (
+                    any(not integer(key, 0, maximum) for key in (
+                        'maps_va', 'maps_size', 'maps_offset', 'maps_dev', 'maps_ino'))
+                    or type(value['maps_match']) is not bool):
+                return None
+        if event == 'observe':
+            if (value['start'] != TRACE_PAGE or value['length'] != 4096
+                    or value['phase'] not in ('before-ack', 'close')
+                    or any(not integer(key, -1, 4095) for key in (
+                        'mincore_errno', 'seek_data_errno', 'seek_hole_errno'))
+                    or any(not integer(key, -1, (1 << 63) - 1) for key in (
+                        'seek_data_offset', 'seek_hole_offset'))):
+                return None
+            if value['mincore_errno'] == 0 and type(value['resident']) is not bool:
+                return None
+            if 'extent_data' in value and type(value['extent_data']) is not bool:
+                return None
+            for operation in ('data', 'hole'):
+                offset, error = value[f'seek_{operation}_offset'], value[f'seek_{operation}_errno']
+                if (error == 0 and offset < 0) or (error != 0 and offset != -1):
+                    return None
     return value
 
 
