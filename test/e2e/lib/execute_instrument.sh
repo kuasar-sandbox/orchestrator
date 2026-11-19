@@ -19,32 +19,8 @@ done
 cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+# Exercise the normal runtime with all temporary memory diagnostics disabled.
 unset SANDBOX_UFFD_TRACE_MEMFD_PAGE SANDBOX_UFFD_GUARD_BACKEND_PAGE SANDBOX_UFFD_TRACE_SHMEM_PAGE
-# A case-owned marker enables page and allocation traces only for restored
-# runtimes. Leave the backend VMA unguarded so this observation does not split it.
-if [ "\${1:-}" = "run" ] && [ -f "$WORK/trace-memory-page" ] && [ ! -L "$WORK/trace-memory-page" ]; then
-    for arg in "\$@"; do
-        case "\$arg" in
-            --) break ;;
-            --restore|--restore=*)
-                if python3 - "$WORK/trace-memory-page" <<'PY_TRACE'
-import sys
-try:
-    with open(sys.argv[1], "rb") as marker:
-        enabled = marker.read(9) == b"4194304\n"
-except OSError:
-    enabled = False
-raise SystemExit(0 if enabled else 1)
-PY_TRACE
-                then
-                    export SANDBOX_UFFD_TRACE_MEMFD_PAGE=4194304
-                    export SANDBOX_UFFD_TRACE_SHMEM_PAGE=4194304
-                fi
-                break
-                ;;
-        esac
-    done
-fi
 if [ "\${1:-}" = "snapshot" ]; then
     python3 - "$SNAPSHOT_ARGV_LOG" "\$@" <<'PY'
 import json, sys

@@ -51,49 +51,12 @@ def trace_record(event='fault', seq=None, version=1, **changes):
     return record
 
 
-def guard_record(event='armed', **changes):
-    attempt = event == 'attempt'
-    record = dict(v=1, seq=1 if attempt else 3 if event == 'closed' else 2,
-                  event=event, reason='close' if event == 'closed' else 'success',
-                  pid=1234, page=diagnostic.TRACE_PAGE, target_valid=True,
-                  backend_va=0x7F0000000000, target_va=0x7F0000000000 + diagnostic.TRACE_PAGE,
-                  length=4096, host_page_size=4096, memfd_fd=12,
-                  memfd_dev=0 if attempt else 1, memfd_ino=0 if attempt else 123,
-                  memfd_size=1 << 30, guard_fd=-1 if attempt else 13,
-                  errno=0, elapsed_ns=1 if attempt else 3 if event == 'closed' else 2)
-    if event == 'failed':
-        record.update(reason='create', errno=1, guard_fd=-1)
-    record.update(changes)
-    return record
-
-
-def shmem_record(event='armed', **changes):
-    record = dict(v=1, seq=1, event=event, pid=1234, page=diagnostic.TRACE_PAGE,
-                  memfd_dev=1, memfd_ino=123)
-    if event == 'armed':
-        record.update(window_start=diagnostic.TRACE_PAGE - 8192,
-                      window_end=diagnostic.TRACE_PAGE + 8192, page_size=4096, max_records=16)
-    elif event == 'failed':
-        record.update(stage='btf', errno=2)
-    elif event == 'insert':
-        record.update(seq=2, inserter_pid=5678, inserter_tid=5679, pid_scope='initial', comm='cloud-hypervisor',
-                      index=diagnostic.TRACE_PAGE // 4096, nr_pages=1, ktime_ns=123456789,
-                      result=0, stack_errno=0, frames=['shmem_add_to_page_cache+0x12',
-                                                       'shmem_get_folio_gfp+0x34'])
-    elif event == 'closed':
-        record.update(seq=3, matched=1, emitted=1, dropped=0, pending=0, nested=0,
-                      entry_missed=0, return_missed=0, errno=0)
-    record.update(changes)
-    return record
-
-
 class LifecycleDiagnostics(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.db, self.log = self.root / 'state.db', self.root / 'conductor.log'
-        self.journal_sequence = 0
         self.log.write_text('')
         repo = Path(__file__).resolve().parents[3]
         schema = re.search(r'const schema = `([^`]+)`',
@@ -124,39 +87,9 @@ class LifecycleDiagnostics(unittest.TestCase):
                             private='DO_NOT_EMIT_HELPER_FIELDS')
         (self.root / 'payload.json').write_text(json.dumps(self.payload))
         journal = self.root / 'journalctl'
-        journal.write_text('#!' + sys.executable + '\n' + r'''
-import json, os, re, sys, time
-from pathlib import Path
-root = Path(os.environ['PAGE_TEST_ROOT'])
-args = sys.argv[1:]
-with (root / 'journal-calls.jsonl').open('a') as output:
-    print(json.dumps(args), file=output)
-if os.environ.get('PAGE_TEST_JOURNAL_MODE') == 'guard-timeout' and any(arg.startswith('--grep=uffd-backend-guard') for arg in args):
-    (root / 'journal.pid').write_text(str(os.getpid()))
-    time.sleep(30)
-if os.environ.get('PAGE_TEST_JOURNAL_MODE') == 'shmem-timeout' and any(arg.startswith('--grep=uffd-shmem-allocation') for arg in args):
-    (root / 'journal.pid').write_text(str(os.getpid()))
-    time.sleep(30)
-entries = [json.loads(line) for line in (root / 'journal.jsonl').read_text().splitlines()]
-if not os.environ.get('PAGE_TEST_JOURNAL_UNFILTERED'):
-    cursor = next((arg.split('=', 1)[1] for arg in args if arg.startswith('--after-cursor=')), None)
-    if cursor:
-        offset = next((index + 1 for index, entry in enumerate(entries) if entry.get('__CURSOR') == cursor), len(entries))
-        entries = entries[offset:]
-    for arg in args:
-        if '=' in arg and not arg.startswith('-'):
-            key, value = arg.split('=', 1)
-            entries = [entry for entry in entries if entry.get(key) == value]
-    pattern = next((arg.split('=', 1)[1] for arg in args if arg.startswith('--grep=')), None)
-    if pattern is not None:
-        entries = [entry for entry in entries if isinstance(entry.get('MESSAGE'), str) and re.search(pattern, entry['MESSAGE'])]
-    count = args[args.index('-n') + 1]
-    entries = entries[:int(count)] if count.startswith('+') else entries[-int(count):]
-    if pattern is not None and not entries:
-        raise SystemExit(1)
-for entry in entries:
-    print(json.dumps(entry))
-''')
+        journal.write_text('#!' + sys.executable + '\n'
+                           'import os\nfrom pathlib import Path\n'
+                           'print(Path(os.environ["PAGE_TEST_ROOT"], "journal.jsonl").read_text())\n')
         helper = self.root / 'memorycompare'
         helper.write_text('#!' + sys.executable + '\n' + r'''
 import json, os, sys, time
@@ -179,7 +112,7 @@ print((root / 'payload.json').read_text())
                           checkpoint_root=str(self.root / 'sandboxes'))
         self.environment = mock.patch.dict(os.environ, dict(
             PATH=str(self.root) + os.pathsep + os.environ['PATH'], PAGE_TEST_ROOT=str(self.root),
-            PAGE_TEST_MODE='', PAGE_TEST_JOURNAL_MODE='', PAGE_TEST_JOURNAL_UNFILTERED=''))
+            PAGE_TEST_MODE=''))
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.write_journal([self.entry('target-a'), self.entry('target-b')])
@@ -289,43 +222,6 @@ print((root / 'payload.json').read_text())
         return dict(KUASAR_SANDBOX_ID=sid, KUASAR_RUN_ID=run or 'current-' + sid,
                     MESSAGE=diagnostic.TRACE_PREFIX + json.dumps(trace))
 
-    def runtime_entry(self, message, sid='target-a', **changes):
-        self.journal_sequence += 1
-        entry = dict(MESSAGE=message, _PID='1234', _BOOT_ID='a' * 32,
-                     _SYSTEMD_UNIT='runner@current-' + sid + '.service', _STREAM_ID='b' * 32,
-                     _TRANSPORT='stdout', __CURSOR='s=' + 'a' * 32 + ';i=' + hex(self.journal_sequence)[2:])
-        entry.update(changes)
-        return entry
-
-    def guard_entry(self, sid='target-a', event='armed', run=None, journal=None, **changes):
-        entry = self.runtime_entry(diagnostic.GUARD_PREFIX + json.dumps(guard_record(event, **changes)), sid,
-                                   KUASAR_SANDBOX_ID=sid, KUASAR_RUN_ID=run or 'current-' + sid,
-                                   SYSLOG_IDENTIFIER='sandbox-ctl', _TRANSPORT='journal')
-        entry.pop('_STREAM_ID')
-        entry.update(journal or {})
-        return entry
-
-    def shmem_entry(self, sid='target-a', event='armed', run=None, journal=None, **changes):
-        entry = self.runtime_entry(diagnostic.SHMEM_PREFIX + json.dumps(shmem_record(event, **changes)), sid,
-                                   KUASAR_SANDBOX_ID=sid, KUASAR_RUN_ID=run or 'current-' + sid,
-                                   SYSLOG_IDENTIFIER='sandbox-ctl', _TRANSPORT='journal')
-        entry.pop('_STREAM_ID')
-        entry.update(journal or {})
-        return entry
-
-    def guard_fault_entries(self, sid='target-a', **changes):
-        messages = [
-            'unexpected fault address 0x7f0000400008', 'fatal error: fault',
-            '[signal SIGBUS: bus error code=0x2 addr=0x7f0000400008 pc=0x401234]',
-            'goroutine 27 gp=0xc00010 m=2 mp=0xc00020 [running]:',
-            'runtime.throw({DO_NOT_EMIT_ARGUMENTS})',
-            '\t/private/DO_NOT_EMIT_PATH/runtime/panic.go:110 +0x1 fp=0xc001 sp=0xc002 pc=0x401235',
-            'github.com/kuasar-sandbox/sandboxer/pkg/memory.(*Memory).Read({DO_NOT_EMIT_BYTES})',
-            '\t/private/DO_NOT_EMIT_PATH/memory_linux.go:42 +0x2',
-            'goroutine 28 [waiting]:', 'private.DO_NOT_EMIT_OTHER_GOROUTINE(0x1)',
-            '\t/private/other.go:12 +0x3']
-        return [self.runtime_entry(message, sid, **changes) for message in messages]
-
     def test_trace_identity_and_quota_preserve_fault_and_business_evidence(self):
         for version in (1, 2):
             with self.subTest(version=version):
@@ -394,333 +290,6 @@ print((root / 'payload.json').read_text())
                           ('target-b', 'active-target-b', -1, -1)])
         self.assertNotIn('DO_NOT_EMIT', json.dumps(records))
         self.assertEqual(len(self.calls()), 1)
-
-    def test_guard_recovers_first_fault_beyond_legacy_tail_without_arguments(self):
-        entries = [self.guard_entry(event='attempt'), self.guard_entry()]
-        entries += self.guard_fault_entries()
-        # More than both the 200-entry and 2 MiB legacy tail; the guard and
-        # first fault stack must still be found by bounded independent queries.
-        entries += [self.runtime_entry('goroutine ' + str(index) + ' [waiting]:') for index in range(500)]
-        entries += [dict(KUASAR_SANDBOX_ID='target-a', KUASAR_RUN_ID='current-target-a',
-                         MESSAGE='heartbeat ' + 'x' * 11000) for _ in range(201)]
-        self.write_journal(entries)
-        before = self.db.read_bytes()
-        records = self.run_diagnostic(probe=False)
-        guards = [row for row in records if row['lifecycle_diagnostic'].startswith('uffd_backend_')]
-        self.assertEqual(len(guards), 3)
-        fault = guards[-1]
-        self.assertEqual((fault['status'], fault['reason']), ('sigbus', 'captured'))
-        self.assertEqual((fault['fault_address'], fault['pc'], fault['signal_code']),
-                         (0x7F0000400008, 0x401234, 2))
-        self.assertTrue(fault['target_match'])
-        self.assertEqual(fault['frames'], [
-            dict(function='runtime.throw', file='panic.go', line=110),
-            dict(function='github.com/kuasar-sandbox/sandboxer/pkg/memory.(*Memory).Read',
-                 file='memory_linux.go', line=42)])
-        self.assertNotIn('DO_NOT_EMIT', json.dumps(records))
-        self.assertEqual(before, self.db.read_bytes())
-        queries = [json.loads(line) for line in (self.root / 'journal-calls.jsonl').read_text().splitlines()]
-        stack_query = next(query for query in queries if '_STREAM_ID=' + 'b' * 32 in query)
-        self.assertEqual(stack_query[stack_query.index('-n') + 1], '+80')
-        self.assertIn('_PID=1234', stack_query)
-        self.assertIn('_BOOT_ID=' + 'a' * 32, stack_query)
-
-    def test_guard_quotas_do_not_evict_business_trace_summary_or_workload_fault(self):
-        entries = [self.entry('target-a'), self.guard_entry(event='attempt'), self.guard_entry()]
-        entries += self.guard_fault_entries()
-        entries += [self.trace_entry('target-a', seq=seq, version=2) for seq in range(1, 33)]
-        entries.append(self.trace_entry('target-a', 'summary', version=2))
-        entries += [self.guard_entry('target-b', event=event) for event in ('attempt', 'armed', 'closed')]
-        self.write_journal(entries)
-        self.log.write_text('\n'.join(json.dumps(dict(sid='target-a', msg='pause capture completed',
-                                                      generation=index)) for index in range(80)))
-        records = self.run_diagnostic()
-        guards = [row for row in records if row['lifecycle_diagnostic'].startswith('uffd_backend_')]
-        traces = [row for row in records if row['lifecycle_diagnostic'] == 'uffd_page_trace']
-        business = [row for row in records if row not in guards and row not in traces]
-        self.assertLessEqual(len(guards), diagnostic.MAX_GUARD_RECORDS)
-        self.assertEqual(len(guards), 3)
-        self.assertEqual(len(traces), 33)
-        self.assertEqual(len(business), diagnostic.MAX_RECORDS)
-        self.assertEqual(sum(row['lifecycle_diagnostic'] == 'snapshot_page' for row in business), 1)
-        self.assertTrue(any('held-memory contents changed' in row.get('MESSAGE', '') for row in business))
-        self.assertEqual(len(self.calls()), 1)
-
-    def test_guard_prefers_later_fault_over_healthy_closed_first_sid(self):
-        entries = [self.guard_entry(event=event) for event in ('attempt', 'armed', 'closed')]
-        entries += [self.guard_entry('target-b', event=event) for event in ('attempt', 'armed')]
-        entries += self.guard_fault_entries('target-b')
-        self.write_journal(entries)
-        guards = [row for row in self.run_diagnostic(probe=False)
-                  if row['lifecycle_diagnostic'].startswith('uffd_backend_')]
-        self.assertEqual(len(guards), 3)
-        self.assertTrue(all(row['sid'] == 'target-b' for row in guards))
-        self.assertEqual(guards[-1]['status'], 'sigbus')
-
-    def test_guard_rejects_old_run_foreign_sid_pid_and_malformed_without_raw_fallback(self):
-        os.environ['PAGE_TEST_JOURNAL_UNFILTERED'] = '1'
-        cases = [self.guard_entry(run='obsolete'), self.guard_entry('foreign'),
-                 self.guard_entry(journal=dict(_PID='4321')),
-                 self.guard_entry(journal=dict(SYSLOG_IDENTIFIER='console')),
-                 self.guard_entry(journal=dict(_TRANSPORT='stdout')),
-                 self.guard_entry(reason='fatal DO_NOT_EMIT_REASON'),
-                 self.guard_entry(error='failed DO_NOT_EMIT_ERROR'),
-                 self.guard_entry(pid=True)]
-        for entry in cases:
-            with self.subTest(message=entry['MESSAGE'][:80]):
-                self.write_journal([entry])
-                records = self.run_diagnostic(probe=False)
-                self.assertFalse(any(row['lifecycle_diagnostic'].startswith('uffd_backend_') for row in records))
-                self.assertNotIn('DO_NOT_EMIT', json.dumps(records))
-
-    def test_guard_fault_requires_exact_boot_unit_pid_stream_and_optional_sid_run(self):
-        # The child fixture applies the same journal field matches as the real
-        # subprocess. A shared stderr stream alone never identifies a backend.
-        for changes in (dict(_PID='4321'), dict(_BOOT_ID='c' * 32),
-                        dict(_SYSTEMD_UNIT='runner@another.service'),
-                        dict(KUASAR_SANDBOX_ID='foreign'), dict(KUASAR_RUN_ID='obsolete'),
-                        dict(_TRANSPORT='journal'), dict(_STREAM_ID='invalid')):
-            with self.subTest(changes=changes):
-                self.write_journal([self.guard_entry(event='attempt'), self.guard_entry()]
-                                   + self.guard_fault_entries(**changes))
-                faults = [row for row in self.run_diagnostic(probe=False)
-                          if row['lifecycle_diagnostic'] == 'uffd_backend_fault']
-                self.assertEqual(len(faults), 1)
-                self.assertEqual(faults[0]['status'], 'unavailable')
-                self.assertEqual(faults[0]['frames'], [])
-
-    def test_guard_stack_is_capped_and_does_not_cross_stream(self):
-        entries = [self.guard_entry(event='attempt'), self.guard_entry()]
-        entries += self.guard_fault_entries()[:4]
-        for index in range(30):
-            entries += [self.runtime_entry('private.frame' + str(index) + '(DO_NOT_EMIT_ARGUMENT)'),
-                        self.runtime_entry('\t/private/frame.go:' + str(index + 1) + ' +0x1')]
-        self.write_journal(entries)
-        fault = next(row for row in self.run_diagnostic(probe=False)
-                     if row['lifecycle_diagnostic'] == 'uffd_backend_fault')
-        self.assertEqual(len(fault['frames']), diagnostic.MAX_FAULT_FRAMES)
-        self.assertEqual(fault['frames'][-1]['function'], 'private.frame11')
-        self.assertNotIn('DO_NOT_EMIT', json.dumps(fault))
-
-        entries = [self.guard_entry(event='attempt'), self.guard_entry()]
-        entries += self.guard_fault_entries()[:3]
-        entries += self.guard_fault_entries(_STREAM_ID='c' * 32)[3:]
-        self.write_journal(entries)
-        fault = next(row for row in self.run_diagnostic(probe=False)
-                     if row['lifecycle_diagnostic'] == 'uffd_backend_fault')
-        self.assertEqual((fault['status'], fault['reason'], fault['frames']),
-                         ('sigbus', 'stack_missing', []))
-
-    def test_guard_query_timeout_reaps_child_and_preserves_business_budget(self):
-        os.environ['PAGE_TEST_JOURNAL_MODE'] = 'guard-timeout'
-        self.log.write_text(json.dumps(dict(sid='target-a', msg='pause capture completed')))
-        stream = io.StringIO()
-        started = time.monotonic()
-        diagnostic.emit_failure_evidence(self.db, self.log, ['target-a'], stream=stream)
-        self.assertLess(time.monotonic() - started, 5)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int((self.root / 'journal.pid').read_text()), 0)
-        records = [json.loads(line) for line in stream.getvalue().splitlines()]
-        self.assertTrue(any(row['lifecycle_diagnostic'] == 'conductor' for row in records))
-        self.assertTrue(any(row['lifecycle_diagnostic'] == 'state' for row in records))
-
-
-    def test_shmem_dedicated_query_recovers_all_records_beyond_business_tail(self):
-        entries = [self.shmem_entry()]
-        entries += [self.shmem_entry(event='insert', seq=seq, ktime_ns=seq) for seq in range(2, 18)]
-        entries += [self.shmem_entry(event='closed', seq=18, matched=21, emitted=16, dropped=5,
-                                     pending=2, nested=3, entry_missed=-1, return_missed=4)]
-        entries += [dict(KUASAR_SANDBOX_ID='target-a', KUASAR_RUN_ID='current-target-a',
-                         MESSAGE='heartbeat ' + 'x' * 11000) for _ in range(201)]
-        self.write_journal(entries)
-        before = self.db.read_bytes()
-        records = self.run_diagnostic(probe=False)
-        allocations = [row for row in records if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-        self.assertEqual([row['seq'] for row in allocations], list(range(1, 19)))
-        self.assertEqual(allocations[-1]['dropped'], 5)
-        self.assertEqual(allocations[-1]['pending'], 2)
-        self.assertEqual(allocations[-1]['entry_missed'], -1)
-        self.assertTrue(all(len(json.dumps(row, separators=(',', ':')).encode()) < 4096 for row in allocations))
-        self.assertEqual(self.db.read_bytes(), before)
-        queries = [json.loads(line) for line in (self.root / 'journal-calls.jsonl').read_text().splitlines()]
-        query = next(query for query in queries if '--grep=' + diagnostic.SHMEM_PREFIX in query)
-        self.assertIn('KUASAR_SANDBOX_ID=target-a', query)
-        self.assertIn('KUASAR_RUN_ID=current-target-a', query)
-        self.assertIn('SYSLOG_IDENTIFIER=sandbox-ctl', query)
-        self.assertEqual(query[query.index('-n') + 1], '+18')
-        self.assertIn('_PID', next(arg for arg in query if arg.startswith('--output-fields=')))
-
-    def test_shmem_quota_is_independent_and_failure_run_beats_live_secondary(self):
-        entries = [self.entry('target-a'), self.shmem_entry()]
-        entries += [self.shmem_entry(event='insert', seq=seq) for seq in range(2, 18)]
-        entries += [self.shmem_entry(event='closed', seq=18, matched=16, emitted=16)]
-        entries += [self.guard_entry(event=event) for event in ('attempt', 'armed', 'closed')]
-        entries += [self.trace_entry('target-a', seq=seq, version=2) for seq in range(1, 33)]
-        entries += [self.trace_entry('target-a', event='summary', version=2)]
-        entries += [self.shmem_entry('target-b'), self.shmem_entry('target-b', event='insert')]
-        entries += [self.guard_entry('target-b', event=event) for event in ('attempt', 'armed')]
-        # A missing guard fault in an active SECOND used to outrank the closed
-        # backend from FIRST, even though FIRST reported the corrupt held page.
-        self.write_journal(entries)
-        self.log.write_text('\n'.join(json.dumps(dict(sid='target-a', msg='pause capture completed',
-                                                      generation=index)) for index in range(80)))
-        records = self.run_diagnostic()
-        allocations = [row for row in records if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-        guards = [row for row in records if row['lifecycle_diagnostic'].startswith('uffd_backend_')]
-        traces = [row for row in records if row['lifecycle_diagnostic'] == 'uffd_page_trace']
-        business = [row for row in records if row not in allocations and row not in guards and row not in traces]
-        self.assertEqual(len(allocations), 18)
-        self.assertEqual(len(guards), 3)
-        self.assertTrue(all(row['sid'] == 'target-a' for row in allocations + guards))
-        self.assertEqual(guards[-1]['event'], 'closed')
-        self.assertEqual(len(traces), 33)
-        self.assertEqual(len(business), diagnostic.MAX_RECORDS)
-        self.assertTrue(any('held-memory contents changed' in row.get('MESSAGE', '') for row in business))
-        self.assertEqual(sum(row['lifecycle_diagnostic'] == 'snapshot_page' for row in business), 1)
-
-    def test_shmem_selects_known_failed_run_without_borrowing_new_run_snapshot(self):
-        with sqlite3.connect(self.db) as db:
-            db.execute("UPDATE sandboxes SET state='running', run_id='active-target-a' WHERE id='target-a'")
-        entries = [self.entry('target-a'), self.shmem_entry(), self.shmem_entry(event='insert'),
-                   self.shmem_entry(event='closed'), self.shmem_entry(run='active-target-a')]
-        entries += [self.guard_entry(event=event) for event in ('attempt', 'armed', 'closed')]
-        self.write_journal(entries)
-        records = self.run_diagnostic()
-        diagnostics = [row for row in records if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation'
-                       or row['lifecycle_diagnostic'].startswith('uffd_backend_')]
-        self.assertEqual(len(diagnostics), 6)
-        self.assertTrue(all(row['run_id'] == 'current-target-a' for row in diagnostics))
-        self.assertEqual(self.calls(), [])
-
-    def test_shmem_rejects_untrusted_sources_and_raw_fallback(self):
-        os.environ['PAGE_TEST_JOURNAL_UNFILTERED'] = '1'
-        cases = [self.shmem_entry('foreign'), self.shmem_entry(run='obsolete'),
-                 self.shmem_entry(run='current-target-b'), self.shmem_entry(journal=dict(_PID='4321')),
-                 self.shmem_entry(journal=dict(_PID=1234)),
-                 self.shmem_entry(journal=dict(SYSLOG_IDENTIFIER='console')),
-                 self.shmem_entry(journal=dict(_TRANSPORT='stdout')),
-                 self.shmem_entry(journal=dict(_BOOT_ID='invalid')),
-                 self.shmem_entry(journal=dict(_SYSTEMD_UNIT='unit\nDO_NOT_EMIT')),
-                 self.shmem_entry(journal=dict(__CURSOR='invalid cursor')),
-                 self.shmem_entry(page=diagnostic.TRACE_PAGE + 4096),
-                 self.shmem_entry(error='failed DO_NOT_EMIT_ERROR')]
-        for entry in cases:
-            with self.subTest(entry=entry):
-                self.write_journal([entry])
-                records = self.run_diagnostic(probe=False)
-                self.assertFalse(any(row['lifecycle_diagnostic'] == 'uffd_shmem_allocation' for row in records))
-                self.assertNotIn('DO_NOT_EMIT', json.dumps(records))
-
-    def test_shmem_requires_same_producer_identity_and_window(self):
-        os.environ['PAGE_TEST_JOURNAL_UNFILTERED'] = '1'
-        invalid = [dict(pid=4321), dict(memfd_dev=2), dict(memfd_ino=456),
-                   dict(index=diagnostic.TRACE_PAGE // 4096 + 2),
-                   dict(index=diagnostic.TRACE_PAGE // 4096 - 3),
-                   dict(frames=['0xffff800000001234']), dict(frames=['failed DO_NOT_EMIT']),
-                   dict(frames=['kernel_fn(']), dict(frames=['kernel_fn'] * 33)]
-        for changes in invalid:
-            with self.subTest(changes=changes):
-                self.write_journal([self.shmem_entry(), self.shmem_entry(event='insert', **changes)])
-                allocations = [row for row in self.run_diagnostic(probe=False)
-                               if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-                self.assertEqual([row['event'] for row in allocations], ['armed'])
-        for journal in (dict(_BOOT_ID='c' * 32), dict(_SYSTEMD_UNIT='runner@other.service')):
-            with self.subTest(journal=journal):
-                self.write_journal([self.shmem_entry(), self.shmem_entry(event='insert', journal=journal)])
-                allocations = [row for row in self.run_diagnostic(probe=False)
-                               if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-                self.assertEqual([row['event'] for row in allocations], ['armed'])
-        self.write_journal([self.shmem_entry(), self.shmem_entry(event='insert', seq=2),
-                            self.shmem_entry(event='insert', seq=2),
-                            self.shmem_entry(event='insert', seq=3, index=1021, nr_pages=2,
-                                             inserter_pid=0, inserter_tid=0, comm='swapper/0'),
-                            self.shmem_entry(event='closed', seq=4, emitted=2, matched=2),
-                            self.shmem_entry(event='insert', seq=4)])
-        allocations = [row for row in self.run_diagnostic(probe=False)
-                       if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-        self.assertEqual([row['seq'] for row in allocations], [1, 2, 3, 4])
-
-    def test_shmem_explicit_failure_is_preserved_without_claiming_no_allocation(self):
-        self.write_journal([self.entry('target-a'), self.shmem_entry(event='failed', stage='btf', errno=2),
-                            self.shmem_entry('target-b'), self.shmem_entry('target-b', event='insert')])
-        allocations = [row for row in self.run_diagnostic(probe=False)
-                       if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-        self.assertEqual(len(allocations), 1)
-        self.assertEqual((allocations[0]['sid'], allocations[0]['event'], allocations[0]['stage']),
-                         ('target-a', 'failed', 'btf'))
-        self.assertNotIn('complete', allocations[0])
-
-    def test_shmem_capture_preserves_frame_boundary_and_rejects_oversized_duplicate_json(self):
-        valid = self.shmem_entry(event='insert', frames=['f' * 96] * 32)
-        self.assertLess(len(valid['MESSAGE'].encode()), diagnostic.MAX_SHMEM_MESSAGE)
-        duplicate = dict(valid, MESSAGE=valid['MESSAGE'][:-1] + ', "pid": 1234}')
-        oversized = dict(valid, MESSAGE='x' * (4096 - len(valid['MESSAGE'])) + valid['MESSAGE'])
-        malformed = dict(valid, MESSAGE=diagnostic.SHMEM_PREFIX + 'failed DO_NOT_EMIT_INVALID_JSON')
-        self.write_journal([self.shmem_entry(), duplicate, oversized, malformed,
-                            self.shmem_entry(event='insert', frames=['f' * 96] * 33), valid,
-                            self.shmem_entry(event='closed')])
-        records = self.run_diagnostic(probe=False)
-        allocations = [row for row in records if row['lifecycle_diagnostic'] == 'uffd_shmem_allocation']
-        self.assertEqual([row['event'] for row in allocations], ['armed', 'insert', 'closed'])
-        self.assertEqual(allocations[1]['frames'], ['f' * 96] * 32)
-        self.assertNotIn('DO_NOT_EMIT', json.dumps(records))
-
-    def test_missing_failure_run_diagnostics_do_not_select_an_unrelated_live_run(self):
-        self.write_journal([self.entry('target-a'), self.shmem_entry('target-b'),
-                            self.shmem_entry('target-b', event='insert'), self.guard_entry('target-b')])
-        records = self.run_diagnostic(probe=False)
-        self.assertFalse(any(row['lifecycle_diagnostic'] == 'uffd_shmem_allocation'
-                             or row['lifecycle_diagnostic'].startswith('uffd_backend_') for row in records))
-
-    def test_shmem_query_timeout_reaps_child_and_preserves_business_evidence(self):
-        os.environ['PAGE_TEST_JOURNAL_MODE'] = 'shmem-timeout'
-        self.log.write_text(json.dumps(dict(sid='target-a', msg='pause capture completed')))
-        stream = io.StringIO()
-        started = time.monotonic()
-        diagnostic.emit_failure_evidence(self.db, self.log, ['target-a'], stream=stream)
-        self.assertLess(time.monotonic() - started, 5)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int((self.root / 'journal.pid').read_text()), 0)
-        records = [json.loads(line) for line in stream.getvalue().splitlines()]
-        self.assertTrue(any(row['lifecycle_diagnostic'] == 'state' for row in records))
-        self.assertTrue(any(row['lifecycle_diagnostic'] == 'conductor' for row in records))
-        self.assertTrue(any('held-memory contents changed' in row.get('MESSAGE', '') for row in records))
-
-
-class BackendGuardSchema(unittest.TestCase):
-    def parse(self, record):
-        return diagnostic.memory_backend_guard(diagnostic.GUARD_PREFIX + json.dumps(record))
-
-    def test_events_have_exact_fixed_fields_types_and_bounds(self):
-        for event in ('attempt', 'armed', 'failed', 'closed'):
-            record = guard_record(event)
-            self.assertEqual(self.parse(record), record)
-            for key in record:
-                with self.subTest(event=event, missing=key):
-                    reduced = dict(record)
-                    del reduced[key]
-                    self.assertIsNone(self.parse(reduced))
-                if type(record[key]) is int:
-                    for invalid in (True, False, '1', None, 1.5, -(1 << 65), 1 << 65):
-                        with self.subTest(event=event, key=key, invalid=invalid):
-                            self.assertIsNone(self.parse(dict(record, **{key: invalid})))
-            self.assertIsNone(self.parse(dict(record, token='DO_NOT_EMIT')))
-        self.assertIsNotNone(self.parse(guard_record('failed', reason='target', errno=22,
-                                                    page=0, target_va=0, target_valid=False)))
-        self.assertIsNotNone(self.parse(guard_record('failed', errno=-1)))
-        for changes in (dict(v=2), dict(seq=1), dict(page=1), dict(target_valid=1),
-                        dict(target_va=1), dict(backend_va=0), dict(length=8192),
-                        dict(guard_fd=-1), dict(host_page_size=65536), dict(errno=1),
-                        dict(event='fault'), dict(reason='DO_NOT_EMIT')):
-            self.assertIsNone(self.parse(guard_record(**changes)))
-
-    def test_duplicate_json_encoded_size_and_malformed_values_are_rejected(self):
-        valid = diagnostic.GUARD_PREFIX + json.dumps(guard_record())
-        self.assertIsNone(diagnostic.memory_backend_guard(valid[:-1] + ', "pid": 1234}'))
-        for message in (None, 1, diagnostic.GUARD_PREFIX + 'null', diagnostic.GUARD_PREFIX + '[]',
-                        diagnostic.GUARD_PREFIX + '{', diagnostic.GUARD_PREFIX + '[' * 1000,
-                        'x' * 2048 + valid, '\u00e9' * 900 + valid):
-            self.assertIsNone(diagnostic.memory_backend_guard(message))
 
 
 class MemoryPageTraceSchema(unittest.TestCase):
@@ -859,91 +428,7 @@ class MemoryPageTraceSchema(unittest.TestCase):
                 self.assertIsNone(diagnostic.memory_page_trace(malformed))
 
 
-class ShmemAllocationSchema(unittest.TestCase):
-    def parse(self, record):
-        return diagnostic.memory_shmem_allocation(diagnostic.SHMEM_PREFIX + json.dumps(record))
-
-    def test_all_events_and_collection_failure_stages(self):
-        for event in ('armed', 'failed', 'insert', 'closed'):
-            with self.subTest(event=event):
-                record = shmem_record(event)
-                self.assertEqual(self.parse(record), record)
-                for field in record:
-                    missing = dict(record)
-                    del missing[field]
-                    self.assertIsNone(self.parse(missing))
-                self.assertIsNone(self.parse(dict(record, error='DO_NOT_EMIT')))
-        for stage in ('parse', 'identity', 'btf', 'maps', 'program', 'attach_return', 'attach_entry', 'reader'):
-            self.assertIsNotNone(self.parse(shmem_record('failed', stage=stage, page=0,
-                                                        memfd_dev=0, memfd_ino=0, errno=-1)))
-        self.assertIsNone(self.parse(shmem_record('failed', stage='failed DO_NOT_EMIT')))
-        self.assertIsNone(self.parse(shmem_record('failed', page=1)))
-        self.assertIsNotNone(self.parse(shmem_record(window_end=diagnostic.TRACE_PAGE + 4096)))
-        self.assertIsNone(self.parse(shmem_record(window_end=diagnostic.TRACE_PAGE + 6144)))
-        self.assertIsNone(self.parse(shmem_record(window_start=diagnostic.TRACE_PAGE - 4096)))
-
-    def test_numeric_fields_reject_boolean_wrong_types_and_overflow(self):
-        maximum = (1 << 64) - 1
-        common = dict(v=(1, 1), pid=(1, (1 << 31) - 1), memfd_dev=(0, maximum), memfd_ino=(1, maximum))
-        bounds = {
-            'armed': dict(common, seq=(1, 1), page=(diagnostic.TRACE_PAGE, diagnostic.TRACE_PAGE),
-                          page_size=(4096, 4096), max_records=(16, 16)),
-            'failed': dict(errno=(-1, 4095)),
-            'insert': dict(seq=(2, 17), inserter_pid=(0, (1 << 31) - 1),
-                           inserter_tid=(0, (1 << 31) - 1), index=(0, maximum // 4096),
-                           nr_pages=(1, 1048576), ktime_ns=(0, maximum),
-                           result=(-(1 << 31), (1 << 31) - 1), stack_errno=(-4095, 0)),
-            'closed': dict(matched=(0, maximum), emitted=(0, 16), dropped=(0, maximum),
-                           pending=(0, 64), nested=(0, maximum), entry_missed=(-1, maximum),
-                           return_missed=(-1, maximum), errno=(-1, 4095)),
-        }
-        for event, fields in bounds.items():
-            for field, (low, high) in fields.items():
-                for invalid in (True, False, 1.0, '1', None, low - 1, high + 1):
-                    with self.subTest(event=event, field=field, invalid=invalid):
-                        self.assertIsNone(self.parse(shmem_record(event, **{field: invalid})))
-        self.assertIsNone(self.parse(shmem_record('insert', index=maximum // 4096, nr_pages=2)))
-        self.assertIsNotNone(self.parse(shmem_record('insert', index=maximum // 4096,
-                                                    ktime_ns=maximum, result=-(1 << 31))))
-        self.assertIsNotNone(self.parse(shmem_record('insert', nr_pages=1048576,
-                                                    result=(1 << 31) - 1, stack_errno=-4095, frames=[])))
-        self.assertIsNotNone(self.parse(shmem_record('closed', seq=18, emitted=16, matched=maximum,
-                                                    dropped=maximum, pending=64, nested=maximum,
-                                                    entry_missed=maximum, return_missed=-1)))
-        self.assertIsNone(self.parse(shmem_record('closed', seq=4, emitted=1)))
-
-    def test_frames_are_bounded_symbols_without_addresses_or_arguments(self):
-        record = shmem_record('insert', frames=['kernel_fn.constprop.0+0xff'] * 32, comm='c' * 16)
-        self.assertEqual(self.parse(record), record)
-        self.assertIsNotNone(self.parse(shmem_record('insert', frames=['f' * 96, 'unknown'], comm='')))
-        for frames in (None, {}, 'kernel_fn', [1], [''], ['f' * 97], ['kernel_fn'] * 33,
-                       ['0xffff800000001234'], ['0xffff800000001234+0x1'],
-                       ['kernel_fn(0x1234)'], ['kernel_fn\nDO_NOT_EMIT'], ['kernel_\u00e9']):
-            with self.subTest(frames=frames):
-                self.assertIsNone(self.parse(shmem_record('insert', frames=frames)))
-        for comm in ('c' * 17, 'worker\n', 'worker\x00', '\u00e9', None, 1):
-            self.assertIsNone(self.parse(shmem_record('insert', comm=comm)))
-        self.assertIsNone(self.parse(shmem_record('insert', stack_errno=-1)))
-        self.assertIsNotNone(self.parse(shmem_record('insert', stack_errno=-1, frames=[])))
-        self.assertIsNone(self.parse(shmem_record('insert', pid_scope='backend')))
-
-    def test_exact_byte_limit_duplicate_fields_and_non_objects(self):
-        record = shmem_record('insert')
-        message = diagnostic.SHMEM_PREFIX + json.dumps(record)
-        self.assertEqual(diagnostic.memory_shmem_allocation('x' * (4095 - len(message)) + message), record)
-        self.assertIsNone(diagnostic.memory_shmem_allocation('x' * (4096 - len(message)) + message))
-        self.assertIsNone(diagnostic.memory_shmem_allocation('\u00e9' * 2048 + message))
-        self.assertIsNone(diagnostic.memory_shmem_allocation('\ud800' + message))
-        duplicate = diagnostic.SHMEM_PREFIX + json.dumps(record)[:-1] + ', "pid": 1234}'
-        for value in (duplicate, diagnostic.SHMEM_PREFIX + '{}', diagnostic.SHMEM_PREFIX + '[]',
-                      diagnostic.SHMEM_PREFIX + 'null', diagnostic.SHMEM_PREFIX + '{',
-                      diagnostic.SHMEM_PREFIX + '[' * 1000 + ']' * 1000, None, 1):
-            self.assertIsNone(diagnostic.memory_shmem_allocation(value))
-        for event in ([], {}, 1, None, 'unknown'):
-            self.assertIsNone(self.parse(dict(shmem_record('insert'), event=event)))
-
-
-class ExecuteMemoryTraceWrapper(unittest.TestCase):
+class ExecuteProductionWrapper(unittest.TestCase):
     def test_actual_wrapper_preserves_argv_exit_and_readiness_for_all_marker_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -978,8 +463,8 @@ raise SystemExit(37)
             cases = [
                 ('absent', None, ['run', '--restore', 'file://saved'], None),
                 ('cold', b'4194304\n', ['run', '--config', 'cold.yaml'], None),
-                ('restore', b'4194304\n', ['run', '--restore', 'file://saved'], '4194304'),
-                ('restore-equals', b'4194304\n', ['run', '--restore=file://saved'], '4194304'),
+                ('restore', b'4194304\n', ['run', '--restore', 'file://saved'], None),
+                ('restore-equals', b'4194304\n', ['run', '--restore=file://saved'], None),
                 ('non-run', b'4194304\n', ['exec', '--restore=file://saved'], None),
                 ('after-delimiter', b'4194304\n', ['run', '--', '--restore=file://saved'], None),
                 ('malformed', b'4194304; echo injected\n', ['run', '--restore=file://saved'], None),
