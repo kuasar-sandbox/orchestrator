@@ -3,12 +3,13 @@ package configsock
 import "errors"
 
 // BuildTaskSchemaVersion gates the BuildSpec wire contract independently from
-// ArtifactPrepareSchemaVersion. Version 7 carries the node runtime timeout
-// policy; earlier workers would silently discard it. Version 6 requires source
+// ArtifactPrepareSchemaVersion. Version 8 carries aggregate and per-disk
+// diffstore QoS; earlier workers would silently discard the new resource fields.
+// Version 7 carries the node runtime timeout policy. Version 6 requires source
 // command presence for target-specific preparation. Version 5 separates checkpoint-location policy
 // from image-class Bundle publication and intentionally removes the old broad
 // publish_location_parent field.
-const BuildTaskSchemaVersion = 7
+const BuildTaskSchemaVersion = 8
 
 // BuildTaskRequest identifies one exact assigned run-builder incarnation.
 type BuildTaskRequest struct {

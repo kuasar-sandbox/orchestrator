@@ -26,7 +26,30 @@ func (c *ResourceDiffCOW) UnmarshalYAML(node *yaml.Node) error {
 	}
 	for field, value := range fields {
 		switch field {
-		case "cache_size", "max_dirty_size":
+		case "cache_size", "max_dirty_size", "max_dirty_size_per_disk", "read_bandwidth", "write_bandwidth", "read_bandwidth_per_disk", "write_bandwidth_per_disk":
+			var decoded any
+			if err := value.Decode(&decoded); err != nil {
+				return fmt.Errorf("sandbox.resources.diff_cow.%s: %w", field, err)
+			}
+			if decoded == nil {
+				return fmt.Errorf("sandbox.resources.diff_cow.%s must be a size", field)
+			}
+		case "read_iops", "write_iops", "read_iops_per_disk", "write_iops_per_disk":
+			var decoded any
+			if err := value.Decode(&decoded); err != nil {
+				return fmt.Errorf("sandbox.resources.diff_cow.%s: %w", field, err)
+			}
+			// Decode aliases before checking the scalar type. yaml.v3 otherwise
+			// permits integral floats when assigning directly to uint64.
+			switch decoded.(type) {
+			case int, uint64:
+			default:
+				return fmt.Errorf("sandbox.resources.diff_cow.%s must be a nonnegative integer", field)
+			}
+			var count uint64
+			if err := value.Decode(&count); err != nil {
+				return fmt.Errorf("sandbox.resources.diff_cow.%s must be a nonnegative integer: %w", field, err)
+			}
 		case "cache_idle_after":
 			var decoded any
 			if err := value.Decode(&decoded); err != nil {

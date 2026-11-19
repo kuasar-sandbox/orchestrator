@@ -97,6 +97,15 @@ func (c *Conductor) Clone() *Conductor {
 	if cow := c.Sandbox.Resources.DiffCOW; cow != nil {
 		out.Sandbox.Resources.DiffCOW = &ResourceDiffCOW{
 			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
+			ReadBandwidth:         clonePtr(cow.ReadBandwidth),
+			WriteBandwidth:        clonePtr(cow.WriteBandwidth),
+			ReadIOPS:              clonePtr(cow.ReadIOPS),
+			WriteIOPS:             clonePtr(cow.WriteIOPS),
+			MaxDirtySizePerDisk:   clonePtr(cow.MaxDirtySizePerDisk),
+			ReadBandwidthPerDisk:  clonePtr(cow.ReadBandwidthPerDisk),
+			WriteBandwidthPerDisk: clonePtr(cow.WriteBandwidthPerDisk),
+			ReadIOPSPerDisk:       clonePtr(cow.ReadIOPSPerDisk),
+			WriteIOPSPerDisk:      clonePtr(cow.WriteIOPSPerDisk),
 		}
 	}
 	if c.Sandbox.Resources.Startup != nil {
@@ -472,14 +481,23 @@ type ResourcesConfig struct {
 	DiffCOW       *ResourceDiffCOW       `yaml:"diff_cow,omitempty" json:"diff_cow,omitempty"`
 }
 
-// ResourceDiffCOW configures the host cache and cold-start ext4 mount policy
-// shared by a sandbox's writable disks. An omitted dirty limit follows the final
-// cache size after request overrides; an omitted Discard means auto.
+// ResourceDiffCOW configures one shared host cache, aggregate and uniform
+// per-disk limits, and the cold-start ext4 mount policy. Omitted leaves inherit;
+// final omitted or zero limits impose no extra ceiling. Discard defaults to auto.
 type ResourceDiffCOW struct {
-	CacheSize      *string `yaml:"cache_size,omitempty" json:"cache_size,omitempty"`
-	MaxDirtySize   *string `yaml:"max_dirty_size,omitempty" json:"max_dirty_size,omitempty"`
-	CacheIdleAfter *string `yaml:"cache_idle_after,omitempty" json:"cache_idle_after,omitempty"`
-	Discard        *string `yaml:"discard,omitempty" json:"discard,omitempty"`
+	CacheSize             *string `yaml:"cache_size,omitempty" json:"cache_size,omitempty"`
+	MaxDirtySize          *string `yaml:"max_dirty_size,omitempty" json:"max_dirty_size,omitempty"`
+	CacheIdleAfter        *string `yaml:"cache_idle_after,omitempty" json:"cache_idle_after,omitempty"`
+	Discard               *string `yaml:"discard,omitempty" json:"discard,omitempty"`
+	ReadBandwidth         *string `yaml:"read_bandwidth,omitempty" json:"read_bandwidth,omitempty"`
+	WriteBandwidth        *string `yaml:"write_bandwidth,omitempty" json:"write_bandwidth,omitempty"`
+	ReadIOPS              *uint64 `yaml:"read_iops,omitempty" json:"read_iops,omitempty"`
+	WriteIOPS             *uint64 `yaml:"write_iops,omitempty" json:"write_iops,omitempty"`
+	MaxDirtySizePerDisk   *string `yaml:"max_dirty_size_per_disk,omitempty" json:"max_dirty_size_per_disk,omitempty"`
+	ReadBandwidthPerDisk  *string `yaml:"read_bandwidth_per_disk,omitempty" json:"read_bandwidth_per_disk,omitempty"`
+	WriteBandwidthPerDisk *string `yaml:"write_bandwidth_per_disk,omitempty" json:"write_bandwidth_per_disk,omitempty"`
+	ReadIOPSPerDisk       *uint64 `yaml:"read_iops_per_disk,omitempty" json:"read_iops_per_disk,omitempty"`
+	WriteIOPSPerDisk      *uint64 `yaml:"write_iops_per_disk,omitempty" json:"write_iops_per_disk,omitempty"`
 }
 
 // UnmarshalJSON preserves the public schema's strict nested JSON decoding.
@@ -565,6 +583,15 @@ func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 	if cow := r.DiffCOW; cow != nil {
 		policy.DiffCOW = &sandboxcfg.DiffCOWPatch{
 			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
+			ReadBandwidth:         clonePtr(cow.ReadBandwidth),
+			WriteBandwidth:        clonePtr(cow.WriteBandwidth),
+			ReadIOPS:              clonePtr(cow.ReadIOPS),
+			WriteIOPS:             clonePtr(cow.WriteIOPS),
+			MaxDirtySizePerDisk:   clonePtr(cow.MaxDirtySizePerDisk),
+			ReadBandwidthPerDisk:  clonePtr(cow.ReadBandwidthPerDisk),
+			WriteBandwidthPerDisk: clonePtr(cow.WriteBandwidthPerDisk),
+			ReadIOPSPerDisk:       clonePtr(cow.ReadIOPSPerDisk),
+			WriteIOPSPerDisk:      clonePtr(cow.WriteIOPSPerDisk),
 		}
 	}
 	return policy
@@ -575,6 +602,15 @@ func (r *ResourcesConfig) setNodeResourcePolicy(policy sandboxcfg.NodeResourcePo
 	if cow := policy.DiffCOW; cow != nil {
 		r.DiffCOW = &ResourceDiffCOW{
 			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize), CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
+			ReadBandwidth:         clonePtr(cow.ReadBandwidth),
+			WriteBandwidth:        clonePtr(cow.WriteBandwidth),
+			ReadIOPS:              clonePtr(cow.ReadIOPS),
+			WriteIOPS:             clonePtr(cow.WriteIOPS),
+			MaxDirtySizePerDisk:   clonePtr(cow.MaxDirtySizePerDisk),
+			ReadBandwidthPerDisk:  clonePtr(cow.ReadBandwidthPerDisk),
+			WriteBandwidthPerDisk: clonePtr(cow.WriteBandwidthPerDisk),
+			ReadIOPSPerDisk:       clonePtr(cow.ReadIOPSPerDisk),
+			WriteIOPSPerDisk:      clonePtr(cow.WriteIOPSPerDisk),
 		}
 	}
 	r.Capacity = ResourceCapacity{CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory}

@@ -275,7 +275,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   支持的 RunRoot 下仍不超过 Linux `sun_path`。
 
 - `POST /internal/task/build/bootstrap`(run-builder;req `{build_id,run_id,version}`)
-  当前 BuildTask schema 为 v7（v7 携带当前节点的 runtime 启动超时策略；v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
+  当前 BuildTask schema 为 v8（v8 在执行与目标资源中携带整体及单盘 diffstore QoS；v7 携带当前节点的 runtime 启动超时策略；v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
   删除旧 broad `publish_location_parent`；v4 增加 register-time requested target，并把 SBX/SNP
   source 收敛为通用 cold Sandbox E；v3 以 `run_dir`/`base_dir` 替代混合语义 workdir，
   `checkpoint_mode` 自 v2 起必需),sandbox ArtifactPrepare
@@ -283,7 +283,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   Bundle 内 E/image 的 carrier scope，以及 portable allocatable/deflate resource defaults；v2 以 typed E/S、durable
   LaunchMode 和 bounded network/disk summary 取代旧 v1 Snapshot-only wire),两个版本号独立演进；bootstrap 和 build prepare 的版本不匹配均在读取
   secret-bearing provider 前返回 400,
-  防止旧 task 静默忽略必需的 publication 语义。参见 [build_task.go](../internal/configsock/build_task.go)
+  防止旧 task 静默忽略 QoS 或必需的 publication 语义。部署配套 node-ctl 与 Conductor 时须替换旧预启动 builder 单元，参见 [QoS 升级与回退](node-resource_zh.md#diff-cow-qos)。参见 [build_task.go](../internal/configsock/build_task.go)
   与 [sandbox_task.go](../internal/configsock/sandbox_task.go)。v6 引入的可选 Build-only 命令存在性摘要与 digest 字段仍受当前 BuildTask gate 保护,不回传命令文本;普通 Sandbox preparation 不使用该 Build-only 字段。认证后返回 task env 与 exactly one of
   `Final|Prepare`。Final 是
   **BuildSpec(构建工作单)**:`{build_id, profile, run_dir, base_dir, from_image | from_template

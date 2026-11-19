@@ -21,8 +21,8 @@ const resourceFieldPath = NsResource
 var ErrInvalidResourceRequest = errors.New("invalid sandbox resource request")
 
 // ResourcePatch is the complete tenant-configurable resource surface. Every
-// leaf is a pointer so an omitted value remains distinguishable from an
-// explicitly invalid zero or empty value.
+// leaf is a pointer so omission remains distinguishable from explicit zero or
+// empty values, with validation owned by each leaf.
 type ResourcePatch struct {
 	Capacity    *CapacityPatch    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *AllocatablePatch `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
@@ -44,14 +44,23 @@ type StartupPatch struct {
 	Memory *string `json:"memory,omitempty" yaml:"memory,omitempty"`
 }
 
-// DiffCOWPatch preserves the host cache limits and cold-start ext4 mount policy
-// explicitly configured by the operator or tenant. Derived limits belong to
-// the final runtime config.
+// DiffCOWPatch preserves the host cache, diffstore limits and cold-start ext4
+// mount policy explicitly configured by the operator or tenant. Omitted leaves
+// inherit; explicit zero limits clear inherited ceilings.
 type DiffCOWPatch struct {
-	CacheSize      *string `json:"cache_size,omitempty" yaml:"cache_size,omitempty"`
-	MaxDirtySize   *string `json:"max_dirty_size,omitempty" yaml:"max_dirty_size,omitempty"`
-	CacheIdleAfter *string `json:"cache_idle_after,omitempty" yaml:"cache_idle_after,omitempty"`
-	Discard        *string `json:"discard,omitempty" yaml:"discard,omitempty"`
+	CacheSize             *string `json:"cache_size,omitempty" yaml:"cache_size,omitempty"`
+	MaxDirtySize          *string `json:"max_dirty_size,omitempty" yaml:"max_dirty_size,omitempty"`
+	CacheIdleAfter        *string `json:"cache_idle_after,omitempty" yaml:"cache_idle_after,omitempty"`
+	Discard               *string `json:"discard,omitempty" yaml:"discard,omitempty"`
+	ReadBandwidth         *string `json:"read_bandwidth,omitempty" yaml:"read_bandwidth,omitempty"`
+	WriteBandwidth        *string `json:"write_bandwidth,omitempty" yaml:"write_bandwidth,omitempty"`
+	ReadIOPS              *uint64 `json:"read_iops,omitempty" yaml:"read_iops,omitempty"`
+	WriteIOPS             *uint64 `json:"write_iops,omitempty" yaml:"write_iops,omitempty"`
+	MaxDirtySizePerDisk   *string `json:"max_dirty_size_per_disk,omitempty" yaml:"max_dirty_size_per_disk,omitempty"`
+	ReadBandwidthPerDisk  *string `json:"read_bandwidth_per_disk,omitempty" yaml:"read_bandwidth_per_disk,omitempty"`
+	WriteBandwidthPerDisk *string `json:"write_bandwidth_per_disk,omitempty" yaml:"write_bandwidth_per_disk,omitempty"`
+	ReadIOPSPerDisk       *uint64 `json:"read_iops_per_disk,omitempty" yaml:"read_iops_per_disk,omitempty"`
+	WriteIOPSPerDisk      *uint64 `json:"write_iops_per_disk,omitempty" yaml:"write_iops_per_disk,omitempty"`
 }
 
 // NodeResourcePolicy is conductor-owned policy, deliberately narrower than
@@ -323,21 +332,50 @@ func parseDiffCOWPatch(path string, raw json.RawMessage) (*DiffCOWPatch, error) 
 	}
 	out := &DiffCOWPatch{}
 	for field, raw := range object {
-		var value string
+		var stringField **string
+		var integerField **uint64
 		switch field {
 		case "cache_size":
-			out.CacheSize = &value
+			stringField = &out.CacheSize
 		case "max_dirty_size":
-			out.MaxDirtySize = &value
+			stringField = &out.MaxDirtySize
 		case "cache_idle_after":
-			out.CacheIdleAfter = &value
+			stringField = &out.CacheIdleAfter
 		case "discard":
-			out.Discard = &value
+			stringField = &out.Discard
+		case "read_bandwidth":
+			stringField = &out.ReadBandwidth
+		case "write_bandwidth":
+			stringField = &out.WriteBandwidth
+		case "read_iops":
+			integerField = &out.ReadIOPS
+		case "write_iops":
+			integerField = &out.WriteIOPS
+		case "max_dirty_size_per_disk":
+			stringField = &out.MaxDirtySizePerDisk
+		case "read_bandwidth_per_disk":
+			stringField = &out.ReadBandwidthPerDisk
+		case "write_bandwidth_per_disk":
+			stringField = &out.WriteBandwidthPerDisk
+		case "read_iops_per_disk":
+			integerField = &out.ReadIOPSPerDisk
+		case "write_iops_per_disk":
+			integerField = &out.WriteIOPSPerDisk
 		default:
 			return nil, fmt.Errorf("%s contains unknown field %q", path, field)
 		}
-		if err := decodeLeaf(path+"."+field, raw, &value); err != nil {
-			return nil, err
+		if integerField != nil {
+			var value uint64
+			if err := decodeLeaf(path+"."+field, raw, &value); err != nil {
+				return nil, err
+			}
+			*integerField = &value
+		} else {
+			var value string
+			if err := decodeLeaf(path+"."+field, raw, &value); err != nil {
+				return nil, err
+			}
+			*stringField = &value
 		}
 	}
 	return out, nil
@@ -371,6 +409,52 @@ func (p *DiffCOWPatch) runtimeConfig(root string) (rtconfig.DiffCOWConfig, error
 			return cfg, fmt.Errorf("%s.diff_cow.discard must not be empty", root)
 		}
 		cfg.Discard = *p.Discard
+	}
+	if p.ReadBandwidth != nil {
+		if *p.ReadBandwidth == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.read_bandwidth must not be empty", root)
+		}
+		cfg.ReadBandwidth = *p.ReadBandwidth
+	}
+	if p.WriteBandwidth != nil {
+		if *p.WriteBandwidth == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.write_bandwidth must not be empty", root)
+		}
+		cfg.WriteBandwidth = *p.WriteBandwidth
+	}
+	if p.ReadIOPS != nil {
+		value := *p.ReadIOPS
+		cfg.ReadIOPS = &value
+	}
+	if p.WriteIOPS != nil {
+		value := *p.WriteIOPS
+		cfg.WriteIOPS = &value
+	}
+	if p.MaxDirtySizePerDisk != nil {
+		if *p.MaxDirtySizePerDisk == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.max_dirty_size_per_disk must not be empty", root)
+		}
+		cfg.MaxDirtySizePerDisk = *p.MaxDirtySizePerDisk
+	}
+	if p.ReadBandwidthPerDisk != nil {
+		if *p.ReadBandwidthPerDisk == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.read_bandwidth_per_disk must not be empty", root)
+		}
+		cfg.ReadBandwidthPerDisk = *p.ReadBandwidthPerDisk
+	}
+	if p.WriteBandwidthPerDisk != nil {
+		if *p.WriteBandwidthPerDisk == "" {
+			return cfg, fmt.Errorf("%s.diff_cow.write_bandwidth_per_disk must not be empty", root)
+		}
+		cfg.WriteBandwidthPerDisk = *p.WriteBandwidthPerDisk
+	}
+	if p.ReadIOPSPerDisk != nil {
+		value := *p.ReadIOPSPerDisk
+		cfg.ReadIOPSPerDisk = &value
+	}
+	if p.WriteIOPSPerDisk != nil {
+		value := *p.WriteIOPSPerDisk
+		cfg.WriteIOPSPerDisk = &value
 	}
 	return cfg, nil
 }
@@ -412,6 +496,37 @@ func mergeDiffCOW(base, over *DiffCOWPatch) *DiffCOWPatch {
 		}
 		if layer.Discard != nil {
 			out.Discard = stringPtr(*layer.Discard)
+		}
+		if layer.ReadBandwidth != nil {
+			out.ReadBandwidth = stringPtr(*layer.ReadBandwidth)
+		}
+		if layer.WriteBandwidth != nil {
+			out.WriteBandwidth = stringPtr(*layer.WriteBandwidth)
+		}
+		if layer.ReadIOPS != nil {
+			value := *layer.ReadIOPS
+			out.ReadIOPS = &value
+		}
+		if layer.WriteIOPS != nil {
+			value := *layer.WriteIOPS
+			out.WriteIOPS = &value
+		}
+		if layer.MaxDirtySizePerDisk != nil {
+			out.MaxDirtySizePerDisk = stringPtr(*layer.MaxDirtySizePerDisk)
+		}
+		if layer.ReadBandwidthPerDisk != nil {
+			out.ReadBandwidthPerDisk = stringPtr(*layer.ReadBandwidthPerDisk)
+		}
+		if layer.WriteBandwidthPerDisk != nil {
+			out.WriteBandwidthPerDisk = stringPtr(*layer.WriteBandwidthPerDisk)
+		}
+		if layer.ReadIOPSPerDisk != nil {
+			value := *layer.ReadIOPSPerDisk
+			out.ReadIOPSPerDisk = &value
+		}
+		if layer.WriteIOPSPerDisk != nil {
+			value := *layer.WriteIOPSPerDisk
+			out.WriteIOPSPerDisk = &value
 		}
 	}
 	return out

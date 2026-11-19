@@ -1223,8 +1223,8 @@ Builder 总期限/步骤/readiness 保持各自职责。
 60 秒总期限。Sandbox bootstrap 版本 7 继续允许 `absolute_deadline_unix_nano` 为零或
 省略；正数是显式绝对截止，负数非法。版本 7 还要求首次 snp task 执行 runtime 准入。
 Conductor 与 sandbox runner 须部署配套版本；bootstrap 版本 6 会被拒绝，避免静默漏检。
-共用 prepare summary 保持版本 5；Builder 版本 7、正数 work deadline 及结果上报预留、
-cluster protocol 和 KMT V1 均不变。
+共用 prepare summary 保持版本 5；Builder 使用版本 8 传递 diffstore QoS，正数 work
+deadline 及结果上报预留、cluster protocol 和 KMT V1 保持既有行为。
 
 Manifest 打开复用 Sandboxer 的 `OpenManifestStream`/readretry，保留原 scoped
 fetcher、Bundle 身份和调用方 context。Builder 在自身 work deadline 内受益；
