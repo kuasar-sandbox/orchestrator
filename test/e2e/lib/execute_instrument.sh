@@ -19,9 +19,9 @@ done
 cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-unset SANDBOX_UFFD_TRACE_MEMFD_PAGE SANDBOX_UFFD_GUARD_BACKEND_PAGE
-# A case-owned marker enables one trace and one backend missing-page guard
-# only for restored runtimes. Neither diagnostic is a memory-correctness fix.
+unset SANDBOX_UFFD_TRACE_MEMFD_PAGE SANDBOX_UFFD_GUARD_BACKEND_PAGE SANDBOX_UFFD_TRACE_SHMEM_PAGE
+# A case-owned marker enables page and allocation traces only for restored
+# runtimes. Leave the backend VMA unguarded so this observation does not split it.
 if [ "\${1:-}" = "run" ] && [ -f "$WORK/trace-memory-page" ] && [ ! -L "$WORK/trace-memory-page" ]; then
     for arg in "\$@"; do
         case "\$arg" in
@@ -38,7 +38,7 @@ raise SystemExit(0 if enabled else 1)
 PY_TRACE
                 then
                     export SANDBOX_UFFD_TRACE_MEMFD_PAGE=4194304
-                    export SANDBOX_UFFD_GUARD_BACKEND_PAGE=4194304
+                    export SANDBOX_UFFD_TRACE_SHMEM_PAGE=4194304
                 fi
                 break
                 ;;

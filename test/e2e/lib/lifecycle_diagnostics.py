@@ -21,6 +21,11 @@ MAX_TRACE_RECORDS = 32
 TRACE_PREFIX = 'uffd-page-trace '
 GUARD_PREFIX = 'uffd-backend-guard '
 MAX_GUARD_RECORDS = 4
+SHMEM_PREFIX = 'uffd-shmem-allocation '
+MAX_SHMEM_RECORDS = 16
+MAX_SHMEM_LIFECYCLE = 2
+MAX_SHMEM_MESSAGE = 4096
+MAX_SHMEM_FRAMES = 32
 MAX_FAULT_LINES = 80
 MAX_FAULT_FRAMES = 12
 GUARD_JOURNAL_FIELDS = ','.join((
@@ -195,6 +200,141 @@ def guard_journal(arguments, deadline, count):
         data = data.rpartition(b'\n')[0]
     return [parse_line(line) for line in data.decode('utf-8', errors='replace').splitlines()[:count]
             if len(line) < 16384]
+
+
+def memory_shmem_allocation(message):
+    """Validate the bounded kernel-allocation schema without forwarding raw text."""
+    if not isinstance(message, str) or len(message) >= MAX_SHMEM_MESSAGE:
+        return None
+    _, marker, payload = message.partition(SHMEM_PREFIX)
+    if not marker:
+        return None
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate allocation field')
+            result[key] = value
+        return result
+
+    try:
+        if len(message.encode('utf-8')) >= MAX_SHMEM_MESSAGE:
+            return None
+        value = json.loads(payload, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    event = value.get('event')
+    fields = {'v', 'seq', 'event', 'pid', 'page', 'memfd_dev', 'memfd_ino'}
+    event_fields = {
+        'armed': {'window_start', 'window_end', 'page_size', 'max_records'},
+        'failed': {'stage', 'errno'},
+        'insert': {'inserter_pid', 'inserter_tid', 'pid_scope', 'comm', 'index', 'nr_pages',
+                   'ktime_ns', 'result', 'stack_errno', 'frames'},
+        'closed': {'matched', 'emitted', 'dropped', 'pending', 'nested',
+                   'entry_missed', 'return_missed', 'errno'},
+    }
+    if not isinstance(event, str) or event not in event_fields or set(value) != fields | event_fields[event]:
+        return None
+
+    def integer(key, low, high):
+        return type(value.get(key)) is int and low <= value[key] <= high
+
+    maximum = (1 << 64) - 1
+    if (not integer('v', 1, 1) or not integer('seq', 1, MAX_SHMEM_RECORDS + MAX_SHMEM_LIFECYCLE)
+            or not integer('pid', 1, (1 << 31) - 1)
+            or any(not integer(key, 0, maximum) for key in ('page', 'memfd_dev', 'memfd_ino'))):
+        return None
+    if event == 'failed':
+        if (value['seq'] != 1 or not isinstance(value['stage'], str)
+                or value['stage'] not in {'parse', 'identity', 'btf', 'maps', 'program',
+                                           'attach_return', 'attach_entry', 'reader'}
+                or not integer('errno', -1, 4095)
+                or value['page'] not in (0, TRACE_PAGE)):
+            return None
+        return value
+    if value['page'] != TRACE_PAGE or value['memfd_ino'] == 0:
+        return None
+    if event == 'armed':
+        if (value['seq'] != 1 or not integer('page_size', 4096, 4096)
+                or not integer('max_records', MAX_SHMEM_RECORDS, MAX_SHMEM_RECORDS)
+                or not integer('window_start', max(0, TRACE_PAGE - 8192), max(0, TRACE_PAGE - 8192))
+                or not integer('window_end', TRACE_PAGE + 4096, TRACE_PAGE + 8192)
+                or value['window_end'] % 4096):
+            return None
+    elif event == 'insert':
+        if (not integer('seq', 2, MAX_SHMEM_RECORDS + 1)
+                or any(not integer(key, 0, (1 << 31) - 1) for key in ('inserter_pid', 'inserter_tid'))
+                or value['pid_scope'] != 'initial'
+                or not isinstance(value['comm'], str)
+                or re.fullmatch(r'[\x20-\x7e]{0,16}', value['comm']) is None
+                or not integer('index', 0, maximum // 4096)
+                or not integer('nr_pages', 1, 1048576)
+                or value['index'] + value['nr_pages'] > 1 << 52
+                or not integer('ktime_ns', 0, maximum)
+                or not integer('result', -(1 << 31), (1 << 31) - 1)
+                or not integer('stack_errno', -4095, 0)):
+            return None
+        frames = value['frames']
+        if (not isinstance(frames, list) or len(frames) > MAX_SHMEM_FRAMES
+                or (value['stack_errno'] != 0 and frames)
+                or any(not isinstance(frame, str) or not 1 <= len(frame) <= 96
+                       or re.fullmatch(r'[A-Za-z0-9_.$:/-]+(?:\+0x[0-9a-fA-F]+)?', frame) is None
+                       or re.fullmatch(r'0x[0-9a-fA-F]+(?:\+0x[0-9a-fA-F]+)?', frame) is not None
+                       for frame in frames)):
+            return None
+    else:
+        if (not integer('emitted', 0, MAX_SHMEM_RECORDS)
+                or value['seq'] != value['emitted'] + 2
+                or any(not integer(key, 0, maximum) for key in ('matched', 'dropped', 'nested'))
+                or not integer('pending', 0, 64)
+                or any(not integer(key, -1, maximum) for key in ('entry_missed', 'return_missed'))
+                or not integer('errno', -1, 4095)):
+            return None
+    return value
+
+
+def shmem_allocation_evidence(sid, run_id, deadline):
+    """One authenticated backend identity, at most 16 insertions and two lifecycle records."""
+    if not run_id:
+        return []
+    entries = guard_journal([
+        'KUASAR_SANDBOX_ID=' + sid, 'KUASAR_RUN_ID=' + run_id,
+        'SYSLOG_IDENTIFIER=sandbox-ctl', '--grep=' + SHMEM_PREFIX], deadline,
+        MAX_SHMEM_RECORDS + MAX_SHMEM_LIFECYCLE)
+    records, identity, armed, last_sequence = [], None, None, 0
+    for entry in entries:
+        if (entry.get('KUASAR_SANDBOX_ID') != sid or entry.get('KUASAR_RUN_ID') != run_id
+                or entry.get('SYSLOG_IDENTIFIER') != 'sandbox-ctl' or entry.get('_TRANSPORT') != 'journal'):
+            continue
+        record = memory_shmem_allocation(entry.get('MESSAGE'))
+        if record is None:
+            continue
+        origin = guard_origin(entry, record['pid'])
+        if origin is None:
+            continue
+        candidate = (*origin, *(record[key] for key in ('pid', 'page', 'memfd_dev', 'memfd_ino')))
+        if identity is None:
+            if record['event'] not in ('armed', 'failed'):
+                continue
+            identity = candidate
+        if candidate != identity or record['seq'] <= last_sequence:
+            continue
+        if record['event'] == 'insert':
+            start, end = record['index'] * 4096, (record['index'] + record['nr_pages']) * 4096
+            if armed is None or start >= armed['window_end'] or end <= armed['window_start']:
+                continue
+        elif record['event'] == 'closed' and armed is None:
+            continue
+        records.append(dict(lifecycle_diagnostic='uffd_shmem_allocation', sid=sid, run_id=run_id, **record))
+        last_sequence = record['seq']
+        if record['event'] == 'armed':
+            armed = record
+        if record['event'] in ('failed', 'closed'):
+            break
+    return records
 
 
 def guard_origin(entry, pid):
@@ -557,7 +697,9 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
     emitted, run_ids = 0, set()
     trace_emitted, trace_summary_emitted = 0, False
     guard_emitted = 0
-    guard_candidate, guard_priority = [], 0
+    guard_candidate, guard_priority = [], (-1, -1)
+    shmem_emitted, shmem_lifecycle_emitted = 0, 0
+    shmem_candidate, shmem_priority = [], (-1, -1)
     states, page_probe_used = {}, False
 
     def emit(source, record):
@@ -598,6 +740,24 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
         except Exception:
             pass
         guard_emitted += 1
+
+    def emit_shmem(record):
+        nonlocal shmem_emitted, shmem_lifecycle_emitted
+        insertion = record['event'] == 'insert'
+        if ((insertion and shmem_emitted >= MAX_SHMEM_RECORDS)
+                or (not insertion and shmem_lifecycle_emitted >= MAX_SHMEM_LIFECYCLE)):
+            return
+        try:
+            encoded = json.dumps(record, sort_keys=True, separators=(',', ':'))
+            if len(encoded.encode('utf-8')) >= MAX_SHMEM_MESSAGE:
+                return
+            print(encoded, file=stream, flush=True)
+        except Exception:
+            pass
+        if insertion:
+            shmem_emitted += 1
+        else:
+            shmem_lifecycle_emitted += 1
 
     try:
         uri = Path(db_path).resolve().as_uri() + '?mode=ro'
@@ -652,17 +812,20 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                     emit('journal', dict(sid=sid, unavailable='exit', exit_code=result.returncode))
                     continue
                 entries = deque(maxlen=12)
-                fault_entry = None
+                faults = {}
                 record = states.get(sid, {})
                 current_run = (record.get('run_id') or record.get('dead_run_id')
                                or record.get('sandbox_result_run_id'))
+                known_runs = tuple(dict.fromkeys(run for run in
+                                  (current_run, record.get('dead_run_id'), record.get('sandbox_result_run_id'))
+                                  if run))
                 for line in tail_lines(output):
                     entry = parse_line(line)
                     message = entry.get('MESSAGE')
                     if entry.get('KUASAR_SANDBOX_ID') != sid or not isinstance(message, str):
                         continue
-                    if 'uffd-backend-guard' in message:
-                        # Immediate guard evidence has its own query and quota;
+                    if 'uffd-backend-guard' in message or 'uffd-shmem-allocation' in message:
+                        # Immediate evidence has its own queries and quotas;
                         # even malformed records must not leak through raw errors.
                         continue
                     if 'uffd-page-trace' in message:
@@ -675,27 +838,40 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                     if JOURNAL_ERROR.search(message):
                         entries.append(project(entry, ('__REALTIME_TIMESTAMP', 'KUASAR_RUN_ID', 'MESSAGE')))
                         fault = held_memory_fault(message)
-                        if fault is not None and current_run and entry.get('KUASAR_RUN_ID') == current_run:
-                            fault_entry = (current_run, fault)
+                        if fault is not None and entry.get('KUASAR_RUN_ID') in known_runs:
+                            faults[entry['KUASAR_RUN_ID']] = fault
                 for entry in entries:
                     emit('journal', dict(sid=sid, **entry))
-                if not guard_emitted:
-                    try:
-                        guards = backend_guard_evidence(sid, current_run, journal_deadline)
-                        priority = (3 if any(row.get('status') == 'sigbus' for row in guards)
-                                    else 2 if any(row.get('event') == 'armed' for row in guards)
-                                    and not any(row.get('event') == 'closed' for row in guards)
-                                    else 1 if guards else 0)
-                        if priority > guard_priority:
-                            guard_candidate, guard_priority = guards, priority
-                        if priority == 3:
-                            for guard in guards:
-                                emit_guard(guard)
-                    except Exception:
-                        # Best-effort guard queries cannot consume business
-                        # records or extend this SID's original journal budget.
-                        pass
-                if memory_probe and not page_probe_used and fault_entry:
+                fault_entry = next(((run, faults[run]) for run in known_runs if run in faults), None)
+                evidence_run = fault_entry[0] if fault_entry else current_run
+                allocations = []
+                try:
+                    allocations = shmem_allocation_evidence(sid, evidence_run, journal_deadline)
+                except Exception:
+                    # Diagnostic queries share this SID's original deadline;
+                    # they cannot consume the business-record budget.
+                    pass
+                priority = (int(fault_entry is not None),
+                            2 if any(row['event'] == 'insert' for row in allocations)
+                            else 1 if allocations else 0)
+                if priority > shmem_priority:
+                    shmem_candidate, shmem_priority = allocations, priority
+                guards = []
+                try:
+                    guards = backend_guard_evidence(sid, evidence_run, journal_deadline)
+                except Exception:
+                    pass
+                priority = (int(fault_entry is not None),
+                            3 if any(row.get('status') == 'sigbus' for row in guards)
+                            else 2 if any(row.get('event') == 'armed' for row in guards)
+                            and not any(row.get('event') == 'closed' for row in guards)
+                            else 1 if guards else 0)
+                if priority > guard_priority:
+                    guard_candidate, guard_priority = guards, priority
+                # A previous failed run can identify the diagnostic producer,
+                # but its snapshot source is not necessarily the current one.
+                if (memory_probe and not page_probe_used and fault_entry
+                        and fault_entry[0] == current_run):
                     run_id, fault = fault_entry
                     try:
                         request = memory_page_request(fault)
@@ -707,9 +883,12 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
         except Exception as error:
             unavailable('journal', error, sid=sid)
 
-    if not guard_emitted:
-        for guard in guard_candidate:
-            emit_guard(guard)
+    # Select after all owned SIDs: a live secondary run must not displace the
+    # closed backend belonging to the actual held-memory failure.
+    for allocation in shmem_candidate:
+        emit_shmem(allocation)
+    for guard in guard_candidate:
+        emit_guard(guard)
 
     try:
         events = deque(maxlen=MAX_RECORDS)
