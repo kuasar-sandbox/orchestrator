@@ -54,8 +54,11 @@ func TestResourceGroupsPreserveGuestReservationWithHostCache(t *testing.T) {
 			}
 		}
 	}
-	if got := node["node.resource.memory.reserved"]; got != float64(guestMemory+cacheMemory) {
-		t.Fatalf("node pool omitted host cache: got %v, want %v", got, guestMemory+cacheMemory)
+	if got := node["node.resource.memory.reserved"]; got != float64(guestMemory) {
+		t.Fatalf("Guest pool includes host cache: got %v, want %v", got, guestMemory)
+	}
+	if node["node.cache.allocated"] != float64(cacheMemory) || node["node.cache.pool.allocated"] != float64(cacheMemory) || sandbox["sandbox.cache.allocated"] != float64(cacheMemory) {
+		t.Fatal("independent cache observations missing")
 	}
 	if got := sandbox["sandbox.resource.memory.reserved"]; got != float64(guestMemory) {
 		t.Fatalf("Guest reservation includes host cache: got %v, want %v", got, guestMemory)

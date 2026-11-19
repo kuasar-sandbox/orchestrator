@@ -19,11 +19,12 @@ const (
 // CacheGrantResult has an absolute controller baseline so retries after lost
 // replies can reconcile without treating allocated cache as Guest memory.
 type CacheGrantResult struct {
-	GrantedDelta  uint64
-	Reservation   uint64
-	ReclaimTarget uint64
-	ReclaimSeq    uint64
-	CooldownMs    int64
+	GrantedDelta    uint64
+	Reservation     uint64
+	ReclaimTarget   uint64
+	ReclaimSeq      uint64
+	CooldownMs      int64
+	RecoveryBlocked bool
 }
 
 // changeCacheLocked is the only cache-reservation aggregate mutation. It is
@@ -32,26 +33,22 @@ func (s *State) changeCacheLocked(r *Reservation, current uint64) error {
 	if r.CacheReservation == current {
 		return nil
 	}
-	next := cloneReservation(r)
-	next.CacheReservation = current
-	if err := s.validateAggregateReplacementLocked([]*Reservation{r}, &next); err != nil {
+	without, err := checkedAggregateSub(s.reservedCache, r.CacheReservation, "cache reservation")
+	if err != nil {
 		return err
 	}
-	if err := s.removeAggregatesLocked(r); err != nil {
+	next, err := checkedAggregateAdd(without, current, "cache reservation")
+	if err != nil {
 		return err
 	}
-	old := r.CacheReservation
-	r.CacheReservation = current
-	if err := s.addAggregatesLocked(r); err != nil {
-		r.CacheReservation = old
-		_ = s.addAggregatesLocked(r)
-		return err
-	}
+	// Cache changes neither Guest watermarks nor Guest grant/protection age.
+	// Admission is woken by the server after a confirmed return.
+	s.reservedCache, r.CacheReservation = next, current
 	return nil
 }
 
-// ReconcileCacheBudget charges only normal pool memory and never uses Guest
-// emergency capacity or the Guest balloon step. current is a safe, physically
+// ReconcileCacheBudget charges the independent cache ledger only.
+// It does not consume Guest memory, grant tokens or history. current is a safe, physically
 // completed cache baseline; it cannot exceed a previously granted amount.
 func (s *State) ReconcileCacheBudget(token string, current, requested, maximum uint64, allocator *Allocator) (CacheGrantResult, bool, error) {
 	return s.ReconcileCacheBudgetWithAck(token, current, requested, maximum, 0, allocator)
@@ -62,9 +59,6 @@ func (s *State) ReconcileCacheBudget(token string, current, requested, maximum u
 func (s *State) ReconcileCacheBudgetWithAck(token string, current, requested, maximum, doneSeq uint64, allocator *Allocator) (CacheGrantResult, bool, error) {
 	if p := s.forToken(token); p != s {
 		return p.ReconcileCacheBudgetWithAck(token, current, requested, maximum, doneSeq, allocator)
-	}
-	if s.poolAllocator != nil {
-		allocator = s.poolAllocator
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,51 +96,40 @@ func (s *State) ReconcileCacheBudgetWithAck(token string, current, requested, ma
 		delete(s.cacheDemandSince, token)
 		return out, true, nil
 	}
+	if s.cacheRecoveryUnknownCount > 0 {
+		// Unknown recovered allocation is not a quota shortage. Continue to
+		// settle confirmed returns, but do not grant or request donor eviction.
+		delete(s.cacheDemandSince, token)
+		out.RecoveryBlocked = true
+		return out, true, nil
+	}
 	remaining := maximum - current
 	if requested < remaining {
 		remaining = requested
 	}
-	if remaining == 0 || allocator == nil || r.CacheReclaimTarget != 0 {
+	if remaining == 0 {
+		delete(s.cacheDemandSince, token)
 		return out, true, nil
 	}
-	pool := s.AllocatablePool.MemoryBytes
-	emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
-	headroom := uint64(0)
-	if pool > s.reservedMemory && pool-s.reservedMemory > emergency {
-		headroom = pool - s.reservedMemory - emergency
+	if r.CacheReclaimTarget != 0 {
+		return out, true, nil
 	}
-	// Guest growth and pending recovery take precedence over discretionary
-	// cache grants. Reuse the existing beneficiary-protection calculation.
-	protected := s.protectedLocked("cache:" + r.SandboxID)
-	if protected >= headroom {
-		headroom = 0
-	} else {
-		headroom -= protected
-	}
-	if s.CachePoolCapacity > 0 {
-		if s.reservedCache >= s.CachePoolCapacity {
-			headroom = 0
-		} else {
-			headroom = min(headroom, s.CachePoolCapacity-s.reservedCache)
-		}
-	}
-	grant := allocator.GrantUnits(token, remaining, headroom, cacheBudgetUnit)
-	out.CooldownMs = grant.CooldownMs
-	if grant.GrantedDelta > 0 {
-		next, err := checkedAggregateAdd(current, grant.GrantedDelta, "cache reservation")
+	headroom := s.cacheHeadroomLocked()
+	grant := cacheGrantBytes(remaining, headroom)
+	if grant > 0 {
+		next, err := checkedAggregateAdd(current, grant, "cache reservation")
 		if err != nil || next > maximum {
 			return CacheGrantResult{}, true, fmt.Errorf("cache grant overflow")
 		}
 		if err := s.changeCacheLocked(r, next); err != nil {
 			return CacheGrantResult{}, true, err
 		}
-		out.GrantedDelta, out.Reservation = grant.GrantedDelta, next
-		delete(s.cacheDemandSince, token)
-		return out, true, nil
+		out.GrantedDelta, out.Reservation = grant, next
+		remaining -= grant
 	}
-	// A token-bucket delay is not a node memory shortage. Start active
-	// reclaim only after a real shortage persists across retries.
-	if headroom >= min(remaining, cacheBudgetUnit) {
+	// Only a finite independent cache quota can cause cache shortage. An
+	// internal grant batch, per-sandbox maximum or Guest pressure cannot.
+	if remaining == 0 || s.CachePoolCapacity == 0 || remaining <= s.cacheHeadroomLocked() {
 		delete(s.cacheDemandSince, token)
 		return out, true, nil
 	}
@@ -154,21 +137,42 @@ func (s *State) ReconcileCacheBudgetWithAck(token string, current, requested, ma
 		s.cacheDemandSince = make(map[string]cacheDemandAge)
 	}
 	demand, found := s.cacheDemandSince[token]
-	// A burst that ended before a later request must not inherit the old
-	// wait age and immediately evict another active sandbox's cache.
 	if !found || now.Sub(demand.last) > 2*time.Second {
-		s.cacheDemandSince[token] = cacheDemandAge{since: now, last: now}
+		s.cacheDemandSince[token] = cacheDemandAge{since: now, last: now, amount: remaining}
 		return out, true, nil
 	}
-	demand.last = now
+	demand.last, demand.amount = now, remaining
 	s.cacheDemandSince[token] = demand
 	if now.Sub(demand.since) < 400*time.Millisecond {
 		return out, true, nil
 	}
-	// Persistent failed requests may borrow from another sandbox. A target
-	// remains charged until its owner has actually returned physical pages.
-	s.requestCacheDonorLocked(r.SandboxID, remaining)
+	// A target remains charged until physical return is confirmed.
+	s.requestCacheDonorLocked(r.SandboxID, remaining-s.cacheHeadroomLocked())
 	return out, true, nil
+}
+
+// cacheHeadroomLocked does not derive a cache limit from Guest memory.
+func (s *State) cacheHeadroomLocked() uint64 {
+	if s.CachePoolCapacity == 0 {
+		return math.MaxUint64
+	}
+	if s.reservedCache >= s.CachePoolCapacity {
+		return 0
+	}
+	return s.CachePoolCapacity - s.reservedCache
+}
+
+// cacheGrantBytes keeps existing finite growth batches and physical units,
+// without borrowing the Guest allocator's tokens, history or rate policy.
+func cacheGrantBytes(requested, headroom uint64) uint64 {
+	limit := min(requested, headroom, uint64(512<<20))
+	if requested < cacheBudgetUnit {
+		if limit < requested {
+			return 0
+		}
+		return requested
+	}
+	return limit - limit%cacheBudgetUnit
 }
 
 // requestCacheDonorLocked assigns a target only; it never credits bytes to
@@ -179,8 +183,8 @@ func (s *State) requestCacheDonorLocked(excludeSID string, shortage uint64) bool
 	if shortage == 0 {
 		return false
 	}
-	// Pending reclaim targets remain charged. They will release ordinary
-	// memory and cache-subpool capacity when completed, so avoid requesting
+	// Pending reclaim targets remain charged. They will release independent
+	// cache capacity when completed, so avoid requesting
 	// the same shortage from every other donor during repeated retries.
 	// This is planning credit only; admission and grants still use current
 	// reservations and never spend unacknowledged bytes.
@@ -200,7 +204,7 @@ func (s *State) requestCacheDonorLocked(excludeSID string, shortage uint64) bool
 	}
 	var donor *Reservation
 	for _, candidate := range s.bySID {
-		if candidate.SandboxID == excludeSID || candidate.Provisional || candidate.Conn == nil ||
+		if candidate.SandboxID == excludeSID || candidate.Provisional || candidate.CacheCoordinated || candidate.Conn == nil ||
 			candidate.CacheReclaimTarget != 0 || candidate.CacheReservation <= cacheBudgetUnit {
 			continue
 		}

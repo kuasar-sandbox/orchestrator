@@ -464,6 +464,7 @@ func (s *State) ForgetDemand(key string) {
 	defer s.mu.Unlock()
 	s.initPressureLocked()
 	s.clearDemandLocked(key)
+	delete(s.admissionCacheDemand, key)
 	s.signalPressureLocked()
 }
 
@@ -532,11 +533,18 @@ func (s *State) RecordAdmissionWaitWithCache(sid string, admission LaunchAdmissi
 	defer s.mu.Unlock()
 	s.initPressureLocked()
 	if budget == 0 || budget > s.AllocatablePool.MemoryBytes ||
-		cache > s.AllocatablePool.MemoryBytes-budget ||
 		(!admission.Accepted && !OperationAllowed(s.pressure.record.Zone, admission.Operation)) {
 		return
 	}
 	oc := s.admissionWithCacheLocked(sid, budget, cache, admission)
+	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByCacheRecovery {
+		key := "admit:" + sid
+		delete(s.admissionCacheDemand, key)
+		if d := s.pressure.demands[key]; d != nil && d.identity == admission.Identity {
+			s.clearDemandLocked(key)
+		}
+		return
+	}
 	if admission.Operation == OperationRecovery && s.pressure.backgroundRecovery == sid {
 		if d := s.pressure.demands["admit:"+sid]; d != nil && d.identity == admission.Identity {
 			s.clearDemandLocked("admit:" + sid)
@@ -554,61 +562,34 @@ func (s *State) RecordAdmissionWaitWithCache(sid string, admission LaunchAdmissi
 		}
 		return
 	}
+	// Cache-only waiting has its own ledger; it never consumes Guest
+	// beneficiary protection or advances Guest pressure failure rounds.
+	cacheKey := "admit:" + sid
+	if cache > 0 && s.CachePoolCapacity > 0 && cache <= s.CachePoolCapacity && cache > s.cacheHeadroomLocked() &&
+		(oc.Status == OutcomeShortTermBlock || oc.Status == OutcomeAdmitted) {
+		now := s.pressure.clock()
+		if s.admissionCacheDemand == nil {
+			s.admissionCacheDemand = make(map[string]cacheDemandAge)
+		}
+		d, exists := s.admissionCacheDemand[cacheKey]
+		if !exists && len(s.admissionCacheDemand) >= 1024 {
+			return
+		}
+		if d.identity != admission.Identity || d.since.IsZero() {
+			d = cacheDemandAge{since: now, identity: admission.Identity}
+		}
+		d.last, d.amount = now, cache
+		s.admissionCacheDemand[cacheKey] = d
+		s.requestCacheDonorLocked(sid, cache-s.cacheHeadroomLocked())
+	} else {
+		delete(s.admissionCacheDemand, cacheKey)
+	}
+	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByCacheBudget {
+		s.clearDemandLocked(cacheKey)
+		return
+	}
 	if oc.Status == OutcomeShortTermBlock && oc.Block == BlockedByMainBudget {
-		// A queued launch is a real executable request, unlike a speculative
-		// cache grow. If cache borrowers are blocking its Guest startup or
-		// initial cache grant, request a donor now, then use the existing
-		// Release / budget-return wakeup to retry the admission queue.
-		pool := s.AllocatablePool.MemoryBytes
-		available := uint64(0)
-		if pool > s.reservedMemory {
-			available = pool - s.reservedMemory
-		}
-		if !admission.SavedSource {
-			emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
-			if available > emergency {
-				available -= emergency
-			} else {
-				available = 0
-			}
-		}
-		protected := s.protectedLocked("admit:" + sid)
-		if protected >= available {
-			available = 0
-		} else {
-			available -= protected
-		}
-		required := budget + cache
-		memoryShortage := uint64(0)
-		if required > available {
-			memoryShortage = required - available
-		}
-		cacheShortage := uint64(0)
-		if cache > 0 && s.CachePoolCapacity > 0 &&
-			s.reservedCache+cache > s.CachePoolCapacity {
-			cacheShortage = s.reservedCache + cache - s.CachePoolCapacity
-		}
-		if admission.SavedSource && cache > 0 {
-			// Saved-source Guest memory may spend emergency headroom, but
-			// its initial cache must not. An admission can therefore be
-			// blocked solely by this cache restriction even when its total
-			// Guest+cache request fits the emergency-inclusive balance.
-			// Include that deficit when selecting a clean-cache donor.
-			emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
-			cacheAvailable := uint64(0)
-			if available > emergency {
-				cacheAvailable = available - emergency
-			}
-			if cache > cacheAvailable {
-				cacheShortage = max(cacheShortage, cache-cacheAvailable)
-			}
-		}
-		s.requestCacheDonorLocked(sid, max(memoryShortage, cacheShortage))
-		// A cache-specific cap is not itself a Guest memory shortage and must
-		// not fabricate Guest pressure/balloon demand.
-		if memoryShortage > 0 {
-			s.failDemandLocked("admit:"+sid, sid, admission.Identity, required, 0, admission.Operation != OperationCreate, s.pressure.clock())
-		}
+		s.failDemandLocked(cacheKey, sid, admission.Identity, budget, 0, admission.Operation != OperationCreate, s.pressure.clock())
 		return
 	}
 	// A saved-source resume waiting for a startup slot or rate token retains
@@ -750,13 +731,15 @@ func (s *State) admissionWithCacheLocked(sid string, budget, cache uint64, launc
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "cache_exceeds_pool_capacity",
 			RejectMsg: "initial cache budget exceeds resource pool cache_capacity"}
 	}
-	if budget == 0 || pool == 0 || budget > pool || cache > pool-budget {
+	if budget == 0 || pool == 0 || budget > pool {
 		return Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_node_capacity", RejectMsg: "initial budget exceeds node pool"}
+	}
+	if cache > 0 && s.cacheRecoveryUnknownCount > 0 {
+		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByCacheRecovery}
 	}
 	// Background work waits for actual budget; it never creates pressure demand.
 	if backgroundRecovery {
-		if s.reservedMemory > pool || budget > pool-s.reservedMemory ||
-			cache > pool-s.reservedMemory-budget {
+		if s.reservedMemory > pool || budget > pool-s.reservedMemory {
 			return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByRecoveryPolicy}
 		}
 	}
@@ -784,22 +767,11 @@ func (s *State) admissionWithCacheLocked(sid string, budget, cache uint64, launc
 	} else {
 		available = 0
 	}
-	// A saved-source Guest may use emergency headroom, but its *initial
-	// cache grant* remains discretionary and must fit the nonemergency
-	// balance, just like every later cache request.
-	cacheAvailable := available
-	if launch.SavedSource {
-		emergency := scaleUint64Floor(pool, s.Wm.EmergencyFactor)
-		if cacheAvailable > emergency {
-			cacheAvailable -= emergency
-		} else {
-			cacheAvailable = 0
-		}
-	}
-	if budget > available || cache > available-budget || cache > cacheAvailable ||
-		(cache > 0 && s.CachePoolCapacity > 0 &&
-			(s.reservedCache >= s.CachePoolCapacity || cache > s.CachePoolCapacity-s.reservedCache)) {
+	if budget > available {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
+	}
+	if cache > s.cacheHeadroomLocked() {
+		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByCacheBudget}
 	}
 	if s.pressure.exclusive != "" && s.pressure.exclusive != sid {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByStartupBudget}
@@ -892,6 +864,9 @@ func (s *State) ForgetAdmissionWait(sid, identity string) {
 	defer s.mu.Unlock()
 	s.initPressureLocked()
 	key := "admit:" + sid
+	if d, ok := s.admissionCacheDemand[key]; ok && d.identity == identity {
+		delete(s.admissionCacheDemand, key)
+	}
 	if d := s.pressure.demands[key]; d != nil && d.identity == identity {
 		s.clearDemandLocked(key)
 		s.signalPressureLocked()

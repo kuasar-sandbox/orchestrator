@@ -17,6 +17,9 @@ type Placement struct {
 }
 
 type PoolSnapshot struct {
+	CacheCapacity     uint64    `json:"cache_capacity,omitempty"`
+	CacheLowWatermark *uint64   `json:"cache_low_watermark,omitempty"`
+	CacheLow          bool      `json:"cache_low"`
 	Name              string    `json:"name"`
 	Capacity          Resources `json:"capacity"`
 	Scheduled         Resources `json:"scheduled"`
@@ -41,6 +44,10 @@ func NewPoolState(resolved *Resolved) *State {
 		p.AllocatablePool = cfg.Allocatable
 		p.PoolName, p.CapacityLimit, p.CPUWatermarks = cfg.Name, cfg.Capacity, cfg.CPUWatermarks
 		p.CachePoolCapacity = cfg.CacheCapacity
+		if cfg.CacheLowWatermark != nil {
+			threshold := *cfg.CacheLowWatermark
+			p.CacheLowWatermark = &threshold
+		}
 		p.placements = map[string]Placement{}
 		p.initPressureLocked()
 		p.pressureWake = root.pressureWake
@@ -205,7 +212,11 @@ func (s *State) PoolSnapshots() []PoolSnapshot {
 		r := p.resourceSnapshotLocked()
 		cpu, memory := ratio(p.allocatedCPU, p.AllocatablePool.CPUMilli), ratio(p.reservedMemory, p.AllocatablePool.MemoryBytes)
 		used := p.scheduledLocked()
-		v := PoolSnapshot{Name: name, Capacity: p.CapacityLimit, Scheduled: used, Available: p.CapacityLimit.Sub(used), StartupPool: p.startupPoolBytesLocked(), Utilization: max(cpu, memory), CPUUtilization: cpu, MemoryUtilization: memory, ResourceSnapshot: r}
+		v := PoolSnapshot{CacheCapacity: p.CachePoolCapacity, CacheLow: p.CacheLowWatermark != nil && p.reservedCache <= *p.CacheLowWatermark, Name: name, Capacity: p.CapacityLimit, Scheduled: used, Available: p.CapacityLimit.Sub(used), StartupPool: p.startupPoolBytesLocked(), Utilization: max(cpu, memory), CPUUtilization: cpu, MemoryUtilization: memory, ResourceSnapshot: r}
+		if p.CacheLowWatermark != nil {
+			threshold := *p.CacheLowWatermark
+			v.CacheLowWatermark = &threshold
+		}
 		p.mu.Unlock()
 		v.Pressure = p.PressureSnapshot()
 		out = append(out, v)
@@ -471,6 +482,8 @@ func (s *State) aggregateResourceSnapshot() ResourceSnapshot {
 		v := p.ResourceSnapshot()
 		out.AllocatablePool = addResourcesSaturating(out.AllocatablePool, v.AllocatablePool)
 		out.Reserved = addResourcesSaturating(out.Reserved, v.Reserved)
+		out.CacheAllocated = addResourcesSaturating(Resources{MemoryBytes: out.CacheAllocated}, Resources{MemoryBytes: v.CacheAllocated}).MemoryBytes
+		out.CacheRecoveryUnknownCount += v.CacheRecoveryUnknownCount
 		out.StartupInFlight = addResourcesSaturating(Resources{MemoryBytes: out.StartupInFlight}, Resources{MemoryBytes: v.StartupInFlight}).MemoryBytes
 		out.ReservationCount += v.ReservationCount
 		out.ProvisionalCount += v.ProvisionalCount

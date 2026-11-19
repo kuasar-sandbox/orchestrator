@@ -233,6 +233,10 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		if cfg.CacheCapacity != nil {
 			p.CacheCapacity, _ = util.ParseSize(*cfg.CacheCapacity)
 		}
+		if cfg.CacheLowWatermark != nil {
+			n, _ := util.ParseSize(*cfg.CacheLowWatermark)
+			p.CacheLowWatermark = &n
+		}
 		if cfg.Capacity.Memory != nil {
 			p.Capacity.MemoryBytes, _ = util.ParseSize(*cfg.Capacity.Memory)
 		}
@@ -273,6 +277,7 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 
 type ResolvedPool struct {
 	CacheCapacity          uint64
+	CacheLowWatermark      *uint64
 	MemoryGrantPerSecBytes uint64
 	Name                   string
 	Capacity               Resources

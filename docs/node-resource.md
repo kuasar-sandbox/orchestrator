@@ -243,7 +243,8 @@ The two pool levels have distinct configuration and accounting:
 | `resource_listen.pools[].name` | Required, unique | Nonempty name matching `[a-zA-Z0-9][a-zA-Z0-9_.-]*`; identifies one resource budget |
 | `resource_listen.pools[].capacity.{cpu,memory}` | Omitted dimension is unlimited | Positive declared-Capacity scheduling envelope; CPU may use fractional cores, memory a positive size |
 | `resource_listen.pools[].allocatable.memory` | Required with multiple pools | Positive net runtime memory; a sole pool may use the legacy derived budget |
-| `resource_listen.pools[].cache_capacity` | Optional | Upper bound on granted diff_cow cache in this existing pool; it is an additional cap and does not pre-reserve separate memory |
+| `resource_listen.pools[].cache_capacity` | Optional | Independent upper bound on granted diff_cow cache; omitted means unlimited, without charging sandbox allocatable.memory |
+| `resource_listen.pools[].cache_low_watermark` | Optional | Absolute allocated-cache byte threshold for background-reclaim deferral; omitted disables the gate, independently of cache_capacity |
 | `resource_listen.pools[].allocatable.cpu` | Inherits capacity CPU; both omitted means no finite denominator | Positive CPU accounting denominator for utilization/watermarks; no separate runtime CPU admission gate |
 | `resource_listen.pools[].watermarks.{cpu,memory}` | Per-leaf inheritance | Optional low/high/emergency factors override the node policy; other dimensions are rejected |
 | `resource_listen.pools[].unit_dropins` | None | Absolute paths to externally supplied unit-placement fragments copied into the managed namespace |
@@ -1020,9 +1021,12 @@ Lifecycle cumulative usage is read through [native stats/usage](observability.md
 A sandbox negotiating `cache_budget_v1` retains its configured
 `resources.diff_cow.cache_size` as its ceiling. The node atomically
 admits its Guest startup reservation and small initial cache grant.
-Later cache requests consume the same resource-pool memory headroom,
-also obey the optional `cache_capacity` cap, and cannot use Guest emergency
-memory. The cache remains owned by `sandbox-ctl` in `ctl/` with no new
+Later cache requests use an independent cache ledger. The optional
+`cache_capacity` limits total granted cache; omission leaves that quota unlimited.
+Cache grants do not consume `allocatable.memory`, Guest emergency or protected
+headroom, or Guest allocation tokens/history. An explicit cache cap may exceed
+the Guest memory capacity. These are separate accounting limits; actual physical
+allocation can still fail and is rolled back normally. The cache remains owned by `sandbox-ctl` in `ctl/` with no new
 cgroup hierarchy or Guest balloon changes.
 
 When a cache grant is denied, existing clean LRU eviction and dirty writeback
@@ -1030,14 +1034,80 @@ continue. A node reclaim target is advisory until the sandbox has safely
 evicted clean pages, physically returned their memory, and acknowledged the
 smaller reservation. On node-controller restart, recovery provisionally charges
 the configured cache maximum until an authenticated StateSync confirms the
-current grant. Older peers retain the original fixed cache behavior.
+current grant. Recovery retains already-held cache even above a lowered cap,
+then denies new cache growth until confirmed returns make room. StateSync checks
+Guest and cache grants separately; reducing one cannot authorize growth of the
+other. Older peers retain the original fixed cache behavior.
 
 Initial and runtime cache grants use 4 MiB units, with a page-aligned tail for
-smaller configured limits. Set `resources.diff_cow.cache_idle_after` (default
-`10s`) to choose how long an untouched Clean page takes to count as idle. The
-page can still be hit, which removes it from the idle count. When idle Clean
-bytes and unused buffers together reach 4 MiB, the sandbox starts a gentle
-asynchronous reclaim attempt. Under contention, the node asks a sandbox with a
-large cache reservation to run the same worker. It returns unused buffers
-first, then takes Clean pages in LRU order. An attempt can return fewer bytes
-than requested, including zero. The node credits only confirmed returns.
+smaller configured limits. `resources.diff_cow.cache_idle_after` (default `10s`)
+only determines when untouched Clean pages count as idle. Those pages remain
+valid; a hit removes them from idle statistics.
+
+#### Node-coordinated reclaim
+
+Clients and nodes negotiate `cache_reclaim_v1` at Admit and confirm it again at
+StateSync. An idle opportunity produces one finite intent. The sandbox waits for
+a node permit before using its existing gentle worker. The worker returns unused
+buffers first, then Clean pages in LRU order, preserving the minimum grant and
+Dirty/Loading/Writeback protections. It does not recheck per-page idle time while
+executing a permit. Ordinary cache replacement and lifecycle release are separate
+from this background policy.
+
+The node bounds **authorized bytes**, initially at 64 MiB/s, a 16 MiB burst, at
+most four outstanding tasks/16 MiB, and at most 4 MiB per task. These internal
+bounds do not promise that physical completion is uniform in every time window.
+Waiting does not accumulate an unlimited reclaim debt. Cache reclaim tokens are
+independent of Guest allocation tokens.
+
+An optional `resource_listen.pools[].cache_low_watermark` is an absolute byte
+threshold, separate from `watermarks.memory/cpu`. Omission disables the low-water
+pause, even when a finite `cache_capacity` is present. A threshold also works
+without a finite cache cap. A pool at or below its threshold retains valid idle
+intents but pauses new permits unless **that pool** has a valid cache request
+exceeding confirmed independent quota headroom. Other pools' shortages, Guest
+pressure and ordinary rate waiting do not reopen it. Already issued tasks finish.
+
+Autonomous reclaim is primary. An ordinary rate-waiting autonomous intent counts
+as schedulable supply. An unissued intent held by its own pool's low-water rule,
+or temporarily disconnected, remains retained but is not schedulable. Any issued
+unfinished autonomous task still suppresses supplemental yield across the node,
+including after disconnect. Only with no schedulable autonomous supply and no
+unfinished autonomous task may a cache-blocked pool ask its larger cache holders
+to yield. Both sources use the same finite executor and node bounds. If new
+schedulable autonomous supply arrives during yield, existing bounded yield tasks
+finish and no new yield is issued before autonomous work. Returns never credit a
+different resource pool.
+
+Task run identity, sequence, source, intent, maximum bytes and absolute target
+are immutable. The target is the issue-time reservation minus the permit bytes;
+it never enlarges the maximum. Each intent has a stable observation and finite
+remaining amount. Retransmission cannot refill it. Completion includes the actual
+capacity and the next intent (or explicit none), settled before the next scheduling
+decision. Partial/zero attempts finish; unchanged fruitless observations cannot
+perpetually block yield by changing ID or time. Low-frequency probes use ordinary
+permits and do not outrank an available yield task.
+
+Pure intent/completion updates use `cache_reclaim_update`, not a zero-growth
+budget request, and preserve outstanding cache-growth demand. A completion outbox
+is kept until its sequence is explicitly acknowledged. Duplicate completion
+cannot subtract a later cache grant. Granted cache and the worker's confirmed
+physical capacity are distinct: growth must be physically confirmed before a new
+reclaim task can use its baseline, including across StateSync or partial allocation
+rollback. Cache/coordination locks are not held during network or physical work.
+
+A timeout never cancels an issued task. On restart, inventory and authenticated
+StateSync recover all possible holders and their task/outbox before new permits.
+Known cache maxima are conservatively charged; unknown live cache ownership uses
+an independent recovery barrier, never a fabricated zero charge or a Guest-budget
+substitute. New cache allocation waits for that barrier to be resolved. Confirmed
+consumer exit can retire its authority through the existing lifecycle.
+
+Mixed versions remain compatible: a new client on an old node keeps its admitted
+legacy mode; a coordinated run cannot silently downgrade on reconnect. Old clients
+may still reclaim locally, so complete node-wide rate/source guarantees apply only
+after all participating elastic clients support coordination and unresolved legacy
+work is reconciled. `resource status` exposes rate, in-flight bytes/tasks, retained
+low-water intents, recovery-pending and legacy participant counts. Pool snapshots
+and `node.cache.*` telemetry keep cache capacity/allocation separate from Guest
+memory; an omitted cache cap is reported as unlimited rather than divided by zero.

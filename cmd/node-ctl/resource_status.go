@@ -32,6 +32,11 @@ func statusCmd(args []string) int {
 	fmt.Printf("operational_margin:  %d MiB / %d cpu_milli\n", status.OperationalMargin.MemoryBytes>>20, status.OperationalMargin.CPUMilli)
 	fmt.Printf("allocatable_pool:    %d MiB / %d cpu_milli\n", status.Pool.MemoryBytes>>20, status.Pool.CPUMilli)
 	fmt.Printf("reserved_memory:     %d MiB / %d cpu_milli\n", status.Allocated.MemoryBytes>>20, status.Allocated.CPUMilli)
+	fmt.Printf("cache_allocated:     %d MiB (recovery_unknown=%d)\n", status.CacheAllocated>>20, status.CacheRecoveryUnknownCount)
+	if r := status.CacheReclaimStatus; r != nil {
+		fmt.Printf("cache_reclaim:       %d MiB/s, burst=%d MiB, in_flight=%d tasks/%d MiB\n", r.RateBytesPerSecond>>20, r.BurstBytes>>20, r.InFlightTasks, r.InFlightBytes>>20)
+		fmt.Printf("cache_reclaim_state: autonomous=%d held=%d recovery_pending=%d legacy=%d\n", r.AutonomousIntents, r.HeldIntents, r.RecoveryPending, r.LegacyParticipants)
+	}
 	if status.Pool.MemoryBytes > 0 {
 		fmt.Printf("utilization:         %.1f%%\n", float64(status.Allocated.MemoryBytes)/float64(status.Pool.MemoryBytes)*100)
 	}

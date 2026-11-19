@@ -17,18 +17,35 @@ func hostResourceGroups(state *nodectl.State, observed time.Time) []hostmetrics.
 	groups = append(groups, hostmetrics.Group{Samples: []hostmetrics.Sample{
 		{Name: "node.resource.memory.allocatable", Unit: "By", Timestamp: observed, Value: float64(node.AllocatablePool.MemoryBytes)},
 		{Name: "node.resource.memory.reserved", Unit: "By", Timestamp: observed, Value: float64(node.Reserved.MemoryBytes)},
+		{Name: "node.cache.allocated", Unit: "By", Timestamp: observed, Value: float64(node.CacheAllocated)},
 		{Name: "node.resource.cpu.allocatable", Unit: "{core}", Timestamp: observed, Value: float64(node.AllocatablePool.CPUMilli) / 1000},
 		{Name: "node.resource.cpu.reserved", Unit: "{core}", Timestamp: observed, Value: float64(node.Reserved.CPUMilli) / 1000},
 		{Name: "node.resource.sandbox.count", Unit: "{sandbox}", Timestamp: observed, Value: float64(node.ReservationCount)},
 	}})
 	for _, pool := range state.PoolSnapshots() {
-		groups = append(groups, hostmetrics.Group{Resource: map[string]string{"resource.pool": pool.Name}, Samples: []hostmetrics.Sample{
+		group := hostmetrics.Group{Resource: map[string]string{"resource.pool": pool.Name}, Samples: []hostmetrics.Sample{
 			{Name: "node.resource.pool.memory.allocatable", Unit: "By", Timestamp: observed, Value: float64(pool.AllocatablePool.MemoryBytes)},
 			{Name: "node.resource.pool.memory.reserved", Unit: "By", Timestamp: observed, Value: float64(pool.Reserved.MemoryBytes)},
+			{Name: "node.cache.pool.allocated", Unit: "By", Timestamp: observed, Value: float64(pool.CacheAllocated)},
 			{Name: "node.resource.pool.cpu.allocatable", Unit: "{core}", Timestamp: observed, Value: float64(pool.AllocatablePool.CPUMilli) / 1000},
 			{Name: "node.resource.pool.cpu.reserved", Unit: "{core}", Timestamp: observed, Value: float64(pool.Reserved.CPUMilli) / 1000},
 			{Name: "node.resource.pool.utilization", Unit: "1", Timestamp: observed, Value: pool.Utilization},
-		}})
+		}}
+		if pool.CacheCapacity > 0 {
+			group.Samples = append(group.Samples, hostmetrics.Sample{Name: "node.cache.pool.capacity", Unit: "By", Timestamp: observed, Value: float64(pool.CacheCapacity)})
+		}
+		lowEnabled, low := float64(0), float64(0)
+		if pool.CacheLowWatermark != nil {
+			lowEnabled = 1
+			group.Samples = append(group.Samples, hostmetrics.Sample{Name: "node.cache.pool.low_watermark", Unit: "By", Timestamp: observed, Value: float64(*pool.CacheLowWatermark)})
+		}
+		if pool.CacheLow {
+			low = 1
+		}
+		group.Samples = append(group.Samples,
+			hostmetrics.Sample{Name: "node.cache.pool.low_enabled", Unit: "1", Timestamp: observed, Value: lowEnabled},
+			hostmetrics.Sample{Name: "node.cache.pool.low", Unit: "1", Timestamp: observed, Value: low})
+		groups = append(groups, group)
 	}
 	for _, reservation := range state.ReservationViews() {
 		if reservation.SandboxID == "" {
@@ -42,6 +59,7 @@ func hostResourceGroups(state *nodectl.State, observed time.Time) []hostmetrics.
 		}
 		groups = append(groups, hostmetrics.Group{Resource: map[string]string{"sandbox.id": reservation.SandboxID}, Samples: []hostmetrics.Sample{
 			{Name: "sandbox.resource.memory.reserved", Unit: "By", Timestamp: observed, Value: float64(reservation.ReservationMemory)},
+			{Name: "sandbox.cache.allocated", Unit: "By", Timestamp: observed, Value: float64(reservation.CacheReservation)},
 			{Name: "sandbox.resource.cpu.reserved", Unit: "{core}", Timestamp: observed, Value: float64(cpuMilli) / 1000},
 		}})
 	}

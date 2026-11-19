@@ -47,6 +47,8 @@ const (
 	BlockedByStartupBudget              // initial Budget > pre-settled headroom (waits for Settled/Released-before-settled)
 	BlockedByTokenBucket                // token bucket empty (waits for refill — uses one-shot timer)
 	BlockedByRecoveryPolicy             // discretionary recovery waits for stable headroom; never drives Pause
+	BlockedByCacheBudget                // independent cache capacity; never drives Guest pressure
+	BlockedByCacheRecovery              // cache allocation unknown during recovery; not reclaimable shortage
 )
 
 // Outcome captures a decision the admission worker can take.

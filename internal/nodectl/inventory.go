@@ -66,9 +66,9 @@ func (i *Inventory) Recover(state *State) error {
 		return err
 	}
 	snapshot := state.ResourceSnapshot()
-	i.Logf("inventory recovered reservations=%d provisional=%d unknown=%d reserved_memory=%d",
+	i.Logf("inventory recovered reservations=%d provisional=%d unknown=%d reserved_memory=%d allocated_cache=%d",
 		snapshot.ReservationCount, snapshot.ProvisionalCount, snapshot.UnknownCount,
-		snapshot.Reserved.MemoryBytes)
+		snapshot.Reserved.MemoryBytes, snapshot.CacheAllocated)
 	return nil
 }
 
@@ -141,13 +141,19 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 				}
 				break
 			}
+			cacheUnknown := false
+			if !resource.HasFeature(lease.ClientFeatures, resource.FeatureCacheBudgetV1) {
+				// Absence of a cache capability does not establish a zero-sized
+				// cache. A legacy fixed cache can be bounded by trusted YAML.
+				cacheMaximum, cacheUnknown = i.legacyManagedCacheMaximum(LiveLease{Lease: lease, Path: path, OwnerPID: owner})
+			}
 			err = state.InstallProvisional(ProvisionalSpec{
 				SandboxID: lease.SandboxID, PeerPID: owner, CgroupPath: lease.CgroupPath,
 				Capacity:              Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
 				ConfiguredAllocatable: Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
 				ReservationMemory:     lease.CapacityMemory, CacheReservation: cacheMaximum, CacheMax: cacheMaximum, InitialBudget: lease.CapacityMemory,
 				RecoverySource: RecoveryLease, RecoveryKey: "lease:" + entry.Name(),
-				LeasePath: path, ClientFeatures: lease.ClientFeatures,
+				LeasePath: path, ClientFeatures: lease.ClientFeatures, CacheRecoveryUnknown: cacheUnknown,
 			})
 			if err != nil {
 				return fmt.Errorf("install lease %s: %w", path, err)
@@ -170,7 +176,7 @@ func (i *Inventory) installUnknownLease(state *State, path string, owner int, pa
 		Capacity: i.Pool, ConfiguredAllocatable: Resources{CPUMilli: i.Pool.CPUMilli},
 		ReservationMemory: i.Pool.MemoryBytes, InitialBudget: i.Pool.MemoryBytes,
 		RecoverySource: RecoveryUnknownLease, RecoveryKey: "unknown:" + path,
-		LeasePath: path,
+		LeasePath: path, CacheRecoveryUnknown: true,
 	}); err != nil {
 		return fmt.Errorf("install invalid live lease %s: %w", path, err)
 	}
@@ -232,18 +238,25 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 			}
 			continue
 		}
+		cacheMaximum, _, cacheErr := cfg.Resources.DiffCOW.Bytes()
+		if cacheErr != nil {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "cache bounds"); err != nil {
+				return err
+			}
+			continue
+		}
 		capMem, capErr := cfg.CapacityMemoryBytes()
 		floorMem, floorErr := cfg.AllocatableMemoryBytes()
 		startupMem, startupErr := cfg.StartupBytes()
 		if capErr != nil || floorErr != nil || startupErr != nil {
-			if err := i.installUnknownManaged(state, sid, owner, pidPath, "resource bounds"); err != nil {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "resource bounds", cacheMaximum); err != nil {
 				return err
 			}
 			continue
 		}
 		cgroupPath := i.vmmCgroup(owner)
 		if cgroupPath == "" || !i.cgroupAllowed(cgroupPath) {
-			if err := i.installUnknownManaged(state, sid, owner, pidPath, "vmm cgroup identity"); err != nil {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "vmm cgroup identity", cacheMaximum); err != nil {
 				return err
 			}
 			continue
@@ -252,7 +265,7 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 			SandboxID: sid, PeerPID: owner, CgroupPath: cgroupPath,
 			Capacity:              Resources{MemoryBytes: capMem, CPUMilli: cpuMilliCeil(float64(cfg.Resources.Capacity.CPU))},
 			ConfiguredAllocatable: Resources{MemoryBytes: floorMem, CPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU)},
-			ReservationMemory:     capMem, InitialBudget: capMem,
+			ReservationMemory:     capMem, InitialBudget: capMem, CacheReservation: cacheMaximum, CacheMax: cacheMaximum,
 			RecoverySource: RecoveryManagedPIDFile, RecoveryKey: "pidfile:" + pidPath,
 		}); err != nil {
 			return err
@@ -262,14 +275,34 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 	return nil
 }
 
-func (i *Inventory) installUnknownManaged(state *State, sid string, owner int, pidPath, reason string) error {
+func (i *Inventory) installUnknownManaged(state *State, sid string, owner int, pidPath, reason string, cacheMaximum ...uint64) error {
+	knownCache := uint64(0)
+	if len(cacheMaximum) > 0 {
+		knownCache = cacheMaximum[0]
+	}
 	i.Logf("live managed sandbox %s has incomplete %s; charging full pool", sid, reason)
 	return state.InstallProvisional(ProvisionalSpec{
 		SandboxID: sid, PeerPID: owner,
 		Capacity: i.Pool, ConfiguredAllocatable: Resources{CPUMilli: i.Pool.CPUMilli},
 		ReservationMemory: i.Pool.MemoryBytes, InitialBudget: i.Pool.MemoryBytes,
 		RecoverySource: RecoveryUnknownManaged, RecoveryKey: "unknown-managed:" + pidPath,
+		CacheReservation: knownCache, CacheMax: knownCache, CacheRecoveryUnknown: len(cacheMaximum) == 0,
 	})
+}
+
+// legacyManagedCacheMaximum returns (upper bound, unknown). It never turns
+// missing cache negotiation into a zero charge or manufactures client features.
+func (i *Inventory) legacyManagedCacheMaximum(live LiveLease) (uint64, bool) {
+	_, yamlPath, ok := i.managedPaths(live.Lease.SandboxID)
+	if !ok || i.ValidateManaged(live, live.OwnerPID) != nil {
+		return 0, true
+	}
+	cfg, err := rtconfig.LoadMerged([]string{yamlPath})
+	if err != nil {
+		return 0, true
+	}
+	maximum, _, err := cfg.Resources.DiffCOW.Bytes()
+	return maximum, err != nil
 }
 
 func managedVMMCgroup(pid int) string {
@@ -365,7 +398,7 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 				SandboxID: sid, CgroupPath: path,
 				Capacity: Resources{MemoryBytes: charge}, ReservationMemory: charge,
 				InitialBudget: charge, RecoverySource: RecoveryCgroup,
-				RecoveryKey: "cgroup:" + path,
+				RecoveryKey: "cgroup:" + path, CacheRecoveryUnknown: true,
 			})
 		})
 		if err != nil && !os.IsNotExist(err) {
@@ -457,6 +490,13 @@ func (i *Inventory) ValidateManaged(live LiveLease, peerPID int) error {
 		return err
 	}
 	l := live.Lease
+	if resource.HasFeature(l.ClientFeatures, resource.FeatureCacheBudgetV1) {
+		maximum, _, cacheErr := cfg.Resources.DiffCOW.Bytes()
+		leaseMaximum, featureErr := resource.CacheMaximumFromFeatures(l.ClientFeatures)
+		if cacheErr != nil || featureErr != nil || maximum != leaseMaximum {
+			return fmt.Errorf("managed cache maximum does not match lease")
+		}
+	}
 	if actual := i.vmmCgroup(peerPID); actual == "" || actual != l.CgroupPath {
 		return fmt.Errorf("managed process cgroup does not match lease")
 	}

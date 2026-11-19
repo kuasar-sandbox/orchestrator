@@ -60,6 +60,42 @@ func TestResourcePoolRoundtripCloneAndDefaults(t *testing.T) {
 	}
 }
 
+func TestResourcePoolCacheOptionsPreservePresenceAndClone(t *testing.T) {
+	capacity, low := "64GiB", "0"
+	input := ResourceListenConfig{Pools: []ResourcePoolConfig{
+		{Name: "default", CacheCapacity: &capacity, CacheLowWatermark: &low},
+	}}
+	input.ApplyDefaults()
+	if err := input.ValidatePools(); err != nil {
+		t.Fatal(err)
+	}
+	for _, encode := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
+		raw, err := encode(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got ResourceListenConfig
+		if err := yaml.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if p := got.Pools[0]; p.CacheCapacity == nil || *p.CacheCapacity != capacity || p.CacheLowWatermark == nil || *p.CacheLowWatermark != "0" {
+			t.Fatalf("explicit cache options lost in roundtrip: %+v", p)
+		}
+	}
+	cloned := cloneResourcePools(input.Pools)
+	*cloned[0].CacheCapacity = "32GiB"
+	*cloned[0].CacheLowWatermark = "1GiB"
+	if *input.Pools[0].CacheCapacity != capacity || *input.Pools[0].CacheLowWatermark != low {
+		t.Fatal("cache config clone aliases source")
+	}
+	for _, invalid := range []string{"-1", "invalid", "18446744073709551616"} {
+		input.Pools[0].CacheLowWatermark = &invalid
+		if err := input.ValidatePools(); err == nil {
+			t.Fatalf("invalid cache threshold accepted: %s", invalid)
+		}
+	}
+}
+
 func TestResourcePoolRejectsInvalidConfiguration(t *testing.T) {
 	for _, replacement := range []struct{ old, value string }{
 		{"enabled: true", "enabled: true\n  resources: {physical_memory: auto}"},
