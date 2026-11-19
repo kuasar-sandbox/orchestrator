@@ -267,6 +267,10 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 	if !proof.Committed || !proof.RuntimeRetired {
 		return nil, fmt.Errorf("previous runtime is not retired")
 	}
+	r, err = s.Inventory.reconcileAdoption(s.State, r)
+	if err != nil {
+		return nil, err
+	}
 	lease, owner, file, err := resource.InspectLeaseCandidate(s.Identity, req.SandboxID, req.LeaseCandidate)
 	if os.IsNotExist(err) && r.Handoff != nil && r.Handoff.ID == req.HandoffID {
 		lease, owner, file, err = resource.InspectLeaseIdentity(resource.LeasePath(s.Identity, req.SandboxID))
@@ -317,15 +321,22 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 				return nil, fmt.Errorf("retained active owner is still live")
 			}
 		}
+		start, err := retentionProcessStartTime(peerPID)
+		if err != nil {
+			return nil, err
+		}
 		r.Stage = retentionAdopting
 		r.Handoff = &retainedHandoff{ID: req.HandoffID, Candidate: req.LeaseCandidate, File: file, Lease: lease,
-			Token: NewToken(), Pool: s.State.SandboxPool(req.SandboxID), InitialBudget: spec.InitialBudget,
+			Token: NewToken(), StartTime: start, Pool: s.State.SandboxPool(req.SandboxID), InitialBudget: spec.InitialBudget,
 			InitialCache: spec.InitialCache, CacheReclaim: resource.CloneCacheReclaimState(req.CacheReclaim)}
 		if err := writeRetainedReceipt(s.Identity, r); err != nil {
 			return nil, err
 		}
 		if err := s.State.setRetainedReceipt(r); err != nil {
 			return nil, err
+		}
+		if s.phaseHook != nil {
+			s.phaseHook("retention_intent")
 		}
 	} else if r.Handoff.File != file || r.Handoff.Lease.PID != peerPID || r.Handoff.Candidate != req.LeaseCandidate ||
 		r.Handoff.InitialBudget != spec.InitialBudget || r.Handoff.InitialCache != spec.InitialCache {
@@ -335,6 +346,14 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 	_, old, err := s.cacheCoordinator().Admit(spec, req.CacheReclaim)
 	if err != nil {
 		return nil, err
+	}
+	// The server must detach this connection on EOF even if publication or
+	// receipt persistence fails before the client receives its token.
+	if token != nil {
+		*token = spec.Token
+	}
+	if old != nil && old != conn {
+		_ = old.Close()
 	}
 	if s.phaseHook != nil {
 		s.phaseHook("retention_admitted")
@@ -352,12 +371,6 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 	}
 	if err := s.State.setRetainedReceipt(r); err != nil {
 		return nil, err
-	}
-	if old != nil && old != conn {
-		_ = old.Close()
-	}
-	if token != nil {
-		*token = spec.Token
 	}
 	return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted, Token: spec.Token,
 		GrantedInitialAlloc: spec.InitialBudget, GrantedInitialCache: spec.InitialCache,

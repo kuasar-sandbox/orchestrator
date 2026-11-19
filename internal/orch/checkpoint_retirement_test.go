@@ -422,3 +422,41 @@ func TestCommittedCaptureRetirementTimeoutRetainsForwardRecovery(t *testing.T) {
 		t.Fatalf("committed source was lost after timeout: %+v %v", current, err)
 	}
 }
+
+func TestReleasedHolderCollectsPausedCheckpointAfterRunDirCleared(t *testing.T) {
+	for _, paused := range []bool{true, false} {
+		t.Run(map[bool]string{true: "paused", false: "running successor"}[paused], func(t *testing.T) {
+			f := pendingPauseFixture(t)
+			stopRetirementWorkers(t, f.o)
+			m := retiredTestOwnership(t, f)
+			testCaptureRecord(t, f, m, func(r *memorycheckpoint.CaptureRecord) {
+				r.FileReady, r.RAMReleased, r.PayloadRef = true, true, "payload.memory"
+			})
+			f.sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: checkpointSnapshotRef, SandboxRef: checkpointSandboxRef}
+			f.sb.RunID, f.sb.RunDir, f.sb.EnvdUDS, f.sb.CiUDS = "", "", "", ""
+			f.sb.State = types.StatePaused
+			if !paused {
+				f.sb.State, f.sb.RunID = types.StateRunning, "successor-run"
+			}
+			if err := f.o.st.Put(context.Background(), f.sb); err != nil {
+				t.Fatal(err)
+			}
+			proof := filepath.Join(t.TempDir(), "collected")
+			checkpointCleanupTool(t, f.o, "touch '"+proof+"'\n")
+			if err := f.o.reconcileRetiredRun(context.Background(), m); err != nil {
+				t.Fatalf("completed holder reconciliation: %v", err)
+			}
+			_, proofErr := os.Stat(proof)
+			if paused && proofErr != nil || !paused && !errors.Is(proofErr, os.ErrNotExist) {
+				t.Fatalf("post-save collection paused=%v: %v", paused, proofErr)
+			}
+			if _, found, err := f.o.st.RunPoolOwnership(context.Background(), m.RunID); err != nil || found {
+				t.Fatalf("finished holder ownership remained: %v %v", found, err)
+			}
+			row, err := f.o.st.Get(context.Background(), f.sb.ID)
+			if err != nil || row.State != f.sb.State || row.RunID != f.sb.RunID || row.ResumeSource != f.sb.ResumeSource {
+				t.Fatalf("post-save collection changed current owner: %+v %v", row, err)
+			}
+		})
+	}
+}

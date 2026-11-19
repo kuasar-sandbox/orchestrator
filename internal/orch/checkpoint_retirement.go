@@ -96,7 +96,7 @@ func (o *Orchestrator) releaseRetiredRun(ctx context.Context, m store.RunPoolOwn
 			return api.ErrPreviousMemorySavePending
 		}
 	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
-		return errors.New("resource controller is unavailable for memory settlement")
+		return fmt.Errorf("%w: resource controller is unavailable for memory settlement", errRetirementPending)
 	}
 	if err := o.fenceSandboxRunner(ctx, m.RunID); err != nil {
 		return err
@@ -194,7 +194,7 @@ func (o *Orchestrator) discardAbsentCapture(ctx context.Context, m store.RunPool
 			return api.ErrPreviousMemorySavePending
 		}
 	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
-		return errors.New("resource controller is unavailable for absent capture verification")
+		return fmt.Errorf("%w: resource controller is unavailable for absent capture verification", errRetirementPending)
 	}
 	return o.runs.forget(m.RunID)
 }
@@ -369,6 +369,8 @@ func (o *Orchestrator) abortCheckpointRetirement(ctx context.Context, sb *types.
 		if _, pending := p.state.RetainedMemory(sb.ID); pending {
 			return api.ErrPreviousMemorySavePending
 		}
+	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
+		return fmt.Errorf("%w: resource controller is unavailable for capture rollback", errRetirementPending)
 	}
 	_, err := o.mutateRetirement(ctx, sb.RunID, func(m *store.RunPoolOwnership) error {
 		if m.TaskID != sb.ID || m.RetirementOperationID != permit.OperationID || m.Role != "" {
@@ -524,7 +526,7 @@ func (o *Orchestrator) RunRetirementRole(ctx context.Context, kind, runID string
 		return out, errors.New("runner retirement acknowledgement changed")
 	}
 	firstAck := false
-	_, err = o.mutateRetirement(ctx, runID, func(current *store.RunPoolOwnership) error {
+	m, err = o.mutateRetirement(ctx, runID, func(current *store.RunPoolOwnership) error {
 		if current.Role != store.RunRoleMemoryHolder || runRetirementEvent(*current) != *ack {
 			return errors.New("runner retirement identity changed")
 		}
@@ -539,16 +541,38 @@ func (o *Orchestrator) RunRetirementRole(ctx context.Context, kind, runID string
 		o.log.Info("checkpoint parent retirement acknowledged", "sid", ack.SandboxID,
 			"run_id", runID, "memory_id", ack.MemoryID, "epoch", ack.Epoch)
 	}
-	out.Acknowledged = true
 	o.runSessionsMu.Lock()
 	if o.retirementWake != nil {
 		close(o.retirementWake)
 	}
 	o.retirementWake = make(chan struct{})
 	o.runSessionsMu.Unlock()
-	o.runs.releaseRuntimeSlot(runID)
 	o.startSandboxRunEndCheck(runID)
+	if err := o.retireHolderExecution(m); err != nil {
+		return out, err
+	}
+	out.Acknowledged = true
 	return out, nil
+}
+
+// The frozen holder retains its durable unit identity and source-pool memory
+// charge, but no longer owns an execution placement. RetireExecution matches
+// the exact old run, so replay cannot remove a successor's placement or budget.
+// A prepared resource receipt still protects B until CommitRetained converts
+// it to R; keep paused cleanup pending if that commit has not completed yet.
+func (o *Orchestrator) retireHolderExecution(m store.RunPoolOwnership) error {
+	if m.Role != store.RunRoleMemoryHolder || !m.ParentRetired || m.TaskID == "" || m.RunID == "" {
+		return errRetirementPending
+	}
+	if p := o.memoryPressure.Load(); p != nil {
+		if err := p.state.RetireExecution(m.TaskID, m.RunID); err != nil {
+			return errors.Join(errRetirementPending, err)
+		}
+	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
+		return fmt.Errorf("%w: resource controller is unavailable for execution retirement", errRetirementPending)
+	}
+	o.runs.releaseRuntimeSlot(m.RunID)
+	return nil
 }
 
 func (o *Orchestrator) awaitParentRetirement(ctx context.Context, m store.RunPoolOwnership) error {
@@ -574,8 +598,7 @@ func (o *Orchestrator) awaitParentRetirement(ctx context.Context, m store.RunPoo
 			return errors.New("runner retirement owner changed")
 		}
 		if current.ParentRetired {
-			o.runs.releaseRuntimeSlot(m.RunID)
-			return nil
+			return o.retireHolderExecution(current)
 		}
 		if session == nil || !session.holderRetirement {
 			return errRetirementPending
@@ -718,5 +741,32 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 			return err
 		}
 	}
-	return o.releaseRetiredRun(ctx, current, record)
+	if current.ParentRetired {
+		if err := o.retireHolderExecution(current); err != nil {
+			return err
+		}
+	}
+	if err := o.releaseRetiredRun(ctx, current, record); err != nil {
+		return err
+	}
+	// A fast Pause cannot collect while its holder pins the directory. The
+	// existing run-end worker gets a real collection opportunity once RAM and
+	// the holder are gone, even when ordinary RunDir ownership is already clear.
+	o.cleanupCheckpointAfterMemorySave(ctx, current)
+	return nil
+}
+
+// Called only from the unlocked, completed-retirement branch above. A cleanup
+// failure owns only garbage under BaseDir; it must not resurrect a retired run
+// or retain its resource charge. Running successors keep their active refs.
+func (o *Orchestrator) cleanupCheckpointAfterMemorySave(ctx context.Context, retired store.RunPoolOwnership) {
+	unlock := o.lifecycle.Lock(retired.TaskID)
+	defer unlock()
+	sb, err := o.st.Get(ctx, retired.TaskID)
+	if err == nil && sb != nil && sb.State == types.StatePaused && sb.InstanceID == retired.RetirementInstanceID && sb.BaseDir == retired.RetirementBaseDir {
+		err = o.cleanupCheckpoint(ctx, sb)
+	}
+	if err != nil {
+		o.log.Warn("checkpoint garbage collection after memory save deferred", "sid", retired.TaskID, "err", err)
+	}
 }

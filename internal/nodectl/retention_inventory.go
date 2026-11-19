@@ -211,16 +211,8 @@ func (i *Inventory) recoverRetained(state *State, controlPIDs map[int]bool) erro
 		} else {
 			i.Logf("retaining uncertain checkpoint memory sid=%s: %v", r.SandboxID, proofErr)
 		}
-		if r.Stage == retentionAdopting {
-			l, pid, file, err := resource.InspectLeaseIdentity(resource.LeasePath(i.ControllerSocket, r.SandboxID))
-			if err == nil && file == r.Handoff.File && pid == r.Handoff.Lease.PID && l.PID == pid {
-				r.OwnerLease, r.OwnerFile, r.OwnerToken = r.Handoff.Lease, r.Handoff.File, r.Handoff.Token
-				r.Stage, changed = retentionActive, true
-			} else {
-				// No success can have been returned before publication. A still
-				// locked candidate can safely retry the admission from holding.
-				r.Stage, r.Handoff, changed = retentionHolding, nil, true
-			}
+		if next := adoptionRecovery(i.ControllerSocket, r); next != r {
+			r, changed = next, true
 		}
 		if changed {
 			if err := writeRetainedReceipt(i.ControllerSocket, r); err != nil {
@@ -250,8 +242,9 @@ func (s *State) retainedSourceLease(sid string, pid int, cgroup string) bool {
 	return err == nil && owner == pid && file == r.SourceFile
 }
 
-// ReconcileRetained consumes only positive monotonic capture facts. It never
-// interprets EOF, file readiness or a dead owner as proof that RAM was freed.
+// ReconcileRetained consumes monotonic capture facts and ends abandoned owner
+// admissions. EOF, file readiness or a dead owner never prove source RAM was
+// freed; only its exact RAMReleased fact can release R.
 func (i *Inventory) ReconcileRetained(state *State) error {
 	return i.reconcileRetained(state, "")
 }
@@ -261,7 +254,7 @@ func (i *Inventory) ReconcileRetained(state *State) error {
 // clears a pending obligation; callers recheck RetainedMemory after success.
 func (s *State) ReconcileRetainedMemory(sid string) error {
 	r := s.retainedSnapshot(sid)
-	if r == nil || r.Settled {
+	if r == nil || (r.Settled && r.Stage != retentionAdopting) {
 		return nil
 	}
 	i := &Inventory{ControllerSocket: r.OwnerLease.ControllerSocket}
@@ -275,6 +268,11 @@ func (i *Inventory) reconcileRetained(state *State, sid string) error {
 	for _, r := range state.retainedSnapshots() {
 		if sid != "" && r.SandboxID != sid {
 			continue
+		}
+		var err error
+		r, err = i.reconcileAdoption(state, r)
+		if err != nil {
+			return err
 		}
 		if r.Settled {
 			continue

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,13 +39,37 @@ func runRecoveryControllerHelper(t *testing.T) {
 		Allocator: NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1 << 30, MinGrantStep: 1}),
 		Inventory: &Inventory{ControllerSocket: socket, CgroupScanPaths: []string{root}, Pool: state.AllocatablePool},
 	}
-	if phase := os.Getenv("NODECTL_CRASH_PHASE"); phase != "" {
+	if phase := os.Getenv("NODECTL_CRASH_PHASE"); phase != "" || os.Getenv("NODECTL_DROP_ADOPT_ACK") != "" {
+		var holdOnce, dropOnce sync.Once
 		srv.phaseHook = func(got string) {
-			if got != phase {
-				return
+			if got == phase {
+				holdOnce.Do(func() {
+					_, _ = fmt.Fprintln(os.Stdout, "phase:"+got)
+					marker := os.Getenv("NODECTL_PHASE_CONTINUE")
+					if marker == "" {
+						select {}
+					}
+					deadline := time.Now().Add(15 * time.Second)
+					for {
+						if _, err := os.Stat(marker); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Error("controller phase continuation timed out")
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+				})
 			}
-			_, _ = fmt.Fprintln(os.Stdout, "phase:"+got)
-			select {}
+			if got == "retention_published" && os.Getenv("NODECTL_DROP_ADOPT_ACK") != "" {
+				dropOnce.Do(func() {
+					if r, ok := state.retentionReservation("retained-sid"); ok && r.Conn != nil {
+						_ = r.Conn.Close()
+					}
+					_, _ = fmt.Fprintln(os.Stdout, "dropped:adopt-ack")
+				})
+			}
 		}
 	}
 	if err := srv.Listen(); err != nil {
@@ -55,6 +80,15 @@ func runRecoveryControllerHelper(t *testing.T) {
 	})
 	admission.Run()
 	ctx, cancel := context.WithCancel(context.Background())
+	if value := os.Getenv("NODECTL_SWEEP_INTERVAL"); value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sweeper := &IdleSweeper{State: state, Admission: admission, Allocator: srv.Allocator, Inventory: srv.Inventory,
+			StartupTTL: time.Minute, Heartbeat: time.Minute, Interval: interval}
+		go sweeper.Run(ctx)
+	}
 	done := make(chan struct{})
 	go func() { _ = srv.Serve(ctx); close(done) }()
 	_, _ = fmt.Fprintln(os.Stdout, "ready")

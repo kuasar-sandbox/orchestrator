@@ -482,8 +482,9 @@ Pause 在接纳操作或进入 `pausing` 之前等待上一轮内存保存。随
 校验、在线 Proxy 握手、运行实例捕获，以及精确 RunID 的来源/paused 原子提交。
 同步捕获继续 Stop/Reset 旧 runner；checkpoint 内存保存则同时提交 holder 角色，
 等待旧父进程停止并 join metrics 采样、将最终 usage 读入私有值并确认退役，保留
-holder unit 及其分代目录。两条路径随后都 detach 精确网络、选择性清理 checkpoint，
-清除普通 RunDir 所有权并发布 paused。holder 的 payload 写入和最终 RAM 释放继续后台完成。
+holder unit 及其分代目录。两条路径随后都 detach 精确网络、尝试选择性清理 checkpoint，
+清除普通 RunDir 所有权并发布 paused。内存读者的 pin 仅延期垃圾回收，不延迟普通运行
+资源清理。holder 的 payload 写入和最终 RAM 释放继续后台完成。
 
 非空 RunID/port/RunDir 表示运行资源清理仍未完成；成功释放后才以 exact CAS 清对应
 字段。失败阻止新的 Resume/Wake/Exec 接管，并由 admission 或重启恢复重试。
@@ -634,12 +635,20 @@ unlink 仍被限制在原目录内。
 Pause 成功不代表节点启动时已经完成该路径检查。外部发布制品的保留与删除仍由使用方负责，
 与本沙箱 checkpoint 清理分别处理。
 
-新来源已提交后，即使清理失败，Pause 仍成功。最后一个持久 RunDir ownership 标记保留到
-checkpoint 清理和既有 paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前
-来源重试，重启后也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
+新来源已提交后，即使清理失败，Pause 仍成功。内存读者持有 pin 时，SDK 在修改别名或删除
+任何内容之前返回 `artifact.ErrCheckpointMemoryReadersBusy`。普通清理中，
+`node-ctl checkpoint-cleanup` 仅在这个结果且 storage Close 成功时返回内部延期退出码 80。
+owner 延期垃圾回收并完成普通 paused 收尾，无需等待内存保存。RAM 结清且 runner fence
+完成后，既有 holder run-end worker 在 SID lifecycle lock 下确认精确 instance/BaseDir
+仍为 paused，再尝试回收，包括 RunDir 已清空的情况。
+
+其他清理失败仍保留最后一个持久 RunDir ownership 标记，直到 checkpoint 清理和既有
+paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前来源重试，重启后
+也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
 不会持锁等待需要同一锁完成的 export。Resume/Wake/Exec 遵守既有 pending-cleanup admission
-合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。普通 Kill 和 BuildBaseDir
-终态删除仍由原 finalizer 负责；此步骤不回收任何共享或外部制品。
+合同。候选已不存在视为完成；权限、I/O 和身份错误继续保留重试责任。检查和硬删除不把
+延期回收视为删除许可。普通 Kill 和 BuildBaseDir 终态删除仍由原 finalizer 负责；
+此步骤不回收任何共享或外部制品。
 
 <a id="releasing-disk-versions-after-resume"></a>
 
@@ -1179,9 +1188,10 @@ hard-delete 后才发送 Extension/object terminal observation 和最终 route D
 route-applied barrier；失败清理本轮 runtime 归属、保留已形成数据，再以 exact owner CAS
 提交 dead 与自动责任并发布 dead 管理投影。
 
-Pause 的 `CommitPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别只在
-Stop/Reset fence、Detach、checkpoint 选择性清理及 RemoveAll 成功后 exact-clear；RunDir CAS 同时清除该目录拥有的 envd/ci
-UDS path。任一步失败都保留尚未完成的字段供当前进程或 startup Reconcile 重试。fully-cleaned paused
+Pause 的 `CommitPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别在精确
+运行退役或 Stop/Reset fence、Detach、checkpoint 选择性清理及普通 RunDir 删除后 exact-clear；
+只有明确的内存读者 busy 结果允许延期回收并继续完成运行资源清理。RunDir CAS 同时清除
+该目录拥有的 envd/ci UDS path。其他失败仍保留尚未完成的字段供当前进程或 startup Reconcile 重试。fully-cleaned paused
 row 保留含 checkpoint 数据及来源操作锁的 BaseDir 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
 并在 `paused -> starting` acceptance 中原子恢复 canonical RunDir/UDS。这样 paused BaseDir 永不被
 runtime cleanup 删除，显式 Delete 仍可从 fully-cleaned paused row 删除 BaseDir 后 hard-delete。

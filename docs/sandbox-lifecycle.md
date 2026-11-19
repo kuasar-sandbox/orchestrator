@@ -489,8 +489,10 @@ state. Synchronous capture stops/resets the old runner. Checkpoint memory saving
 instead commits its holder role and waits for the old parent to stop/join metrics,
 read its final usage into a private value and acknowledge retirement. It keeps the
 holder unit and its generation directory alive. Both paths detach the exact
-network, selectively clean checkpoints and clear normal RunDir ownership before
-publishing paused. The holder's payload write and final RAM release continue later.
+network, attempt selective checkpoint cleanup and clear normal RunDir ownership
+before publishing paused. Memory-reader pins defer only garbage collection; they
+do not delay ordinary runtime cleanup. The holder's payload write and final RAM
+release continue later.
 
 Remaining RunID/port/RunDir means runtime cleanup is pending. Exact CASes clear
 only successfully released ownership; failures block new Resume/Wake/Exec
@@ -695,14 +697,24 @@ cleanup precondition; a successful Pause does not imply path validation happened
 at node startup. Published artifact retention and deletion remain the caller's
 responsibility, separate from owned checkpoint cleanup.
 
-A committed Pause remains successful if cleanup fails. The last durable RunDir
-ownership marker remains until checkpoint cleanup and ordinary paused cleanup
-succeed. The existing worker retries with a freshly loaded current source under
-the SID lifecycle lock, including after restart. Active or detached exports keep
+A committed Pause remains successful if cleanup fails. A memory-reader pin makes
+the SDK return `artifact.ErrCheckpointMemoryReadersBusy` before modifying aliases
+or deleting anything. For ordinary cleanup, `node-ctl checkpoint-cleanup` maps only
+this result, with successful storage close, to its internal deferred exit code 80.
+The owner defers garbage collection and finishes ordinary paused cleanup without
+waiting for the memory save. After RAM settlement and runner fencing, the existing
+holder run-end worker retries collection under the SID lifecycle lock if the exact
+instance and BaseDir are still paused, including when RunDir is already empty.
+
+For other cleanup failures, the last durable RunDir ownership marker remains until
+checkpoint cleanup and ordinary paused cleanup succeed. The existing worker
+retries with a freshly loaded current source under the SID lifecycle lock,
+including after restart. Active or detached exports keep
 their read fence; cleanup never waits for an export while holding the lock it
 needs. Resume/Wake/Exec obey the existing pending-cleanup admission contract.
 Missing candidates count as finished; permission, I/O, and identity errors retain
-retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
+retry ownership. Inspection and hard deletion do not accept deferred collection as
+permission to delete. Ordinary Kill and terminal BuildBaseDir deletion retain their
 existing finalizers. Shared/external artifacts are never reclaimed by this step.
 
 <a id="releasing-disk-versions-after-resume"></a>
@@ -1156,7 +1168,7 @@ Create/Connect/Wake/route activation/native exec/exec-session/migration import s
 
 After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation and the final route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans runtime ownership while retaining formed data, then exactly commits dead with automatic responsibility and publishes its management projection.
 
-CommitPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
+CommitPaused atomically stores state/source. RunID, port and RunDir clear individually after exact runtime retirement or Stop/Reset fencing, Detach, selective checkpoint cleanup and ordinary RunDir removal. Only the explicit memory-reader busy result permits deferring collection while this runtime cleanup completes. RunDir CAS also clears its envd/CI UDS paths. Other failures retain remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
 When `resource_listen` is enabled, local admission uses the selected resource pool's
 source-independent [effective-zone matrix](node-resource.md#rawzone-and-effective-zone).

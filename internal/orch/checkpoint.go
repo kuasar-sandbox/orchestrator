@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,11 +14,21 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
-// cleanupCheckpoint runs under the SID lifecycle lock, after runner fencing,
-// while RunDir still durably owns paused cleanup. Artifact interpretation stays
-// in the tenant-key-bound tool process, outside conductor.
+// CheckpointMemoryReadersBusyExitCode is the internal checkpoint-cleanup
+// command's exact no-mutation result while memory readers protect the files.
+const CheckpointMemoryReadersBusyExitCode = 80
+
+var errCheckpointMemoryReadersBusy = errors.New("checkpoint garbage collection is deferred by memory readers")
+
+// cleanupCheckpoint runs under the SID lifecycle lock for a paused source,
+// during ordinary cleanup or after its memory holder releases the files.
+// Artifact interpretation stays in the tenant-key-bound tool process.
 func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox) error {
 	_, err := o.inspectOrCleanupCheckpoint(ctx, sb, false)
+	if errors.Is(err, errCheckpointMemoryReadersBusy) {
+		o.log.Debug("checkpoint garbage collection deferred by memory readers", "sid", sb.ID)
+		return nil
+	}
 	return err
 }
 
@@ -85,6 +96,10 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if !inspect && errors.As(err, &exitErr) && exitErr.ExitCode() == CheckpointMemoryReadersBusyExitCode {
+			return nil, errCheckpointMemoryReadersBusy
+		}
 		return nil, fmt.Errorf("orch: checkpoint inspection/cleanup %s: %w: %s", sb.ID, err, stderr.String())
 	}
 	var refs []artifact.DiffCheckpointRef

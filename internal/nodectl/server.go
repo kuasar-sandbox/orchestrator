@@ -276,6 +276,13 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 // reply. The conn-EOF monitor cancels the queue entry if the client
 // disconnects while queued.
 func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *string) *Message {
+	if req.Type == resource.TypeAdoptRetained && s.Inventory != nil {
+		// Reclaim an ended prior attempt before evaluating headroom, including
+		// when its provisional B would otherwise keep the retry in the FIFO.
+		if err := s.Inventory.reconcileRetained(s.State, req.SandboxID); err != nil {
+			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error()}
+		}
+	}
 	if req.Type == resource.TypeAdoptRetained && s.State.retainedSnapshot(req.SandboxID) == nil {
 		if req.Retention == nil {
 			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: "missing retained capture identity"}

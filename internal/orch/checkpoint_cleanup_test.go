@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -84,6 +85,29 @@ func TestCheckpointCleanupFailureRetainsMarkerAndRestartRetries(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "--from\n"+f.sb.ResumeSource.Ref+"\n") || !strings.Contains(string(args), "--sandbox-id\n"+f.sb.ID+"\n") {
 		t.Fatalf("tool lost source/producer: %s", args)
+	}
+}
+
+func TestCheckpointMemoryReadersDeferOnlyGCWithoutHoldingRuntimeOwnership(t *testing.T) {
+	f := localPausedCheckpoint(t, "checkpoint-reader-deferred")
+	stopRetirementWorkers(t, f.o)
+	holder := filepath.Join(f.sb.RunDir, "memory-holders", "memory", "1")
+	if err := os.MkdirAll(holder, 0700); err != nil {
+		t.Fatal(err)
+	}
+	checkpointCleanupTool(t, f.o, fmt.Sprintf("exit %d\n", CheckpointMemoryReadersBusyExitCode))
+	if err := f.o.finalizePausedCleanupOnce(f.sb.ID); err != nil {
+		t.Fatalf("memory-reader GC retained ordinary runtime ownership: %v", err)
+	}
+	row, err := f.o.st.Get(context.Background(), f.sb.ID)
+	if err != nil || pausedCleanupPending(row) || row.ResumeSource != f.sb.ResumeSource {
+		t.Fatalf("deferred GC lost source or kept runtime fields: %+v %v", row, err)
+	}
+	if _, err := os.Stat(holder); err != nil {
+		t.Fatalf("deferred GC removed holder namespace: %v", err)
+	}
+	if _, err := f.o.inspectOrCleanupCheckpoint(context.Background(), row, true); err == nil {
+		t.Fatal("inspection incorrectly accepted the cleanup-only deferred code")
 	}
 }
 

@@ -43,6 +43,7 @@ type retainedHandoff struct {
 	Candidate     string                      `json:"candidate"`
 	File          resource.LeaseFileIdentity  `json:"file"`
 	Lease         resource.Lease              `json:"lease"`
+	StartTime     uint64                      `json:"start_time,omitempty"`
 	Token         string                      `json:"token"`
 	Pool          string                      `json:"pool"`
 	InitialBudget uint64                      `json:"initial_budget"`
@@ -263,6 +264,42 @@ func (s *State) setRetainedReceipt(r *retainedReceipt) error {
 	}
 	root.retained[r.SandboxID] = cloneRetained(r)
 	return nil
+}
+
+// resetRetainedAdoption removes only the failed attempt's provisional B/cache.
+// The caller has already persisted holding and proved that this candidate can
+// no longer publish. Keep the in-memory intent on any error so a retry cannot
+// pass this cleanup barrier. The source R belongs to a separate accounting role.
+func (s *State) resetRetainedAdoption(previous, next *retainedReceipt) (net.Conn, error) {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	current := root.retained[previous.SandboxID]
+	if current == nil || !sameCapture(current.Capture, previous.Capture) || current.Stage != retentionAdopting ||
+		current.Handoff == nil || previous.Handoff == nil || current.Handoff.ID != previous.Handoff.ID ||
+		current.Handoff.File != previous.Handoff.File || current.Handoff.Token != previous.Handoff.Token {
+		return nil, fmt.Errorf("retained handoff changed before cleanup")
+	}
+	h := previous.Handoff
+	p := root.retainedPool(h.Pool)
+	if p == nil {
+		return nil, fmt.Errorf("handoff pool disappeared")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var conn net.Conn
+	if active := p.bySID[previous.SandboxID]; active != nil {
+		if active.Token != h.Token || active.PeerPID != h.Lease.PID || active.CgroupPath != h.Lease.CgroupPath || active.RetentionPrepared {
+			return nil, fmt.Errorf("handoff reservation changed before cleanup")
+		}
+		conn = active.Conn
+		if _, err := p.deleteLocked(previous.SandboxID); err != nil {
+			return nil, err
+		}
+	}
+	root.retained[previous.SandboxID] = cloneRetained(next)
+	p.refreshRetainedCleanupLocked(previous.SandboxID)
+	return conn, nil
 }
 
 func (s *State) releaseRetained(sid string, capture resource.CaptureRetention) error {

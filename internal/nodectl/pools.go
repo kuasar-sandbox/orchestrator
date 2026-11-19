@@ -362,8 +362,9 @@ func (s *State) BeginPhase(pool, previousSID, sid, runID string, capacity Resour
 	return nil
 }
 
-// RetireExecution is only called by the lifecycle owner after systemd confirms
-// this run has exited. A stale run cannot remove its successor's reservation.
+// RetireExecution is called by the lifecycle owner after normal run exit or
+// confirmed checkpoint execution retirement. A memory holder may remain alive;
+// its retained charge is independent. A stale run cannot retire its successor.
 func (s *State) RetireExecution(sid, runID string) error {
 	if s.pools != nil {
 		// Placement and retained-memory ownership may now name different
