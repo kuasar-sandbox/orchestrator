@@ -93,6 +93,10 @@ pressure_diagnostics() (
     # sandbox metadata, resource tokens, or the whole conductor configuration.
     set +e
     echo "==> pressure failure diagnostics"
+    MANIFEST_KEY="$MK" \
+    KUASAR_E2E_MEMORY_COMPARE_BIN="${MEMORY_COMPARE_BIN:-}" \
+    KUASAR_E2E_MEMORY_CONFIG="$WORK/manifest.yaml" \
+    KUASAR_E2E_MEMORY_CHECKPOINT_ROOT="$WORK/lib/sandboxes" \
     timeout 12 python3 "$SCRIPT_DIR/lifecycle_diagnostics.py" \
         "$WORK/lib/node-ctl.db" "$WORK/orch-pressure.log" \
         "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}" || true

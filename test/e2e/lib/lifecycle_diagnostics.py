@@ -1,6 +1,7 @@
 """Bounded, read-only evidence for failed idle/pressure Pause/Wake cases."""
 from collections import deque
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -79,7 +80,112 @@ def parse_line(line):
             return {}
 
 
-def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, stream=None):
+def held_memory_fault(message):
+    """Read only the bounded JSON emitted by the hold workload's failure path."""
+    _, marker, payload = message.partition('held-memory contents changed')
+    payload = payload.lstrip(': ').strip()
+    if not marker or not payload or len(payload) > MAX_FIELD:
+        return None
+    try:
+        value = json.loads(payload)
+        return value if isinstance(value, dict) else None
+    except ValueError:
+        return None
+
+
+def memory_page_request(fault):
+    """A masked/unavailable PFN is not a usable physical address."""
+    if fault.get('page_size') != 4096:
+        raise ValueError('unsupported guest page size')
+    mapping, page = fault.get('pagemap'), fault.get('page')
+    if not isinstance(mapping, dict) or not isinstance(page, dict):
+        raise ValueError('missing page evidence')
+    pfn = mapping.get('pfn')
+    if (mapping.get('present') is not True or mapping.get('swapped') is not False
+            or type(pfn) is not int or not 0 < pfn < (1 << 52)):
+        raise ValueError('guest PFN is unavailable')
+    start, length = page.get('offset_in_page'), page.get('length')
+    if (type(start) is not int or type(length) is not int
+            or not 0 <= start < 4096 or not 0 < length <= 4096 - start):
+        raise ValueError('invalid held-page intersection')
+    digest = page.get('sha256')
+    if not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+        raise ValueError('invalid guest page digest')
+    return pfn * 4096, start, length, digest
+
+
+def saved_memory_page(probe, record, request):
+    """Read one saved page through the native fixture, with no VM side effects."""
+    gpa, start, length, guest_digest = request
+    if record.get('resume_source_kind') != 'snapshot':
+        raise ValueError('no saved snapshot')
+    sid = record['id']
+    if re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', sid) is None:
+        raise ValueError('invalid sandbox identity')
+    source_ref = record.get('resume_source_ref')
+    if not isinstance(source_ref, str) or not source_ref.startswith('file://'):
+        raise ValueError('unsupported saved source')
+    command = [probe['helper'], 'page', '--source-ref', source_ref,
+               '--source-dir', str(Path(probe['checkpoint_root']) / sid / 'checkpoint'),
+               '--manifest-config', probe['manifest_config'], '--gpa', str(gpa),
+               '--start', str(start), '--length', str(length)]
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=output,
+                                stderr=subprocess.DEVNULL, timeout=3)
+        if result.returncode:
+            return dict(unavailable='helper_exit', exit_code=result.returncode)
+        if output.seek(0, 2) > 16384:
+            raise ValueError('oversized page evidence')
+        output.seek(0)
+        value = json.loads(output.read(16384))
+    if not isinstance(value, dict):
+        raise ValueError('invalid page evidence')
+    # Only the fixture's numeric/digest evidence is forwarded. Paths, arbitrary
+    # helper output and local encryption configuration never enter the journal.
+    out = project(value, ('source_identity', 'gpa', 'memory_offset', 'start', 'length', 'sha256', 'non_ff'))
+    if (any(type(out.get(field)) is not int for field in ('gpa', 'start', 'length'))
+            or (out['gpa'], out['start'], out['length']) != (gpa, start, length)):
+        raise ValueError('page evidence does not match request')
+    offset, non_ff = out.get('memory_offset'), out.get('non_ff')
+    if (type(offset) is not int or not 0 <= offset <= (1 << 64) - 4096 or offset % 4096
+            or type(non_ff) is not int or not 0 <= non_ff <= length):
+        raise ValueError('invalid saved page counters')
+    digest = out.get('sha256')
+    if not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+        raise ValueError('invalid saved page digest')
+    points = value.get('bad_points', [])
+    layers = value.get('layers', [])
+    if (not isinstance(points, list) or len(points) != min(non_ff, 8)
+            or not isinstance(layers, list) or not 1 <= len(layers) <= 64):
+        raise ValueError('unbounded page evidence')
+    previous = start - 1
+    for point in points:
+        if (not isinstance(point, dict) or type(point.get('offset')) is not int
+                or not previous < point['offset'] < start + length
+                or type(point.get('actual')) is not int or not 0 <= point['actual'] < 255):
+            raise ValueError('invalid saved page sample')
+        previous = point['offset']
+    for layer in layers:
+        if (not isinstance(layer, dict) or not isinstance(layer.get('identity'), str)
+                or re.fullmatch(r'(digest|hmac):[0-9a-f]{64}', layer['identity']) is None
+                or layer.get('kind') not in ('Data', 'Zero', 'Hole')):
+            raise ValueError('invalid saved page layer')
+    if out.get('source_identity') != layers[0]['identity']:
+        raise ValueError('saved page identity does not match top layer')
+    # Native offsets are within the physical page; workload offsets are within
+    # held. The two digests already cover the same start:length intersection.
+    out['bad_points'] = [project(point, ('offset', 'actual')) for point in points]
+    out['layers'] = [project(layer, ('identity', 'kind')) for layer in layers]
+    out['guest_sha256'] = guest_digest
+    out['same_bytes_at_reported_pfn'] = digest == guest_digest
+    # A PFN sampled after restore is not proof that Linux never migrated that
+    # virtual page since capture. Preserve this boundary in the emitted record.
+    out['pfn_observation'] = 'after_restore_failure'
+    return out
+
+
+def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, stream=None,
+                          memory_probe=None):
     """Never replace the case's original failure, including if a source is absent."""
     stream = sys.stderr if stream is None else stream
     # These cases own at most three identities (PRESSURE_SID usually duplicates
@@ -88,6 +194,7 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
     if not ids:
         return
     emitted, run_ids = 0, set()
+    states, page_probe_used = {}, False
 
     def emit(source, record):
         nonlocal emitted
@@ -111,6 +218,7 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
             rows = db.execute(f'SELECT {columns} FROM sandboxes WHERE id IN ({placeholders})', ids).fetchall()
         for row in rows:
             record = dict(row)
+            states[record['id']] = record
             run_ids.update(record[key] for key in ('run_id', 'sandbox_result_run_id', 'dead_run_id') if record[key])
             out = project(record, STATE_FIELDS)
             try:
@@ -153,14 +261,30 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                     emit('journal', dict(sid=sid, unavailable='exit', exit_code=result.returncode))
                     continue
                 entries = deque(maxlen=12)
+                fault_entry = None
                 for line in tail_lines(output):
                     entry = parse_line(line)
                     message = entry.get('MESSAGE')
                     if (entry.get('KUASAR_SANDBOX_ID') == sid and isinstance(message, str)
                             and JOURNAL_ERROR.search(message)):
-                        entries.append(project(entry, ('__REALTIME_TIMESTAMP', 'MESSAGE')))
+                        entries.append(project(entry, ('__REALTIME_TIMESTAMP', 'KUASAR_RUN_ID', 'MESSAGE')))
+                        fault = held_memory_fault(message)
+                        record = states.get(sid, {})
+                        current_run = (record.get('run_id') or record.get('dead_run_id')
+                                       or record.get('sandbox_result_run_id'))
+                        if fault is not None and current_run and entry.get('KUASAR_RUN_ID') == current_run:
+                            fault_entry = (current_run, fault)
                 for entry in entries:
                     emit('journal', dict(sid=sid, **entry))
+                if memory_probe and not page_probe_used and fault_entry:
+                    run_id, fault = fault_entry
+                    try:
+                        request = memory_page_request(fault)
+                        page_probe_used = True
+                        page = saved_memory_page(memory_probe, states[sid], request)
+                        emit('snapshot_page', dict(sid=sid, run_id=run_id, **page))
+                    except Exception as error:
+                        unavailable('snapshot_page', error, sid=sid, run_id=run_id)
         except Exception as error:
             unavailable('journal', error, sid=sid)
 
@@ -180,7 +304,12 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
 
 if __name__ == '__main__':
     try:
-        emit_failure_evidence(sys.argv[1], sys.argv[2], sys.argv[3:])
+        probe = {name: os.environ.get(variable, '') for name, variable in (
+            ('helper', 'KUASAR_E2E_MEMORY_COMPARE_BIN'),
+            ('manifest_config', 'KUASAR_E2E_MEMORY_CONFIG'),
+            ('checkpoint_root', 'KUASAR_E2E_MEMORY_CHECKPOINT_ROOT'))}
+        emit_failure_evidence(sys.argv[1], sys.argv[2], sys.argv[3:],
+                              memory_probe=probe if all(probe.values()) else None)
     except Exception as error:
         # The shell caller also preserves its original failure status.
         print('lifecycle diagnostics unavailable: ' + type(error).__name__, file=sys.stderr)
