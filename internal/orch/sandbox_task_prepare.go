@@ -228,6 +228,13 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if artifactTopologyNeedsTemplate(effectiveDisks) && strings.TrimSpace(o.cfg.Sandbox.Boot.OverlayDiffTemplate) == "" {
 		return launchFailed("artifact_prepare", errors.New("orch: artifact disk topology requires sandbox.boot.overlay_diff_template"))
 	}
+	var templateLocations map[string]string
+	if artifactTopologyNeedsTemplate(effectiveDisks) {
+		templateLocations = map[string]string{}
+		if err := o.addDiffTemplateLocation(templateLocations, o.cfg.Sandbox.Boot.OverlayDiffTemplate); err != nil {
+			return launchFailed("artifact_prepare", err)
+		}
+	}
 	hostPrepareStarted := time.Now()
 	o.log.Info("sandbox task artifact prepared",
 		"sid", sb.ID,
@@ -378,7 +385,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if err := launchCtx.Err(); err != nil {
 		return launchFailed("config_write", err)
 	}
-	final := o.sandboxFinalLaunchSpec(sb, tmpl, preparation.Spec, nil)
+	final := o.sandboxFinalLaunchSpec(sb, tmpl, preparation.Spec, templateLocations)
 	attempt.PublishFinalSpec(final)
 	finalPublished = true
 	o.logLaunchPhase(attempt, sb, "host_resource_network_prepare_duration", time.Since(hostPrepareStarted))

@@ -50,7 +50,7 @@ sandbox:
   network:
     switch: $SWITCH
     tapfd_socket: $TAPFD_SOCKET
-  boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle, overlay_diff_template: $OVL }
+  boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle, overlay_diff_template: "$OVL" }
 builder:
   insecure_registry: true
   diff_template: $BLD

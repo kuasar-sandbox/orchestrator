@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"io"
 	"net"
 	"net/url"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
 	"github.com/kuasar-sandbox/orchestrator/internal/listenresource"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
@@ -684,10 +684,10 @@ type ProfileNet struct {
 
 // BootConfig is the boot artifacts that define a sandbox instance.
 type BootConfig struct {
-	WorkspaceDefaultDisk *rtconfig.DiskV1 `yaml:"workspace_default_disk,omitempty" json:"workspace_default_disk,omitempty"`
-	Kernel               string           `yaml:"kernel" json:"kernel"`                               // vmlinux path
-	Runtime              string           `yaml:"runtime" json:"runtime"`                             // guest runtime erofs
-	OverlayDiffTemplate  string           `yaml:"overlay_diff_template" json:"overlay_diff_template"` // pre-formatted ext4 seeding the cold-boot overlay upper
+	WorkspaceDiffTemplate string `yaml:"workspace_diff_template,omitempty" json:"workspace_diff_template,omitempty"` // default source for an explicitly requested workspace disk
+	Kernel                string `yaml:"kernel" json:"kernel"`                                                       // vmlinux path
+	Runtime               string `yaml:"runtime" json:"runtime"`                                                     // guest runtime erofs
+	OverlayDiffTemplate   string `yaml:"overlay_diff_template" json:"overlay_diff_template"`                         // source of the cold-boot writable ext4 upper
 }
 
 // BuilderConfig is the build-instance settings. Durable registration/execution
@@ -711,9 +711,8 @@ type BuilderConfig struct {
 
 	Referer BuilderRefererConfig `yaml:"referer" json:"referer"`
 
-	// DiffTemplate is the pre-formatted ext4 seeding a build sandbox's
-	// writable disk (pull cache + steps delta + export scratch): size it
-	// 2-3x the largest expected image (the ext4 size is fixed at mkfs).
+	// DiffTemplate supplies a build sandbox's writable ext4 disk (pull cache +
+	// steps delta + export scratch), as a template reference or legacy host path.
 	DiffTemplate string `yaml:"diff_template" json:"diff_template"`
 	// Phase timeouts (seconds): image pull+flatten, one RUN step, the
 	// readyCmd poll budget, and the whole build. Defaults 600/600/120/1800.
@@ -988,6 +987,9 @@ func DecodeConductor(r io.Reader) (*Conductor, error) {
 	}
 	var c Conductor
 	if err := decodeKnownYAML(b, &c); err != nil {
+		if strings.Contains(err.Error(), "workspace_default_disk") {
+			return nil, fmt.Errorf("config: sandbox.boot.workspace_default_disk was removed; move its diff_template to sandbox.boot.workspace_diff_template and put base, base_from_refs or size in an explicit disk request: %w", err)
+		}
 		return nil, err
 	}
 	c.applyDefaults()
@@ -1210,10 +1212,19 @@ func validateAdvertisedEndpoint(name, endpoint string) error {
 }
 
 func (c *Conductor) validateDeclarative() error {
-	if d := c.Sandbox.Boot.WorkspaceDefaultDisk; d != nil {
-		if err := d.Validate(); err != nil {
-			return fmt.Errorf("config: sandbox.boot.workspace_default_disk: %w", err)
+	for _, field := range []struct {
+		name  string
+		value *string
+	}{
+		{"sandbox.boot.workspace_diff_template", &c.Sandbox.Boot.WorkspaceDiffTemplate},
+		{"sandbox.boot.overlay_diff_template", &c.Sandbox.Boot.OverlayDiffTemplate},
+		{"builder.diff_template", &c.Builder.DiffTemplate},
+	} {
+		value, err := difftemplate.Normalize(*field.value)
+		if err != nil {
+			return fmt.Errorf("config: %s: %w", field.name, err)
 		}
+		*field.value = value
 	}
 	if err := c.Sandbox.Timeouts.validate(); err != nil {
 		return err

@@ -17,15 +17,19 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorext"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
 
 // Run assembles and serves the conductor using a frozen declarative config,
@@ -285,13 +289,37 @@ func wrapExtensionAPI(wrapper conductorextension.APIWrapper, next http.Handler) 
 }
 
 func newAPIHandler(cfg *publicconfig.Conductor, core api.Core, logger *slog.Logger, metricsProxy http.Handler) http.Handler {
-	diskMB := 0
-	if info, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
-		diskMB = int(info.Size() >> 20)
-	}
 	resources := api.Resources{
 		VCPU:     configresolve.SandboxResources(cfg.Sandbox.Resources).Capacity.CPU,
-		MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB,
+		MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: templateDiskMB(cfg.Sandbox.Boot.OverlayDiffTemplate, cfg.Checkpoint.Remote.RefLocationParent),
 	}
 	return api.New(core, cfg.API.Domain, resources, logger).WithMetricsProxy(metricsProxy).Handler()
+}
+
+func templateDiskMB(raw, parent string) int {
+	diskMB := 0
+	if ref, err := difftemplate.Normalize(raw); err == nil && ref != "" {
+		parsed, err := rtconfig.ParseDiffTemplate(ref)
+		if err != nil {
+			return 0
+		}
+		var locations rtconfig.RefLocations
+		if parsed.Ref.Location != "" {
+			location, err := reflocation.Resolve(parent, parsed.Ref.Location)
+			if err != nil {
+				return 0
+			}
+			locations = rtconfig.RefLocations{parsed.Ref.Location: location.Path}
+		}
+		// This node-uniform projection has no tenant capability. Sources that
+		// require one remain unknown; never borrow MANIFEST_KEY or report the
+		// carrier's tar/ZIP length as filesystem capacity.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		size, err := sandbox.TemplateCapacity(ctx, ref, nil, locations)
+		cancel()
+		if err == nil {
+			diskMB = int(size >> 20)
+		}
+	}
+	return diskMB
 }

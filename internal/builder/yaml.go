@@ -10,6 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -115,6 +117,10 @@ func (p *buildPipeline) flattenConfigFiles() ([]map[string]any, error) {
 // /opt/sandbox-runtime projection.
 func (p *buildPipeline) importYAML() (map[string]any, error) {
 	s := p.spec
+	template, err := p.templateReference(s.Paths.BuilderDiffTpl)
+	if err != nil {
+		return nil, fmt.Errorf("builder.diff_template: %w", err)
+	}
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
 		"timeouts":  s.RuntimeTimeouts,
@@ -123,7 +129,7 @@ func (p *buildPipeline) importYAML() (map[string]any, error) {
 			"kernel":  "file://" + s.Paths.Kernel,
 			"runtime": "file://" + s.Paths.Runtime,
 			"root": map[string]any{
-				"diff_template": "file://" + s.Paths.BuilderDiffTpl,
+				"diff_template": template,
 			},
 		},
 		"launch": map[string]any{"placeholder": true},
@@ -155,9 +161,13 @@ func (p *buildPipeline) rootDoc(diffTpl string) map[string]any {
 // footprint, /run/e2b, sits on a tmpfs mount the export skips).
 func (p *buildPipeline) stepsYAML(plan []workspace.Prepared) (map[string]any, error) {
 	s := p.spec
+	template, err := p.templateReference(s.Paths.BuilderDiffTpl)
+	if err != nil {
+		return nil, fmt.Errorf("builder.diff_template: %w", err)
+	}
 	boot := map[string]any{
 		"kernel": "file://" + s.Paths.Kernel, "runtime": "file://" + s.Paths.Runtime,
-		"root": p.rootDoc("file://" + s.Paths.BuilderDiffTpl),
+		"root": p.rootDoc(template),
 	}
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
@@ -194,13 +204,23 @@ func (p *buildPipeline) stepsYAML(plan []workspace.Prepared) (map[string]any, er
 // the source's complete root graph only for this materialization boot, replaces
 // its workload with the builder envd, and clears persistent actions so init,
 // files, and mounts are not applied a second time before flattening.
-func (p *buildPipeline) sourceStepsYAML() map[string]any {
+func (p *buildPipeline) sourceStepsYAML() (map[string]any, error) {
 	s := p.spec
-	root := map[string]any{"diff_template": "file://" + s.Paths.BuilderDiffTpl}
+	var template string
+	if p.sourceNeedsBuilderTemplate() {
+		var err error
+		template, err = p.templateReference(s.Paths.BuilderDiffTpl)
+		if err != nil {
+			return nil, fmt.Errorf("builder.diff_template: %w", err)
+		}
+	}
+	active := map[string]any{}
+	if template != "" {
+		active["diff_template"] = template
+	}
+	root := active
 	if s.SourceSandboxConfig != nil && s.SourceSandboxConfig.Boot.Root.Overlay != nil {
-		root = map[string]any{"overlay": map[string]any{
-			"diff_template": "file://" + s.Paths.BuilderDiffTpl,
-		}}
+		root = map[string]any{"overlay": active}
 	}
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
@@ -241,7 +261,55 @@ func (p *buildPipeline) sourceStepsYAML() map[string]any {
 	if f := p.dnsFiles(); f != nil {
 		doc["ephemeral_files"] = f
 	}
-	return doc
+	return doc, nil
+}
+
+func (p *buildPipeline) sourceNeedsBuilderTemplate() bool {
+	cfg := p.spec.SourceSandboxConfig
+	if cfg == nil {
+		return true
+	}
+	if cfg.IsCheckpoint() {
+		return false
+	}
+	if cfg.Boot.Root.Overlay != nil {
+		return cfg.Boot.Root.Overlay.Base == ""
+	}
+	return cfg.Boot.Root.Base == ""
+}
+
+// Resolve only a selected template's named directory. The resulting capability
+// is shared by host seed freezing and the launched sandbox-ctl process.
+func (p *buildPipeline) templateReference(raw string) (string, error) {
+	value, err := difftemplate.Normalize(raw)
+	if err != nil || value == "" {
+		return value, err
+	}
+	ref, err := rtconfig.ParseDiffTemplate(value)
+	if err != nil || ref.Ref.Location == "" {
+		return value, err
+	}
+	location, err := reflocation.Resolve(p.spec.CheckpointRefLocationParent, ref.Ref.Location)
+	if err != nil {
+		return "", err
+	}
+	if p.spec.RefLocations == nil {
+		p.spec.RefLocations = map[string]string{}
+	}
+	if old, ok := p.spec.RefLocations[ref.Ref.Location]; ok && old != location.URI {
+		return "", fmt.Errorf("template location %q conflicts", ref.Ref.Location)
+	}
+	p.spec.RefLocations[ref.Ref.Location] = location.URI
+	if p.artifacts != nil {
+		if p.artifacts.locations == nil {
+			p.artifacts.locations = rtconfig.RefLocations{}
+		}
+		if old, ok := p.artifacts.locations[ref.Ref.Location]; ok && old != location.Path {
+			return "", fmt.Errorf("template artifact location %q conflicts", ref.Ref.Location)
+		}
+		p.artifacts.locations[ref.Ref.Location] = location.Path
+	}
+	return value, nil
 }
 
 // --- helpers -------------------------------------------------------------------

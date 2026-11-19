@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -35,6 +36,69 @@ func TestCapturedWorkspaceOnlyBindsEmptyDevicesOnFreshCreate(t *testing.T) {
 	}
 }
 
+func TestWorkspaceCreatePreservesDefaultIntentUntilTargetGeometry(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Sandbox.Boot.OverlayDiffTemplate = "/legacy-overlay-must-not-be-used"
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = ""
+	sb := &types.Sandbox{Metadata: map[string]string{}}
+	entries := []workspace.Entry{{Name: "project", Disk: json.RawMessage(`{}`)}}
+	sb.Metadata[workspace.Namespace] = workspace.TopologyJSON(entries)
+	if err := o.prepareCreateWorkspaces(t.Context(), sb, entries, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(sb.WorkspacePlan) != 1 || !sb.WorkspacePlan[0].DefaultFromSlot || sb.WorkspacePlan[0].Disk != nil {
+		t.Fatalf("default intent lost or resolved early: %+v", sb.WorkspacePlan)
+	}
+	raw, err := json.Marshal(sb.WorkspacePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recovered []workspace.Prepared
+	if err := json.Unmarshal(raw, &recovered); err != nil {
+		t.Fatalf("pending plan is not recoverable: %v", err)
+	}
+	// Configuration can change while source preparation is running. The
+	// admitted choice still derives from the target, not this newer template.
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = "mkfs://ext4?size=16MiB"
+	saved := types.ArtifactDiskTopology{WorkspaceTopology: `[{"name":"project","mounts":[{"path":"/data"}]}]`, Disks: []types.ArtifactDiskShape{{Name: "project", Mode: types.ArtifactDiskSingle, Slot: true, SlotSize: 32 << 20}}}
+	plan, binds, err := resolveCapturedWorkspaces(saved, recovered)
+	if err != nil || len(plan) != 1 || len(binds) != 1 || binds[0].Disk == nil || binds[0].Disk.DiffTemplate != "mkfs://ext4?size=33554432" || binds[0].DefaultFromSlot {
+		t.Fatalf("target default = %+v, %+v, %v", plan, binds, err)
+	}
+	saved.Disks[0].SlotSize = 0
+	if _, _, err := resolveCapturedWorkspaces(saved, recovered); err == nil {
+		t.Fatal("dynamic slot silently acquired a default capacity")
+	}
+	saved.Disks[0].SlotSize, saved.Disks[0].Bound = 32<<20, true
+	if _, _, err := resolveCapturedWorkspaces(saved, recovered); err == nil {
+		t.Fatal("pending default replaced a captured disk")
+	}
+}
+
+func TestWorkspaceCreateExplicitSizeAndOmission(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = "mkfs://ext4?size=32MiB"
+	sb := &types.Sandbox{Metadata: map[string]string{}}
+	entries := []workspace.Entry{
+		{Name: "sized", Disk: json.RawMessage(`{"kind":"disk","version":1,"size":16777216}`)},
+		{Name: "inherit"},
+	}
+	sb.Metadata[workspace.Namespace] = workspace.TopologyJSON(entries)
+	if err := o.prepareCreateWorkspaces(t.Context(), sb, entries, false); err != nil {
+		t.Fatal(err)
+	}
+	if sb.WorkspacePlan[0].Disk.DiffTemplate != "mkfs://ext4?size=16777216" || sb.WorkspacePlan[1].Disk != nil || sb.WorkspacePlan[1].DefaultFromSlot {
+		t.Fatalf("explicit size or omission changed: %+v", sb.WorkspacePlan)
+	}
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = ""
+	sb.WorkspacePlan = nil
+	entries = []workspace.Entry{{Name: "project", Mounts: []workspace.Mount{{Path: "/data"}}, Disk: json.RawMessage(`{}`)}}
+	sb.Metadata[workspace.Namespace] = workspace.TopologyJSON(entries)
+	if err := o.prepareCreateWorkspaces(t.Context(), sb, entries, true); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("new image device without geometry: %v", err)
+	}
+}
+
 func TestImageCreateValidatesWorkspaceTopologyAtAdmission(t *testing.T) {
 	o := &Orchestrator{}
 	ctx := context.Background()
@@ -55,7 +119,7 @@ func TestImageCreateValidatesWorkspaceTopologyAtAdmission(t *testing.T) {
 
 func TestWorkspaceTemplateRegistrationRequiresTargetAndRetainsDefault(t *testing.T) {
 	o := testOrch(t)
-	o.cfg.Sandbox.Boot.OverlayDiffTemplate = "/seeds/first.ext4"
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = "/seeds/first.ext4"
 	ctx := context.Background()
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
 	meta, entries, err := workspace.Extract(map[string]string{workspace.Namespace: `[{"name":"project","mounts":[{"path":"/data"}],"disk":{}}]`})
@@ -77,7 +141,7 @@ func TestWorkspaceTemplateRegistrationRequiresTargetAndRetainsDefault(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	o.cfg.Sandbox.Boot.OverlayDiffTemplate = "/seeds/updated.ext4"
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = "/seeds/updated.ext4"
 	stored, err := o.st.GetBuild(ctx, b.BuildID)
 	if err != nil {
 		t.Fatal(err)

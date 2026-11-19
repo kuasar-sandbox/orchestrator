@@ -30,7 +30,7 @@ func runningWorkspaceFixture(t *testing.T) (*Orchestrator, *types.Sandbox, strin
 	_, key := defaultTestCredentials(t, mk)
 	sb.State = types.StateRunning
 	sb.WorkspacePlan = []workspace.Prepared{{Name: "project", Mounts: []workspace.Mount{{Path: "/data"}}}}
-	o.cfg.Sandbox.Boot.OverlayDiffTemplate = filepath.Join(dir, "default-one")
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = filepath.Join(dir, "default-one")
 	if err := o.st.Put(t.Context(), sb); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func runningWorkspaceFixture(t *testing.T) (*Orchestrator, *types.Sandbox, strin
 func TestWorkspaceAttachRetainsDefaultWhenOwnerUnavailable(t *testing.T) {
 	o, sb, key := runningWorkspaceFixture(t)
 	ctx := t.Context()
-	selected := o.cfg.Sandbox.Boot.OverlayDiffTemplate
+	selected := o.cfg.Sandbox.Boot.WorkspaceDiffTemplate
 	if err := o.AttachWorkspace(ctx, sb.ID, "other", "project", []byte("{}")); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("foreign sandbox: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestWorkspaceAttachRetainsDefaultWhenOwnerUnavailable(t *testing.T) {
 		t.Fatalf("unauthorized attach recorded a default: %v, %v", got, err)
 	}
 	for _, template := range []string{selected, filepath.Join(t.TempDir(), "new-default")} {
-		o.cfg.Sandbox.Boot.OverlayDiffTemplate = template
+		o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = template
 		if err := o.AttachWorkspace(ctx, sb.ID, key, "project", []byte("{}")); !errors.Is(err, api.ErrWorkspaceUnavailable) {
 			t.Fatalf("owner unavailable: %v", err)
 		}
@@ -59,6 +59,106 @@ func TestWorkspaceAttachRetainsDefaultWhenOwnerUnavailable(t *testing.T) {
 		if err != nil || got == nil || got.Disk.DiffTemplate != "file://"+selected {
 			t.Fatalf("stored default: %v, %v", got, err)
 		}
+	}
+}
+
+func TestWorkspaceAttachDerivesFixedSlotAndReusesSavedChoice(t *testing.T) {
+	o, sb, key := runningWorkspaceFixture(t)
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = ""
+	o.cfg.Sandbox.Boot.OverlayDiffTemplate = "/must-not-fallback"
+	runRoot, err := os.MkdirTemp("", "ws-slot-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(runRoot)
+	o.cfg.Paths.RunRoot = runRoot
+	sock := o.diskSocket(sb)
+	if err := os.MkdirAll(filepath.Dir(sock), 0700); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	queries, binds := 0, 0
+	size := int64(16 << 20)
+	server := ctl.Server{Path: sock, DiskListHandler: func() (ctl.DiskStateReport, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		queries++
+		return ctl.DiskStateReport{Disks: []ctl.DiskState{{Name: "project", State: "unbound", SizeBytes: &size}}}, nil
+	}, DiskBindHandler: func(req ctl.BindDiskRequest) error {
+		mu.Lock()
+		defer mu.Unlock()
+		binds++
+		if req.Disk.DiffTemplate != "mkfs://ext4?size=16777216" || req.Disk.Size == nil || *req.Disk.Size != size {
+			t.Errorf("bind did not use the fixed slot: %+v", req.Disk)
+		}
+		fixed, err := o.st.WorkspaceDefault(t.Context(), sb.ID, sb.InstanceID, "project", nil)
+		if err != nil || fixed == nil || fixed.Disk.Identity() != req.Disk.Identity() {
+			t.Errorf("bind preceded durable choice: %+v %v", fixed, err)
+		}
+		return ctl.ErrDiskPending
+	}}
+	if err := server.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = server.Serve(ctx) }()
+	defer func() { cancel(); server.Stop(); <-done }()
+	for i := 0; i < 2; i++ {
+		if err := o.AttachWorkspace(ctx, sb.ID, key, "project", []byte(`{}`)); !errors.Is(err, api.ErrWorkspaceUnavailable) {
+			t.Fatalf("pending bind: %v", err)
+		}
+		o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = "mkfs://ext4?size=32MiB"
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if queries != 1 || binds != 2 {
+		t.Fatalf("retry reselected source: queries=%d binds=%d", queries, binds)
+	}
+}
+
+func TestWorkspaceSlotDefaultNeverUsesDynamicOrUnavailableCapacity(t *testing.T) {
+	for _, mode := range []string{"unavailable", "dynamic", "bound", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			o, sb, key := runningWorkspaceFixture(t)
+			o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = ""
+			runRoot, err := os.MkdirTemp("", "ws-cap-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(runRoot)
+			o.cfg.Paths.RunRoot = runRoot
+			if mode != "unavailable" {
+				sock := o.diskSocket(sb)
+				if err := os.MkdirAll(filepath.Dir(sock), 0700); err != nil {
+					t.Fatal(err)
+				}
+				server := ctl.Server{Path: sock, DiskListHandler: func() (ctl.DiskStateReport, error) {
+					d := ctl.DiskState{Name: "project", State: "unbound"}
+					if mode == "bound" {
+						d.State = "ready"
+					}
+					if mode == "missing" {
+						d.Name = "other"
+					}
+					return ctl.DiskStateReport{Disks: []ctl.DiskState{d}}, nil
+				}, DiskBindHandler: func(ctl.BindDiskRequest) error { t.Error("invalid slot reached Bind"); return ctl.ErrDiskInvalid }}
+				if err := server.Listen(); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+				go func() { defer close(done); _ = server.Serve(ctx) }()
+				defer func() { cancel(); server.Stop(); <-done }()
+			}
+			if err := o.AttachWorkspace(t.Context(), sb.ID, key, "project", []byte(`{}`)); err == nil {
+				t.Fatal("invalid target accepted")
+			}
+			fixed, err := o.st.WorkspaceDefault(t.Context(), sb.ID, sb.InstanceID, "project", nil)
+			if err != nil || fixed != nil {
+				t.Fatalf("saved an invented disk: %+v %v", fixed, err)
+			}
+		})
 	}
 }
 
@@ -126,7 +226,7 @@ func TestWorkspaceLiveRetryAndPrivacy(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("attached")
-	o.cfg.Sandbox.Boot.OverlayDiffTemplate = filepath.Join(t.TempDir(), "replaced-default")
+	o.cfg.Sandbox.Boot.WorkspaceDiffTemplate = filepath.Join(t.TempDir(), "replaced-default")
 	binDir := t.TempDir()
 	entered, release := filepath.Join(binDir, "entered"), filepath.Join(binDir, "release")
 	t.Setenv("KS_TEST_PROBE_ENTERED", entered)

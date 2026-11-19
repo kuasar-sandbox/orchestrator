@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 
@@ -19,7 +20,7 @@ import (
 )
 
 func (o *Orchestrator) workspaceDiskOptions(sb *types.Sandbox) workspacedisk.Options {
-	return workspacedisk.Options{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey, ManifestConfig: o.cfg.ManifestConfig, DefaultDisk: o.cfg.Sandbox.Boot.WorkspaceDefaultDisk, OverlayDiffTemplate: o.cfg.Sandbox.Boot.OverlayDiffTemplate, RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent}
+	return workspacedisk.Options{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey, ManifestConfig: o.cfg.ManifestConfig, DefaultTemplate: o.cfg.Sandbox.Boot.WorkspaceDiffTemplate, RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent}
 }
 
 func (o *Orchestrator) resolveWorkspaceDisk(ctx context.Context, sb *types.Sandbox, raw json.RawMessage) (rtconfig.DiskV1, rtconfig.RefLocations, error) {
@@ -70,6 +71,35 @@ func workspaceDeclared(sb *types.Sandbox, name string) bool {
 	return false
 }
 
+// Only the owner knows whether the target is still an unbound fixed slot.
+// Workspace metadata deliberately carries presentation, not device geometry.
+func (o *Orchestrator) workspaceSlotDefault(ctx context.Context, sb *types.Sandbox, name string) (rtconfig.DiskV1, error) {
+	report, err := ctl.ListDataDisks(ctx, o.diskSocket(sb))
+	if err != nil {
+		if ctx.Err() != nil {
+			return rtconfig.DiskV1{}, ctx.Err()
+		}
+		return rtconfig.DiskV1{}, api.ErrWorkspaceUnavailable
+	}
+	for _, slot := range report.Disks {
+		if slot.Name != name {
+			continue
+		}
+		if slot.State != "unbound" {
+			return rtconfig.DiskV1{}, api.ErrWorkspaceConflict
+		}
+		if slot.SizeBytes == nil {
+			return rtconfig.DiskV1{}, fmt.Errorf("%w: workspace %q requires a template or an explicit disk size", api.ErrBadRequest, name)
+		}
+		selected, err := (workspace.Prepared{Name: name, DefaultFromSlot: true}).ResolveDefault(*slot.SizeBytes)
+		if err != nil {
+			return rtconfig.DiskV1{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+		return *selected.Disk, nil
+	}
+	return rtconfig.DiskV1{}, api.ErrWorkspaceConflict
+}
+
 func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name string, input json.RawMessage) error {
 	ctx, finish, err := o.workspaceOperation(ctx)
 	if err != nil {
@@ -109,6 +139,9 @@ func (o *Orchestrator) AttachWorkspace(ctx context.Context, id, apiKey, name str
 		}
 		if fixed == nil {
 			d, locations, err = o.resolveWorkspaceDisk(ctx, sb, input)
+			if errors.Is(err, workspacedisk.ErrDefaultNeedsSlot) {
+				d, err = o.workspaceSlotDefault(ctx, sb, name)
+			}
 			if err != nil {
 				return err
 			}

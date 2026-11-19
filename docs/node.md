@@ -296,16 +296,55 @@ The following table owns shared node-service fields. Capability-specific configu
 | `units.install` | `true` | False delegates unit installation to operations |
 | `sandbox.boot.kernel` | — | vmlinux path |
 | `sandbox.boot.runtime` | — | Single guest runtime Bundle: offset-zero EROFS plus digest-marker ZIP, containing envd and flatten-ctl ([Guest profiles: envd and the toolchain](#guest-runtime)) |
-| `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with `mkfs.ext4 -O ^has_journal`. Restore obtains the layer graph from artifacts |
-| `sandbox.boot.workspace_default_disk` | optional | Complete DiskV1 used for workspace `disk:{}`. When omitted, each new workspace uses `overlay_diff_template` as its ext4 seed. Example: `{kind: disk, version: 1, diff_template: file:///srv/kuasar/workspace.ext4}`. Public inline raw seeds must match an explicitly configured named-location seed. |
+| `sandbox.boot.overlay_diff_template` | — | Template reference for a fresh cold-boot writable ext4 upper. For example, `mkfs://ext4?size=1GiB` generates an empty filesystem. Restore obtains its disk graph from the captured artifacts |
+| `sandbox.boot.workspace_diff_template` | Optional | Template reference selected only by an explicit workspace `disk:{}` request. If absent, the request needs an existing unbound fixed slot from which to obtain capacity. It does not inherit `overlay_diff_template`; see [Workspace storage](sandbox-lifecycle.md#workspace-storage) |
 
-For new `sandbox.boot.overlay_diff_template` and `builder.diff_template` files,
-use `mkfs.ext4 -O ^has_journal` to avoid filesystem journal capacity and metadata
-writes on disposable work disks. This does not disable journald or application
-logs and is not a crash-recovery guarantee. Existing journaled templates and
-user-supplied images remain compatible; sync/quiesce, snapshot/restore and mount
-behavior are unchanged. Apply this only when creating a new empty template,
-never by reformatting an existing data disk.
+<a id="diff-template-references"></a>
+
+**Writable disk templates.** `sandbox.boot.overlay_diff_template`,
+`sandbox.boot.workspace_diff_template` and `builder.diff_template` share the
+same reference syntax. Existing bare host paths remain accepted and normalize
+to raw `file://` references. Complete URIs retain their selected format:
+
+| Reference | Source |
+| --- | --- |
+| `file:///srv/seed.ext4` | Raw sparse filesystem image |
+| `file:///srv/seed.tar@digest:<digest>` | Plaintext canonical tarstream with the declared content digest |
+| `file:///srv/seed.tar@hmac:<digest>` | Encrypted canonical tarstream, opened with the selected tenant capability |
+| `file:///srv/seeds.bundle@manifest:<content-key>` | Selected Manifest and its complete disk content inside a Bundle |
+| `manifest://<content-key>` | Disk Manifest from the configured Store/Cache |
+| `mkfs://ext4?size=10GiB` | Deterministic empty ext4 of the requested fixed capacity |
+
+The file forms also support a basename followed by `@location:<name>`; the
+existing `checkpoint.remote.ref_location_parent` resolves the named directory.
+No format is guessed from file contents, and a bad identity, unavailable source,
+wrong key or capacity mismatch fails the selected operation without substituting
+an empty disk. External templates describe one logical disk. The content digest
+belongs to the canonical tarstream; a Bundle selector identifies its inner
+Manifest, not the ZIP file's hash. Authenticated file/Store reads retain the
+existing tenant and named-location boundaries.
+
+`mkfs` needs no host template file or external formatting program. Its fixed
+profile controls filesystem UUID, timestamps, hash seed and layout so identical
+capacities produce identical initial filesystem content. Capacity aliases
+normalize to byte counts. It creates only a new empty filesystem without a COW
+base; a captured disk or existing writer retains its data. It does not resize an
+existing filesystem. [Sandboxer's block-storage contract](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/block-storage.md) owns the generator, source verification and sparse materialization.
+
+For manually prepared empty raw templates, `mkfs.ext4 -O ^has_journal` avoids
+filesystem journal capacity and metadata writes on disposable work disks; the
+built-in profile also omits the journal. This does not disable journald or
+application logs and is not a crash-recovery guarantee. Existing journaled
+templates and user-supplied images remain compatible. Apply formatting only to
+new empty templates. The node-wide API `diskSizeMB` uses logical seed capacity
+when it can be inspected without tenant credentials; zero means unavailable.
+It never reports a tarstream or Bundle carrier's physical length.
+
+The former `sandbox.boot.workspace_default_disk` key is rejected with a
+migration message. Move a template-only value's `diff_template` string to
+`workspace_diff_template`. Put any `base`, `base_from_refs` or `size` semantics
+in an explicit disk request instead of dropping them. Previously saved default
+choices and captured disks continue to use their original content.
 
 The primary use case is [NUMA deployment with multiple pools](#numa-deployment-with-multiple-pools): distinct templates carry per-node CPU/memory placement. [Resource pools](node-resource.md#resource-pools) add capacity-aware placement and pressure recovery. The repeated-template example below illustrates configuration semantics, not distinct NUMA bindings.
 

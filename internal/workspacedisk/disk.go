@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
@@ -19,14 +21,14 @@ import (
 )
 
 var (
-	ErrSelection    = errors.New("invalid workspace disk")
-	ErrUnauthorized = errors.New("workspace disk source is not authorized")
+	ErrSelection        = errors.New("invalid workspace disk")
+	ErrUnauthorized     = errors.New("workspace disk source is not authorized")
+	ErrDefaultNeedsSlot = errors.New("workspace default requires a template or a fixed target slot capacity")
 )
 
 type Options struct {
-	APISecret, ManifestKey                                 string
-	ManifestConfig, RefLocationParent, OverlayDiffTemplate string
-	DefaultDisk                                            *rtconfig.DiskV1
+	APISecret, ManifestKey                             string
+	ManifestConfig, RefLocationParent, DefaultTemplate string
 }
 
 // Storage fixes the customer key per operation; a conductor can serve multiple
@@ -46,6 +48,10 @@ func Storage(cfgPath, manifestKey string) (*artifact.ProcessStorage, error) {
 func AddLocation(loc rtconfig.RefLocations, parent, raw string) error {
 	if raw == "" {
 		return nil
+	}
+	if strings.HasPrefix(strings.ToLower(raw), "mkfs:") {
+		_, err := rtconfig.ParseDiffTemplate(raw)
+		return err
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
@@ -84,18 +90,14 @@ func Plan(input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocati
 	trusted := false
 	switch {
 	case len(fields) == 0:
-		if o.DefaultDisk != nil {
-			disk = *o.DefaultDisk
-		} else {
-			if o.OverlayDiffTemplate == "" {
-				return disk, nil, false, errors.New("workspace default disk is not configured")
-			}
-			path, err := filepath.Abs(o.OverlayDiffTemplate)
-			if err != nil {
-				return disk, nil, false, err
-			}
-			disk = rtconfig.DiskV1{Kind: "disk", Version: 1, DiffTemplate: (manifest.Ref{Scheme: manifest.RefSchemeFile, Path: path}).String()}
+		if o.DefaultTemplate == "" {
+			return disk, nil, false, ErrDefaultNeedsSlot
 		}
+		template, err := difftemplate.Normalize(o.DefaultTemplate)
+		if err != nil {
+			return disk, nil, false, fmt.Errorf("%w: %v", ErrSelection, err)
+		}
+		disk = rtconfig.DiskV1{Kind: "disk", Version: 1, DiffTemplate: template}
 		trusted = true
 	case fields["migrationToken"] != nil:
 		var token string
@@ -113,7 +115,9 @@ func Plan(input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocati
 			return disk, nil, false, ErrSelection
 		}
 	}
-	if err := disk.Validate(); err != nil {
+	var err error
+	disk, err = disk.NormalizeCreate()
+	if err != nil {
 		return rtconfig.DiskV1{}, nil, false, fmt.Errorf("%w: %v", ErrSelection, err)
 	}
 	locations := rtconfig.RefLocations{}
@@ -126,12 +130,19 @@ func Plan(input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocati
 		return disk, locations, false, nil
 	}
 
-	// A raw filesystem seed has no tenant-authenticated metadata. Only the
-	// exact named seed that this node already offers as the default is public.
+	// Only the exact named external template already offered by this node is
+	// public. Supporting more formats must not expand tenant file/Store access.
+	// Built-in generation has no external source to authorize.
 	if disk.DiffTemplate != "" {
-		r, _ := manifest.ParseRef(disk.DiffTemplate)
-		if r.Location == "" || o.DefaultDisk == nil || o.DefaultDisk.DiffTemplate != disk.DiffTemplate {
-			return disk, nil, false, ErrUnauthorized
+		r, err := rtconfig.ParseDiffTemplate(disk.DiffTemplate)
+		if err != nil {
+			return disk, nil, false, ErrSelection
+		}
+		if r.Kind != rtconfig.DiffTemplateMkfs {
+			configured, err := difftemplate.Normalize(o.DefaultTemplate)
+			if err != nil || r.Ref.Location == "" || configured != disk.DiffTemplate {
+				return disk, nil, false, ErrUnauthorized
+			}
 		}
 	}
 	for _, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {

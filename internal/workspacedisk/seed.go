@@ -51,11 +51,13 @@ func FreezeSeed(ctx context.Context, disk rtconfig.DiskV1, storage *artifact.Pro
 	}
 	defer func() { retErr = errors.Join(retErr, os.RemoveAll(temp)) }()
 	path := filepath.Join(temp, "writer")
-	init, err := sandbox.PrepareDiff(path, seed, size)
+	init, err := sandbox.PrepareDiffWithStorage(ctx, path, seed, base, storage, locations)
 	if err != nil {
 		return rtconfig.DiskV1{}, err
 	}
-	writer, err := diffstore.OpenDisk(path, base, init, options...)
+	// This writer only stages the immutable seed. Cancellation may discard it;
+	// successful export below still waits for verified, durable materialization.
+	writer, err := diffstore.OpenDisk(path, base, init, append(options, diffstore.WithDiscardOnClose())...)
 	if err != nil {
 		return rtconfig.DiskV1{}, err
 	}

@@ -392,14 +392,46 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
 | `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl([guest profile:envd 与工具链](#guest-runtime)) |
-| `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏文件提供;restore 不需要(overlay 链来自快照) |
-| `sandbox.boot.workspace_default_disk` | 可选 | workspace 的 `disk:{}` 使用的完整 DiskV1。省略时，新盘以 `overlay_diff_template` 为 ext4 初始内容。示例为 `{kind: disk, version: 1, diff_template: file:///srv/kuasar/workspace.ext4}`。公开内联 raw 种子须与节点显式配置的具名位置种子一致。 |
+| `sandbox.boot.overlay_diff_template` | – | 冷启动新建 ext4 可写 upper 使用的模板引用。例如 `mkfs://ext4?size=1GiB` 自动生成空文件系统。恢复使用捕获制品中的磁盘图 |
+| `sandbox.boot.workspace_diff_template` | 可选 | 仅显式 workspace `disk:{}` 请求选择的模板引用。缺省时，请求需要从已有未绑定固定 slot 取得容量；不继承 `overlay_diff_template`。见 [Workspace 存储](sandbox-lifecycle_zh.md#workspace-storage) |
 
-新建 `sandbox.boot.overlay_diff_template` 和 `builder.diff_template` 时，使用
-`mkfs.ext4 -O ^has_journal`，避免可丢弃工作盘的文件系统 journal 占用及元数据
-日志写入。这不影响 journald 或应用日志，也不提供崩溃恢复保证。已有带 journal
-的模板和用户自带镜像继续兼容；sync/quiesce、快照/恢复及挂载行为保持不变。
-此约定仅适用于新建空模板，不要重新格式化已有数据盘。
+<a id="diff-template-references"></a>
+
+**可写磁盘模板。** `sandbox.boot.overlay_diff_template`、
+`sandbox.boot.workspace_diff_template` 和 `builder.diff_template` 使用相同引用语法。
+已有宿主路径写法继续接受，并规范化为 raw `file://` 引用；完整 URI 保留所选格式：
+
+| 引用 | 来源 |
+| --- | --- |
+| `file:///srv/seed.ext4` | raw 稀疏文件系统镜像 |
+| `file:///srv/seed.tar@digest:<digest>` | 带声明内容摘要的明文 canonical tarstream |
+| `file:///srv/seed.tar@hmac:<digest>` | 使用所选租户能力打开的加密 canonical tarstream |
+| `file:///srv/seeds.bundle@manifest:<content-key>` | Bundle 内选定 Manifest 及其完整磁盘内容 |
+| `manifest://<content-key>` | 配置 Store/Cache 中的磁盘 Manifest |
+| `mkfs://ext4?size=10GiB` | 请求固定容量的确定性空 ext4 |
+
+file 形式也支持 basename 后接 `@location:<name>`，使用既有
+`checkpoint.remote.ref_location_parent` 解析具名目录。不根据文件内容猜测格式；
+身份错误、来源不可用、密钥错误或容量冲突使所选操作失败，不替换为空盘。
+外部模板表示一个逻辑磁盘。内容摘要属于 canonical tarstream；Bundle 选择器
+标识内部 Manifest，不是 ZIP 文件哈希。已认证文件和 Store 读取保留现有租户及
+具名位置权限边界。
+
+`mkfs` 不需要宿主模板文件或外部格式化程序。固定 profile 控制文件系统 UUID、
+时间、hash seed 和布局，使相同容量得到相同初始文件系统内容。容量别名规范化为
+字节数。它仅为没有 COW base 的新盘建立空文件系统；捕获盘或已有 writer 保留
+原数据，不执行文件系统扩容。生成器、来源完整性验证与稀疏物化由 [sandboxer 共享存储契约](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/block-storage_zh.md)负责。
+
+手工准备空 raw 模板时，`mkfs.ext4 -O ^has_journal` 可避免可丢弃工作盘的文件系统
+journal 占用和元数据日志写入；内建 profile 同样不创建 journal。这不影响 journald
+或应用日志，也不提供崩溃恢复保证。已有 journal 模板和用户镜像仍然兼容，格式化
+仅适用于新建空模板。节点统一 API 的 `diskSizeMB` 在无需租户凭据即可探测时报告
+逻辑初始盘容量；零表示不可用，绝不使用 tarstream 或 Bundle 的物理文件长度。
+
+旧 `sandbox.boot.workspace_default_disk` 键会报错并提示迁移。旧值仅包含模板时，
+将其 `diff_template` 字符串移入 `workspace_diff_template`；`base`、
+`base_from_refs` 或 `size` 等完整磁盘语义应转入显式 disk 请求，不能丢弃。
+已经保存的默认选择和捕获磁盘继续使用原内容。
 
 多池的主要应用场景是 [使用多池进行 NUMA 部署](#numa-deployment-with-multiple-pools)：不同 unit 模板承载不同节点的 CPU/内存放置策略，[资源池](node-resource_zh.md#resource-pools) 提供容量感知调度和压力恢复。以下重复模板示例仅说明配置语义，不代表不同 NUMA 绑定。
 

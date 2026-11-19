@@ -943,7 +943,7 @@ func TestImageStepsProvisionPrivateWorkspaceDisk(t *testing.T) {
 		t.Fatalf("steps source = (%v, %d, %q)", base, size, template)
 	}
 	writerPath := filepath.Join(t.TempDir(), "steps.diff")
-	init, err := rtsandbox.PrepareDiff(writerPath, template, size)
+	init, err := rtsandbox.PrepareDiffWithStorage(p.ctx, writerPath, template, base, p.artifacts.storage, p.artifacts.locations)
 	if err != nil {
 		t.Fatal(err)
 	}

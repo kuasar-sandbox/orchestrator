@@ -142,21 +142,22 @@ def sbx_append():
     delete(sibling)
 
 
-def build_steps():
+def build_steps(source_template=image, pending_default=False):
     cpu = int(os.environ["BUILDER_CPU"])
     target = {"kind": "sandbox", "memory": False}
     headers = {
-        "X-Kuasar-Sandbox-Workspace": json.dumps(declared(1, {"disk": {}})),
+        "X-Kuasar-Sandbox-Workspace": json.dumps(
+            [{"name": "project", "disk": {}}] if pending_default else declared(1, {"disk": {}})),
         "X-Kuasar-Sandbox-Resource": '{"capacity":{"cpu":1,"memory":"512MiB"}}',
         "X-Kuasar-Sandbox-Builder": json.dumps({
             "target": target, "resources": {"cpu": cpu, "memory": "6GiB", "storage": "4GiB"}}),
     }
-    build = request("POST", "/v3/templates", {"name": "workspace-steps", "profile": "bare",
+    build = request("POST", "/v3/templates", {"name": "workspace-steps-fixed-slot" if pending_default else "workspace-steps", "profile": "bare",
                     "cpuCount": cpu, "memoryMB": 6144}, headers=headers, status=202)
     tid, bid = build["templateID"], build["buildID"]
     steps = [{"type": "RUN", "args": ["echo first > /data/build-only; echo root > /workspace-step"]},
              {"type": "RUN", "args": ['test "$(cat /data/build-only)" = first; echo second >> /workspace-step']}]
-    request("POST", f"/v2/templates/{tid}/builds/{bid}", {"fromTemplate": image, "steps": steps}, status=202)
+    request("POST", f"/v2/templates/{tid}/builds/{bid}", {"fromTemplate": source_template, "steps": steps}, status=202)
     deadline = time.monotonic() + 480
     while time.monotonic() < deadline:
         result = request("GET", f"/templates/{tid}/builds/{bid}/status")
@@ -172,6 +173,60 @@ def build_steps():
     guest(child, 'test "$(head -1 /workspace-step)" = root; test "$(tail -1 /workspace-step)" = second; '
                  'test ! -e /data/build-only; echo final > /data/final')
     delete(child)
+
+
+def explicit_size_precedence():
+    size = 16 << 20
+    disk = {"kind": "disk", "version": 1, "size": size}
+    sid = create(image, declared(1, {"disk": disk}), "explicit-size", 1)
+    assert states(sid)["project"]["sizeBytes"] == size
+    guest(sid, "echo sized > /data/value; sync")
+    pause(sid, False)
+    saved = template_of(sid)
+    delete(sid)
+    restored = create(saved, None, "explicit-size-restored", 1)
+    assert states(restored)["project"]["sizeBytes"] == size
+    guest(restored, 'test "$(cat /data/value)" = sized')
+    delete(restored)
+
+
+def fixed_slot_defaults():
+    size = 16 << 20
+    fixed = {"slot": {"size": "16MiB"}}
+    source = create(image, declared(1, fixed), "fixed-slot", 1)
+    assert states(source)["project"]["state"] == "unattached"
+    assert states(source)["project"]["sizeBytes"] == size
+    pause(source, False)
+    empty_template = template_of(source)
+    delete(source)
+
+    # Pending Create and Build choose capacity from the exact captured E.
+    selected = create(empty_template, [{"name": "project", "disk": {}}], "fixed-slot-create", 1)
+    assert states(selected)["project"]["sizeBytes"] == size
+    guest(selected, "echo selected > /data/value; sync")
+    delete(selected)
+    build_steps(empty_template, pending_default=True)
+
+    live_slot = create(empty_template, None, "fixed-slot-attach", 1)
+    control(live_slot, "project", "attach", {"disk": {}}, status=204)
+    assert states(live_slot)["project"]["sizeBytes"] == size
+    guest(live_slot, "echo retained > /data/value; sync")
+    control(live_slot, "project", "attach", {"disk": {}}, status=204)
+    guest(live_slot, 'test "$(cat /data/value)" = retained')
+    pause(live_slot, False)
+    captured = template_of(live_slot)
+    delete(live_slot)
+    restored = create(captured, None, "fixed-slot-restored", 1)
+    guest(restored, 'test "$(cat /data/value)" = retained')
+    delete(restored)
+
+    dynamic = create(image, declared(1), "dynamic-without-default", 1)
+    control(dynamic, "project", "attach", {"disk": {}}, status=400)
+    assert states(dynamic)["project"]["state"] == "unattached"
+    control(dynamic, "project", "attach", {"disk": {"kind": "disk", "version": 1, "size": size}}, status=204)
+    assert states(dynamic)["project"]["sizeBytes"] == size
+    guest(dynamic, "echo explicit > /data/value; sync")
+    delete(dynamic)
 
 
 def handoff():
@@ -218,9 +273,13 @@ def handoff():
 
 
 try:
-    handoff()
-    sbx_append()
-    build_steps()
+    if os.environ.get("WORKSPACE_DEFAULT_TEST") == "fixed-slot":
+        fixed_slot_defaults()
+    else:
+        handoff()
+        sbx_append()
+        build_steps()
+        explicit_size_precedence()
 finally:
     for remaining in list(live):
         try:
