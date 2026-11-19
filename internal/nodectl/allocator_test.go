@@ -126,51 +126,17 @@ func TestAllocator_HistoryEvictsOldSamples(t *testing.T) {
 	}
 }
 
-// Cache growth requires complete budget credits, including a short final
-// tail, instead of converting a fractional token balance into a byte grant.
+// Cache grants retain physical accounting units but are independent of Guest
+// grant tokens. A short final tail still requires its complete capacity.
 func TestCacheGrantUnitsRequiresCompleteTail(t *testing.T) {
-	const unit = uint64(8 << 20)
-	a := NewAllocator(AllocatorPolicy{
-		MemoryGrantPerSecBytes: 32 << 20, MinGrantStep: 4 << 20,
-		MaxGrantStep: 64 << 20,
-	})
-	now := time.Now()
-	a.clock = func() time.Time { return now }
-	a.lastRefill = now
-	a.tokens = 4095.5
-	if got := a.GrantUnits("tail", 4<<20, 4<<20, unit); got.GrantedDelta != 0 {
-		t.Fatalf("granted incomplete and unaligned final tail %d", got.GrantedDelta)
+	const tail = uint64(2 << 20)
+	if got := cacheGrantBytes(tail, tail-4096); got != 0 {
+		t.Fatalf("granted incomplete tail %d", got)
 	}
-	a.tokens = 4 << 20
-	if got := a.GrantUnits("tail", 4<<20, 4<<20, unit); got.GrantedDelta != 4<<20 {
-		t.Fatalf("complete final tail not granted: %+v", got)
+	if got := cacheGrantBytes(tail, tail); got != tail {
+		t.Fatalf("complete final tail not granted: %d", got)
 	}
-}
-
-func TestCacheGrantUnitsAccumulatesBelowEightMiBPerSecond(t *testing.T) {
-	const unit = uint64(8 << 20)
-	const miB = uint64(1 << 20)
-	a := NewAllocator(AllocatorPolicy{
-		MemoryGrantPerSecBytes: miB, MinGrantStep: 4 * miB,
-		MaxGrantStep: 512 * miB,
-	})
-	now := time.Now()
-	a.clock = func() time.Time { return now }
-	a.lastRefill = now
-	a.tokens = float64(miB)
-	if got := a.GrantUnits("slow", unit, unit, unit); got.GrantedDelta != 0 {
-		t.Fatalf("low-rate bucket granted prematurely: %+v", got)
-	}
-	now = now.Add(7 * time.Second)
-	if got := a.GrantUnits("slow", unit, unit, unit); got.GrantedDelta != unit {
-		t.Fatalf("low-rate bucket could not accumulate a complete unit: %+v", got)
-	}
-	now = now.Add(time.Second)
-	if got := a.GrantUnits("slow", unit, unit, unit); got.GrantedDelta != 0 {
-		t.Fatalf("low-rate bucket exceeded its one MiB/s refill rate: %+v", got)
-	}
-	now = now.Add(7 * time.Second)
-	if got := a.GrantUnits("slow", unit, unit, unit); got.GrantedDelta != unit {
-		t.Fatalf("low-rate bucket failed to refill: %+v", got)
+	if got := cacheGrantBytes(12<<20, 10<<20); got != 8<<20 {
+		t.Fatalf("grant did not keep whole units: %d", got)
 	}
 }

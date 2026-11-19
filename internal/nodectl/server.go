@@ -27,6 +27,8 @@ type Server struct {
 	Inventory *Inventory
 	Owner     *OwnerLock
 	Logf      func(string, ...any)
+	cacheOnce sync.Once
+	cache     *CacheCoordinator
 
 	listener net.Listener
 
@@ -236,6 +238,8 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 		return s.handleRequestBudget(req, *token)
 	case TypeRequestCacheBudget:
 		return s.handleRequestCacheBudget(req, *token)
+	case resource.TypeCacheReclaimUpdate:
+		return s.handleCacheReclaimUpdate(req, *token)
 	case TypeOOMReport:
 		return s.handleOOMReport(req, *token)
 	case TypeHeartbeat:
@@ -363,6 +367,9 @@ func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
 // buildAdmitOK builds the Reservation, inserts it into State, returns
 // the AdmitResponse message. Caller has already token-consumed.
 func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *string) (*Message, error) {
+	if req.CacheReclaim != nil && !resource.HasFeature(req.ClientFeatures, FeatureStateSyncV1) {
+		return nil, fmt.Errorf("cache coordination requires lifecycle StateSync recovery")
+	}
 	spec := admitSpecFromRequest(conn, peerPID, req)
 	launch, err := s.Admission.resolveLaunch(req.SandboxID, peerPID)
 	if err != nil {
@@ -394,7 +401,7 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 	t := NewToken()
 	spec.Token = t
 	spec.LeasePath = leasePath
-	_, oldConn, err := s.State.Admit(spec)
+	_, oldConn, err := s.cacheCoordinator().Admit(spec, req.CacheReclaim)
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +427,7 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 		Status:              StatusAdmitted,
 		GrantedInitialAlloc: spec.InitialBudget,
 		GrantedInitialCache: spec.InitialCache,
-		ClientFeatures:      featureResponse(req.ClientFeatures),
+		ClientFeatures:      featureResponse(req.ClientFeatures, req.CacheReclaim != nil),
 	}, nil
 }
 
@@ -466,7 +473,7 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 		return &Message{Type: TypeError, Msg: "state sync reservation outside (0, capacity]"}
 	}
 	newToken := NewToken()
-	res, oldConns, err := s.State.Sync(SyncSpec{
+	res, oldConns, reclaim, err := s.cacheCoordinator().Sync(SyncSpec{
 		Token: newToken, SandboxID: l.SandboxID, PeerPID: live.OwnerPID,
 		CgroupPath:            l.CgroupPath,
 		Capacity:              Resources{MemoryBytes: l.CapacityMemory, CPUMilli: l.CapacityCPUMilli},
@@ -476,7 +483,7 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 		CacheMax:              req.AppliedCacheMaximum,
 		Settled:               req.Settled, HostMemoryCurrent: req.CurrentRSS,
 		LeasePath: live.Path, ClientFeatures: l.ClientFeatures, Conn: conn,
-	})
+	}, req.CacheReclaim)
 	if err != nil {
 		return &Message{Type: TypeError, Msg: "state sync: " + err.Error()}
 	}
@@ -491,7 +498,7 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 	}
 	*token = newToken
 	s.Logf("state sync sid=%s pid=%d settled=%v reservation=%d", res.SandboxID, res.PeerPID, req.Settled, res.ReservationMemory)
-	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res)}
+	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res), CacheReclaimTask: reclaim.Task, CacheReclaimAck: reclaim.Ack, ClientFeatures: featureResponse(l.ClientFeatures, req.CacheReclaim != nil)}
 }
 
 func (s *Server) handleSettled(req *Message, token string) *Message {
@@ -568,7 +575,8 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 	// Heartbeat is a consistency echo. Only sandbox-originated RequestBudget
 	// and StateSync may change this reservation; the response is never a
 	// balloon/cgroup command.
-	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory, CacheReservation: res.CacheReservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res)}
+	reclaim := s.cacheCoordinator().Poll(token)
+	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory, CacheReservation: reclaim.Reservation, CacheReclaimTarget: res.CacheReclaimTarget, CacheReclaimSeq: cachePendingReclaimSeq(res), CacheReclaimTask: reclaim.Task, CacheReclaimAck: reclaim.Ack}
 }
 
 func (s *Server) handleRelease(req *Message, token string) *Message {
@@ -606,6 +614,7 @@ func (s *Server) handleAdminDrain(req *Message) *Message {
 // node state over the controller UDS.
 func (s *Server) handleAdminStatus() *Message {
 	snapshot := s.State.ResourceSnapshot()
+	reclaim := s.cacheCoordinator().Status()
 	return &Message{
 		Type: TypeAck, Zone: string(snapshot.Zone),
 		NodeAllocated:    snapshot.Reserved.MemoryBytes,
@@ -616,7 +625,10 @@ func (s *Server) handleAdminStatus() *Message {
 		NodeBudget: resourceView(snapshot.NodeBudget), HostReserved: resourceView(snapshot.HostReserved),
 		OperationalMargin: resourceView(snapshot.OperationalMargin),
 		Allocated:         resourceView(snapshot.Reserved), Pool: resourceView(snapshot.AllocatablePool),
-		StartupInFlight: snapshot.StartupInFlight,
+		StartupInFlight:           snapshot.StartupInFlight,
+		CacheReclaimStatus:        &reclaim,
+		CacheAllocated:            snapshot.CacheAllocated,
+		CacheRecoveryUnknownCount: snapshot.CacheRecoveryUnknownCount,
 	}
 }
 
@@ -815,7 +827,7 @@ func (s *Server) handleRequestCacheBudget(req *Message, token string) *Message {
 		s.Admission.queueMu.Lock()
 		defer s.Admission.queueMu.Unlock()
 	}
-	result, found, err := s.State.ReconcileCacheBudgetWithAck(token, req.CacheCurrent, req.CacheRequested, req.CacheMaximum, req.CacheReclaimDone, s.Allocator)
+	result, found, err := s.cacheCoordinator().Grant(token, req.CacheCurrent, req.CacheRequested, req.CacheMaximum, req.CacheReclaimDone, s.Allocator)
 	if !found {
 		return &Message{Type: TypeError, Msg: "no precise cache reservation"}
 	}
@@ -829,15 +841,41 @@ func (s *Server) handleRequestCacheBudget(req *Message, token string) *Message {
 		Type: TypeCacheBudgetResponse, CacheGranted: result.GrantedDelta,
 		CacheReservation: result.Reservation, CacheReclaimTarget: result.ReclaimTarget, CacheReclaimSeq: result.ReclaimSeq,
 		CooldownMs: result.CooldownMs,
+		Reason:     cacheGrantReason(result),
 	}
 }
 
-// The node advertises a feature only when the client requested it.
-func featureResponse(features []string) []string {
-	for _, feature := range features {
-		if feature == FeatureCacheBudgetV1 {
-			return []string{FeatureCacheBudgetV1}
-		}
+func cacheGrantReason(result CacheGrantResult) string {
+	if result.RecoveryBlocked {
+		return "cache recovery pending"
 	}
-	return nil
+	return ""
+}
+
+// The node advertises a feature only when the client requested it.
+func featureResponse(features []string, coordinated ...bool) []string {
+	var out []string
+	if resource.HasFeature(features, FeatureCacheBudgetV1) {
+		out = append(out, FeatureCacheBudgetV1)
+	}
+	if len(coordinated) > 0 && coordinated[0] && resource.HasFeature(features, resource.FeatureCacheReclaimV1) {
+		out = append(out, resource.FeatureCacheReclaimV1)
+	}
+	return out
+}
+
+func (s *Server) cacheCoordinator() *CacheCoordinator {
+	s.cacheOnce.Do(func() { s.cache = NewCacheCoordinator(s.State) })
+	return s.cache
+}
+
+func (s *Server) handleCacheReclaimUpdate(req *Message, token string) *Message {
+	result, err := s.cacheCoordinator().Update(token, req.CacheReclaim)
+	if err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
+	}
+	if s.Admission != nil {
+		s.Admission.PushWake()
+	}
+	return &Message{Type: TypeAck, CacheReservation: result.Reservation, CacheReclaimTask: result.Task, CacheReclaimAck: result.Ack}
 }

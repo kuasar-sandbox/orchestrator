@@ -25,8 +25,11 @@ type ResourcePoolConfig struct {
 	Watermarks  map[string]ResourceDimensionWatermarks `yaml:"watermarks,omitempty" json:"watermarks,omitempty"`
 	UnitDropins []string                               `yaml:"unit_dropins,omitempty" json:"unit_dropins,omitempty"`
 	// CacheCapacity caps granted diff_cow cache memory within this resource
-	// pool; omission means no cache-specific cap beyond allocatable.memory.
+	// pool, independently of sandbox allocatable.memory. Omission is unlimited.
 	CacheCapacity *string `yaml:"cache_capacity,omitempty" json:"cache_capacity,omitempty"`
+	// CacheLowWatermark enables background-reclaim deferral at or below an
+	// explicit allocated-cache byte threshold. Omission disables this gate.
+	CacheLowWatermark *string `yaml:"cache_low_watermark,omitempty" json:"cache_low_watermark,omitempty"`
 }
 
 // Pointers preserve explicit zero thresholds and partial dimension overrides.
@@ -57,6 +60,7 @@ func cloneResourcePools(in []ResourcePoolConfig) []ResourcePoolConfig {
 		p.Allocatable.CPU, p.Allocatable.Memory = clonePtr(p.Allocatable.CPU), clonePtr(p.Allocatable.Memory)
 		p.UnitDropins = slices.Clone(p.UnitDropins)
 		p.CacheCapacity = clonePtr(p.CacheCapacity)
+		p.CacheLowWatermark = clonePtr(p.CacheLowWatermark)
 		if p.Watermarks != nil {
 			p.Watermarks = make(map[string]ResourceDimensionWatermarks, len(in[i].Watermarks))
 			for k, w := range in[i].Watermarks {
@@ -134,6 +138,11 @@ func (r *ResourceListenConfig) ValidatePools() error {
 			n, err := util.ParseSize(*p.CacheCapacity)
 			if err != nil || n == 0 {
 				return fmt.Errorf("config: resource pool %s cache_capacity must be a positive size", p.Name)
+			}
+		}
+		if p.CacheLowWatermark != nil {
+			if _, err := util.ParseSize(*p.CacheLowWatermark); err != nil {
+				return fmt.Errorf("config: resource pool %s cache_low_watermark must be a nonnegative size", p.Name)
 			}
 		}
 		if len(r.Pools) > 1 && p.Allocatable.Memory == nil {

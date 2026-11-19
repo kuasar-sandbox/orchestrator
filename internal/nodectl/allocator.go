@@ -31,10 +31,6 @@ type Allocator struct {
 	tokens     float64
 	lastRefill time.Time
 	clock      func() time.Time
-	// Activated by cache grants only: legacy Guest-only buckets retain
-	// their existing capacity, but a shared cache/Guest bucket can retain
-	// enough tokens to authorize a complete cache-budget unit.
-	cacheUnit uint64
 
 	// Per-sandbox grant history for fairness (last 60s grant total).
 	history map[string]*grantHistory
@@ -73,7 +69,7 @@ func (a *Allocator) refillLocked() {
 }
 
 func (a *Allocator) bucketCapacity() uint64 {
-	return max(a.policy.MemoryGrantPerSecBytes, a.policy.MinGrantStep, a.cacheUnit)
+	return max(a.policy.MemoryGrantPerSecBytes, a.policy.MinGrantStep)
 }
 
 // recordGrantLocked appends a grant to the per-sandbox history and
@@ -188,54 +184,4 @@ func (a *Allocator) CleanupHistory(token string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.history, token)
-}
-
-// GrantUnits reserves cache in whole physical-budget units. It shares the
-// existing nonemergency token bucket with Guest growth, but never consumes
-// tokens for a sub-unit grant that the cache cannot use.
-func (a *Allocator) GrantUnits(token string, requested, headroom, unit uint64) GrantDecision {
-	if a == nil || unit == 0 || unit%4096 != 0 || requested%4096 != 0 {
-		return GrantDecision{CooldownMs: 200}
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.cacheUnit = max(a.cacheUnit, unit)
-	a.refillLocked()
-	if requested == 0 || headroom == 0 || a.policy.MemoryGrantPerSecBytes == 0 {
-		return GrantDecision{CooldownMs: 200}
-	}
-	limit := min(requested, headroom, a.bucketCapacity())
-	if a.policy.MaxGrantStep > 0 {
-		limit = min(limit, a.policy.MaxGrantStep)
-	}
-	// A final tail smaller than one accounting unit is all-or-nothing.
-	// Partial grants cannot be reconciled safely after a lost response.
-	required := unit
-	if requested < unit {
-		required = requested
-		if limit < requested {
-			return GrantDecision{CooldownMs: 200}
-		}
-		limit = requested
-	} else {
-		limit -= limit % unit
-		if limit == 0 {
-			return GrantDecision{CooldownMs: 200}
-		}
-	}
-	if a.tokens < float64(required) {
-		need := (float64(required) - a.tokens) / float64(a.policy.MemoryGrantPerSecBytes)
-		return GrantDecision{CooldownMs: max(int64(200), int64(math.Ceil(need*1000)))}
-	}
-	if requested >= unit && a.tokens < float64(limit) {
-		can := uint64(a.tokens)
-		can -= can % unit
-		limit = min(limit, can)
-	}
-	if limit == 0 {
-		return GrantDecision{CooldownMs: 200}
-	}
-	a.tokens -= float64(limit)
-	a.recordGrantLocked(token, limit)
-	return GrantDecision{GrantedDelta: limit, CooldownMs: 200}
 }

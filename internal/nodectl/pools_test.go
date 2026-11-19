@@ -370,8 +370,8 @@ func TestResourcePoolLateAdmissionCancellationDoesNotProtectOldPool(t *testing.T
 	}
 }
 
-// A cache limit is an additional cap on grants within an existing resource
-// pool, not a preallocated memory pool or a deduction from allocatable.memory.
+// Cache capacity is independent of sandbox allocatable.memory and does not
+// preallocate or deduct Guest memory.
 func TestResourcePoolOptionalCacheCapacity(t *testing.T) {
 	maxCache := "256MiB"
 	cfg := &config.ResourceListenConfig{

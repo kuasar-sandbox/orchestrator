@@ -44,7 +44,7 @@ func mustCacheGrant(t *testing.T, s *State, token string, current, requested, ma
 	return res
 }
 
-func TestCacheGrantSharesPoolAndKeepsGuestReservationIndependent(t *testing.T) {
+func TestCacheGrantKeepsGuestPoolIndependent(t *testing.T) {
 	s := makeState(4<<30, 0)
 	tok := admitCacheTest(t, s, "a", 1<<30)
 	a := allocatorCacheTest()
@@ -57,15 +57,15 @@ func TestCacheGrantSharesPoolAndKeepsGuestReservationIndependent(t *testing.T) {
 	if r.ReservationMemory != 256<<20 || r.CacheReservation != 64*testCacheMiB {
 		t.Fatalf("cache polluted Guest reservation: %+v", r)
 	}
-	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != baseline+64*testCacheMiB {
-		t.Fatalf("cache not in pool: got=%d want=%d", got, baseline+64*testCacheMiB)
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != baseline {
+		t.Fatalf("cache changed Guest pool: got=%d want=%d", got, baseline)
 	}
 	// A physically completed shrink returns exactly that amount. Replaying
 	// the lower baseline is idempotent even if the original ACK was lost.
 	shrunk := mustCacheGrant(t, s, tok, 16*testCacheMiB, 0, 1<<30, a)
 	replay := mustCacheGrant(t, s, tok, 16*testCacheMiB, 0, 1<<30, a)
 	if shrunk.Reservation != 16*testCacheMiB || replay.Reservation != shrunk.Reservation ||
-		s.ResourceSnapshot().Reserved.MemoryBytes != baseline+16*testCacheMiB {
+		s.ResourceSnapshot().Reserved.MemoryBytes != baseline || s.reservedCache != 16*testCacheMiB {
 		t.Fatalf("bad shrink / replay: %+v %+v", shrunk, replay)
 	}
 	if _, _, err := s.ReconcileCacheBudget(tok, 24*testCacheMiB, 0, 1<<30, a); err == nil {
@@ -136,7 +136,7 @@ func TestCacheProvisionalRecoveryIncludesMaximumAndSyncReconciles(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != capMem+capCache {
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != capMem || s.reservedCache != capCache {
 		t.Fatalf("recovery failed to charge cached maximum: %d", got)
 	}
 	if _, _, err := s.Sync(SyncSpec{
@@ -148,7 +148,7 @@ func TestCacheProvisionalRecoveryIncludesMaximumAndSyncReconciles(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 384<<20 {
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 256<<20 || s.reservedCache != 128<<20 {
 		t.Fatalf("state sync total charge: %d", got)
 	}
 }
@@ -177,7 +177,7 @@ func TestCacheGrantResponseLostReconcilesWithoutDoubleCharge(t *testing.T) {
 	once := mustCacheGrant(t, s, tok, 8*testCacheMiB, 0, 512<<20, a)
 	twice := mustCacheGrant(t, s, tok, 8*testCacheMiB, 0, 512<<20, a)
 	if once.Reservation != 8*testCacheMiB || twice.Reservation != 8*testCacheMiB ||
-		s.ResourceSnapshot().Reserved.MemoryBytes != 256<<20+8*testCacheMiB {
+		s.ResourceSnapshot().Reserved.MemoryBytes != 256<<20 || s.reservedCache != 8*testCacheMiB {
 		t.Fatalf("ambiguous shrink failed idempotence: first=%+v repeat=%+v", once, twice)
 	}
 }
@@ -202,7 +202,7 @@ func TestCacheInitialAdmitReplayIsIdempotent(t *testing.T) {
 	if _, _, err := s.Admit(spec); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != before || got != 264<<20 {
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != before || got != 256<<20 {
 		t.Fatalf("replayed Admit double charged: %d", got)
 	}
 	if r := reservationForTest(t, s, "replay-cache"); r.CacheReservation != 8<<20 {
@@ -210,16 +210,15 @@ func TestCacheInitialAdmitReplayIsIdempotent(t *testing.T) {
 	}
 }
 
-// Test the exact compact E2E admission budget after accounting for the
-// additional 8MiB physical diff_cow grant per sandbox. The old 400MiB
-// fixture cannot admit four; 432MiB admits four but still rejects a fifth.
+// Initial cache grants do not reduce the number of Guest budgets admitted
+// by the compact resource-pool fixture.
 func TestCacheCompactAdmissionFourButNotFive(t *testing.T) {
 	const miB = uint64(1 << 20)
 	for _, tc := range []struct {
 		physicalMiB  int
 		wantAdmitted int
 	}{
-		{400, 3}, {432, 4},
+		{400, 4}, {432, 4},
 	} {
 		t.Run(fmt.Sprintf("%dMiB", tc.physicalMiB), func(t *testing.T) {
 			s := makeState(uint64(tc.physicalMiB)*miB, 80*miB)
@@ -248,15 +247,15 @@ func TestCacheCompactAdmissionFourButNotFive(t *testing.T) {
 			if admitted != tc.wantAdmitted {
 				t.Fatalf("admitted %d, want %d under %dMiB physical memory", admitted, tc.wantAdmitted, tc.physicalMiB)
 			}
-			want := uint64(admitted) * 72 * miB
+			want := uint64(admitted) * 64 * miB
 			if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != want {
-				t.Fatalf("reserved %d, want Guest+cache %d", got, want)
+				t.Fatalf("reserved %d, want Guest %d", got, want)
 			}
 		})
 	}
 }
 
-func TestCacheGrantCannotSpendProtectedGuestHeadroom(t *testing.T) {
+func TestCacheGrantDoesNotConsumeProtectedGuestHeadroom(t *testing.T) {
 	const miB = uint64(1 << 20)
 	s := makeState(4<<30, 0)
 	token := admitCacheTest(t, s, "cache-borrower", 1<<30)
@@ -273,12 +272,12 @@ func TestCacheGrantCannotSpendProtectedGuestHeadroom(t *testing.T) {
 	now := s.pressure.clock()
 	s.failDemandLocked("grow:protected", "protected", "guest-protected", available, 0, false, now)
 	s.mu.Unlock()
-	deny := mustCacheGrant(t, s, token, 0, 8*miB, 1<<30, a)
-	if deny.GrantedDelta != 0 || s.reservedCache != 0 {
-		t.Fatalf("cache spent protected Guest reservation: %+v reservedCache=%d", deny, s.reservedCache)
+	first := mustCacheGrant(t, s, token, 0, 8*miB, 1<<30, a)
+	if first.GrantedDelta != 8*miB || s.reservedCache != 8*miB || s.ResourceSnapshot().Reserved.MemoryBytes != baseline {
+		t.Fatalf("cache spent protected Guest reservation: %+v reservedCache=%d", first, s.reservedCache)
 	}
 	s.ForgetDemand("grow:protected")
-	grant := mustCacheGrant(t, s, token, 0, 8*miB, 1<<30, a)
+	grant := mustCacheGrant(t, s, token, 8*miB, 8*miB, 1<<30, a)
 	if grant.GrantedDelta != 8*miB {
 		t.Fatalf("cache remained blocked after protected demand cleared: %+v", grant)
 	}
@@ -296,7 +295,7 @@ func TestCacheBlockedInitialAdmissionRequestsDonorReclaim(t *testing.T) {
 	}
 	wait := LaunchAdmission{Operation: OperationCreate, Identity: "admit-cache-attempt"}
 	oc := s.AnalyzeLaunchWithCache("waiting", 64*miB, 8*miB, wait)
-	if oc.Status != OutcomeShortTermBlock || oc.Block != BlockedByMainBudget {
+	if oc.Status != OutcomeShortTermBlock || oc.Block != BlockedByCacheBudget {
 		t.Fatalf("cache-cap-only admission did not block: %+v", oc)
 	}
 	s.RecordAdmissionWaitWithCache("waiting", wait, 64*miB, 8*miB)
@@ -304,7 +303,7 @@ func TestCacheBlockedInitialAdmissionRequestsDonorReclaim(t *testing.T) {
 	if !found || target != 8*miB {
 		t.Fatalf("queued sandbox did not trigger donor reclaim: %d found=%v", target, found)
 	}
-	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 272*miB {
+	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 256*miB {
 		t.Fatalf("reclaim directive prematurely returned donor memory: %d", got)
 	}
 	if demand := s.PressureSnapshot().Demands; len(demand) != 0 {
@@ -333,9 +332,9 @@ func TestCacheBlockedInitialAdmissionRequestsDonorReclaim(t *testing.T) {
 	}
 }
 
-// Guest resume can use an emergency memory reserve, but a discretionary
-// cache grant must never use that exemption.
-func TestSavedSourceInitialCacheCannotUseGuestEmergencyMemory(t *testing.T) {
+// Guest resume uses its own emergency reserve while cache is independently
+// admitted; cache grants neither consume nor inherit Guest emergency policy.
+func TestSavedSourceInitialCacheIndependentOfGuestEmergencyMemory(t *testing.T) {
 	const miB = uint64(1 << 20)
 	s := makeState(4<<30, 0)
 	pool := s.AllocatablePool.MemoryBytes
@@ -351,8 +350,8 @@ func TestSavedSourceInitialCacheCannotUseGuestEmergencyMemory(t *testing.T) {
 	if got := s.AnalyzeLaunchWithCache("saved", guest, 0, resume); got.Status != OutcomeAdmitted {
 		t.Fatalf("saved-source Guest lost existing emergency exemption: %+v", got)
 	}
-	if got := s.AnalyzeLaunchWithCache("saved", guest, 8*miB, resume); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
-		t.Fatalf("saved-source cache improperly consumed emergency memory: %+v", got)
+	if got := s.AnalyzeLaunchWithCache("saved", guest, 8*miB, resume); got.Status != OutcomeAdmitted {
+		t.Fatalf("independent cache incorrectly blocked saved-source Guest: %+v", got)
 	}
 }
 
@@ -369,14 +368,15 @@ func TestSavedSourceInitialCacheShortageRequestsDonor(t *testing.T) {
 	if got := mustCacheGrant(t, s, donor, 0, 16*miB, 1<<30, a); got.GrantedDelta != 16*miB {
 		t.Fatalf("donor grant: %+v", got)
 	}
-	// Leave only emergency memory free. Guest resume is entitled to use it,
-	// while its initial cache needs the donor to return physical memory.
+	// Guest has emergency headroom while the separate cache quota is full.
+	// Only the cache quota requires a donor.
+	s.CachePoolCapacity = 16 * miB
 	s.mu.Lock()
 	s.reservedMemory = pool - emergency
 	s.mu.Unlock()
 	resume := LaunchAdmission{Operation: OperationResume, SavedSource: true, Accepted: true, Identity: "saved-cache-wait"}
 	guest := emergency - 8*miB
-	if got := s.AnalyzeLaunchWithCache("saved", guest, 8*miB, resume); got.Status != OutcomeShortTermBlock || got.Block != BlockedByMainBudget {
+	if got := s.AnalyzeLaunchWithCache("saved", guest, 8*miB, resume); got.Status != OutcomeShortTermBlock || got.Block != BlockedByCacheBudget {
 		t.Fatalf("expected cache-only shortage: %+v", got)
 	}
 	s.RecordAdmissionWaitWithCache("saved", resume, guest, 8*miB)
@@ -433,7 +433,7 @@ func TestPendingReclaimDoesNotEvictMultipleDonorsForSameShortage(t *testing.T) {
 	}
 }
 
-func TestGuestGrowthShortageTriggersCacheReclaimBeforePause(t *testing.T) {
+func TestGuestGrowthShortageDoesNotTriggerCacheReclaim(t *testing.T) {
 	const miB = uint64(1 << 20)
 	for _, source := range []string{"other sandbox", "own sandbox"} {
 		t.Run(source, func(t *testing.T) {
@@ -462,15 +462,12 @@ func TestGuestGrowthShortageTriggersCacheReclaimBeforePause(t *testing.T) {
 				t.Fatalf("Guest received %d bytes from a full pool", delta)
 			}
 			target, found := s.CacheTarget(donor)
-			if !found || target == 0 || target >= 128*miB {
-				t.Fatalf("Guest shortage failed to request donor cache shrink: %d found=%v", target, found)
+			if !found || target != 0 {
+				t.Fatalf("Guest shortage triggered independent cache shrink: %d found=%v", target, found)
 			}
-			if s.reservedCache != 128*miB {
-				t.Fatalf("node freed pending donor target without physical return: %d", s.reservedCache)
-			}
-			mustCacheGrant(t, s, donor, target, 0, 1<<30, a)
-			if delta := request(); delta != 128*miB-target {
-				t.Fatalf("Guest received %d bytes after donor returned %d", delta, 128*miB-target)
+			mustCacheGrant(t, s, donor, 64*miB, 0, 1<<30, a)
+			if delta := request(); delta != 0 {
+				t.Fatalf("Guest spent returned cache bytes: %d", delta)
 			}
 		})
 	}

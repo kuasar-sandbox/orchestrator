@@ -26,8 +26,8 @@ func TestServerCacheBudgetProtocolAndGuestIsolation(t *testing.T) {
 		t.Fatalf("first cache grant: %+v %v", grant, err)
 	}
 	charge := srv.State.ResourceSnapshot().Reserved.MemoryBytes
-	if charge != 136*mb {
-		t.Fatalf("host cache not charged with Guest: %d", charge)
+	if charge != 128*mb || srv.State.ResourceSnapshot().CacheAllocated != 8*mb {
+		t.Fatalf("host cache not independently charged: %d", charge)
 	}
 	hb, err := client.Heartbeat(0, 0, 0, 0)
 	if err != nil || hb.NewAllocatable != 128*mb || hb.CacheReservation != 8*mb {
@@ -82,7 +82,7 @@ func TestServerCacheInitialAdmitChargesAtomically(t *testing.T) {
 	if r := reservationByTokenForTest(t, srv.State, client.Token()); r.CacheReservation != 8*miB || r.ReservationMemory != 128*miB {
 		t.Fatalf("wrong initial separate charges: %+v", r)
 	}
-	if s := srv.State.ResourceSnapshot(); s.Reserved.MemoryBytes != 136*miB || s.StartupInFlight != 128*miB {
+	if s := srv.State.ResourceSnapshot(); s.Reserved.MemoryBytes != 128*miB || s.CacheAllocated != 8*miB || s.StartupInFlight != 128*miB {
 		t.Fatalf("initial cache incorrectly counted in startup pool: %+v", s)
 	}
 	if budget, err := client.RequestCacheBudgetContext(context.Background(), 8*miB, 0, 1<<30); err != nil || budget.Reservation != 8*miB || budget.Granted != 0 {
@@ -90,7 +90,7 @@ func TestServerCacheInitialAdmitChargesAtomically(t *testing.T) {
 	}
 }
 
-func TestAdmissionCacheInitialRespectsExtraPoolLimit(t *testing.T) {
+func TestAdmissionCacheInitialRespectsIndependentPoolLimit(t *testing.T) {
 	s := makeState(4<<30, 0)
 	s.Wm.StartupFactor = 0.5
 	s.CachePoolCapacity = 4 << 20
