@@ -15,7 +15,7 @@ path = Path(sys.argv[1])
 text = path.read_text()
 assert text.count("overlay_diff_template: ") == 1
 path.write_text(text.replace("overlay_diff_template: ",
-    "workspace_diff_template: mkfs://ext4?size=1GiB, overlay_diff_template: "))
+    'workspace_diff_template: "mkfs://ext4?size=1GiB", overlay_diff_template: '))
 PY
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
