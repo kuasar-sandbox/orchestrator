@@ -253,7 +253,7 @@ runner 追加本地保留的 ref-location并以直接子进程启动 `sandbox-ct
 runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用户→以 exact run-id CAS
 为 `running`并开放数据面。只有子进程后来退出，父进程的 Wait 才返回并开始有界结果上报。
 
-<a id="capture-and-pause"></a>
+<a id="workspace-storage"></a>
 
 ## Workspace 存储
 
@@ -270,10 +270,29 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 | Create 输入 | 创建结果 |
 |---|---|
 | `"slot":{}` | 预留未接盘设备和挂载路径，容量由 attach 时的实际盘决定。`"slot":{"size":"8GiB"}` 则要求实际盘容量恰好为 8 GiB。 |
-| `"disk":{}` | 使用节点配置的默认盘初始化私有数据盘。 |
+| `"disk":{}` | 配置了 `sandbox.boot.workspace_diff_template` 时使用它；否则按已有未绑定固定 slot 的容量创建空 ext4。未配置模板的动态或新增设备没有默认容量，请求会被拒绝。 |
 | `"disk":{"migrationToken":"…"}` | 使用相同租户凭据导入其他沙箱导出的盘，为本实例新建可写层。 |
-| `"disk":{…DiskV1…}` | 传入已授权的完整磁盘，`kind` 为 `disk`，`version` 为 `1`。用 `base` 表示最上层，`base_from_refs` 从近到远列出依赖层，也可以使用已授权的 `diff_template`。`size` 是以字节为单位的可选容量断言。 |
+| `"disk":{…DiskV1…}` | 传入已授权的完整磁盘，`kind` 为 `disk`，`version` 为 `1`。用 `base` 表示最上层，`base_from_refs` 从近到远列出依赖层，或使用已授权的 `diff_template`；此时 `size` 是字节容量断言。没有来源和父层时，正数 `size` 创建空 ext4，优先于 workspace 默认模板。 |
 | 省略两者 | 从镜像创建时预留动态盘位（`"slot":{}`），从 SBX 或 SNP 模板创建时继承捕获的设备和数据。 |
+
+显式创建容量保持既有 DiskV1 wire 结构：`size` 是字节整数，`kind` 和 `version`
+仍然必填。例如：
+
+```json
+[{"name":"project","mounts":[{"path":"/data"}],"disk":{"kind":"disk","version":1,"size":10737418240}}]
+```
+
+它等价于在该 disk 中添加 `"diff_template":"mkfs://ext4?size=10737418240"`，
+不使用节点默认模板。显式 `mkfs` 引用也遵循[模板引用契约](node_zh.md#diff-template-references)。
+显式外部模板仍须与节点配置的同一个具名位置 workspace 模板完全一致；支持更多格式
+不扩大宿主文件或 Store 访问范围。base 层授权与 migrationToken 规则保持不变，
+同一项不能同时包含 `slot` 和 `disk`。
+
+只有显式空 disk 才调用默认规则。省略 disk 仍继承或预留设备；migrationToken
+使用其捕获内容。workspace 默认值不会回退到 `overlay_diff_template`。选定模板
+若打开失败、认证失败或容量不符，操作直接失败，不生成替代盘。Create/Build
+需要目标容量时，先保存这一私有选择意图，待准确来源拓扑可用后解析；已选择的
+配置模板也不会因后续配置改变而更换。
 
 固定和动态盘位都需要 Guest 内核支持 autofs，才能在首次访问目录时挂载磁盘。动态盘位的初始容量为零。如果 VMM 不通知 Guest 容量变化，运行中的 Guest 内核需要在打开设备时重读容量。缺少这项支持时，attach 可能成功，但首次访问 workspace 目录会失败。若 Guest 内核缺少这项支持或其能力未知，建议使用与待接入磁盘容量相同的固定盘位。[动态盘位的内核支持](https://github.com/kuasar-sandbox/guest-runtime/pull/134)
 
@@ -295,7 +314,14 @@ node-ctl workspace export "$A" --name project |
 
 导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 返回 204 后，新发起的目录访问可以直接触发挂载，即使同一目录此前已有在空盘位上发起的访问。Guest 在实际访问时挂载文件系统，并向该访问返回文件系统或子目录本身的错误。
 
+空 disk 的 Attach 首先复用已保存默认选择。仅首次选择时才使用配置的 workspace
+模板，或查询实际运行 owner，取得目标未绑定固定 slot 的容量。动态 slot 的临时
+几何不能作为创建容量。完整规范 DiskV1 在绑定前保存；重试、暂停恢复和之后的节点
+配置修改继续使用同一选择与私有 writer。owner 不可用时，不会保存猜测容量。
+
 列表对空盘位返回 `unattached`。盘已发布且 conductor 仍在完成 attach 时返回 `attaching`，操作结束后对已发布的磁盘返回 `attached`。容量已知时附带 `sizeBytes`。可使用相同的 Workspace 名称和盘源重试接盘。盘源或沙箱状态冲突返回 409，暂时无法取得磁盘状态时返回 503。
+
+<a id="capture-and-pause"></a>
 
 ## Capture 与 Pause
 

@@ -5,7 +5,21 @@ import (
 	"sort"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
+
+func (o *Orchestrator) addDiffTemplateLocation(locations map[string]string, raw string) error {
+	value, err := difftemplate.Normalize(raw)
+	if err != nil || value == "" {
+		return err
+	}
+	ref, err := rtconfig.ParseDiffTemplate(value)
+	if err != nil || ref.Ref.Location == "" {
+		return err
+	}
+	return o.addRefLocation(locations, ref.Ref.String())
+}
 
 func (o *Orchestrator) addRefLocation(locations map[string]string, raw string) error {
 	ref, err := manifest.ParseRef(raw)

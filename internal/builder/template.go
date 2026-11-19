@@ -195,6 +195,16 @@ func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	active := &cfg.Boot.Root.DiffTemplate
+	if cfg.Boot.Root.Overlay != nil {
+		active = &cfg.Boot.Root.Overlay.DiffTemplate
+	}
+	if *active != "" {
+		*active, err = p.templateReference(*active)
+		if err != nil {
+			return nil, fmt.Errorf("overlay_diff_template: %w", err)
+		}
+	}
 	// The former CLI path loaded this document through config.LoadMerged,
 	// which applied canonical defaults before image-default materialization.
 	// Direct package assembly receives the typed value, so apply the identical

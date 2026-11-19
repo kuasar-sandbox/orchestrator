@@ -47,7 +47,7 @@ func (p *buildPipeline) prepareWorkspaces() error {
 			if choice.Mounts != nil && !slices.Equal(choice.Mounts, e.Mounts) {
 				return fmt.Errorf("workspace %q: source mounts differ", e.Name)
 			}
-			if !d.Unbound() && (choice.Slot != nil || choice.Disk != nil) {
+			if !d.Unbound() && (choice.Slot != nil || choice.Disk != nil || choice.DefaultFromSlot) {
 				return fmt.Errorf("workspace %q: source is already attached", e.Name)
 			}
 			if choice.Slot != nil {
@@ -55,6 +55,16 @@ func (p *buildPipeline) prepareWorkspaces() error {
 				got, err := choice.Slot.Capacity()
 				if err != nil || got != want {
 					return fmt.Errorf("workspace %q: slot size differs", e.Name)
+				}
+			}
+			if choice.DefaultFromSlot {
+				capacity, err := d.Slot.Capacity()
+				if err != nil {
+					return fmt.Errorf("workspace %q: %w", e.Name, err)
+				}
+				choice, err = choice.ResolveDefault(capacity)
+				if err != nil {
+					return err
 				}
 			}
 			if choice.Disk != nil {
@@ -74,6 +84,10 @@ func (p *buildPipeline) prepareWorkspaces() error {
 		}
 	} else {
 		for i := range plan {
+			if plan[i].DefaultFromSlot {
+				_, err := plan[i].ResolveDefault(0)
+				return err
+			}
 			if plan[i].Disk == nil {
 				continue
 			}

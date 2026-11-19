@@ -336,7 +336,11 @@ func (p *buildPipeline) phaseSteps(stepWorkspaces []workspace.Prepared) (retErr 
 	envdUDS := filepath.Join(p.phaseRunDir("b"), "envd-steps.sock")
 	var sb *phaseSandbox
 	if s.SourceSandboxConfig != nil {
-		document, yamlErr := yaml.Marshal(p.sourceStepsYAML())
+		doc, yamlErr := p.sourceStepsYAML()
+		if yamlErr != nil {
+			return yamlErr
+		}
+		document, yamlErr := yaml.Marshal(doc)
 		if yamlErr != nil {
 			return yamlErr
 		}

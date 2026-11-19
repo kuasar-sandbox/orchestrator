@@ -221,8 +221,6 @@ Synchronous Create performs request validation and pure parsing, selects the req
 
 The cold-image background path retains its single-stage fast path: prepare resources/network/YAML, then allocate a RunID from the runner pool. Artifact launch first creates directories and binds `ready.sock`; the pool commit callback binds an exact RunID with `starting AND run_id=''` CAS. The assigned parent immediately connects readiness and obtains bootstrap using its already-locked RunID pidfile. After authentication, ManifestKey overrides its environment. Based on E/S kind and LaunchMode, the task opens the root, selects PreparedSource and submits a non-secret capacity/network/ref-closure summary. The sole launch worker then resolves resources/network, attaches networking, persists ownership with `starting AND run_id=<exact>` CAS, writes root-credential-free YAML and returns the final LaunchSpec. The resident runner appends its retained ref-locations and starts `sandbox-ctl run` as a direct child. While the parent waits for that child, conductor independently consumes the strict runtime readiness wire, performs e2b `POST /init` for environment/default user and commits `running` with an exact-RunID CAS before opening traffic. Only when the child later exits does the parent's single Wait return and its bounded result report begin.
 
-<a id="capture-and-pause"></a>
-
 ## Workspace storage
 
 A workspace gives one named data disk one or more paths inside the guest. An application can write to these paths, pause sandbox A and pass the disk to sandbox B. B can use different guest paths. Each consumer gets its own writable layer.
@@ -238,10 +236,35 @@ Each `path` is an absolute guest directory. Each `subpath` is relative to the di
 | Create choice | Result |
 |---|---|
 | `"slot":{}` | Reserve an unattached device and its guest paths. The disk supplied on attach determines its size. `"slot":{"size":"8GiB"}` requires exactly that capacity. |
-| `"disk":{}` | Initialize a private disk from the node's configured default. |
+| `"disk":{}` | Use `sandbox.boot.workspace_diff_template` if configured; otherwise create an empty ext4 using an existing unbound fixed slot's capacity. A dynamic or new device without a configured template has no default capacity and is rejected. |
 | `"disk":{"migrationToken":"…"}` | Initialize a private writer over the disk exported by another sandbox with the same tenant credentials. |
-| `"disk":{…DiskV1…}` | Use a complete authorized disk with `kind:"disk"` and `version:1`. Include `base` and any `base_from_refs` in newest-to-oldest order, or use an authorized `diff_template`. The optional `size` asserts capacity in bytes. |
+| `"disk":{…DiskV1…}` | Use a complete authorized disk with `kind:"disk"` and `version:1`. Include `base` and any `base_from_refs` in newest-to-oldest order, or use an authorized `diff_template`; `size` then asserts capacity in bytes. With no source or parents, a positive `size` creates a new empty ext4 and takes precedence over the configured workspace template. |
 | Neither field | On an image, reserve a dynamic slot (`"slot":{}`). On a sandbox or snapshot template, inherit the captured device and its data. |
+
+An explicit creation size keeps the existing DiskV1 wire shape: `size` is an
+integer byte count, and `kind`/`version` remain mandatory. For example:
+
+```json
+[{"name":"project","mounts":[{"path":"/data"}],"disk":{"kind":"disk","version":1,"size":10737418240}}]
+```
+
+This request is equivalent to adding
+`"diff_template":"mkfs://ext4?size=10737418240"` to that disk. It does not use
+the node's default template. The generator's [template-reference contract](node.md#diff-template-references)
+also applies to explicit `mkfs` references. A complete external template request
+must still name the exact configured named-location workspace template; broader
+host file or Store access is not granted by supporting more formats. Existing
+base-layer authorization and migration-token rules are unchanged. `slot` and
+`disk` cannot appear together in the same entry.
+
+Only an explicit empty disk invokes defaults. An omitted disk inherits or
+reserves a device; a migration token selects its captured data. The workspace
+default never falls back to `overlay_diff_template`. A selected template that
+fails to open, authenticate or match the target size fails the operation instead
+of generating a replacement. During Create/Build, a request waiting for slot
+capacity retains that private intent until the exact source topology is known.
+Once a configured template has been selected, a later configuration change does
+not alter that choice.
 
 Both fixed and dynamic slots need autofs in the guest kernel to mount the disk on first access. A dynamic slot starts at zero capacity. If the VMM does not notify the guest of a capacity change, the running guest kernel must reread the device capacity on open. Without that support, attach can succeed while the first access to a workspace path fails. If the guest kernel lacks this support or its capabilities are unknown, use a fixed slot sized to match the disk you will attach. [Kernel support for dynamic slots](https://github.com/kuasar-sandbox/guest-runtime/pull/134).
 
@@ -263,7 +286,17 @@ node-ctl workspace export "$A" --name project |
 
 Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. After attach returns 204, a new access to B’s guest path can trigger the mount even if an earlier access started while the slot was empty. The guest mounts the filesystem on access and reports filesystem or subdirectory errors to the caller.
 
+An empty-disk Attach first reuses any saved default choice. On the first
+selection, it uses the configured workspace template or queries the live owner
+for the named unbound fixed slot's capacity. A dynamic slot's temporary geometry
+is not a creation size. The complete normalized disk is saved before binding;
+retries, pause/resume and subsequent node configuration changes keep that same
+choice and private writer. An unavailable owner cannot cause an invented
+capacity to be saved.
+
 The list reports `unattached` for an empty slot, `attaching` while the conductor completes an attach to a published disk, and `attached` for the published disk after the operation. It includes `sizeBytes` when known. Retry an attach with the same Workspace name and disk source. The API returns 409 for a conflicting disk or sandbox state and 503 when the disk state is unavailable.
+
+<a id="capture-and-pause"></a>
 
 ## Capture and Pause
 

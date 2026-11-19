@@ -118,8 +118,12 @@ sandbox:
   boot:
     kernel: /opt/sandbox/kernel/6.1/vmlinux
     runtime: /opt/sandbox/runtime/v1/sandbox-runtime.bundle
-    # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
-    overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
+    # Generate the cold-boot ext4 upper without a separately prepared template file.
+    # Raw file paths and explicit file/manifest template references remain supported.
+    overlay_diff_template: mkfs://ext4?size=1GiB
+    # Optional default for an explicit workspace disk:{} request. When omitted,
+    # an existing unbound fixed slot supplies the capacity; no overlay fallback.
+    # workspace_diff_template: mkfs://ext4?size=10GiB
 
 # Build-instance settings. Builds run INSIDE build sandboxes (tenant network +
 # isolation): image pull and step execution happen in microVMs booted from the
@@ -135,7 +139,7 @@ builder:
   registration_ttl: 1h
   queue_ttl: 30m
   terminal_ttl: 24h                               # owner-free ready/error Build history
-  diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4
+  diff_template: mkfs://ext4?size=8GiB
   # Build resources configure A/B sandboxes and admission; sandbox-ctl owns VMM limits.
   # storage participates in admission only (no V1 filesystem hard quota).
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)

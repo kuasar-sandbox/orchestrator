@@ -44,6 +44,11 @@ func (o *Orchestrator) prepareCreateWorkspaces(ctx context.Context, sb *types.Sa
 		p := workspace.Prepared{Name: e.Name, Mounts: e.Mounts, Slot: e.Slot}
 		if e.Disk != nil {
 			d, l, check, err := workspacedisk.Plan(e.Disk, o.workspaceDiskOptions(sb))
+			if errors.Is(err, workspacedisk.ErrDefaultNeedsSlot) {
+				p.DefaultFromSlot = true
+				sb.WorkspacePlan = append(sb.WorkspacePlan, p)
+				continue
+			}
 			if errors.Is(err, workspacedisk.ErrUnauthorized) {
 				return api.ErrNotAllowed
 			}
@@ -114,7 +119,7 @@ func resolveCapturedWorkspaces(topology types.ArtifactDiskTopology, choices []wo
 			if p.Mounts != nil && !slices.Equal(e.Mounts, p.Mounts) {
 				return nil, nil, fmt.Errorf("workspace %q: mounts conflict with template", e.Name)
 			}
-			if p.Slot != nil || p.Disk != nil {
+			if p.Slot != nil || p.Disk != nil || p.DefaultFromSlot {
 				if !d.Slot || d.Bound {
 					return nil, nil, fmt.Errorf("workspace %q: captured disk is already attached", e.Name)
 				}
@@ -123,6 +128,10 @@ func resolveCapturedWorkspaces(topology types.ArtifactDiskTopology, choices []wo
 					if err != nil || size != d.SlotSize {
 						return nil, nil, fmt.Errorf("workspace %q: captured slot geometry differs", e.Name)
 					}
+				}
+				p, err = p.ResolveDefault(d.SlotSize)
+				if err != nil {
+					return nil, nil, err
 				}
 				if p.Disk != nil {
 					p.Mounts = e.Mounts

@@ -168,7 +168,7 @@ Cancel 204 表示执行和清理均已完成;未被其他操作删除的记录�
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
 | `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行([按目标执行与发布](#execution-and-publication)) |
 | `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用([沙箱配置传递链](sandbox-lifecycle_zh.md#request-configuration)、[按目标执行与发布](#execution-and-publication)) |
-| `builder.diff_template` | – | 构建沙箱可写盘使用 `mkfs.ext4 -O ^has_journal` 预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
+| `builder.diff_template` | – | 新建 ext4 拉取缓存、steps 及导出 scratch 盘的模板引用，例如 `mkfs://ext4?size=8GiB`。支持共享[模板引用语法](node_zh.md#diff-template-references)，兼容已有宿主路径；建议容量至少为最大预期镜像的 3 倍 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元不设置 `TimeoutStartSec`;另有独立的 60 秒 fencing/宿主清理窗口,见 [持久化、恢复与保留](#recovery)) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw([按目标执行与发布](#execution-and-publication)) |
 
@@ -518,7 +518,7 @@ run-builder 对每阶段调用
 或 sibling。最终 node-local Build cleanup 才删除完整 BuildRunDir/BuildBaseDir。
 
 - **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
-  复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
+  初始化的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
   经 `/opt/sandbox-runtime` 投影出 静态 `flatten-ctl`。若
   `builder.referer.enabled=true`,guest 先以租户 registry 凭据执行
   `flatten-ctl referer lookup --json --owner <owner> <fromImage>`;lookup 只接受格式有效且
@@ -554,6 +554,9 @@ run-builder 对每阶段调用
   挂载,被 `--skip-mounts` 排除,导出不自吞、工具链不进镜像。即使没有 steps，E source
   也必须走 B 并导出完整顶层 image，所以成品不引用 source E/root layers。
   RUN 步骤须在返回前完成对导出选集内 rootfs 的写入。构建约定要求源树在导出结束前保持稳定；选集与内容检查用于检测变化，不提供原子快照，也不强制终止后台进程。
+  SBX/SNP 的既有 active ext4 base 使用不带模板的新空 COW 层，保留其数据和容量；
+  仅没有 active base 的空 upper 选择 `builder.diff_template`。只读 EROFS lower
+  是另一设备，不妨碍为它生成新的空 ext4 upper。
 
 - **C memory snapshot**(只在 resolved `target={kind:sandbox,memory:true}`):使用与普通
   Sandbox Create/顶层 E 相同的 cold-config projection，以 final image 完整替换 boot。
