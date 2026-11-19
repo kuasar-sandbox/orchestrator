@@ -134,6 +134,98 @@ func TestCacheCoordinatorHeldPoolDoesNotBlockOtherPool(t *testing.T) {
 	}
 }
 
+func TestCacheCoordinatorYieldRoundsSubpageQuotaShortage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		admission bool
+		requested uint64
+	}{
+		{name: "runtime-batch", requested: 4 << 20},
+		{name: "runtime-page", requested: 4096},
+		{name: "admission", admission: true, requested: 4 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeState(4<<30, 0)
+			s.Wm.StartupFactor = .5
+			s.CachePoolCapacity = 64<<20 + 1
+			c, _ := newReclaimTestCoordinator(s)
+			donorCache := uint64(60 << 20)
+			if tc.admission {
+				donorCache = 64 << 20
+			}
+			donor := admitReclaimTest(t, c, "", "donor", donorCache)
+			launch := LaunchAdmission{Operation: OperationCreate, Identity: "cache-wait"}
+			spec := AdmitSpec{SandboxID: "waiting", Token: "waiting-token", CgroupPath: "/cg/waiting",
+				Capacity: Resources{MemoryBytes: 256 << 20}, InitialBudget: 64 << 20,
+				InitialCache: tc.requested, CacheMax: 128 << 20, ClientFeatures: []string{resource.FeatureCacheBudgetV1}, Admission: &launch}
+			var borrower reclaimTestRun
+			if tc.admission {
+				if oc := s.AnalyzeLaunchWithCache(spec.SandboxID, spec.InitialBudget, spec.InitialCache, launch); oc.Status != OutcomeShortTermBlock || oc.Block != BlockedByCacheBudget {
+					t.Fatalf("expected independent cache admission shortage: %+v", oc)
+				}
+				if _, _, err := s.Admit(spec); err == nil {
+					t.Fatal("admission spent unavailable cache")
+				}
+				s.RecordAdmissionWaitWithCache(spec.SandboxID, launch, spec.InitialBudget, spec.InitialCache)
+			} else {
+				borrower = admitReclaimTest(t, c, "", "borrower", 4<<20)
+				cacheDemandTest(t, c, borrower, 4<<20, tc.requested)
+			}
+			task := c.Poll(donor.token).Task
+			if task == nil || task.Source != resource.CacheReclaimYield || task.MaxBytes != tc.requested {
+				t.Fatalf("unaligned quota shortage did not receive whole-page authority: %+v", task)
+			}
+			if task.MaxBytes > cacheReclaimBatch || task.Target+task.MaxBytes != donorCache || task.Target < cacheBudgetUnit {
+				t.Fatalf("rounded yield exceeded finite donor bounds: %+v", task)
+			}
+			completeReclaimTest(t, c, donor, task, task.Target, nil)
+			if tc.admission {
+				if r, _, err := s.Admit(spec); err != nil || r.CacheReservation != tc.requested {
+					t.Fatalf("page-aligned return did not unblock admission: %+v %v", r, err)
+				}
+			} else if g, found, err := c.Grant(borrower.token, 4<<20, tc.requested, borrower.spec.CacheMax, 0, nil); err != nil || !found || g.GrantedDelta != tc.requested {
+				t.Fatalf("page-aligned return did not unblock growth: %+v %v", g, err)
+			}
+			if s.reservedCache > s.CachePoolCapacity {
+				t.Fatal("rounded yield allowed cache quota overcommit")
+			}
+		})
+	}
+}
+
+func TestCacheCoordinatorRoundedYieldPreservesPermitBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		tokens, donor, need, want uint64
+	}{
+		{name: "insufficient-page-tokens", tokens: 4095, donor: 64 << 20, need: 4 << 20},
+		{name: "fractional-token-tail", tokens: 4097, donor: 64 << 20, need: 4 << 20, want: 4096},
+		{name: "batch-cap", tokens: cacheReclaimBurst, donor: 64 << 20, need: 8 << 20, want: cacheReclaimBatch},
+		{name: "donor-floor", tokens: cacheReclaimBurst, donor: cacheBudgetUnit + 4096, need: 4 << 20, want: 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeState(4<<30, 0)
+			s.Wm.StartupFactor = .5
+			s.CachePoolCapacity = tc.donor + 1
+			c, now := newReclaimTestCoordinator(s)
+			donor := admitReclaimTest(t, c, "", "donor", tc.donor)
+			c.tokens, c.refill = tc.tokens, *now
+			s.RecordAdmissionWaitWithCache("waiting", LaunchAdmission{Operation: OperationCreate, Identity: "cache-wait"}, 64<<20, tc.need)
+			task := c.Poll(donor.token).Task
+			if tc.want == 0 {
+				if task != nil {
+					t.Fatalf("rounding bypassed insufficient rate tokens: %+v", task)
+				}
+			} else if task == nil || task.MaxBytes != tc.want || task.Target < cacheBudgetUnit {
+				t.Fatalf("rounding exceeded permit bounds: %+v", task)
+			}
+			if c.tokens != tc.tokens-tc.want || s.reservedCache != tc.donor {
+				t.Fatal("permit overdrew tokens or credited unconfirmed return")
+			}
+		})
+	}
+}
+
 func TestCacheCoordinatorRateWaitingAndIssuedAutoSuppressYield(t *testing.T) {
 	for _, issued := range []bool{false, true} {
 		t.Run(fmt.Sprintf("issued=%v", issued), func(t *testing.T) {

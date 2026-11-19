@@ -578,6 +578,14 @@ func (c *CacheCoordinator) scheduleLocked(now time.Time) {
 		if m.task != nil || m.growthPending || r.Conn == nil || m.seq == math.MaxUint64 || inCount >= cacheReclaimMaxInFlight {
 			return false
 		}
+		if source == resource.CacheReclaimYield {
+			// A byte-granular pool quota can leave a subpage shortage. Return
+			// a whole page to satisfy it; cap before rounding to avoid overflow.
+			bytes = min(bytes, cacheReclaimBatch)
+			if remainder := bytes % 4096; remainder != 0 {
+				bytes += 4096 - remainder
+			}
+		}
 		bytes = min(bytes, cacheReclaimBatch, c.tokens, cacheReclaimBurst-inBytes, r.CacheReservation-cacheBudgetUnit)
 		bytes -= bytes % 4096
 		if bytes == 0 {
