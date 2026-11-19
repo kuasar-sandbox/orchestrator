@@ -25,28 +25,26 @@ MARK="STATE_$RANDOM"
 start_freeze_service
 "$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$EXECUTE_RUN_ROOT/sandboxes" -- /bin/sh -ceu '
 pid=$1
-global=/proc/1/root/sys/fs/cgroup
-real=$global/app
+root=/sys/fs/cgroup
 grep -qx "0::/init" /proc/self/cgroup
-test ! -s /sys/fs/cgroup/cgroup.procs
-test ! -s "$real/cgroup.procs"
-grep -qx "$$" "$real/init/cgroup.procs"
+test ! -s "$root/cgroup.procs"
+grep -qx "$$" "$root/init/cgroup.procs"
 service_path=$(cut -d: -f3 "/proc/$pid/cgroup")
 case "$service_path" in /user|/user/*) ;; *) exit 1 ;; esac
-grep -qx "$pid" "$real$service_path/cgroup.procs"
+grep -qx "$pid" "$root$service_path/cgroup.procs"
 for controller in cpu memory io; do
-    grep -qw "$controller" "$global/cgroup.subtree_control"
-    grep -qw "$controller" "$real/cgroup.subtree_control"
+    grep -qw "$controller" "$root/cgroup.controllers"
+    grep -qw "$controller" "$root/cgroup.subtree_control"
 done
 for group in init user ptys socats; do
-    test -d "$real/$group"
-    test -e "$real/$group/cpu.weight"
-    test -e "$real/$group/memory.max"
-    test -e "$real/$group/io.weight"
+    test -d "$root/$group"
+    test -e "$root/$group/cpu.weight"
+    test -e "$root/$group/memory.max"
+    test -e "$root/$group/io.weight"
 done
 ' sh "$FREEZE_PID" >"$WORK/cgroup-topology.out" 2>&1 \
     || { sed 's/^/  cgroup| /' "$WORK/cgroup-topology.out"; fail "delegated envd cgroup topology"; }
-echo "==> PASS: real /app is empty; /init + envd user/ptys/socats and cpu/memory/io delegation verified"
+echo "==> PASS: scoped cgroup root is empty; /init + envd user/ptys/socats and cpu/memory/io delegation verified"
 
 # ---- local Pause, all policy fields unset -> exact legacy argv + restore ---
 # Write a marker file in the guest BEFORE pausing; after resume it must still be
