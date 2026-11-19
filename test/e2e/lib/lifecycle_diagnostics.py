@@ -14,6 +14,9 @@ import tempfile
 MAX_RECORDS = 64
 MAX_FIELD = 2048
 MAX_INPUT = 2 * 1024 * 1024
+TRACE_PAGE = 4194304
+MAX_TRACE_RECORDS = 32
+TRACE_PREFIX = 'uffd-page-trace '
 STATE_FIELDS = (
     'id', 'instance_id', 'state', 'run_id', 'sandbox_result_run_id',
     'dead_unix', 'dead_run_id', 'launch_mode', 'resume_source_kind',
@@ -91,6 +94,61 @@ def held_memory_fault(message):
         return value if isinstance(value, dict) else None
     except ValueError:
         return None
+
+
+def memory_page_trace(message):
+    """Accept only the one-page trace schema, never arbitrary runtime fields."""
+    _, marker, payload = message.partition(TRACE_PREFIX)
+    if not marker or len(message) >= MAX_FIELD:
+        return None
+    try:
+        value = json.loads(payload)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    event = value.get('event')
+    fields = {'v', 'page', 'seq', 'event'}
+    if event == 'summary':
+        fields |= {'recorded', 'dropped'}
+    elif event in ('seed', 'fault', 'source', 'copy', 'zero', 'remove', 'load-hit'):
+        fields |= {'start', 'length', 'state'}
+        if event == 'source':
+            fields.add('kind')
+        elif event in ('copy', 'zero'):
+            fields |= {'sha256', 'non_ff', 'done', 'errno'}
+    else:
+        return None
+    if set(value) != fields:
+        return None
+
+    def integer(key, low, high):
+        return type(value.get(key)) is int and low <= value[key] <= high
+
+    maximum = (1 << 64) - 1
+    if (not integer('v', 1, 1) or not integer('page', TRACE_PAGE, TRACE_PAGE)
+            or not integer('seq', 1, maximum)):
+        return None
+    if event == 'summary':
+        if (not integer('recorded', 0, MAX_TRACE_RECORDS) or not integer('dropped', 0, maximum)
+                or value['seq'] != value['recorded'] + value['dropped'] + 1):
+            return None
+    else:
+        if (not integer('seq', 1, MAX_TRACE_RECORDS) or not integer('start', 0, TRACE_PAGE)
+                or not integer('length', 1, maximum)
+                or not TRACE_PAGE + 4096 <= value['start'] + value['length'] <= 1 << 64
+                or value['state'] not in ('absent', 'loaded', 'released')):
+            return None
+        if event == 'source' and value['kind'] not in ('data', 'hole', 'zero'):
+            return None
+        if event in ('copy', 'zero') and (
+                not isinstance(value['sha256'], str)
+                or re.fullmatch(r'[0-9a-f]{64}', value['sha256']) is None
+                or not integer('non_ff', 0, 4096)
+                or not integer('done', -(1 << 63), (1 << 63) - 1)
+                or not integer('errno', -1, 4095)):
+            return None
+    return value
 
 
 def memory_page_request(fault):
@@ -194,6 +252,7 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
     if not ids:
         return
     emitted, run_ids = 0, set()
+    trace_emitted, trace_summary_emitted = 0, False
     states, page_probe_used = {}, False
 
     def emit(source, record):
@@ -208,6 +267,22 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
 
     def unavailable(source, error, **fields):
         emit(source, dict(unavailable=type(error).__name__, **fields))
+
+    def emit_trace(record):
+        nonlocal trace_emitted, trace_summary_emitted
+        if record['event'] == 'summary':
+            if trace_summary_emitted:
+                return
+            trace_summary_emitted = True
+        else:
+            if trace_emitted >= MAX_TRACE_RECORDS:
+                return
+            trace_emitted += 1
+        try:
+            print(json.dumps(dict(lifecycle_diagnostic='uffd_page_trace', **record), sort_keys=True),
+                  file=stream, flush=True)
+        except Exception:
+            pass
 
     try:
         uri = Path(db_path).resolve().as_uri() + '?mode=ro'
@@ -262,16 +337,24 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                     continue
                 entries = deque(maxlen=12)
                 fault_entry = None
+                record = states.get(sid, {})
+                current_run = (record.get('run_id') or record.get('dead_run_id')
+                               or record.get('sandbox_result_run_id'))
                 for line in tail_lines(output):
                     entry = parse_line(line)
                     message = entry.get('MESSAGE')
-                    if (entry.get('KUASAR_SANDBOX_ID') == sid and isinstance(message, str)
-                            and JOURNAL_ERROR.search(message)):
+                    if entry.get('KUASAR_SANDBOX_ID') != sid or not isinstance(message, str):
+                        continue
+                    if 'uffd-page-trace' in message:
+                        # Trace messages have their own quota and cannot evict
+                        # the workload fault from the last twelve error lines.
+                        trace = memory_page_trace(message)
+                        if trace is not None and current_run and entry.get('KUASAR_RUN_ID') == current_run:
+                            emit_trace(dict(sid=sid, run_id=current_run, **trace))
+                        continue
+                    if JOURNAL_ERROR.search(message):
                         entries.append(project(entry, ('__REALTIME_TIMESTAMP', 'KUASAR_RUN_ID', 'MESSAGE')))
                         fault = held_memory_fault(message)
-                        record = states.get(sid, {})
-                        current_run = (record.get('run_id') or record.get('dead_run_id')
-                                       or record.get('sandbox_result_run_id'))
                         if fault is not None and current_run and entry.get('KUASAR_RUN_ID') == current_run:
                             fault_entry = (current_run, fault)
                 for entry in entries:

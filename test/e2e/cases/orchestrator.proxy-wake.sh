@@ -49,6 +49,8 @@ wait_sandbox_state "$SID" missing 120 || fail "delete finalization"
 # these two primary guest workloads; it never changes host services/resources.
 build_image_template bare
 stop_orchestrator
+# Failure diagnostics trace only this memfd page on pressure-phase restores.
+printf '%s\n' 4194304 > "$WORK/trace-memory-page"
 # Preserve the original 100s client / 120s parking allowance after the full
 # 60s critical hold. These are deadlines, not additional sleeps or retries.
 PROXY_PARK_TIMEOUT=180s

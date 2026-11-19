@@ -19,6 +19,28 @@ done
 cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+unset SANDBOX_UFFD_TRACE_MEMFD_PAGE
+# A case-owned marker enables one read-free trace only for restored runtimes.
+if [ "\${1:-}" = "run" ] && [ -f "$WORK/trace-memory-page" ] && [ ! -L "$WORK/trace-memory-page" ]; then
+    for arg in "\$@"; do
+        case "\$arg" in
+            --) break ;;
+            --restore|--restore=*)
+                if python3 - "$WORK/trace-memory-page" <<'PY_TRACE'
+import sys
+try:
+    with open(sys.argv[1], "rb") as marker:
+        enabled = marker.read(9) == b"4194304\n"
+except OSError:
+    enabled = False
+raise SystemExit(0 if enabled else 1)
+PY_TRACE
+                then export SANDBOX_UFFD_TRACE_MEMFD_PAGE=4194304; fi
+                break
+                ;;
+        esac
+    done
+fi
 if [ "\${1:-}" = "snapshot" ]; then
     python3 - "$SNAPSHOT_ARGV_LOG" "\$@" <<'PY'
 import json, sys
