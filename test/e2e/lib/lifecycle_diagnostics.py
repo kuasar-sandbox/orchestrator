@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 
 MAX_RECORDS = 64
@@ -18,6 +19,16 @@ MAX_INPUT = 2 * 1024 * 1024
 TRACE_PAGE = 4194304
 MAX_TRACE_RECORDS = 32
 TRACE_PREFIX = 'uffd-page-trace '
+GUARD_PREFIX = 'uffd-backend-guard '
+MAX_GUARD_RECORDS = 4
+MAX_FAULT_LINES = 80
+MAX_FAULT_FRAMES = 12
+GUARD_JOURNAL_FIELDS = ','.join((
+    'MESSAGE', 'SYSLOG_IDENTIFIER', 'KUASAR_SANDBOX_ID', 'KUASAR_RUN_ID',
+    '_PID', '_BOOT_ID', '_SYSTEMD_UNIT', '_STREAM_ID', '_TRANSPORT', '__CURSOR'))
+SIGBUS_LINE = re.compile(
+    r'^\[signal SIGBUS: bus error code=(0x[0-9a-fA-F]+|[0-9]+) '
+    r'addr=(0x[0-9a-fA-F]+) pc=(0x[0-9a-fA-F]+)\]$')
 STATE_FIELDS = (
     'id', 'instance_id', 'state', 'run_id', 'sandbox_result_run_id',
     'dead_unix', 'dead_run_id', 'launch_mode', 'resume_source_kind',
@@ -95,6 +106,223 @@ def held_memory_fault(message):
         return value if isinstance(value, dict) else None
     except ValueError:
         return None
+
+
+def memory_backend_guard(message):
+    """Accept only the immediate, fixed-field guard records; never raw errors."""
+    if not isinstance(message, str) or len(message) >= MAX_FIELD:
+        return None
+    _, marker, payload = message.partition(GUARD_PREFIX)
+    if not marker:
+        return None
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate guard field')
+            result[key] = value
+        return result
+
+    try:
+        if len(message.encode('utf-8')) >= MAX_FIELD:
+            return None
+        value = json.loads(payload, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    fields = {'v', 'seq', 'event', 'reason', 'pid', 'page', 'target_valid',
+              'backend_va', 'target_va', 'length', 'host_page_size', 'memfd_fd',
+              'memfd_dev', 'memfd_ino', 'memfd_size', 'guard_fd', 'errno', 'elapsed_ns'}
+    if not isinstance(value, dict) or set(value) != fields:
+        return None
+    maximum = (1 << 64) - 1
+    bounds = {key: (0, maximum) for key in
+              ('page', 'backend_va', 'target_va', 'memfd_dev', 'memfd_ino', 'elapsed_ns')}
+    bounds.update(v=(1, 1), seq=(1, 3), pid=(1, (1 << 31) - 1), length=(4096, 4096),
+                  host_page_size=(1, (1 << 31) - 1), memfd_fd=(-1, (1 << 31) - 1),
+                  memfd_size=(-(1 << 63), (1 << 63) - 1), guard_fd=(-1, (1 << 31) - 1),
+                  errno=(-1, 4095))
+    if any(type(value[key]) is not int or not low <= value[key] <= high
+           for key, (low, high) in bounds.items()):
+        return None
+    if type(value['target_valid']) is not bool:
+        return None
+    if value['target_valid']:
+        if (value['page'] % 4096 or not value['backend_va'] or value['backend_va'] % 4096
+                or value['target_va'] != value['backend_va'] + value['page']
+                or value['target_va'] + 4096 > maximum
+                or value['page'] + 4096 > value['memfd_size']):
+            return None
+    elif value['page'] != 0 or value['target_va'] != 0:
+        return None
+    event = value['event']
+    if not isinstance(event, str) or not isinstance(value['reason'], str):
+        return None
+    if event == 'attempt':
+        valid = (value['seq'] == 1 and value['reason'] == 'success' and value['errno'] == 0
+                 and value['guard_fd'] == -1 and value['memfd_dev'] == value['memfd_ino'] == 0)
+    elif event == 'armed':
+        valid = (value['seq'] == 2 and value['reason'] == 'success' and value['errno'] == 0
+                 and value['target_valid'] and value['guard_fd'] >= 0 and value['host_page_size'] == 4096)
+    elif event == 'failed':
+        valid = (value['seq'] == 2 and value['errno'] != 0 and value['reason'] in
+                 {'target', 'page_size', 'address', 'stat', 'create', 'api', 'features', 'register'})
+    elif event == 'closed':
+        valid = (value['seq'] == 3 and value['reason'] == 'close' and value['target_valid']
+                 and value['guard_fd'] >= 0 and value['host_page_size'] == 4096)
+    else:
+        valid = False
+    return value if valid else None
+
+
+def guard_journal(arguments, deadline, count):
+    """Read a bounded prefix, sharing the original per-SID journal deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired('journalctl', 3)
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        result = subprocess.run(
+            ['journalctl', *arguments, '--no-pager', '-o', 'json', '-n', '+' + str(count),
+             '--output-fields=' + GUARD_JOURNAL_FIELDS], stdin=subprocess.DEVNULL,
+            stdout=output, stderr=errors, timeout=remaining)
+        output.seek(0)
+        # A malformed long entry cannot displace the start of the fault stack.
+        data = output.read(256 * 1024)
+        errors.seek(0)
+        if result.returncode and not (result.returncode == 1 and not data and not errors.read(1)):
+            raise RuntimeError('journal query failed')
+    if data and not data.endswith(b'\n'):
+        data = data.rpartition(b'\n')[0]
+    return [parse_line(line) for line in data.decode('utf-8', errors='replace').splitlines()[:count]
+            if len(line) < 16384]
+
+
+def guard_origin(entry, pid):
+    """Only trusted journal metadata can bind a backend's native log to fd 2."""
+    boot, unit, cursor = (entry.get(key) for key in ('_BOOT_ID', '_SYSTEMD_UNIT', '__CURSOR'))
+    if (entry.get('_PID') != str(pid) or not isinstance(boot, str)
+            or not re.fullmatch(r'[0-9a-f]{32}', boot) or not isinstance(unit, str)
+            or not re.fullmatch(r'[A-Za-z0-9@_.:\\-]{1,256}', unit)
+            or not isinstance(cursor, str) or not re.fullmatch(r'[A-Za-z0-9=;_-]{1,512}', cursor)):
+        return None
+    return (boot, unit)
+
+
+def fault_stack(entries, origin, pid, stream_id, sid, run_id):
+    """Project the first Go stack only: symbols and source basenames, no args."""
+    frames, started, pending, lines = [], False, None, 0
+    for entry in entries:
+        if (guard_origin(entry, pid) != origin or entry.get('_STREAM_ID') != stream_id
+                or entry.get('_TRANSPORT') != 'stdout'
+                or entry.get('KUASAR_SANDBOX_ID', sid) != sid
+                or entry.get('KUASAR_RUN_ID', run_id) != run_id):
+            continue
+        message = entry.get('MESSAGE')
+        if not isinstance(message, str) or len(message) >= MAX_FIELD:
+            continue
+        for line in message.splitlines():
+            lines += 1
+            if lines > MAX_FAULT_LINES:
+                return frames
+            if re.fullmatch(r'goroutine [0-9]+(?: [^\r\n]{0,200})? \[[^\]\r\n]{1,80}\]:', line):
+                if started:
+                    return frames
+                started = True
+                continue
+            if line == 'runtime stack:':
+                if started:
+                    return frames
+                started = True
+                continue
+            if not started:
+                continue
+            if line.startswith('created by '):
+                return frames
+            location = re.fullmatch(
+                r'\s+(?:[A-Za-z0-9_./@-]+/)?([A-Za-z0-9_.-]+\.(?:go|s)):([0-9]{1,10})'
+                r'(?: \+0x[0-9a-fA-F]+)?(?: (?:fp|sp|pc)=0x[0-9a-fA-F]{1,16}){0,3}', line)
+            if pending and location:
+                frames.append(dict(function=pending, file=location[1][:80], line=int(location[2])))
+                pending = None
+                if len(frames) >= MAX_FAULT_FRAMES:
+                    return frames
+                continue
+            symbol = re.match(
+                r'^([A-Za-z0-9_/.$\[\],*-]+(?:\(\*?[A-Za-z0-9_/.\[\],*-]+\)[A-Za-z0-9_/.$\[\],*-]+)?)\(', line)
+            pending = symbol[1][:128] if symbol else None
+    return frames
+
+
+def backend_guard_evidence(sid, run_id, deadline):
+    """One backend identity, three producer records and at most one fault record."""
+    if not run_id:
+        return []
+    entries = guard_journal([
+        'KUASAR_SANDBOX_ID=' + sid, 'KUASAR_RUN_ID=' + run_id,
+        'SYSLOG_IDENTIFIER=sandbox-ctl', '--grep=' + GUARD_PREFIX], deadline, MAX_GUARD_RECORDS)
+    records, selected, seen, armed, closed = [], None, set(), None, False
+    for entry in entries:
+        if (entry.get('KUASAR_SANDBOX_ID') != sid or entry.get('KUASAR_RUN_ID') != run_id
+                or entry.get('SYSLOG_IDENTIFIER') != 'sandbox-ctl' or entry.get('_TRANSPORT') != 'journal'):
+            continue
+        record = memory_backend_guard(entry.get('MESSAGE'))
+        if record is None or entry.get('_PID') != str(record['pid']):
+            continue
+        if record['target_valid'] and record['page'] != TRACE_PAGE:
+            continue
+        identity = tuple(record[key] for key in
+                         ('pid', 'page', 'backend_va', 'target_va', 'target_valid', 'memfd_fd', 'memfd_size'))
+        identity += (entry.get('_BOOT_ID'), entry.get('_SYSTEMD_UNIT'))
+        if selected is None:
+            selected = identity
+        if identity != selected or record['seq'] in seen:
+            continue
+        if record['event'] == 'closed' and armed and any(
+                record[key] != armed[1][key] for key in ('memfd_dev', 'memfd_ino', 'guard_fd')):
+            continue
+        seen.add(record['seq'])
+        records.append(dict(lifecycle_diagnostic='uffd_backend_guard', sid=sid, run_id=run_id, **record))
+        if record['event'] == 'armed':
+            armed = (entry, record)
+        closed |= record['event'] == 'closed'
+    if armed is None or closed:
+        return records
+    entry, record = armed
+    fault = dict(lifecycle_diagnostic='uffd_backend_fault', sid=sid, run_id=run_id,
+                 pid=record['pid'], page=record['page'], target_va=record['target_va'],
+                 status='unavailable', reason='identity', frames=[])
+    records.append(fault)
+    origin = guard_origin(entry, record['pid'])
+    if origin is None:
+        return records
+    matches = ['_BOOT_ID=' + origin[0], '_SYSTEMD_UNIT=' + origin[1], '_PID=' + str(record['pid'])]
+    try:
+        signals = guard_journal([*matches, '--after-cursor=' + entry['__CURSOR'],
+                                 '--grep=' + SIGBUS_LINE.pattern], deadline, 1)
+        fault['reason'] = 'missing'
+        for signal in signals:
+            message, stream_id = signal.get('MESSAGE'), signal.get('_STREAM_ID')
+            match = SIGBUS_LINE.fullmatch(message) if isinstance(message, str) else None
+            if (not match or guard_origin(signal, record['pid']) != origin
+                    or signal.get('_TRANSPORT') != 'stdout' or not isinstance(stream_id, str)
+                    or not re.fullmatch(r'[0-9a-f]{32}', stream_id)
+                    or signal.get('KUASAR_SANDBOX_ID', sid) != sid
+                    or signal.get('KUASAR_RUN_ID', run_id) != run_id):
+                continue
+            code, address, pc = (int(part, 16 if part.startswith('0x') else 10) for part in match.groups())
+            if code > (1 << 32) - 1 or address >= 1 << 64 or pc >= 1 << 64:
+                continue
+            fault.update(status='sigbus', reason='stack_missing', signal_code=code,
+                         fault_address=address, pc=pc,
+                         target_match=record['target_va'] <= address < record['target_va'] + 4096)
+            stack = guard_journal([*matches, '_STREAM_ID=' + stream_id,
+                                   '--after-cursor=' + signal['__CURSOR']], deadline, MAX_FAULT_LINES)
+            fault['frames'] = fault_stack(stack, origin, record['pid'], stream_id, sid, run_id)
+            if fault['frames']:
+                fault['reason'] = 'captured'
+    except Exception as error:
+        fault['reason'] = 'timeout' if isinstance(error, subprocess.TimeoutExpired) else 'query'
+    return records
 
 
 def memory_page_trace(message):
@@ -328,6 +556,8 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
         return
     emitted, run_ids = 0, set()
     trace_emitted, trace_summary_emitted = 0, False
+    guard_emitted = 0
+    guard_candidate, guard_priority = [], 0
     states, page_probe_used = {}, False
 
     def emit(source, record):
@@ -358,6 +588,16 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                   file=stream, flush=True)
         except Exception:
             pass
+
+    def emit_guard(record):
+        nonlocal guard_emitted
+        if guard_emitted >= MAX_GUARD_RECORDS:
+            return
+        try:
+            print(json.dumps(record, sort_keys=True), file=stream, flush=True)
+        except Exception:
+            pass
+        guard_emitted += 1
 
     try:
         uri = Path(db_path).resolve().as_uri() + '?mode=ro'
@@ -403,6 +643,7 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
     # hide the durable result. Temporary files bound memory even for long entries.
     for sid in ids:
         try:
+            journal_deadline = time.monotonic() + 3
             with tempfile.TemporaryFile() as output:
                 result = subprocess.run(
                     ['journalctl', f'KUASAR_SANDBOX_ID={sid}', '--no-pager', '-n', '200', '-o', 'json'],
@@ -420,6 +661,10 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                     message = entry.get('MESSAGE')
                     if entry.get('KUASAR_SANDBOX_ID') != sid or not isinstance(message, str):
                         continue
+                    if 'uffd-backend-guard' in message:
+                        # Immediate guard evidence has its own query and quota;
+                        # even malformed records must not leak through raw errors.
+                        continue
                     if 'uffd-page-trace' in message:
                         # Trace messages have their own quota and cannot evict
                         # the workload fault from the last twelve error lines.
@@ -434,6 +679,22 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                             fault_entry = (current_run, fault)
                 for entry in entries:
                     emit('journal', dict(sid=sid, **entry))
+                if not guard_emitted:
+                    try:
+                        guards = backend_guard_evidence(sid, current_run, journal_deadline)
+                        priority = (3 if any(row.get('status') == 'sigbus' for row in guards)
+                                    else 2 if any(row.get('event') == 'armed' for row in guards)
+                                    and not any(row.get('event') == 'closed' for row in guards)
+                                    else 1 if guards else 0)
+                        if priority > guard_priority:
+                            guard_candidate, guard_priority = guards, priority
+                        if priority == 3:
+                            for guard in guards:
+                                emit_guard(guard)
+                    except Exception:
+                        # Best-effort guard queries cannot consume business
+                        # records or extend this SID's original journal budget.
+                        pass
                 if memory_probe and not page_probe_used and fault_entry:
                     run_id, fault = fault_entry
                     try:
@@ -445,6 +706,10 @@ def emit_failure_evidence(db_path, log_path, sandbox_ids, facts_path=None, strea
                         unavailable('snapshot_page', error, sid=sid, run_id=run_id)
         except Exception as error:
             unavailable('journal', error, sid=sid)
+
+    if not guard_emitted:
+        for guard in guard_candidate:
+            emit_guard(guard)
 
     try:
         events = deque(maxlen=MAX_RECORDS)
