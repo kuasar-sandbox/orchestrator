@@ -531,6 +531,12 @@ func (c *CacheCoordinator) scheduleLocked(now time.Time) {
 				shortages[m.pool] -= min(shortages[m.pool], m.task.MaxBytes)
 			}
 		}
+		// Retain the intent until physical growth is confirmed, but do not
+		// treat it as schedulable supply or a donor. Existing authority above
+		// still participates in the global source and in-flight barriers.
+		if m.growthPending {
+			continue
+		}
 		available := uint64(0)
 		if r.CacheReservation > cacheBudgetUnit {
 			available = r.CacheReservation - cacheBudgetUnit
@@ -543,7 +549,7 @@ func (c *CacheCoordinator) scheduleLocked(now time.Time) {
 				autos = append(autos, m)
 			}
 		}
-		if m.task == nil && r.Conn != nil && available > 0 && !waiters[m.pool][m.sid] && now.Sub(m.lastAttempt) >= cacheReclaimRetryDelay {
+		if shortages[m.pool] > 0 && m.task == nil && r.Conn != nil && available > 0 && !waiters[m.pool][m.sid] && now.Sub(m.lastAttempt) >= cacheReclaimRetryDelay {
 			donors = append(donors, m)
 		}
 	}
@@ -566,13 +572,6 @@ func (c *CacheCoordinator) scheduleLocked(now time.Time) {
 			return probes[i].sid < probes[j].sid
 		}
 		return probes[i].lastIssued < probes[j].lastIssued
-	})
-	sort.Slice(donors, func(i, j int) bool {
-		a, b := donors[i].pool.bySID[donors[i].sid], donors[j].pool.bySID[donors[j].sid]
-		if a.CacheReservation == b.CacheReservation {
-			return donors[i].sid < donors[j].sid
-		}
-		return a.CacheReservation > b.CacheReservation
 	})
 	issue := func(m *cacheReclaimMember, source string, bytes uint64) bool {
 		r := m.pool.bySID[m.sid]
@@ -610,6 +609,13 @@ func (c *CacheCoordinator) scheduleLocked(now time.Time) {
 	if inAuto {
 		return
 	}
+	sort.Slice(donors, func(i, j int) bool {
+		a, b := donors[i].pool.bySID[donors[i].sid], donors[j].pool.bySID[donors[j].sid]
+		if a.CacheReservation == b.CacheReservation {
+			return donors[i].sid < donors[j].sid
+		}
+		return a.CacheReservation > b.CacheReservation
+	})
 	issuedYield := false
 	for _, m := range donors {
 		if shortage := shortages[m.pool]; shortage > 0 && issue(m, resource.CacheReclaimYield, shortage) {

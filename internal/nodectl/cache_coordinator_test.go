@@ -408,6 +408,45 @@ func TestCacheCoordinatorGrowthMustBePhysicallyConfirmed(t *testing.T) {
 	}
 }
 
+func TestCacheCoordinatorPendingGrowthDoesNotBlockOtherPoolYield(t *testing.T) {
+	c, now, a, d, b := twoPoolReclaimTest(t, false)
+	c.tokens, c.refill = 0, *now
+	intent := reclaimIntent(1, 1, 8<<20)
+	updateReclaimTest(t, c, a, resource.CacheReclaimState{Intent: intent})
+	grant, found, err := c.Grant(a.token, 32<<20, 32<<20, a.spec.CacheMax, 0, nil)
+	if err != nil || !found || grant.Reservation != 64<<20 {
+		t.Fatalf("grant: %+v %v", grant, err)
+	}
+	// This retained opportunity has no executable physical baseline yet.
+	// A different pool must be able to resolve its real quota shortage.
+	c.tokens = cacheReclaimBurst
+	cacheDemandTest(t, c, b, 16<<20, 12<<20)
+	yield := c.Poll(d.token).Task
+	if yield == nil || yield.Source != resource.CacheReclaimYield {
+		t.Fatal("unconfirmed growth blocked another pool's supplemental yield")
+	}
+	if c.Poll(a.token).Task != nil {
+		t.Fatal("unconfirmed physical capacity received reclaim authority")
+	}
+	if m := c.members[a.spec.SandboxID]; !m.growthPending || m.intent == nil || *m.intent != *intent {
+		t.Fatal("pending growth discarded or consumed the retained opportunity")
+	}
+	// Physical confirmation restores primary eligibility, but cannot overlap
+	// the already-issued yield. It must win as soon as that batch completes.
+	if out := updateReclaimTest(t, c, a, resource.CacheReclaimState{Intent: intent}); out.Task != nil {
+		t.Fatal("confirmed autonomous supply overlapped issued yield")
+	}
+	if out := completeReclaimTest(t, c, d, yield, 48<<20-yield.MaxBytes, nil); out.Task != nil {
+		t.Fatal("supplemental yield continued ahead of confirmed autonomous supply")
+	}
+	if task := c.Poll(a.token).Task; task == nil || task.Source != resource.CacheReclaimAutonomous || task.Target+task.MaxBytes != grant.Reservation {
+		t.Fatalf("confirmed autonomous supply did not resume at its physical baseline: %+v", task)
+	}
+	if c.Poll(d.token).Task != nil {
+		t.Fatal("supplemental yield overlapped resumed autonomous work")
+	}
+}
+
 func TestCacheCoordinatorDisconnectedUnissuedIntentDoesNotBlockYield(t *testing.T) {
 	c, now, a, d, b := twoPoolReclaimTest(t, false)
 	c.tokens, c.refill = 0, *now
