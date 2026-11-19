@@ -203,7 +203,9 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
         projected = sum(item["memory"]["bytes"] for item in receipts if not item.get("settled") and item["stage"] != "prepared")
         active = sum(item["allocatable_memory"] for item in rows)
         cache = sum(item.get("cache_allocated", 0) for item in pressure.get("pools", []))
-        if pressure["reserved_memory"] == active + projected + cache and receipt["stage"] != "prepared":
+        # Guest Budget and retained RAM share this pool. Host cache has its own
+        # existing pool and must not be charged into reserved_memory again.
+        if pressure["reserved_memory"] == active + projected and (receipt["stage"] != "prepared" or receipt.get("settled")):
             break
         assert time.monotonic() < deadline, (pressure["reserved_memory"], active, projected, cache, receipt["stage"])
         time.sleep(.05)
@@ -213,7 +215,8 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
             "ram_released": latest["ram_released"], "resource_stage": receipt["stage"],
             "retained_bytes": 0 if receipt.get("settled") else memory["bytes"],
             "active_bytes": sum(item["allocatable_memory"] for item in current),
-            "node_reserved_bytes": pressure["reserved_memory"], "source_pool": memory["source_pool"]}
+            "node_reserved_bytes": pressure["reserved_memory"], "cache_allocated_bytes": cache,
+            "source_pool": memory["source_pool"]}
 
 
 def disk_state(directory):
