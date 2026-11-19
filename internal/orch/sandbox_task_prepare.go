@@ -397,6 +397,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
+	if err := o.requirePreviousMemorySaveSupport(launchCtx, sb); err != nil {
+		return launchFailed("runtime", err)
+	}
 	for _, b := range binds {
 		if err := o.bindWorkspaceDisk(launchCtx, sb, b, *b.Disk, b.RefLocations); err != nil {
 			return launchFailed("workspace_attach", err)

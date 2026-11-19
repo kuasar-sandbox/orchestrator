@@ -204,7 +204,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 			token = req.Token
 		}
 		resp := s.dispatch(conn, peerPID, req, &token)
-		if req.Type == TypeAdmit && resp == nil {
+		if (req.Type == TypeAdmit || req.Type == resource.TypeAdoptRetained) && resp == nil {
 			queuedSID = req.SandboxID
 		}
 		if resp != nil {
@@ -228,6 +228,10 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 // the response (or nil if the message has no reply).
 func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *string) *Message {
 	switch req.Type {
+	case resource.TypePrepareRetained, resource.TypeCommitRetained, resource.TypeAbortRetained, resource.TypeReleaseRetained:
+		return s.handleRetained(peerPID, req, *token)
+	case resource.TypeAdoptRetained:
+		return s.handleAdmit(conn, peerPID, req, token)
 	case TypeAdmit:
 		return s.handleAdmit(conn, peerPID, req, token)
 	case TypeStateSync:
@@ -272,6 +276,18 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 // reply. The conn-EOF monitor cancels the queue entry if the client
 // disconnects while queued.
 func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *string) *Message {
+	if req.Type == resource.TypeAdoptRetained && s.State.retainedSnapshot(req.SandboxID) == nil {
+		if req.Retention == nil {
+			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: "missing retained capture identity"}
+		}
+		proof, err := readRetentionCapture(req.SandboxID, *req.Retention)
+		if err == nil && proof.RAMReleased {
+			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Reason: resource.ReasonRetentionSettledMissing,
+				ClientFeatures: featureResponse(req.ClientFeatures), Msg: "capture RAM released; use ordinary lease admission"}
+		}
+		return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Reason: "checkpoint_memory_unaccounted",
+			Msg: "pending checkpoint memory has no transferable node receipt"}
+	}
 	// A recovered provisional or ACK-lost Admit is already charged. Let the
 	// matching lease owner atomically replace that charge before applying gates
 	// intended only for a new consumer.
@@ -367,6 +383,12 @@ func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
 // buildAdmitOK builds the Reservation, inserts it into State, returns
 // the AdmitResponse message. Caller has already token-consumed.
 func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *string) (*Message, error) {
+	if req.Type == resource.TypeAdoptRetained {
+		return s.buildRetainedAdmitOK(conn, peerPID, req, token)
+	}
+	if err := s.validateOrdinaryRetainedOwner(peerPID, req); err != nil {
+		return nil, err
+	}
 	if req.CacheReclaim != nil && !resource.HasFeature(req.ClientFeatures, FeatureStateSyncV1) {
 		return nil, fmt.Errorf("cache coordination requires lifecycle StateSync recovery")
 	}
@@ -445,6 +467,9 @@ func admitSpecFromRequest(conn net.Conn, peerPID int, req *Message) AdmitSpec {
 }
 
 func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token *string) *Message {
+	if err := s.validateOrdinaryRetainedOwner(peerPID, req); err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
+	}
 	if s.Inventory == nil {
 		return &Message{Type: TypeError, Msg: "state sync inventory unavailable"}
 	}
@@ -771,6 +796,13 @@ func (i *IdleSweeper) Run(ctx context.Context) {
 }
 
 func (i *IdleSweeper) sweep() {
+	if i.Inventory != nil {
+		if err := i.Inventory.ReconcileRetained(i.State); err != nil {
+			i.Logf("sweep: retained checkpoint memory: %v", err)
+		} else if i.Admission != nil {
+			i.Admission.PushWake()
+		}
+	}
 	now := time.Now()
 	swept := false
 	for _, res := range i.State.SweepSnapshot() {
@@ -855,6 +887,9 @@ func cacheGrantReason(result CacheGrantResult) string {
 // The node advertises a feature only when the client requested it.
 func featureResponse(features []string, coordinated ...bool) []string {
 	var out []string
+	if resource.HasFeature(features, resource.FeatureRetainedMemoryV1) {
+		out = append(out, resource.FeatureRetainedMemoryV1)
+	}
 	if resource.HasFeature(features, FeatureCacheBudgetV1) {
 		out = append(out, FeatureCacheBudgetV1)
 	}

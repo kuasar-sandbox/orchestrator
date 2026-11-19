@@ -383,6 +383,29 @@ checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceO
 副作用前返回 400。Pause Header 中显式提供 `merge_ref`/`drop_caches` 也受此限制。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
 `merge_ref`、`drop_caches`,不接受 `memory`。
 
+### Checkpoint 内存保存
+
+启动时启用 checkpoint 支持的 runtime，在内存捕获指定实际 checkpoint ID 时，可以在
+冻结不可变内存并释放运行资源后完成 Pause。原 `sandbox-ctl` 作为仍有明确所有者的
+memory holder 继续写出内存。临时 socket 位于分代的 `RunDir/memory-holders` 目录，
+checkpoint 元数据引用该 holder。保存期间 Resume 和 Export 使用同一个本地 Snapshot
+视图，文件完成后切换到文件。Resume 分配独立的可写内存；旧 holder 的内存只有在所有
+读者释放后才释放资源记账。
+
+再次 Pause 默认等待上一轮内存保存。等待可取消，沙箱保持 `running`，不持有 SID
+生命周期锁或 source-operation grant；结束后重新验证实例及 RunID。请求
+`{"noWaitForPreviousMemorySave":true}` 可以在保存仍未完成时立即返回 409。
+TTL、idle 和资源压力后台流程使用不等待选项及原有重试机制。恢复较老的 checkpoint
+同样必须继承该 SID 尚未完成的保存责任。
+
+这是既有 checkpoint 捕获行为的改进，不增加运行模式。未启用 checkpoint，或捕获未
+指定 checkpoint ID 时，继续同步保存。受管理的异步保存要求当前 Conductor、node-ctl
+父进程、sandboxer runtime，以及启用时的资源控制器，明确支持完整生命周期；旧组件
+明确不支持时继续同步捕获，未知能力或未解决的退役状态不能授权异步操作。新 runtime
+理解已有保存责任后才能变为 `running`。回退 Conductor/node-ctl 前需先完成全部保存。
+若 sandboxer 一并回退到不认识本地 checkpoint 描述符的版本，还需先导出为普通可移植
+S/E 并从该表示恢复；仅等待 payload 文件完成不足以兼容旧 reader。
+
 `ifIdleSince` 可为 `ifIdle=true` 增加持续空闲时间阈值。格式为带时区的
 RFC 3339 时间，保留亚秒精度；缺省/null 保持原行为。未指定 `ifIdle=true`、
 格式非法或晚于最终 Conductor 接收时刻的时间，在安装 gate 前返回 400。
@@ -410,8 +433,9 @@ finalizer 在 SID 锁内重读状态和 RunID，只完成剩余暂停清理。Re
 视图中同时清除旧结果，有效 paused 来源仍可导出；已退休 RunID 的报告不能修改后继运行。
 capture 成功但 paused 事务失败时，未提交操作保持 pausing，交由既有恢复路径处理，
 不能宣称旧实例仍在 running。
-崩溃后遗留的 durable pausing 没有已提交新来源, Reconcile fence 精确 runner 并按既有终止路径
-收敛, 不仅凭进程存活重新发布 running.
+受管理的内存退役按精确捕获记录恢复：已提交且运行资源已退役时，前滚完成 paused/source
+事务；结果未知时保留所有者等待重查。没有退役 intent 的中断 pausing，仍沿原有精确
+runner fencing 和终止清理流程收敛，不仅凭进程存活重新发布 running。
 
 `checkpoint=true` 保存一个长期保留的不可变 E 或 S/E 对, 与 paused/source 在同一事务提交,
 返回 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. 默认 Pause 仍返回 204. Sandbox 选项
@@ -454,13 +478,18 @@ capture 返回生产者的实际身份: `snapshot --json` 返回
 结构化结果, 再原子提交 pausing→paused; Snapshot 保存实际 S/E 对, E-only capture
 清除旧 Snapshot 及其关联. capture 失败绝不提交半对.
 
-Pause 的顺序固定为 resolve request/quota -> accepted operation -> online Proxy handshake -> running→pausing -> runtime capture ->
-`CommitPaused(id, exactRunID, ResumeSource, checkpointID)` -> stop/reset exact runner -> detach exact network ->
-selective checkpoint cleanup -> RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与完整 source kind/S/E；之后非空
-RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
-exact-CAS 清 network；任一步失败保留尚需重试的字段。checkpoint 或 RunDir 清理失败不允许新的 Resume/Wake/Exec
-取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 与当前 checkpoint 依赖始终保留，已知且无用的旧 checkpoint 文件会选择性清除。capture 失败仅在相同 RunID 仍持有 pausing 行且未接纳退出结果时恢复 running；
-已接纳的退出沿既有终态路径清理。失败尝试保留旧 source，不创建成功 alias，也不从 S 降级为 E。
+Pause 在接纳操作或进入 `pausing` 之前等待上一轮内存保存。随后依次完成请求/配额
+校验、在线 Proxy 握手、运行实例捕获，以及精确 RunID 的来源/paused 原子提交。
+同步捕获继续 Stop/Reset 旧 runner；checkpoint 内存保存则同时提交 holder 角色，
+等待旧父进程停止并 join metrics 采样、将最终 usage 读入私有值并确认退役，保留
+holder unit 及其分代目录。两条路径随后都 detach 精确网络、选择性清理 checkpoint，
+清除普通 RunDir 所有权并发布 paused。holder 的 payload 写入和最终 RAM 释放继续后台完成。
+
+非空 RunID/port/RunDir 表示运行资源清理仍未完成；成功释放后才以 exact CAS 清对应
+字段。失败阻止新的 Resume/Wake/Exec 接管，并由 admission 或重启恢复重试。
+BaseDir/checkpoint 保留。受管理捕获即使丢失命令响应，也按已提交记录前滚；仅明确的
+提交前拒绝或 abort 才可回滚，未知结果保留退役 intent。普通同步捕获失败继续原有
+精确 RunID 回滚/退出结果流程。失败不发布半个 S/E 对，也不将内存来源静默降为磁盘来源。
 
 <a id="local-disk-checkpoints"></a>
 

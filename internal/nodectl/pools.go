@@ -64,6 +64,7 @@ func NewPoolState(resolved *Resolved) *State {
 	}
 	root.AllocatablePool = Resources{}
 	for _, p := range root.pools {
+		p.retentionRoot = root
 		root.AllocatablePool = addResourcesSaturating(root.AllocatablePool, p.AllocatablePool)
 	}
 	root.NodeBudget, root.HostReserved, root.OperationalMargin = root.AllocatablePool, Resources{}, Resources{}
@@ -364,6 +365,34 @@ func (s *State) BeginPhase(pool, previousSID, sid, runID string, capacity Resour
 // RetireExecution is only called by the lifecycle owner after systemd confirms
 // this run has exited. A stale run cannot remove its successor's reservation.
 func (s *State) RetireExecution(sid, runID string) error {
+	if s.pools != nil {
+		// Placement and retained-memory ownership may now name different
+		// pools. Find this exact execution; the SID's current route can
+		// already belong to its successor.
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for name, p := range s.pools {
+			p.mu.Lock()
+			claim, ok := p.placements[sid]
+			if !ok || claim.Identity != runID {
+				p.mu.Unlock()
+				continue
+			}
+			if p.bySID[sid] != nil {
+				if _, err := p.deleteLocked(sid); err != nil {
+					p.mu.Unlock()
+					return err
+				}
+			}
+			delete(p.placements, sid)
+			if s.bindings[sid] == name {
+				delete(s.bindings, sid)
+			}
+			p.mu.Unlock()
+			return nil
+		}
+		return nil
+	}
 	p := s.forSID(sid)
 	if p != s {
 		err := p.RetireExecution(sid, runID)

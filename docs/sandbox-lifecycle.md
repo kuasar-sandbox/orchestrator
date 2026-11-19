@@ -362,6 +362,37 @@ Explicit Pause body may be empty or:
 
 Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field, even with a null value, returns 400 before freeze/capture/lifecycle side effects. Explicit merge_ref/drop_caches fields in the Pause Header have the same restriction. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
 
+### Checkpoint memory saving
+
+For a runtime started with checkpoint support, a memory capture with an actual
+checkpoint ID can complete Pause after freezing its immutable memory and releasing
+runtime resources. The existing `sandbox-ctl` remains an owned memory holder while
+it writes the payload. The temporary socket is under the generation-specific
+`RunDir/memory-holders` directory; checkpoint metadata identifies that holder.
+Resume and export use the same local Snapshot view while saving, then switch to
+the completed file. Resume allocates its own writable memory. The previous
+holder's memory remains accounted for until all readers have released it.
+
+A second Pause waits for this previous memory save by default. The wait is
+cancelable, leaves the sandbox `running`, and holds neither the SID lifecycle lock
+nor the source-operation grant. After waiting, admission rechecks the exact
+sandbox instance and RunID. To return 409 immediately while the save remains
+pending, send `{"noWaitForPreviousMemorySave":true}`. TTL, idle and resource-pressure
+workers use this no-wait behavior with their existing retry machinery. Restoring
+an older checkpoint does not bypass the same sandbox's outstanding save.
+
+This is the existing checkpoint capture behavior, not an additional launch mode.
+Non-checkpoint runtimes and captures without a checkpoint ID keep synchronous
+saving. Managed asynchronous saving requires positive support from the current
+Conductor, node-ctl parent, sandboxer runtime, and the resource controller when
+enabled. An older component that explicitly lacks support keeps synchronous
+capture; unknown capability or an unresolved retirement cannot authorize it.
+A new runtime must understand any existing save obligation before it becomes
+`running`. Before rolling back Conductor/node-ctl, finish all outstanding saves.
+Downgrading sandboxer to a reader without the local checkpoint descriptor also
+requires exporting the local checkpoint as a portable S/E and restoring that
+representation; merely waiting for the payload file is insufficient.
+
 `ifIdleSince` optionally adds a continuous-idle threshold to `ifIdle=true`.
 Use an RFC 3339 timestamp with a timezone (subsecond precision is retained).
 Omitted/null keeps the existing behavior. A missing `ifIdle=true`, malformed
@@ -401,9 +432,10 @@ old result in both storage and live views, and a valid paused source remains
 exportable. Reports from a retired RunID cannot change a subsequent run.
 If capture succeeds but the paused transaction fails, the uncommitted operation
 remains pausing for existing recovery; it must not be advertised as running.
-Restart never adopts an interrupted durable pausing
-row merely because its runner is live: it fences that exact runner and uses existing terminal
-cleanup because no new source was committed.
+Restart reconciles a managed retirement against its exact durable capture record.
+A committed and retired capture finishes the paused/source transaction; an unknown
+outcome retains its owner for retry. Without a retirement intent, an interrupted
+pausing row keeps the existing exact-run fencing and terminal cleanup behavior.
 
 `checkpoint=true` atomically retains the immutable E or S/E pair with paused/source and returns
 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Sandbox option
@@ -450,7 +482,24 @@ validates the complete structured result before committing pausing→paused;
 Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
 and its association. Capture failure never commits a partial pair.
 
-Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure restores running only while the same RunID still owns the pausing row and no exit result has been accepted; an accepted exit follows existing terminal cleanup. Failed attempts retain the old source and create no success alias, never downgrading S to E.
+Pause waits for a previous memory save before accepting its operation or entering
+`pausing`. It then resolves request/quota, completes the online Proxy handshake,
+captures the runtime and atomically commits the exact RunID's source and paused
+state. Synchronous capture stops/resets the old runner. Checkpoint memory saving
+instead commits its holder role and waits for the old parent to stop/join metrics,
+read its final usage into a private value and acknowledge retirement. It keeps the
+holder unit and its generation directory alive. Both paths detach the exact
+network, selectively clean checkpoints and clear normal RunDir ownership before
+publishing paused. The holder's payload write and final RAM release continue later.
+
+Remaining RunID/port/RunDir means runtime cleanup is pending. Exact CASes clear
+only successfully released ownership; failures block new Resume/Wake/Exec
+ownership and retry at admission or startup. BaseDir/checkpoint remains. A managed
+capture's committed record drives recovery forward even if the command response
+is lost. Only definite precommit rejection/abort permits rollback; an unknown
+outcome preserves the retirement intent. Ordinary synchronous failure keeps its
+existing exact-run rollback/result behavior. No failed capture publishes a partial
+S/E pair or silently changes a memory snapshot into a disk-only source.
 
 <a id="local-disk-checkpoints"></a>
 

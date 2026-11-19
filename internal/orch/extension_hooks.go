@@ -206,8 +206,9 @@ func cloneSandboxPauseRequest(request *conductorextension.SandboxPauseRequest) *
 		return nil
 	}
 	return &conductorextension.SandboxPauseRequest{
-		CaptureKind: request.CaptureKind,
-		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
+		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
+		CaptureKind:                 request.CaptureKind,
+		Checkpoint:                  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
 		CheckpointMergeRef:   cloneBool(request.CheckpointMergeRef),
 		CheckpointDropCaches: cloneBool(request.CheckpointDropCaches),
 	}

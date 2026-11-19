@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,15 @@ import (
 
 func runRecoveryControllerHelper(t *testing.T) {
 	socket, root := os.Getenv("NODECTL_SOCKET"), os.Getenv("NODECTL_CGROUP_ROOT")
-	state := NewState(530<<20, 4000, 0, 0, Watermarks{
+	physical := uint64(530 << 20)
+	if value := os.Getenv("NODECTL_TEST_PHYSICAL"); value != "" {
+		var err error
+		physical, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := NewState(physical, 4000, 0, 0, Watermarks{
 		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: .75,
 	})
 	admission := NewAdmissionController(AdmissionPolicy{

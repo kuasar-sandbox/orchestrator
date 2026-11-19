@@ -44,6 +44,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 // vsClient is the vswitch surface the orchestrator uses; the production impl is
@@ -101,6 +102,7 @@ type Orchestrator struct {
 	runSessionsMu       sync.Mutex
 	runSessionsNext     uint64
 	runSessions         map[runSessionKey]*runSessionGeneration
+	retirementWake      chan struct{}
 	runEndMu            sync.Mutex
 	runEndActive        map[string]*sandboxRunEndWork // one pending/running entry per exact RunID
 	runEndQueue         []string
@@ -170,6 +172,7 @@ type Orchestrator struct {
 	// source.
 	resourceControllerSocketIdentity string
 	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error)
+	captureStateReader               func(context.Context, string, ctl.CaptureStateQuery) (ctl.CaptureState, error)
 	removeSandboxRunDir              func(string) error
 	removeSandboxBaseDir             func(string) error
 	resetMu                          sync.Mutex
@@ -740,6 +743,9 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
+	if err := o.requirePreviousMemorySaveSupport(launchCtx, sb); err != nil {
+		return launchFailed("runtime", err)
+	}
 	if tmpl.Profile == types.ProfileE2B {
 		envdStarted := time.Now()
 		err = o.envdInit(launchCtx, sb)
@@ -854,6 +860,9 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 }
 
 func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, sb *types.Sandbox, includeLocal bool) error {
+	if err := o.ensureRunnerMayFence(ctx, p.runID); err != nil {
+		return err
+	}
 	if p.unit == "" && p.runID != "" && !p.runnerFenced {
 		unit, err := o.resolveRunUnit(ctx, runKindSandbox, p.runID)
 		if err != nil {
@@ -902,12 +911,15 @@ func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, sb *t
 		if removeRunDir == nil {
 			removeRunDir = os.RemoveAll
 		}
-		if err := removeRunDir(p.runDir); err != nil {
+		if err := removeRunDirPreservingMemoryHolders(p.runDir, removeRunDir); err != nil {
 			return fmt.Errorf("remove run dir %s: %w", p.runDir, err)
 		}
 		p.runDirRemoved = true
 	}
 	if includeLocal && p.baseDir != "" && !p.baseDirRemoved {
+		if err := o.ensureRetiredMemoryReleased(ctx, sb.ID); err != nil {
+			return err
+		}
 		removeBaseDir := o.removeSandboxBaseDir
 		if removeBaseDir == nil {
 			removeBaseDir = os.RemoveAll
@@ -1283,19 +1295,16 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 	if o.extensionSandboxHook != nil {
 		return o.pauseWithExtension(ctx, id, apiKey, request)
 	}
-	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, sb, err := o.lockPauseAdmission(ctx, id, request, func(sb *types.Sandbox) error {
+		if !ownsSandbox(sb, apiKey) {
+			return api.ErrNotFound
+		}
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
 	defer unlock()
-
-	sb, err := o.st.Get(ctx, id)
-	if err != nil {
-		return "", err
-	}
-	if !ownsSandbox(sb, apiKey) {
-		return "", api.ErrNotFound
-	}
 	switch sb.State {
 	case types.StateStarting:
 		return "", api.ErrSandboxStarting
@@ -1318,18 +1327,14 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 }
 
 func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) (string, error) {
-	ctx, unlock, err := o.lockLifecycleMutation(ctx, id)
+	ctx, unlock, sandbox, err := o.lockPauseAdmission(ctx, id, request, func(sb *types.Sandbox) error {
+		if !ownsSandbox(sb, apiKey) {
+			return api.ErrNotFound
+		}
+		return nil
+	})
 	if err != nil {
 		return "", err
-	}
-	sandbox, err := o.st.Get(ctx, id)
-	if err != nil {
-		unlock()
-		return "", err
-	}
-	if !ownsSandbox(sandbox, apiKey) {
-		unlock()
-		return "", api.ErrNotFound
 	}
 	switch sandbox.State {
 	case types.StateStarting:
@@ -1358,8 +1363,9 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	precondition := sandboxPrecondition(sandbox)
 	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Pause = &conductorextension.SandboxPauseRequest{
-		CaptureKind: conductorextension.CaptureKind(request.Kind),
-		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
+		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
+		CaptureKind:                 conductorextension.CaptureKind(request.Kind),
+		Checkpoint:                  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
 		CheckpointMergeRef: cloneBool(request.SnapshotPolicy.MergeRef), CheckpointDropCaches: cloneBool(request.SnapshotPolicy.DropCaches),
 	}
 	operationID := operation.ID
@@ -1375,28 +1381,28 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	if candidate == nil {
 		return "", fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
 	}
-	if types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
+	if candidate.NoWaitForPreviousMemorySave != request.NoWaitForPreviousMemorySave || types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
 		return "", fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
-	ctx, unlock, err = o.lockLifecycleMutation(ctx, id)
+	var current *types.Sandbox
+	ctx, unlock, current, err = o.lockPauseAdmission(ctx, id, request, func(current *types.Sandbox) error {
+		if !ownsSandbox(current, apiKey) {
+			return api.ErrNotFound
+		}
+		if !sandboxPreconditionMatches(precondition, current) {
+			return api.ErrSandboxChanged
+		}
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
 	defer unlock()
-	current, err := o.st.Get(ctx, id)
-	if err != nil {
-		return "", err
-	}
-	if !ownsSandbox(current, apiKey) {
-		return "", api.ErrNotFound
-	}
-	if !sandboxPreconditionMatches(precondition, current) {
-		return "", api.ErrSandboxChanged
-	}
 	finalRequest := sandboxcfg.CaptureRequest{
-		Kind:       types.CaptureKind(candidate.CaptureKind),
-		Checkpoint: candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
+		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
+		Kind:                        types.CaptureKind(candidate.CaptureKind),
+		Checkpoint:                  candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
 		SnapshotPolicy: sandboxcfg.SnapshotPolicy{
 			MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
 		},
@@ -1444,7 +1450,7 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	default:
 		return api.ErrNotFound
 	}
-	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox, NoWaitForPreviousMemorySave: true}
 	if current.AutoPauseMemory {
 		request.Kind = types.CaptureSnapshot
 		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, sandboxcfg.SnapshotPolicy{})
@@ -1482,6 +1488,13 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if sb.State != types.StateRunning {
 		return "", api.ErrNotFound
 	}
+	// Every caller owns the lifecycle lock here. Never wait under that lock or
+	// after beginPauseOperation has detached the caller's cancellation.
+	if pending, err := o.previousMemorySavePending(ctx, sb, true); err != nil {
+		return "", err
+	} else if pending {
+		return "", api.ErrPreviousMemorySavePending
+	}
 	if request.Checkpoint {
 		retained, err := o.st.Checkpoint(ctx, sb.ID)
 		if err != nil {
@@ -1514,11 +1527,18 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	result, err := o.capture(opCtx, sb, request)
 	o.log.Info("pause capture completed", "sid", sb.ID, "capture_ms", float64(time.Since(captureStarted))/1e6, "err", err)
 	if err != nil {
-		o.rollbackPause(opCtx, sb)
+		if errors.Is(err, errCaptureOutcomePending) {
+			o.startSandboxRunEndCheck(sb.RunID)
+		} else {
+			o.rollbackPause(opCtx, sb)
+		}
 		return "", err
 	}
-	changed, err := o.st.CommitPaused(opCtx, sb.ID, sb.RunID, result.Source, result.CheckpointID)
+	changed, err := o.commitPausedCapture(opCtx, sb, result.Source, result.CheckpointID)
 	if err != nil {
+		if m, ok := o.runs.ownership(sb.RunID); ok && m.RetirementOperationID != "" {
+			o.startSandboxRunEndCheck(sb.RunID)
+		}
 		return "", fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
 	}
 	if !changed {
@@ -1570,8 +1590,14 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 	defer release()
 	runID := sb.RunID
 	if runID != "" {
-		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
+		holder, err := o.cleanupRetiredRunner(ctx, sb)
+		if err != nil {
 			return err
+		}
+		if !holder {
+			if err := o.fenceSandboxRunner(ctx, runID); err != nil {
+				return err
+			}
 		}
 		changed, err := o.st.ClearPausedRunner(ctx, sb.ID, runID)
 		if err != nil {
@@ -1580,7 +1606,9 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		if !changed {
 			return fmt.Errorf("orch: paused runner ownership changed for %s", sb.ID)
 		}
-		o.runs.forget(runID)
+		if !holder {
+			o.runs.forget(runID)
+		}
 		sb.RunID = ""
 	}
 	if port := sb.VswitchPort; port != "" {
@@ -1615,7 +1643,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		if err := o.cleanupCheckpoint(ctx, sb); err != nil {
 			return err
 		}
-		if err := removeRunDir(runDir); err != nil {
+		if err := removeRunDirPreservingMemoryHolders(runDir, removeRunDir); err != nil {
 			return fmt.Errorf("remove paused sandbox RunDir %s: %w", runDir, err)
 		}
 		changed, err := o.st.ClearPausedRunDir(ctx, sb.ID, runDir, sb.EnvdUDS, sb.CiUDS)
@@ -2729,6 +2757,17 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	var deleting, paused, acceptedStarting, interrupted, acceptedRunning, dead, deadHistory []*types.Sandbox
 	var adopted []string
 	knownRuns := make(map[string]bool)
+	retiringRuns := make(map[string]store.RunPoolOwnership)
+	ownerships, err := o.st.RunPoolOwnerships(ctx)
+	if err != nil {
+		return err
+	}
+	for _, ownership := range ownerships {
+		if ownership.RetirementOperationID != "" {
+			knownRuns[ownership.RunID] = true
+			retiringRuns[ownership.RunID] = ownership
+		}
+	}
 	if err := o.st.RangeByState(ctx, types.StateDeleting, func(sb *types.Sandbox) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
@@ -2751,7 +2790,9 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
 		}
-		dead = append(dead, sb)
+		if _, retiring := retiringRuns[sb.RunID]; !retiring {
+			dead = append(dead, sb)
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -2801,7 +2842,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	for _, sb := range deleting {
 		o.log.Info("reconcile: resume deleting sandbox finalizer", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
 		if err := o.finalizeSandboxDeleteOnce(ctx, sb.ID); err != nil {
-			if errors.Is(err, errSourceOperationBusy) {
+			if errors.Is(err, errSourceOperationBusy) || retirementIsPending(err) {
 				o.startSandboxDeleteFinalizer(sb.ID)
 				continue
 			}
@@ -2811,7 +2852,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	for _, sb := range paused {
 		o.log.Info("reconcile: verify paused ownership cleanup", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
 		if err := o.finalizePausedCleanupOnce(sb.ID); err != nil {
-			if !errors.Is(err, errSourceOperationBusy) {
+			if !errors.Is(err, errSourceOperationBusy) && !retirementIsPending(err) {
 				return fmt.Errorf("reconcile: cleanup paused sandbox %s: %w", sb.ID, err)
 			}
 			unlock := o.lifecycle.Lock(sb.ID)
@@ -2910,6 +2951,9 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	}
 	for _, sb := range deadHistory {
 		o.observeSandboxUpsert(sb)
+	}
+	for runID := range retiringRuns {
+		o.startSandboxRunEndCheck(runID)
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
 	// pool instance because their old WaitAssignment request belonged to the
@@ -3218,6 +3262,18 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 	if request.Kind == types.CaptureSandbox {
 		command, kind = "export", types.ResumeSourceSandbox
 	}
+	var permit *ctl.HostRetirementPermit
+	if request.Kind == types.CaptureSnapshot {
+		permit, err = o.prepareCheckpointRetirement(ctx, sb, id.String())
+		if err != nil {
+			return types.ResumeSource{}, err
+		}
+		if permit != nil && request.Checkpoint {
+			if _, err := o.mutateRetirement(ctx, sb.RunID, func(m *store.RunPoolOwnership) error { m.RetainCheckpoint = true; return nil }); err != nil {
+				return types.ResumeSource{}, errors.Join(err, o.abortCheckpointRetirement(ctx, sb, *permit))
+			}
+		}
+	}
 	run := func(checkpointID string) (types.ResumeSource, error) {
 		// Each attempt owns its argv and buffers. An unsupported old runtime may
 		// have emitted output before returning; it is not part of the copy report.
@@ -3229,10 +3285,17 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 			args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
 		}
 		cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+		cmd.Env, err = retirementCommandEnvironment(permit)
+		if err != nil {
+			return types.ResumeSource{}, err
+		}
 		var out, errb bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &errb
 		inheritSourceOperation(ctx, cmd)
-		if err := cmd.Run(); err != nil {
+		if err := cmd.Start(); err != nil {
+			return types.ResumeSource{}, errors.Join(errCaptureNotStarted, fmt.Errorf("orch: start %s %s: %w", command, sb.ID, err))
+		}
+		if err := cmd.Wait(); err != nil {
 			return types.ResumeSource{}, fmt.Errorf("orch: %s %s (mode %s): %w: %s", command, sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
 		}
 		return decodeCaptureSource(out.Bytes(), kind)
@@ -3242,9 +3305,15 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 	// 78 is sandbox-ctl's explicit checkpoint_unsupported result, including
 	// old running instances. I/O errors and incomplete reports never downgrade.
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 78 {
+		if permit != nil {
+			if abortErr := o.abortCheckpointRetirement(ctx, sb, *permit); abortErr != nil {
+				return types.ResumeSource{}, errors.Join(errCaptureOutcomePending, err, abortErr)
+			}
+			permit = nil
+		}
 		return run("")
 	}
-	return source, err
+	return o.recoverCaptureOutcome(ctx, sb, permit, source, err)
 }
 
 // decodeCaptureSource is shared by capture adapters regardless of whether the

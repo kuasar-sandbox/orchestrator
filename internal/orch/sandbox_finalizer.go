@@ -238,6 +238,15 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 	if sb.State != types.StateRunning && sb.State != types.StatePausing && sb.State != types.StateDeleting {
 		return fmt.Errorf("orch: terminal cleanup requires running or deleting sandbox %s", sb.ID)
 	}
+	if sb.State == types.StateDeleting {
+		if err := o.discardRetiredMemoryForDelete(ctx, sb); err != nil {
+			return err
+		}
+	} else {
+		if err := o.ensureRetiredMemoryReleased(ctx, sb.ID); err != nil {
+			return err
+		}
+	}
 	if sb.RunID != "" {
 		if err := o.fenceSandboxRunner(ctx, sb.RunID); err != nil {
 			return err
@@ -259,7 +268,11 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 		removeRunDir = os.RemoveAll
 	}
 	if sb.RunDir != "" {
-		if err := removeRunDir(sb.RunDir); err != nil {
+		remove := func(path string) error { return removeRunDirPreservingMemoryHolders(path, removeRunDir) }
+		if sb.State == types.StateDeleting {
+			remove = removeRunDir // Every holder and reader was fenced above.
+		}
+		if err := remove(sb.RunDir); err != nil {
 			return fmt.Errorf("remove sandbox RunDir %s: %w", sb.RunDir, err)
 		}
 	}
@@ -647,6 +660,15 @@ func sandboxHasLocalOwnership(sb *types.Sandbox) bool {
 // directory is removed. An already missing/inactive unit is an equivalent Stop
 // result, but ResetFailed and the final liveness readback remain mandatory.
 func (o *Orchestrator) fenceSandboxRunner(ctx context.Context, runID string) error {
+	if err := o.ensureRunnerMayFence(ctx, runID); err != nil {
+		return err
+	}
+	return o.fenceSandboxRunnerUnit(ctx, runID)
+}
+
+// Destruction callers must first own the deleting SID and its exclusive source
+// grant. Other callers use fenceSandboxRunner's pending-memory guard.
+func (o *Orchestrator) fenceSandboxRunnerUnit(ctx context.Context, runID string) error {
 	unit, err := o.resolveRunUnit(ctx, runKindSandbox, runID)
 	if err != nil {
 		return err

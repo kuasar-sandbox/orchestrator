@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import subprocess
 import tarfile
@@ -135,6 +136,86 @@ def local_metadata(database, sid):
     return result
 
 
+def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log, phase):
+    """Prove the managed path, including a save that finished before observation."""
+    with sqlite3.connect(database, timeout=5) as db:
+        row = db.execute("select state, base_dir, instance_id, run_id, resume_source_kind, resume_source_ref from sandboxes where id=?", (sid,)).fetchone()
+        owners = {run: json.loads(raw) for run, raw in db.execute("select run_id, ownership from run_pool_ownership")}
+    assert row and row[0] == phase and row[4] == "snapshot", row
+    directory = Path(row[1]) / "checkpoint"
+    locator = json.loads((directory / "current-memory.json").read_text())
+    record_path = directory / "memory" / (hashlib.sha256(locator["checkpoint_id"].encode()).hexdigest() + ".json")
+    record = json.loads(record_path.read_text())
+    producer = record["producer"]
+    assert record["committed"] and record["runtime_retired"] and not record.get("aborted") and not record.get("discarded"), record
+    assert producer["sandbox_id"] == sid and producer["instance_id"] == row[2] and producer["run_id"], producer
+    assert record["host_operation_id"] == record["checkpoint_id"] == locator["checkpoint_id"], record
+    assert (record["memory_id"], record["epoch"]) == (locator["memory_id"], locator["epoch"]), record
+    assert record["snapshot_ref"] == row[5], (record["snapshot_ref"], row[5])
+    name = row[5].removeprefix("file://").split("@", 1)[0]
+    assert row[5].startswith("file://") and name == Path(name).name, row[5]
+    with tarfile.open(directory / name, tarinfo=_CheckpointTarInfo) as carrier:
+        members = [m for m in carrier if m.isfile() and not m.name.startswith(".kuasar.")]
+        assert len(members) == 1, members
+        with zipfile.ZipFile(carrier.extractfile(members[0])) as logical:
+            descriptor = json.loads(logical.read("memory.checkpoint.json"))
+    assert descriptor["version"] == 1 and descriptor["memory_id"] == record["memory_id"] and descriptor["checkpoint_id"] == record["checkpoint_id"], descriptor
+    parent_ack = False
+    for line in Path(log).read_text().splitlines():
+        if "checkpoint parent retirement acknowledged" not in line:
+            continue
+        fields = dict(word.split("=", 1) for word in shlex.split(line) if "=" in word)
+        parent_ack |= all(fields.get(key) == str(value) for key, value in {
+            "sid": sid, "run_id": producer["run_id"], "memory_id": record["memory_id"], "epoch": record["epoch"],
+        }.items())
+    assert parent_ack, "no exact parent sampling-retirement ACK (a missing unit alone is not an ACK)"
+    old_owner = owners.get(producer["run_id"])
+    if old_owner:
+        assert old_owner.get("role") == "memory-holder" and old_owner.get("parent_retired"), old_owner
+        assert old_owner["memory_id"] == record["memory_id"] and old_owner["memory_epoch"] == record["epoch"], old_owner
+    else:
+        assert record["ram_released"], "holder ownership disappeared while RAM was retained"
+
+    # These are read-only public admin views. Retry the observation if a normal
+    # balloon/account transition crosses the two queries; never invent R from
+    # a PID, socket disappearance, or FileReady alone.
+    deadline = time.monotonic() + 10
+    while True:
+        rows = json.loads(subprocess.check_output([node_ctl, "resource", "list", "--socket", resource_socket], text=True, timeout=5)) or []
+        pressure = json.loads(subprocess.check_output([node_ctl, "resource", "pressure", "--socket", control_socket], text=True, timeout=5))
+        receipts = [json.loads(path.read_text()) for path in Path(resource_socket + ".retained").glob("*.json")]
+        exact = [item for item in receipts if item["sandbox_id"] == sid]
+        assert len(exact) == 1, "managed capture did not retain a resource receipt"
+        receipt = exact[0]
+        assert receipt["producer"] == producer and receipt["checkpoint_id"] == record["checkpoint_id"], "resource producer changed"
+        memory = receipt["memory"]
+        assert memory["memory_id"] == record["memory_id"] and memory["epoch"] == record["epoch"], "resource memory generation changed"
+        assert memory["bytes"] == receipt["source"]["reservation_memory"] > 0 and memory["source_pool"], memory
+        current = [item for item in rows if item["sandbox_id"] == sid]
+        if phase == "paused":
+            assert not current, "paused holder still owns an active B reservation"
+        else:
+            assert row[3] and row[3] != producer["run_id"] and len(current) == 1, "resume did not obtain one new run and B"
+            assert current[0]["peer_pid"] != record["holder"]["pid"] and current[0]["allocatable_memory"] > 0, current
+        latest = json.loads(record_path.read_text())
+        if receipt.get("settled"):
+            assert latest["ram_released"], "R was released before the physical RAM fact"
+        projected = sum(item["memory"]["bytes"] for item in receipts if not item.get("settled") and item["stage"] != "prepared")
+        active = sum(item["allocatable_memory"] for item in rows)
+        cache = sum(item.get("cache_allocated", 0) for item in pressure.get("pools", []))
+        if pressure["reserved_memory"] == active + projected + cache and receipt["stage"] != "prepared":
+            break
+        assert time.monotonic() < deadline, (pressure["reserved_memory"], active, projected, cache, receipt["stage"])
+        time.sleep(.05)
+    return {"sid": sid, "phase": phase, "producer": producer, "current_run_id": row[3],
+            "memory_id": record["memory_id"], "checkpoint_id": record["checkpoint_id"],
+            "runtime_retired": True, "parent_ack": True, "file_ready": latest["file_ready"],
+            "ram_released": latest["ram_released"], "resource_stage": receipt["stage"],
+            "retained_bytes": 0 if receipt.get("settled") else memory["bytes"],
+            "active_bytes": sum(item["allocatable_memory"] for item in current),
+            "node_reserved_bytes": pressure["reserved_memory"], "source_pool": memory["source_pool"]}
+
+
 def disk_state(directory):
     root = Path(directory)
     result = []
@@ -254,6 +335,10 @@ def main():
     meta = sub.add_parser("metadata")
     meta.add_argument("database")
     meta.add_argument("sid")
+    managed = sub.add_parser("managed-memory")
+    for field in ("database", "sid", "node_ctl", "control_socket", "resource_socket", "log"):
+        managed.add_argument(field)
+    managed.add_argument("phase", choices=("paused", "running"))
     disks = sub.add_parser("disks")
     disks.add_argument("directory")
     layout = sub.add_parser("layout")
@@ -276,6 +361,8 @@ def main():
         print(json.dumps(fence_refs(args.metadata, args.report, args.held, args.directory, args.identity, args.baseline), sort_keys=True))
     elif args.command == "metadata":
         print(json.dumps(local_metadata(args.database, args.sid), sort_keys=True))
+    elif args.command == "managed-memory":
+        print(json.dumps(managed_memory(args.database, args.sid, args.node_ctl, args.control_socket, args.resource_socket, args.log, args.phase), sort_keys=True))
     elif args.command == "disks":
         print(json.dumps(disk_state(args.directory), sort_keys=True))
     elif args.command == "live-root-disk":

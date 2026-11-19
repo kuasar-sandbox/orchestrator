@@ -36,10 +36,12 @@ checkpoint_hash >"$WORK/checkpoint-original.hash"
 checkpoint_disk_state "$SID" "$WORK/checkpoint-original.disks"
 checkpoint_measure before_pause "$(checkpoint_clock)" 8
 pause_checkpoint_guest snapshot 8
+checkpoint_managed_memory "$SID" paused "$CASE_OUT/checkpoint-memory-paused.json"
 checkpoint_local_metadata "$SID" "$WORK/checkpoint-first.json"
 checkpoint_disk_state "$SID" "$WORK/checkpoint-paused.disks"
 checkpoint_same_disks "$WORK/checkpoint-original.disks" "$WORK/checkpoint-paused.disks"
 resume_checkpoint_guest 8
+checkpoint_managed_memory "$SID" running "$CASE_OUT/checkpoint-memory-resumed.json"
 checkpoint_wait_released "$SID" || fail "successful memory resume did not release versions"
 checkpoint_hash >"$WORK/checkpoint-first-resume.hash"
 cmp "$WORK/checkpoint-original.hash" "$WORK/checkpoint-first-resume.hash"

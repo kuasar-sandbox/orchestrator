@@ -39,9 +39,11 @@ func HTTPClientWithTimeout(socket string, timeout time.Duration) *http.Client {
 }
 
 type RunSession struct {
-	body io.ReadCloser
-	once sync.Once
-	done chan error
+	body   io.ReadCloser
+	once   sync.Once
+	done   chan error
+	events chan RunRetirementEvent
+	stop   chan struct{}
 }
 
 func (s *RunSession) Close() error {
@@ -49,7 +51,12 @@ func (s *RunSession) Close() error {
 		return nil
 	}
 	var err error
-	s.once.Do(func() { err = s.body.Close() })
+	s.once.Do(func() {
+		if s.stop != nil {
+			close(s.stop)
+		}
+		err = s.body.Close()
+	})
 	return err
 }
 
@@ -63,17 +70,30 @@ func (s *RunSession) Done() <-chan error {
 }
 
 type RunSessionKeeper struct {
-	cancel context.CancelFunc
-	done   chan struct{}
+	cancel   context.CancelFunc
+	done     chan struct{}
+	events   chan RunRetirementEvent
+	features []string
+}
+
+func (k *RunSessionKeeper) Retirements() <-chan RunRetirementEvent {
+	if k == nil {
+		return nil
+	}
+	return k.events
 }
 
 func OpenRunSessionKeeper(ctx context.Context, socket, kind, runID string) (*RunSessionKeeper, error) {
-	first, err := OpenRunSession(ctx, socket, kind, runID)
+	return OpenRunSessionKeeperWithFeatures(ctx, socket, kind, runID, nil)
+}
+
+func OpenRunSessionKeeperWithFeatures(ctx context.Context, socket, kind, runID string, features []string) (*RunSessionKeeper, error) {
+	first, err := openRunSessionFeatures(ctx, socket, kind, runID, features)
 	if err != nil {
 		return nil, err
 	}
 	keeperCtx, cancel := context.WithCancel(ctx)
-	k := &RunSessionKeeper{cancel: cancel, done: make(chan struct{})}
+	k := &RunSessionKeeper{cancel: cancel, done: make(chan struct{}), events: make(chan RunRetirementEvent, 1), features: append([]string(nil), features...)}
 	go k.keep(keeperCtx, socket, kind, runID, first)
 	return k, nil
 }
@@ -89,12 +109,20 @@ func (k *RunSessionKeeper) Close() error {
 
 func (k *RunSessionKeeper) keep(ctx context.Context, socket, kind, runID string, session *RunSession) {
 	defer close(k.done)
-	defer session.Close()
+	defer close(k.events)
+	defer func() { _ = session.Close() }()
 	delay := 20 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case event := <-session.events:
+			select {
+			case k.events <- event:
+			case <-ctx.Done():
+				return
+			}
+			continue
 		case <-session.Done():
 		}
 		for {
@@ -103,7 +131,7 @@ func (k *RunSessionKeeper) keep(ctx context.Context, socket, kind, runID string,
 				return
 			default:
 			}
-			next, err := OpenRunSession(ctx, socket, kind, runID)
+			next, err := openRunSessionFeatures(ctx, socket, kind, runID, k.features)
 			if err == nil {
 				_ = session.Close()
 				session = next
@@ -128,7 +156,11 @@ func (k *RunSessionKeeper) keep(ctx context.Context, socket, kind, runID string,
 }
 
 func OpenRunSession(ctx context.Context, socket, kind, runID string) (*RunSession, error) {
-	body, _ := json.Marshal(RunSessionRequest{Kind: kind, RunID: runID})
+	return openRunSessionFeatures(ctx, socket, kind, runID, nil)
+}
+
+func openRunSessionFeatures(ctx context.Context, socket, kind, runID string, features []string) (*RunSession, error) {
+	body, _ := json.Marshal(RunSessionRequest{Kind: kind, RunID: runID, Features: features})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost"+PathRunSession, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -139,7 +171,8 @@ func OpenRunSession(ctx context.Context, socket, kind, runID string) (*RunSessio
 		return nil, &transportError{err: err}
 	}
 	var out RunSessionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&out); err != nil {
 		_ = resp.Body.Close()
 		return nil, &transportError{err: fmt.Errorf("configsock: decode run session: %w", err)}
 	}
@@ -151,15 +184,29 @@ func OpenRunSession(ctx context.Context, socket, kind, runID string) (*RunSessio
 		_ = resp.Body.Close()
 		return nil, errors.New("configsock: run session identity mismatch")
 	}
-	session := &RunSession{body: resp.Body, done: make(chan error, 1)}
+	session := &RunSession{body: resp.Body, done: make(chan error, 1), events: make(chan RunRetirementEvent, 1), stop: make(chan struct{})}
 	go func() {
-		_, err := io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			session.done <- &transportError{err: err}
-			return
+		defer resp.Body.Close()
+		for {
+			var event RunSessionResponse
+			if err := decoder.Decode(&event); err != nil {
+				if errors.Is(err, io.EOF) {
+					session.done <- nil
+				} else {
+					session.done <- &transportError{err: err}
+				}
+				return
+			}
+			if event.Kind != kind || event.RunID != runID || event.Retirement == nil || !event.Retirement.Valid() || event.Retirement.RunID != runID {
+				session.done <- errors.New("configsock: invalid retirement event")
+				return
+			}
+			select {
+			case session.events <- *event.Retirement:
+			case <-session.stop:
+				return
+			}
 		}
-		session.done <- nil
 	}()
 	return session, nil
 }

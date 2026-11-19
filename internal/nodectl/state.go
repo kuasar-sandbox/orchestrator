@@ -125,6 +125,9 @@ type Reservation struct {
 	StartupExpired bool     `json:"startup_expired,omitempty"`
 	ClientFeatures []string `json:"client_features,omitempty"`
 	Conn           net.Conn `json:"-"`
+	// Protected while a capture's durable retention intent may own this
+	// Budget. Ordinary cleanup cannot mistake a lost commit ACK for release.
+	RetentionPrepared bool `json:"retention_prepared,omitempty"`
 }
 
 func (r Reservation) identity() string {
@@ -162,6 +165,15 @@ type cacheDemandAge struct {
 
 type State struct {
 	mu sync.Mutex
+	// The root gate covers routed insertions and checkpoint ownership changes.
+	// Holding it across route + mutation prevents a stale Sync from recreating
+	// the same SID in its previous pool after a cross-pool handoff.
+	retentionMu     sync.Mutex
+	retentionOps    sync.Mutex // serializes durable receipt transactions, never held by ordinary RPCs
+	retentionRoot   *State
+	retained        map[string]*retainedReceipt
+	retainedBytes   map[string]uint64
+	retainedCgroups map[string]string
 	// A multi-pool State routes the existing controller's operations to ledgers.
 	// Ledgers have no server, admission worker or lifecycle owner of their own.
 	pools         map[string]*State
@@ -585,6 +597,9 @@ func cloneReservation(r *Reservation) Reservation {
 }
 
 func (s *State) deleteLocked(sid string) (*Reservation, error) {
+	if r := s.bySID[sid]; r != nil && r.RetentionPrepared {
+		return nil, fmt.Errorf("checkpoint memory capture still owns reservation")
+	}
 	return s.detachLocked(sid, true)
 }
 
@@ -599,7 +614,7 @@ func (s *State) detachLocked(sid string, released bool) (*Reservation, error) {
 	}
 	delete(s.bySID, sid)
 	s.initPressureLocked()
-	if ob, ok := s.pressure.obligations[sid]; released && ok && ob.cleanup && !ob.cleanupOwner {
+	if ob, ok := s.pressure.obligations[sid]; released && ok && ob.cleanup && !ob.cleanupOwner && s.retainedBytes[sid] == 0 {
 		ob.cleanup = false
 		if ob.retired {
 			delete(s.pressure.obligations, sid)
@@ -700,6 +715,16 @@ type ProvisionalSpec struct {
 }
 
 func (s *State) InstallProvisional(spec ProvisionalSpec) error {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	if err := root.checkRetainedOwnerLocked(spec.SandboxID, spec.PeerPID, "", spec.ReservationMemory); err != nil {
+		return err
+	}
+	return s.installProvisional(spec)
+}
+
+func (s *State) installProvisional(spec ProvisionalSpec) error {
 	if s.pools != nil && s.forSID(spec.SandboxID) == s && s.ResolvePool != nil {
 		name, err := s.ResolvePool(spec.SandboxID, spec.PeerPID, spec.CgroupPath)
 		if err != nil {
@@ -711,7 +736,7 @@ func (s *State) InstallProvisional(spec ProvisionalSpec) error {
 
 	}
 	if p := s.forSID(spec.SandboxID); p != s {
-		return p.InstallProvisional(spec)
+		return p.installProvisional(spec)
 	}
 	if s.pools != nil {
 		return fmt.Errorf("cannot recover resource pool for %s", spec.SandboxID)
@@ -777,6 +802,7 @@ func (s *State) HasCgroup(path string) bool {
 }
 
 type AdmitSpec struct {
+	RetainedAdoption      string           // controller-only handoff operation; never trusted from ordinary Admit
 	Admission             *LaunchAdmission // authenticated in-process launch; nil for inventory/tests
 	CacheCoordinated      bool
 	SandboxID             string
@@ -840,8 +866,18 @@ func (s *State) CanReplayAdmit(spec AdmitSpec) bool {
 // new precise reservation. A retry by the same lease owner is idempotent and
 // receives a fresh session token without double charging.
 func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	if err := root.checkRetainedOwnerLocked(spec.SandboxID, spec.PeerPID, spec.RetainedAdoption, spec.InitialBudget); err != nil {
+		return Reservation{}, nil, err
+	}
+	return s.admit(spec)
+}
+
+func (s *State) admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	if p := s.forSID(spec.SandboxID); p != s {
-		return p.Admit(spec)
+		return p.admit(spec)
 	}
 	if s.pools != nil {
 		return Reservation{}, nil, fmt.Errorf("resource pool identity unavailable")
@@ -927,6 +963,7 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 			r.CacheRecoveryUnknown = existing.CacheRecoveryUnknown
 		}
 		oldConn = existing.Conn
+		r.RetentionPrepared = existing.RetentionPrepared
 	}
 	if sid := s.tokenToSID[spec.Token]; sid != "" && sid != spec.SandboxID {
 		return Reservation{}, nil, fmt.Errorf("token already belongs to sandbox %q", sid)
@@ -989,6 +1026,16 @@ type SyncSpec struct {
 }
 
 func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	if err := root.checkRetainedOwnerLocked(spec.SandboxID, spec.PeerPID, "", spec.ReservationMemory); err != nil {
+		return Reservation{}, nil, err
+	}
+	return s.syncReservation(spec)
+}
+
+func (s *State) syncReservation(spec SyncSpec) (Reservation, []net.Conn, error) {
 	if s.pools != nil && s.forSID(spec.SandboxID) == s {
 		if s.ResolvePool == nil {
 			return Reservation{}, nil, fmt.Errorf("resource pool identity unavailable")
@@ -1002,7 +1049,7 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 		}
 	}
 	if p := s.forSID(spec.SandboxID); p != s {
-		return p.Sync(spec)
+		return p.syncReservation(spec)
 	}
 	if spec.SandboxID == "" || spec.Token == "" || spec.ReservationMemory == 0 || spec.ReservationMemory > spec.Capacity.MemoryBytes ||
 		spec.CacheReservation > spec.CacheMax ||
@@ -1042,6 +1089,7 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	}
 	existing := s.bySID[spec.SandboxID]
 	if existing != nil {
+		r.RetentionPrepared = existing.RetentionPrepared
 		if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
 			return Reservation{}, nil, fmt.Errorf("sandbox %q owner mismatch", spec.SandboxID)
 		}
@@ -1235,6 +1283,9 @@ func (s *State) ReconcileAndGrant(token string, current, requested uint64, urgen
 	r := s.byTokenLocked(token)
 	if r == nil || r.Provisional {
 		return GrantResult{}, false, nil
+	}
+	if r.RetentionPrepared {
+		return GrantResult{Reservation: cloneReservation(r)}, true, fmt.Errorf("checkpoint memory capture freezes the current Budget")
 	}
 	if current == 0 || current > r.Capacity.MemoryBytes {
 		return GrantResult{}, true, fmt.Errorf("current reservation %d outside (0, %d]", current, r.Capacity.MemoryBytes)
