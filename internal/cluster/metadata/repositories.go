@@ -54,9 +54,10 @@ type RouteRepository interface {
 	CompareAndPutRoute(context.Context, RouteKey, Version, SandboxRecord) (Version, error)
 	DeleteRoute(context.Context, RouteKey, Version) error
 	DeleteRouteAndOwnership(context.Context, RouteKey, Version, string, NodeSandboxRef) error
+	ApplyRouteDelete(context.Context, Registration, Version, NodeSandboxRef, *SandboxRecord) error
 	CommitIntentAndOwnership(context.Context, Version, SandboxRecord, NodeSandboxRef) (Version, error)
 	RollbackIntent(context.Context, RouteKey, Version, *SandboxRecord, bool) (Version, error)
-	ApplyRouteReport(context.Context, string, NodeSandboxRef, routesync.RouteEntry) (RouteReportResult, error)
+	ApplyRouteReport(context.Context, Registration, NodeSandboxRef, routesync.RouteEntry) (RouteReportResult, error)
 	ReadAndObserveRoute(context.Context, RouteKey) (Versioned[SandboxRecord], Invalidation, error)
 	ListRoutes(context.Context, string, Cursor, int) (Page[Versioned[SandboxRecord]], error)
 }
@@ -69,8 +70,8 @@ type BuildRepository interface {
 	AcceptBuildRegistration(context.Context, BuildKey, string, string, *types.BuildTarget) (Versioned[BuildRecord], error)
 	EnsureRegistrationOwnership(context.Context, BuildKey, string, string) error
 	RejectRegistrationIntent(context.Context, BuildKey, string, string) error
-	ApplyBuildReport(context.Context, string, NodeBuildRef, routesync.BuildEvent) error
-	DeleteBuildProjection(context.Context, string, NodeBuildRef) error
+	ApplyBuildReport(context.Context, Registration, NodeBuildRef, routesync.BuildEvent) error
+	DeleteBuildProjection(context.Context, Registration, NodeBuildRef) error
 	ListBuilds(context.Context, string, Cursor, int) (Page[Versioned[BuildRecord]], error)
 	ListBuildsByTemplate(context.Context, string, string, Cursor, int) (Page[Versioned[BuildRecord]], error)
 }

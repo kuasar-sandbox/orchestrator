@@ -253,23 +253,25 @@ func listTyped[T any](ctx context.Context, s *Store, scope fdb.Key, cursor metad
 		if last != nil {
 			begin = fdb.FirstGreaterThan(last)
 		}
-		rows, err := tr.GetRange(fdb.SelectorRange{Begin: begin, End: fdb.FirstGreaterOrEqual(bounds.End)}, fdb.RangeOptions{Limit: limit + 1}).GetSliceWithError()
-		if err != nil {
-			return err
-		}
+		rows := tr.GetRange(fdb.SelectorRange{Begin: begin, End: fdb.FirstGreaterOrEqual(bounds.End)}, fdb.RangeOptions{Limit: limit + 1, Mode: fdb.StreamingModeSmall}).Iterator()
 		used := 0
-		for i, row := range rows {
-			if i == limit {
-				out.Next = encodeCursor(scope, rows[i-1].Key)
+		var previous fdb.Key
+		for rows.Advance() {
+			row, err := rows.Get()
+			if err != nil {
+				return err
+			}
+			if _, err = recordStamp(row.Value); err != nil {
+				return err
+			}
+			size := binary.BigEndian.Uint64(row.Value[11:19])
+			if len(out.Items) == limit || (len(out.Items) > 0 && uint64(used)+size > maxPageBytes) {
+				out.Next = encodeCursor(scope, previous)
 				break
 			}
 			r, err := decodeRecord(tr, row.Key, row.Value)
 			if err != nil {
 				return err
-			}
-			if used+len(r.payload) > maxPageBytes && len(out.Items) > 0 {
-				out.Next = encodeCursor(scope, rows[i-1].Key)
-				break
 			}
 			v, err := typed[T](r)
 			if err != nil {
@@ -277,6 +279,7 @@ func listTyped[T any](ctx context.Context, s *Store, scope fdb.Key, cursor metad
 			}
 			out.Items = append(out.Items, v)
 			used += len(r.payload)
+			previous = row.Key
 		}
 		return nil
 	})
