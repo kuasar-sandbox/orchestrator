@@ -254,6 +254,16 @@ func (s *State) checkRetainedOwnerLocked(sid string, pid int, adoption string, b
 	return fmt.Errorf("sandbox %q has a retained account; explicit owner handoff required", sid)
 }
 
+// The authenticated lease/process identity owns a prepared B, not its current
+// connection token. StateSync can rotate that token while retaining the same
+// producer and frozen budget. Server/inventory boundaries verify the lease inode
+// and process start time; these fields fence the in-memory reservation transition.
+func sameCaptureReservation(active *Reservation, capture *retainedCapture) bool {
+	return active != nil && active.SandboxID == capture.Source.SandboxID &&
+		active.PeerPID == capture.Source.PeerPID && active.CgroupPath == capture.Source.CgroupPath &&
+		active.LeasePath == capture.Source.LeasePath && active.ReservationMemory == capture.Memory.Bytes
+}
+
 // prepareRetained protects only this execution's B. Earlier entries remain
 // independent R obligations, even if this runtime restored another graph.
 func (s *State) prepareRetained(r *retainedAccount, capture resource.CaptureRetention) error {
@@ -279,7 +289,7 @@ func (s *State) prepareRetained(r *retainedAccount, capture resource.CaptureRete
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	active := p.bySID[r.SandboxID]
-	if active == nil || active.PeerPID != e.Source.PeerPID || active.Token != e.Source.Token || active.ReservationMemory != e.Memory.Bytes {
+	if !sameCaptureReservation(active, e) || active.Token != e.Source.Token {
 		return fmt.Errorf("capture reservation owner or Budget changed")
 	}
 	if root.retained == nil {
@@ -310,7 +320,7 @@ func (s *State) commitRetained(r *retainedAccount, capture resource.CaptureReten
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	active := p.bySID[r.SandboxID]
-	if active == nil || active.PeerPID != e.Source.PeerPID || active.Token != e.Source.Token || active.ReservationMemory != e.Memory.Bytes {
+	if !sameCaptureReservation(active, e) || !active.RetentionPrepared {
 		return nil, fmt.Errorf("prepared reservation changed")
 	}
 	amount, err := checkedAggregateAdd(p.retainedBytes[r.SandboxID], e.Memory.Bytes, "retained memory")
@@ -351,7 +361,7 @@ func (s *State) abortRetained(next *retainedAccount, capture resource.CaptureRet
 		return fmt.Errorf("retained source pool disappeared")
 	}
 	p.mu.Lock()
-	if active := p.bySID[r.SandboxID]; active != nil && active.Token == e.Source.Token {
+	if active := p.bySID[r.SandboxID]; sameCaptureReservation(active, e) && active.RetentionPrepared {
 		active.RetentionPrepared = false
 	}
 	p.mu.Unlock()
@@ -427,7 +437,7 @@ func (s *State) releaseRetained(next *retainedAccount, capture resource.CaptureR
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e.Stage == retentionPrepared {
-		if active := p.bySID[r.SandboxID]; active != nil && active.PeerPID == e.Source.PeerPID && active.Token == e.Source.Token {
+		if active := p.bySID[r.SandboxID]; sameCaptureReservation(active, e) && active.RetentionPrepared {
 			if _, err := p.detachLocked(r.SandboxID, true); err != nil {
 				return err
 			}
