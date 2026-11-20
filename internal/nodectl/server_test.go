@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/unixcred"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 // startTestServer spins up a controller daemon backed by a tmpdir UDS.
@@ -371,6 +375,234 @@ func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing
 	}
 	if got := reservationForTest(t, state, "queued"); got.Conn != nil {
 		t.Fatal("queued Admit EOF retained a closed connection as liveness evidence")
+	}
+}
+
+// A queued Admit may outlive the client's transport deadline. Exercise the
+// complete saved-source reconnect path with Unix sockets, driving queue work
+// explicitly so no 30-second sleep or scheduler race chooses the old ACK.
+func TestQueuedSavedAdmitReconnectPreservesReservation(t *testing.T) {
+	dir := shortTestDir(t)
+	const (
+		sid          = "queued-saved"
+		runID        = "sr-queued-saved"
+		cacheRunID   = "00112233445566778899aabbccddeeff"
+		budget       = uint64(640 << 20)
+		initialCache = uint64(4 << 20)
+		maxCache     = uint64(64 << 20)
+	)
+	state := NewState(1<<30, 2000, 0, 0, Watermarks{
+		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: .4,
+	})
+	state.CachePoolCapacity = 128 << 20
+	installReservationForTest(t, state, Reservation{
+		Token: "donor-token", SandboxID: "donor",
+		Capacity:              Resources{MemoryBytes: 1 << 30, CPUMilli: 1000},
+		ConfiguredAllocatable: Resources{MemoryBytes: 64 << 20, CPUMilli: 1000},
+		ReservationMemory:     600 << 20, Stage: StageSettled,
+	})
+	admission := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: 180 * time.Second, QueueMaxDepth: 4,
+	})
+	var version atomic.Uint64
+	version.Store(1)
+	admission.LookupLaunch = func(gotSID string, peerPID int) (LaunchAdmission, error) {
+		if gotSID != sid || peerPID != os.Getpid() {
+			return LaunchAdmission{}, fmt.Errorf("unexpected launch identity: %s pid=%d", gotSID, peerPID)
+		}
+		return LaunchAdmission{
+			Identity:  fmt.Sprintf("%s:%d", runID, version.Load()),
+			Operation: OperationResume, SavedSource: true, Accepted: true,
+		}, nil
+	}
+	socket := filepath.Join(dir, "controller.sock")
+	cgroupRoot := filepath.Join(dir, "cgroups")
+	srv := &Server{
+		State: state, Admission: admission, Allocator: NewAllocator(AllocatorPolicy{}), Logf: t.Logf,
+		Inventory: &Inventory{ControllerSocket: socket, CgroupScanPaths: []string{cgroupRoot}},
+	}
+	admission.SetWiring(state, nil, srv.BuildAdmitOKFromQueue)
+	// The worker is deliberately not started: each processQueue below names
+	// an ordering that can occur when the client deadline precedes QueueTTL.
+	t.Cleanup(admission.drainQueueOnStop)
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	waitDone := func(done <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("connection handler did not observe EOF")
+		}
+	}
+	connect := func() (net.Conn, net.Conn, <-chan struct{}) {
+		t.Helper()
+		client, err := net.DialTimeout("unix", socket, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := listener.Accept()
+		if err != nil {
+			_ = client.Close()
+			t.Fatal(err)
+		}
+		peerPID, err := unixcred.PeerPID(server.(*net.UnixConn))
+		if err != nil {
+			_ = client.Close()
+			_ = server.Close()
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			srv.serveConn(context.Background(), server, peerPID)
+			close(done)
+		}()
+		t.Cleanup(func() {
+			_ = client.Close()
+			waitDone(done)
+		})
+		return client, server, done
+	}
+	waitQueued := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for admission.QueueDepth() != want && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := admission.QueueDepth(); got != want {
+			t.Fatalf("queue depth=%d, want %d", got, want)
+		}
+	}
+	write := func(conn net.Conn, message *Message) {
+		t.Helper()
+		if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteMessage(conn, message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(conn net.Conn) *Message {
+		t.Helper()
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		message, err := ReadMessage(conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return message
+	}
+	expire := func(conn net.Conn, done <-chan struct{}) {
+		t.Helper()
+		if err := conn.SetReadDeadline(time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		_, err := ReadMessage(conn)
+		if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+			t.Fatalf("queued transport expiry=%v, want timeout without an Admit response", err)
+		}
+		_ = conn.Close()
+		waitDone(done)
+	}
+	request := &Message{
+		Type: TypeAdmit, SandboxID: sid, CgroupPath: filepath.Join(cgroupRoot, sid),
+		CapacityMemoryBytes: 1 << 30, CapacityCPU: 1,
+		FloorMemoryBytes: 64 << 20, FloorCPU: 1, StartupBudgetMemory: 256 << 20,
+		AllocatableAtSnapshot: budget, CacheMaximum: maxCache, CacheInitial: initialCache,
+		ClientFeatures: []string{
+			FeatureStateSyncV1, FeatureCacheBudgetV1, resource.CacheMaximumFeature(maxCache),
+			resource.FeatureCacheReclaimV1, resource.CacheReclaimRunFeature(cacheRunID),
+		},
+		CacheReclaim: &resource.CacheReclaimState{RunID: cacheRunID, Current: initialCache},
+	}
+
+	first, firstServer, firstDone := connect()
+	write(first, request)
+	waitQueued(1)
+	expire(first, firstDone)
+	// EOF leaves this queued launch waiting; it has no reservation to release.
+	waitQueued(1)
+	second, secondServer, secondDone := connect()
+	write(second, request)
+	waitQueued(2)
+	if _, found, err := state.Release("donor-token"); err != nil || !found {
+		t.Fatalf("release donor: found=%v err=%v", found, err)
+	}
+	admission.processQueue()
+	waitQueued(1)
+	old := reservationForTest(t, state, sid)
+	if old.Conn != nil || old.Stage != StageAdmitted {
+		t.Fatalf("lost queued ACK did not retain a disconnected admitted reservation: %+v", old)
+	}
+	checkCharge := func(startup uint64) {
+		t.Helper()
+		got := state.ResourceSnapshot()
+		if got.ReservationCount != 1 || got.Reserved.MemoryBytes != budget ||
+			got.Reserved.CPUMilli != 1000 || got.CacheAllocated != initialCache ||
+			got.StartupInFlight != startup || got.ProvisionalCount != 0 || got.UnknownCount != 0 {
+			t.Fatalf("reconnect changed the exact resource charge: %+v", got)
+		}
+	}
+	checkCharge(budget)
+	// The second queued request cannot reserve the same budget twice. Its
+	// next connection must take the synchronous ACK-lost replay path.
+	expire(second, secondDone)
+	third, thirdServer, _ := connect()
+	write(third, request)
+	reply := read(third)
+	if reply.Type != TypeAdmitResponse || reply.Status != StatusAdmitted ||
+		reply.Token == "" || reply.Token == old.Token || reply.GrantedInitialAlloc != budget ||
+		reply.GrantedInitialCache != initialCache {
+		t.Fatalf("saved-source replay=%+v", reply)
+	}
+	checkCharge(budget)
+	if got := reservationForTest(t, state, sid); got.Conn != thirdServer || !got.CacheCoordinated {
+		t.Fatalf("replay lost the live connection or cache owner: %+v", got)
+	}
+	state.mu.Lock()
+	exclusive := state.pressure.exclusive
+	state.mu.Unlock()
+	if exclusive != sid {
+		t.Fatalf("replay lost the saved-source startup lane: %q", exclusive)
+	}
+	// Late EOF callbacks and the still-queued old attempt must not clear the
+	// live successor's connection, token or accounting.
+	srv.handleQueuedConnDrop(sid, firstServer)
+	srv.handleQueuedConnDrop(sid, secondServer)
+	admission.processQueue()
+	waitQueued(1)
+	write(third, &Message{Type: TypeSettled, Token: reply.Token})
+	if settled := read(third); settled.Type != TypeAck {
+		t.Fatalf("live successor could not settle: %+v", settled)
+	}
+	checkCharge(0)
+	// CommitPreparedRunning advances PressureVersion for this same RunID.
+	// Rechecking that identity retires its stale queue entry and demand.
+	version.Add(1)
+	admission.processQueue()
+	waitQueued(0)
+	if got := reservationForTest(t, state, sid); got.Conn != thirdServer || got.Token != reply.Token {
+		t.Fatalf("retiring the old queue entry changed the live successor: %+v", got)
+	}
+	if demands := state.PressureSnapshot().Demands; len(demands) != 0 {
+		t.Fatalf("retired queued launch retained executable demand: %+v", demands)
+	}
+	write(third, &Message{Type: TypeHeartbeat, Token: reply.Token})
+	if heartbeat := read(third); heartbeat.Type != TypeAck {
+		t.Fatalf("old queue cleanup closed the live successor: %+v", heartbeat)
+	}
+	checkCharge(0)
+	write(third, &Message{Type: TypeRelease, Token: reply.Token, Reason: "test-complete"})
+	if released := read(third); released.Type != TypeAck {
+		t.Fatalf("release replayed reservation: %+v", released)
+	}
+	if got := state.ResourceSnapshot(); got.ReservationCount != 0 || got.Reserved.MemoryBytes != 0 ||
+		got.Reserved.CPUMilli != 0 || got.CacheAllocated != 0 || got.StartupInFlight != 0 {
+		t.Fatalf("replayed lifecycle did not release its exact charge: %+v", got)
 	}
 }
 

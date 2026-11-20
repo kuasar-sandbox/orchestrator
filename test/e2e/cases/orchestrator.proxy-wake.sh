@@ -63,6 +63,11 @@ path = Path(sys.argv[1]); text = path.read_text()
 # automatic Pause before the background-recovery assertion.
 assert text.count("  timeout_sec: 120\n") == 1
 text = text.replace("  timeout_sec: 120\n", "  timeout_sec: 600\n", 1)
+# Saved-source admission includes pressure detection, capture and real release.
+# Give this phase the existing 180s policy-observation budget; a 30s queue TTL
+# can reject a healthy capture before that observation can assess recovery.
+assert text.count("queue_ttl: 30s") == 1
+text = text.replace("queue_ttl: 30s", "queue_ttl: 180s", 1)
 # P=1GiB fits either full-capacity Snapshot, while both held workloads plus
 # their real headroom cannot run together. No workload size enters node policy.
 text = text.replace("physical_memory: auto", "physical_memory: 1792MiB", 1)
