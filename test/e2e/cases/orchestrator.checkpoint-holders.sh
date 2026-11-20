@@ -304,6 +304,12 @@ ledger 4 0 d-paused
 stop_orchestrator
 start_orchestrator "$WORK/orch-four-holders.log"
 ledger 4 0 four-recovered
+# Four independently changed 512 MiB captures can exceed the original 1 GiB
+# fault volume. End the storage fault with room for every complete payload;
+# only then restore each holder's original per-file limit.
+[ "$(findmnt -rn -M "$CHECKPOINT_ROOT" -o ID)" = "$MOUNT_ID" ] || fail 'mount identity changed before fault release'
+mount -o remount,size=3g "$CHECKPOINT_ROOT"
+[ "$(findmnt -rn -M "$CHECKPOINT_ROOT" -o ID)" = "$MOUNT_ID" ] || fail 'fault release replaced the mount'
 rm -f -- "$FILLER"
 release_payload_failures
 for _ in $(seq 1 300); do
