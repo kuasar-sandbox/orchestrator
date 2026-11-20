@@ -13,12 +13,12 @@ func TestDiffCOWResourceResolution(t *testing.T) {
 		name, nodeCache, nodeDirty, request, cache, dirty string
 		reject                                            bool
 	}{
-		{"defaults", "", "", `{}`, "32MiB", "16777216", false},
+		{"defaults", "", "", `{}`, "32MiB", "0", false},
 		{"partial dirty", "128MiB", "", `{"diff_cow":{"max_dirty_size":"64MiB"}}`, "128MiB", "64MiB", false},
-		{"final cache", "128MiB", "", `{"diff_cow":{"cache_size":"64MiB"}}`, "64MiB", "33554432", false},
+		{"final cache", "128MiB", "", `{"diff_cow":{"cache_size":"64MiB"}}`, "64MiB", "0", false},
 		{"inherited explicit dirty", "128MiB", "64MiB", `{"diff_cow":{"cache_size":"32MiB"}}`, "", "", true},
 		{"dirty without node cache", "", "", `{"diff_cow":{"max_dirty_size":"64MiB"}}`, "", "", true},
-		{"round down", "", "", `{"diff_cow":{"cache_size":"12KiB"}}`, "12KiB", "4096", false},
+		{"small cache without dirty ceiling", "", "", `{"diff_cow":{"cache_size":"12KiB"}}`, "12KiB", "0", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node := NodeResourcePolicy{DiffCOW: &DiffCOWPatch{}}

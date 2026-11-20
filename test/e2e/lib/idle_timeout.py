@@ -9,6 +9,7 @@ import sqlite3
 import shlex
 import statistics
 import subprocess
+import sys
 import threading
 import time
 
@@ -291,6 +292,16 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
             target.unlink(missing_ok=True); release.touch(); after_capture.unlink(missing_ok=True)
     finally:
         stop.set();thread.join(timeout=2)
+        if not business_passed:
+            try:
+                from lifecycle_diagnostics import emit_failure_evidence
+                emit_failure_evidence(db_path, work/'orch.log', [sid],
+                                      Path(env['CASE_OUT'])/'pause-exit-facts.jsonl')
+            except Exception as error:
+                try:
+                    print('lifecycle diagnostics unavailable: ' + type(error).__name__, file=sys.stderr)
+                except Exception:
+                    pass
         result = dict(business_passed=business_passed, capture_timing_includes_test_barriers=True, idle_timeout=timeout, samples=samples, resources=resources, transitions=transitions, verified_requests=counter)
         # Product logs expose the timing components without adding test hooks.
         log_path = work/'orch.log'

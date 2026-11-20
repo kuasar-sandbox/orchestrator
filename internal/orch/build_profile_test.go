@@ -222,7 +222,7 @@ func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing
 	if unresolved.Capacity.CPU != 0 || unresolved.Capacity.Memory != "" || unresolved.Startup != nil {
 		t.Fatalf("source target resources resolved against node defaults: %+v", unresolved)
 	}
-	if execution.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "128MiB", MaxDirtySize: "67108864"}) ||
+	if execution.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "128MiB", MaxDirtySize: "0"}) ||
 		unresolved.DiffCOW != (rtconfig.DiffCOWConfig{}) {
 		t.Fatalf("execution/target DiffCOW = %+v/%+v", execution.DiffCOW, unresolved.DiffCOW)
 	}
@@ -234,7 +234,7 @@ func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing
 		t.Fatalf("resolveBuildTargetResources with source capacity: %v", err)
 	}
 	if resolved.Capacity.CPU != 4 || resolved.Capacity.Memory != "8GiB" ||
-		resolved.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}) ||
+		resolved.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "0"}) ||
 		resolved.Allocatable.CPU != 4 || resolved.Allocatable.Memory != "8GiB" ||
 		resolved.Startup == nil || resolved.Startup.Memory != "4GiB" {
 		t.Fatalf("resolved source target resources = %+v", resolved)

@@ -72,7 +72,7 @@ sandbox:
 ```
 
 - `capacity.memory` is Capacity.
-- `diff_cow` budgets one host cache across the sandbox's writable disks. An omitted cache size defaults to 32 MiB. An omitted dirty limit follows half the final cache size, rounded down to 4 KiB with a 4 KiB minimum. The example resolves to 64 MiB of cache and a 32 MiB dirty limit. Explicit limits must be positive 4 KiB multiples and dirty must fit in cache.
+- `diff_cow` budgets one host cache across the sandbox's writable disks and carries aggregate and uniform per-disk QoS limits. An omitted cache size defaults to 32 MiB. All ten QoS limits default to no extra ceiling, so this example has 64 MiB of shared cache with no separate dirty limit. See [Diffstore QoS](#diff-cow-qos) for units, inheritance and per-disk accounting.
 - `allocatable.memory` is settled headroom, default `256MiB`. If an inherited default exceeds final Capacity, the resolver clamps it to Capacity. Explicit out-of-range request values are rejected.
 - `startup.memory` is cold-start headroom, defaulting to final Capacity in both static and dynamic modes. It is independent of settled headroom and need not be greater or smaller.
 - `overhead.memory` is node-owned host VMM overhead. Sandbox-ctl occupies a separate control cgroup and does not consume that allowance. `watermark_high.ratio` also belongs to node policy. Neither may be set by requests/templates.
@@ -157,9 +157,85 @@ These fields belong to Conductor configuration. Shared loading, path and environ
 | `sandbox.resources.overhead.memory` | `32MiB` | Node-owned host VMM overhead; sandbox-ctl is outside VMM cgroup. Requests/templates cannot override |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | Node-owned memory.high pressure ratio in `(0,1)`; requests/templates cannot override |
 | `sandbox.resources.diff_cow.cache_size` | `32MiB` | Host cache shared by the sandbox's writable disks |
-| `sandbox.resources.diff_cow.max_dirty_size` | Half the final cache size, rounded down to 4 KiB, minimum 4 KiB | An explicit limit must fit within the cache |
+| `sandbox.resources.diff_cow.cache_idle_after` | `10s` | Positive inactivity observation interval for clean-page reclamation |
+| `sandbox.resources.diff_cow.max_dirty_size` | `0` (no extra ceiling) | Aggregate dirty bytes; a positive value must fit within `cache_size` |
+| `sandbox.resources.diff_cow.max_dirty_size_per_disk` | `0` | Uniform dirty-byte ceiling, accounted independently for each writable disk |
+| `sandbox.resources.diff_cow.read_bandwidth` / `.write_bandwidth` | `0` | Aggregate ordinary read/write request bytes per second |
+| `sandbox.resources.diff_cow.read_bandwidth_per_disk` / `.write_bandwidth_per_disk` | `0` | Uniform per-logical-disk read/write bytes per second |
+| `sandbox.resources.diff_cow.read_iops` / `.write_iops` | `0` | Aggregate ordinary read/write requests per second; nonnegative integers |
+| `sandbox.resources.diff_cow.read_iops_per_disk` / `.write_iops_per_disk` | `0` | Uniform per-logical-disk read/write requests per second; nonnegative integers |
 | `sandbox.resources.diff_cow.discard` | `auto` | Writable ext4 cold-mount policy: `auto` mounts with `discard`; `manual` uses `nodiscard` while retaining explicit trim support |
 | `resource_listen` | Absent/not embedded | Sole controller endpoint source: socket resolves to absolute bind Listen and canonical SocketIdentity for ownership/inventory/lease/Sandbox YAML. Clients reach the same socket inode through its canonical path. enabled and tuning are in node-resource [resource_listen](#resource_listen). Omitted/disabled means static cgroups |
+
+<a id="diff-cow-qos"></a>
+
+### Diffstore QoS
+
+The aggregate limits are shared by all logical disks in one sandbox. Each
+`*_per_disk` rule is configured once and applies independently to every logical
+disk, including disks bound to a slot later. Both levels apply to each request;
+adding a disk does not enlarge the aggregate allowance. A rootfs lower and upper
+share one logical-disk rate allowance. There are no disk-name overrides or
+automatically reserved per-disk shares.
+
+All ten limits use `0` for no extra ceiling. An omitted leaf inherits an earlier
+resource-policy layer; an explicit zero clears only that leaf's inherited
+ceiling. A zero aggregate limit does not disable a finite per-disk limit, or vice
+versa. Raw node policy and request metadata preserve omitted-versus-zero
+presence. Node configuration files retain their existing overlay rule where
+`null` in a later file deletes a leaf; request JSON does not accept `null`.
+
+Bandwidth values use sandboxer's binary size units, with per-second implied:
+`50MiB` and `50M` both mean 52,428,800 B/s; a suffix-free integer means B/s.
+Use size strings in resource JSON, including `"0"`; IOPS are JSON integers.
+Bandwidth must resolve to whole bytes and has no page-alignment requirement.
+`cache_size` must be a positive 4 KiB multiple. Positive dirty limits must also
+be 4 KiB multiples. The aggregate dirty limit must fit in `cache_size`; a
+per-disk dirty limit may exceed either cache or aggregate dirty capacity, in
+which case the tighter effective constraint still applies.
+
+Ordinary reads and writes consume their complete logical request size and one
+operation on admission, including cache hits. Internal splitting, retries and
+asynchronous writeback do not consume the rate allowance again. FLUSH and
+DISCARD retain their existing behavior. Admission permits one complete request
+as a short burst and charges its full cost to subsequent admission; idle time
+does not accumulate extra bursts. These are sustained rates, not strict maxima
+for every possible one-second window.
+
+Dirty occupancy includes reserved pages and pages whose writeback has not yet
+completed. The aggregate dirty limit and each disk's dirty limit use the same
+shared cache; they do not allocate additional cache or reserve separate disk
+partitions. With no independent dirty limit, current effective cache capacity
+still bounds occupancy, including the current grant in elastic-cache mode.
+Existing cache-budget admission and reclamation remain in control of that
+capacity.
+
+Configure these policies before creating or restoring a sandbox. Orchestrator
+resolves node policy and request overrides into Host YAML; sandboxer applies the
+target policy to the runtime and subsequently bound slots. QoS does not enter
+portable disk identities or checkpoint data. This configuration path does not
+reload the policy of an already running sandbox.
+
+**Upgrade:** the former omitted `max_dirty_size` default was half the final cache
+size. It is now zero, allowing more of the existing cache to be dirty and
+potentially leaving less clean or immediately reclaimable cache. Explicit old
+limits remain in effect. The execution-side sandboxer must support the new
+schema and zero semantics before using the new default: resolved Host YAML
+contains `max_dirty_size: "0"` even when no new rate fields were configured.
+Older strict binaries reject new fields and zero dirty limits. Before a
+rollback, remove new fields and replace an explicit zero aggregate dirty limit
+with a positive limit accepted by the older binary.
+
+Deploy matching Conductor and `node-ctl` runner/builder binaries, and replace
+prestarted units still running an older binary. BuildTask schema v8 rejects
+older builders at both bootstrap and prepare completion: their older resource
+decoder could otherwise discard the new limits before starting an upgraded
+sandboxer. Mixed-version builders fail the task request; they do not run with
+partially applied QoS. A sandboxer-only upgrade does not update those builders.
+Before rolling back Conductor, finish or drain in-flight Builds, or retain a
+compatible newer Conductor to recover them. Durable Build preparation records
+also contain the new resource fields; removing node configuration fields does
+not make those records readable by an older version.
 
 <a id="request-resources"></a>
 
@@ -172,7 +248,21 @@ Resource and traffic merge by leaf. Public resource JSON permits only:
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
   "startup": {"memory": "1GiB"},
-  "diff_cow": {"cache_size": "64MiB", "max_dirty_size": "16MiB", "discard": "auto"}
+  "diff_cow": {
+    "discard": "auto",
+    "cache_size": "32MiB",
+    "cache_idle_after": "10s",
+    "max_dirty_size": "32MiB",
+    "read_bandwidth": "50MiB",
+    "write_bandwidth": "20MiB",
+    "read_iops": 0,
+    "write_iops": 0,
+    "max_dirty_size_per_disk": "32MiB",
+    "read_bandwidth_per_disk": "50MiB",
+    "write_bandwidth_per_disk": "20MiB",
+    "read_iops_per_disk": 0,
+    "write_iops_per_disk": 0
+  }
 }
 ```
 
@@ -191,7 +281,7 @@ node resource policy
 
 Each resource leaf overlays independently. For example, group capacity.memory and Create allocatable.memory both survive. Every layer is validated before merging. Group/reserve, standalone/cluster and Build registration share the helper. Other namespaces follow the rules in [Sandbox configuration propagation](sandbox-lifecycle.md#request-configuration).
 
-`X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` gives the sandbox a 32 MiB dirty limit when the node has omitted it. Use `"max_dirty_size":"16MiB"` inside `diff_cow` to set it explicitly. Sizes must be positive multiples of 4 KiB. Raw policy, request metadata and migration tokens retain only configured leaves. Restore resolves cache limits on the target node independently of portable artifact capacity. Build execution inherits the node policy, and the target Sandbox also applies the target request.
+`X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` changes shared cache capacity without adding a dirty ceiling when the node omitted it. Use `"max_dirty_size":"16MiB"` to choose a finite aggregate ceiling, or `"max_dirty_size":"0"` to clear an inherited one. Other aggregate and per-disk limits overlay independently. Raw policy, request metadata and migration tokens retain only configured leaves. Restore resolves the target host's diffstore policy independently of portable artifact capacity. Build execution inherits the node policy, and the target Sandbox also applies the target request.
 
 To defer filesystem discard on a new cold start, set
 `sandbox.resources.diff_cow.discard: manual` on the node, or send

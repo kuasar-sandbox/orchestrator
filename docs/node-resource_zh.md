@@ -178,9 +178,9 @@ sandbox YAML,runner 仍通过继承 cgroup FD 注入该 host capability。
 
 ### request/template 所有权
 
-同一 Sandbox 的可写盘共享一份宿主机 DiffCOW 缓存。`cache_size` 缺省为 32 MiB，省略的 `max_dirty_size` 按最终缓存的一半向下对齐到 4 KiB，至少为 4 KiB。上例得到 64 MiB 缓存与 32 MiB 脏数据上限。显式大小须为 4 KiB 的正整数倍，脏数据上限不得超过缓存。
+同一 Sandbox 的可写盘共享一份宿主机 DiffCOW 缓存。`cache_size` 缺省为 32 MiB；十项 QoS 限制最终缺省均不设置额外上限。上例得到 64 MiB 共享缓存，没有独立脏数据上限。整体和统一单盘限制的单位、继承及计量规则见 [Diffstore QoS](#diff-cow-qos)。
 
-tenant resource patch 支持 `capacity`、`allocatable`、`startup`，以及 `diff_cow` 的缓存限制与冷启动 discard 策略。`control`、
+tenant resource patch 支持 `capacity`、`allocatable`、`startup`，以及 `diff_cow` 的缓存、整体/统一单盘 QoS 和冷启动 discard 策略。`control`、
 `overhead`、`watermark_high`、sensor 和 `deflate_on_oom` 均由 node resolver 管理。
 parser 对未知字段和这些越权字段直接报错,不会静默忽略。
 
@@ -198,9 +198,63 @@ parser 对未知字段和这些越权字段直接报错,不会静默忽略。
 | `sandbox.resources.overhead.memory` | `32MiB` | node-owned host VMM overhead;sandbox-ctl 不在 VMM cgroup 内;request/template 不可覆盖 |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | node-owned sandbox `memory.high` pressure ratio,必须在 `(0,1)`;request/template 不可覆盖 |
 | `sandbox.resources.diff_cow.cache_size` | `32MiB` | 同一 Sandbox 的可写磁盘共享的宿主机缓存 |
-| `sandbox.resources.diff_cow.max_dirty_size` | 最终缓存的一半，向下对齐到 4 KiB，至少 4 KiB | 显式脏数据上限不得超过缓存 |
+| `sandbox.resources.diff_cow.cache_idle_after` | `10s` | clean 页回收所用的正数空闲观察间隔 |
+| `sandbox.resources.diff_cow.max_dirty_size` | `0`（无额外上限） | 整体脏数据字节上限；正值不得超过 `cache_size` |
+| `sandbox.resources.diff_cow.max_dirty_size_per_disk` | `0` | 统一单盘脏数据字节上限，各可写磁盘独立计量 |
+| `sandbox.resources.diff_cow.read_bandwidth` / `.write_bandwidth` | `0` | 整体普通读写请求字节/秒 |
+| `sandbox.resources.diff_cow.read_bandwidth_per_disk` / `.write_bandwidth_per_disk` | `0` | 统一单盘普通读写请求字节/秒 |
+| `sandbox.resources.diff_cow.read_iops` / `.write_iops` | `0` | 整体普通读写请求次数/秒，非负整数 |
+| `sandbox.resources.diff_cow.read_iops_per_disk` / `.write_iops_per_disk` | `0` | 统一单盘普通读写请求次数/秒，非负整数 |
 | `sandbox.resources.diff_cow.discard` | `auto` | 可写 ext4 的冷启动挂载策略：`auto` 使用 `discard` 挂载；`manual` 使用 `nodiscard`，同时保留显式 trim 能力 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md [resource_listen](#resource_listen)。省略或 disabled = 静态 cgroup |
+
+<a id="diff-cow-qos"></a>
+
+### Diffstore QoS
+
+整体额度由同一沙箱内所有逻辑磁盘共享。每项 `*_per_disk` 规则只配置一次，分别作用于
+各个逻辑盘，包括后续绑定到 slot 的磁盘。两层约束同时生效；增加磁盘不会增加整体额度。
+rootfs 的 lower、upper 共用一个逻辑盘入口额度。不提供按磁盘名覆盖，也不自动为各盘
+预留份额。
+
+十项限制均以 `0` 表示不施加额外上限。配置省略叶子时继承前层，显式零只清除对应叶子的
+继承上限；整体不限不会取消单盘限制，单盘不限也不会取消整体限制。原始节点策略和请求
+metadata 保留“省略/显式零”的区别。节点多文件配置继续沿用既有规则：后层 `null` 删除
+叶子；请求 JSON 不接受 `null`。
+
+带宽沿用 sandboxer 的二进制容量单位，字段隐含每秒：`50MiB` 与 `50M` 都表示
+52,428,800 B/s，无后缀整数表示 B/s。资源 JSON 的容量和带宽使用字符串，包括 `"0"`；
+IOPS 使用非负整数。带宽须能精确表示完整字节数，不要求按页对齐。`cache_size` 须为
+4 KiB 的正整数倍，脏数据上限的正值也须为 4 KiB 整数倍。整体正值不得超过
+`cache_size`；单盘脏数据上限可以高于缓存或整体上限，运行时仍受更紧的约束限制。
+
+普通读写成功准入时按完整逻辑请求计一次 IOPS 和相应字节数，缓存命中也计入。
+内部切分、重试和异步回写不重复消费入口额度；FLUSH、DISCARD 沿用既有行为。
+准入允许一个完整请求的短时突发，并按其完整成本影响后续准入；空闲时不积累额外突发
+额度。因此配置表示持续速率，不保证任意一秒窗口都不超过该数值。
+
+脏数据占用包括已预留和正在回写但尚未完成的页面。整体与单盘脏数据限制使用同一份
+共享缓存，不增加总缓存，也不划分或预留单盘缓存区。没有独立脏上限时，实际占用仍受
+当前有效缓存容量约束，包括 elastic cache 模式下的当前 grant。现有缓存预算准入与
+回收机制继续控制这份容量。
+
+在沙箱创建或恢复前配置这些策略。Orchestrator 将节点策略与请求覆盖解析为 Host YAML，
+sandboxer 应用目标策略，后续绑定的 slot 自动遵循相同规则。QoS 不写入可携带磁盘身份
+或 checkpoint 数据。本配置入口不热更新已经运行的沙箱。
+
+**升级影响：** `max_dirty_size` 缺省从最终缓存的一半改为零，允许现有缓存中有更多脏数据，
+可能减少 clean 或可立即回收的缓存；已有显式旧上限继续生效。使用新默认前，执行端
+sandboxer 必须支持新 schema 和零值语义：即使没有配置新增速率字段，解析后的 Host YAML
+也会包含 `max_dirty_size: "0"`。旧严格解析器拒绝新增字段和零脏上限。回退前应移除新增
+字段，并将显式零整体脏上限改为旧版本支持的正值配置。
+
+Conductor 与 `node-ctl` runner/builder 必须部署配套版本，并替换仍运行旧二进制的预启动
+单元。BuildTask schema v8 在 bootstrap 和 prepare completion 两个入口拒绝旧 builder，
+避免其旧资源解码器先丢弃新增限制，再启动已经升级的 sandboxer。混用旧 builder 会使
+任务请求失败，不会带着部分生效的 QoS 执行；仅升级 sandboxer 不能更新这些 builder。
+回退 Conductor 前应先完成或排空在途 Build，或保留兼容的新 Conductor 完成恢复。
+已持久化的 Build preparation 记录也包含新资源字段，仅删除节点配置中的新字段，
+不能让旧版本读取这些记录。
 
 <a id="request-resources"></a>
 
@@ -213,7 +267,21 @@ parser 对未知字段和这些越权字段直接报错,不会静默忽略。
   "capacity": {"cpu": 2, "memory": "8GiB"},
   "allocatable": {"cpu": 0.5, "memory": "256MiB"},
   "startup": {"memory": "1GiB"},
-  "diff_cow": {"cache_size": "64MiB", "max_dirty_size": "16MiB", "discard": "auto"}
+  "diff_cow": {
+    "discard": "auto",
+    "cache_size": "32MiB",
+    "cache_idle_after": "10s",
+    "max_dirty_size": "32MiB",
+    "read_bandwidth": "50MiB",
+    "write_bandwidth": "20MiB",
+    "read_iops": 0,
+    "write_iops": 0,
+    "max_dirty_size_per_disk": "32MiB",
+    "read_bandwidth_per_disk": "50MiB",
+    "write_bandwidth_per_disk": "20MiB",
+    "read_iops_per_disk": 0,
+    "write_iops_per_disk": 0
+  }
 }
 ```
 
@@ -241,7 +309,7 @@ namespace 遵循[Sandbox 配置透传](sandbox-lifecycle_zh.md#request-configura
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
 
-例如节点省略脏数据上限时，请求头 `X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` 会得到 32 MiB 的脏数据上限。在 `diff_cow` 内提供 `"max_dirty_size":"16MiB"` 可显式设置上限。两项大小均须为 4 KiB 的正整数倍。原始策略、请求 metadata 和迁移 token 只保存显式叶子，恢复时由目标节点重新解析缓存限制，独立于制品 capacity。Build 执行继承节点策略，目标 Sandbox 再叠加其请求配置。
+节点省略脏数据上限时，请求头 `X-Kuasar-Sandbox-Resource: {"diff_cow":{"cache_size":"64MiB"}}` 只改变共享缓存容量，不增加独立脏上限。提供 `"max_dirty_size":"16MiB"` 可设置有限整体上限，`"max_dirty_size":"0"` 可清除继承上限；其他整体和单盘限制分别按叶子覆盖。原始策略、请求 metadata 和迁移 token 只保存显式叶子，恢复时由目标节点解析 diffstore 策略，独立于制品 capacity。Build 执行继承节点策略，目标 Sandbox 再叠加其请求配置。
 
 若希望新冷启动延后文件系统 discard，可在节点设置
 `sandbox.resources.diff_cow.discard: manual`，或为实例发送

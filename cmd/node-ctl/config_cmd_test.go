@@ -30,7 +30,11 @@ func TestConductorConfigTemplateUsesNestedSandboxResourcePolicy(t *testing.T) {
 		"memory: 256MiB",
 		"startup: { memory: 512MiB }",
 		"overhead: { memory: 32MiB }",
-		"diff_cow:", "cache_size: 32MiB", "max_dirty_size: 16MiB",
+		"diff_cow:", "cache_size: 32MiB", "max_dirty_size: 0",
+		"cache_idle_after: 10s", "read_bandwidth: 0", "write_bandwidth: 0",
+		"read_iops: 0", "write_iops: 0", "max_dirty_size_per_disk: 0",
+		"read_bandwidth_per_disk: 0", "write_bandwidth_per_disk: 0",
+		"read_iops_per_disk: 0", "write_iops_per_disk: 0",
 	} {
 		if !strings.Contains(sandboxBlock, want) {
 			t.Errorf("sandbox template does not contain %q:\n%s", want, sandboxBlock)

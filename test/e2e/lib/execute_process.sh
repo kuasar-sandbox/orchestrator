@@ -69,12 +69,28 @@ EOF
 ORCH_PID=""
 ORCH_LOG=""
 start_conductor() { # $1=log path; starts only the owned control-plane process
-    local log_path="$1" ready=""
+    local log_path="$1" ready="" discover_port="$PORT" owner_pid="$BASHPID" actual_port discovery_status
     ORCH_LOG="$log_path"
     "$ORCH_BIN_DIR/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log_path" 2>&1 &
     ORCH_PID=$!
     PIDS+=("$ORCH_PID")
     for _ in $(seq 1 30); do
+        if [ "$discover_port" = 0 ]; then
+            if actual_port=$(python3 "$SCRIPT_DIR/conductor_listener.py" "$ORCH_PID" "$owner_pid"); then
+                PORT="$actual_port"
+                discover_port=""
+            else
+                discovery_status=$?
+                if [ "$discovery_status" -ne 1 ]; then
+                    sed 's/^/  /' "$log_path"
+                    fail "cannot identify owned Conductor API listener"
+                fi
+                # No listener yet: use this iteration of the existing startup
+                # budget, without restarting the process or choosing a port.
+                sleep 0.5
+                continue
+            fi
+        fi
         if curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null; then
             ready=1
             break
