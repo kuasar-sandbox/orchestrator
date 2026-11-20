@@ -794,19 +794,13 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 	return nil
 }
 
-// Called only from the unlocked, completed-retirement branch above. A cleanup
-// failure owns only garbage under BaseDir; it must not resurrect a retired run
-// or retain its resource charge. Running successors keep their active refs.
-func (o *Orchestrator) cleanupCheckpointAfterMemorySave(ctx context.Context, retired store.RunPoolOwnership) {
+// RAM and run ownership are already released. The existing SID worker reloads
+// the current paused row as its BaseDir garbage owner; it never carries a stale
+// source selection or recreates an old run/resource obligation.
+func (o *Orchestrator) cleanupCheckpointAfterMemorySave(_ context.Context, retired store.RunPoolOwnership) {
 	unlock := o.lifecycle.Lock(retired.TaskID)
 	defer unlock()
-	sb, err := o.st.Get(ctx, retired.TaskID)
-	if err == nil && sb != nil && sb.State == types.StatePaused && sb.InstanceID == retired.RetirementInstanceID && sb.BaseDir == retired.RetirementBaseDir {
-		err = o.cleanupCheckpoint(ctx, sb)
-	}
-	if err != nil {
-		o.log.Warn("checkpoint garbage collection after memory save deferred", "sid", retired.TaskID, "err", err)
-	}
+	o.startPausedCleanupRetry(retired.TaskID)
 }
 
 // An intent can survive a conductor crash before the capture command reaches

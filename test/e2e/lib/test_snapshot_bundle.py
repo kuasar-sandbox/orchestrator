@@ -1,4 +1,4 @@
-"""Exercise the shipped Bundle B graph assertion without KVM or product mocks."""
+"""Exercise the shipped portable Bundle graph assertions without KVM."""
 import json
 from pathlib import Path
 import subprocess
@@ -9,95 +9,116 @@ import zipfile
 
 
 CASE = Path(__file__).resolve().parents[1] / "cases" / "orchestrator.snapshot.sh"
-# Execute the actual E2E assertion, not a separately maintained approximation.
-PARSER = CASE.read_text().split("import json, re, sys, zipfile\n", 1)[1].split(
-    "\nPY_BUNDLE_B\n", 1)[0]
-PARSER = "import json, re, sys, zipfile\n" + PARSER
-A, B, H, BASE, LOWER = (char * 64 for char in "abcef")
+# Execute the actual E2E assertions, not separately maintained approximations.
+def shipped_assertion(marker):
+    body = CASE.read_text().split("<<'" + marker + "'", 1)[1].split("\n" + marker + "\n", 1)[0]
+    return body[body.index("\nimport ") + 1:]
+
+
+PARSER = shipped_assertion("PY_BUNDLE_B")
+A, B, H, PUBLIC, BASE, LOWER = (char * 64 for char in "abcdef")
 
 
 def ref(key):
     return "manifest://" + key
 
 
+def located(key):
+    return "file://" + key + ".bundle@manifest:" + key + "@location:bundle"
+
+
 class SnapshotBundleGraph(unittest.TestCase):
-    def validate(self, refs=None, suffix=None, members=None, extra_cfg=None):
+    def validate(self, refs=None, suffix=None, members=None, extra_cfg=None,
+                 root_members=None, missing_history=False, parser=PARSER):
         if refs is None:
-            refs = [ref(H), ref(BASE), ref(LOWER)]
+            refs = [located(H), ref(BASE), ref(LOWER)]
         if suffix is None:
             suffix = [ref(BASE), ref(LOWER)]
         if members is None:
-            members = ["manifest/" + key for key in (B, H)]
+            members = ["manifest/" + H]
+        if root_members is None:
+            root_members = ["manifest/" + PUBLIC]
         cfg = {"FromRefs": refs, **(extra_cfg or {})}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            current, parent, bundle = (root / name for name in ("b.json", "a.json", "b.bundle"))
+            current, parent = (root / name for name in ("b.json", "a.json"))
             current.write_text(json.dumps(cfg))
             parent.write_text(json.dumps({"FromRefs": suffix}))
-            with zipfile.ZipFile(bundle, "w") as archive:
-                for name in members:
-                    archive.writestr(name, b"fixture")
+            carriers = [(PUBLIC, root_members)]
+            if not missing_history:
+                carriers.append((H, members))
+            for key, names in carriers:
+                with zipfile.ZipFile(root / (key + ".bundle"), "w") as archive:
+                    for name in names:
+                        archive.writestr(name, b"fixture")
             return subprocess.run(
-                [sys.executable, "-", str(current), str(parent), str(bundle), B],
-                input=PARSER, text=True, capture_output=True, timeout=5)
+                [sys.executable, "-", str(current), str(parent), str(root), located(PUBLIC), A, B],
+                input=parser, text=True, capture_output=True, timeout=5)
 
     def assert_rejected(self, diagnostic, **kwargs):
         result = self.validate(**kwargs)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(diagnostic, result.stderr)
 
-    def test_trimmed_single_parent_uses_actual_history_not_original_a(self):
-        # No A member: the original assertion rejects this valid #380 graph.
+    def test_materialized_history_has_its_own_exact_carrier(self):
         result = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_legacy_all_dirty_parent_may_retain_its_identity(self):
-        result = self.validate(refs=[ref(A), ref(BASE), ref(LOWER)],
-                               members=["manifest/" + key for key in (B, A, BASE, LOWER)])
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_full_local_snapshot_cannot_impersonate_materialized_history(self):
+        for key in (A, B):
+            with self.subTest(key=key):
+                self.assert_rejected("reused a full local Snapshot", refs=[located(key), ref(BASE), ref(LOWER)])
 
     def test_one_local_history_without_external_suffix(self):
-        result = self.validate(refs=[ref(H)], suffix=[], members=["manifest/" + key for key in (B, H)])
+        result = self.validate(refs=[located(H)], suffix=[])
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_actual_history_cannot_be_masked_by_original_a(self):
-        self.assert_rejected("omits referenced memory history manifest", members=[
-            "manifest/" + key for key in (B, A, BASE, LOWER)])
+        self.assert_rejected("exact single-root carrier", members=["manifest/" + A])
+        self.assert_rejected("FileNotFoundError", missing_history=True)
 
-    def test_portable_suffix_may_remain_remote_or_already_be_embedded(self):
-        # The inherited published template is not a local history carrier.
-        # Absence of bundle/refs must not imply recursive Store materialization.
-        for keys in ((B, H), (B, H, BASE), (B, H, BASE, LOWER)):
-            with self.subTest(keys=keys):
-                result = self.validate(members=["manifest/" + key for key in keys])
-                self.assertEqual(result.returncode, 0, result.stderr)
+    def test_named_publication_keeps_single_root_carriers(self):
+        self.assert_rejected("exact single-root carrier", members=["manifest/" + H, "manifest/" + A])
+        self.assert_rejected("exact single-root carrier", root_members=["manifest/" + PUBLIC, "manifest/" + H])
 
     def test_external_refs_entry_is_rejected_even_when_all_manifests_exist(self):
         self.assert_rejected("unexpectedly retained external Bundle locations", members=[
-            *("manifest/" + key for key in (B, H, BASE, LOWER)), "bundle/refs"])
+            "manifest/" + H, "bundle/refs"])
 
     def test_missing_and_extra_history_are_rejected(self):
-        for refs in ([], [ref(BASE), ref(LOWER)], [ref(H), ref(A), ref(BASE), ref(LOWER)]):
+        for refs in ([], [ref(BASE), ref(LOWER)], [located(H), located(A), ref(BASE), ref(LOWER)]):
             with self.subTest(refs=refs):
                 self.assert_rejected("want one history plus inherited", refs=refs)
 
     def test_inherited_suffix_cannot_change_or_reorder(self):
-        for refs in ([ref(H), ref(LOWER), ref(BASE)], [ref(H), ref(A), ref(LOWER)]):
+        for refs in ([located(H), ref(LOWER), ref(BASE)], [located(H), ref(A), ref(LOWER)]):
             with self.subTest(refs=refs):
                 self.assert_rejected("want one history plus inherited", refs=refs)
 
-    def test_history_must_be_a_canonical_logical_manifest_ref(self):
+    def test_history_must_be_a_canonical_selector_at_the_published_location(self):
         for history in ("file:///old.bundle@manifest:" + H, "manifest://" + "g" * 64,
-                        "manifest://short", "https://example.test/history", None):
+                        ref(H), located(H).replace("location:bundle", "location:other"),
+                        located(H).replace(H + ".bundle", A + ".bundle"), None):
             with self.subTest(history=history):
-                self.assert_rejected("not logical Manifest references", refs=[history, ref(BASE), ref(LOWER)])
+                self.assert_rejected("not a canonical published Bundle selector", refs=[history, ref(BASE), ref(LOWER)])
 
     def test_self_reference_is_rejected_even_with_a_matching_member(self):
-        self.assert_rejected("references its own root", refs=[ref(B), ref(BASE), ref(LOWER)])
+        self.assert_rejected("references its own root", refs=[located(PUBLIC), ref(BASE), ref(LOWER)])
 
     def test_physical_selectors_cannot_hide_in_nested_configuration(self):
         self.assert_rejected("physical Bundle selectors leaked", extra_cfg={
             "Nested": {"values": ["file:///old.bundle@manifest:" + A]}})
+
+    def test_published_disk_selectors_are_allowed(self):
+        result = self.validate(extra_cfg={"Boot": {"Root": {"Base": located("1" * 64)}}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_c_composition_requires_new_history_and_separate_carriers(self):
+        parser = shipped_assertion("PY_BUNDLE")
+        result = self.validate(parser=parser)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_rejected("new immutable identity", parser=parser, refs=[located(A), ref(BASE), ref(LOWER)])
+        self.assert_rejected("separate single-root", parser=parser, root_members=["manifest/" + PUBLIC, "manifest/" + A])
 
 
 if __name__ == "__main__":

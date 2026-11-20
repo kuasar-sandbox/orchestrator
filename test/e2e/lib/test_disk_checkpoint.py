@@ -34,15 +34,18 @@ class DiskCheckpoint(unittest.TestCase):
                        ("sandbox", "paused", str(self.root), "sandbox", self.reference, ""))
 
     def artifact_payload(self, checkpoint=None, extra=(), *, sparse=False, prefix=0, pax_size=True, reverse=False,
-                         extents=None, stored_adjustment=0, carrier_extra=()):
+                         extents=None, stored_adjustment=0, carrier_extra=(), entries=None):
         if checkpoint is None:
             checkpoint = {"version": 1, "checkpoint_id": IDENTITY,
                           "root": {"diff_id": "root"}, "disks": [{"name": "data", "diff_id": "data"}]}
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:
             # ZipInfo's fixed default timestamp keeps rebuilt fixture bytes identical.
-            archive.writestr(zipfile.ZipInfo("sandbox.runtime.cfg"), b"fixture runtime config")
-            archive.writestr(zipfile.ZipInfo("checkpoint.json"), json.dumps(checkpoint))
+            if entries is None:
+                entries = [("sandbox.runtime.cfg", b"fixture runtime config"),
+                           ("checkpoint.json", json.dumps(checkpoint))]
+            for name, content in entries:
+                archive.writestr(zipfile.ZipInfo(name), content)
             for name in extra:
                 archive.writestr(zipfile.ZipInfo(name), b"unexpected")
         body = payload.getvalue()
@@ -85,6 +88,49 @@ class DiskCheckpoint(unittest.TestCase):
                 carrier.addfile(tarfile.TarInfo(name))
         return checkpoint
 
+    def memory_entries(self):
+        descriptor = {"version": 1, "checkpoint_id": IDENTITY, "memory_id": "memory-one",
+                      "size": 8192, "map_ref": "file://memory.map@digest:" + "d" * 64,
+                      "parents": ["file:///checkpoint/previous.snapshot@digest:" + "c" * 64],
+                      "working_set": True}
+        return descriptor, [("config.json", "{}"), ("state.json", "{}"),
+                            ("snapshot.cfg", "{}"), ("memory.checkpoint.json", json.dumps(descriptor))]
+
+    def test_memory_descriptor_reads_canonical_sparse_carrier(self):
+        descriptor, entries = self.memory_entries()
+        for prefix in (0, 8 << 30):
+            with self.subTest(prefix=prefix):
+                self.artifact_payload(entries=entries, sparse=True, prefix=prefix)
+                # A large logical sparse prefix must not be materialized merely
+                # to inspect metadata; the real digest-marker member follows it.
+                self.assertLess(self.artifact.stat().st_size, 1 << 16)
+                self.assertEqual(disk_checkpoint.memory_descriptor(self.artifact), descriptor)
+
+    def test_memory_descriptor_rejects_missing_metadata(self):
+        _, entries = self.memory_entries()
+        for missing, _ in entries:
+            with self.subTest(missing=missing):
+                self.artifact_payload(entries=[entry for entry in entries if entry[0] != missing], sparse=True)
+                with self.assertRaises(AssertionError):
+                    disk_checkpoint.memory_descriptor(self.artifact)
+
+    def test_memory_descriptor_rejects_duplicate_metadata(self):
+        descriptor, entries = self.memory_entries()
+        duplicate = ("memory.checkpoint.json", json.dumps({**descriptor, "memory_id": "other-memory"}))
+        with self.assertWarns(UserWarning):
+            self.artifact_payload(entries=entries + [duplicate], sparse=True)
+        with self.assertRaises(AssertionError):
+            disk_checkpoint.memory_descriptor(self.artifact)
+
+    def test_memory_descriptor_rejects_malformed_or_unsupported_metadata(self):
+        _, entries = self.memory_entries()
+        for body, error in (("invalid json", json.JSONDecodeError), ("{}", KeyError),
+                            ('{"version":2}', AssertionError)):
+            with self.subTest(body=body):
+                self.artifact_payload(entries=entries[:-1] + [("memory.checkpoint.json", body)], sparse=True)
+                with self.assertRaises(error):
+                    disk_checkpoint.memory_descriptor(self.artifact)
+
     def memory_attempt(self, *, memory="memory-one", epoch=1, legacy=False):
         locator = {"checkpoint_id": IDENTITY, "memory_id": memory, "epoch": epoch}
         digest = disk_checkpoint.hashlib.sha256(IDENTITY.encode()).hexdigest()
@@ -92,6 +138,39 @@ class DiskCheckpoint(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(locator))
         return locator, path
+
+    def test_memory_collection_waits_for_release_and_actual_deletion(self):
+        locator, path = self.memory_attempt()
+        (self.checkpoint / "current-memory.json").write_text(json.dumps(locator))
+        record = {**locator, "committed": True, "runtime_retired": True}
+        path.write_text(json.dumps(record))
+        old = self.checkpoint / "obsolete.sandbox"
+        old.touch()
+        observations = []
+        def advance(_):
+            observations.append(old.exists())
+            if len(observations) == 1:
+                path.write_text(json.dumps({**record, "file_ready": True, "ram_released": True}))
+            else:
+                old.unlink()
+        with mock.patch.object(disk_checkpoint.time, "sleep", side_effect=advance):
+            result = disk_checkpoint.wait_memory_collected(self.checkpoint, locator["memory_id"], [old])
+        self.assertEqual(observations, [True, True])
+        self.assertFalse(result["initial"]["ram_released"])
+        self.assertEqual(result["final"]["remaining"], [])
+
+    def test_memory_collection_never_accepts_another_attempt_or_deletes_garbage(self):
+        locator, path = self.memory_attempt()
+        (self.checkpoint / "current-memory.json").write_text(json.dumps(locator))
+        path.write_text(json.dumps({**locator, "committed": True, "runtime_retired": True,
+                                    "file_ready": True, "ram_released": True}))
+        old = self.checkpoint / "obsolete.sandbox"
+        old.touch()
+        with self.assertRaises(AssertionError):
+            disk_checkpoint.wait_memory_collected(self.checkpoint, "another-memory", [old], timeout=0)
+        with self.assertRaisesRegex(AssertionError, "GC did not finish"):
+            disk_checkpoint.wait_memory_collected(self.checkpoint, locator["memory_id"], [old], timeout=0)
+        self.assertTrue(old.exists())
 
     def test_memory_record_uses_exact_current_attempt_not_latest_or_legacy(self):
         locator, path = self.memory_attempt()

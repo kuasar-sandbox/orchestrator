@@ -112,6 +112,20 @@ def artifact_content(path):
     return names, result
 
 
+def memory_descriptor(path):
+    """Inspect the immutable local-memory metadata of a tarstream fixture."""
+    with tarfile.open(path, tarinfo=_CheckpointTarInfo) as carrier:
+        members = [m for m in carrier if m.isfile() and not m.name.startswith(".kuasar.")]
+        assert len(members) == 1, members
+        with zipfile.ZipFile(carrier.extractfile(members[0])) as logical:
+            names = logical.namelist()
+            assert len(names) == 4 and set(names) == {
+                "config.json", "state.json", "snapshot.cfg", "memory.checkpoint.json"}, names
+            descriptor = json.loads(logical.read("memory.checkpoint.json"))
+    assert descriptor["version"] == 1, descriptor
+    return descriptor
+
+
 def local_artifact(database, sid):
     with sqlite3.connect(database, timeout=5) as db:
         row = db.execute("select state, base_dir, resume_source_kind, resume_source_ref, resume_sandbox_ref from sandboxes where id=?", (sid,)).fetchone()
@@ -161,6 +175,35 @@ def memory_record(directory, locator=None):
     return record
 
 
+def wait_memory_collected(directory, memory_id, obsolete, timeout=60):
+    """Observe automatic post-save GC after ordinary RunDir retirement.
+
+    This never invokes collection or deletes a file. A new attempt cannot
+    satisfy the wait, and RAM release alone is not proof of artifact cleanup.
+    """
+    directory = Path(directory)
+    locator_path = directory / "current-memory.json"
+    locator = json.loads(locator_path.read_text())
+    assert locator["memory_id"] == memory_id, (locator, memory_id)
+    started = time.monotonic()
+    initial = None
+    while True:
+        assert json.loads(locator_path.read_text()) == locator, "current capture changed while waiting for GC"
+        record = memory_record(directory, locator)
+        assert record.get("committed") and record.get("runtime_retired") and not record.get("aborted") and not record.get("discarded"), record
+        state = {key: record.get(key, False) for key in ("file_ready", "ram_released")}
+        state["remaining"] = [str(path) for path in obsolete if os.path.lexists(path)]
+        if initial is None:
+            initial = state
+        if state["ram_released"]:
+            assert state["file_ready"], "successful capture lost its payload before GC"
+            if not state["remaining"]:
+                return {**locator, "initial": initial, "final": state,
+                        "elapsed_seconds": time.monotonic() - started}
+        assert time.monotonic() - started < timeout, ("post-save checkpoint GC did not finish", locator, state)
+        time.sleep(.1)
+
+
 def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log, phase):
     """Prove the managed path, including a save that finished before observation."""
     with sqlite3.connect(database, timeout=5) as db:
@@ -178,11 +221,7 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
     assert record["snapshot_ref"] == row[5], (record["snapshot_ref"], row[5])
     name = row[5].removeprefix("file://").split("@", 1)[0]
     assert row[5].startswith("file://") and name == Path(name).name, row[5]
-    with tarfile.open(directory / name, tarinfo=_CheckpointTarInfo) as carrier:
-        members = [m for m in carrier if m.isfile() and not m.name.startswith(".kuasar.")]
-        assert len(members) == 1, members
-        with zipfile.ZipFile(carrier.extractfile(members[0])) as logical:
-            descriptor = json.loads(logical.read("memory.checkpoint.json"))
+    descriptor = memory_descriptor(directory / name)
     assert descriptor["version"] == 1 and descriptor["memory_id"] == record["memory_id"] and descriptor["checkpoint_id"] == record["checkpoint_id"], descriptor
     parent_ack = False
     for line in Path(log).read_text().splitlines():

@@ -326,20 +326,34 @@ for merge in false false false true false; do
     wait_paused_cleanup "$SID" || fail "history checkpoint cleanup did not finish"
     "$BIN/sandbox-ctl" info --json "$CHECKPOINT_DIR/$SID.snapshot" >"$WORK/history-current.json"
     current_pair=$(checkpoint_pair "$SID" snapshot "$CHECKPOINT_DIR/$SID.snapshot") || fail "invalid current history S/E pair"
-    python3 - "$WORK/history-current.json" "$WORK/w-policy.json" "$merge" "$CHECKPOINT_DIR" "$SID" "$previous_pair" "$current_pair" <<'PY_HISTORY'
+    PYTHONPATH="$SCRIPT_DIR" python3 - "$WORK/history-current.json" "$WORK/w-policy.json" "$merge" "$CHECKPOINT_DIR" "$SID" "$previous_pair" "$current_pair" <<'PY_HISTORY'
 import json, os, sys
+from disk_checkpoint import memory_descriptor, wait_memory_collected
 current, original = (json.load(open(path)) for path in sys.argv[1:3])
 refs, external = current.get("FromRefs") or [], original.get("FromRefs") or []
-count = 0 if sys.argv[3] == "true" else 1
-if len(refs) != count+len(external) or refs[count:] != external:
-    raise SystemExit(f"unbounded/local boundary changed: {refs!r}, suffix={external!r}")
+if refs != external:
+    raise SystemExit(f"external memory suffix changed: {refs!r}, want {external!r}")
 root, sid, before, after = sys.argv[4:]
 # checkpoint_pair validated actual stored S/E identities and both physical files
 # while each source was current. Snapshot capture creates only the S alias.
 old_e, current_e = (json.loads(pair)[3] for pair in (before, after))
 def checkpoint_path(ref):
     return os.path.join(root, ref.removeprefix("file://").split("@", 1)[0])
+# Local history stays behind the descriptor boundary until publication.
+# Require the exact previous immutable S, one direct parent, and this round's
+# C/W selection. The following restores still verify the actual guest state.
+previous_s, current_s = (json.loads(pair)[2] for pair in (before, after))
+descriptor = memory_descriptor(checkpoint_path(current_s))
+previous_descriptor = memory_descriptor(checkpoint_path(previous_s))
+expected_parent = "file://" + os.path.join(root, previous_s.removeprefix("file://"))
+assert descriptor.get("parents") == [expected_parent], (descriptor, expected_parent)
+assert descriptor.get("working_set", False) == (sys.argv[3] == "false"), descriptor
+assert descriptor["memory_id"] != previous_descriptor["memory_id"], (descriptor, previous_descriptor)
 old_path, current_path = checkpoint_path(old_e), checkpoint_path(current_e)
+garbage = [os.path.join(root, name) for name in (sid+".snapshot.4294967295.partial", "8".zfill(64)+".snapshot")]
+if old_path != current_path:
+    garbage.append(old_path)
+print("checkpoint GC:", json.dumps(wait_memory_collected(root, descriptor["memory_id"], garbage)), file=sys.stderr)
 if old_path != current_path and os.path.lexists(old_path):
     raise SystemExit(f"unused previous E remains after source commit: {old_e!r}")
 for name in ("user.snapshot", "user.tmp", sid+"2.snapshot.12.partial", sid+".snapshot.01.partial", "unfamiliar", "f"*64+".image"):
@@ -357,7 +371,7 @@ for node in [current["Boot"]["Root"], *(current["Boot"]["Disks"] or [])]:
             raise SystemExit(f"local writable disk lower was not absorbed: {raw}")
 PY_HISTORY
 done
-echo "==> PASS: repeated managed false/true/false restores preserved state, bounded history, and directory protection"
+echo "==> PASS: repeated managed false/true/false restores preserved state, exact local parents, external suffix, and directory protection"
 
 S_COLD_RUN_CALL=$(run_argv_count)
 code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113,"memory":false}')

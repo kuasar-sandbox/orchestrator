@@ -156,7 +156,8 @@ func (o *Orchestrator) abandonSandboxDeleteWorker(sid string) {
 }
 
 // startPausedCleanupRetry coalesces cleanup for a paused row whose exact
-// runner, network, or RunDir owner could not yet be released and persisted.
+// runner, network, or RunDir owner could not yet be released and persisted, or
+// whose BaseDir still needs checkpoint GC after those runtime fields are clear.
 // The worker is part of acceptedOps so orderly shutdown keeps dependencies
 // alive until the current attempt finishes; lifecycle cancellation stops later
 // retries and leaves the durable paused owner for startup reconciliation.
@@ -524,6 +525,14 @@ func (o *Orchestrator) retirePausedCleanupWorker(sid string) (bool, error) {
 	}
 	if pausedCleanupPending(current) {
 		return false, nil
+	}
+	if current != nil && current.State == types.StatePaused {
+		// Runtime fields are already clear. Keep only the paused BaseDir's GC
+		// retry responsibility, including reader-busy and source-lock errors.
+		// Select fresh refs under the same lock as retiring this SID worker.
+		if _, err := o.inspectOrCleanupCheckpoint(ctx, current, false); err != nil {
+			return false, err
+		}
 	}
 	o.pausedCleanupMu.Lock()
 	delete(o.pausedCleanupActive, sid)

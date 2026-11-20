@@ -2872,6 +2872,11 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		if err == nil && current != nil && current.State == types.StatePaused {
 			o.cache(current)
 			o.observeSandboxUpsert(current)
+			// A paused row still owns its BaseDir after RunDir and holder
+			// retirement. Recover a last GC attempt lost before shutdown.
+			if !pausedCleanupPending(current) {
+				o.startPausedCleanupRetry(current.ID)
+			}
 		}
 		unlock()
 		if err != nil {

@@ -692,10 +692,13 @@ Pause 成功不代表节点启动时已经完成该路径检查。外部发布�
 任何内容之前返回 `artifact.ErrCheckpointMemoryReadersBusy`。普通清理中，
 `node-ctl checkpoint-cleanup` 仅在这个结果且 storage Close 成功时返回内部延期退出码 80。
 owner 延期垃圾回收并完成普通 paused 收尾，无需等待内存保存。RAM 结清且 runner fence
-完成后，既有 holder run-end worker 在 SID lifecycle lock 下确认精确 instance/BaseDir
-仍为 paused，再尝试回收，包括 RunDir 已清空的情况。
+完成后，holder run-end worker 释放旧 run ownership，并调度既有 SID paused-cleanup worker。
+当前 paused 行承担剩余 BaseDir GC 责任，RunDir 已清空及重启后也可重试。读者 pin、来源
+fence 冲突和 I/O 错误保留此 worker 的重试责任，不延长 RAM 计费或重新建立运行所有权。
+每次重试都在 SID lifecycle lock 下读取当前来源；运行中的继任者跳过，已暂停的继任者
+按其自身当前来源检查，不沿用旧 run 的来源选择。
 
-其他清理失败仍保留最后一个持久 RunDir ownership 标记，直到 checkpoint 清理和既有
+普通 paused 收尾中的其他清理失败仍保留最后一个持久 RunDir ownership 标记，直到 checkpoint 清理和既有
 paused 收尾均成功。既有 worker 在 SID lifecycle lock 下重新读取当前来源重试，重启后
 也如此。active 或 detached export 的读取 fence 在其完成前持续有效；清理
 不会持锁等待需要同一锁完成的 export。Resume/Wake/Exec 遵守既有 pending-cleanup admission

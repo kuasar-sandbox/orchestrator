@@ -491,14 +491,12 @@ func TestReleasedHolderCollectsPausedCheckpointAfterRunDirCleared(t *testing.T) 
 	for _, paused := range []bool{true, false} {
 		t.Run(map[bool]string{true: "paused", false: "running successor"}[paused], func(t *testing.T) {
 			f := pendingPauseFixture(t)
-			stopRetirementWorkers(t, f.o)
 			m := retiredTestOwnership(t, f)
 			testCaptureRecord(t, f, m, func(r *memorycheckpoint.CaptureRecord) {
 				r.FileReady, r.RAMReleased, r.PayloadRef = true, true, "payload.memory"
 			})
 			f.sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: checkpointSnapshotRef, SandboxRef: checkpointSandboxRef}
-			f.sb.RunID, f.sb.RunDir, f.sb.EnvdUDS, f.sb.CiUDS = "", "", "", ""
-			f.sb.State = types.StatePaused
+			clearCheckpointRuntime(t, f)
 			if !paused {
 				f.sb.State, f.sb.RunID = types.StateRunning, "successor-run"
 			}
@@ -507,9 +505,11 @@ func TestReleasedHolderCollectsPausedCheckpointAfterRunDirCleared(t *testing.T) 
 			}
 			proof := filepath.Join(t.TempDir(), "collected")
 			checkpointCleanupTool(t, f.o, "touch '"+proof+"'\n")
+			checkpointGCLifecycle(t, f.o)
 			if err := f.o.reconcileRetiredRun(context.Background(), m); err != nil {
 				t.Fatalf("completed holder reconciliation: %v", err)
 			}
+			waitCheckpointGC(t, f.o, f.sb.ID)
 			_, proofErr := os.Stat(proof)
 			if paused && proofErr != nil || !paused && !errors.Is(proofErr, os.ErrNotExist) {
 				t.Fatalf("post-save collection paused=%v: %v", paused, proofErr)

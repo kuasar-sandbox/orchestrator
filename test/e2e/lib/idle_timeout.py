@@ -14,6 +14,73 @@ import threading
 import time
 
 
+def capture_barrier_fact(database, sid):
+    """Require the exact capture fact while the helper holds Pause commit."""
+    with sqlite3.connect(database, timeout=5) as db:
+        row = db.execute('select state,instance_id,run_id,base_dir,sandbox_result_run_id,sandbox_result_json from sandboxes where id=?', (sid,)).fetchone()
+        assert row and row[0] == 'pausing' and row[2], row
+        owned = db.execute('select ownership from run_pool_ownership where run_id=?', (row[2],)).fetchone()
+    owner = json.loads(owned[0]) if owned else {}
+    fact = dict(state=row[0], run_id=row[2], snapshot_succeeded=True, pause_commit_held=True)
+    if owner.get('retirement_operation_id'):
+        # Host role publication follows helper completion. A retired child may
+        # already have exited, but its parent must keep that unknown role and
+        # must never publish an ordinary result for a memory holder.
+        assert owner['task_id'] == sid and owner['run_id'] == row[2], owner
+        assert owner['retirement_instance_id'] == row[1] and owner['retirement_base_dir'] == row[3], owner
+        assert not owner.get('role') and not owner.get('parent_retired'), owner
+        from disk_checkpoint import memory_record
+        record = memory_record(Path(row[3]) / 'checkpoint')
+        assert record['producer'] == dict(sandbox_id=sid, instance_id=row[1], run_id=row[2]), record
+        assert record['checkpoint_id'] == owner['retirement_checkpoint_id'], record
+        assert record['host_operation_id'] == owner['retirement_operation_id'], record
+        assert record['committed'] and record['runtime_retired'] and not record.get('aborted') and not record.get('discarded'), record
+        assert record.get('snapshot_ref') and record.get('sandbox_ref'), record
+        assert row[4] != row[2] or not row[5], 'holder published an ordinary runner result'
+        return dict(fact, completion='runtime-retired', memory_id=record['memory_id'], epoch=record['epoch'],
+                    operation_id=record['host_operation_id'], checkpoint_id=record['checkpoint_id'])
+    # A legacy parent or a runtime without retention still reports its ordinary
+    # exit. Absence of a holder record alone cannot select this branch.
+    if row[4] == row[2] and row[5]:
+        return dict(fact, completion='runner-result', result=json.loads(row[5]))
+    return None
+
+
+def verify_capture_parent_ack(database, log, sid, fact):
+    if fact['completion'] != 'runtime-retired':
+        return
+    # ParentRetired is persisted just before its log entry. Cleanup may observe
+    # that durable bit first; wait only for the corresponding diagnostic flush.
+    deadline = time.monotonic() + 5
+    while True:
+        with sqlite3.connect(database, timeout=5) as db:
+            row = db.execute('select ownership from run_pool_ownership where run_id=?', (fact['run_id'],)).fetchone()
+            result = db.execute('select sandbox_result_run_id,sandbox_result_json from sandboxes where id=?', (sid,)).fetchone()
+        assert not result or result[0] != fact['run_id'] or not result[1], 'holder has an ordinary runner result'
+        if row:
+            owner = json.loads(row[0])
+            assert owner.get('role') == 'memory-holder' and owner.get('parent_retired'), owner
+            assert owner['memory_id'] == fact['memory_id'] and owner['memory_epoch'] == fact['epoch'], owner
+            assert owner['task_id'] == sid and owner['run_id'] == fact['run_id'], owner
+            assert owner['retirement_operation_id'] == fact['operation_id'] and owner['retirement_checkpoint_id'] == fact['checkpoint_id'], owner
+        acknowledged = False
+        for line in Path(log).read_text().splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                event = dict(word.split('=', 1) for word in shlex.split(line) if '=' in word)
+            if event.get('sid') != sid or event.get('run_id') != fact['run_id']:
+                continue
+            assert event.get('msg') not in ('sandbox execution result accepted',
+                                           'sandbox execution result accepted from disconnected run'), 'holder became an ordinary runner result'
+            if event.get('msg') == 'checkpoint parent retirement acknowledged':
+                acknowledged |= event.get('memory_id') == fact['memory_id'] and str(event.get('epoch')) == str(fact['epoch'])
+        if acknowledged:
+            break
+        assert time.monotonic() < deadline, 'exact holder parent retirement ACK missing after Pause commit'
+        time.sleep(.02)
+
+
 def run():
     env = os.environ
     sid, work = env['SID'], Path(env['WORK'])
@@ -254,22 +321,20 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
                 assert time.monotonic()<deadline, 'automatic capture barrier not reached'
                 time.sleep(.02)
             assert state()[0]=='pausing'
-            # The snapshot is committed by Sandboxer, but Conductor has not
-            # received the helper's completion. Require the old runner result
-            # to be durable first; neither message order may destroy the source.
+            # The helper has successfully returned from the real SDK capture.
+            # Frozen captures prove runtime retirement before their parent role
+            # can be committed. Only legacy captures require an ordinary result.
             deadline=time.monotonic()+30
             while True:
-                with sqlite3.connect(db_path,timeout=5) as db:
-                    fact=db.execute('select state,run_id,sandbox_result_run_id,sandbox_result_json from sandboxes where id=?',(sid,)).fetchone()
-                assert fact[0]=='pausing', fact[0]
-                if fact[1] and fact[1]==fact[2] and fact[3]:
+                fact = capture_barrier_fact(db_path, sid)
+                if fact is not None:
                     with (Path(env['CASE_OUT'])/'pause-exit-facts.jsonl').open('a') as stream:
-                        stream.write(json.dumps(dict(idle_timeout=timeout,state=fact[0],run_id=fact[1],result=json.loads(fact[3]),snapshot_succeeded=True,pause_commit_held=True))+'\n')
-                    break
-                assert time.monotonic()<deadline, 'runner result did not arrive before Pause commit'
+                        stream.write(json.dumps(dict(idle_timeout=timeout, **fact))+'\n')
+                    return fact
+                assert time.monotonic()<deadline, 'legacy runner result did not arrive before Pause commit'
                 time.sleep(.02)
         try:
-            hold_capture()
+            held = hold_capture()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future=pool.submit(http)
                 time.sleep(.3)
@@ -277,13 +342,15 @@ ThreadingHTTPServer(('0.0.0.0',8001),Handler).serve_forever()
                 target.unlink(); release.touch()
                 verify(future.result())
             await_paused(time.monotonic())
-            hold_capture()
+            verify_capture_parent_ack(db_path, work/'orch.log', sid, held)
+            held = hold_capture()
             started=time.monotonic()
             http(expected=502)
             parked=time.monotonic()-started
             assert 9 <= parked < 15, ('original park deadline changed', parked)
             target.unlink(); release.touch()
             await_paused(time.monotonic())
+            verify_capture_parent_ack(db_path, work/'orch.log', sid, held)
             verify(http())  # Timed-out business was never delivered or replayed.
             await_paused(time.monotonic())
             assert counter == 17

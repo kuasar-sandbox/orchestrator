@@ -777,11 +777,16 @@ the SDK return `artifact.ErrCheckpointMemoryReadersBusy` before modifying aliase
 or deleting anything. For ordinary cleanup, `node-ctl checkpoint-cleanup` maps only
 this result, with successful storage close, to its internal deferred exit code 80.
 The owner defers garbage collection and finishes ordinary paused cleanup without
-waiting for the memory save. After RAM settlement and runner fencing, the existing
-holder run-end worker retries collection under the SID lifecycle lock if the exact
-instance and BaseDir are still paused, including when RunDir is already empty.
+waiting for the memory save. After RAM settlement and runner fencing, the holder
+run-end worker releases the old run ownership and schedules the existing SID
+paused-cleanup worker. The current paused row owns the remaining BaseDir GC work,
+including when RunDir is empty and after restart. Reader/source-fence contention
+and I/O failures keep this worker retrying; they do not retain RAM accounting or
+recreate runtime ownership. Each attempt selects the current source under the SID
+lifecycle lock. A running successor is skipped, and a paused successor is checked
+against its own current source rather than the retired run's selection.
 
-For other cleanup failures, the last durable RunDir ownership marker remains until
+For other failures during ordinary paused cleanup, the last durable RunDir ownership marker remains until
 checkpoint cleanup and ordinary paused cleanup succeed. The existing worker
 retries with a freshly loaded current source under the SID lifecycle lock,
 including after restart. Active or detached exports keep
