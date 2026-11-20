@@ -2,6 +2,8 @@ package orch
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -66,13 +68,17 @@ func testCaptureRecord(t *testing.T, f sandboxFinalizerFixture, m store.RunPoolO
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path+".ram.lock", nil, 0600); err != nil {
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".ram.lock", nonce, 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Stat(path+".ram.lock", &stat); err != nil {
 		t.Fatal(err)
 	}
-	r.Holder.RAMLock = memorycheckpoint.FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
+	r.Holder.RAMLock = memorycheckpoint.FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino, Nonce: hex.EncodeToString(nonce)}
 	w, err := memorycheckpoint.CreateRecord(filepath.Join(f.sb.BaseDir, "checkpoint"), r)
 	if err != nil {
 		t.Fatal(err)

@@ -1,6 +1,8 @@
 package nodectl
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,13 +36,17 @@ func newTestRetentionRecord(t *testing.T, directory string, record memorycheckpo
 	if err := os.Remove(dir); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path+".ram.lock", nil, 0600); err != nil {
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path+".ram.lock", nonce, 0600); err != nil {
 		return nil, err
 	}
 	if err := unix.Stat(path+".ram.lock", &stat); err != nil {
 		return nil, err
 	}
-	record.Holder.RAMLock = memorycheckpoint.FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
+	record.Holder.RAMLock = memorycheckpoint.FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino, Nonce: hex.EncodeToString(nonce)}
 	return memorycheckpoint.CreateRecord(directory, record)
 }
 
