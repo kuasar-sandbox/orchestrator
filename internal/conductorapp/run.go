@@ -36,6 +36,12 @@ import (
 // exact node-ctl executable path, and already resolved process runtime. Built-in
 // node-ctl and custom conductor Apps enter this same function.
 func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable string, runtime *Runtime) error {
+	return run(parent, cfg, nodeCtlExecutable, runtime, func(ctx context.Context) (launcher.Launcher, error) {
+		return launcher.NewSystemd(ctx)
+	})
+}
+
+func run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable string, runtime *Runtime, newLauncher func(context.Context) (launcher.Launcher, error)) error {
 	if cfg == nil || runtime == nil || runtime.Logger == nil || runtime.SecretBox == nil {
 		return fmt.Errorf("conductor app: unresolved startup state")
 	}
@@ -63,7 +69,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		logger.Warn("chmod db", "err", err)
 	}
 
-	lifecycle, err := launcher.NewSystemd(ctx)
+	// Launch rollback still needs D-Bus after work (or its parent) is canceled.
+	// Keep the connection alive until the deferred Close runs after all drains.
+	lifecycle, err := newLauncher(context.WithoutCancel(ctx))
 	if err != nil {
 		cancel()
 		return err

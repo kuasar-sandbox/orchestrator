@@ -37,6 +37,8 @@ type Launcher interface {
 type Systemd struct{ conn *dbus.Conn }
 
 // NewSystemd connects to the system bus' systemd manager.
+// ctx controls the connection lifetime and must remain live through dependent
+// cleanup/drains; callers must Close the launcher after that cleanup finishes.
 func NewSystemd(ctx context.Context) (*Systemd, error) {
 	conn, err := dbus.NewSystemdConnectionContext(ctx)
 	if err != nil {
