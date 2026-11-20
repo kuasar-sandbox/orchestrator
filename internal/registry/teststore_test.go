@@ -115,7 +115,7 @@ func testApplyRoute(r *Registry, ctx context.Context, node string, event *routes
 	r.applyRoute(testReportContext(ctx, r.stores, node), node, event)
 }
 func testApplyDelete(r *Registry, ctx context.Context, node, sid, group, key, fingerprint string) bool {
-	return r.applyDelete(testReportContext(ctx, r.stores, node), node, sid, group, key, fingerprint)
+	return r.applyDelete(testReportContext(ctx, r.stores, node), node, sid, group, key, fingerprint) == nil
 }
 func testApplyDeleteBySID(r *Registry, ctx context.Context, node, sid string) {
 	r.applyDeleteBySID(testReportContext(ctx, r.stores, node), node, sid)

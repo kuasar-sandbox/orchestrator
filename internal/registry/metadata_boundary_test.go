@@ -218,7 +218,9 @@ func TestReadyUnknownDoesNotFinishOrDeleteOrphan(t *testing.T) {
 	faults := &unknownRouteRepository{RouteRepository: reg.stores.routes, reportUnknown: true}
 	reg.stores.routes = faults
 	report := testE2BRoute(route.SandboxID, routesync.StateRunning)
-	reg.applyRoute(testNodeSession(ctx, reg.stores, "n1"), "n1", &report)
+	if err := reg.applyRoute(testNodeSession(ctx, reg.stores, "n1"), "n1", &report); !errors.Is(err, metadata.ErrUnknown) {
+		t.Fatalf("unknown READY reported completion: %v", err)
+	}
 	select {
 	case <-call.done:
 		t.Fatal("unknown READY finished request")
@@ -246,7 +248,7 @@ func TestDeleteUnknownDoesNotRetryIntoLaterIdentity(t *testing.T) {
 	}
 	faults := &unknownRouteRepository{RouteRepository: reg.stores.routes, deleteUnknown: true}
 	reg.stores.routes = faults
-	if reg.applyDelete(testNodeSession(ctx, reg.stores, route.NodeID), route.NodeID, route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint) {
+	if err := reg.applyDelete(testNodeSession(ctx, reg.stores, route.NodeID), route.NodeID, route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint); err == nil {
 		t.Fatal("unknown delete reported definite completion")
 	}
 	if faults.deletes != 1 {
@@ -536,7 +538,7 @@ func TestCrossRegistryRegistrationFencesEveryOldStreamProjection(t *testing.T) {
 			old.applyRoute(oldCtx, "n1", &event)
 		}},
 		{"route_delete", func(t *testing.T) {
-			if old.applyDelete(oldCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint) {
+			if err := old.applyDelete(oldCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint); err == nil {
 				t.Fatal("old route delete succeeded")
 			}
 		}},
@@ -544,7 +546,7 @@ func TestCrossRegistryRegistrationFencesEveryOldStreamProjection(t *testing.T) {
 		{"route_full_snapshot", func(t *testing.T) { old.applyNodeFullSnapshot(oldCtx, "n1", []metadata.NodeSandboxRef{routeRef}, nil) }},
 		{"failed_create_rollback", func(t *testing.T) {
 			old.inflight[flightKey(route.Group, route.RouteKey)] = &reserveCall{done: make(chan struct{}), group: route.Group, routeKey: route.RouteKey, rollbackFence: reserveRollbackFence{SandboxID: route.SandboxID, NodeSandboxID: route.NodeSandboxID, SandboxGeneration: route.SandboxGeneration, Revision: revision}}
-			if old.applyDelete(oldCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint) {
+			if err := old.applyDelete(oldCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint); err == nil {
 				t.Fatal("old failed-create event rolled back successor")
 			}
 		}},
@@ -579,7 +581,7 @@ func TestCrossRegistryRegistrationFencesEveryOldStreamProjection(t *testing.T) {
 	if got, err := stores.builds.ReadBuild(ctx, buildKey); err != nil || got.Exists {
 		t.Fatalf("new Build deletion rejected: %+v %v", got, err)
 	}
-	if !fresh.applyDelete(freshCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint) {
+	if err := fresh.applyDelete(freshCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint); err != nil {
 		t.Fatal("new route deletion rejected")
 	}
 }
@@ -605,7 +607,7 @@ func TestNodeProjectionRequiresCapturedRegistration(t *testing.T) {
 			}
 			event := testE2BRoute(route.SandboxID, routesync.StateRunning)
 			reg.applyRoute(frameCtx, "n1", &event)
-			if reg.applyDelete(frameCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint) {
+			if err := reg.applyDelete(frameCtx, "n1", route.NodeSandboxID, route.Group, route.RouteKey, route.APISecretFingerprint); err == nil {
 				t.Fatal("invalid session deleted route")
 			}
 			if got, v, found, err := reg.stores.GetSandbox(ctx, route.Group, route.RouteKey); err != nil || !found || v != revision || got.State != StateReserved {

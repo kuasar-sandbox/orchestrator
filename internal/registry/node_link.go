@@ -365,10 +365,14 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 				if collectingFull && m.Route.SandboxID != "" {
 					fullSeen[m.Route.SandboxID] = struct{}{}
 				}
-				r.applyRoute(ctx, nr.NodeID, m.Route)
+				if err := r.applyRoute(ctx, nr.NodeID, m.Route); err != nil {
+					return fmt.Errorf("node-link: apply route Upsert: %w", err)
+				}
 			}
 		case routesync.TypeDelete:
-			r.applyDeleteBySID(ctx, nr.NodeID, m.SID)
+			if err := r.applyDeleteBySID(ctx, nr.NodeID, m.SID); err != nil {
+				return fmt.Errorf("node-link: apply route Delete: %w", err)
+			}
 		case routesync.TypeHeartbeat:
 			if m.Beat != nil {
 				queueLatestHeartbeat(heartbeatCh, m.Beat)
@@ -426,7 +430,9 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 				return errors.New("node-link: Bookmark before Build full sync completed")
 			}
 			if collectingFull && m.FullSync {
-				r.applyNodeFullSnapshot(ctx, nr.NodeID, fullExpected, fullSeen)
+				if err := r.applyNodeFullSnapshot(ctx, nr.NodeID, fullExpected, fullSeen); err != nil {
+					return fmt.Errorf("node-link: finish route full sync: %w", err)
+				}
 			}
 			collectingFull = false
 			fullSeen = nil
