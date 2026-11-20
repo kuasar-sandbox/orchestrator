@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -241,7 +242,7 @@ func (o *Orchestrator) completeSandboxResetOnce(ctx context.Context, expected *t
 func (o *Orchestrator) prepareCurrentDisks(ctx context.Context, sb *types.Sandbox) (types.ResumeSource, error) {
 	args := []string{"reset", "--checkpoint-dir", filepath.Join(sb.BaseDir, "checkpoint"), "--sandbox-id", sb.ID,
 		"--instance-id", sb.InstanceID, "--run-id", sb.DeadRunID, "--operation-id", sb.ResetID, "--json", "--manifest-config", o.cfg.ManifestConfig}
-	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	cmd := helperexec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, stderr bytes.Buffer
