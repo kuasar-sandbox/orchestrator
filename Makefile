@@ -2,12 +2,13 @@
 # sandbox data Proxy, and node-level resource control. The node-ctl executable
 # provides the separately deployed conductor, Proxy, and telemetry roles.
 #
-# node-ctl, cluster-ctl, node-stub-ctl, and e2b-key-ctl are pure-Go binaries
-# (CGO_ENABLED=0). Guest runtime images are built by the guest-runtime repo.
+# node-ctl, node-stub-ctl and e2b-key-ctl remain pure Go (CGO_ENABLED=0).
+# cluster-ctl alone links the pinned FoundationDB native client. Guest runtime
+# images are built by the guest-runtime repo.
 
 SHELL := /bin/bash
 
-.PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
+.PHONY: all build build-core build-cluster-native prepare-cluster-native test-core test-cluster-native node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
 	        test test-source vet bench release test-release clean help
 
 # ---------------------------------------------------------------------------
@@ -42,7 +43,9 @@ endef
 all: build
 
 # `build` ships the control-plane binaries.
-build: node-ctl cluster-ctl node-stub-ctl e2b-key-ctl
+build: build-core build-cluster-native
+
+build-core: node-ctl node-stub-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
@@ -58,10 +61,20 @@ node-ctl:
 	$(call link_bin,node-ctl)
 
 # cluster-ctl: the cluster control plane (registry / router / placer, cluster.md).
-cluster-ctl:
-	@mkdir -p "$(BINDIR)"
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/cluster-ctl" ./cmd/cluster-ctl
+cluster-ctl: build-cluster-native
+
+prepare-cluster-native:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/cluster-native.py prepare --arch "$(TARGET_ARCH)"
+
+build-cluster-native:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/cluster-native.py build --arch "$(TARGET_ARCH)" --output "$(BINDIR)" --go "$(GO)" -- $(GO_BUILD_FLAGS)
 	$(call link_bin,cluster-ctl)
+	$(call link_bin,run-cluster-ctl)
+
+# The caller supplies an isolated test database; this never connects to the
+# machine's default cluster file and fails if FDB_CLUSTER_FILE is absent.
+test-cluster-native:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/cluster-native.py test --arch "$(TARGET_ARCH)" --go "$(GO)" -- -count=1 -timeout=10m
 
 # node-stub-ctl: controllable node-link stubs for cluster e2e. It simulates node
 # control-plane behavior without launching microVMs.
@@ -70,7 +83,9 @@ node-stub-ctl:
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-stub-ctl" ./cmd/node-stub-ctl
 	$(call link_bin,node-stub-ctl)
 
-test:
+test: test-core
+
+test-core:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_ENABLED=0 $(GO) test ./...
 	bash test/source/runtask_privilege.sh
@@ -137,7 +152,9 @@ test-release:
 help:
 	@echo "orchestrator. Targets:"
 	@echo "  build / node-ctl           build conductor, Proxy, telemetry, runners, and resource controller"
-	@echo "  cluster-ctl                build registry/router/placer control plane"
+	@echo "  build-core                 build the three CGO=0 commands"
+	@echo "  build-cluster-native        build cluster-ctl plus its pinned native runtime"
+	@echo "  test-core / test-cluster-native  validate pure-Go / real FoundationDB paths"
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"

@@ -79,13 +79,13 @@ restart_redirect_owner() {
     [ "$REDIRECT_CONNECTIONS" -gt 0 ] || fail "redirected node never connected to $REDIRECT_OWNER"
     step "restarting actual redirect owner=$REDIRECT_OWNER pid=${REGISTRY_PIDS[$index]} endpoint=$REDIRECT_ENDPOINT"
     stop_redirect_process "${REGISTRY_PIDS[$index]}" "$REDIRECT_OWNER"
-    "$BIN/cluster-ctl" registry --config "$WORK/$REDIRECT_OWNER.yaml" > >(tee -a "$WORK/$REDIRECT_OWNER.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" registry --config "$WORK/$REDIRECT_OWNER.yaml" > >(tee -a "$WORK/$REDIRECT_OWNER.log" >&2) 2>&1 &
     REGISTRY_PIDS[$index]=$!
     PIDS+=("$!")
     wait_port "${CONTROL_PORTS[$index]}" "$REDIRECT_OWNER-restarted"
 
     stop_redirect_process "$ROUTER_PID" router
-    "$BIN/cluster-ctl" router --config "$WORK/router.yaml" > >(tee -a "$WORK/router.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" > >(tee -a "$WORK/router.log" >&2) 2>&1 &
     ROUTER_PID=$!
     PIDS+=("$!")
     wait_port "$ROUTER_PORT" router-restarted

@@ -12,7 +12,7 @@ This contract follows cluster capabilities and state ownership across Registry, 
 - `router`: a unified e2b-compatible entry point that locates the route owner by sandbox group and forwards the hot path directly to the node.
 - `placer`: the group provider/importer and placement scheduler; it consumes `node_list` and offers Place / verify-key to Registry.
 
-Registry's foundation is a consistent KV organized by `namespace + shard key + recordSet + record key`. All `node_link`, `route_link`, `node_list` and `placer_link` records share this model: no traversal across shards, full replication within a shard, and convergence through quorum reads/writes, CAS, WATCH and read repair.
+Registry accesses durable execution metadata through typed repositories backed by FoundationDB 7.3.77. Transaction, replication and recovery belong to FoundationDB; Registry retains lifecycle rules, node connection ownership and command dispatch. Router and Placer use the same business protocols without importing a database client.
 
 **Read by task:** [Public ingress](#client-access) · [Groups and placement](#groups-and-placement) · [Configure roles](#configuration) · [State ownership](#membership-and-state) · [Link protocols](#protocols) · [Failure and recovery](#failure-and-recovery)
 
@@ -27,11 +27,12 @@ Registry's foundation is a consistent KV organized by `namespace + shard key + r
 ```mermaid
 flowchart TD
   client["Client / E2B SDK"] --> router["Router"]
-  router -->|"Reserve / Resolve"| registry["Registry state cluster"]
+  router -->|"Reserve / Resolve"| registry["Registry services"]
   router -->|"Known target data"| node["Node Conductor and Proxy"]
   registry <-->|"node_link commands and state"| node
   registry <-->|"placer_link / Place"| placer["Placer and Group provider"]
   registry -->|"node_list WATCH_LIST"| placer
+  registry -->|"Typed metadata transactions"| fdb["FoundationDB"]
 ```
 
 The steady-state data plane bypasses Registry. Explicit create/connect/exec-session operations and data requests with a missing target or typed stale fallback require Registry:
@@ -46,9 +47,9 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 ### Design principles
 
 1. **Group is the business shard key**: every northbound cluster request must include `X-Kuasar-Sandbox-Group` or equivalent group identity. A cluster data-plane entry without a group is currently unsupported.
-2. **Registry is a reliable state cluster**: Registry members directly replicate execution state. With three owners, a logical owner set tolerates one member failure; a single-owner configuration has no redundancy. Automatic recovery of running sandboxes is not required after the entire Registry cluster loses its state.
-3. **No traversal across shards**: Registry must not scan across group/node shards or combine partial results from unrelated shards into an authoritative view.
-4. **Full replication within a shard**: owners of the same `namespace + shard key + recordSet` hold the complete view and can serve point reads, CAS and WATCH. A non-owner may coordinate point reads/CAS, but cannot provide a complete local Snapshot/WATCH.
+2. **Durable metadata belongs to FoundationDB**: Registry process failure does not erase metadata. Database availability depends on the external FoundationDB redundancy and failure domains, not Registry owner count. Losing all metadata still does not authorize reconstructing execution ownership from incomplete reports.
+3. **Operations stay within typed scopes**: Route/Build operations use a group and record identity, node operations use NodeID, and the low-frequency directory uses bounded bucket pages. Unrelated partial lists cannot be merged into authority.
+4. **Atomicity follows business invariants**: coupled intent/ownership, lifecycle fences and projections commit through typed transactions. Registry members do not maintain replicas of each other's metadata.
 5. **Member health does not determine sharding**: the member list comes from versioned configuration; `LocateN` takes only membership members as input. Memberlist detects health and propagates metadata.
 6. **Nodes are the authority for runtime state**: node reports determine whether sandboxes/builds still exist. A host reboot loses running processes; surviving durable rows are reconciled against actual units and checkpoint/cleanup ownership. A conductor process restart can adopt surviving units. Neither event means blindly deleting all durable rows or automatically recreating every old sandbox; see [State ownership and disaster-recovery boundaries](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry Reliability](#registry-reliability).
 7. **Placer does not own lifecycle**: it imports groups, patches selectors, applies shuffle sharding/P2C and proposes placements. The node owner checks current connectivity/usage; the node's durable transaction makes the authoritative Build registration admission decision.
@@ -60,7 +61,7 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 
 | Role | Responsibility |
 |---|---|
-| Registry member | Forms the Registry cluster and hosts `route_link` / `node_link` / `node_list` / `placer_link` execution state and membership |
+| Registry member | Hosts business protocols, live node links and membership; accesses durable metadata through typed repositories |
 | Router | Unified e2b entry; locates route owners by group; Resolve on a cache miss, Reserve for create/connect/exec-session/data; local route cache on the hot path |
 | Placer | Consumes `node_list` WATCH_LIST; imports groups through providers/importers; maintains placement and selector patches; offers Place / verify-key |
 | Node | Runs sandboxes/builds; reports full inventories and events through node_link; receives create/connect/exec_session/delete/build/key commands |
@@ -477,14 +478,7 @@ sourceOwners race:
   POST /placer-link/import-source-lease
 ```
 
-The source lease lives in registry shardkv:
-
-```text
-namespace = placer_link
-shardKey  = import/source/<source_id>
-recordSet = import
-recordKey = state
-```
+The source lease is a durable `ImportSourceRepository` record keyed by `source_id`. The business key `import/source/<source_id>` selects service candidates; it does not select storage replicas.
 
 A lease request carries `source_id`, `owner_id`, `run_id`, and `ttl_ms`. Only the lease winner executes that source's `Importer.Range(cursor, limit)`.
 
@@ -602,7 +596,7 @@ The placer owns selector patches and APISecret/ManifestKey pair-cache refresh:
 1. Obtain the group's typed `manifest_key` and `api_secret`. A missing APISecret can be derived only from an inline ManifestKey using the fixed derivation.
 2. Compute the target node set from placement selectors and shuffle results.
 3. A selector patch carries either the complete pair or no credential fields. Each member includes a typed carrier and full 64-hex SHA-256 fingerprint; half-pairs are rejected.
-4. Registry/node owners use the full `APISecretFingerprint` as the record key, write the desired pair to node_link's `key_pair` recordSet, and replicate it by CAS across the owner set.
+4. Registry/node owners use the full `APISecretFingerprint` as the key and persist the desired pair through `KeyPairRepository`. Its transaction checks pair identity and lease; replacement invalidates a prior ACK.
 5. A node_link heartbeat performs atomic `key_put` only for entries lacking `AckAccepted` or entering the renewal window. Delivery state advances only for an ACK matching the entire current desired pair and lease.
 6. One full APISecret fingerprint can bind only identical pair material; conflicts must not overwrite it.
 7. Nodes evict unrenewed pairs by TTL. `key_drop` addresses the full APISecret fingerprint and is not a correctness dependency.
@@ -627,7 +621,7 @@ Each configuration type owns its exact field meanings below. Shared Conductor pa
 
 ### Registry configuration and listeners
 
-Registry uses one control-plane listener by default. A separate node_link listener can isolate long-lived node connections without changing owner rules. The following three-member example shows membership and timing fields; `https://` advertisements also require the matching `member.tls` configuration and peer trust. They do not enable TLS by themselves. The built-in default has one member and one owner per namespace.
+Registry uses one control-plane listener by default. A separate node_link listener can isolate long-lived node connections without changing owner rules. The following three-member example shows membership and timing fields; `https://` advertisements also require the matching `member.tls` configuration and peer trust. They do not enable TLS by themselves. The built-in default has one member and one service candidate per business scope. Configure the external database independently.
 
 ```yaml
 member:
@@ -637,7 +631,7 @@ member:
 membership:
   active: 1
   # next: 2                    # Target version during joint phase
-  # old_grace: 1               # Retain old members as read-only shardkv certificate/snapshot sources after cutover
+  # old_grace: 1               # Keep old peers reachable for streams they already hold
   reload_ready_timeout: 10s
   versions:
     - version: 1
@@ -659,8 +653,9 @@ node_link:
 route_link:
   park_timeout: 30s
 
-node_list:
-  watch_retention: 10000
+foundationdb:
+  cluster_file: /etc/foundationdb/fdb.cluster
+  prefix: "kuasar-sandbox/cluster/"
 
 placer_link:
   placer_label: placer.default
@@ -676,7 +671,6 @@ Default paths:
 /node-link/*
 /route-link/*
 /placer-link/*
-/internal/registry-member/shardkv
 /internal/node-owner
 /internal/node-link/relay
 /internal/memberlist/packet
@@ -685,12 +679,36 @@ Default paths:
 
 Registry's advertised address is `membership.versions[].members[].advertise`; redirect-capable nodes use `membership.versions[].members[].node_advertise`.
 
+
+<a id="native-build-and-runtime"></a>
+
+### Native build, runtime and validation
+
+`cluster-ctl` alone requires CGO and the `fdb` tag. `node-ctl`, `node-stub-ctl` and `e2b-key-ctl` remain CGO=0. Use a native Linux x86_64 or aarch64 build host with Go, a C compiler, Python 3.9+ and `readelf`; the build does not install Debian packages or require `dpkg-deb`.
+
+```sh
+make build-core
+make build-cluster-native
+make test-core
+python3 -B scripts/with-test-fdb.py -- make test-cluster-native
+```
+
+`make build` composes both binary paths. The native target fetches only the SHA256-pinned official 7.3.77 client/SDK and Debian runtime inputs in [cluster-native-lock.json](../scripts/cluster-native-lock.json), validates the ELF dependency and symbol-version closure, then executes the real command's `version` through its bundled loader. The SDK comes from the official clients package because the standalone 7.3.77 headers tar omits a required header. The native tests exercise the driver, command assembly and the same cluster-stub business tests against a real, explicitly selected test database. `with-test-fdb.py` starts and cleans only its isolated local test cluster. An existing test database can instead be selected explicitly with `FDB_CLUSTER_FILE`; a missing variable is an error, not a skipped native gate.
+
+The release contains `bin/cluster-ctl`, `bin/run-cluster-ctl`, fixed runtime files under `lib/cluster-ctl/`, and native licenses/provenance under `share/licenses/orchestrator/native/`. The launcher invokes the bundled loader with an explicit library path; install the complete archive and run the roles through `run-cluster-ctl`. The supplied systemd units use `/usr/bin/run-cluster-ctl`. Linux x86_64 needs AVX for the official client, independently of Go's `GOAMD64` setting. The ARM package uses native ARM libraries without emulator-specific settings.
+
+Registry must have a readable cluster file for the external FoundationDB database and the same prefix as its peers. Coordinator-file updates may require a writable connection file according to the database deployment. Router/Placer roles share the native executable but do not open Registry storage. This archive contains a client runtime, not a production database server; FoundationDB redundancy, storage media and operational recovery remain separate deployment responsibilities.
+
+Release validation retains source revision, selected dependency and Go module checks. Only cluster-ctl is admitted as CGO=1 with the `fdb` tag; the other payloads and trusted archive validator remain CGO=0. Native library names, bytes, loader, licenses and provenance are checked against a fixed allowlist. Validation never executes foreign-architecture payloads or downloads dependencies. `make test-release` includes native linkage/launcher and negative packaging fixtures; it uses the matching host architecture.
+
+Prepared product cluster cases receive the fixed `fdbserver-test` and `fdbcli-test` helpers through [the declared helper inventory](../release/helper-inputs.json). The source-build stage verifies the official package hashes and the executables' compatibility with the product runtime. Each case starts its own single-SSD database, connection file and prefix, writes that same configuration into its Registry instances, and cleans up its own processes. The prepared runtime uses the delivered launcher/libraries and helpers without compiling, fetching dependencies or selecting a machine's default database. This isolated fixture tests deployment wiring; it does not claim production database redundancy.
+
 <a id="router-command"></a>
 
 ### Router command
 
 ```text
-cluster-ctl router --config /etc/cluster-ctl/router.yaml
+run-cluster-ctl router --config /etc/cluster-ctl/router.yaml
 ```
 
 <a id="router-configuration"></a>
@@ -735,7 +753,7 @@ Public router ingress can terminate TLS; registry control connections can use in
 ### Placer command
 
 ```text
-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
+run-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
 A standalone placer must configure at least one `import_groups` source. Embedded or production integrations can directly inject custom `SandboxGroupProvider` / `SandboxGroupImporter` implementations.
@@ -813,7 +831,7 @@ These fields belong to Conductor configuration. Shared loading, path and environ
 
 With cluster.node_link.endpoint ([Configuration](node.md#conductor-configuration)), `node-ctl conductor serve` dials Registry to join the cluster orchestrated by `cluster-ctl registry/router/placer`. Node-link reuses routesync's framed JSON over h2c engine (node-proxy.md [routesync and shared route views](node-proxy.md#route-synchronization)), with reversed roles: node owns local routes/builds; Registry subscribes and sends commands.
 
-This section defines node behavior. [cluster.md](cluster.md) defines Registry ownership selection, redirect/relay, shardkv replication and membership changes.
+This section defines node behavior. [cluster.md](cluster.md) defines Registry ownership selection, redirect/relay, typed metadata transactions and membership changes.
 
 ```text
 node-ctl conductor serve
@@ -833,7 +851,7 @@ There are two cluster→node paths:
 
 <a id="membership-and-state"></a>
 
-## Membership, replicated state and ownership
+## Membership, durable state and ownership
 
 These are Registry consistency and role-membership contracts, not additional public Sandbox APIs.
 
@@ -845,28 +863,15 @@ These are Registry consistency and role-membership contracts, not additional pub
 
 #### Versioned membership
 
-Registry membership comes only from an operator-distributed configuration file. Each version has a stable label:
+Registry membership comes from an operator-distributed configuration file. Each version has the stable label `registry.<version>.<sha256(sort(member_ids))>`. This is service membership; FoundationDB maintains its own database topology.
 
-```text
-registry.<version>.<sha256(sort(member_ids))>
-```
+| View | Business use |
+|---|---|
+| `active` | Current route, node, node_list and placer_link candidates |
+| `next` | Prepared candidate view during the controlled connection transition |
+| `old_grace` | Previous peers retained for existing node streams and forwarded owner RPCs; excluded from new connection-owner selection |
 
-Registry can hold three views simultaneously:
-
-- `active`: the version clients use to locate route/node/node_list/placer_link owners.
-- `next`: the target version during the joint phase. Writes must satisfy both active and next quorums.
-- `old_grace`: the previous version retained after cutover. Old members may still accept peers/node_link or receive node-owner RPCs, and provide old-head snapshots/certificates as a read-only shardkv set. They are excluded from write owner sets and cannot commit writes using the old view.
-
-```text
-stable(v1)
-  -> load_config(active=v1,next=v2)
-  -> wait_memberlist_ready(v2)
-  -> joint owner set: owners(v1) ∪ owners(v2)
-  -> cutover active=v2, old_grace=v1
-  -> retire(v1)
-```
-
-Reload can load/cancel `next` from a stable state, or promote an already configured `next` to the new `active`. It cannot jump directly from stable(v1) to stable(v2).
+Reload can load/cancel `next` from stable state, then promote an already configured `next` to `active` with `old_grace`. It cannot jump directly from stable v1 to stable v2. Memberlist readiness still gates the transition. All views use the same metadata database; the transition has no Registry storage quorum or snapshot-transfer phase.
 
 <a id="registry-memberlist-boundaries"></a>
 
@@ -916,311 +921,104 @@ Registry considers only members satisfying `role=placer && alive && ready=true &
 
 ### Registry state model
 
+Registry persists execution metadata in an external FoundationDB 7.3.77 database. All Registry processes serving one cluster use the same `foundationdb.cluster_file` and `foundationdb.prefix`. FoundationDB owns storage replication, transaction commit, conflict detection and durable recovery. Registry owns the business transitions and the live node connections.
+
 <a id="registry-data-hierarchy"></a>
 
-#### Data hierarchy
+#### Layers and minimum interfaces
 
-```text
-namespace
-  └── shardKey
-        └── recordSet
-              ├── commit Rev
-              ├── recordKey -> value
-              └── tombstone(recordKey)
-```
+| Layer | Goal | Interface exposed to its caller |
+|---|---|---|
+| Router / Placer | Authenticate and forward requests, or propose placement from a checked directory | Existing route_link / placer_link / node_list HTTP contracts |
+| Registry business services | Validate lifecycle and ownership, dispatch commands, reconcile node reports | Typed Route, Build, Node, Ownership, KeyPair, Directory and ImportSource capabilities |
+| `internal/cluster/metadata` | Define portable records, complete versions, domain outcomes and bounded lists | `Versioned[T]`, `Version`, typed repository methods, `Invalidation`, `ObservationAdmission` |
+| `internal/observebudget` | Bound observations and sequential rearming before native work is admitted | Reservation and release; the shared database owner supplies this capability |
+| `internal/fdbdriver` | Implement atomic metadata operations with the official client | Typed repositories only; native database/transaction handles and storage keys remain private |
+| FoundationDB | Durable transactions and replication | Official Go/C API, used only by the native driver |
 
-- `namespace`: a logical domain, such as `route_link` or `node_link`.
-- `shardKey`: the member-sharding key, such as group or node_id.
-- `recordSet`: the replication, Rev and WATCH domain.
-- `recordKey`: a record key within the recordSet.
-- `Rev`: the recordSet commit version. A record's `rev` is the recordSet Rev at that record's last modification.
-
-A shard is the unit of member sharding; a recordSet is the unit of data replication. Rev does not belong at the shard level, which would unnecessarily couple independently evolving profile/sandbox/build/key domains within that shard.
+The repository stays one Go module. `metadata`, Registry, Router, Placer and business membership are pure Go. All native driver and `cmd/cluster-ctl` sources require `fdb && cgo`; only the command's Registry assembly opens the database. There is no generic public KV/transaction closure, process-local version handle, alternate in-memory production backend or old replication fallback. The interfaces are defined in [metadata/repositories.go](../internal/cluster/metadata/repositories.go).
 
 <a id="registry-owner-resolution"></a>
 
-#### Owner resolution
+#### Business owners and storage placement
 
-```text
-(namespace, shardKey)
-        │
-        ▼
-ShardResolver
-        │  LocateN(shardKey, versioned members, owner_count)
-        ▼
-owner set
-   ┌──────────┬──────────┬──────────┐
-   ▼          ▼          ▼
- registry A  registry B  registry C
- full copy   full copy   full copy
-```
+`membership.owners.route_link/node_link/placer_link/node_list` selects Registry service candidates and node connection affinity. `LocateN` and the placer Maglev selection remain business routing mechanisms. They do not select FoundationDB storage replicas or define a database replication factor. `ConnectionOwners` exposes only the local member ID and ordered candidates for a NodeID; it has no storage API.
 
-`membership.owners.route_link/node_link/placer_link/node_list` controls the owner count for each namespace. Owner count is Registry's internal replication factor. `placer_link.placer_replica_count` controls only the number of ready-placer failover candidates called by Registry; it is not the owner count of the `placer_link` namespace.
+A Registry may read or change an authorized record through the shared database without fetching a peer's local copy. The selected `link_owner` remains the process holding the node's stream, and node commands still reach it through node-owner RPC. `placer_link.placer_replica_count` continues to bound ready-placer failover candidates.
 
 <a id="registry-namespace-schema"></a>
 
-#### Namespace schema
+#### Typed record scopes
 
-| Namespace | Shard key | RecordSet | Record key | Contents |
-|---|---|---|---|---|
-| `route_link` | group | `sandbox` | route_key | Route record |
-| `route_link` | group | `build` | build_id | Build execution state |
-| `node_link` | node_id | `profile` | `profile` | Node profile, labels, liveness, link_owner and low-frequency capacity |
-| `node_link` | node_id | `sandbox` | node_sandbox_id | Per-node sandbox ownership; value contains sandbox_id + sandbox_generation + group + route_key + profile + api_secret_fingerprint |
-| `node_link` | node_id | `build` | build_id | Per-node Build ownership; value contains group |
-| `node_link` | node_id | `key_pair` | api_secret_fingerprint | Node APISecret+ManifestKey pair cache |
-| `node_list` | `node_list` | `nodes` | node_id | Low-frequency node directory and WATCH_LIST |
-| `placer_link` | `import/source/<source_id>` | `import` | `state` | Import-source lease/cursor |
+| Capability | Identity | Durable contents and atomic boundary |
+|---|---|---|
+| Route | `(group, route_key)` | Current stable sandbox identity and node generation; creation intent and exact node ownership are committed together |
+| Build | `(group, build_id)` | Registration intent, accepted node projection, template index and exact node ownership; completion merges with the latest authorized projection |
+| Node | `node_id` | Profile, immutable registration fence, reaping claim and low-frequency directory projection |
+| Ownership | `(node_id, node_sandbox_id)` or `(node_id, build_id)` | Exact reverse references used to authorize reports and cleanup |
+| KeyPair | `(node_id, api_secret_fingerprint)` | Desired pair, lease and matching acknowledgement; replacement invalidates an old ACK |
+| Directory | Fixed 256 buckets of low-frequency node projections | Paginated checked view and bucket change tokens |
+| ImportSource | `source_id` | Lease holder, run ID, business term and successful-page cursor |
 
-A fixed schema defines the current recordSet collection. If a namespace introduces dynamic recordSet names in the future, its recordSet directory must itself be a reserved recordSet in the same shard, following the same CAS/WATCH rules.
+Point operations address one business identity. Listing methods take a scoped opaque cursor and a bounded page size; they do not copy a whole group's or node's records into each write. The driver chunks payloads that need multiple values inside the same transaction and enforces record/transaction limits. It does not remove FoundationDB's transaction size and lifetime limits. A listing cursor is a continuation within one typed scope, not a permanent database snapshot.
 
 <a id="registry-readwrite-protocol"></a>
 
-#### Read/write protocol
+#### Transactions, versions and outcomes
 
-Shardkv must let any receiving Registry member perform CAS, reads and WATCH within the target shard's owner set without introducing a primary for every group/node. It must also preserve a monotonically consistent recordSet committed history across a member failure, joint membership, partial repair and tombstone collection.
+A stored version is the record's complete **10-byte committed versionstamp**: the 8-byte commit version followed by the 2-byte transaction batch order. JSON/text uses exactly 20 hexadecimal characters, for example `0102030405060708fffe`. The last two bytes must survive storage, DTO encoding and cache comparison. Versions are neither timestamps nor node lifecycle `state_version`; import-source terms and sandbox generations retain their separate business meaning.
 
-The approach separates member sharding from data replication:
+CAS compares all ten bytes for equality. A missing record uses the zero value as an expected-absence condition. Live route and directory entries must carry a nonzero committed stamp; malformed encodings and incomplete stamps are rejected. Deleting and recreating identical payload does not revive an old expected version. Returned versions belong to the record's commit, not a read transaction's version. See [metadata/version.go](../internal/cluster/metadata/version.go).
 
-- `shardKey` determines only the owner set.
-- `recordSet` is the replication unit for CAS, Rev, WATCH and commit certificates.
-- Writes use a unique ballot `(round, writer_id)` and two-phase prepare/accept.
-- Accepted state is initially invisible; only a quorum-chosen committed snapshot can enter the committed view.
-- A committed snapshot carries a `CommitCertificate`, allowing later readers/writers to prove that a quorum decided that Rev even if they see only one up-to-date replica.
+The same Route record in the same database history can also use full-byte ordering. Router rejects an older response while a newer cache entry is resident, and rejects an equal version that names a different node target. Equal version plus equal target may refresh endpoint information, since the node profile can change independently. Eviction/TTL removes that cache entry's ordering guard; Router does not keep an unbounded historical watermark. A restored/new database history must not be compared with stale process caches.
 
-Shardkv distinguishes two collections within each shard view:
-
-- `WriteSets`: sets allowed to prepare/accept/install. Active in stable mode; active+next in joint mode; active after cutover with old_grace.
-- `ReadSets`: sets allowed for reads/snapshots/certificate validation. Active in stable mode; active+next in joint mode; active+old_grace after cutover.
-
-A stable commit requires the current `WriteSets` quorum; a joint commit requires active quorum + next quorum. Old_grace participates only in reads and proof of the old head, not new-write commits.
-
-```text
-coordinator
-   │ prepare(ballot)
-   ├──────────────► owner A
-   ├──────────────► owner B
-   └──────────────► owner C
-          quorum promise
-   │ fetch committed snapshot from read members
-   │ install current head on write owners
-   │ accept(record, new_rev)
-   ├──────────────► owner A
-   ├──────────────► owner B
-   └──────────────► owner C
-          quorum accepted
-   │ install(snapshot, commit_certificate)
-   ├──────────────► owner A
-   ├──────────────► owner B
-   └──────────────► owner C
-          quorum installed, laggards repaired best-effort
-```
+The driver separates `Conflict`, `Unavailable`, `Unknown` and capacity errors. A native error proven not committed can be retried within the operation's context and original business preconditions. A commit whose outcome cannot be proved returns `Unknown`; timeout is not evidence of rollback. Callers reconcile against durable state and must not blindly redispatch node side effects because a commit reply or command ACK was lost.
 
 <a id="registry-invariants"></a>
 
-##### Invariants
+#### Lifecycle and ownership invariants
 
-Shardkv correctness rests on these invariants:
+- Route intent and exact sandbox ownership commit atomically before dispatch. Rollback checks this attempt's complete version and identity, so a late compensation cannot erase a newer generation.
+- Build registration intent and node reference commit together. Acceptance and authorized node reports merge in a transaction, preserving a newer ready/error projection. Definite rejection removes only the matching intent and ownership; an ambiguous dispatch remains pinned.
+- Registration returns an immutable node fence. Heartbeats and profile updates carry that original fence. Reading a newer profile does not authorize an older stream to adopt the new registration.
+- Reaping atomically claims the expected stale profile and withdraws its directory entry. Each bounded cleanup verifies the claim, record version and exact ownership. Finalization succeeds only after the eligible references are gone; a resumed older worker cannot delete new registration state.
+- Key-pair ACKs must match the complete current desired material and lease. Expiry/replacement and stale ACKs cannot acknowledge different credentials.
+- Import-source checkpoints verify owner, run ID, term and lease. Cursor advance occurs only after every item in the page succeeded.
 
-1. **The replication unit is a recordSet**. Each `(namespace, shardKey, recordSet)` has one monotonically increasing `Rev` sequence. A commit changes at most one `recordKey`, but consumes the next `Rev` of the entire recordSet.
-2. **Member sharding and data replication are separate**. `shardKey` determines the owner set; `recordSet` determines the Rev, CAS and WATCH domain. Different recordSets within a shard advance their Revs independently.
-3. **A ballot applies to the entire recordSet**. `prepare` raises the recordSet-level promise. Concurrent writes to different keys are therefore ordered in one recordSet Rev sequence instead of independently allocating the same `Rev+1`.
-4. **Accept is invisible**. On `accept`, an owner stores only a pending accepted record. It does not change committed records, trigger WATCH or expose the record to ordinary reads. Only an install with a commit certificate, or a quorum-verifiable snapshot, enters the committed view.
-5. **Each owner holds a complete committed view**. A ready owner can serve local Snapshot/WATCH. A non-ready local view can participate in quorum protocols but cannot act as a complete local read source.
-
-The system assumes crash/fail-stop Registry members that do not forge peer responses. Communication can time out, disconnect or duplicate requests, but request bodies are not Byzantine-tampered. `UpdatedAt` serves only TTL/GC; it does not order consistency.
-
-<a id="registry-commit-certificates"></a>
-
-##### Commit certificates
-
-An accept quorum has already decided the value of a Rev. Keeping only in-memory accepted state would create an availability problem: if an accepting member then fails, the surviving quorum may see just one current replica and one older replica, making it impossible to recover the latest commit by requiring an identical snapshot from a quorum.
-
-The coordinator therefore creates a `CommitCertificate` after accept quorum:
-
-```text
-CommitCertificate {
-  rev      = committed recordSet Rev
-  digest   = hash(rev + canonical live records)
-  ballot   = accepted ballot
-  labels   = membership labels whose owner set accepted quorum
-  members  = accept quorum member ids
-}
-```
-
-`canonical live records` includes only undeleted records. A delete still advances recordSet `Rev` and therefore changes the commit's `digest`; whether an owner locally retains an expired tombstone does not change the logical committed state at that Rev.
-
-Install writes the complete committed snapshot and certificate to owners. A later quorum snapshot read can establish the committed head in either way:
-
-```text
-case A: same (rev,digest) snapshot is returned by quorum
-case B: one snapshot carries valid certificate, and certificate.members proves one ReadSet quorum
-```
-
-Case B permits this sequence: m1/m2 commit while m3 is down; m1 subsequently fails, yet m2+m3 can continue writing. The certificate from m2 proves that the m1/m2 accept quorum decided the Rev, so the coordinator can repair the snapshot onto m3 and then allocate `Rev+1`.
-
-`labels` identifies old heads during membership transitions. A certificate committed in stable V1 has `labels=[V1]`. On the first access to a cold recordSet after entering V1+V2 joint mode, V2 owners may not yet have that head. A snapshot certificate satisfying a V1-owner quorum still proves a committed head. The coordinator first installs/repairs it onto the joint owner set, then performs the next write. A new joint-phase certificate carries both V1/V2 labels because new writes require old quorum + new quorum.
-
-After cutover to `active=V2,old_grace=V1`, V1 leaves `WriteSets` but remains in `ReadSets`. On V2's first access to a cold recordSet, a V1 certificate can still prove its old head; Registry repairs that head onto V2 write owners before continuing. Once V2 write owners hold a certified committed head, subsequent operations need only an online V2 write quorum, not an online V1 old_grace quorum as well. V1 certificates stop being accepted as proof for the current shard view only when `old_grace` is retired. Concurrent old-only and new-only writes that bypass the joint view remain forbidden throughout the transition.
-
-If the coordinator fails after accept quorum but before install quorum, the next writer's prepare sees the pending accepted record. The new coordinator must complete that record under a new ballot and install its certificate before processing its own write. For callers, a CAS returning `ErrQuorum` at such a stage has an unknown outcome: reread/retry using `(recordKey, expectRev)` instead of assuming the write did not happen.
-
-Install must also obey local monotonicity:
-
-- A locally certified view cannot be overwritten by a lower `Rev`.
-- At the same `Rev`, snapshots may replace each other only if their canonical digests match; this allows retained/compacted tombstone representations.
-- Different canonical digests at the same `Rev` represent different committed histories and must be rejected so the caller can retry/report a conflict.
-- An uncertified local view is only a cache awaiting repair and can be replaced by the quorum-chosen committed snapshot.
-
-<a id="registry-write-correctness"></a>
-
-##### Write correctness
-
-A successful CAS linearizes when the accept quorum decides that Rev. Returning success additionally requires an install quorum to have saved the committed snapshot/certificate, so the commit remains recoverable after another member fails.
-
-Two different values cannot both commit at the same Rev because:
-
-- Each write uses a unique ballot `(round, writer_id)`.
-- Any two quorums in the same member set intersect. A joint view requires both old and new quorums, so it also intersects old-only/new-only operations. Membership transitions must not permit concurrent old-only and new-only writes that bypass the joint view.
-- After prepare, an intersecting owner rejects accepts with a lower ballot.
-- If that owner has a pending accepted record, a later writer with a higher ballot sees it in prepare and completes it first. A new write cannot skip an accepted `head+1`.
-- An owner rejects an accept with `rec.rev > local_rev+1`, preventing the coordinator from skipping intermediate Revs.
-
-The recordSet's committed history is therefore a linear sequence. CAS `expectRev` matches the target record's last-modified Rev. If other keys advance the recordSet Rev while the target key stays unchanged, those unrelated writes do not invalidate its `expectRev`.
-
-<a id="registry-read-correctness"></a>
-
-##### Read correctness
-
-Point reads use a quorum by default, without always fetching a full snapshot:
-
-```text
-read(key) from all ReadSet members
-  ├─ if same record version is visible on WriteSet quorum: return it and repair write laggards
-  ├─ if ReadSet quorum reports not found and no ReadSet member reports a record: return not found
-  └─ otherwise fetch committed snapshot, choose committed head, install/repair, then read key
-```
-
-A record version can be returned only when that version itself is quorum-visible. If the key was modified/deleted at a higher Rev, the successful write installed its new version on a `WriteSets` quorum. The read's `ReadSets` intersects the current/old commit-certificate sets and cannot mistake an old version for a quorum-visible one. Not-found also needs a `ReadSets` quorum; during old_grace, empty active replicas alone cannot prove that an old recordSet is absent. A higher version on one replica or conflicting replicas requires fallback to committed-snapshot selection.
-
-Snapshot/EnsureReady always chooses the committed head first, installs it locally and marks `(label, Rev)` ready. When the local recordSet view is ready, callers can use `ReadOptions`:
-
-| Option | Behavior |
-|---|---|
-| `ReadDefault` | Quorum read |
-| `ReadDefault + MinRev` | Read the ready local view directly if its Rev satisfies MinRev; otherwise fall back to quorum |
-| `ReadLocal` | Read only the ready local view; return local-view-behind if not ready |
-| `ReadLocal + MinRev` | Return local-view-behind if the ready local view's Rev is insufficient |
-
-Only `EnsureReady` / `Snapshot` / `Watch` establishes a complete local view. Ordinary accept stores only pending accepted state. Read repair can install one committed record without marking that recordSet complete and ready.
+These rules are expressed by domain methods in the typed repositories, so a consumer cannot separate an atomic operation into independent generic writes.
 
 <a id="registry-watch-correctness"></a>
+<a id="registry-watch"></a>
 
-##### WATCH correctness
+#### Read, observe and directory publication
 
-WATCH uses only committed records:
+`ReadAndObserveRoute` reads the current route and arms its native observation in one transaction. The returned observation is a one-shot instruction to reread. It is not a retained event stream or a count of transitions. Registry Reserve leaders reserve observation capacity before mutating business state; sequential rearming retains the reservation. Setup, active futures and cancellation until reclamation all count against the same database owner's budget. Catalog observations share that budget, with reserved catalog capacity; a second Registry-local limiter must not hide or exceed native usage.
 
-- Pending accepts neither enter the watch log nor wake subscribers.
-- Contiguous single-record commits append put/delete deltas to the watch log.
-- Installing a snapshot that is not a single-record commit at local `rev+1` resets subscribers, requiring another full snapshot.
-- The token contains epoch, membership label, recordSet identity and recordSet Rev. An epoch/label/recordSet mismatch or compacted log requires resubscription/reset.
+The directory stores 256 bucket tokens. `Load` assembles bounded pages, validates the bucket tokens and retries changed buckets before publishing a complete view. `Observe` compares the supplied token before installing its watches; a change between load and observation causes immediate invalidation instead of a lost wakeup. The result is a checked view suitable for placement, not an indefinitely held MVCC read transaction.
 
-WATCH is therefore an incremental cache of the committed view, not the replication protocol itself. Quorum read/CAS/install still provides replication and repair.
+Registry adapts this to the existing node_list protocol: reset, initial items, bookmark, then differences from subsequent checked views. The token is an opaque encoding of the bucket versions. Every reconnect starts a fresh reset/bookmark snapshot; an old token does not request replay from a retained history. Slow or failed subscribers reconnect and rebuild their complete view. Router continues to subscribe to neither routes nor node_list.
 
 <a id="registry-efficiency-boundaries"></a>
 
-##### Efficiency boundaries
+#### Scale and latency boundaries
 
-The current implementation prioritizes very many shards with small-to-medium recordSets:
+The ten-million-sandbox design target does not allocate a watch, Registry copy or cache entry for every sandbox. Router's hot path uses its bounded cache and goes directly to the node. Metadata writes touch the affected identity, exact indexes and ownership; lists and reaping are paginated. High-frequency node usage does not feed the low-frequency directory.
 
-| Operation | RPC rounds | Payload | Notes |
-|---|---:|---|---|
-| Point read of a quorum-visible record | 1 | O(1) record | Hot path; can also repair a lagging replica |
-| Point read missing on the complete quorum | 1 | O(1) record | Direct not-found if no ReadSet member returns the key |
-| Conflicting/lagging point read | read + snapshot/install | O(recordSet) snapshot | Establishes the committed head |
-| CAS | prepare + snapshot + head install + accept + commit install | O(recordSet) snapshot/install | Cold path; owner calls run in parallel |
-| Initial Snapshot/Watch | snapshot + install | O(recordSet) | Establishes a complete ready local view |
-| WATCH delta | 0 additional RPCs | O(1) event | Broadcast only after local committed install |
-
-With `N=3`, a stable write normally takes five sequential phases, with calls to owners parallelized within each phase (prepare, snapshot read, current-head install, accept and new-commit install). Reserve/create/build/import leases are cold paths, whose cost is acceptable relative to sandbox startup/build time; Router's hot data path does not write shardkv. Cost grows mainly with the records in one recordSet, not the global group/node count, because Registry does not scan across shards.
-
-Design constraints:
-
-- RecordSets should not hold unbounded tables. Group sandbox/build tables, node sandbox/build/key tables and the low-frequency node_list directory should remain pageable, evictable or reprojectable from their authority.
-- If a future recordSet needs frequent large-table writes, use a delta certificate based on the preceding digest or split the recordSet; do not continue relying on full-snapshot install.
-- Member readiness provides only fail-fast/liveness signals and does not change quorum calculation. With owner count 3, the runtime guarantee is one member failure from the logical shard's perspective.
-
-<a id="registry-watch"></a>
-
-#### WATCH
-
-WATCH operates at recordSet level. Initial frames provide reset/snapshot, followed by a bookmark marking completion of the initial view, then live deltas.
-
-```text
-watch(from token)
-  -> reset(records, rev, token)
-  -> bookmark(rev, token)
-  -> put/delete(..., rev, token)
-```
-
-The watch token encodes local epoch, shard-view label, recordSet identity and Rev. A mismatched epoch/label/recordSet or compacted changelog requires resubscription for reset + full snapshot.
-
-The route owner also uses the shardkv watch log to wake its own process's waiters. This is not a Router watch: Router does not subscribe to routes.
+Durable transaction latency remains part of the cold Reserve/registration path. Compare it with the old implementation using the same workload, concurrency, data size and durability assumptions. A former in-memory/no-WAL baseline is not a durability-equivalent latency promise. Passing interface, native ABI and correctness tests does not establish a ten-million-object capacity or p99 SLO; those require the delivery workload measurements.
 
 <a id="registry-gc"></a>
 
-#### GC
+#### Deletion and cleanup
 
-GC addresses local storage and WATCH reset-snapshot growth, not data migration. It must preserve two boundaries:
-
-- Do not enumerate across shards.
-- Do not change recordSet committed history.
-
-A tombstone is retained after deletion for short-term `GetRecord`, WATCH reset and debugging. Logical reads/writes care only whether the key currently exists, so expired tombstones can be deleted locally. The commit certificate's canonical digest excludes deleted records: at the same Rev, an owner retaining tombstones and one that compacted them have equivalent committed snapshots, without a same-Rev conflict.
-
-Compactor rules:
-
-- Delete a local tombstone only after retention expires and the owner member is ready.
-- Before compaction, repair the local view through recordSet committed-head selection so collection does not run on a lagging replica.
-- Release expired idle local shards in non-pinned namespaces.
-
-GC does not trigger migration. Active records are still reached through the namespace's authority and reads/writes to the same shard.
+FoundationDB owns physical value/version reclamation. Registry does not run peer snapshot repair or a local replica tombstone compactor. Domain deletion uses complete expected versions and exact ownership. Node-owned terminal retention and bounded, claim-fenced reaping determine which business records may be removed; storage cleanup does not invent a new lifecycle TTL.
 
 <a id="registry-membership-changes"></a>
 
 ### Membership changes
 
-For one shard key:
+The existing active/next/old_grace sequence controls service discovery, node-link affinity and peer availability. During active/next overlap, clients and `ConnectionOwners` use the configured candidate views; after cutover, old_grace peers may still receive commands for streams they already hold. A new connection uses current owner candidates.
 
-```text
-oldOwners   = LocateN(shardKey, V1)
-newOwners   = LocateN(shardKey, V2)
-jointOwners = oldOwners ∪ newOwners
-
-write/read quorum = quorum(oldOwners) + quorum(newOwners)
-repair            = best-effort to jointOwners
-```
-
-Example:
-
-```text
-V1 owners for group G: A,B,C
-V2 owners for group G: B,D,E
-
-joint write sets: A,B,C + B,D,E
-commit requires: quorum(A,B,C) + quorum(B,D,E)
-```
-
-A simple majority of the union is unsafe because it may miss a committed value held only by an old quorum. An overlapping member can count toward both the old and the new quorum.
-
-A membership transition is not a global migration job. Registry does not scan every group/node. Data reaches new owners naturally through these authorities:
-
-- Active node connections, heartbeats and sandbox/build events continuously write to the current node_link owner set.
-- Node owners continuously project low-frequency profiles to node_list under the current membership.
-- Group requests, node reports and group-scoped list/export operations catch up/read-repair the route_link recordSet they access. This does not introduce operator export/import of execution state; [State ownership and disaster-recovery boundaries](#registry-state-ownership-and-disaster-recovery-boundaries) defines that boundary.
-- Placer import/source leases, cursors and selector patches use the current `placer_link` owner set.
-
-On first access to an old recordSet, its old membership certificate can prove the old head; that same operation then repairs it to current `WriteSets`. Joint/cutover therefore needs no cross-shard scan. After cutover, `old_grace` remains a read-only `ReadSets` source so empty active replicas cannot incorrectly declare a cold recordSet absent. Cutover must still be controlled: all new writes during active/next joint mode must use the joint view. If some members write using only next early, the protocol no longer guarantees intersection across membership quorums.
+This sequence does not move metadata, establish database write quorums or copy group/node snapshots. All members continue to access the same FoundationDB database and prefix. FoundationDB topology, redundancy and backup/restore are managed independently of Registry membership. The configuration reload guard still requires the controlled active → next → active transition so connection routing remains coherent.
 
 <a id="router-membership"></a>
 
@@ -1283,45 +1081,30 @@ Read only the protocol involved in an integration or failure. Node events, Regis
 
 #### Connection, redirect and relay
 
-A node can connect to any Registry member. The receiving member first resolves its node owner set with `LocateN(node_id,N)`.
+A node may connect to any Registry member. The receiving member obtains its ordered business connection candidates through `ConnectionOwners`, using `LocateN(node_id, N)` over the configured views.
 
-```text
-node X connects registry A
+| Receiving member | Result |
+|---|---|
+| Is a connection candidate | Accepts the stream and persists registration/profile through the typed Node repository |
+| Is not a candidate and the node supports redirect | Returns the configured candidate endpoints; the node reconnects |
+| Is not a candidate and no usable redirect is available | Relays sequentially to candidates until an owner accepts |
 
-hash(node X) -> node owners = B,C,D
+The profile's `link_owner` identifies the Registry process actually holding the h2 stream. Route-owner create/connect/delete/build/key commands reach that process through node-owner RPC. There is one durable metadata copy from the application's perspective, accessed through FoundationDB; accepting a stream does not start peer metadata replication.
 
-case 1: A ∈ owners
-node X ─────► A
-              │ subscribe node stream
-              ├── replicate profile/sandbox/build/key ─► C
-              └── replicate profile/sandbox/build/key ─► D
-
-case 2: A ∉ owners, node supports redirect
-node X ─────► A
-              │ hello{redirect:[B,C,D]}
-              ▼
-node X reconnects B/C/D
-
-case 3: A ∉ owners, no redirect target
-node X ─────► A ── relay ──► first successful owner in B,C,D
-```
-
-Relay must try owners sequentially in owner order; the first successful responder accepts the subscription. The node profile's `link_owner` identifies the Registry member actually holding the h2 stream. Route-owner create/connect/delete/build/key commands reach `link_owner` through node-owner RPC.
-
-During `old_grace`, old members are excluded from owner sets but can remain `link_owner` and receive forwarded commands. When the node disconnects and reconnects, it resolves owners using current membership.
+During `old_grace`, an old member may remain `link_owner` and receive forwarded commands. After disconnect, the node reconnects using current candidates. The immutable registration fence prevents an overlapping old session from adopting a new profile or erasing its ownership.
 
 <a id="registry-node-records"></a>
 
 #### Node records
 
-Node_link maintains these recordSets:
+Node_link uses these typed record domains:
 
 - `profile`: node_id, labels, runtime_digest, api_endpoint, data_endpoint, Build registration/execution capacity and durable usage, draining, liveness and link_owner. Heartbeat `allocated` memory is the sum of all sandbox NodeReservations on that node; `pool` is the node allocatable pool, not host `memory.current`, VMM charge or guest demand. The low-frequency `node_list` projection includes both endpoints and capacity; usage stays in the node owner's live profile.
 - `sandbox`: the complete per-node sandbox ownership map, `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`.
 - `build`: the complete per-node Build ownership map, `build_id -> {group,template_id}`.
 - `key_pair`: the APISecret+ManifestKey pair cache refreshed by selector patches.
 
-Heartbeats update only runtime/liveness fields in `profile`; they must not rewrite the `sandbox`, `build` or `key_pair` recordSets. The cluster writes sandbox/build ownership before dispatch. Registration usage counts registered/waiting/building rows with neither cancel nor delete intent. Execution usage independently counts every execution claim, including cancellation and cleanup. Accepting intent releases registration capacity; exact host cleanup and terminal commit release execution capacity. Retaining owner-free terminal history does not retain admission usage. The ownership record stays until explicit deletion or node terminal retention actually deletes that Build row and emits `BuildDelete`; Registry then exactly deletes the corresponding Build projection and owner ref. Selector patches update key_pair. Nodes do not generate group/route-key, but validate and separately persist sandbox system context delivered by node-link. A Build's cluster group is a separate system field of the node Build row, outside portable metadata. High-frequency heartbeats therefore do not slow unrelated recordSet CAS queues.
+Heartbeats update only runtime/liveness fields in `profile`; they must not rewrite the `sandbox`, `build` or `key_pair` domains. The cluster writes sandbox/build ownership before dispatch. Registration usage counts registered/waiting/building rows with neither cancel nor delete intent. Execution usage independently counts every execution claim, including cancellation and cleanup. Accepting intent releases registration capacity; exact host cleanup and terminal commit release execution capacity. Retaining owner-free terminal history does not retain admission usage. The ownership record stays until explicit deletion or node terminal retention actually deletes that Build row and emits `BuildDelete`; Registry then exactly deletes the corresponding Build projection and owner ref. Selector patches update key_pair. Nodes do not generate group/route-key, but validate and separately persist sandbox system context delivered by node-link. A Build's cluster group is a separate system field of the node Build row, outside portable metadata. High-frequency profile updates do not rewrite unrelated ownership records.
 
 Within a node, `node_sandbox_id` ownership is written by CAS: replaying the same complete ownership is an idempotent refresh; different ownership returns a conflict without overwriting the old value. If create encounters that conflict before sending the node command, it rolls back only this attempt's RESERVED record, preserves stable `sandbox_id`, consumes the next `sandbox_generation`, generates a new `node_sandbox_id` and retries. The node synchronously rejects an existing or currently-being-created node-local ID before asynchronous launch.
 
@@ -1346,7 +1129,7 @@ Unavailable nodes return a temporary failure without discarding retained managem
 
 The node returns CmdCreate `cmd_ack` only after claiming the unique launch attempt, inserting durable `starting,run_id=""`, and caching/publishing starting. The ACK means node-local launch acceptance, not READY. Subsequent resource preparation, runner or runtime failure publishes retained dead and fences replacement until parent deletion. CmdConnect completes cleanup of old runner/network/RunDir ownership before ACK; atomic paused→starting acceptance restores canonical RunDir/UDS and commits the deadline before publishing starting. Restore failure publishes a paused Upsert and must not enter the fresh-create Delete path. CmdDelete ACK means the node durably accepted `deleting`; it does not wait for the local finalizer. Pending replay is idempotent. Standalone and cluster Delete share one finalizer: node-link owns neither another cleanup implementation nor different path derivation. Deleting Upsert is published before ACK to withdraw business routing while preserving management; final Delete and terminal observation follow hard deletion.
 
-High-frequency usage and liveness are not projected to node_list. That directory contains registration-time labels/capacity/endpoints/runtime and draining changes. The node owner's current node-link connection is the sole liveness authority. Before create/build dispatch, the route owner checks connectivity; failed candidates enter the current placement's exclusion set before reselection. Failure to persist the node_link profile rejects the subscription. A node_list projection failure does not disconnect node_link; later register/heartbeat/resync retries the pending directory projection.
+High-frequency usage and liveness are not projected to node_list. That directory contains registration-time labels/capacity/endpoints/runtime and draining changes. The node owner's current node-link connection is the sole liveness authority. Before create/build dispatch, the route owner checks connectivity; failed candidates enter the current placement's exclusion set before reselection. Registration commits the profile, immutable fence and directory projection atomically; failure rejects the subscription. A profile update that changes directory fields commits the projection and bucket invalidation in the same transaction. Heartbeats that change only usage/liveness leave the directory untouched.
 
 <a id="registry-incremental-subscriptions"></a>
 
@@ -1488,68 +1271,21 @@ kuasar-sandbox.cluster is not tenant configuration. Cluster Build group uses a s
 
 ### node_list
 
-Node_list is a special namespace with a fixed shard key:
-
-```text
-namespace = node_list
-shardKey  = node_list
-recordSet = nodes
-recordKey = node_id
-```
-
-```text
-node_link owner
-  │ labels/capacity/endpoints/runtime/draining low-frequency projection
-  ▼
-node_list owner set: LocateN("node_list", M)
-  ┌─────────────┬─────────────┬─────────────┐
-  ▼             ▼             ▼
- owner A       owner B       owner C
- full view     full view     full view
-  ▲
-  │ WATCH_LIST
-  ▼
-placer consumes one owner at a time
-```
-
-The node_list owner shard is fully replicated. Placer neither needs nor is allowed to merge results from multiple owners as if they were different shards. If the current owner disconnects, placer clears that source view and switches to another owner for a new reset + bookmark.
-
-When node_list is not ready, it may list + repair only from the same node_list owner set. It cannot scan across node shards or create a second authoritative propagation path by rebuilding from node_link.
+Node_list is the low-frequency projection produced by typed Node transactions and read through `NodeDirectory`. It is physically partitioned into 256 fixed buckets in FoundationDB, independent of Registry service membership. The business routing key `node_list` still chooses service candidates for HTTP WATCH_LIST.
 
 <a id="placer-node-list"></a>
 
 #### node_list WATCH_LIST
 
-Registry node owners project these low-frequency node fields into node_list:
+The view contains NodeID, labels, runtime digest, separate API/Data endpoints, configured capacity, Build registration/execution limits and draining. High-frequency usage/headroom remains in the node owner's live profile. Each entry carries its projection record's complete committed `Version`; Placer rejects missing/uncommitted versions and compares all ten bytes when resolving the same node identity from checked sources.
 
-- node_id
-- labels
-- runtime_digest
-- api_endpoint
-- data_endpoint
-- Configured registration/execution Build capacity; usage/headroom does not enter this low-frequency view.
-- draining
-- Liveness timestamp
+1. Placer consumes one service candidate's complete view at a time.
+2. Reset starts a shadow snapshot; items populate it; bookmark atomically makes that source ready.
+3. Registry reads bounded directory pages and validates bucket change tokens before publishing. A subsequent invalidation triggers a new checked load and differences from the last complete view.
+4. Tokens are opaque bucket-version bookmarks. Every reconnect repeats reset/bookmark, without event-history replay or a registry-local numeric revision.
+5. Ordinary heartbeat usage does not update the directory. Low-frequency profile/draining/liveness changes and reaping update the appropriate projection and bucket token transactionally.
 
-```text
-registry node owners
-  │ low-frequency projection
-  ▼
-node_list owner set
-  │ reset + delta + bookmark
-  ▼
-placer local node view
-```
-
-WATCH_LIST semantics:
-
-1. The placer derives node_list owner candidates from active membership and consumes one owner's complete WATCH_LIST at a time.
-2. The first frame is reset, followed by deltas; bookmark marks completion of the initial view.
-3. A watch token encodes the registry-local epoch, node_list shard-view label, and Rev.
-4. An epoch/label mismatch or compacted changelog requires a full resubscription.
-5. Ordinary heartbeats do not trigger WATCH_LIST. Draining changes and coarse liveness refresh do update node_list.
-
-The node_list shard is fully replicated across its owners. The placer neither needs nor may merge results from multiple node_list owners. If its current owner disconnects, the placer clears that source view, fails over to another candidate owner, and repeats reset + bookmark. It must not declare ready before bookmark completes.
+On disconnect/failover, Placer clears the old source and waits for the new candidate's bookmark before becoming ready. It does not combine partial service snapshots into an authoritative directory or reconstruct it by scanning node ownership. Database errors and capacity failures propagate; a partial load is never published as a complete node list.
 
 <a id="route-link"></a>
 
@@ -1623,7 +1359,7 @@ Each operation has its own typed Reserve body: create accepts optional `config`,
 - `exec-session`: query must carry expected stable `sid`; the typed body carries nonnegative int64 `ttl_seconds` and a normalized array of CEL source strings. Headers carry the original `X-API-KEY` and optional `X-Kuasar-Migration-Token`. Registry validates the API key with the route business record's bound APISecret and checks expected stable SID. The raw key terminates at the Registry verifier; it does not enter commands, ACKs, routes, logs or error text. Registry sends `CmdExecSession{APISecretFingerprint,Profile,TTLSeconds,ExecConditions,MigrationToken?,Cluster?}` to the current/new candidate NodeSandboxID. Any other command kind carrying `ExecConditions` must be rejected. The node synchronously performs optional import, object/credential/context validation, authoritative CEL compilation and KAT signing. ACK carries only `ExecSessionResult{ExecAccessToken}`, followed by asynchronous resume under the existing contract. Compilation/minting failure precedes any resume mutation. Conditions exist only in this public request, Reserve body, Command and token; they are never persisted in Route, SandboxRecord, events or metadata, and their source is not logged. MigrationToken likewise lives only in this Reserve/command wire exchange, is never stored in route/SandboxRecord or included in logs/errors, and is discarded after synchronous import. Registry validates the typed result, rereads the current route and returns `Route + ExecSession` without waiting for READY. Router exposes only `execAccessToken` to the client. Token issuance on a READY/RESERVED route neither rewrites its revision nor takes another workflow's rollback fence; only PAUSED transitions to RESERVED under existing activation semantics. Every API call uses its own CmdID and mints a fresh KAT; exec-session Reserve calls are not coalesced.
 - `data`: query must carry expected stable `sid`; a legacy target may supply an effective `port`, which Registry combines with route `target_port` for authentication. The logical exec service does not require a port. Headers carry `X-Access-Token`, and exec additionally carries `E2b-Sandbox-Service: exec`. For ordinary targets, Registry selects EnvdAccessToken or ForwardAccessToken by profile/port; exec validates a KAT with `StableID + ServiceSecret`. Authentication precedes any route CAS/CmdConnect. READY or PAUSING returns directly; PAUSED first CASes to RESERVED and sends CmdConnect; RESERVED waits for events in the current stable lineage. `Route` returns in READY or PAUSING with a valid DataEndpoint. A nonexistent route returns not-found without creating a sandbox.
 
-`Route` is a protected result containing stable SandboxID, current NodeSandboxID, `APIEndpoint`, `DataEndpoint` and `route_revision`. Both endpoints come from the current node runtime/profile looked up by NodeID, rather than being copied into SandboxRecord. Control/build always uses APIEndpoint; data/exec always uses DataEndpoint. Router→node currently uses plaintext HTTP/CONNECT, so each value must point to its reachable plaintext internal listener. External TLS terminates at Router; node-link mTLS is separate. `route_revision` is the current committed revision of the group route recordSet, allowing Router to reject late results for an old node. Router does not subscribe to route_link updates.
+`Route` is a protected result containing stable SandboxID, current NodeSandboxID, `APIEndpoint`, `DataEndpoint` and `route_revision`. Both endpoints come from the current node runtime/profile looked up by NodeID, rather than being copied into SandboxRecord. Control/build always uses APIEndpoint; data/exec always uses DataEndpoint. Router→node currently uses plaintext HTTP/CONNECT, so each value must point to its reachable plaintext internal listener. External TLS terminates at Router; node-link mTLS is separate. `route_revision` is the Route record's complete 10-byte committed version, encoded as 20 hexadecimal characters, allowing Router to reject late results while a newer entry is cached. Router does not subscribe to route_link updates.
 
 CmdConnect/CmdExecSession `CmdID` correlates only the current Command and ACK waiter; it is not a durable idempotency key. Registry does not automatically redeliver the same Command/`CmdID` after ACK timeout, link loss or node restart. The call returns a temporary failure, and an API retry creates a new operation/CmdID. Connect remains retryable through insert-only targets, object-binding validation and node-local launch ownership; an Exec Session retry can issue another KAT. The system persists no command digest, ACK/result or temporary deduplication state.
 
@@ -1662,28 +1398,9 @@ Registry does not apply P2C to placers. P2C belongs inside placer, where it choo
 
 #### Import/source
 
-```text
-source_id = file-prod-a
+`source_id` is the importer's sole execution unit. Ready placers use `LocateN(source_id, readyPlacers, import_source_owner_count)` to select the contenders. They race for `ImportSourceRepository.Acquire(source_id, owner_id, run_id, ttl)` through Registry. This is an atomic database lease; the candidate routing key does not define a storage shard.
 
-ready placers ── LocateN(source_id, readyPlacers, import_source_owner_count)
-       │
-       ▼
-candidates race CAS lease:
-  namespace = placer_link
-  shardKey  = import/source/file-prod-a
-  recordSet = import
-  recordKey = state
-
-lease winner
-  │ Range(cursor, limit)
-  │ GetPlacementHint/GetKey/GetAPISecret(group)
-  │ selector patch with lease fencing
-  │ cursor checkpoint after page success
-  ▼
-node_link key_pair cache refreshed
-```
-
-`source_id` is the importer's sole execution unit. Placers configured with the same `source_id` compete for one `placer_link` source-execution record. Provider point lookups may deduplicate across sources; an Importer Range does not combine multiple sources into one view.
+The winner ranges one source in bounded pages, obtains each group's placement hint and credential pair, and sends selector patches. Only after every item in that page succeeds may it checkpoint the cursor using the same owner, run ID and term. Expired/replaced leases cannot advance a cursor. Provider point lookups may deduplicate across sources, but Importer Range does not combine sources into one execution view.
 
 <a id="router-boundary"></a>
 
@@ -1769,7 +1486,7 @@ Value:
 
 This cache is protected state inside the router process. Root credentials and tokens must not be emitted in public responses, logs, or observability interfaces. `envd_access_token` serves e2b envd ports; `forward_access_token` serves other forwarding targets. `traffic_access_token` is retained with the protected route and returned in create responses; the cluster router does not use it for data-plane authentication.
 
-`route_revision` is the committed revision of the group's route recordSet. A lower revision cannot overwrite the cache. An equal revision with a different NodeSandboxID is also rejected. Late Resolve/Reserve results from an old generation therefore cannot roll back a switched node target.
+`route_revision` is the Route record's complete 10-byte committed stamp, encoded as 20 hexadecimal characters. For the same database history and cache identity, compare all bytes: older versions cannot overwrite a resident entry, and an equal version with a different NodeSandboxID is rejected. Equal version plus equal target can refresh endpoints. Zero or incomplete versions cannot enter the cache. Eviction/TTL removes the resident guard; there is no unbounded history across eviction.
 
 Ports are not parsed from route_key. A legacy port comes from `E2b-Sandbox-Port`, the `<port>-<sandbox_id>` Host, CONNECT authority, or route_link's `target_port`. `target_port>0` enforces that port: use it when the request omits a port, and reject an explicitly conflicting port with 400. If all sources are missing, legacy requests return 400; the router does not default to 49983. `exec` is a portless logical service. A request may carry a port, but the router does not use it to select the backend and does not reject an omitted port. Port contracts for other explicit services remain within the [#63](https://github.com/kuasar-sandbox/orchestrator/issues/63) scope.
 
@@ -1809,7 +1526,7 @@ After a successful handshake, HTTP 401/403/404 comes from the sandbox applicatio
 
 ### Build
 
-Build records live in the group-scoped `route_link` `build` recordSet. The node owns durable registration/execution claims and usage; its node-link owner holds the current connectivity/profile projection for Registry checks.
+Build records are accessed through the group-scoped `BuildRepository`. The node owns durable registration/execution claims and usage; its node-link owner holds the current connectivity/profile projection for Registry checks.
 
 ```text
 router build register
@@ -1839,7 +1556,7 @@ node TTL deletes history; BuildDelete removes projection/ref
 
 Northbound `/v3/templates` resolves omitted profile to `e2b` according to that endpoint's semantics. Internally, profile must be explicit. `builder.target`, supplied through the `X-Kuasar-Sandbox-Builder` header or `metadata["kuasar-sandbox.builder"]`, is immutable after registration: Image, top-level Sandbox E and memory Sandbox targets travel with canonical builder JSON, Registry replay identity, `build_register` and the node Build row. Builds that declare a workspace or inherit one from the source template require an explicit Sandbox target at registration. For builds without workspaces, the worker resolves an omitted target from effective start/ready commands. The route owner persists profile, target/config identity and placement's `APISecretFingerprint` into BuildRecord and passes them through `build_register`. The node uses the full fingerprint to copy the same credential pair into the local Build and writes profile into BuildSpec. Missing/invalid values are rejected, never silently rewritten. Bare builds can choose all three targets but still cannot use e2b-only start/ready commands.
 
-Build Register and ordinary Create share strict header/metadata normalization for resource/network/launch/init/mounts/files/metadata, and also pass `envVars`. Registry's replicated BuildRecord retains non-secret config/env/secure plus irreversible digests of credentials/MMDS values. Raw credentials and initial MMDS values live only in the current dispatch envelope; after validation, the node encrypts them into task-local Build state. Router, Registry, node and worker must each fail closed on instance-only inputs for explicit Image/top-level Sandbox E, unconditional rejection of restore, and target/output-ref mismatches. Filtering by one hop does not replace another hop's trust boundary.
+Build Register and ordinary Create share strict header/metadata normalization for resource/network/launch/init/mounts/files/metadata, and also pass `envVars`. Registry's durable BuildRecord retains non-secret config/env/secure plus irreversible digests of credentials/MMDS values. Raw credentials and initial MMDS values live only in the current dispatch envelope; after validation, the node encrypts them into task-local Build state. Router, Registry, node and worker must each fail closed on instance-only inputs for explicit Image/top-level Sandbox E, unconditional rejection of restore, and target/output-ref mismatches. Filtering by one hop does not replace another hop's trust boundary.
 
 Placer filters low-frequency configured capacity. Registry validates the node's live connection and current registration-usage headroom, then persists immutable `BuildStarting` dispatch intent and the `(node_id,build_id)` ownership ref before `build_register`. The node's durable registration transaction is the sole authoritative admission decision; Registry has no `AdmitBuild` lease or terminal `ReleaseBuild` RPC. Insufficient known headroom or a definitive admission rejection permits exclusion/reselection after exact intent cleanup. Timeout, reset, disconnect, ACK loss or an invalid/uncertain acceptance leaves the operation bound to the selected node and BuildID. A retry must replay the identical stored definition and credential/MMDS digests to that same target; it cannot silently move an ambiguous registration to another node. Equal build_id values on different nodes remain distinct node-local bindings.
 
@@ -1861,7 +1578,7 @@ Build placement continues to use registration headroom and the selected node's d
 
 The node is the authority for sandbox/build execution state. Sandbox/build records in `route_link`, reverse ownership in `node_link`, and admission-related projections derive from node facts for routing, queries or scheduling; operator files cannot create or transfer them. A terminal Build remains a projection of one node execution. Its produced template/manifest is durably reusable; the BuildRecord is not.
 
-Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If an execution shard is completely lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. The explicit recovery/bootstrap protocol is not implemented; [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) is a historical proposal closed as not planned, not an available recovery procedure; manually writing execution rows must not bypass that limitation.
+FoundationDB database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. The explicit recovery/bootstrap protocol is not implemented; [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) is a historical proposal closed as not planned, not an available recovery procedure; manually writing execution rows must not bypass that limitation.
 
 The historical proposal [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33), closed as not planned, described an **unbound durable route** with a migration token as the disaster-recovery object for a portable paused sandbox, not SandboxRecord. It would contain no old SID/NodeID/admission and use fresh placement, target-node snapshot validation and a new identity before READY established the runtime route. This recovery-only workflow is not implemented or available through normal route_link APIs.
 
@@ -1880,10 +1597,10 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 | node_link disconnect | Node owner immediately rejects new submissions to that node; route owner excludes/reselects it. Once the disconnected node's last heartbeat is older than node_dead_after, revision-fenced reaping claims the stale profile and cleans its directory and eligible execution projections. Dead/deleting Sandbox management rows and their exact ownership remain; in-flight reservations are not swept. Reconnection reports full/incremental state |
 | Conductor process restart | Reconciles durable rows against systemd units: adopts live sandboxes/builders, retries deleting/paused cleanup, resumes already accepted interrupted restores, and cleans/fails missing fresh executions. This is not whole-host reboot |
 | Node host reboot | Running processes are gone. If node SQLite/artifacts survive, reconciliation still processes paused rows, accepted interrupted restores, cleanup owners and retained Builds. Missing executions converge through node reports/exact route cleanup; no blanket durable-row deletion or automatic recreation of every old sandbox |
-| One Registry member fails | Service continues while the owner-set quorum is available; access to the same shard or authority reports read-repair recovered members. A single-owner deployment cannot tolerate losing its owner |
-| Multiple Registry failures lose quorum | Affected shards stop writes, without unsafe degraded writes |
-| Registry execution shard is completely lost while nodes survive | Do not import backup execution rows. Rebuilding projections from node facts requires an unavailable recovery/bootstrap protocol (#34 is a historical, unimplemented proposal) |
-| Membership change | active/next joint write quorums + old_grace read-only certificates/snapshots |
+| One Registry member fails | Other service candidates still access durable metadata in FoundationDB. Nodes whose stream owner failed reconnect; registration fences reject stale overlapping sessions |
+| FoundationDB is unavailable or cannot commit | Metadata operations fail or return an explicit unknown commit outcome; Registry does not fall back to local writes |
+| FoundationDB metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; the application recovery/bootstrap protocol remains unavailable (#34 is historical) |
+| Membership change | Changes service candidates and node-link affinity; all views keep using the same database and prefix |
 | Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. Provider data and portable templates/manifests remain reusable, but do not restore lost Registry execution ownership. Migration-token route recovery (#33) is a historical, unimplemented proposal, not an execution-row import or an available fallback |
 
 <a id="registry-performance"></a>
@@ -1893,8 +1610,8 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 - Hot data path: a complete node-target cache hit forwards directly to the node, including pausing/paused/starting, without Registry access.
 - Cold Place path: group → route_link owner → ready-placer failover → node-owner connectivity/current-usage check → authoritative node admission. Definitively failed candidates are excluded before reselection; ambiguous Build dispatch stays pinned.
 - Very many groups: Router does not subscribe to groups; Registry does not scan across them; placer import pages independently by source_id.
-- Very many nodes: node_link shards by node_id; node_list holds only a low-frequency directory, not high-frequency usage.
-- Membership changes: no global promoter; node reports, group requests, source imports and read repair drive convergence.
+- Very many nodes: profile and ownership operations are scoped to NodeID; the bucketed node_list holds low-frequency directory data, not high-frequency usage.
+- Membership changes: no metadata migration or peer read-repair; connection re-registration and reports reconcile business state through the shared database.
 
 <a id="registry-cluster-stub-e2e"></a>
 
@@ -1911,7 +1628,7 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 
 Source stub integration runs with `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh`
 or the required `make test-source` gate. It uses the selected source workspace
-and starts real control-plane processes without a MicroVM. Prepared product
+and starts real control-plane processes plus an isolated FoundationDB test fixture without a MicroVM. Prepared product
 E2E uses the [shared public runner and focused cases](../CONTRIBUTING.md#node-validation).
 `test/source/cluster_stub.sh` covers N=1 and multi-member Registry, joint/old_grace membership cutover, group import, key distribution, explicit create/Reserve, stable-SandboxID CmdConnect, SandboxID↔NodeSandboxID translation, control/build reaching the API listener, data/exec reaching the Data listener, ExecSession Reserve/CmdExecSession issuance, `service=exec` KAT rejection/two-hop validation and the second-hop buffered tunnel, route cache, BuildRegister, orphan-route cleanup, reconnect full-sync convergence after a lost Build Delete, and emptied-node convergence. The stub's `reboot-empty` deliberately empties simulated state; it is not proof that real conductor startup deletes durable SQLite rows.
 
@@ -2008,6 +1725,6 @@ See the authoritative [registration dispatch and projection reconciliation](../i
 
 ### Placer references
 
-- [cluster.md](cluster.md) — overall registry membership, shardkv, node_link, route_link, and placer_link design.
+- [cluster.md](cluster.md) — Registry membership, typed FoundationDB metadata, node_link, route_link and placer_link design.
 - [cluster.md](#client-access) — router Reserve consumption, route cache, and data-plane forwarding.
 - [node.md](node.md) — node-side node-link registration, heartbeats, command execution, and key TTL.

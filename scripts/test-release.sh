@@ -6,8 +6,9 @@ set -euo pipefail
 # their own verified workspace outside these standalone packaging fixtures.
 export GOWORK=off
 
-# Archive fixtures target x86_64 even when this gate runs on an ARM host.
-# Validators run natively; payload fixtures are inspected, never executed.
+# Native cluster fixtures use the matching host architecture and the pinned
+# runtime. Validation itself only inspects payloads; the build gate also runs
+# the launcher before any artifact is considered ready for packaging.
 # Archive fixtures prescribe 0755 directories regardless of the caller's umask.
 # mktemp still creates the enclosing workspace with mode 0700.
 umask 022
@@ -16,6 +17,12 @@ umask 022
 export GOSUMDB=sum.golang.google.cn GOTOOLCHAIN=local GOWORK=off
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "$(uname -m)" in
+  x86_64) fixture_arch=x86_64; fixture_goarch=amd64; other_arch=aarch64; other_goarch=arm64 ;;
+  aarch64) fixture_arch=aarch64; fixture_goarch=arm64; other_arch=x86_64; other_goarch=amd64 ;;
+  *) echo 'test-release: native Linux x86_64 or aarch64 host required' >&2; exit 1 ;;
+esac
+export PUBLISHER_TEST_ARCH="$fixture_arch"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -40,6 +47,7 @@ fi
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-deb-extract.py"
 GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 
 init_fixture_repo() {
@@ -264,15 +272,52 @@ install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publis
 install -m 0644 "$ROOT/scripts/release-publisher.py" "$fixture_root/scripts/release-publisher.py"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
+install -m 0755 "$ROOT/scripts/cluster-native.py" "$fixture_root/scripts/cluster-native.py"
+install -m 0644 "$ROOT/scripts/deb_extract.py" "$fixture_root/scripts/deb_extract.py"
+install -m 0755 "$ROOT/scripts/run-cluster-ctl" "$fixture_root/scripts/run-cluster-ctl"
+install -m 0644 "$ROOT/scripts/cluster-native-lock.json" "$fixture_root/scripts/cluster-native-lock.json"
+cp -a "$ROOT/scripts/native-licenses" "$fixture_root/scripts/native-licenses"
+python3 -B "$fixture_root/scripts/cluster-native.py" prepare --arch "$fixture_arch"
 printf 'module github.com/kuasar-sandbox/orchestrator\n\ngo 1.24\n' > "$fixture_root/go.mod"
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   mkdir -p "$fixture_root/cmd/$binary"
   printf 'package main\nfunc main() {}\n' > "$fixture_root/cmd/$binary/main.go"
 done
+cat > "$fixture_root/cmd/cluster-ctl/native.go" <<'GONATIVE'
+//go:build fdb && cgo
+
+package main
+
+/*
+#cgo LDFLAGS: -lfdb_c -lresolv
+#define FDB_API_VERSION 730
+#include <foundationdb/fdb_c.h>
+#include <arpa/nameser.h>
+
+// Go's cgo resolver on older glibc links libresolv separately. Exercise a
+// resolver-library symbol even on newer hosts where getaddrinfo is in libc.
+static int resolver_fixture(void) {
+    unsigned char message[12] = {0};
+    ns_msg parsed;
+    return ns_initparse(message, sizeof(message), &parsed);
+}
+*/
+import "C"
+
+func init() {
+    if C.fdb_get_max_api_version() < 730 {
+        panic("FoundationDB client must implement API 730")
+    }
+    if C.resolver_fixture() != 0 {
+        panic("bundled resolver must parse an empty DNS message")
+    }
+}
+GONATIVE
 mkdir -p "$fixture_root/."
 cp -a "$ROOT/deploy" "$fixture_root/deploy"
 printf 'accelerator_commit := %s\nconnector_commit := %s\nsandboxer_commit := %s\nruntime_commit := %s\n' \
   "$accelerator_sha" "$connector_sha" "$sandboxer_sha" "$runtime_sha" > "$fixture_root/Makefile"
+printf 'fixture_arch := %s\nfixture_goarch := %s\n' "$fixture_arch" "$fixture_goarch" >> "$fixture_root/Makefile"
 cat >> "$fixture_root/Makefile" <<'EOF'
 .PHONY: build
 build:
@@ -280,17 +325,17 @@ build:
 	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
 	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
 	test "$$(git -C ../guest-runtime rev-parse HEAD)" = "$(runtime_commit)"
-	mkdir -p bin/x86_64
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl ./cmd/node-ctl
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/cluster-ctl ./cmd/cluster-ctl
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/node-stub-ctl ./cmd/node-stub-ctl
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/e2b-key-ctl ./cmd/e2b-key-ctl
+	mkdir -p bin/$(fixture_arch)
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(fixture_goarch) go build -trimpath -buildvcs=true -o bin/$(fixture_arch)/node-ctl ./cmd/node-ctl
+	python3 -B scripts/cluster-native.py build --arch "$(fixture_arch)" --output "bin/$(fixture_arch)" -- -trimpath -buildvcs=true
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(fixture_goarch) go build -trimpath -buildvcs=true -o bin/$(fixture_arch)/node-stub-ctl ./cmd/node-stub-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(fixture_goarch) go build -trimpath -buildvcs=true -o bin/$(fixture_arch)/e2b-key-ctl ./cmd/e2b-key-ctl
 EOF
 fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts go.mod cmd deploy Makefile)"
-(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH="$fixture_goarch" go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/node-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/cmd/node-ctl/main.go"
-(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH="$fixture_goarch" go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/node-ctl)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
@@ -304,9 +349,12 @@ if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_
   fail "release accepted a binary without source stamping"
 fi
 GOWORK=off make --no-print-directory -C "$fixture_root" build
+LC_ALL=C readelf -d "$fixture_root/bin/$fixture_arch/cluster-ctl" | grep -Fq '[libresolv.so.2]' \
+  || fail "native fixture did not exercise the resolver library dependency"
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
-  install -m 0755 "$fixture_root/bin/x86_64/$binary" "$TMP/bin/$binary"
+  install -m 0755 "$fixture_root/bin/$fixture_arch/$binary" "$TMP/bin/$binary"
 done
+cp -a "$fixture_root/bin/$fixture_arch/cluster-runtime" "$TMP/bin/cluster-runtime"
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
@@ -320,11 +368,11 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_GUEST_RUNTIME_SOURCE_DIR="$TMP/guest-runtime" \
   RELEASE_GUEST_RUNTIME_SOURCE_SHA="$runtime_sha" \
   RELEASE_GUEST_RUNTIME_VERSION=runtime-v0.2.0 \
-  RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
-"$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+  RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 "$fixture_arch" "$TMP/bundle"
+"$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$TMP/bundle"
 # A current publication may bind its own binaries to its selected commit;
 # standalone validation above does not require or query historical sources.
-if SOURCE_SHA=0000000000000000000000000000000000000000 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle" > "$TMP/publication-source.log" 2>&1; then
+if SOURCE_SHA=0000000000000000000000000000000000000000 "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$TMP/bundle" > "$TMP/publication-source.log" 2>&1; then
   fail "publication accepted an owner binary built at another commit"
 fi
 grep -Fq 'Go payload must be built from the clean selected commit' "$TMP/publication-source.log" \
@@ -337,12 +385,14 @@ grep -Fq 'Go payload must be built from the clean selected commit' "$TMP/publica
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
   "$fixture_project_sha" release/v1.2.x
 
-archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
+archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-$fixture_arch.tar.gz"
 RELEASE_DEPENDENCIES=accelerator=v0.1.3,connector=v0.1.2,sandboxer=v0.1.3,runtime=runtime-v0.2.0 \
-  "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+  "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$TMP/bundle"
 go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
-  ./bin/e2b-key-ctl ./deploy/node-ctl.service \
+  ./bin/e2b-key-ctl ./bin/run-cluster-ctl ./lib/cluster-ctl/ld.so \
+  ./lib/cluster-ctl/libfdb_c.so ./lib/cluster-ctl/libresolv.so.2 ./share/licenses/orchestrator/native/runtime.json \
+  ./deploy/node-ctl.service \
   ./deploy/node-telemetry.service ./deploy/telemetry.example.yaml \
   ./deploy/telemetry-fanout.example.yaml \
   ./deploy/telemetry-prometheus.example.yaml \
@@ -379,8 +429,8 @@ SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_GUEST_RUNTIME_SOURCE_DIR="$TMP/guest-runtime" \
   RELEASE_GUEST_RUNTIME_SOURCE_SHA="$runtime_sha" \
   RELEASE_GUEST_RUNTIME_VERSION=runtime-v0.2.0 \
-  RELEASE_SOURCE_ROOT="$fixture_root" "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
-cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
+  RELEASE_SOURCE_ROOT="$fixture_root" "$ROOT/scripts/release.sh" package v1.2.3 "$fixture_arch" "$TMP/reproducible"
+cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-$fixture_arch.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
 # Repack altered payloads and validate their actual identity and architecture.
@@ -391,7 +441,7 @@ repack_candidate() (
 )
 
 git clone --quiet --no-local "$fixture_root" "$TMP/target-source"
-for target in darwin/amd64 linux/arm64; do
+for target in "darwin/$fixture_goarch" "linux/$other_goarch"; do
   (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
     go build -trimpath -buildvcs=true -o "$TMP/target-${target//\//-}" ./cmd/node-ctl)
   release_materials_require_go_revision "$TMP/target-${target//\//-}" "$fixture_project_sha"
@@ -401,18 +451,20 @@ for target in darwin/amd64 linux/arm64; do
   tar -xzf "$archive" -C "$candidate/root"
   install -m 0755 "$TMP/target-${target//\//-}" "$candidate/root/bin/node-ctl"
   repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted a $target payload with regenerated metadata and checksums"
   fi
-  grep -Fq 'must target linux/amd64' "$candidate/result.log" || fail "$target failed for an unrelated reason"
+  grep -Fq "must target linux/$fixture_goarch" "$candidate/result.log" || fail "$target failed for an unrelated reason"
 done
 
 
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
-  (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -buildvcs=true -o "$TMP/cgo-$binary" "./cmd/$binary")
+  cgo=1; expected_cgo=0
+  if [ "$binary" = cluster-ctl ]; then cgo=0; expected_cgo=1; fi
+  (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED="$cgo" GOOS=linux GOARCH="$fixture_goarch" \
+    go build -tags=fdb -trimpath -buildvcs=true -o "$TMP/cgo-$binary" "./cmd/$binary")
   release_materials_require_go_revision "$TMP/cgo-$binary" "$fixture_project_sha"
-  go version -m "$TMP/cgo-$binary" | grep -Fq 'CGO_ENABLED=1' \
+  go version -m "$TMP/cgo-$binary" | grep -Fq "CGO_ENABLED=$cgo" \
     || fail "CGO fixture did not preserve its actual build setting"
   candidate="$TMP/wrong-cgo-$binary"
   cp -a "$TMP/bundle" "$candidate"
@@ -420,13 +472,39 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   tar -xzf "$archive" -C "$candidate/root"
   install -m 0755 "$TMP/cgo-$binary" "$candidate/root/bin/$binary"
   repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
-    fail "validator accepted a CGO_ENABLED=1 payload with regenerated metadata and checksums: $binary"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted CGO_ENABLED=$cgo for $binary"
   fi
-  grep -Fq 'with CGO_ENABLED=0' "$candidate/result.log" || fail "CGO fixture failed for an unrelated reason"
+  grep -Fq "with CGO_ENABLED=$expected_cgo" "$candidate/result.log" || fail "CGO fixture failed for an unrelated reason"
 done
 
-for extra in bin/unexpected-tool deploy/unexpected.service bin/extra/; do
+# A CGO=1 build alone is insufficient: the native assembly tag must be present.
+(cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=1 GOOS=linux GOARCH="$fixture_goarch" \
+  go build -trimpath -buildvcs=true -o "$TMP/untagged-cluster-ctl" ./cmd/cluster-ctl)
+candidate="$TMP/no-native-tag"
+cp -a "$TMP/bundle" "$candidate"
+mkdir "$candidate/root"
+tar -xzf "$archive" -C "$candidate/root"
+install -m 0755 "$TMP/untagged-cluster-ctl" "$candidate/root/bin/cluster-ctl"
+repack_candidate "$candidate"
+if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
+  fail "validator accepted cluster-ctl without the fdb build tag"
+fi
+grep -Fq 'must be built with the fdb tag' "$candidate/result.log" || fail "missing-tag fixture failed for an unrelated reason"
+
+candidate="$TMP/missing-native-resolver"
+cp -a "$TMP/bundle" "$candidate"
+mkdir "$candidate/root"
+tar -xzf "$archive" -C "$candidate/root"
+rm "$candidate/root/lib/cluster-ctl/libresolv.so.2"
+repack_candidate "$candidate"
+if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
+  fail "validator accepted a native runtime without libresolv"
+fi
+grep -Fq 'missing member "./lib/cluster-ctl/libresolv.so.2"' "$candidate/result.log" \
+  || fail "missing resolver was rejected for an unrelated reason"
+
+for extra in bin/unexpected-tool deploy/unexpected.service bin/extra/ lib/cluster-ctl/extra.so share/licenses/orchestrator/native/extra.txt; do
   candidate="$TMP/extra-entry-${extra//\//-}"
   cp -a "$TMP/bundle" "$candidate"
   mkdir "$candidate/root"
@@ -437,7 +515,7 @@ for extra in bin/unexpected-tool deploy/unexpected.service bin/extra/; do
        case "$extra" in bin/*) chmod 0755 "$candidate/root/$extra" ;; *) chmod 0644 "$candidate/root/$extra" ;; esac ;;
   esac
   repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted an uncontracted archive entry: $extra"
   fi
   grep -Fq 'unexpected member' "$candidate/result.log" || fail "extra entry failed for an unrelated reason"
@@ -454,7 +532,7 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-argume
     node-stub-ctl) other=e2b-key-ctl ;;
     e2b-key-ctl) other=node-ctl ;;
     command-line-arguments)
-      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+      (cd "$TMP/target-source" && GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH="$fixture_goarch" \
         go build -o "$TMP/command-line-tool" ./cmd/node-ctl/main.go)
       install -m 0755 "$TMP/command-line-tool" "$candidate/root/bin/node-ctl"
       binary=node-ctl
@@ -466,7 +544,7 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-argume
     cp "$candidate/root/bin/$other" "$candidate/root/bin/$binary"
   fi
   repack_candidate "$candidate"
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted a swapped main package with regenerated metadata and checksums"
   fi
   grep -Fq "must be the $binary main package" "$candidate/result.log" \
@@ -474,24 +552,24 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl command-line-argume
 done
 
 cp -a "$TMP/bundle" "$TMP/tampered"
-printf 'tampered\n' >> "$TMP/tampered/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
-if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
+printf 'tampered\n' >> "$TMP/tampered/assets/orchestrator-v1.2.3-linux-$fixture_arch.tar.gz"
+if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$TMP/tampered" >/dev/null 2>&1; then
   fail "validator accepted a tampered archive"
 fi
 
 cp -a "$TMP/bundle" "$TMP/extra"
 touch "$TMP/extra/assets/release.json"
-if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
+if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$TMP/extra" >/dev/null 2>&1; then
   fail "validator accepted an extra asset"
 fi
 
-if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package 01.2.3 "$fixture_arch" \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 "$other_arch" \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
-  fail "packager accepted x86_64 payloads as aarch64"
+  fail "packager accepted payloads for the wrong architecture"
 fi
 
 for mutation in setuid setgid writable-directory writable-binary; do
@@ -507,7 +585,7 @@ for mutation in setuid setgid writable-directory writable-binary; do
   esac
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted $mutation with regenerated checksums"
   fi
   grep -Fq 'unsafe type, mode or ownership' "$candidate/result.log" \
@@ -519,7 +597,7 @@ mkdir "$TMP/nonroot-owner/root"
 tar -xzf "$archive" -C "$TMP/nonroot-owner/root"
 tar --sort=name --owner=1234 --group=0 --numeric-owner --mtime=@1700000000 \
   -czf "$TMP/nonroot-owner/assets/$(basename "$archive")" -C "$TMP/nonroot-owner/root" .
-if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/nonroot-owner" >/dev/null 2>&1; then
+if "$fixture_root/scripts/release.sh" validate v1.2.3 "$fixture_arch" "$TMP/nonroot-owner" >/dev/null 2>&1; then
   fail "validator accepted non-root numeric ownership with regenerated checksums"
 fi
 
@@ -532,7 +610,7 @@ for command in git curl wget cargo make gcc; do
 done
 env PATH="$TMP/standalone-bin:$PATH" GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local \
   SOURCE_SHA="$fixture_project_sha" "$TMP/standalone-tools/scripts/release.sh" validate \
-  v1.2.3 x86_64 "$TMP/bundle"
+  v1.2.3 "$fixture_arch" "$TMP/bundle"
 echo "test-release: standalone validation without checkouts/downloads/build PASS"
 
 echo "test-release: PASS"

@@ -1,0 +1,125 @@
+{
+  "foundationdb_version": "7.3.77",
+  "foundationdb_commit": "3ea44ce1d9003ad095e408039e1f755c319c4dfb",
+  "go_binding": "v0.0.0-20260416192139-3ea44ce1d900",
+  "glibc_version": "2.36-9+deb12u14",
+  "x86_64_cpu_requirement": "AVX",
+  "headers": {
+    "url": "https://github.com/apple/foundationdb/releases/download/7.3.77/foundationdb-clients_7.3.77-1_amd64.deb",
+    "sha256": "b6c263723009bddbc30b6ae8cf9854340bd35cef14152abb0da8fb5af2b91254",
+    "files": {
+      "fdb.options": "0dbd32a988be2bc64dfd66c4f67023e32aeced33d34964c6146c268aa90bf3b0",
+      "fdb_c.h": "cf9192d77dd98091e5dcac722734e79ab2ea457fa59742839ff06e61b6112cb6",
+      "fdb_c_apiversion.g.h": "334ab3b6e0d3c20ec2562962c8b820fcb92c156edbc15d1deabaafc0b06143a8",
+      "fdb_c_options.g.h": "ca1a68e02e96fd7227e89c69c52530ba86a3004d82ba36322b4aeeeeb2ea9835",
+      "fdb_c_shim.h": "75ea59863db3ff68508c366f240e581f05f61159f61889209c693a38b1076ba7",
+      "fdb_c_types.h": "82ea67e61592873c637e228764f5921179a710826be558ee0d1703023913e14d"
+    }
+  },
+  "foundationdb_license": {
+    "url": "https://raw.githubusercontent.com/apple/foundationdb/3ea44ce1d9003ad095e408039e1f755c319c4dfb/LICENSE",
+    "sha256": "2f841c1cd8c117763475eb8317f4a4afa0172212f8684a84c38fb937a8c1b220"
+  },
+  "architectures": {
+    "x86_64": {
+      "goarch": "amd64",
+      "loader": "ld-linux-x86-64.so.2",
+      "client": {
+        "url": "https://github.com/apple/foundationdb/releases/download/7.3.77/foundationdb-clients_7.3.77-1_amd64.deb",
+        "sha256": "b6c263723009bddbc30b6ae8cf9854340bd35cef14152abb0da8fb5af2b91254"
+      },
+      "packages": [
+        {
+          "name": "libc6",
+          "source": "glibc",
+          "version": "2.36-9+deb12u14",
+          "url": "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb",
+          "sha256": "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf"
+        },
+        {
+          "name": "liblzma5",
+          "source": "xz-utils",
+          "version": "5.4.1-1+deb12u1",
+          "url": "https://deb.debian.org/debian/pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_amd64.deb",
+          "sha256": "f96d8876b53ec89d76a992bc199679b818cf518225a768954d9451fb556a4eb7"
+        },
+        {
+          "name": "zlib1g",
+          "source": "zlib",
+          "version": "1:1.2.13.dfsg-1",
+          "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb",
+          "sha256": "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4"
+        }
+      ],
+      "files": {
+        "lib/cluster-ctl/ld.so": "02bcda52c1a5dfc236f94d9e5255b4a0e26347d8a372a5223b650e31f291ce3c",
+        "lib/cluster-ctl/libc.so.6": "6b4a45352fd0c540a9c7c718f35ce8c8e46a4e482f9d3885a910c32d1a0e1421",
+        "lib/cluster-ctl/libdl.so.2": "95d521b2c39fd0333271b6fdcdddff878ae82001a304313a837b8e728ebe3cb1",
+        "lib/cluster-ctl/libfdb_c.so": "e4ad7fed7b7580bf5f7b38f0a4279d37e698f69d534182e5de0b8beeef6cd1b1",
+        "lib/cluster-ctl/liblzma.so.5": "983464a4e0e840f85b519cb7b6153b60c75d6473f4d4c32a5a37b3f9894c52c3",
+        "lib/cluster-ctl/libm.so.6": "7f2ca87f652f56b094462474b076749e90e689d0ecb9cb63c7679820b271b4e7",
+        "lib/cluster-ctl/libpthread.so.0": "b93a680da8a05b939b235c1533572e7a2f6d3d8808bf70209997edc64ea5fedc",
+        "lib/cluster-ctl/libresolv.so.2": "ac3924c6cdb26cdfff10fec2ab2748705c83931b39c7f6e638a2b31ae34d420b",
+        "lib/cluster-ctl/librt.so.1": "41c72def458b8cfb6aab96a7dbada7454dd216d89aac65fb085eb52bead51def",
+        "lib/cluster-ctl/libz.so.1": "7e2a72b4c4b38c61e6962de6e3f4a5e9ae692e732c68deead10a7ce2135a7f68",
+        "share/licenses/orchestrator/native/Apache-2.0": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "share/licenses/orchestrator/native/GPL-2": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+        "share/licenses/orchestrator/native/LGPL-2.1": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95",
+        "share/licenses/orchestrator/native/foundationdb/LICENSE": "2f841c1cd8c117763475eb8317f4a4afa0172212f8684a84c38fb937a8c1b220",
+        "share/licenses/orchestrator/native/libc6/copyright": "40c7e1f2118531f038ca22999bd976901254e1bc5cd1b0f0211bdd064c599987",
+        "share/licenses/orchestrator/native/liblzma5/copyright": "a2dc8fac0f496e1c58aff67018cf0c6b88336316afa5642f9335b71642e28aa8",
+        "share/licenses/orchestrator/native/zlib1g/copyright": "9e5b96d63773a5d177ba264254390f792be07e41748ebd94730981c6cac31cc6"
+      }
+    },
+    "aarch64": {
+      "goarch": "arm64",
+      "loader": "ld-linux-aarch64.so.1",
+      "client": {
+        "url": "https://github.com/apple/foundationdb/releases/download/7.3.77/libfdb_c.aarch64.so",
+        "sha256": "cd080617d5ba235aeb9916b258a6a840bee5cc21e54be3599614e2aca58d605d"
+      },
+      "packages": [
+        {
+          "name": "libc6",
+          "source": "glibc",
+          "version": "2.36-9+deb12u14",
+          "url": "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb",
+          "sha256": "01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4"
+        },
+        {
+          "name": "liblzma5",
+          "source": "xz-utils",
+          "version": "5.4.1-1+deb12u1",
+          "url": "https://deb.debian.org/debian/pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_arm64.deb",
+          "sha256": "647ce9d81e41c30071ce6ac0d3324579216a33aaa1d28971d6952315f6a95a75"
+        },
+        {
+          "name": "zlib1g",
+          "source": "zlib",
+          "version": "1:1.2.13.dfsg-1",
+          "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb",
+          "sha256": "52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913"
+        }
+      ],
+      "files": {
+        "lib/cluster-ctl/ld.so": "17538b8f9889a470c061f69a8fea8124da89627311cd16546c133a89f09056df",
+        "lib/cluster-ctl/libc.so.6": "e4ac8ae1d81e4865e3aadedb962879cf9415903b3f2ba81ec75e9962b86ab8b0",
+        "lib/cluster-ctl/libdl.so.2": "e5e9474a683596d59cc9e13246bc83878433e53c3befbabd73e3da9ccb5fe174",
+        "lib/cluster-ctl/libfdb_c.so": "cd080617d5ba235aeb9916b258a6a840bee5cc21e54be3599614e2aca58d605d",
+        "lib/cluster-ctl/liblzma.so.5": "530e774de0f3fd8754351f387f52db6a0cb134b350e43d80044dea7109400f17",
+        "lib/cluster-ctl/libm.so.6": "3c4cb3be0b974edf05f023f85ab15107fb5afc2687163593d0d4cf8e80c17b39",
+        "lib/cluster-ctl/libpthread.so.0": "434dcd27f22fc8bf236c0c00541a1e503d302aa796c333729a2cd15a4cfe4814",
+        "lib/cluster-ctl/libresolv.so.2": "5f3769c75e5eca6ff14f2c7a22bcc8cfeeef31da9545434a281a5fdd1f66d6f0",
+        "lib/cluster-ctl/librt.so.1": "41d135537fba3875ebccccace6e4bb5e546941877376504b3921e663f83e42e7",
+        "lib/cluster-ctl/libz.so.1": "ffb1ab496e6eced03ab679075f9f2c415c7728a145cc7f63d614497102d73822",
+        "share/licenses/orchestrator/native/Apache-2.0": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "share/licenses/orchestrator/native/GPL-2": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+        "share/licenses/orchestrator/native/LGPL-2.1": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95",
+        "share/licenses/orchestrator/native/foundationdb/LICENSE": "2f841c1cd8c117763475eb8317f4a4afa0172212f8684a84c38fb937a8c1b220",
+        "share/licenses/orchestrator/native/libc6/copyright": "40c7e1f2118531f038ca22999bd976901254e1bc5cd1b0f0211bdd064c599987",
+        "share/licenses/orchestrator/native/liblzma5/copyright": "a2dc8fac0f496e1c58aff67018cf0c6b88336316afa5642f9335b71642e28aa8",
+        "share/licenses/orchestrator/native/zlib1g/copyright": "9e5b96d63773a5d177ba264254390f792be07e41748ebd94730981c6cac31cc6"
+      }
+    }
+  }
+}

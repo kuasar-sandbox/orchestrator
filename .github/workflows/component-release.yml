@@ -324,7 +324,13 @@ jobs:
               make test
               make vet
             fi
+            # cluster-ctl is the only native command. The matching runner must
+            # supply the C toolchain. The Python reader extracts dependencies
+            # after downloading and checking their SHA256 against the repo lock.
+            command -v cc
+            command -v readelf
             make build
+            python3 -B scripts/with-test-fdb.py -- make test-cluster-native
             VERSION='${{ needs.preflight.outputs.version }}'
             [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
             export SOURCE_DATE_EPOCH

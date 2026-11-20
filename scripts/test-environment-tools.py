@@ -144,19 +144,34 @@ class EnvironmentTools(unittest.TestCase):
             (root / "orchestrator").mkdir()
             tools.mkdir()
             scripts.mkdir(parents=True)
+            workspace_command = (
+                '-B /inputs/release/ci/integration/go_workspace.py --root /src '
+                '--owners orchestrator --bound-release --version {version} '
+                '--dependency accelerator {accelerator_version} {accelerator_sha} '
+                '--dependency connector {connector_version} {connector_sha} '
+                '--dependency sandboxer {sandboxer_version} {sandboxer_sha} '
+                '--dependency guest-runtime {runtime_version} {runtime_sha}'
+            ).format(**values)
+            native_command = '-B scripts/with-test-fdb.py -- make test-cluster-native'
             commands = {
                 "go": '#!/bin/sh\ntest "$GOWORK" = "$HOME/selected.go.work"\n',
-                "make": '#!/bin/sh\ntest "$GOWORK" = "$HOME/selected.go.work"\n',
+                "make": ('#!/bin/sh\n'
+                         'test "$GOWORK" = "$HOME/selected.go.work" || exit 97\n'
+                         '{ printf "make"; printf "|%s" "$@"; printf "\\n"; } >> "$CALLS"\n'),
                 "python3": (
                     '#!/bin/sh\n'
-                    'test "$*" = "-B /inputs/release/ci/integration/go_workspace.py --root /src '
-                    '--owners orchestrator --bound-release --version {version} '
-                    '--dependency accelerator {accelerator_version} {accelerator_sha} '
-                    '--dependency connector {connector_version} {connector_sha} '
-                    '--dependency sandboxer {sandboxer_version} {sandboxer_sha} '
-                    '--dependency guest-runtime {runtime_version} {runtime_sha}" || exit 98\n'
-                    'echo "$HOME/selected.go.work"\n'
-                ).format(**values),
+                    '{ printf "python3"; printf "|%s" "$@"; printf "\\n"; } >> "$CALLS"\n'
+                    f'if test "$#" -eq {len(workspace_command.split())} && test "$*" = "{workspace_command}"; then\n'
+                    '  echo "$HOME/selected.go.work"\n'
+                    f'elif test "$#" -eq 5 && test "$*" = "{native_command}"; then\n'
+                    '  test "$GOWORK" = "$HOME/selected.go.work" || exit 97\n'
+                    '  test "$PWD" = "$HOME/orchestrator" || exit 96\n'
+                    '  shift 3\n'
+                    '  "$@"\n'
+                    'else\n'
+                    '  exit 98\n'
+                    'fi\n'
+                ),
                 "git": "#!/bin/sh\ncase $1 in rev-parse) echo " + values["source_sha"]
                        + ";; show) echo 1;; *) exit 92;; esac\n",
             }
@@ -168,19 +183,33 @@ class EnvironmentTools(unittest.TestCase):
                 'set -eu\ntest "$RELEASE_SOURCE_ROOT" = "$HOME/orchestrator"\nprintf "%s|%s|%s|%s|%s|%s|%s\\n" "$1" "$2" "$3" '
                 '"$ACCELERATOR_VERSION" "$CONNECTOR_VERSION" "$SANDBOXER_VERSION" "$RUNTIME_VERSION" >> "$OBSERVED"\n')
             observed = root / "observed"
+            calls = root / "calls"
             for arch in ("x86_64", "aarch64"):
                 with self.subTest(arch=arch):
                     observed.unlink(missing_ok=True)
+                    calls.unlink(missing_ok=True)
                     # Workbench does not inherit the release job's host env.
                     environment = {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                   "HOME": str(root), "TARGET_ARCH": arch, "OBSERVED": str(observed)}
+                                   "HOME": str(root), "TARGET_ARCH": arch,
+                                   "OBSERVED": str(observed), "CALLS": str(calls)}
                     result = subprocess.run([shutil.which("bash"), "-euo", "pipefail", "-c", selected_program],
                                             cwd=root, env=environment, text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(calls.read_text().splitlines(), [
+                        "python3|" + "|".join(workspace_command.split()),
+                        *(["make|test", "make|vet"] if arch == "x86_64" else []),
+                        "make|build",
+                        "python3|" + "|".join(native_command.split()),
+                        "make|test-cluster-native",
+                    ])
                     self.assertEqual(observed.read_text().splitlines(), [
                         "|".join((operation, values["version"], arch, values["accelerator_version"],
                                   values["connector_version"], values["sandboxer_version"], values["runtime_version"]))
                         for operation in ("package", "validate")])
+                    for rejected in (workspace_command + " unexpected", native_command + " unexpected"):
+                        result = subprocess.run([tools / "python3", *rejected.split()],
+                                                env=environment, text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 98, result.stderr)
 
 
 if __name__ == "__main__":

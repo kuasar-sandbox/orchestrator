@@ -9,6 +9,16 @@
   ],
   "helpers": [
     {
+      "name": "fdbserver-test",
+      "env": "FDB_SERVER_TEST_BIN",
+      "cases": ["orchestrator.cluster-*.sh"]
+    },
+    {
+      "name": "fdbcli-test",
+      "env": "FDB_CLI_TEST_BIN",
+      "cases": ["orchestrator.cluster-*.sh"]
+    },
+    {
       "name": "proxy-lifecycle",
       "env": "PROXY_LIFECYCLE_BIN",
       "cases": ["orchestrator.proxy-inplace-restart.sh"]
