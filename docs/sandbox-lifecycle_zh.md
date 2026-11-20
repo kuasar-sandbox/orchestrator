@@ -385,6 +385,9 @@ checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceO
 
 ### Checkpoint 内存保存
 
+`checkpoint.mode=local`（tarstream）与 `bundle` 只选择保存格式，两者都支持 holder
+交接与后台保存。
+
 启动时启用 checkpoint 支持的 runtime，在内存捕获指定实际 checkpoint ID 时，可以在
 冻结不可变内存、释放运行资源并完整删除普通 RunDir 后完成 Pause。原 `sandbox-ctl`
 作为仍有明确所有者的 memory holder 继续写出内存。临时 socket 位于规范化 RunDir
@@ -410,6 +413,8 @@ socket、marker 和本代目录，不处理 RunDir 或任何父目录；替换�
 非阻塞证明；进程死亡、socket 消失或看似完整的 payload 都不能单独证明释放。
 有效捕获记录（包括 Aborted intent）及其稳定 writer/RAM 锁 inode 随 BaseDir 保留到
 终端删除，current-memory locator 前移不会隐藏尚待资源 receipt 结算的准确证明。
+Aborted 准备后的每次重试使用独立 memoryID、递增 epoch、JSON 和绑定 nonce 的 RAM pin；
+同一逻辑 checkpoint 的尝试共用稳定准备 writer 锁。
 这些元数据保留不延长无引用 payload 的生命周期；数据文件仍按普通引用图执行 GC。
 
 producer 未发布 `FileReady` 即退出时，已有 RAM 读者继续占有原额度；最后一个 pin
@@ -425,9 +430,14 @@ producer 未发布 `FileReady` 即退出时，已有 RAM 读者继续占有原�
 已 fence 后，独立 holder 目录清理错误只保留重试所有权，不重新计 R，也不阻塞控制器
 启动。捕获 JSON、原证明及未结清资源的错误保持原有失败语义。启动时 accepted-running/dead
 路径仅对已识别的退役/保存 pending 使用既有 worker 延期，不用宽泛 pending 分类
-吞掉损坏记录。
+吞掉损坏记录。恢复库存还包含已经准入、尚未规范化的 live handoff 候选。
+对 capture 根本未启动的 intent，只有准确 fence、取得稳定准备锁并复查没有 capture/R
+之后才清除；保留 BaseDir 和原 ResumeSource。
 
-再次 Pause 默认等待上一轮内存保存。等待可取消，沙箱保持 `running`，不持有 SID
+本次捕获可能新增冻结 RAM 义务时，默认等待前轮实际 `RAMReleased`，不能只等
+`FileReady`。host 使用 SDK runtime 的显式能力判断准入，不按保存格式或是否保留用户
+checkpoint 分流。纯磁盘捕获、已知同步 fallback 跳过该门禁且不建立 retirement permit。
+等待可取消，沙箱保持 `running`，不持有 SID
 生命周期锁或 source-operation grant；结束后重新验证实例及 RunID。请求
 `{"noWaitForPreviousMemorySave":true}` 可以在保存仍未完成时立即返回 409。
 TTL、idle 和资源压力后台流程使用不等待选项及原有重试机制。恢复较老的 checkpoint

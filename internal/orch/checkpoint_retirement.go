@@ -252,7 +252,11 @@ func (o *Orchestrator) readRunCapture(ctx context.Context, m store.RunPoolOwners
 		return nil, nil
 	}
 	run := artifact.CurrentRun{SandboxID: m.TaskID, InstanceID: m.RetirementInstanceID, RunID: m.RunID}
-	record, err := artifact.ReadCheckpointCapture(ctx, filepath.Join(m.RetirementBaseDir, "checkpoint"), run, m.RetirementCheckpointID)
+	var attempt []string
+	if m.MemoryID != "" {
+		attempt = []string{m.MemoryID}
+	}
+	record, err := artifact.ReadCheckpointCapture(ctx, filepath.Join(m.RetirementBaseDir, "checkpoint"), run, m.RetirementCheckpointID, attempt...)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -279,7 +283,7 @@ func (o *Orchestrator) recoverRunCapture(ctx context.Context, m store.RunPoolOwn
 	if err != nil || record == nil || !record.Committed || !record.RuntimeRetired || record.RAMReleased || record.Aborted || record.Discarded {
 		return record, err
 	}
-	path, err := memorycheckpoint.RecordPath(filepath.Join(m.RetirementBaseDir, "checkpoint"), m.RetirementCheckpointID)
+	path, err := memorycheckpoint.RecordPath(filepath.Join(m.RetirementBaseDir, "checkpoint"), m.RetirementCheckpointID, record.MemoryID)
 	if err != nil {
 		return nil, err
 	}
@@ -326,6 +330,9 @@ func (o *Orchestrator) mutateRetirement(ctx context.Context, runID string, mutat
 }
 
 func (o *Orchestrator) prepareCheckpointRetirement(ctx context.Context, sb *types.Sandbox, checkpointID string) (*ctl.HostRetirementPermit, error) {
+	if plan := captureAdmissionFor(ctx, sb); plan != nil && plan.checked && plan.retentionSupported != nil && !*plan.retentionSupported {
+		return nil, nil
+	}
 	if sb == nil || sb.InstanceID == "" || sb.RunID == "" || checkpointID == "" {
 		return nil, nil
 	}
@@ -679,7 +686,7 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 		return err
 	}
 	if record == nil {
-		return errCaptureOutcomePending
+		return o.reconcileUnstartedCapture(ctx, current)
 	}
 	sandbox, err := o.st.Get(ctx, current.TaskID)
 	if err != nil {
@@ -794,4 +801,89 @@ func (o *Orchestrator) cleanupCheckpointAfterMemorySave(ctx context.Context, ret
 	if err != nil {
 		o.log.Warn("checkpoint garbage collection after memory save deferred", "sid", retired.TaskID, "err", err)
 	}
+}
+
+// An intent can survive a conductor crash before the capture command reaches
+// PrepareHolder. Absence alone is not a release fact: fence preparation and
+// the exact producer while holding the SID/source authority, then recheck.
+func (o *Orchestrator) reconcileUnstartedCapture(ctx context.Context, observed store.RunPoolOwnership) error {
+	unlock := o.lifecycle.Lock(observed.TaskID)
+	defer unlock()
+	current, found, err := o.st.RunPoolOwnership(ctx, observed.RunID)
+	if err != nil {
+		return err
+	}
+	if !found || current.RetirementOperationID == "" {
+		return nil
+	}
+	if !sameUnstartedCapture(current, observed) {
+		return errCaptureOutcomePending
+	}
+	sb, err := o.st.Get(ctx, current.TaskID)
+	if err != nil {
+		return err
+	}
+	if sb == nil || sb.State != types.StatePausing || sb.RunID != current.RunID ||
+		sb.InstanceID != current.RetirementInstanceID || sb.BaseDir != current.RetirementBaseDir {
+		return errCaptureOutcomePending
+	}
+	ctx, release, err := o.trySourceOperation(ctx, sb)
+	if err != nil {
+		return errors.Join(errRetirementPending, err)
+	}
+	defer release()
+	preparation, err := memorycheckpoint.LockPreparation(filepath.Join(current.RetirementBaseDir, "checkpoint"), current.RetirementCheckpointID)
+	if err != nil {
+		return errors.Join(errCaptureOutcomePending, err)
+	}
+	defer preparation.Close()
+	checkAbsent := func() error {
+		record, err := o.readRunCapture(ctx, current)
+		if err != nil {
+			return err
+		}
+		if record != nil {
+			return errCaptureOutcomePending
+		}
+		state, err := o.retirementResourceState()
+		if err != nil {
+			return err
+		}
+		if state != nil {
+			if _, pending := state.RetainedMemory(current.TaskID); pending {
+				return api.ErrPreviousMemorySavePending
+			}
+		}
+		return nil
+	}
+	if err := checkAbsent(); err != nil {
+		return err
+	}
+	// The preparation lock excludes a delayed holder transition. This is the
+	// only non-delete path allowed to fence an intent without a capture fact.
+	if err := o.fenceSandboxRunnerUnit(ctx, current.RunID); err != nil {
+		return errors.Join(errRetirementPending, err)
+	}
+	latest, found, err := o.st.RunPoolOwnership(ctx, current.RunID)
+	if err != nil {
+		return err
+	}
+	if !found || !sameUnstartedCapture(latest, current) {
+		return errCaptureOutcomePending
+	}
+	if err := checkAbsent(); err != nil {
+		return err
+	}
+	if err := o.abortCheckpointRetirement(ctx, sb, ctl.HostRetirementPermit{OperationID: current.RetirementOperationID}); err != nil {
+		return err
+	}
+	return o.finalizeRunningSandboxDeadLocked(ctx, sb)
+}
+
+func sameUnstartedCapture(a, b store.RunPoolOwnership) bool {
+	return a.Role == "" && b.Role == "" && a.MemoryID == "" && b.MemoryID == "" && a.MemoryEpoch == 0 && b.MemoryEpoch == 0 &&
+		!a.ParentRetired && !b.ParentRetired && a.Kind == runKindSandbox && b.Kind == runKindSandbox &&
+		a.RunID == b.RunID && a.TaskID == b.TaskID && a.RetirementOperationID == b.RetirementOperationID &&
+		a.RetirementCheckpointID == b.RetirementCheckpointID && a.RetirementInstanceID == b.RetirementInstanceID &&
+		a.RetirementBaseDir == b.RetirementBaseDir
 }

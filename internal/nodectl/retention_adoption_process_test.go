@@ -225,3 +225,49 @@ func TestRetainedMemoryRPCPublishedACKLossWithoutRestart(t *testing.T) {
 	waitRetainedCharge(t, socket, 0, 0)
 	controller.stop(t)
 }
+
+func TestRetainedMemoryRPCLiveCandidateSurvivesControllerRestart(t *testing.T) {
+	for _, phase := range []string{"retention_intent", "retention_admitted"} {
+		for _, managed := range []bool{false, true} {
+			name := phase + "/direct"
+			if managed {
+				name = phase + "/managed"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Setenv("NODECTL_TEST_PHYSICAL", "4294967296")
+				dir := shortTestDir(t)
+				root, socket := filepath.Join(dir, "cgroups"), filepath.Join(dir, "ctl.sock")
+				if managed {
+					t.Setenv("NODECTL_RETENTION_MANAGED", filepath.Join(dir, "managed"))
+				}
+				writeFakeCgroupRoot(t, root)
+				controller := startRecoveryController(t, socket, root, phase)
+				source := startHoldingRetentionProcess(t, dir, socket)
+				successor := startRetentionClient(t, "successor", dir, socket)
+				successor.send(t, "admit")
+				if got := controller.next(t); got != "phase:"+phase {
+					t.Fatalf("handoff phase: %s", got)
+				}
+				before := waitRetentionStage(t, socket, retentionAdopting)
+				controller.kill(t)
+				controller = startRecoveryController(t, socket, root, "")
+				if got := successor.next(t); got != "ok:admit" {
+					t.Fatalf("candidate replay: %s", got)
+				}
+				after := waitRetentionStage(t, socket, retentionActive)
+				if after.OwnerToken != before.Handoff.Token || after.OwnerFile != before.Handoff.File ||
+					after.OwnerLease.PID != successor.cmd.Process.Pid {
+					t.Fatal("restart changed handoff identity")
+				}
+				waitRetainedCharge(t, socket, 512<<20, 1)
+				source.run(t, "ram_released")
+				source.run(t, "release_retained")
+				waitRetainedCharge(t, socket, 256<<20, 1)
+				source.run(t, "close")
+				successor.run(t, "close")
+				waitRetainedCharge(t, socket, 0, 0)
+				controller.stop(t)
+			})
+		}
+	}
+}

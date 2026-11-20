@@ -364,6 +364,9 @@ Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. 
 
 ### Checkpoint memory saving
 
+`checkpoint.mode=local` (tarstream) and `bundle` select saving formats. Both
+support holder handoff and background saving.
+
 For a runtime started with checkpoint support, a memory capture with an actual
 checkpoint ID can complete Pause after freezing its immutable memory, releasing
 runtime resources and removing the complete ordinary RunDir. The existing
@@ -400,6 +403,9 @@ process, a missing socket, nor a complete-looking payload is sufficient alone.
 Valid capture records, including aborted intents, and their stable writer/RAM
 lock inodes remain until terminal BaseDir deletion. Advancing the current-memory
 locator cannot hide the exact proof still needed by a retained resource receipt.
+Each retry after an aborted preparation has its own memoryID, increasing epoch,
+JSON and nonce-bound RAM pin; the preparation writer lock is shared across
+attempts of the logical checkpoint.
 This metadata retention does not retain unreferenced payloads: their ordinary
 reference graph continues to determine data-file garbage collection.
 
@@ -423,8 +429,16 @@ block controller startup. Capture JSON, original proof and unsettled-resource
 errors keep their existing failure semantics. Startup's accepted-running/dead
 paths defer only the identified retirement/save-pending conditions to existing
 workers; they never hide malformed records under a broad pending category.
+Startup inventories live admitted handoff candidates before the ledger is ready.
+An intent whose capture never started is cleared only after exact fencing, a
+stable preparation lock and a recheck that no capture/R exists; BaseDir and the
+previous ResumeSource remain available.
 
-A second Pause waits for this previous memory save by default. The wait is
+A capture that can add a new frozen-RAM obligation waits for the previous
+`RAMReleased` by default; `FileReady` is insufficient. The host uses the SDK
+runtime's explicit capability for admission, independently of saving format or
+whether the API retains a named user checkpoint. Disk-only captures and known
+synchronous fallbacks skip this gate and create no retirement permit. The wait is
 cancelable, leaves the sandbox `running`, and holds neither the SID lifecycle lock
 nor the source-operation grant. After waiting, admission rechecks the exact
 sandbox instance and RunID. To return 409 immediately while the save remains

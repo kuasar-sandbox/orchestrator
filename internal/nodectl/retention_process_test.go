@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v3"
+
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
@@ -30,7 +33,32 @@ func TestRetainedMemoryClientProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := recoverySandboxConfig(socket, cgroup)
-	path, err := memorycheckpoint.RecordPath(filepath.Join(dir, "checkpoint"), "checkpoint-one")
+	if managed := os.Getenv("NODECTL_RETENTION_MANAGED"); managed != "" && role == "successor" {
+		dir := filepath.Join(managed, "retained-sid")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		pidfile, err := os.OpenFile(filepath.Join(dir, "retained-sid.pid"), os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pidfile.Close()
+		lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+		if err := unix.FcntlFlock(pidfile.Fd(), unix.F_SETLK, &lock); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintln(pidfile, os.Getpid()); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := yaml.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "retained-sid.yaml"), raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path, err := memorycheckpoint.RecordPath(filepath.Join(dir, "checkpoint"), "checkpoint-one", "memory-one")
 	if err != nil {
 		t.Fatal(err)
 	}

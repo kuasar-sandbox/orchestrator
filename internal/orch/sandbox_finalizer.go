@@ -669,7 +669,9 @@ func (o *Orchestrator) fenceSandboxRunner(ctx context.Context, runID string) err
 }
 
 // Destruction callers must first own the deleting SID and its exclusive source
-// grant. Other callers use fenceSandboxRunner's pending-memory guard.
+// grant. Unstarted capture recovery additionally holds the preparation writer
+// fence and proves no capture or retained charge exists. Other callers use
+// fenceSandboxRunner's pending-memory guard.
 func (o *Orchestrator) fenceSandboxRunnerUnit(ctx context.Context, runID string) error {
 	unit, err := o.resolveRunUnit(ctx, runKindSandbox, runID)
 	if err != nil {

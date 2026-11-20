@@ -39,6 +39,23 @@ func runRecoveryControllerHelper(t *testing.T) {
 		Allocator: NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1 << 30, MinGrantStep: 1}),
 		Inventory: &Inventory{ControllerSocket: socket, CgroupScanPaths: []string{root}, Pool: state.AllocatablePool},
 	}
+	if managed := os.Getenv("NODECTL_RETENTION_MANAGED"); managed != "" {
+		srv.Inventory.ManagedRunRoot = managed
+		srv.Inventory.processVMMCgroup = func(pid int) string {
+			for _, name := range []string{"source", "successor"} {
+				path := filepath.Join(root, name)
+				pids, err := readCgroupPIDs(path)
+				if err == nil {
+					for _, found := range pids {
+						if found == pid {
+							return path
+						}
+					}
+				}
+			}
+			return ""
+		}
+	}
 	if phase := os.Getenv("NODECTL_CRASH_PHASE"); phase != "" || os.Getenv("NODECTL_DROP_ADOPT_ACK") != "" {
 		var holdOnce, dropOnce sync.Once
 		srv.phaseHook = func(got string) {

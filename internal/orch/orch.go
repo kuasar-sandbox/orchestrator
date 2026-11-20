@@ -1495,7 +1495,8 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	}
 	// Every caller owns the lifecycle lock here. Never wait under that lock or
 	// after beginPauseOperation has detached the caller's cancellation.
-	if pending, err := o.previousMemorySavePending(ctx, sb, true); err != nil {
+	ctx = withCaptureAdmission(ctx)
+	if pending, err := o.captureMemorySavePending(ctx, sb, request, true); err != nil {
 		return "", err
 	} else if pending {
 		return "", api.ErrPreviousMemorySavePending

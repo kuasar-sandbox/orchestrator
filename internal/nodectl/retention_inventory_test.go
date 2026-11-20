@@ -14,7 +14,7 @@ import (
 // real, stable proof identities and model its service directory as already gone.
 func newTestRetentionRecord(t *testing.T, directory string, record memorycheckpoint.CaptureRecord) (*memorycheckpoint.RecordWriter, error) {
 	t.Helper()
-	path, err := memorycheckpoint.RecordPath(directory, record.CheckpointID)
+	path, err := memorycheckpoint.RecordPath(directory, record.CheckpointID, record.MemoryID)
 	if err != nil {
 		return nil, err
 	}

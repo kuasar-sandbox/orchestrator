@@ -122,7 +122,7 @@ func startCheckpointHolder(t *testing.T, f sandboxFinalizerFixture, owner store.
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	path, err := memorycheckpoint.RecordPath(spec.Directory, spec.Record.CheckpointID)
+	path, err := memorycheckpoint.RecordPath(spec.Directory, spec.Record.CheckpointID, spec.Record.MemoryID)
 	if err != nil {
 		t.Fatal(err)
 	}

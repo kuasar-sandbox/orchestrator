@@ -197,3 +197,170 @@ func TestRetainedMemoryAdoptionUnknownOrLiveCandidateKeepsIntent(t *testing.T) {
 		})
 	}
 }
+
+func TestRetainedMemoryInventoryRestoresLiveUnpublishedCandidate(t *testing.T) {
+	for _, phase := range []string{"retention_intent", "retention_admitted"} {
+		for _, settled := range []bool{false, true} {
+			name := phase + "/pending-R"
+			if settled {
+				name = phase + "/settled-removed-source-pool"
+			}
+			t.Run(name, func(t *testing.T) {
+				srv, writer, capture := committedRetentionFixture(t)
+				if settled {
+					if err := writer.Update(func(r *memorycheckpoint.CaptureRecord) {
+						r.FileReady, r.RAMReleased, r.PayloadRef = true, true, "payload"
+					}); err != nil {
+						t.Fatal(err)
+					}
+					if resp := srv.handleRetained(os.Getpid(), &Message{Type: resource.TypeReleaseRetained, SandboxID: "sid", Retention: &capture}, "original-token"); resp.Type != TypeAck {
+						t.Fatal(resp.Msg)
+					}
+					srv.State.PoolName = "replacement"
+				}
+				_, req := adoptionCandidate(t, srv, capture, "live-candidate")
+				srv.phaseHook = func(got string) {
+					if got == phase {
+						panic("restart")
+					}
+				}
+				func() {
+					defer func() {
+						if got := recover(); got != "restart" {
+							t.Fatalf("phase interruption: %v", got)
+						}
+					}()
+					if _, err := srv.buildRetainedAdmitOK(nil, os.Getpid(), req, nil); err != nil {
+						t.Fatal(err)
+					}
+				}()
+				before := srv.State.retainedSnapshot("sid")
+				state := makeState(8<<30, 0)
+				state.PoolName, state.Wm.StartupFactor = srv.State.PoolName, .75
+				if err := srv.Inventory.Recover(state); err != nil {
+					t.Fatalf("recover live candidate: %v", err)
+				}
+				r, ok := state.retentionReservation("sid")
+				if !ok || !r.Provisional || r.Token != before.Handoff.Token || r.PeerPID != before.Handoff.Lease.PID ||
+					r.LeasePath != before.Handoff.Candidate || r.CacheReservation != 4<<20 {
+					t.Fatalf("candidate execution was not restored exactly: %+v", r)
+				}
+				want := uint64(512 << 20)
+				if settled {
+					want = 256 << 20
+				}
+				if got := state.ResourceSnapshot(); got.Reserved.MemoryBytes != want || got.CacheAllocated != 4<<20 || got.ReservationCount != 1 {
+					t.Fatalf("restart accounting: %+v", got)
+				}
+				// Ordinary managed/lease recovery must not gain the handoff's
+				// narrowly authenticated authority to replace this reservation.
+				if err := state.InstallProvisional(ProvisionalSpec{SandboxID: "sid", PeerPID: os.Getpid(),
+					ReservationMemory: 256 << 20, RecoveryKey: "ordinary", Capacity: Resources{MemoryBytes: 1 << 30}}); err == nil {
+					t.Fatal("ordinary recovery bypassed retained owner guard")
+				}
+				recovered := recoveredPoolServer(srv, state)
+				resp, err := recovered.buildRetainedAdmitOK(nil, os.Getpid(), req, nil)
+				if err != nil || resp.Status != StatusAdmitted || resp.Token != before.Handoff.Token {
+					t.Fatalf("exact candidate replay: %+v %v", resp, err)
+				}
+				if got := state.ResourceSnapshot(); got.Reserved.MemoryBytes != want || got.CacheAllocated != 4<<20 || got.ReservationCount != 1 {
+					t.Fatalf("replay charged a second execution: %+v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestRetainedMemoryInventoryRejectsChangedCandidateIdentity(t *testing.T) {
+	for _, field := range []string{"file", "start-time", "lease", "path", "pool"} {
+		t.Run(field, func(t *testing.T) {
+			srv, _, capture := committedRetentionFixture(t)
+			_, req := adoptionCandidate(t, srv, capture, "live-candidate")
+			srv.phaseHook = func(phase string) {
+				if phase == "retention_intent" {
+					panic("restart")
+				}
+			}
+			func() {
+				defer func() {
+					if got := recover(); got != "restart" {
+						t.Fatalf("phase interruption: %v", got)
+					}
+				}()
+				if _, err := srv.buildRetainedAdmitOK(nil, os.Getpid(), req, nil); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			r := srv.State.retainedSnapshot("sid")
+			switch field {
+			case "file":
+				r.Handoff.File.Inode++
+			case "start-time":
+				r.Handoff.StartTime++
+			case "lease":
+				r.Handoff.Lease.FloorMemory++
+			case "path":
+				r.Handoff.Candidate = resource.LeasePath(srv.Identity, "sid")
+			case "pool":
+				r.Handoff.Pool = "absent"
+			}
+			if err := writeRetainedReceipt(srv.Identity, r); err != nil {
+				t.Fatal(err)
+			}
+			state := makeState(8<<30, 0)
+			if err := srv.Inventory.Recover(state); err == nil {
+				t.Fatal("changed candidate was accepted")
+			}
+			if _, ok := state.retentionReservation("sid"); ok {
+				t.Fatal("unverified candidate received B")
+			}
+			if got := state.ResourceSnapshot().Reserved.MemoryBytes; got != 256<<20 {
+				t.Fatalf("uncertain candidate erased R: %d", got)
+			}
+		})
+	}
+}
+
+func TestRetainedMemoryCandidateRecoveryKeepsSourceAndSuccessorPoolsSeparate(t *testing.T) {
+	srv, _, capture := committedRetentionFixture(t)
+	_, req := adoptionCandidate(t, srv, capture, "cross-pool")
+	srv.phaseHook = func(phase string) {
+		if phase == "retention_intent" {
+			panic("restart")
+		}
+	}
+	func() {
+		defer func() {
+			if got := recover(); got != "restart" {
+				t.Fatalf("phase interruption: %v", got)
+			}
+		}()
+		if _, err := srv.buildRetainedAdmitOK(nil, os.Getpid(), req, nil); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	r := srv.State.retainedSnapshot("sid")
+	r.Memory.SourcePool, r.Source.ResourcePool, r.Handoff.Pool = "numa0", "numa0", "numa1"
+	if err := writeRetainedReceipt(srv.Identity, r); err != nil {
+		t.Fatal(err)
+	}
+	state := twoPoolState(t)
+	if err := srv.Inventory.Recover(state); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"numa0", "numa1"} {
+		got := state.PoolStates()[name].ResourceSnapshot()
+		if got.Reserved.MemoryBytes != 256<<20 {
+			t.Fatalf("%s lost its separate obligation: %+v", name, got)
+		}
+		if name == "numa0" && (got.ReservationCount != 0 || got.CacheAllocated != 0) {
+			t.Fatalf("source pool acquired execution/cache: %+v", got)
+		}
+		if name == "numa1" && (got.ReservationCount != 1 || got.CacheAllocated != 4<<20) {
+			t.Fatalf("candidate pool missing execution/cache: %+v", got)
+		}
+	}
+	if state.SandboxPool("sid") != "numa1" {
+		t.Fatal("candidate was routed to historical source pool")
+	}
+}

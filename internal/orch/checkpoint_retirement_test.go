@@ -59,7 +59,7 @@ func testCaptureRecord(t *testing.T, f sandboxFinalizerFixture, m store.RunPoolO
 	for _, change := range adjust {
 		change(&r)
 	}
-	path, err := memorycheckpoint.RecordPath(filepath.Join(f.sb.BaseDir, "checkpoint"), r.CheckpointID)
+	path, err := memorycheckpoint.RecordPath(filepath.Join(f.sb.BaseDir, "checkpoint"), r.CheckpointID, r.MemoryID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -255,6 +255,9 @@ func (i *Inventory) recoverRetained(state *State, controlPIDs map[int]bool) erro
 		if err := state.restoreRetained(r); err != nil {
 			return err
 		}
+		if err := i.recoverRetainedCandidate(state, r, controlPIDs); err != nil {
+			return err
+		}
 		if start, err := retentionProcessStartTime(r.Source.PeerPID); err == nil && start == r.SourceStartTime {
 			controlPIDs[r.Source.PeerPID] = true
 		}

@@ -135,7 +135,7 @@ func startRetentionHolderProcess(t *testing.T, root string) *retentionHolderProc
 		p.dead = true
 		t.Fatalf("holder startup: %v; %s", err, stderr.String())
 	}
-	p.path, err = memorycheckpoint.RecordPath(filepath.Join(root, "checkpoint"), p.record.CheckpointID)
+	p.path, err = memorycheckpoint.RecordPath(filepath.Join(root, "checkpoint"), p.record.CheckpointID, p.record.MemoryID)
 	if err != nil {
 		t.Fatal(err)
 	}

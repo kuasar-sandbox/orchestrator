@@ -13,6 +13,39 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
+// A capture decision belongs to one uninterrupted lifecycle lock. It carries
+// the capability result into permit preparation without probing the runtime
+// again. Callers discard it whenever they release that lock to wait.
+type captureAdmissionKey struct{}
+type captureAdmissionState struct {
+	sid, instanceID, runID string
+	checked, pending       bool
+	retentionSupported     *bool
+}
+
+func withCaptureAdmission(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(captureAdmissionKey{}).(*captureAdmissionState); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, captureAdmissionKey{}, &captureAdmissionState{})
+}
+func captureAdmissionFor(ctx context.Context, sb *types.Sandbox) *captureAdmissionState {
+	v, _ := ctx.Value(captureAdmissionKey{}).(*captureAdmissionState)
+	if v == nil || sb == nil {
+		return nil
+	}
+	if v.checked && (v.sid != sb.ID || v.instanceID != sb.InstanceID || v.runID != sb.RunID) {
+		return nil
+	}
+	return v
+}
+func rememberCaptureAdmission(ctx context.Context, sb *types.Sandbox, pending bool, supported *bool) {
+	if v := captureAdmissionFor(ctx, sb); v != nil {
+		v.sid, v.instanceID, v.runID = sb.ID, sb.InstanceID, sb.RunID
+		v.checked, v.pending, v.retentionSupported = true, pending, supported
+	}
+}
+
 // lockPauseAdmission leaves a pending runtime running. Neither its lifecycle
 // lock nor the cross-process source grant is retained during the cancellable
 // wait. A request that waited for one run may never pause its successor.
@@ -40,7 +73,8 @@ func (o *Orchestrator) lockPauseAdmission(ctx context.Context, sid string, reque
 		if sb == nil || sb.State != types.StateRunning {
 			return guardCtx, unlock, sb, nil
 		}
-		pending, err := o.previousMemorySavePending(guardCtx, sb, true)
+		guardCtx = context.WithValue(guardCtx, captureAdmissionKey{}, &captureAdmissionState{})
+		pending, err := o.captureMemorySavePending(guardCtx, sb, request, true)
 		if err != nil || !pending {
 			if err != nil {
 				unlock()
@@ -53,13 +87,37 @@ func (o *Orchestrator) lockPauseAdmission(ctx context.Context, sid string, reque
 		if request.NoWaitForPreviousMemorySave {
 			return ctx, nil, nil, api.ErrPreviousMemorySavePending
 		}
-		if _, err := o.previousMemorySavePending(ctx, expected, false); err != nil {
+		if _, err := o.captureMemorySavePending(ctx, expected, request, false); err != nil {
 			return ctx, nil, nil, err
 		}
 	}
 }
 
-func (o *Orchestrator) previousMemorySavePending(ctx context.Context, sb *types.Sandbox, noWait bool) (bool, error) {
+// Only an operation that may retain another frozen generation needs this
+// admission barrier. Disk export and a known legacy parent keep their existing
+// synchronous path. Unknown parent/runtime capability remains conservative.
+func (o *Orchestrator) captureMemorySavePending(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest, noWait bool) (bool, error) {
+	if request.Kind == types.CaptureSandbox || sb == nil || sb.InstanceID == "" || sb.RunID == "" {
+		return false, nil
+	}
+	if plan := captureAdmissionFor(ctx, sb); noWait && plan != nil && plan.checked {
+		return plan.pending, nil
+	}
+	if sb != nil {
+		o.runSessionsMu.Lock()
+		parent := o.runSessions[runSessionKey{kind: runKindSandbox, runID: sb.RunID}]
+		legacy := parent != nil && !parent.holderRetirement
+		o.runSessionsMu.Unlock()
+		if legacy {
+			supported := false
+			rememberCaptureAdmission(ctx, sb, false, &supported)
+			return false, nil
+		}
+	}
+	return o.previousMemorySavePending(ctx, sb, noWait, true)
+}
+
+func (o *Orchestrator) previousMemorySavePending(ctx context.Context, sb *types.Sandbox, noWait bool, forCapture ...bool) (bool, error) {
 	if sb == nil {
 		return false, nil
 	}
@@ -79,9 +137,14 @@ func (o *Orchestrator) previousMemorySavePending(ctx context.Context, sb *types.
 	}
 	state, err := read(ctx, filepath.Join(sb.RunDir, "ctl.sock"), ctl.CaptureStateQuery{
 		SandboxID: sb.ID, InstanceID: sb.InstanceID, RunID: sb.RunID,
-		NoWaitForPreviousMemorySave: noWait,
+		NoWaitForPreviousMemorySave: noWait, ForCapture: len(forCapture) != 0 && forCapture[0],
 	})
 	if errors.Is(err, ctl.ErrCaptureStateUnsupported) {
+		if len(forCapture) != 0 && forCapture[0] {
+			supported := false
+			rememberCaptureAdmission(ctx, sb, false, &supported)
+			return false, nil // This legacy runtime cannot create a new holder.
+		}
 		pending, pendingErr := o.retainedMemoryPending(ctx, sb.ID)
 		if pendingErr != nil {
 			return false, pendingErr
@@ -96,6 +159,12 @@ func (o *Orchestrator) previousMemorySavePending(ctx context.Context, sb *types.
 	}
 	if state.SandboxID != sb.ID || state.InstanceID != sb.InstanceID || state.RunID != sb.RunID {
 		return false, api.ErrPauseRunChanged
+	}
+	if len(forCapture) != 0 && forCapture[0] {
+		if state.RetentionSupported != nil && !*state.RetentionSupported {
+			state.Pending = false
+		}
+		rememberCaptureAdmission(ctx, sb, state.Pending, state.RetentionSupported)
 	}
 	return state.Pending, nil
 }

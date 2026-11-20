@@ -5,6 +5,7 @@ import (
 	"os"
 	"reflect"
 	"syscall"
+	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
@@ -124,4 +125,99 @@ func (i *Inventory) reconcileAdoption(state *State, r *retainedReceipt) (*retain
 		}
 	}
 	return next, nil
+}
+
+// recoverRetainedCandidate runs before ordinary lease and managed inventory.
+// An unpublished candidate is a distinct, live execution owner even though its
+// canonical lease still belongs to the retired producer. Only the persisted
+// handoff's complete identity can authorize recovery of this provisional B.
+func (i *Inventory) recoverRetainedCandidate(state *State, r *retainedReceipt, controlPIDs map[int]bool) error {
+	if r.Stage != retentionAdopting || r.Handoff == nil {
+		return nil
+	}
+	h := r.Handoff
+	lease, owner, file, err := resource.InspectLeaseCandidate(i.ControllerSocket, r.SandboxID, h.Candidate)
+	if err != nil {
+		return fmt.Errorf("recover retained candidate: %w", err)
+	}
+	if owner != h.Lease.PID || file != h.File || !reflect.DeepEqual(lease, h.Lease) ||
+		lease.SandboxID != r.SandboxID || lease.ControllerSocket != i.ControllerSocket || h.StartTime == 0 {
+		return fmt.Errorf("retained candidate identity changed")
+	}
+	start, err := retentionProcessStartTime(owner)
+	if err != nil || start != h.StartTime {
+		return fmt.Errorf("retained candidate process identity changed")
+	}
+	if !i.cgroupAllowed(lease.CgroupPath) {
+		return fmt.Errorf("retained candidate cgroup outside configured roots")
+	}
+	if err := i.ValidateManaged(LiveLease{Lease: lease, OwnerPID: owner, Path: h.Candidate}, owner); err != nil {
+		return fmt.Errorf("recover managed retained candidate: %w", err)
+	}
+	maximum, err := resource.CacheMaximumFromFeatures(lease.ClientFeatures)
+	if err != nil || h.InitialCache > maximum {
+		return fmt.Errorf("invalid retained candidate cache bound")
+	}
+	if err := validateCacheReclaimState(lease.ClientFeatures, h.CacheReclaim, maximum); err != nil {
+		return err
+	}
+	if state.ResolvePool != nil {
+		pool, err := state.ResolvePool(r.SandboxID, owner, lease.CgroupPath)
+		if err != nil {
+			return fmt.Errorf("resolve retained candidate pool: %w", err)
+		}
+		if pool != h.Pool {
+			return fmt.Errorf("retained candidate pool changed from %q to %q", h.Pool, pool)
+		}
+	}
+	if err := state.restoreRetainedCandidate(r, maximum); err != nil {
+		return err
+	}
+	controlPIDs[owner] = true
+	return nil
+}
+
+func (s *State) restoreRetainedCandidate(receipt *retainedReceipt, cacheMaximum uint64) error {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	r := root.retained[receipt.SandboxID]
+	if r == nil || r.Stage != retentionAdopting || r.Handoff == nil ||
+		!reflect.DeepEqual(r.Handoff, receipt.Handoff) || !sameCapture(r.Capture, receipt.Capture) {
+		return fmt.Errorf("retained candidate recovery intent changed")
+	}
+	h := r.Handoff
+	p := root.retainedPool(h.Pool)
+	if p == nil {
+		return fmt.Errorf("unknown retained candidate pool %q", h.Pool)
+	}
+	if root.pools != nil {
+		root.mu.Lock()
+		defer root.mu.Unlock()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.bySID[r.SandboxID] != nil {
+		return fmt.Errorf("retained candidate already reserved")
+	}
+	now := time.Now()
+	lease := h.Lease
+	active := &Reservation{
+		Token: h.Token, SandboxID: r.SandboxID, PeerPID: lease.PID, CgroupPath: lease.CgroupPath,
+		Capacity:              Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
+		ConfiguredAllocatable: Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
+		ReservationMemory:     h.InitialBudget, InitialBudget: h.InitialBudget,
+		CacheReservation: h.InitialCache, CacheMax: cacheMaximum,
+		CacheCoordinated: h.CacheReclaim != nil,
+		Stage:            StageStartup, StageEnteredAt: now, LastHeartbeatAt: now,
+		Provisional: true, RecoverySource: RecoveryLease, RecoveryKey: "retained-candidate:" + h.ID,
+		LeasePath: h.Candidate, ClientFeatures: append([]string(nil), lease.ClientFeatures...),
+	}
+	if err := p.insertLocked(active); err != nil {
+		return err
+	}
+	if root.pools != nil {
+		root.bindings[r.SandboxID] = h.Pool
+	}
+	return nil
 }
