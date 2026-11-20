@@ -57,12 +57,32 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 		return nil, err
 	}
 	defer release()
-	// Legacy/recovered rows may have no checkpoint directory. There are then no
-	// candidates to remove; an I/O or identity failure is not equivalent.
-	if _, err := os.Lstat(dir); os.IsNotExist(err) && !inspect {
-		return nil, nil
-	} else if err != nil {
+	retained, err := o.st.Checkpoints(ctx, sb.ID)
+	if err != nil {
 		return nil, err
+	}
+	if _, err := os.Lstat(dir); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		// Legacy/recovered cleanup can have no local files. Inspection may
+		// return an empty set only when neither the current nor any named root
+		// needs this directory; a missing local S or E remains an error.
+		if inspect {
+			needsLocal := func(s types.ResumeSource) bool {
+				return !s.Empty() && (!s.Valid() || !types.IsPortableRef(s.Ref) ||
+					(s.Kind == types.ResumeSourceSnapshot && !types.IsPortableRef(s.SandboxRef)))
+			}
+			if needsLocal(source) {
+				return nil, err
+			}
+			for _, capture := range retained {
+				if needsLocal(capture.Source) {
+					return nil, err
+				}
+			}
+		}
+		return nil, nil
 	}
 	args := []string{"checkpoint-cleanup", "--sandbox-id", sb.ID, "--path-id", sb.ID,
 		"--base-root", nodepath.SandboxBaseRoot(o.cfg.Paths.BaseRoot), "--manifest-config", o.cfg.ManifestConfig}
@@ -72,10 +92,6 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 		args = append(args, "--restore", source.Ref)
 	}
 	args = append(args, "--from", e)
-	retained, err := o.st.Checkpoints(ctx, sb.ID)
-	if err != nil {
-		return nil, err
-	}
 	pairs := make([]artifact.CheckpointSource, 0, len(retained))
 	for _, capture := range retained {
 		pair := artifact.CheckpointSource{SandboxRef: capture.Source.Ref}
