@@ -96,6 +96,15 @@ func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePo
 		out.DiffCOW = &sandboxcfg.DiffCOWPatch{
 			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
 			CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
+			ReadBandwidth:         clonePtr(cow.ReadBandwidth),
+			WriteBandwidth:        clonePtr(cow.WriteBandwidth),
+			ReadIOPS:              clonePtr(cow.ReadIOPS),
+			WriteIOPS:             clonePtr(cow.WriteIOPS),
+			MaxDirtySizePerDisk:   clonePtr(cow.MaxDirtySizePerDisk),
+			ReadBandwidthPerDisk:  clonePtr(cow.ReadBandwidthPerDisk),
+			WriteBandwidthPerDisk: clonePtr(cow.WriteBandwidthPerDisk),
+			ReadIOPSPerDisk:       clonePtr(cow.ReadIOPSPerDisk),
+			WriteIOPSPerDisk:      clonePtr(cow.WriteIOPSPerDisk),
 		}
 	}
 	if in.WatermarkHigh != nil {
@@ -124,6 +133,15 @@ func PublicSandboxResources(policy sandboxcfg.NodeResourcePolicy) publicconfig.R
 		out.DiffCOW = &publicconfig.ResourceDiffCOW{
 			CacheSize: clonePtr(cow.CacheSize), MaxDirtySize: clonePtr(cow.MaxDirtySize),
 			CacheIdleAfter: clonePtr(cow.CacheIdleAfter), Discard: clonePtr(cow.Discard),
+			ReadBandwidth:         clonePtr(cow.ReadBandwidth),
+			WriteBandwidth:        clonePtr(cow.WriteBandwidth),
+			ReadIOPS:              clonePtr(cow.ReadIOPS),
+			WriteIOPS:             clonePtr(cow.WriteIOPS),
+			MaxDirtySizePerDisk:   clonePtr(cow.MaxDirtySizePerDisk),
+			ReadBandwidthPerDisk:  clonePtr(cow.ReadBandwidthPerDisk),
+			WriteBandwidthPerDisk: clonePtr(cow.WriteBandwidthPerDisk),
+			ReadIOPSPerDisk:       clonePtr(cow.ReadIOPSPerDisk),
+			WriteIOPSPerDisk:      clonePtr(cow.WriteIOPSPerDisk),
 		}
 	}
 	if policy.WatermarkHigh != nil {

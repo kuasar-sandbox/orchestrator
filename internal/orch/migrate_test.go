@@ -178,7 +178,7 @@ func TestMigrationTokenCarriesStrictPortableResourceAndTrafficMetadata(t *testin
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	sb := migrationSandbox(t, dir, "portable-resource", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
 	sb.Metadata = map[string]string{
-		sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" }, "diff_cow": {"cache_size":"12KiB"} } `,
+		sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" }, "diff_cow": {"cache_size":"12KiB","read_iops":0,"read_bandwidth_per_disk":"17MiB"} } `,
 		sandboxcfg.NsTraffic:  ` { "max_inflight" : { "total" : 9, "forward" : 0 } } `,
 		"ordinary":            "preserved",
 	}
@@ -193,7 +193,7 @@ func TestMigrationTokenCarriesStrictPortableResourceAndTrafficMetadata(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := payload.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"startup":{"memory":"1GiB"},"diff_cow":{"cache_size":"12KiB"}}`; got != want {
+	if got, want := payload.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"startup":{"memory":"1GiB"},"diff_cow":{"cache_size":"12KiB","read_iops":0,"read_bandwidth_per_disk":"17MiB"}}`; got != want {
 		t.Fatalf("portable resource metadata = %q, want %q", got, want)
 	}
 	if payload.Metadata["ordinary"] != "preserved" {
@@ -295,8 +295,9 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	o.cfg.ResourceListen = &config.ResourceListenConfig{Enabled: true}
 	allocatableMemory := "128MiB"
 	sourceCache := "128MiB"
+	sourceReadBandwidth := "40MiB"
 	o.cfg.Sandbox.Resources = configresolve.PublicSandboxResources(sandboxcfg.NodeResourcePolicy{
-		DiffCOW:     &sandboxcfg.DiffCOWPatch{CacheSize: &sourceCache},
+		DiffCOW:     &sandboxcfg.DiffCOWPatch{CacheSize: &sourceCache, ReadBandwidth: &sourceReadBandwidth},
 		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: &allocatableMemory},
 		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "64MiB"},
 	})
@@ -321,7 +322,7 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceResources, err := o.resolveArtifactResources(sourceSpec, capacity)
-	if err != nil || sourceResources.DiffCOW.MaxDirtySize != "67108864" {
+	if err != nil || sourceResources.DiffCOW.MaxDirtySize != "0" || sourceResources.DiffCOW.ReadBandwidth != "40MiB" {
 		t.Fatalf("source DiffCOW = %+v, %v", sourceResources.DiffCOW, err)
 	}
 	token, err := o.mintSandboxToken(source, source.ResumeSource)
@@ -329,7 +330,8 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	targetCache := "64MiB"
-	o.cfg.Sandbox.Resources.DiffCOW = &config.ResourceDiffCOW{CacheSize: &targetCache}
+	targetReadBandwidth := "20MiB"
+	o.cfg.Sandbox.Resources.DiffCOW = &config.ResourceDiffCOW{CacheSize: &targetCache, ReadBandwidth: &targetReadBandwidth}
 	targetID, err := o.ImportSandbox(context.Background(), apiKey, token, "target-resource", api.ImportOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +356,7 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	if resources.Capacity.CPU != 2 || resources.Capacity.Memory != "8GiB" ||
-		resources.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "33554432"}) ||
+		resources.DiffCOW != (rtconfig.DiffCOWConfig{CacheSize: "64MiB", MaxDirtySize: "0", ReadBandwidth: "20MiB"}) ||
 		resources.Allocatable.CPU != 2 || resources.Allocatable.Memory != "512MiB" ||
 		resources.Startup == nil || resources.Startup.Memory != "1GiB" ||
 		resources.Overhead == nil || resources.Overhead.Memory != "64MiB" ||

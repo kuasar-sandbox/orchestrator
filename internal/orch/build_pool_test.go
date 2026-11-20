@@ -541,9 +541,27 @@ func TestFiniteExecutionIdlePoolBindsBeforePublishingAssignment(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := newRunPools(runKindBuild, o.cfg.Units.BuilderPoolConfigs(), time.Second, t.TempDir(), lc, &o.runs, o.log).pools[0]
-	if err := pool.Start(ctx); err != nil {
+	if err := os.MkdirAll(nodepath.RunnerRoot(pool.runRoot), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Own both pool loops so refill/retirement cannot outlive the fixture's
+	// SQLite store and temporary directory. Cancellation alone is not a join.
+	controlDone := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		for _, done := range []<-chan struct{}{pool.done, controlDone} {
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("builder pool loop did not stop")
+			}
+		}
+	})
+	go func() {
+		defer close(controlDone)
+		pool.controlLoop(ctx)
+	}()
+	go pool.loop(ctx)
 	var runID string
 	select {
 	case unit := <-lc.started:

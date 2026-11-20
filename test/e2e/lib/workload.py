@@ -151,6 +151,61 @@ def run_idle(duration):
     time.sleep(duration)
 
 
+def held_memory_failure(held, offset, actual):
+    # This runs only after the original page-stride assertion has failed. Keep
+    # the report within one journal message, without dumping retained memory.
+    details = dict(offset=offset, actual=actual, expected=255, held_bytes=len(held))
+    try:
+        import ctypes
+        import hashlib
+
+        base = ctypes.addressof(ctypes.c_ubyte.from_buffer(held))
+        address = base + offset
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_address = address - address % page_size
+        start = max(0, page_address - base)
+        end = min(len(held), page_address + page_size - base)
+        details.update(buffer_address=hex(base), address=hex(address), page_address=hex(page_address),
+                       page_offset=address % page_size, page_size=page_size)
+        page = memoryview(held)[start:end]
+        bad_points = []
+        non_ff = 0
+        for index, value in enumerate(page, start):
+            if value != 255:
+                non_ff += 1
+                if len(bad_points) < 8:
+                    bad_points.append(dict(offset=index, actual=value))
+        details["page"] = dict(start=start, end=end, offset_in_page=base + start - page_address,
+                               length=end - start, non_ff=non_ff,
+                               bad_points=bad_points, sha256=hashlib.sha256(page).hexdigest())
+        try:
+            fd = os.open("/proc/self/pagemap", os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                entry_bytes = os.pread(fd, 8, (address // page_size) * 8)
+            finally:
+                os.close(fd)
+            if len(entry_bytes) != 8:
+                raise OSError(f"short pagemap read: {len(entry_bytes)} bytes")
+            entry = int.from_bytes(entry_bytes, sys.byteorder)
+            present = bool(entry & (1 << 63))
+            swapped = bool(entry & (1 << 62))
+            pfn_mask = (1 << 55) - 1
+            pfn = entry & pfn_mask if present and not swapped else None
+            details["pagemap"] = dict(present=present, swapped=swapped, pfn=pfn,
+                                      flags=hex(entry & ~pfn_mask))
+            if present and pfn == 0:
+                details["pagemap"]["pfn"] = None
+                details["pagemap"]["pfn_unavailable"] = "kernel returned zero (PFN may be masked)"
+        except Exception as error:
+            details["pagemap"] = dict(unavailable=f"{type(error).__name__}: {error}"[:160])
+    except Exception as error:
+        details["diagnostic_error"] = f"{type(error).__name__}: {error}"[:160]
+    message = "held-memory contents changed: " + json.dumps(details, separators=(",", ":"))
+    if len(message) >= 2048:
+        return "held-memory contents changed: diagnostic report exceeded 2047 characters"
+    return message
+
+
 def run_hold(duration, target_mib):
     # The node receives no workload size or completion hint. This controlled
     # primary guest process survives Snapshot; native exec sessions do not.
@@ -164,8 +219,15 @@ def run_hold(duration, target_mib):
     while time.time() < end:
         # Touch every page without discarding the allocation. Do not count
         # process exit, an OOM, or an empty allocation as coordination success.
-        if any(held[index] != 255 for index in range(0, len(held), 4096)):
-            raise RuntimeError("held-memory contents changed")
+        for index in range(0, len(held), 4096):
+            actual = held[index]
+            if actual != 255:
+                message = "held-memory contents changed"
+                try:
+                    message = held_memory_failure(held, index, actual)
+                except Exception:
+                    pass  # A failed diagnostic must preserve the original failure.
+                raise RuntimeError(message)
         tick += 1
         with open(state_file + ".new", "w") as output:
             json.dump(dict(nonce=nonce, held=len(held), tick=tick), output)

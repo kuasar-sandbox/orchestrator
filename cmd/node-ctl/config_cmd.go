@@ -210,9 +210,20 @@ sandbox:                                          # sandbox-instance defaults
     # startup: { memory: 512MiB }                 # cold headroom in static/dynamic mode; omitted => capacity.memory
     overhead: { memory: 32MiB }                   # node-owned host VMM overhead
     watermark_high: { ratio: 0.875 }              # node-owned memory.high pressure ratio
-    # diff_cow:                                   # host cache shared across writable disks
+    # diff_cow:                                   # one shared host cache and sandbox-local disk policy
+    #   discard: auto
     #   cache_size: 32MiB
-    #   max_dirty_size: 16MiB                     # omit to derive from the final cache size
+    #   cache_idle_after: 10s
+    #   max_dirty_size: 0                         # all ten limits: omitted/0 = no extra ceiling
+    #   read_bandwidth: 0                         # bytes/s; 50MiB means 50 MiB/s
+    #   write_bandwidth: 0
+    #   read_iops: 0                              # nonnegative integer requests/s
+    #   write_iops: 0
+    #   max_dirty_size_per_disk: 0                # same rule, accounted independently for each disk
+    #   read_bandwidth_per_disk: 0
+    #   write_bandwidth_per_disk: 0
+    #   read_iops_per_disk: 0
+    #   write_iops_per_disk: 0
   network:
     switch: sw0
     # tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock # persistent TAPFD/1 PREPARE/OPEN/RELEASE; connector: vswitch serve --tapfd-listen <same path>

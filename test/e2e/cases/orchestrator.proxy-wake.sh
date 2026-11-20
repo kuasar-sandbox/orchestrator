@@ -63,6 +63,11 @@ path = Path(sys.argv[1]); text = path.read_text()
 # automatic Pause before the background-recovery assertion.
 assert text.count("  timeout_sec: 120\n") == 1
 text = text.replace("  timeout_sec: 120\n", "  timeout_sec: 600\n", 1)
+# Saved-source admission includes pressure detection, capture and real release.
+# Give this phase the existing 180s policy-observation budget; a 30s queue TTL
+# can reject a healthy capture before that observation can assess recovery.
+assert text.count("queue_ttl: 30s") == 1
+text = text.replace("queue_ttl: 30s", "queue_ttl: 180s", 1)
 # P=1GiB fits either full-capacity Snapshot, while both held workloads plus
 # their real headroom cannot run together. No workload size enters node policy.
 text = text.replace("physical_memory: auto", "physical_memory: 1792MiB", 1)
@@ -93,6 +98,13 @@ pressure_diagnostics() (
     # sandbox metadata, resource tokens, or the whole conductor configuration.
     set +e
     echo "==> pressure failure diagnostics"
+    MANIFEST_KEY="$MK" \
+    KUASAR_E2E_MEMORY_COMPARE_BIN="${MEMORY_COMPARE_BIN:-}" \
+    KUASAR_E2E_MEMORY_CONFIG="$WORK/manifest.yaml" \
+    KUASAR_E2E_MEMORY_CHECKPOINT_ROOT="$WORK/lib/sandboxes" \
+    timeout 12 python3 "$SCRIPT_DIR/lifecycle_diagnostics.py" \
+        "$WORK/lib/node-ctl.db" "$WORK/orch-pressure.log" \
+        "${FIRST:-}" "${SECOND:-}" "${PRESSURE_SID:-}" || true
     timeout 5 "$BIN/node-ctl" resource pressure --socket "$WORK/node-ctl.socket"
     timeout 5 "$BIN/node-ctl" resource status --socket "$WORK/sandbox-resource.sock"
     timeout 5 "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" |

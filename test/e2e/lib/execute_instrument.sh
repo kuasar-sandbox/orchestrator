@@ -19,6 +19,8 @@ done
 cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+# Exercise the normal runtime with all temporary memory diagnostics disabled.
+unset SANDBOX_UFFD_TRACE_MEMFD_PAGE SANDBOX_UFFD_GUARD_BACKEND_PAGE SANDBOX_UFFD_TRACE_SHMEM_PAGE
 if [ "\${1:-}" = "snapshot" ]; then
     python3 - "$SNAPSHOT_ARGV_LOG" "\$@" <<'PY'
 import json, sys

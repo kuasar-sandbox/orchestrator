@@ -1,4 +1,7 @@
 """Run the prepared guest pressure fixture and its host-controlled barriers."""
+import ctypes
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -10,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 LIB = Path(__file__).with_name("resource.sh")
@@ -181,6 +185,95 @@ resource_write_sandbox fixture 320 1024 512 false
         finally:
             process.terminate()
             process.communicate(timeout=3)
+
+    def test_hold_workload_reports_first_bad_page_and_still_exits_one(self):
+        for location in ("first", "middle"):
+            with self.subTest(location=location):
+                state = self.work / f"corrupt-{location}.json"
+                result = subprocess.run([sys.executable, "-c", r'''
+import ctypes
+import importlib.util
+import json
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("workload", sys.argv[1])
+workload = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(workload)
+held = bytearray(b"\xff" * (1 << 20))
+base = ctypes.addressof(ctypes.c_ubyte.from_buffer(held))
+page_size = os.sysconf("SC_PAGE_SIZE")
+offset = 0 if sys.argv[2] == "first" else 2 * page_size
+page_address = (base + offset) // page_size * page_size
+start = max(0, page_address - base)
+end = min(len(held), page_address + page_size - base)
+held[start:end] = b"\x00" * (end - start)
+first_bad = (start + 4095) // 4096 * 4096
+print(json.dumps(dict(base=base, start=start, end=end, first_bad=first_bad)), flush=True)
+workload.grow_to = lambda *_: held
+workload.run_hold(1, 1)
+''', str(WORKLOAD), location], env={**os.environ, "WL_STATE_FILE": str(state)},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                expected = json.loads(result.stdout)
+                message = next(line.removeprefix("RuntimeError: ")
+                               for line in result.stderr.splitlines()
+                               if line.startswith("RuntimeError: held-memory contents changed"))
+                self.assertLess(len(message), 2048)
+                details = json.loads(message.removeprefix("held-memory contents changed: "))
+                self.assertEqual(details["offset"], expected["first_bad"])
+                self.assertEqual(details["actual"], 0)
+                self.assertEqual(details["expected"], 255)
+                self.assertEqual(details["held_bytes"], 1 << 20)
+                self.assertEqual(int(details["buffer_address"], 16), expected["base"])
+                address = expected["base"] + expected["first_bad"]
+                self.assertEqual(int(details["address"], 16), address)
+                self.assertEqual(details["page_offset"], address % details["page_size"])
+                page_address = address - details["page_offset"]
+                self.assertEqual(int(details["page_address"], 16), page_address)
+                page = details["page"]
+                self.assertEqual((page["start"], page["end"]),
+                                 (expected["start"], expected["end"]))
+                size = expected["end"] - expected["start"]
+                self.assertEqual(page["offset_in_page"], expected["base"] + expected["start"] - page_address)
+                self.assertEqual(page["length"], size)
+                self.assertEqual(page["non_ff"], size)
+                self.assertEqual(page["sha256"], hashlib.sha256(bytes(size)).hexdigest())
+                self.assertEqual(page["bad_points"], [dict(offset=index, actual=0)
+                                 for index in range(expected["start"], expected["start"] + 8)])
+                self.assertTrue("present" in details["pagemap"] or
+                                "unavailable" in details["pagemap"])
+                self.assertFalse(state.exists())
+
+    def test_hold_workload_preserves_failure_when_diagnostics_are_unavailable(self):
+        spec = importlib.util.spec_from_file_location("workload", WORKLOAD)
+        workload = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workload)
+        held = bytearray(b"\xff" * (1 << 20))
+        held[4096] = 0
+        workload.grow_to = lambda *_: held
+
+        with mock.patch.object(workload.os, "open", side_effect=PermissionError("pagemap denied")):
+            with self.assertRaises(RuntimeError) as failure:
+                workload.run_hold(1, 1)
+        details = json.loads(str(failure.exception).removeprefix("held-memory contents changed: "))
+        self.assertEqual(details["offset"], 4096)
+        self.assertIn("PermissionError: pagemap denied", details["pagemap"]["unavailable"])
+        self.assertEqual(details["page"]["non_ff"], 1)
+
+        with mock.patch.object(ctypes, "addressof", side_effect=RuntimeError("x" * 10000)):
+            with self.assertRaises(RuntimeError) as failure:
+                workload.run_hold(1, 1)
+        message = str(failure.exception)
+        self.assertLess(len(message), 2048)
+        details = json.loads(message.removeprefix("held-memory contents changed: "))
+        self.assertEqual(details["offset"], 4096)
+        self.assertEqual(details["actual"], 0)
+        self.assertIn("RuntimeError:", details["diagnostic_error"])
+
+        with mock.patch.object(workload, "held_memory_failure", side_effect=RuntimeError("diagnostic failed")):
+            with self.assertRaisesRegex(RuntimeError, "^held-memory contents changed$"):
+                workload.run_hold(1, 1)
 
 
     def test_guest_start_gate_has_a_real_failure_deadline(self):

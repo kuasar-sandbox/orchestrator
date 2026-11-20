@@ -1185,8 +1185,9 @@ and /init, without the former implicit 60-second limit. Sandbox bootstrap versio
 absolute cutoff and negative is invalid. Version 7 additionally requires fresh snp
 tasks to honor runtime admission. Deploy matching Conductor and sandbox runner
 versions; bootstrap version 6 is rejected instead of silently omitting that check.
-Shared prepare summary stays version 5; Builder version 7 and its positive work
-deadline/reporting reserve, the cluster protocol and KMT V1 are unchanged.
+Shared prepare summary stays version 5. Builder uses version 8 for diffstore QoS;
+its positive work deadline/reporting reserve, the cluster protocol and KMT V1
+retain their existing behavior.
 
 Manifest opens reuse Sandboxer's `OpenManifestStream`/readretry with the original
 scoped fetcher, Bundle identity and caller context. Builder benefits within its
