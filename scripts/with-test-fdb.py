@@ -19,6 +19,34 @@ import uuid
 from test_fdb_assets import NATIVE, prepare
 
 
+def database_diagnostics(loader, cli, cluster_file, environment):
+    status = subprocess.run([*loader, str(cli), "-C", str(cluster_file), "--exec", "status json", "--timeout", "2"],
+                            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    space = os.statvfs(cluster_file.parent)
+    return ("test FoundationDB filesystem: total=" + str(space.f_blocks * space.f_frsize)
+            + " available=" + str(space.f_bavail * space.f_frsize)
+            + " free=" + str(space.f_bfree * space.f_frsize) + " bytes\n"
+            + "test FoundationDB status (exit " + str(status.returncode) + "):\n"
+            + status.stdout.decode(errors="replace"))
+
+
+def verify_transactions(loader, cli, cluster_file, environment):
+    # An available database may still reject ordinary traffic, for example when
+    # Ratekeeper stops transactions at its free-space limit. The CLI's set/get
+    # commands use separate ordinary-priority transactions outside begin/commit.
+    token = uuid.uuid4().hex
+    key = "/orchestrator-test-readiness/" + token
+    commands = "writemode on; set " + key + " " + token + "; get " + key + "; clear " + key + "; get " + key
+    probe = subprocess.run([*loader, str(cli), "-C", str(cluster_file), "--exec", commands, "--timeout", "4"],
+                           env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    written = ("`" + key + "' is `" + token + "'\n").encode()
+    cleared = ("`" + key + "': not found\n").encode()
+    if probe.returncode != 0 or written not in probe.stdout or cleared not in probe.stdout:
+        raise RuntimeError("test FoundationDB ordinary read/write check failed:\n"
+                           + probe.stdout.decode(errors="replace") + "\n"
+                           + database_diagnostics(loader, cli, cluster_file, environment))
+
+
 def main():
     command = sys.argv[1:]
     if command[:1] == ["--"]:
@@ -71,8 +99,11 @@ def main():
                     time.sleep(0.1)
                 if not available:
                     raise RuntimeError("test FoundationDB did not become available")
-                print("test FoundationDB ready (7.3.77, single SSD)", flush=True)
+                verify_transactions(loader, cli, cluster_file, clean_env)
+                print("test FoundationDB ready (7.3.77, single SSD; ordinary read/write checked)", flush=True)
                 result = subprocess.run(command, env={**clean_env, "FDB_CLUSTER_FILE": str(cluster_file)})
+                if result.returncode != 0:
+                    print(database_diagnostics(loader, cli, cluster_file, clean_env), file=sys.stderr, flush=True)
                 return result.returncode
             finally:
                 if process.poll() is None:
