@@ -875,6 +875,21 @@ of completion. Normal completion, confirmed runtime disappearance and explicit
 deletion share the source-protected resource cleanup; retained dead history and
 execution results keep their existing business meaning.
 
+Direct cooperative helpers (publication, workspace storage, build host tools,
+capture/reset and checkpoint inspection/cleanup) share a cancellation policy:
+SIGTERM first, then SIGKILL after a five-second internal grace period, and always
+wait for actual child exit. The operation context and existing commit protocols
+remain authoritative. This fallback is not a measured cleanup guarantee. Short
+admission checks retain their own deadlines; proxy workers, guest exec and
+VM/service runners retain their independent lifecycle protocols.
+
+Canceling publication sends SIGTERM to `sandbox-ctl publish` so it can remove
+temporary materialization and its current incomplete target file before exiting.
+Export/source ownership remains held until the child exits. After the shared helper policy's five-second grace period,
+an unresponsive publisher is killed; forced termination can still leave files.
+Already committed shared artifacts are not rolled back. This cancellation path
+also applies to request cancellation and conductor lifecycle shutdown.
+
 Publish does not hold a long lifecycle lock. After validating the result, Export
 checks the complete original S/E pair, source instance and export attempt under
 the per-SID lifecycle lock. Resume winning `BeginResume` cancels KMT export with
