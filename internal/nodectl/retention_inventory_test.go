@@ -7,7 +7,42 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
+	"golang.org/x/sys/unix"
 )
+
+// Metadata-driven ledger tests do not keep a physical holder alive. Preserve
+// real, stable proof identities and model its service directory as already gone.
+func newTestRetentionRecord(t *testing.T, directory string, record memorycheckpoint.CaptureRecord) (*memorycheckpoint.RecordWriter, error) {
+	t.Helper()
+	path, err := memorycheckpoint.RecordPath(directory, record.CheckpointID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(filepath.Dir(directory), ".retention-holder-")
+	if err != nil {
+		return nil, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Stat(dir, &stat); err != nil {
+		return nil, err
+	}
+	record.Holder.Directory = memorycheckpoint.HolderDirectoryIdentity{Path: dir, Device: uint64(stat.Dev), Inode: stat.Ino}
+	record.Holder.SocketPath = filepath.Join(dir, "m.sock")
+	if err := os.Remove(dir); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path+".ram.lock", nil, 0600); err != nil {
+		return nil, err
+	}
+	if err := unix.Stat(path+".ram.lock", &stat); err != nil {
+		return nil, err
+	}
+	record.Holder.RAMLock = memorycheckpoint.FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
+	return memorycheckpoint.CreateRecord(directory, record)
+}
 
 func directRetentionFixture(t *testing.T) (*Server, *memorycheckpoint.RecordWriter, resource.CaptureRetention) {
 	t.Helper()
@@ -36,7 +71,7 @@ func directRetentionFixture(t *testing.T) (*Server, *memorycheckpoint.RecordWrit
 	if err != nil {
 		t.Fatal(err)
 	}
-	w, err := memorycheckpoint.CreateRecord(filepath.Join(dir, "checkpoint"), memorycheckpoint.CaptureRecord{
+	w, err := newTestRetentionRecord(t, filepath.Join(dir, "checkpoint"), memorycheckpoint.CaptureRecord{
 		Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid", InstanceID: "instance", RunID: "run"},
 		CheckpointID: "checkpoint", MemoryID: "memory", Epoch: 1,
 		Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dir, "holder.sock")}})
@@ -168,7 +203,7 @@ func TestRetainedMemorySupersededReleaseIsExactNoOp(t *testing.T) {
 			if reuseMemoryID {
 				memory, epoch = capture.MemoryID, 2
 			}
-			nextWriter, err := memorycheckpoint.CreateRecord(filepath.Dir(filepath.Dir(w.Path())), memorycheckpoint.CaptureRecord{
+			nextWriter, err := newTestRetentionRecord(t, filepath.Dir(filepath.Dir(w.Path())), memorycheckpoint.CaptureRecord{
 				Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid", InstanceID: "instance-two", RunID: "run-two"},
 				CheckpointID: "checkpoint-two", MemoryID: memory, Epoch: epoch, Holder: proof.Holder})
 			if err != nil {

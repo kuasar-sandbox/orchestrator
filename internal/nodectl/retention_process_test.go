@@ -56,7 +56,7 @@ func TestRetainedMemoryClientProcessHelper(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		writer, err = memorycheckpoint.CreateRecord(filepath.Join(dir, "checkpoint"), memorycheckpoint.CaptureRecord{
+		writer, err = newTestRetentionRecord(t, filepath.Join(dir, "checkpoint"), memorycheckpoint.CaptureRecord{
 			Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "retained-sid", InstanceID: "instance-one", RunID: "run-one"},
 			CheckpointID: "checkpoint-one", MemoryID: "memory-one", Epoch: 1,
 			Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dir, "holder.sock")}})
@@ -75,7 +75,7 @@ func TestRetainedMemoryClientProcessHelper(t *testing.T) {
 			if startErr != nil {
 				t.Fatal(startErr)
 			}
-			writer, err = memorycheckpoint.CreateRecord(filepath.Join(dir, "checkpoint"), memorycheckpoint.CaptureRecord{
+			writer, err = newTestRetentionRecord(t, filepath.Join(dir, "checkpoint"), memorycheckpoint.CaptureRecord{
 				Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "retained-sid", InstanceID: "instance-two", RunID: "run-two"},
 				CheckpointID: "checkpoint-two", MemoryID: "memory-two", Epoch: 1,
 				Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: start, SocketPath: filepath.Join(dir, "holder-two.sock")}})

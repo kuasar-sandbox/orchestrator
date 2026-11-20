@@ -365,10 +365,16 @@ Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. 
 ### Checkpoint memory saving
 
 For a runtime started with checkpoint support, a memory capture with an actual
-checkpoint ID can complete Pause after freezing its immutable memory and releasing
-runtime resources. The existing `sandbox-ctl` remains an owned memory holder while
-it writes the payload. The temporary socket is under the generation-specific
-`RunDir/memory-holders` directory; checkpoint metadata identifies that holder.
+checkpoint ID can complete Pause after freezing its immutable memory, releasing
+runtime resources and removing the complete ordinary RunDir. The existing
+`sandbox-ctl` remains an owned memory holder while it writes the payload. Its
+temporary socket lives in an exclusively created sibling of the canonical RunDir,
+with a short identity hash and random suffix. The capture record binds the exact
+directory path, device/inode and immutable identity marker; the holder owns that
+directory's lock independently of the ordinary runtime. Cleanup removes only its
+own socket, marker and directory, never the RunDir or an ancestor. A replaced or
+locked directory and unknown contents remain protected. Creating the sibling
+requires write permission on RunDir's parent and must succeed before capture commit.
 Resume and export use the same local Snapshot view while saving, then switch to
 the completed file. Resume allocates its own writable memory. The previous
 holder's memory remains accounted for until all readers have released it.
@@ -381,6 +387,43 @@ receipt has no remaining source-pool memory charge and does not require that old
 pool to remain configured; any successor budget still belongs to its own live
 lease and resource pool.
 
+Physical RAM release and file availability are separate persistent facts. The
+holder transfers a read-only memfd and its RAM lifetime pin in one SCM_RIGHTS
+message, protecting queued descriptors as well as accepted readers. Readers close
+RAM FDs and mappings before their pin; file-only GC pins and resource ACK retries
+do not retain RAM. Normal completion and crash recovery require an exclusive lock
+on the original, record-bound RAM-pin inode before publishing `RAMReleased`.
+Recovery additionally checks the stable record writer and exact PID/start-time
+death, and applies only after `Committed` and `RuntimeRetired` are established.
+The host and resource controller share this nonblocking SDK proof. Neither a dead
+process, a missing socket, nor a complete-looking payload is sufficient alone.
+Valid capture records, including aborted intents, and their stable writer/RAM
+lock inodes remain until terminal BaseDir deletion. Advancing the current-memory
+locator cannot hide the exact proof still needed by a retained resource receipt.
+This metadata retention does not retain unreferenced payloads: their ordinary
+reference graph continues to determine data-file garbage collection.
+
+If the producer exits without `FileReady`, existing RAM readers retain their
+charge until they close. After the last pin disappears, recovery records
+`RAMReleased` and settles the exact source-pool R even though that snapshot is lost.
+It does not fabricate `FileReady` or mark the capture explicitly discarded. Only
+the exact old run still in `pausing` converges to `dead`, retaining BaseDir and its
+previous historical source. Already-paused rows and running successors keep their
+business state; selecting the lost source for restore/export fails explicitly.
+Unknown identity, missing/replaced proof or unconfirmed runtime retirement keeps
+the responsibility and diagnostic for existing fenced deletion/reset recovery.
+
+Terminal cleanup fences the exact current run, clears its network and removes its
+RunDir before waiting for an older run's RAM or directory cleanup. The exact-run
+fence still protects a current holder that owns pending RAM. Hard deletion retains
+its original all-generation fencing and reader-proof requirements before BaseDir
+removal. Once R is durably settled and the old unit fenced, an independent holder
+directory cleanup error retains only retry ownership; it cannot recreate R or
+block controller startup. Capture JSON, original proof and unsettled-resource
+errors keep their existing failure semantics. Startup's accepted-running/dead
+paths defer only the identified retirement/save-pending conditions to existing
+workers; they never hide malformed records under a broad pending category.
+
 A second Pause waits for this previous memory save by default. The wait is
 cancelable, leaves the sandbox `running`, and holds neither the SID lifecycle lock
 nor the source-operation grant. After waiting, admission rechecks the exact
@@ -388,6 +431,11 @@ sandbox instance and RunID. To return 409 immediately while the save remains
 pending, send `{"noWaitForPreviousMemorySave":true}`. TTL, idle and resource-pressure
 workers use this no-wait behavior with their existing retry machinery. Restoring
 an older checkpoint does not bypass the same sandbox's outstanding save.
+When the producer is confirmed dead without a published file, a default wait
+returns an explicit unavailable error while RAM remains, without entering
+`pausing`. Physical completion is checked before historical save errors: once
+RAM is released, a successor restored from an intact older checkpoint can pause
+again even if the previous capture is lost. No replacement holder is started.
 
 This is the existing checkpoint capture behavior, not an additional launch mode.
 Non-checkpoint runtimes and captures without a checkpoint ID keep synchronous
@@ -441,8 +489,9 @@ exportable. Reports from a retired RunID cannot change a subsequent run.
 If capture succeeds but the paused transaction fails, the uncommitted operation
 remains pausing for existing recovery; it must not be advertised as running.
 Restart reconciles a managed retirement against its exact durable capture record.
-A committed and retired capture finishes the paused/source transaction; an unknown
-outcome retains its owner for retry. Without a retirement intent, an interrupted
+A committed, retired and available capture finishes the paused/source transaction;
+a physically released capture without a published file instead finishes the exact
+pausing run as dead. An unknown outcome retains its owner for retry. Without a retirement intent, an interrupted
 pausing row keeps the existing exact-run fencing and terminal cleanup behavior.
 
 `checkpoint=true` atomically retains the immutable E or S/E pair with paused/source and returns

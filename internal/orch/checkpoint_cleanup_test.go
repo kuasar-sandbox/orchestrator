@@ -91,7 +91,7 @@ func TestCheckpointCleanupFailureRetainsMarkerAndRestartRetries(t *testing.T) {
 func TestCheckpointMemoryReadersDeferOnlyGCWithoutHoldingRuntimeOwnership(t *testing.T) {
 	f := localPausedCheckpoint(t, "checkpoint-reader-deferred")
 	stopRetirementWorkers(t, f.o)
-	holder := filepath.Join(f.sb.RunDir, "memory-holders", "memory", "1")
+	holder := filepath.Join(filepath.Dir(f.sb.RunDir), ".fixture-gc-holder")
 	if err := os.MkdirAll(holder, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,10 @@ func TestCheckpointMemoryReadersDeferOnlyGCWithoutHoldingRuntimeOwnership(t *tes
 		t.Fatalf("deferred GC lost source or kept runtime fields: %+v %v", row, err)
 	}
 	if _, err := os.Stat(holder); err != nil {
-		t.Fatalf("deferred GC removed holder namespace: %v", err)
+		t.Fatalf("deferred GC removed independent holder: %v", err)
+	}
+	if _, err := os.Lstat(f.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deferred GC retained ordinary RunDir: %v", err)
 	}
 	if _, err := f.o.inspectOrCleanupCheckpoint(context.Background(), row, true); err == nil {
 		t.Fatal("inspection incorrectly accepted the cleanup-only deferred code")

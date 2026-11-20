@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -59,7 +58,7 @@ func (o *Orchestrator) ensureRetiredMemoryReleased(ctx context.Context, sid stri
 		if m.TaskID != sid || m.RetirementOperationID == "" {
 			continue
 		}
-		record, err := o.readRunCapture(ctx, m)
+		record, err := o.recoverRunCapture(ctx, m)
 		if err != nil {
 			return err
 		}
@@ -132,8 +131,11 @@ func (o *Orchestrator) releaseRetiredRun(ctx context.Context, m store.RunPoolOwn
 			return err
 		}
 	}
-	if err := removeReleasedHolderDirectory(m, record); err != nil {
-		return err
+	if err := memorycheckpoint.RemoveHolderDirectory(*record); err != nil {
+		// RAM and its resource charge are already gone, and the exact old
+		// unit is fenced. Keep only this directory cleanup responsibility;
+		// it cannot block controller startup or re-create a RAM obligation.
+		return errors.Join(errRetirementPending, err)
 	}
 	return o.runs.forget(m.RunID)
 }
@@ -221,25 +223,6 @@ func (o *Orchestrator) discardAbsentCapture(ctx context.Context, m store.RunPool
 	return o.runs.forget(m.RunID)
 }
 
-func removeReleasedHolderDirectory(m store.RunPoolOwnership, record *artifact.CaptureRecord) error {
-	root := filepath.Join(m.RetirementRunDir, "memory-holders")
-	dir := filepath.Join(root, record.MemoryID, fmt.Sprint(record.Epoch))
-	if m.RetirementRunDir == "" || filepath.Clean(record.Holder.SocketPath) != filepath.Join(dir, "m.sock") {
-		return errors.New("retired holder path is outside its recorded generation")
-	}
-	// Only this released generation may be recursive. The shared RunDir can
-	// already contain the successor's control socket and must remain untouched.
-	if err := os.RemoveAll(dir); err != nil {
-		return err
-	}
-	for _, path := range []string{filepath.Dir(dir), root, m.RetirementRunDir} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
-			return err
-		}
-	}
-	return nil
-}
-
 func retirementCommandEnvironment(permit *ctl.HostRetirementPermit) ([]string, error) {
 	const prefix = "SANDBOX_CHECKPOINT_RETIREMENT="
 	env := make([]string, 0, len(os.Environ())+1)
@@ -256,32 +239,6 @@ func retirementCommandEnvironment(permit *ctl.HostRetirementPermit) ([]string, e
 		env = append(env, prefix+string(raw))
 	}
 	return env, nil
-}
-
-func removeRunDirPreservingMemoryHolders(path string, remove func(string) error) error {
-	info, err := os.Lstat(filepath.Join(path, "memory-holders"))
-	if errors.Is(err, os.ErrNotExist) {
-		return remove(path)
-	}
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return errors.New("memory holder namespace is not a directory")
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.Name() == "memory-holders" {
-			continue
-		}
-		if err := remove(filepath.Join(path, entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func runRetirementEvent(m store.RunPoolOwnership) configsock.RunRetirementEvent {
@@ -310,6 +267,32 @@ func (o *Orchestrator) readRunCapture(ctx context.Context, m store.RunPoolOwners
 	}
 	if m.MemoryID != "" && (record.MemoryID != m.MemoryID || record.Epoch != m.MemoryEpoch) {
 		return nil, errors.Join(errCaptureOutcomePending, errors.New("capture memory generation changed"))
+	}
+	return record, nil
+}
+
+// Recover only from the SDK's exact writer/PID/RAM-pin proof. In particular,
+// neither a missing service nor an exited process alone may release ownership.
+// All proof locks are nonblocking, including when a lifecycle caller owns SID.
+func (o *Orchestrator) recoverRunCapture(ctx context.Context, m store.RunPoolOwnership) (*artifact.CaptureRecord, error) {
+	record, err := o.readRunCapture(ctx, m)
+	if err != nil || record == nil || !record.Committed || !record.RuntimeRetired || record.RAMReleased || record.Aborted || record.Discarded {
+		return record, err
+	}
+	path, err := memorycheckpoint.RecordPath(filepath.Join(m.RetirementBaseDir, "checkpoint"), m.RetirementCheckpointID)
+	if err != nil {
+		return nil, err
+	}
+	recovered, err := memorycheckpoint.RecoverMemoryRelease(ctx, path, *record)
+	if err != nil {
+		return nil, err
+	}
+	record = &recovered.Record
+	if recovered.ProducerExited && !record.FileReady && !record.RAMReleased {
+		// Existing readers can still own frozen RAM. Keep the physical obligation
+		// retryable without advertising this source as a successful new capture.
+		return record, errors.Join(api.ErrPreviousMemorySavePending,
+			fmt.Errorf("%w: checkpoint %s memory %s", memorycheckpoint.ErrMemoryUnavailable, record.CheckpointID, record.MemoryID))
 	}
 	return record, nil
 }
@@ -374,7 +357,7 @@ func (o *Orchestrator) prepareCheckpointRetirement(ctx context.Context, sb *type
 		}
 		m.TaskID = sb.ID
 		m.RetirementOperationID, m.RetirementCheckpointID = permit.OperationID, checkpointID
-		m.RetirementInstanceID, m.RetirementBaseDir, m.RetirementRunDir = sb.InstanceID, sb.BaseDir, sb.RunDir
+		m.RetirementInstanceID, m.RetirementBaseDir = sb.InstanceID, sb.BaseDir
 		return nil
 	})
 	if err != nil {
@@ -401,7 +384,7 @@ func (o *Orchestrator) abortCheckpointRetirement(ctx context.Context, sb *types.
 			return errors.New("cannot abort committed runner retirement")
 		}
 		m.RetirementOperationID, m.RetirementCheckpointID, m.RetirementInstanceID = "", "", ""
-		m.RetirementBaseDir, m.RetirementRunDir = "", ""
+		m.RetirementBaseDir = ""
 		m.MemoryID, m.MemoryEpoch, m.RetainCheckpoint, m.ParentRetired = "", 0, false, false
 		return nil
 	})
@@ -409,6 +392,9 @@ func (o *Orchestrator) abortCheckpointRetirement(ctx context.Context, sb *types.
 }
 
 func captureSource(record *artifact.CaptureRecord) (types.ResumeSource, error) {
+	if record != nil && record.Lost() {
+		return types.ResumeSource{}, fmt.Errorf("%w: checkpoint %s memory %s", memorycheckpoint.ErrMemoryLost, record.CheckpointID, record.MemoryID)
+	}
 	if record == nil || !record.Committed || !record.RuntimeRetired || record.Discarded {
 		return types.ResumeSource{}, errCaptureOutcomePending
 	}
@@ -430,13 +416,17 @@ func (o *Orchestrator) recoverCaptureOutcome(ctx context.Context, sb *types.Sand
 	if err != nil || !found {
 		return types.ResumeSource{}, errors.Join(errCaptureOutcomePending, captureErr, err)
 	}
-	record, err := o.readRunCapture(ctx, m)
+	record, err := o.recoverRunCapture(ctx, m)
 	if err != nil {
 		return types.ResumeSource{}, errors.Join(errCaptureOutcomePending, captureErr, err)
 	}
 	if record != nil && record.Committed {
 		if !record.RuntimeRetired {
 			record, err = o.awaitCapturedRuntime(ctx, m, record)
+			if err != nil {
+				return types.ResumeSource{}, errors.Join(errCaptureOutcomePending, captureErr, err)
+			}
+			record, err = o.recoverRunCapture(ctx, m)
 			if err != nil {
 				return types.ResumeSource{}, errors.Join(errCaptureOutcomePending, captureErr, err)
 			}
@@ -491,7 +481,7 @@ func (o *Orchestrator) capturedHolderOwnership(ctx context.Context, sb *types.Sa
 	if err != nil || !found || m.RetirementOperationID == "" {
 		return nil, err
 	}
-	record, err := o.readRunCapture(ctx, m)
+	record, err := o.recoverRunCapture(ctx, m)
 	if err != nil {
 		return nil, err
 	}
@@ -684,7 +674,7 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 	if current.RetirementOperationID == "" {
 		return nil
 	}
-	record, err := o.readRunCapture(ctx, current)
+	record, err := o.recoverRunCapture(ctx, current)
 	if err != nil {
 		return err
 	}
@@ -725,6 +715,13 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 		if sb == nil || sb.InstanceID != current.RetirementInstanceID || sb.RunID != current.RunID || sb.State != types.StatePausing {
 			return errCaptureOutcomePending
 		}
+		if record.Lost() {
+			// Retirement is irreversible. Keep the last usable historical source
+			// and finish this exact run as dead, never as an unusable paused S.
+			o.log.Warn("checkpoint memory lost after runtime retirement", "sid", sb.ID,
+				"run_id", current.RunID, "memory_id", record.MemoryID, "epoch", record.Epoch)
+			return o.finalizeRunningSandboxDeadLocked(ctx, sb)
+		}
 		source, err := captureSource(record)
 		if err != nil {
 			return err
@@ -751,8 +748,10 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 		return errRetirementPending
 	}
 	if current.Role != store.RunRoleMemoryHolder {
-		if _, err := captureSource(record); err != nil {
-			return err
+		if !record.Lost() {
+			if _, err := captureSource(record); err != nil {
+				return err
+			}
 		}
 		// A delete may have superseded the unknown pause outcome. Preserve the
 		// committed holder identity without resurrecting the deleting sandbox.

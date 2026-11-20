@@ -386,9 +386,13 @@ checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceO
 ### Checkpoint 内存保存
 
 启动时启用 checkpoint 支持的 runtime，在内存捕获指定实际 checkpoint ID 时，可以在
-冻结不可变内存并释放运行资源后完成 Pause。原 `sandbox-ctl` 作为仍有明确所有者的
-memory holder 继续写出内存。临时 socket 位于分代的 `RunDir/memory-holders` 目录，
-checkpoint 元数据引用该 holder。保存期间 Resume 和 Export 使用同一个本地 Snapshot
+冻结不可变内存、释放运行资源并完整删除普通 RunDir 后完成 Pause。原 `sandbox-ctl`
+作为仍有明确所有者的 memory holder 继续写出内存。临时 socket 位于规范化 RunDir
+父目录内独占创建的平级目录，名称包含短身份哈希及随机尾部。捕获记录绑定该目录的
+准确路径、dev/inode 和不可变身份 marker；holder 独立持有目录锁。清理仅删除自身
+socket、marker 和本代目录，不处理 RunDir 或任何父目录；替换目录、被占锁目录及
+未知内容均受保护。RunDir 父目录必须允许创建平级目录，创建失败在捕获提交前返回。
+保存期间 Resume 和 Export 使用同一个本地 Snapshot
 视图，文件完成后切换到文件。Resume 分配独立的可写内存；旧 holder 的内存只有在所有
 读者释放后才释放资源记账。
 
@@ -397,11 +401,41 @@ checkpoint 元数据引用该 holder。保存期间 Resume 和 Export 使用同�
 证明。已结清的历史 receipt 不再占用源池内存，因此不要求旧源池继续存在于配置中；
 后继运行的预算仍由自己的有效 lease 和资源池负责。
 
+物理 RAM 释放与文件可用性是独立持久事实。holder 在同一条 SCM_RIGHTS 消息中传递
+只读 memfd 和 RAM 生命周期 pin，覆盖已经接收及仍在 socket 队列中的 FD。读者先
+结束 RAM FD/映射，再关闭 pin；文件型 GC pin 与资源 ACK 重试不能延长 RAM 占有。
+正常完成和异常恢复均须对记录绑定的原 RAM pin inode 取得排他锁，才发布
+`RAMReleased`。异常恢复还须取得稳定 record writer 锁、确认准确 PID/start-time 已退出，
+且仅处理已经 `Committed` 和 `RuntimeRetired` 的捕获。host 与资源控制器共用 SDK
+非阻塞证明；进程死亡、socket 消失或看似完整的 payload 都不能单独证明释放。
+有效捕获记录（包括 Aborted intent）及其稳定 writer/RAM 锁 inode 随 BaseDir 保留到
+终端删除，current-memory locator 前移不会隐藏尚待资源 receipt 结算的准确证明。
+这些元数据保留不延长无引用 payload 的生命周期；数据文件仍按普通引用图执行 GC。
+
+producer 未发布 `FileReady` 即退出时，已有 RAM 读者继续占有原额度；最后一个 pin
+关闭后，恢复发布 `RAMReleased` 并结清原池准确 R，即使对应内存快照已经丢失。
+恢复不补造 `FileReady`，也不把该捕获标记为主动 Discarded。仅准确旧运行仍处于
+`pausing` 时收敛为 `dead`，保留 BaseDir 与原历史来源；已 paused 或正在运行的后继
+不改变业务状态。选择丢失来源恢复或导出会明确失败。未知身份、原 proof 缺失/被替换
+或运行退役尚未确认时，保留责任及诊断，由既有准确 fence 后的删除/Reset 流程处理。
+
+终态清理先 fence 准确当前运行、清理网络并完整删除其 RunDir，再等待历史运行的 RAM
+或目录责任；当前运行本身仍是持 RAM 的 holder 时，原 exact-run fence 保护仍然生效。
+硬删除在 BaseDir 删除前继续执行原有全代际 fence 与读者证明。R 持久结清且旧 unit
+已 fence 后，独立 holder 目录清理错误只保留重试所有权，不重新计 R，也不阻塞控制器
+启动。捕获 JSON、原证明及未结清资源的错误保持原有失败语义。启动时 accepted-running/dead
+路径仅对已识别的退役/保存 pending 使用既有 worker 延期，不用宽泛 pending 分类
+吞掉损坏记录。
+
 再次 Pause 默认等待上一轮内存保存。等待可取消，沙箱保持 `running`，不持有 SID
 生命周期锁或 source-operation grant；结束后重新验证实例及 RunID。请求
 `{"noWaitForPreviousMemorySave":true}` 可以在保存仍未完成时立即返回 409。
 TTL、idle 和资源压力后台流程使用不等待选项及原有重试机制。恢复较老的 checkpoint
 同样必须继承该 SID 尚未完成的保存责任。
+若确认 producer 已退出且没有已发布文件，默认等待在仍有 RAM 时明确返回不可用，
+不进入 `pausing`。判断顺序先消费物理完成事实，再处理历史保存错误：旧 RAM 释放后，
+从其他完整 checkpoint 恢复的后继可以再次暂停，不被历史 lost 永久阻塞。
+系统不自动启动替代 holder。
 
 这是既有 checkpoint 捕获行为的改进，不增加运行模式。未启用 checkpoint，或捕获未
 指定 checkpoint ID 时，继续同步保存。受管理的异步保存要求当前 Conductor、node-ctl
@@ -438,8 +472,9 @@ finalizer 在 SID 锁内重读状态和 RunID，只完成剩余暂停清理。Re
 视图中同时清除旧结果，有效 paused 来源仍可导出；已退休 RunID 的报告不能修改后继运行。
 capture 成功但 paused 事务失败时，未提交操作保持 pausing，交由既有恢复路径处理，
 不能宣称旧实例仍在 running。
-受管理的内存退役按精确捕获记录恢复：已提交且运行资源已退役时，前滚完成 paused/source
-事务；结果未知时保留所有者等待重查。没有退役 intent 的中断 pausing，仍沿原有精确
+受管理的内存退役按精确捕获记录恢复：已提交、运行资源已退役且来源可用时，前滚完成
+paused/source 事务；物理 RAM 已释放但文件未发布时，将准确 pausing 运行收敛为 dead。
+结果未知时保留所有者等待重查。没有退役 intent 的中断 pausing，仍沿原有精确
 runner fencing 和终止清理流程收敛，不仅凭进程存活重新发布 running。
 
 `checkpoint=true` 保存一个长期保留的不可变 E 或 S/E 对, 与 paused/source 在同一事务提交,

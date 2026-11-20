@@ -916,7 +916,7 @@ func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, sb *t
 		if removeRunDir == nil {
 			removeRunDir = os.RemoveAll
 		}
-		if err := removeRunDirPreservingMemoryHolders(p.runDir, removeRunDir); err != nil {
+		if err := removeRunDir(p.runDir); err != nil {
 			return fmt.Errorf("remove run dir %s: %w", p.runDir, err)
 		}
 		p.runDirRemoved = true
@@ -1648,7 +1648,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		if err := o.cleanupCheckpoint(ctx, sb); err != nil {
 			return err
 		}
-		if err := removeRunDirPreservingMemoryHolders(runDir, removeRunDir); err != nil {
+		if err := removeRunDir(runDir); err != nil {
 			return fmt.Errorf("remove paused sandbox RunDir %s: %w", runDir, err)
 		}
 		changed, err := o.st.ClearPausedRunDir(ctx, sb.ID, runDir, sb.EnvdUDS, sb.CiUDS)

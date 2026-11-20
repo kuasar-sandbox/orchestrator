@@ -81,10 +81,13 @@ func TestReconcileTerminalSuccessorDefersPreviousMemoryRetirement(t *testing.T) 
 					if _, found, err := restarted.st.RunPoolOwnership(context.Background(), m.RunID); err != nil || !found {
 						t.Fatalf("pending predecessor lost ownership: found=%t err=%v", found, err)
 					}
-					for _, path := range []string{w.Path(), f.sb.RunDir, f.sb.BaseDir} {
+					for _, path := range []string{w.Path(), f.sb.BaseDir} {
 						if _, err := os.Stat(path); err != nil {
 							t.Fatalf("pending cleanup removed owned path: %v", err)
 						}
+					}
+					if _, err := os.Lstat(f.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("historical holder retained successor RunDir: %v", err)
 					}
 					if _, stops := f.lc.stopSnapshot(); stops != 0 {
 						t.Fatalf("pending retirement stopped holder: %d", stops)
@@ -166,8 +169,8 @@ func TestReconcileTerminalRetirementReadErrorStillFails(t *testing.T) {
 			if _, found, err := restarted.st.RunPoolOwnership(context.Background(), m.RunID); err != nil || !found {
 				t.Fatalf("failed recovery lost holder proof: found=%t err=%v", found, err)
 			}
-			if _, err := os.Stat(f.sb.RunDir); err != nil {
-				t.Fatal(err)
+			if _, err := os.Stat(f.sb.BaseDir); err != nil {
+				t.Fatalf("invalid proof removed retained history: %v", err)
 			}
 		})
 	}

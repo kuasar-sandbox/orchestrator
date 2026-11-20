@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,14 +134,21 @@ func readRetentionCapture(sid string, c resource.CaptureRetention) (*memorycheck
 	if err != nil {
 		return nil, fmt.Errorf("capture proof: %w", err)
 	}
+	if err := validateRetentionCapture(sid, c, r); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func validateRetentionCapture(sid string, c resource.CaptureRetention, r *memorycheckpoint.CaptureRecord) error {
 	op := r.HostOperationID
 	if op == "" {
 		op = r.CheckpointID
 	}
 	if r.Producer.SandboxID != sid || r.MemoryID != c.MemoryID || r.Epoch != c.Epoch || op != c.OperationID {
-		return nil, fmt.Errorf("capture proof identity changed")
+		return fmt.Errorf("capture proof identity changed")
 	}
-	return r, nil
+	return nil
 }
 
 func validateRetentionProof(r *retainedReceipt, proof *memorycheckpoint.CaptureRecord) error {
@@ -148,6 +156,34 @@ func validateRetentionProof(r *retainedReceipt, proof *memorycheckpoint.CaptureR
 		return fmt.Errorf("capture producer or holder identity changed")
 	}
 	return nil
+}
+
+// Validate the durable receipt before asking the SDK to publish a physical
+// release fact. The same nonblocking proof is used at startup and periodically;
+// no resource mutex waits for a producer or borrowed RAM reader to exit.
+func recoverRetentionCapture(r *retainedReceipt) (*memorycheckpoint.CaptureRecord, error) {
+	proof, err := readRetentionCapture(r.SandboxID, r.Capture)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRetentionProof(r, proof); err != nil {
+		return nil, err
+	}
+	if !proof.Committed || !proof.RuntimeRetired || proof.RAMReleased || proof.Aborted || proof.Discarded {
+		return proof, nil
+	}
+	recovered, err := memorycheckpoint.RecoverMemoryRelease(context.Background(), r.Capture.CapturePath, *proof)
+	if err != nil {
+		return nil, err
+	}
+	proof = &recovered.Record
+	if err := validateRetentionCapture(r.SandboxID, r.Capture, proof); err != nil {
+		return nil, err
+	}
+	if err := validateRetentionProof(r, proof); err != nil {
+		return nil, err
+	}
+	return proof, nil
 }
 
 func retentionProcessStartTime(pid int) (uint64, error) {
@@ -189,10 +225,7 @@ func (i *Inventory) recoverRetained(state *State, controlPIDs map[int]bool) erro
 			return fmt.Errorf("retention inventory identity mismatch")
 		}
 		changed := false
-		proof, proofErr := readRetentionCapture(r.SandboxID, r.Capture)
-		if proofErr == nil {
-			proofErr = validateRetentionProof(r, proof)
-		}
+		proof, proofErr := recoverRetentionCapture(r)
 		if proofErr == nil {
 			if proof.Aborted && r.Stage == retentionPrepared {
 				// The original VM still owns its ordinary B. Remove only the
@@ -244,7 +277,8 @@ func (s *State) retainedSourceLease(sid string, pid int, cgroup string) bool {
 
 // ReconcileRetained consumes monotonic capture facts and ends abandoned owner
 // admissions. EOF, file readiness or a dead owner never prove source RAM was
-// freed; only its exact RAMReleased fact can release R.
+// freed. Recovery may publish RAMReleased only after the SDK proves the exact
+// producer is gone and the original RAM-pin inode has no remaining references.
 func (i *Inventory) ReconcileRetained(state *State) error {
 	return i.reconcileRetained(state, "")
 }
@@ -277,11 +311,11 @@ func (i *Inventory) reconcileRetained(state *State, sid string) error {
 		if r.Settled {
 			continue
 		}
-		proof, err := readRetentionCapture(r.SandboxID, r.Capture)
-		if err == nil {
-			err = validateRetentionProof(r, proof)
-		}
+		proof, err := recoverRetentionCapture(r)
 		if err != nil {
+			if i.Logf != nil {
+				i.Logf("retaining uncertain checkpoint memory sid=%s: %v", r.SandboxID, err)
+			}
 			continue
 		}
 		if proof.Aborted && r.Stage == retentionPrepared {

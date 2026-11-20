@@ -88,15 +88,10 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 want = ("paused", "", "", "", "", "", "", "", "", sys.argv[3])
 if row != want or not Path(sys.argv[3]).is_dir():
     raise SystemExit(1)
-# A checkpoint holder owns only this generation namespace. Ordinary runtime
-# paths must already be gone; awaiting the holder would measure disk saving as
-# part of Pause again. The checkpoint case checks its capture and ACK evidence.
+# A checkpoint holder owns an independent sibling directory. Ordinary RunDir
+# must be absent while saving may continue in that separately owned directory.
 run_dir = Path(sys.argv[4])
-try:
-    names = {item.name for item in run_dir.iterdir()}
-except FileNotFoundError:
-    names = set()
-raise SystemExit(0 if names <= {"memory-holders"} else 1)
+raise SystemExit(0 if not run_dir.exists() and not run_dir.is_symlink() else 1)
 PY
         then
             return 0

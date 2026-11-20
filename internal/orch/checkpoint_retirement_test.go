@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
+	"golang.org/x/sys/unix"
 )
 
 func retiredTestOwnership(t *testing.T, f sandboxFinalizerFixture) store.RunPoolOwnership {
@@ -22,7 +23,7 @@ func retiredTestOwnership(t *testing.T, f sandboxFinalizerFixture) store.RunPool
 	pool := f.o.runnerPool.pools[0]
 	m := store.RunPoolOwnership{RunID: f.sb.RunID, Kind: runKindSandbox, Pool: pool.name, ResourcePool: pool.resourcePool,
 		Unit: f.lc.unit, TaskID: f.sb.ID, RetirementOperationID: "capture-1", RetirementCheckpointID: "capture-1",
-		RetirementInstanceID: f.sb.InstanceID, RetirementBaseDir: f.sb.BaseDir, RetirementRunDir: f.sb.RunDir,
+		RetirementInstanceID: f.sb.InstanceID, RetirementBaseDir: f.sb.BaseDir,
 		Role: store.RunRoleMemoryHolder, MemoryID: "memory-1", MemoryEpoch: 1}
 	if err := f.o.st.SaveRunPoolOwnership(context.Background(), m); err != nil {
 		t.Fatal(err)
@@ -37,13 +38,41 @@ func retiredTestOwnership(t *testing.T, f sandboxFinalizerFixture) store.RunPool
 
 func testCaptureRecord(t *testing.T, f sandboxFinalizerFixture, m store.RunPoolOwnership, adjust ...func(*memorycheckpoint.CaptureRecord)) *memorycheckpoint.RecordWriter {
 	t.Helper()
+	// These tests control durable facts directly. Give an already-removed
+	// service directory a real identity; physical holder tests use PrepareHolder.
+	dir, err := os.MkdirTemp(filepath.Dir(f.sb.RunDir), ".fixture-holder-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Stat(dir, &stat); err != nil {
+		t.Fatal(err)
+	}
+	identity := memorycheckpoint.HolderDirectoryIdentity{Path: dir, Device: uint64(stat.Dev), Inode: stat.Ino}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
 	r := memorycheckpoint.CaptureRecord{Version: 1, Producer: memorycheckpoint.RunIdentity{SandboxID: f.sb.ID, InstanceID: f.sb.InstanceID, RunID: f.sb.RunID},
 		CheckpointID: m.RetirementCheckpointID, HostOperationID: m.RetirementOperationID, MemoryID: "memory-1", Epoch: 1,
 		SnapshotRef: checkpointSnapshotRef, SandboxRef: checkpointSandboxRef, Committed: true, RuntimeRetired: true,
-		Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: 1, SocketPath: filepath.Join(f.sb.RunDir, "memory-holders", "memory-1", "1", "m.sock")}}
+		Holder: memorycheckpoint.HolderIdentity{PID: os.Getpid(), StartTime: 1, SocketPath: filepath.Join(dir, "m.sock"), Directory: identity}}
 	for _, change := range adjust {
 		change(&r)
 	}
+	path, err := memorycheckpoint.RecordPath(filepath.Join(f.sb.BaseDir, "checkpoint"), r.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".ram.lock", nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Stat(path+".ram.lock", &stat); err != nil {
+		t.Fatal(err)
+	}
+	r.Holder.RAMLock = memorycheckpoint.FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
 	w, err := memorycheckpoint.CreateRecord(filepath.Join(f.sb.BaseDir, "checkpoint"), r)
 	if err != nil {
 		t.Fatal(err)
@@ -218,26 +247,28 @@ func TestCaptureUnknownEOFAndDeleteDoNotDiscardFrozenOwner(t *testing.T) {
 	}
 }
 
-func TestRunDirectoryCleanupPreservesOnlyHolderNamespace(t *testing.T) {
-	dir := t.TempDir()
-	holder := filepath.Join(dir, "memory-holders", "memory", "1")
+func TestPausedCleanupRemovesRunDirectoryAndPreservesSiblingHolder(t *testing.T) {
+	f := localPausedCheckpoint(t, "sibling-holder")
+	stopRetirementWorkers(t, f.o)
+	checkpointCleanupTool(t, f.o, "exit 0\n")
+	holder := filepath.Join(filepath.Dir(f.sb.RunDir), ".fixture-sibling-holder")
 	if err := os.MkdirAll(holder, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(holder, "m.sock"), []byte("holder"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "ctl.sock"), []byte("old runtime"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(f.sb.RunDir, "ctl.sock"), []byte("old runtime"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeRunDirPreservingMemoryHolders(dir, os.RemoveAll); err != nil {
+	if err := f.o.finalizePausedCleanupOnce(f.sb.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(holder, "m.sock")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "ctl.sock")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("normal runtime path remained")
+	if _, err := os.Lstat(f.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("ordinary RunDir inode remained")
 	}
 }
 
@@ -283,7 +314,7 @@ func TestOrdinaryFenceCannotKillPendingHolder(t *testing.T) {
 	}
 }
 
-func TestReleasedHolderCleanupPreservesSuccessorRunDirectory(t *testing.T) {
+func TestReleasedHolderAbsentServicePreservesSuccessorRunDirectory(t *testing.T) {
 	f := pendingPauseFixture(t)
 	stopRetirementWorkers(t, f.o)
 	m := retiredTestOwnership(t, f)
@@ -294,12 +325,6 @@ func TestReleasedHolderCleanupPreservesSuccessorRunDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := w.Read()
-	if err := os.MkdirAll(filepath.Dir(record.Holder.SocketPath), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(record.Holder.SocketPath, []byte("released"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	successor := filepath.Join(f.sb.RunDir, "ctl.sock")
 	if err := os.WriteFile(successor, []byte("successor"), 0600); err != nil {
 		t.Fatal(err)
@@ -420,6 +445,39 @@ func TestCommittedCaptureRetirementTimeoutRetainsForwardRecovery(t *testing.T) {
 	current, err = f.o.st.Get(context.Background(), f.sb.ID)
 	if err != nil || current.State != types.StatePaused || current.ResumeSource.Ref != checkpointSnapshotRef {
 		t.Fatalf("committed source was lost after timeout: %+v %v", current, err)
+	}
+}
+
+func TestCommittedLostCaptureRetainsForwardRecoveryInsteadOfRollback(t *testing.T) {
+	f := pendingPauseFixture(t)
+	stopRetirementWorkers(t, f.o)
+	m := retiredTestOwnership(t, f)
+	m.Role, m.MemoryID, m.MemoryEpoch = "", "", 0
+	if err := f.o.saveRunOwnership(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	testCaptureRecord(t, f, m, func(r *memorycheckpoint.CaptureRecord) { r.RAMReleased = true })
+	if changed, err := f.o.st.SetPausing(context.Background(), f.sb.ID, f.sb.RunID, true); err != nil || !changed {
+		t.Fatalf("prepare pause: %v %v", changed, err)
+	}
+	_, err := f.o.recoverCaptureOutcome(context.Background(), f.sb,
+		&ctl.HostRetirementPermit{OperationID: m.RetirementOperationID}, types.ResumeSource{}, io.EOF)
+	if !errors.Is(err, memorycheckpoint.ErrMemoryLost) || !errors.Is(err, errCaptureOutcomePending) {
+		t.Fatalf("lost committed capture became rollback-safe: %v", err)
+	}
+	current, err := f.o.st.Get(context.Background(), f.sb.ID)
+	if err != nil || current.State != types.StatePausing {
+		t.Fatalf("committed loss revived the runtime: %v", err)
+	}
+	if _, found, err := f.o.st.RunPoolOwnership(context.Background(), m.RunID); err != nil || !found {
+		t.Fatalf("committed loss discarded forward recovery: %v %v", found, err)
+	}
+	if err := f.o.reconcileRetiredRun(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	current, err = f.o.st.Get(context.Background(), f.sb.ID)
+	if err != nil || current.State != types.StateDead {
+		t.Fatalf("lost capture did not converge through terminal cleanup: %v", err)
 	}
 }
 

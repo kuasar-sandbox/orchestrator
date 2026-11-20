@@ -242,10 +242,6 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 		if err := o.discardRetiredMemoryForDelete(ctx, sb); err != nil {
 			return err
 		}
-	} else {
-		if err := o.ensureRetiredMemoryReleased(ctx, sb.ID); err != nil {
-			return err
-		}
 	}
 	if sb.RunID != "" {
 		if err := o.fenceSandboxRunner(ctx, sb.RunID); err != nil {
@@ -268,12 +264,18 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 		removeRunDir = os.RemoveAll
 	}
 	if sb.RunDir != "" {
-		remove := func(path string) error { return removeRunDirPreservingMemoryHolders(path, removeRunDir) }
-		if sb.State == types.StateDeleting {
-			remove = removeRunDir // Every holder and reader was fenced above.
-		}
-		if err := remove(sb.RunDir); err != nil {
+		if err := removeRunDir(sb.RunDir); err != nil {
 			return fmt.Errorf("remove sandbox RunDir %s: %w", sb.RunDir, err)
+		}
+	}
+	if sb.State != types.StateDeleting {
+		// An exited successor owns neither an old holder's RAM nor its service
+		// directory. Finish this exact run's fence/network/RunDir before waiting
+		// for SID history. The exact-run fence above still protects a pending
+		// holder when it is itself the current run; hard delete keeps all of its
+		// original generation and reader fences before removing BaseDir.
+		if err := o.ensureRetiredMemoryReleased(ctx, sb.ID); err != nil {
+			return err
 		}
 	}
 	removeBaseDir := o.removeSandboxBaseDir

@@ -49,7 +49,6 @@ type RunPoolOwnership struct {
 	RetirementCheckpointID string `json:"retirement_checkpoint_id,omitempty"`
 	RetirementInstanceID   string `json:"retirement_instance_id,omitempty"`
 	RetirementBaseDir      string `json:"retirement_base_dir,omitempty"`
-	RetirementRunDir       string `json:"retirement_run_dir,omitempty"`
 	RetainCheckpoint       bool   `json:"retain_checkpoint,omitempty"`
 	Role                   string `json:"role,omitempty"`
 	MemoryID               string `json:"memory_id,omitempty"`
