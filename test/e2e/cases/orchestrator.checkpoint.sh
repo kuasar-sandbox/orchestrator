@@ -86,6 +86,7 @@ def versions(meta):
     return {(disk['diff_id'], meta['checkpoint_id']) for disk in [meta['root'], *(meta.get('disks') or [])]}
 # The prior run's durable current-disk description protects A until the new
 # binding replaces it. The admitted publisher can defer that collection.
+refs = [ref for ref in refs if ref.get('diff_id')]
 actual = {(ref['diff_id'], ref['id']) for ref in refs}
 assert len(actual) == len(refs) and versions(second) <= actual <= versions(first) | versions(second), refs
 PY
@@ -117,13 +118,21 @@ PY
 [ "${#FENCE_DIFF_IDS[@]}" -gt 0 ] || fail "temporary fence returned no exact DIFF identities"
 FENCE_DELETE_ARGS=()
 for diff_id in "${FENCE_DIFF_IDS[@]}"; do FENCE_DELETE_ARGS+=(--diff-id "$diff_id"); done
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$WORK/checkpoint-fence.sources.json" <<'PY'
+import json,sqlite3,sys
+with sqlite3.connect(sys.argv[1]) as db:
+    rows=db.execute('select source_kind,source_ref,sandbox_ref from sandbox_checkpoints where sandbox_id=?',(sys.argv[2],)).fetchall()
+    rows+=db.execute('select resume_source_kind,resume_source_ref,resume_sandbox_ref from sandboxes where id=?',(sys.argv[2],)).fetchall()
+roots=[{'snapshot_ref':r if k=='snapshot' else '', 'sandbox_ref':e if k=='snapshot' else r} for k,r,e in rows if r]
+json.dump({'retain':roots},open(sys.argv[3],'w'))
+PY
 timeout -k 2s 30 "$BIN/sandbox-ctl" checkpoint delete --path-id "$SID" --checkpoint "$FENCE_ID" \
-    "${FENCE_DELETE_ARGS[@]}" --run-root "$EXECUTE_RUN_ROOT/sandboxes" --json >"$WORK/checkpoint-fence.deleted.json"
+    "${FENCE_DELETE_ARGS[@]}" --sources "$(cat "$WORK/checkpoint-fence.sources.json")" --run-root "$EXECUTE_RUN_ROOT/sandboxes" --json >"$WORK/checkpoint-fence.deleted.json"
 checkpoint_list "$SID" "$WORK/checkpoint-fence.remaining.json"
 python3 - "$WORK/checkpoint-held.json" "$WORK/checkpoint-fence.remaining.json" \
     "$WORK/checkpoint-fence.refs.json" "$WORK/checkpoint-fence.deleted.json" <<'PY'
 import json, sys
-def refs(path): return sorted((ref['diff_id'], ref['id']) for ref in json.load(open(path)))
+def refs(path): return sorted((ref.get('diff_id',''), ref.get('memory_id',''), ref['id']) for ref in json.load(open(path)))
 assert refs(sys.argv[1]) == refs(sys.argv[2]), 'temporary fence changed the original held versions'
 assert refs(sys.argv[3]) == refs(sys.argv[4]), 'temporary fence deletion did not match its exact refs'
 PY

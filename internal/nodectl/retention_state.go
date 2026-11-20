@@ -11,52 +11,70 @@ import (
 
 const (
 	retentionPrepared = "prepared"
+	retentionHeld     = "held"
+	retentionSettled  = "settled"
 	retentionHolding  = "holding"
 	retentionAdopting = "adopting"
 	retentionActive   = "active"
 )
 
-// The receipt extends the existing inventory; it is not an independently
-// admitted reservation. Prepared owns the original B; holding/active own one R
-// projected into SourcePool. CaptureRecord owns all data/release facts.
-type retainedReceipt struct {
-	Version         int                             `json:"version"`
-	SandboxID       string                          `json:"sandbox_id"`
+// One durable account owns the SID's lease handoff. Each capture independently
+// owns its original B -> R -> settled transition in its immutable source pool.
+// Neither the selected restore graph nor current-memory.json defines this set.
+type retainedAccount struct {
+	Version    int                        `json:"version"`
+	SandboxID  string                     `json:"sandbox_id"`
+	ID         string                     `json:"id"`
+	Revision   uint64                     `json:"revision"`
+	Stage      string                     `json:"stage"`
+	Captures   []*retainedCapture         `json:"captures"`
+	OwnerLease resource.Lease             `json:"owner_lease"`
+	OwnerFile  resource.LeaseFileIdentity `json:"owner_file"`
+	OwnerToken string                     `json:"owner_token"`
+	Handoff    *retainedHandoff           `json:"handoff,omitempty"`
+}
+
+type retainedCapture struct {
 	Capture         resource.CaptureRetention       `json:"capture"`
 	Producer        memorycheckpoint.RunIdentity    `json:"producer"`
 	CheckpointID    string                          `json:"checkpoint_id"`
 	Holder          memorycheckpoint.HolderIdentity `json:"holder"`
 	Memory          resource.RetainedMemory         `json:"memory"`
 	Stage           string                          `json:"stage"`
-	Settled         bool                            `json:"settled,omitempty"` // the exact R release has been durably accounted
 	Source          Reservation                     `json:"source"`
 	SourceStartTime uint64                          `json:"source_start_time"`
 	SourceFile      resource.LeaseFileIdentity      `json:"source_file"`
-	OwnerLease      resource.Lease                  `json:"owner_lease"`
-	OwnerFile       resource.LeaseFileIdentity      `json:"owner_file"`
-	OwnerToken      string                          `json:"owner_token"`
-	Handoff         *retainedHandoff                `json:"handoff,omitempty"`
 }
 
 type retainedHandoff struct {
-	ID            string                      `json:"id"`
-	Candidate     string                      `json:"candidate"`
-	File          resource.LeaseFileIdentity  `json:"file"`
-	Lease         resource.Lease              `json:"lease"`
-	StartTime     uint64                      `json:"start_time,omitempty"`
-	Token         string                      `json:"token"`
-	Pool          string                      `json:"pool"`
-	InitialBudget uint64                      `json:"initial_budget"`
-	InitialCache  uint64                      `json:"initial_cache"`
-	CacheReclaim  *resource.CacheReclaimState `json:"cache_reclaim,omitempty"`
+	ID              string                      `json:"id"`
+	AccountRevision uint64                      `json:"account_revision"`
+	Candidate       string                      `json:"candidate"`
+	File            resource.LeaseFileIdentity  `json:"file"`
+	Lease           resource.Lease              `json:"lease"`
+	StartTime       uint64                      `json:"start_time,omitempty"`
+	Token           string                      `json:"token"`
+	Pool            string                      `json:"pool"`
+	InitialBudget   uint64                      `json:"initial_budget"`
+	InitialCache    uint64                      `json:"initial_cache"`
+	CacheReclaim    *resource.CacheReclaimState `json:"cache_reclaim,omitempty"`
 }
 
-func cloneRetained(r *retainedReceipt) *retainedReceipt {
+func cloneCapture(r *retainedCapture) *retainedCapture {
+	out := *r
+	out.Source = cloneReservation(&r.Source)
+	return &out
+}
+
+func cloneRetained(r *retainedAccount) *retainedAccount {
 	if r == nil {
 		return nil
 	}
 	out := *r
-	out.Source = cloneReservation(&r.Source)
+	out.Captures = make([]*retainedCapture, len(r.Captures))
+	for i, c := range r.Captures {
+		out.Captures[i] = cloneCapture(c)
+	}
 	out.OwnerLease.ClientFeatures = append([]string(nil), r.OwnerLease.ClientFeatures...)
 	if r.Handoff != nil {
 		h := *r.Handoff
@@ -66,6 +84,48 @@ func cloneRetained(r *retainedReceipt) *retainedReceipt {
 	}
 	return &out
 }
+
+func (r *retainedAccount) reference() *resource.RetainedAccount {
+	if r == nil {
+		return nil
+	}
+	return &resource.RetainedAccount{ID: r.ID, Revision: r.Revision}
+}
+
+func (r *retainedAccount) capture(c resource.CaptureRetention) *retainedCapture {
+	if r != nil {
+		for _, e := range r.Captures {
+			if sameCapture(e.Capture, c) {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+func (r *retainedAccount) pending() bool {
+	if r != nil {
+		for _, e := range r.Captures {
+			if e.Stage != retentionSettled {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r *retainedAccount) prepared() *retainedCapture {
+	if r != nil {
+		for _, e := range r.Captures {
+			if e.Stage == retentionPrepared {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+func sameCapture(a, b resource.CaptureRetention) bool { return a == b }
 
 func (s *State) retentionOwner() *State {
 	if s.retentionRoot != nil {
@@ -106,31 +166,64 @@ func (s *State) retainedPool(name string) *State {
 	return nil
 }
 
-// RetainedMemory includes a prepared obligation even though it is still
-// charged as B. Unsupported clients must not treat that SID as ready.
+// RetainedMemory reports a pending obligation for lifecycle barriers. Callers
+// settling a specific capture must use RetainedCapture; this is not a total B.
 func (s *State) RetainedMemory(sid string) (resource.RetainedMemory, bool) {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
-	r := root.retained[sid]
-	if r == nil || r.Settled {
-		return resource.RetainedMemory{}, false
+	if r := root.retained[sid]; r != nil {
+		for _, e := range r.Captures {
+			if e.Stage != retentionSettled {
+				return e.Memory, true
+			}
+		}
 	}
-	return r.Memory, true
+	return resource.RetainedMemory{}, false
 }
 
-func (s *State) retainedSnapshot(sid string) *retainedReceipt {
+func (s *State) RetainedCapture(sid, memoryID string, epoch uint64) (resource.RetainedMemory, bool) {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	if r := root.retained[sid]; r != nil {
+		for _, e := range r.Captures {
+			if e.Stage != retentionSettled && e.Memory.MemoryID == memoryID && e.Memory.Epoch == epoch {
+				return e.Memory, true
+			}
+		}
+	}
+	return resource.RetainedMemory{}, false
+}
+
+// RetainedCaptureOperation is used before the host has learned a MemoryID.
+// It fences only the exact producer/operation, never unrelated old holders.
+func (s *State) RetainedCaptureOperation(producer memorycheckpoint.RunIdentity, checkpointID, operationID string) bool {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	if account := root.retained[producer.SandboxID]; account != nil {
+		for _, entry := range account.Captures {
+			if entry.Stage != retentionSettled && entry.Producer == producer && entry.CheckpointID == checkpointID && entry.Capture.OperationID == operationID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *State) retainedSnapshot(sid string) *retainedAccount {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
 	return cloneRetained(root.retained[sid])
 }
 
-func (s *State) retainedSnapshots() []*retainedReceipt {
+func (s *State) retainedSnapshots() []*retainedAccount {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
-	out := make([]*retainedReceipt, 0, len(root.retained))
+	out := make([]*retainedAccount, 0, len(root.retained))
 	for _, r := range root.retained {
 		out = append(out, cloneRetained(r))
 	}
@@ -139,77 +232,89 @@ func (s *State) retainedSnapshots() []*retainedReceipt {
 
 func (s *State) checkRetainedOwnerLocked(sid string, pid int, adoption string, budget uint64) error {
 	r := s.retained[sid]
-	if r == nil || r.Settled {
+	if r == nil {
 		return nil
 	}
-	switch r.Stage {
-	case retentionPrepared:
-		if pid == r.Source.PeerPID && budget == r.Memory.Bytes {
+	if e := r.prepared(); e != nil {
+		if pid == e.Source.PeerPID && budget == e.Memory.Bytes {
 			return nil
 		}
-	case retentionAdopting:
-		if r.Handoff != nil && adoption == r.Handoff.ID && pid == r.Handoff.Lease.PID {
-			return nil
-		}
-	case retentionActive:
-		if pid == r.OwnerLease.PID {
-			return nil
+	} else {
+		switch r.Stage {
+		case retentionAdopting:
+			if r.Handoff != nil && adoption == r.Handoff.ID && pid == r.Handoff.Lease.PID && budget == r.Handoff.InitialBudget {
+				return nil
+			}
+		case retentionActive:
+			if pid == r.OwnerLease.PID {
+				return nil
+			}
 		}
 	}
-	return fmt.Errorf("sandbox %q has pending checkpoint memory; explicit owner handoff required", sid)
+	return fmt.Errorf("sandbox %q has a retained account; explicit owner handoff required", sid)
 }
 
-func sameCapture(a, b resource.CaptureRetention) bool { return a == b }
-
-func (s *State) prepareRetained(r *retainedReceipt) error {
+// prepareRetained protects only this execution's B. Earlier entries remain
+// independent R obligations, even if this runtime restored another graph.
+func (s *State) prepareRetained(r *retainedAccount, capture resource.CaptureRetention) error {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
-	if old := root.retained[r.SandboxID]; old != nil && !old.Settled {
-		if sameCapture(old.Capture, r.Capture) {
+	e := r.capture(capture)
+	if e == nil || e.Stage != retentionPrepared {
+		return fmt.Errorf("missing prepared capture")
+	}
+	if old := root.retained[r.SandboxID]; old != nil {
+		if old.ID != r.ID {
+			return fmt.Errorf("retained account changed")
+		}
+		if prior := old.capture(capture); prior != nil {
 			return nil
 		}
-		return fmt.Errorf("previous checkpoint memory is still retained")
+		if old.prepared() != nil {
+			return fmt.Errorf("active Budget already has a capture intent")
+		}
 	}
 	p := root.forSID(r.SandboxID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	active := p.bySID[r.SandboxID]
-	if active == nil || active.PeerPID != r.Source.PeerPID || active.Token != r.Source.Token || active.ReservationMemory != r.Memory.Bytes {
+	if active == nil || active.PeerPID != e.Source.PeerPID || active.Token != e.Source.Token || active.ReservationMemory != e.Memory.Bytes {
 		return fmt.Errorf("capture reservation owner or Budget changed")
 	}
 	if root.retained == nil {
-		root.retained = make(map[string]*retainedReceipt)
+		root.retained = make(map[string]*retainedAccount)
 	}
 	root.retained[r.SandboxID] = cloneRetained(r)
 	active.RetentionPrepared = true
 	return nil
 }
 
-// commitRetained changes accounting roles in one pool critical section. It
-// performs no cgroup, balloon or Guest Budget operation on the frozen owner.
-func (s *State) commitRetained(r *retainedReceipt) (net.Conn, error) {
+// commitRetained transfers B into one R, without any guest/cgroup operation.
+func (s *State) commitRetained(r *retainedAccount, capture resource.CaptureRetention) (net.Conn, error) {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
 	old := root.retained[r.SandboxID]
-	if old == nil || !sameCapture(old.Capture, r.Capture) {
+	e := old.capture(capture)
+	if old == nil || old.ID != r.ID || e == nil {
 		return nil, fmt.Errorf("retention intent changed")
 	}
-	if old.Stage != retentionPrepared || old.Settled {
+	if e.Stage != retentionPrepared {
 		return nil, nil
 	}
-	p := root.retainedPool(old.Memory.SourcePool)
+	p := root.retainedPool(e.Memory.SourcePool)
 	if p == nil {
 		return nil, fmt.Errorf("retained source pool disappeared")
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	active := p.bySID[r.SandboxID]
-	if active == nil || active.PeerPID != old.Source.PeerPID || active.ReservationMemory != old.Memory.Bytes {
+	if active == nil || active.PeerPID != e.Source.PeerPID || active.Token != e.Source.Token || active.ReservationMemory != e.Memory.Bytes {
 		return nil, fmt.Errorf("prepared reservation changed")
 	}
-	if _, err := checkedAggregateAdd(p.reservedMemory-active.ReservationMemory, old.Memory.Bytes, "retained memory"); err != nil {
+	amount, err := checkedAggregateAdd(p.retainedBytes[r.SandboxID], e.Memory.Bytes, "retained memory")
+	if err != nil {
 		return nil, err
 	}
 	conn := active.Conn
@@ -219,12 +324,8 @@ func (s *State) commitRetained(r *retainedReceipt) (net.Conn, error) {
 	if p.retainedBytes == nil {
 		p.retainedBytes = make(map[string]uint64)
 	}
-	if p.retainedCgroups == nil {
-		p.retainedCgroups = make(map[string]string)
-	}
-	p.retainedBytes[r.SandboxID] = old.Memory.Bytes
-	p.retainedCgroups[r.SandboxID] = old.Source.CgroupPath
-	p.reservedMemory += old.Memory.Bytes
+	p.retainedBytes[r.SandboxID] = amount
+	p.reservedMemory += e.Memory.Bytes
 	p.refreshRetainedCleanupLocked(r.SandboxID)
 	p.initPressureLocked()
 	p.pressure.lastReservationChange = p.pressure.clock()
@@ -233,49 +334,51 @@ func (s *State) commitRetained(r *retainedReceipt) (net.Conn, error) {
 	return conn, nil
 }
 
-func (s *State) abortRetained(sid string, capture resource.CaptureRetention) error {
+func (s *State) abortRetained(next *retainedAccount, capture resource.CaptureRetention) error {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
-	r := root.retained[sid]
-	if r == nil || r.Settled {
+	r := root.retained[next.SandboxID]
+	e := r.capture(capture)
+	if e == nil {
 		return nil
 	}
-	if !sameCapture(r.Capture, capture) || r.Stage != retentionPrepared {
+	if e.Stage != retentionPrepared || r.ID != next.ID || next.capture(capture) != nil {
 		return fmt.Errorf("retention is not abortable")
 	}
-	p := root.retainedPool(r.Memory.SourcePool)
+	p := root.retainedPool(e.Memory.SourcePool)
+	if p == nil {
+		return fmt.Errorf("retained source pool disappeared")
+	}
 	p.mu.Lock()
-	if active := p.bySID[sid]; active != nil {
+	if active := p.bySID[r.SandboxID]; active != nil && active.Token == e.Source.Token {
 		active.RetentionPrepared = false
 	}
 	p.mu.Unlock()
-	delete(root.retained, sid)
+	root.retained[r.SandboxID] = cloneRetained(next)
 	return nil
 }
 
-func (s *State) setRetainedReceipt(r *retainedReceipt) error {
+func (s *State) setRetainedReceipt(r *retainedAccount) error {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
 	old := root.retained[r.SandboxID]
-	if old == nil || !sameCapture(old.Capture, r.Capture) {
-		return fmt.Errorf("retention identity changed")
+	if old == nil || old.ID != r.ID || r.Revision < old.Revision {
+		return fmt.Errorf("retained account changed")
 	}
 	root.retained[r.SandboxID] = cloneRetained(r)
 	return nil
 }
 
-// resetRetainedAdoption removes only the failed attempt's provisional B/cache.
-// The caller has already persisted holding and proved that this candidate can
-// no longer publish. Keep the in-memory intent on any error so a retry cannot
-// pass this cleanup barrier. The source R belongs to a separate accounting role.
-func (s *State) resetRetainedAdoption(previous, next *retainedReceipt) (net.Conn, error) {
+// Failed admission frees only its provisional B/cache. Entries and even an
+// empty account survive until the SID's terminal lifecycle explicitly retires it.
+func (s *State) resetRetainedAdoption(previous, next *retainedAccount) (net.Conn, error) {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
 	current := root.retained[previous.SandboxID]
-	if current == nil || !sameCapture(current.Capture, previous.Capture) || current.Stage != retentionAdopting ||
+	if current == nil || current.ID != previous.ID || current.Stage != retentionAdopting ||
 		current.Handoff == nil || previous.Handoff == nil || current.Handoff.ID != previous.Handoff.ID ||
 		current.Handoff.File != previous.Handoff.File || current.Handoff.Token != previous.Handoff.Token {
 		return nil, fmt.Errorf("retained handoff changed before cleanup")
@@ -302,126 +405,115 @@ func (s *State) resetRetainedAdoption(previous, next *retainedReceipt) (net.Conn
 	return conn, nil
 }
 
-func (s *State) releaseRetained(sid string, capture resource.CaptureRetention) error {
+func (s *State) releaseRetained(next *retainedAccount, capture resource.CaptureRetention) error {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
-	r := root.retained[sid]
-	if r == nil {
-		return nil
-	}
-	if !sameCapture(r.Capture, capture) {
+	r := root.retained[next.SandboxID]
+	e := r.capture(capture)
+	if r == nil || r.ID != next.ID || e == nil {
 		return fmt.Errorf("retention generation changed")
 	}
-	if r.Settled {
+	if e.Stage == retentionSettled {
 		return nil
 	}
-	p := root.retainedPool(r.Memory.SourcePool)
+	if n := next.capture(capture); n == nil || n.Stage != retentionSettled {
+		return fmt.Errorf("missing settlement")
+	}
+	p := root.retainedPool(e.Memory.SourcePool)
 	if p == nil {
 		return fmt.Errorf("retained source pool disappeared")
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if r.Stage == retentionPrepared {
-		// RAMReleased also proves the prepared producer no longer owns B.
-		if active := p.bySID[sid]; active != nil && active.PeerPID == r.Source.PeerPID {
-			if _, err := p.detachLocked(sid, true); err != nil {
+	if e.Stage == retentionPrepared {
+		if active := p.bySID[r.SandboxID]; active != nil && active.PeerPID == e.Source.PeerPID && active.Token == e.Source.Token {
+			if _, err := p.detachLocked(r.SandboxID, true); err != nil {
 				return err
 			}
 		}
-	} else if amount := p.retainedBytes[sid]; amount != 0 {
-		next, err := checkedAggregateSub(p.reservedMemory, amount, "retained memory")
+	} else {
+		amount, err := checkedAggregateSub(p.retainedBytes[r.SandboxID], e.Memory.Bytes, "retained SID memory")
 		if err != nil {
 			return err
 		}
-		p.reservedMemory = next
-		delete(p.retainedBytes, sid)
-		delete(p.retainedCgroups, sid)
+		total, err := checkedAggregateSub(p.reservedMemory, e.Memory.Bytes, "retained memory")
+		if err != nil {
+			return err
+		}
+		p.reservedMemory = total
+		if amount == 0 {
+			delete(p.retainedBytes, r.SandboxID)
+		} else {
+			p.retainedBytes[r.SandboxID] = amount
+		}
 	}
-	nextReceipt := cloneRetained(r)
-	nextReceipt.Settled = true
-	root.retained[sid] = nextReceipt
-	p.refreshRetainedCleanupLocked(sid)
-	if p.pressure.exclusive == sid && p.bySID[sid] == nil {
+	root.retained[r.SandboxID] = cloneRetained(next)
+	p.refreshRetainedCleanupLocked(r.SandboxID)
+	p.initPressureLocked()
+	if p.pressure.exclusive == r.SandboxID && p.bySID[r.SandboxID] == nil {
 		p.pressure.exclusive = ""
 	}
-	p.initPressureLocked()
 	p.pressure.lastReservationChange = p.pressure.clock()
 	p.signalPressureLocked()
 	return nil
 }
 
-func (s *State) restoreRetained(r *retainedReceipt) error {
+func (s *State) restoreRetained(r *retainedAccount) error {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
 	if old := root.retained[r.SandboxID]; old != nil {
-		if sameCapture(old.Capture, r.Capture) {
+		if old.ID == r.ID && old.Revision == r.Revision {
 			return nil
 		}
 		return fmt.Errorf("conflicting retained memory inventory")
 	}
-	if r.Settled {
-		// A release tombstone preserves exact replay/owner identity, but no
-		// longer projects a charge into its historical source pool. Operators
-		// may remove or rename that fully drained pool before this restart.
-		if root.retained == nil {
-			root.retained = make(map[string]*retainedReceipt)
+	for _, e := range r.Captures {
+		if e.Stage != retentionSettled && root.retainedPool(e.Memory.SourcePool) == nil {
+			return fmt.Errorf("unknown retained memory pool %q", e.Memory.SourcePool)
 		}
-		root.retained[r.SandboxID] = cloneRetained(r)
-		return nil
-	}
-	p := root.retainedPool(r.Memory.SourcePool)
-	if p == nil {
-		return fmt.Errorf("unknown retained memory pool %q", r.Memory.SourcePool)
 	}
 	if root.pools != nil {
 		root.mu.Lock()
 		defer root.mu.Unlock()
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if r.Stage == retentionPrepared {
-		active := cloneReservation(&r.Source)
-		active.Conn, active.RetentionPrepared = nil, true
-		active.LastHeartbeatAt = time.Time{}
-		if err := p.insertLocked(&active); err != nil {
-			return err
+	for _, e := range r.Captures {
+		if e.Stage == retentionSettled {
+			continue
 		}
-		if root.pools != nil {
-			root.bindings[r.SandboxID] = r.Memory.SourcePool
+		p := root.retainedPool(e.Memory.SourcePool)
+		p.mu.Lock()
+		var err error
+		if e.Stage == retentionPrepared {
+			active := cloneReservation(&e.Source)
+			active.Conn, active.RetentionPrepared, active.LastHeartbeatAt = nil, true, time.Time{}
+			err = p.insertLocked(&active)
+			if err == nil && root.pools != nil {
+				root.bindings[r.SandboxID] = e.Memory.SourcePool
+			}
+		} else {
+			var total, amount uint64
+			total, err = checkedAggregateAdd(p.reservedMemory, e.Memory.Bytes, "retained memory")
+			if err == nil {
+				amount, err = checkedAggregateAdd(p.retainedBytes[r.SandboxID], e.Memory.Bytes, "retained SID memory")
+			}
+			if err == nil {
+				if p.retainedBytes == nil {
+					p.retainedBytes = make(map[string]uint64)
+				}
+				p.reservedMemory, p.retainedBytes[r.SandboxID] = total, amount
+			}
 		}
-	} else {
-		next, err := checkedAggregateAdd(p.reservedMemory, r.Memory.Bytes, "retained memory")
+		p.refreshRetainedCleanupLocked(r.SandboxID)
+		p.mu.Unlock()
 		if err != nil {
 			return err
 		}
-		p.reservedMemory = next
-		if p.retainedBytes == nil {
-			p.retainedBytes = make(map[string]uint64)
-		}
-		if p.retainedCgroups == nil {
-			p.retainedCgroups = make(map[string]string)
-		}
-		p.retainedBytes[r.SandboxID] = r.Memory.Bytes
-		p.retainedCgroups[r.SandboxID] = r.Source.CgroupPath
 	}
 	if root.retained == nil {
-		root.retained = make(map[string]*retainedReceipt)
+		root.retained = make(map[string]*retainedAccount)
 	}
 	root.retained[r.SandboxID] = cloneRetained(r)
-	p.refreshRetainedCleanupLocked(r.SandboxID)
 	return nil
-}
-
-func (s *State) retainedSourceCgroup(path string) bool {
-	root := s.retentionOwner()
-	root.retentionMu.Lock()
-	defer root.retentionMu.Unlock()
-	for _, r := range root.retained {
-		if !r.Settled && r.Source.CgroupPath == path {
-			return true
-		}
-	}
-	return false
 }

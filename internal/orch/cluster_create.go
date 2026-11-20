@@ -54,6 +54,10 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 // fresh Sandbox constructor and durable admission as the direct API.
 func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.Command, pair store.KeyPair, tmpl types.TemplateID, normalized sandboxCreateConfig) (*types.Sandbox, *launchAttempt, error) {
 	admissionStarted := time.Now()
+	maxCheckpoints, err := types.ResolveMaxCheckpoints(cmd.MaxCheckpoints)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	timeoutSeconds := o.cfg.Sandbox.TimeoutSec
 	var environment map[string]string
 	autoPauseMemory := cloneBool(cmd.AutoPauseMemory)
@@ -107,7 +111,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 	normalized.Workspaces = cmd.Workspaces
 	normalized.Metadata = clusterSandboxMetadata(normalized.Metadata)
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
-		ID: cmd.SID, StableID: cmd.Cluster.StableID,
+		ID: cmd.SID, StableID: cmd.Cluster.StableID, MaxCheckpoints: maxCheckpoints,
 		Cluster:  &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
 		Template: tmpl, Pair: pair, Config: normalized, Env: environment,
 		TimeoutSeconds: timeoutSeconds, IdleTimeout: idleTimeout, AutoPauseMemory: autoPauseMemory,

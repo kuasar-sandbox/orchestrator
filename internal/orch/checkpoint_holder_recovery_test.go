@@ -349,42 +349,41 @@ func TestLostHolderRecoveryChangesOnlyExactPausingRun(t *testing.T) {
 	}
 }
 
-func TestDeadHolderDefaultPauseWaitFailsUntilLastReaderCloses(t *testing.T) {
+func TestDeadHolderDoesNotGateSuccessorPauseAndStillNeedsReleaseProof(t *testing.T) {
 	f := pendingPauseFixture(t)
 	stopRetirementWorkers(t, f.o)
 	m := retiredTestOwnership(t, f)
 	p := startCheckpointHolder(t, f, m, true)
 	top := p.open(t)
+	defer top.Close()
 	f.sb.RunID = "restored-from-older-checkpoint"
 	if err := f.o.st.Put(context.Background(), f.sb); err != nil {
 		t.Fatal(err)
 	}
 	p.kill(t)
-	f.o.captureStateReader = func(ctx context.Context, _ string, query ctl.CaptureStateQuery) (ctl.CaptureState, error) {
-		r, err := memorycheckpoint.WaitCurrent(ctx, p.spec.Directory, query.SandboxID, query.NoWaitForPreviousMemorySave)
-		if errors.Is(err, memorycheckpoint.ErrSavePending) {
-			return captureStateFor(query, true), nil
+	f.o.captureStateReader = func(_ context.Context, _ string, query ctl.CaptureStateQuery) (ctl.CaptureState, error) {
+		if !query.ForCapture {
+			t.Fatal("admission queried historical save")
 		}
-		if err != nil {
-			return ctl.CaptureState{}, err
-		}
-		result := captureStateFor(query, false)
-		if r != nil {
-			result.MemoryID, result.Epoch = r.MemoryID, r.Epoch
-		}
-		return result, nil
+		return captureStateFor(query, false), nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := f.o.Pause(ctx, f.sb.ID, f.apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}); !errors.Is(err, memorycheckpoint.ErrMemoryUnavailable) {
-		t.Fatalf("default wait after producer loss: %v", err)
+	for _, noWait := range []bool{false, true} {
+		_, unlock, admitted, err := f.o.lockPauseAdmission(ctx, f.sb.ID, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, NoWaitForPreviousMemorySave: noWait}, nil)
+		if err != nil {
+			t.Fatalf("old holder blocked successor capture: %v", err)
+		}
+		unlock()
+		if admitted.RunID != f.sb.RunID || admitted.State != types.StateRunning {
+			t.Fatal("wrong running generation")
+		}
 	}
-	current, err := f.o.st.Get(context.Background(), f.sb.ID)
-	if err != nil || current.State != types.StateRunning || p.record(t).RAMReleased {
-		t.Fatalf("unavailable wait changed running state or released reader RAM: %+v %v", current, err)
+	if err := f.o.reconcileRetiredRun(ctx, m); err == nil {
+		t.Fatal("live reader released old producer ownership")
 	}
-	if _, err := f.o.Pause(ctx, f.sb.ID, f.apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, NoWaitForPreviousMemorySave: true}); !errors.Is(err, api.ErrPreviousMemorySavePending) {
-		t.Fatalf("no-wait physical obligation: %v", err)
+	if p.record(t).RAMReleased {
+		t.Fatal("admission settled still-readable RAM")
 	}
 	if err := top.Close(); err != nil {
 		t.Fatal(err)
@@ -392,16 +391,12 @@ func TestDeadHolderDefaultPauseWaitFailsUntilLastReaderCloses(t *testing.T) {
 	if err := f.o.reconcileRetiredRun(ctx, m); err != nil {
 		t.Fatal(err)
 	}
-	if r := p.record(t); !r.Lost() || r.SaveError == "" {
-		t.Fatalf("fixture lost historical error or physical completion: %+v", r)
+	if r := p.record(t); !r.Lost() || !r.RAMReleased || r.SaveError == "" {
+		t.Fatalf("lost capture proof: %+v", r)
 	}
-	_, unlock, admitted, err := f.o.lockPauseAdmission(ctx, f.sb.ID, sandboxcfg.CaptureRequest{}, nil)
-	if err != nil {
-		t.Fatalf("completed historical loss poisoned pause admission: %v", err)
-	}
-	defer unlock()
-	if admitted.RunID != f.sb.RunID || admitted.State != types.StateRunning {
-		t.Fatal("admission used a different running generation")
+	current, err := f.o.st.Get(ctx, f.sb.ID)
+	if err != nil || current.RunID != f.sb.RunID || current.State != types.StateRunning {
+		t.Fatalf("old settlement changed successor: %v", err)
 	}
 }
 

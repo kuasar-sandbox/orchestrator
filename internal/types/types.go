@@ -380,7 +380,7 @@ type Sandbox struct {
 	// it is never copied to a new sandbox, template or migration token.
 	HoldValue *int64 `json:"-"`
 
-	MaxCheckpoints int    // sandbox option, currently fixed at 1
+	MaxCheckpoints int    // positive sandbox-local named checkpoint quota; default 1
 	InstanceID     string // immutable parent incarnation; never a timestamp
 	AutoReset      bool
 	DeadRunID      string // confirmed ended run; retained through cleanup and dead

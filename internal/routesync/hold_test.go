@@ -88,7 +88,7 @@ func TestHoldProjectionOnlyReachesLocalTrafficProxy(t *testing.T) {
 					offered = append(offered, HoldTrafficV1)
 				}
 				go serveAuthority(ctx, downW, func() {}, upR, src, reg, nil, nil, offered, nil)
-				if m := readTestMessage(t, downR); m.Type != TypeHello || m.Hello.Version != 11 ||
+				if m := readTestMessage(t, downR); m.Type != TypeHello || m.Hello.Version != Version ||
 					slices.Contains(m.Hello.ProxyCapabilities, HoldTrafficV1) != tc.wantHold || !slices.Contains(m.Hello.ProxyCapabilities, InplaceRestartV1) {
 					t.Fatalf("unexpected Hello: %+v", m.Hello)
 				}

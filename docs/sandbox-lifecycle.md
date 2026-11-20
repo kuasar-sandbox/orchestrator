@@ -28,7 +28,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional idleTimeout/autoPauseMemory/autoReset/max_checkpoints (fixed at 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
+| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional idleTimeout/autoPauseMemory/autoReset/max_checkpoints (positive integer, default 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata, autoReset, optional deadAt/executionResult/autoResetError ([Termination, Reset and retained data](#reset-and-retention)) |
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
@@ -438,22 +438,30 @@ An intent whose capture never started is cleared only after exact fencing, a
 stable preparation lock and a recheck that no capture/R exists; BaseDir and the
 previous ResumeSource remain available.
 
-A capture that can add a new frozen-RAM obligation waits for the previous
-`RAMReleased` by default; `FileReady` is insufficient. The host uses the SDK
-runtime's explicit capability for admission, independently of saving format or
-whether the API retains a named user checkpoint. Disk-only captures and known
-synchronous fallbacks skip this gate and create no retirement permit. The wait is
-cancelable, leaves the sandbox `running`, and holds neither the SID lifecycle lock
-nor the source-operation grant. After waiting, admission rechecks the exact
-sandbox instance and RunID. To return 409 immediately while the save remains
-pending, send `{"noWaitForPreviousMemorySave":true}`. TTL, idle and resource-pressure
-workers use this no-wait behavior with their existing retry machinery. Restoring
-an older checkpoint does not bypass the same sandbox's outstanding save.
-When the producer is confirmed dead without a published file, a default wait
-returns an explicit unavailable error while RAM remains, without entering
-`pausing`. Physical completion is checked before historical save errors: once
-RAM is released, a successor restored from an intact older checkpoint can pause
-again even if the previous capture is lost. No replacement holder is started.
+Multiple holders may coexist for one SID. A new Pause never waits for an older
+RAM release, for either Bundle or tarstream. `noWaitForPreviousMemorySave` and
+`NoWaitForPreviousMemorySave` remain accepted compatibility inputs without a
+previous-save gate. Restore adopts every unsettled SID obligation from the
+authoritative node inventory, independent of the chosen checkpoint or branch:
+Q = B + ΣRi. Each exact capture Ri is charged once in its original SourcePool;
+the target pool admits new B/cache. ReservationMemory, balloon, StateSync, Guest
+Capacity and startup still describe B only. The next freeze converts only B to
+another Ri. Name deletion or FileReady never reduces the ledger; exact durable
+RAMReleased settlement does. Historical loss does not block a successor restored
+from an intact source, but any remaining RAM still requires release proof.
+
+Receipt v2 separates the holding/adopting/active SID account header from its
+prepared/held/settled capture entries. `checkpoint_memory_handoff_v2` sends a
+fixed-size account ID/revision and handoff identity, not the collection in a
+64 KiB frame. First acceptance charges candidate B/cache before persisting its
+intent. Replay keeps that exact contract despite Ri settlement and revision
+changes. Admission failure preserves old R; failed restore releases only its B.
+Final Ri settlement cannot erase a pending candidate. Restart inventories every
+holder's source lease/process/cgroup; settled entries retain zero-charge identity
+while discovery could mistake them for active B. Empty headers retire at the SID
+terminal boundary. Per-generation Abort/Release matches the exact capture and
+operation; only terminal deletion checks all R. CaptureState lifecycle version 2
+and the resource capability must match; old peers cannot partially adopt a set.
 
 This is the existing checkpoint capture behavior, not an additional launch mode.
 Non-checkpoint runtimes and captures without a checkpoint ID keep synchronous
@@ -514,9 +522,10 @@ pausing row keeps the existing exact-run fencing and terminal cleanup behavior.
 
 `checkpoint=true` atomically retains the immutable E or S/E pair with paused/source and returns
 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Sandbox option
-`max_checkpoints` is currently fixed at 1; Create accepts omission or 1. There is no node retention
-setting. A retained capture, including one being exported, rejects the next checkpoint Pause
-with 409 before handshake/capture. Ordinary Pause neither occupies this quota nor replaces it.
+`max_checkpoints` defaults to 1 and accepts positive integers. Direct/cluster
+Create, Reserve retries and replacements preserve the accepted policy; it does
+not enter S/E or migration tokens. Named Pause checks quota before freeze and
+again in the paused/source/holder transaction, returning 409 at the limit. Ordinary Pause neither occupies this quota nor replaces it.
 
 Resume releases only obsolete versions not protected by the retained ResumeSource or a user checkpoint; a new no-ID Export after Resume
 returns 400. A retained checkpoint survives Resume. Export accepts `checkpointID` in
@@ -532,6 +541,11 @@ Checkpoints always belong to their sandbox and disappear with parent deletion.
 Termination retains current disks, dependencies, the original ResumeSource and user checkpoints ([Termination, Reset and retained data](#reset-and-retention)).
 The existing checkpoint schema still rejects databases missing `max_checkpoints`;
 the Reset metadata upgrade is additive and defaults existing objects to autoReset=false ([SQLite state](node.md#sqlite-state)).
+
+The existing SQLite registry migrates to composite `(sandbox_id, checkpoint_id)`
+and a positive-integer quota constraint, preserving rows, parents, foreign keys,
+indexes and triggers. Export/delete consumes only the selected ID, retaining it
+on failure. Name removal frees quota first; descendant dependencies retain backends.
 
 checkpoint.mode accepts local/bundle for both CaptureKinds:
 
@@ -557,8 +571,8 @@ validates the complete structured result before committing pausing→paused;
 Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
 and its association. Capture failure never commits a partial pair.
 
-Pause waits for a previous memory save before accepting its operation or entering
-`pausing`. It then resolves request/quota, completes the online Proxy handshake,
+Pause checks current capture capability and request/quota before entering
+`pausing`, then completes the online Proxy handshake,
 captures the runtime and atomically commits the exact RunID's source and paused
 state. Synchronous capture stops/resets the old runner. Checkpoint memory saving
 instead commits its holder role and waits for the old parent to stop/join metrics,

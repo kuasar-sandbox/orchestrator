@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -282,6 +283,20 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 	removeBaseDir := o.removeSandboxBaseDir
 	if removeBaseDir == nil {
 		removeBaseDir = os.RemoveAll
+	}
+	if sb.State == types.StateDeleting {
+		state, err := o.retirementResourceState()
+		if err != nil {
+			return err
+		}
+		if state != nil {
+			if err := state.ReconcileRetainedMemory(sb.ID); err != nil {
+				return err
+			}
+			if _, pending := state.RetainedMemory(sb.ID); pending {
+				return api.ErrPreviousMemorySavePending
+			}
+		}
 	}
 	if sb.State == types.StateDeleting && sb.BaseDir != "" {
 		if err := removeBaseDir(sb.BaseDir); err != nil {
@@ -581,6 +596,18 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 	defer release()
 	if err := o.cleanupSandboxTerminalOwnership(cleanupCtx, sb); err != nil {
 		return err
+	}
+
+	// The terminal SID owner, rather than the last holder, retires the node
+	// account after all execution discovery paths and frozen RAM are gone.
+	state, err := o.retirementResourceState()
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		if err := state.RetireRetainedMemory(sb.ID); err != nil {
+			return err
+		}
 	}
 
 	deleted, err := o.st.DeleteFinalizedSandbox(cleanupCtx, sb)

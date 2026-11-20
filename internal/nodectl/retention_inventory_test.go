@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
@@ -57,7 +58,7 @@ func directRetentionFixture(t *testing.T) (*Server, *memorycheckpoint.RecordWrit
 	lease, err := resource.CreateLease(resource.Lease{Version: resource.LeaseVersion, SandboxID: "sid", PID: os.Getpid(),
 		ControllerSocket: socket, CgroupPath: filepath.Join(dir, "cgroups", "old"), CapacityMemory: 1 << 30, CapacityCPUMilli: 1000,
 		FloorMemory: 128 << 20, FloorCPUMilli: 500, StartupMemory: 256 << 20,
-		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}})
+		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +127,8 @@ func TestRetainedMemoryAbortedProofReconcilesWithoutReleasingB(t *testing.T) {
 					t.Fatalf("ordinary cleanup remained blocked: %v %v", found, err)
 				}
 			}
-			if _, err := os.Stat(retentionPath(srv.Identity, "sid")); !os.IsNotExist(err) {
-				t.Fatalf("aborted receipt still persisted: %v", err)
+			if account, err := readRetainedReceipt(retentionPath(srv.Identity, "sid")); err != nil || len(account.Captures) != 0 {
+				t.Fatalf("abort must preserve the empty SID account: %+v %v", account, err)
 			}
 		})
 	}
@@ -155,7 +156,7 @@ func TestRetainedMemoryUnknownProofPreservesCharge(t *testing.T) {
 func TestRetainedMemoryAbsentReceiptNeedsReleasedProof(t *testing.T) {
 	srv, w, capture := directRetentionFixture(t)
 	req := &Message{Type: resource.TypeAdoptRetained, SandboxID: "sid", Retention: &capture,
-		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}}
+		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}}
 	token := ""
 	resp := srv.handleAdmit(nil, os.Getpid(), req, &token)
 	if resp.Status != StatusRejected || resp.Reason == resource.ReasonRetentionSettledMissing {
@@ -168,7 +169,7 @@ func TestRetainedMemoryAbsentReceiptNeedsReleasedProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp = srv.handleAdmit(nil, os.Getpid(), req, &token)
-	if resp.Status != StatusRejected || resp.Reason != resource.ReasonRetentionSettledMissing || !resource.HasFeature(resp.ClientFeatures, resource.FeatureRetainedMemoryV1) {
+	if resp.Status != StatusRejected || resp.Reason != resource.ReasonRetentionSettledMissing || !resource.HasFeature(resp.ClientFeatures, resource.FeatureRetainedMemoryV2) {
 		t.Fatalf("released static capture cannot use ordinary lease: %+v", resp)
 	}
 }
@@ -177,7 +178,6 @@ func TestRetainedMemorySupersededReleaseIsExactNoOp(t *testing.T) {
 	for _, reuseMemoryID := range []bool{false, true} {
 		t.Run(map[bool]string{false: "different-memory-same-epoch", true: "same-memory-different-epoch"}[reuseMemoryID], func(t *testing.T) {
 			srv, w, capture := directRetentionFixture(t)
-			old, _ := srv.State.retentionReservation("sid")
 			call := func(typ string, peer int, c resource.CaptureRetention, token string) *Message {
 				return srv.handleRetained(peer, &Message{Type: typ, SandboxID: "sid", Retention: &c}, token)
 			}
@@ -195,12 +195,18 @@ func TestRetainedMemorySupersededReleaseIsExactNoOp(t *testing.T) {
 					t.Fatal(resp.Msg)
 				}
 			}
-			_, _, err := srv.State.Admit(AdmitSpec{SandboxID: "sid", PeerPID: os.Getpid(), Token: "new-token", CgroupPath: old.CgroupPath,
-				Capacity: Resources{MemoryBytes: 1 << 30, CPUMilli: 1000}, InitialBudget: 256 << 20,
-				ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20, CPUMilli: 500}, ClientFeatures: old.ClientFeatures, LeasePath: old.LeasePath})
-			if err != nil {
+			srv.State.Wm.StartupFactor = .75
+			srv.Admission = NewAdmissionController(AdmissionPolicy{Rate: 100, Burst: 100, StartupTTL: time.Minute})
+			srv.Admission.SetWiring(srv.State, nil, srv.BuildAdmitOKFromQueue)
+			candidate, req := adoptionCandidate(t, srv, capture, "next-owner")
+			var newToken string
+			if resp, err := srv.buildRetainedAdmitOK(nil, os.Getpid(), req, &newToken); err != nil || resp.Status != StatusAdmitted {
+				t.Fatalf("adopt: %+v %v", resp, err)
+			}
+			if _, err := candidate.ConfirmPublished(); err != nil {
 				t.Fatal(err)
 			}
+
 			proof, err := memorycheckpoint.ReadCaptureRecord(w.Path())
 			if err != nil {
 				t.Fatal(err)
@@ -209,7 +215,7 @@ func TestRetainedMemorySupersededReleaseIsExactNoOp(t *testing.T) {
 			if reuseMemoryID {
 				memory, epoch = capture.MemoryID, 2
 			}
-			nextWriter, err := newTestRetentionRecord(t, filepath.Dir(filepath.Dir(w.Path())), memorycheckpoint.CaptureRecord{
+			nextWriter, err := newTestRetentionRecord(t, filepath.Join(filepath.Dir(srv.Identity), "checkpoint"), memorycheckpoint.CaptureRecord{
 				Version: memorycheckpoint.Version, Producer: memorycheckpoint.RunIdentity{SandboxID: "sid", InstanceID: "instance-two", RunID: "run-two"},
 				CheckpointID: "checkpoint-two", MemoryID: memory, Epoch: epoch, Holder: proof.Holder})
 			if err != nil {
@@ -217,14 +223,14 @@ func TestRetainedMemorySupersededReleaseIsExactNoOp(t *testing.T) {
 			}
 			defer nextWriter.Close()
 			next := resource.CaptureRetention{CapturePath: nextWriter.Path(), MemoryID: memory, Epoch: epoch, OperationID: "checkpoint-two"}
-			if resp := call(resource.TypePrepareRetained, os.Getpid(), next, "new-token"); resp.Type != TypeAck {
+			if resp := call(resource.TypePrepareRetained, os.Getpid(), next, newToken); resp.Type != TypeAck {
 				t.Fatal(resp.Msg)
 			}
 			if resp := call(resource.TypeReleaseRetained, os.Getppid(), capture, "original-token"); resp.Type != TypeError {
 				t.Fatalf("nonproducer received release ACK: %+v", resp)
 			}
 			resp := call(resource.TypeReleaseRetained, os.Getpid(), capture, "original-token")
-			if reuseMemoryID && resp.Type != TypeError || !reuseMemoryID && resp.Type != TypeAck {
+			if resp.Type != TypeAck {
 				t.Fatalf("superseded release: %+v", resp)
 			}
 			if got, pending := srv.State.RetainedMemory("sid"); !pending || got.MemoryID != memory || got.Epoch != epoch || srv.State.ResourceSnapshot().Reserved.MemoryBytes != 256<<20 {

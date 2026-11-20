@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -15,7 +16,8 @@ import (
 )
 
 // CheckpointMemoryReadersBusyExitCode is the internal checkpoint-cleanup
-// command's exact no-mutation result while memory readers protect the files.
+// command's deferred physical-GC result. Logical revocation may already have
+// completed while memory readers continue protecting the files.
 const CheckpointMemoryReadersBusyExitCode = 80
 
 var errCheckpointMemoryReadersBusy = errors.New("checkpoint garbage collection is deferred by memory readers")
@@ -34,9 +36,6 @@ func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox)
 
 func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types.Sandbox, inspect bool) ([]artifact.DiffCheckpointRef, error) {
 	source := sb.ResumeSource
-	if source.Empty() || types.IsPortableRef(source.Ref) {
-		return nil, nil
-	}
 	current, err := o.st.Get(ctx, sb.ID)
 	if err != nil {
 		return nil, err
@@ -44,9 +43,12 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 	if current == nil || current.InstanceID != sb.InstanceID || current.State != sb.State || (!inspect && current.State != types.StatePaused) || current.ResumeSource != sb.ResumeSource || current.RunDir != sb.RunDir {
 		return nil, fmt.Errorf("orch: checkpoint source ownership changed for %s", sb.ID)
 	}
-	dir, err := o.ownedLocalArtifactDir(sb, source)
-	if err != nil {
-		return nil, err
+	dir := filepath.Join(nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sb.ID), "checkpoint")
+	if !source.Empty() && !types.IsPortableRef(source.Ref) {
+		dir, err = o.ownedLocalArtifactDir(sb, source)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// An export can retain this source while publishing outside the lock. Do not
 	// wait for its completion here: publication needs this lock to finalize.
@@ -70,21 +72,25 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 		args = append(args, "--restore", source.Ref)
 	}
 	args = append(args, "--from", e)
-	retained, err := o.st.Checkpoint(ctx, sb.ID)
+	retained, err := o.st.Checkpoints(ctx, sb.ID)
 	if err != nil {
 		return nil, err
 	}
-	if retained != nil {
-		pair := artifact.CheckpointSource{SandboxRef: retained.Source.Ref}
-		if retained.Source.Kind == types.ResumeSourceSnapshot {
-			pair.SnapshotRef, pair.SandboxRef = retained.Source.Ref, retained.Source.SandboxRef
+	pairs := make([]artifact.CheckpointSource, 0, len(retained))
+	for _, capture := range retained {
+		pair := artifact.CheckpointSource{SandboxRef: capture.Source.Ref}
+		if capture.Source.Kind == types.ResumeSourceSnapshot {
+			pair.SnapshotRef, pair.SandboxRef = capture.Source.Ref, capture.Source.SandboxRef
 		}
-		encoded, err := json.Marshal([]artifact.CheckpointSource{pair})
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, "--retain", string(encoded))
+		pairs = append(pairs, pair)
 	}
+	encoded, err := json.Marshal(pairs)
+	if err != nil {
+		return nil, err
+	}
+	// An explicit empty set is different from an omitted caller-owned set.
+	args = append(args, "--retain", string(encoded))
+
 	args = append(args, "--ref-location-parent", o.cfg.Checkpoint.Remote.RefLocationParent)
 	if inspect {
 		args = append(args, "--list-versions")

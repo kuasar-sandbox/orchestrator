@@ -35,7 +35,7 @@ func TestRetentionHolderRecoveryProducer(t *testing.T) {
 	lease, err := resource.CreateLease(resource.Lease{Version: resource.LeaseVersion, SandboxID: "sid", PID: os.Getpid(),
 		ControllerSocket: socket, CgroupPath: filepath.Join(root, "cgroups", "source"),
 		CapacityMemory: 1 << 30, CapacityCPUMilli: 1000, FloorMemory: 128 << 20, FloorCPUMilli: 500,
-		StartupMemory: 256 << 20, ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}})
+		StartupMemory: 256 << 20, ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}})
 	if err != nil {
 		fail(err)
 	}
@@ -268,7 +268,7 @@ func (f *retentionHolderFixture) check(t *testing.T, pending bool, activeBytes u
 		t.Fatalf("old recovery changed successor lease inode/owner: %v", err)
 	}
 	receipt, err := readRetainedReceipt(retentionPath(f.srv.Identity, "sid"))
-	if err != nil || receipt.Settled == pending || receipt.OwnerToken != f.token || receipt.OwnerFile != f.owner {
+	if err != nil || (!receipt.pending()) == pending || receipt.OwnerToken != f.token || receipt.OwnerFile != f.owner {
 		t.Fatalf("resource receipt did not durably preserve settlement and successor identity: %v", err)
 	}
 }

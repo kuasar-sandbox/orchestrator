@@ -111,7 +111,7 @@ func (o *Orchestrator) releaseRetiredRun(ctx context.Context, m store.RunPoolOwn
 		if err := state.ReconcileRetainedMemory(m.TaskID); err != nil {
 			return err
 		}
-		if retained, ok := state.RetainedMemory(m.TaskID); ok && retained.MemoryID == record.MemoryID && retained.Epoch == record.Epoch {
+		if _, ok := state.RetainedCapture(m.TaskID, record.MemoryID, record.Epoch); ok {
 			// The controller must persist settlement while its capture proof is
 			// still readable. A later hard delete may remove that proof.
 			return api.ErrPreviousMemorySavePending
@@ -216,7 +216,7 @@ func (o *Orchestrator) discardAbsentCapture(ctx context.Context, m store.RunPool
 		return err
 	}
 	if state != nil {
-		if _, pending := state.RetainedMemory(m.TaskID); pending {
+		if state.RetainedCaptureOperation(memorycheckpoint.RunIdentity{SandboxID: m.TaskID, InstanceID: m.RetirementInstanceID, RunID: m.RunID}, m.RetirementCheckpointID, m.RetirementOperationID) {
 			return api.ErrPreviousMemorySavePending
 		}
 	}
@@ -382,7 +382,7 @@ func (o *Orchestrator) abortCheckpointRetirement(ctx context.Context, sb *types.
 		if err := state.ReconcileRetainedMemory(sb.ID); err != nil {
 			return err
 		}
-		if _, pending := state.RetainedMemory(sb.ID); pending {
+		if state.RetainedCaptureOperation(memorycheckpoint.RunIdentity{SandboxID: sb.ID, InstanceID: sb.InstanceID, RunID: sb.RunID}, permit.CheckpointID, permit.OperationID) {
 			return api.ErrPreviousMemorySavePending
 		}
 	}
@@ -850,7 +850,7 @@ func (o *Orchestrator) reconcileUnstartedCapture(ctx context.Context, observed s
 			return err
 		}
 		if state != nil {
-			if _, pending := state.RetainedMemory(current.TaskID); pending {
+			if state.RetainedCaptureOperation(memorycheckpoint.RunIdentity{SandboxID: current.TaskID, InstanceID: current.RetirementInstanceID, RunID: current.RunID}, current.RetirementCheckpointID, current.RetirementOperationID) {
 				return api.ErrPreviousMemorySavePending
 			}
 		}

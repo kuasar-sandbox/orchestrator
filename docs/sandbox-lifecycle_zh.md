@@ -32,7 +32,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?, max_checkpoints?}` + 可选 `X-Kuasar-Sandbox-*` Header;`max_checkpoints` 仅接受省略或 1；`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?, max_checkpoints?}` + 可选 `X-Kuasar-Sandbox-*` Header;`max_checkpoints` 缺省为 1，显式值必须为正整数；`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata`、autoReset，以及可选 deadAt/executionResult/autoResetError（[终止、Reset 与数据保留](#reset-and-retention)） |
 | usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
@@ -437,18 +437,24 @@ producer 未发布 `FileReady` 即退出时，已有 RAM 读者继续占有原�
 对 capture 根本未启动的 intent，只有准确 fence、取得稳定准备锁并复查没有 capture/R
 之后才清除；保留 BaseDir 和原 ResumeSource。
 
-本次捕获可能新增冻结 RAM 义务时，默认等待前轮实际 `RAMReleased`，不能只等
-`FileReady`。host 使用 SDK runtime 的显式能力判断准入，不按保存格式或是否保留用户
-checkpoint 分流。纯磁盘捕获、已知同步 fallback 跳过该门禁且不建立 retirement permit。
-等待可取消，沙箱保持 `running`，不持有 SID
-生命周期锁或 source-operation grant；结束后重新验证实例及 RunID。请求
-`{"noWaitForPreviousMemorySave":true}` 可以在保存仍未完成时立即返回 409。
-TTL、idle 和资源压力后台流程使用不等待选项及原有重试机制。恢复较老的 checkpoint
-同样必须继承该 SID 尚未完成的保存责任。
-若确认 producer 已退出且没有已发布文件，默认等待在仍有 RAM 时明确返回不可用，
-不进入 `pausing`。判断顺序先消费物理完成事实，再处理历史保存错误：旧 RAM 释放后，
-从其他完整 checkpoint 恢复的后继可以再次暂停，不被历史 lost 永久阻塞。
-系统不自动启动替代 holder。
+同一 SID 可以同时存在多个 holder，新的暂停不等待旧 RAM 释放，Bundle 与 tarstream
+行为一致。`noWaitForPreviousMemorySave` 与 `NoWaitForPreviousMemorySave` 保留为
+兼容输入，不再触发前轮等待或 pending 冲突。恢复从权威节点库存接管该 SID 所有未
+结清额度，与所选 checkpoint 或分支无关：Q = B + ΣRi。每份 Ri 按准确 capture 只计
+一次并留在原 SourcePool，新 B/cache 由目标池准入。ReservationMemory、balloon、
+StateSync、Guest Capacity 和 startup 仍只表示本代 B，下一轮也只把 B 转为新 Ri。
+名称删除或 FileReady 不直接减账，准确 RAMReleased 证明持久结算后才扣除对应 Ri。
+旧捕获丢失不阻止从完整来源恢复的后继再次暂停，但剩余 RAM 仍须凭释放证明结算。
+
+receipt v2 将 SID 账户头的 holding/adopting/active 与各捕获的
+prepared/held/settled 分开。`checkpoint_memory_handoff_v2` 使用定长 account ID/
+revision 和 handoff 身份，不把全集塞进 64 KiB 帧。首次受理先准入并计入 B/cache，
+再持久化候选 intent；重放固定原合同，不因 Ri 乱序结清或 revision 推进而变化。
+准入失败保留旧 R，恢复失败仅释放本次 B，最后一份 R 结清不能清空待完成候选。
+重启库存覆盖所有 holder 的来源 lease、进程和 cgroup；已 settled 身份仍可被发现时
+保留零额度防重认记录，空账户头随 SID 终态清理。每代 Abort/Release 按准确 capture/
+operation 判断，只有终端删除检查全部 R。CaptureState lifecycle version 2 与资源
+能力须配套，旧端不能部分接管集合。
 
 这是既有 checkpoint 捕获行为的改进，不增加运行模式。未启用 checkpoint，或捕获未
 指定 checkpoint ID 时，继续同步保存。受管理的异步保存要求当前 Conductor、node-ctl
@@ -492,8 +498,9 @@ runner fencing 和终止清理流程收敛，不仅凭进程存活重新发布 r
 
 `checkpoint=true` 保存一个长期保留的不可变 E 或 S/E 对, 与 paused/source 在同一事务提交,
 返回 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. 默认 Pause 仍返回 204. Sandbox 选项
-`max_checkpoints` 当前固定为 1, Create 仅接受省略或 1; 没有节点级保留上限配置. 配额在
-握手/capture 前检查, 已有未消费 checkpoint 时下一次指定 checkpoint 的 Pause 返回 409.
+`max_checkpoints` 缺省为 1，接受正整数。Direct/cluster Create、Reserve 重试及
+replacement 保留已受理的策略；它不写入 S/E 或 migration token。命名 Pause 在冻结前
+检查名额，并在 paused/source/holder 提交事务中再次核验，达到上限返回 409。
 普通 Pause 不占此配额, 也不覆盖保留来源. 正在导出的 checkpoint 仍占配额.
 
 Resume 只删除当前 ResumeSource 与用户 checkpoint 都不再依赖的版本；Resume 后新发起的不带 ID Export 仍返回 400.
@@ -531,7 +538,7 @@ capture 返回生产者的实际身份: `snapshot --json` 返回
 结构化结果, 再原子提交 pausing→paused; Snapshot 保存实际 S/E 对, E-only capture
 清除旧 Snapshot 及其关联. capture 失败绝不提交半对.
 
-Pause 在接纳操作或进入 `pausing` 之前等待上一轮内存保存。随后依次完成请求/配额
+Pause 不等待其他 holder 的后台保存。它依次完成协议能力与请求/配额
 校验、在线 Proxy 握手、运行实例捕获，以及精确 RunID 的来源/paused 原子提交。
 同步捕获继续 Stop/Reset 旧 runner；checkpoint 内存保存则同时提交 holder 角色，
 等待旧父进程停止并 join metrics 采样、将最终 usage 读入私有值并确认退役，保留
@@ -544,6 +551,10 @@ holder unit 及其分代目录。两条路径随后都 detach 精确网络、尝
 BaseDir/checkpoint 保留。受管理捕获即使丢失命令响应，也按已提交记录前滚；仅明确的
 提交前拒绝或 abort 才可回滚，未知结果保留退役 intent。普通同步捕获失败继续原有
 精确 RunID 回滚/退出结果流程。失败不发布半个 S/E 对，也不将内存来源静默降为磁盘来源。
+
+现有 SQLite 登记迁为 `(sandbox_id, checkpoint_id)` 复合主键，并将固定为 1 的
+配额约束改为正整数；迁移保留原登记、父行、外键、索引和触发器。导出或删除只消费
+选定 ID，失败保留登记。名称撤销先释放配额，后代仍依赖的后端继续保留。
 
 <a id="local-disk-checkpoints"></a>
 

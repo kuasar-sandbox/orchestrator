@@ -112,7 +112,7 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 	defer release()
 	socket := filepath.Join(sb.RunDir, "ctl.sock")
 	if !selected.listed {
-		refs, err := ctl.ListDiffCheckpoints(ctx, socket)
+		refs, err := ctl.ListCheckpoints(ctx, socket)
 		if errors.Is(err, ctl.ErrCheckpointUnsupported) {
 			// Explicitly unsupported runtimes need no online version cleanup.
 			// Finish this check; independent triggers still recheck capability.
@@ -121,7 +121,7 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 		if err != nil {
 			return fmt.Errorf("list disk checkpoints: %w", err)
 		}
-		retained, err := o.st.Checkpoint(ctx, sid)
+		retained, err := o.st.Checkpoints(ctx, sid)
 		if err != nil {
 			return err
 		}
@@ -133,10 +133,14 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 		}
 		keep := map[ctl.DiffCheckpointRef]bool{}
 		for _, ref := range protected {
-			keep[ctl.DiffCheckpointRef{DiffID: ref.DiffID, ID: ref.ID}] = true
+			keep[ctl.CheckpointRef{DiffID: ref.DiffID, MemoryID: ref.MemoryID, ID: ref.ID}] = true
+		}
+		named := make(map[string]bool, len(retained))
+		for _, checkpoint := range retained {
+			named[checkpoint.ID] = true
 		}
 		for _, ref := range refs {
-			if !keep[ref] && (retained == nil || ref.ID != retained.ID) {
+			if !keep[ref] && !named[ref.ID] {
 				selected.refs = append(selected.refs, ref)
 			}
 		}
@@ -144,7 +148,24 @@ func (o *Orchestrator) releaseDiskCheckpointsOnce(ctx context.Context, sid strin
 		selected.instanceID = sb.InstanceID
 		selected.listed = true
 	}
-	if err := ctl.DeleteDiffCheckpoints(ctx, socket, "", selected.refs); err != nil {
+	sources := ctl.CheckpointSources{Retain: []ctl.CheckpointSource{}}
+	set := func(source types.ResumeSource) ctl.CheckpointSource {
+		out := ctl.CheckpointSource{SandboxRef: source.Ref}
+		if source.Kind == types.ResumeSourceSnapshot {
+			out.SnapshotRef, out.SandboxRef = source.Ref, source.SandboxRef
+		}
+		return out
+	}
+	primary := set(sb.ResumeSource)
+	sources.SnapshotRef, sources.SandboxRef = primary.SnapshotRef, primary.SandboxRef
+	retained, err := o.st.Checkpoints(ctx, sid)
+	if err != nil {
+		return err
+	}
+	for _, capture := range retained {
+		sources.Retain = append(sources.Retain, set(capture.Source))
+	}
+	if err := ctl.DeleteCheckpoints(ctx, socket, "", selected.refs, sources); err != nil {
 		return fmt.Errorf("delete selected disk checkpoints: %w", err)
 	}
 	return nil

@@ -32,21 +32,19 @@ checkpoint_wait_released() { # SID
 import json,os,sqlite3,subprocess,sys
 with sqlite3.connect(sys.argv[1]) as db:
     kind,ref,e=db.execute('select resume_source_kind,resume_source_ref,resume_sandbox_ref from sandboxes where id=?',(sys.argv[2],)).fetchone()
-    retained=db.execute('select source_kind,source_ref,sandbox_ref from sandbox_checkpoints where sandbox_id=?',(sys.argv[2],)).fetchone()
-if not ref or not ref.startswith('file://'):
-    print('[]');raise SystemExit
-args=[sys.argv[3],'checkpoint-cleanup','--sandbox-id',sys.argv[2],'--base-root',sys.argv[4],'--from',e if kind=='snapshot' else ref,'--manifest-config',sys.argv[5],'--list-versions']
-if kind=='snapshot':args+=['--restore',ref]
-if retained:
-    k,r,e=retained
-    args+=['--retain',json.dumps([dict(SandboxRef=e if k=='snapshot' else r,SnapshotRef=r if k=='snapshot' else '')])]
+    retained=db.execute('select source_kind,source_ref,sandbox_ref from sandbox_checkpoints where sandbox_id=?',(sys.argv[2],)).fetchall()
+args=[sys.argv[3],'checkpoint-cleanup','--sandbox-id',sys.argv[2],'--base-root',sys.argv[4],'--manifest-config',sys.argv[5],'--list-versions']
+if ref:args+=['--from',e if kind=='snapshot' else ref]
+if kind=='snapshot' and ref:args+=['--restore',ref]
+roots=[dict(sandbox_ref=e if k=='snapshot' else r,snapshot_ref=r if k=='snapshot' else '') for k,r,e in retained]
+args+=['--retain',json.dumps(roots)]
 subprocess.run(args,check=True)
 PY
     for attempt in $(seq 1 120); do
         checkpoint_list "$1" "$WORK/checkpoint-list.json" || return 1
         if python3 - "$WORK/checkpoint-list.json" "$WORK/checkpoint-protected.json" <<'PY'
 import json, sys
-def refs(path): return {(r['diff_id'],r['id']) for r in (json.load(open(path)) or [])}
+def refs(path): return {(r.get('diff_id'),r.get('memory_id'),r['id']) for r in (json.load(open(path)) or [])}
 raise SystemExit(0 if refs(sys.argv[1]) == refs(sys.argv[2]) else 1)
 PY
         then return 0; fi

@@ -21,8 +21,9 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	if req.MaxCheckpoints != 0 && req.MaxCheckpoints != 1 {
-		return nil, fmt.Errorf("%w: max_checkpoints must be 1", api.ErrBadRequest)
+	maxCheckpoints, err := types.ResolveMaxCheckpoints(req.MaxCheckpoints)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 
 	admissionStarted := time.Now()
@@ -85,7 +86,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	}
 	normalized.Workspaces = req.Workspaces
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
-		ID: sid, StableID: identity.StableID, Template: tmpl, Pair: pair,
+		ID: sid, StableID: identity.StableID, Template: tmpl, Pair: pair, MaxCheckpoints: maxCheckpoints,
 		Config: normalized, Env: req.EnvVars, TimeoutSeconds: req.TimeoutSec,
 		IdleTimeout: types.CloneIdleTimeout(req.IdleTimeout), AutoPauseMemory: req.AutoPauseMemory, AutoReset: req.AutoReset, InitialMMDS: initialMMDSRouteSecretValues(mmdsDoc),
 	})
@@ -188,6 +189,7 @@ type sandboxCreateSpec struct {
 	Config          sandboxCreateConfig
 	Env             map[string]string
 	TimeoutSeconds  int
+	MaxCheckpoints  int
 	IdleTimeout     *int64
 	AutoPauseMemory *bool
 	AutoReset       bool
@@ -211,7 +213,7 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 	}
 	now := time.Now()
 	sb := &types.Sandbox{
-		ID: spec.ID, StableIDValue: spec.StableID, IdleTimeout: types.CloneIdleTimeout(spec.IdleTimeout),
+		ID: spec.ID, StableIDValue: spec.StableID, IdleTimeout: types.CloneIdleTimeout(spec.IdleTimeout), MaxCheckpoints: spec.MaxCheckpoints,
 		Profile: spec.Template.Profile, TemplateID: spec.Template.String(),
 		State: types.StateStarting, LaunchMode: launchMode, AutoPauseMemory: autoPauseMemory, AutoReset: spec.AutoReset,
 		RunDir:    nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, spec.ID),
