@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -48,17 +47,7 @@ func TestCheckpointCleanupCLICommitAndRetry(t *testing.T) {
 						t.Fatal(err)
 					}
 					f.o.executables = configresolve.ExecutablesForNodeCtl(nodeBinary)
-					lifetime, stop := context.WithCancel(ctx)
-					f.o.SetLifecycleContext(lifetime)
-					drain := func() {
-						stop()
-						timeout, cancel := context.WithTimeout(ctx, 5*time.Second)
-						defer cancel()
-						if err := f.o.DrainPauses(timeout); err != nil {
-							t.Errorf("drain cleanup: %v", err)
-						}
-					}
-					t.Cleanup(drain)
+					drain := checkpointGCLifecycle(t, f.o)
 					var key [32]byte
 					decoded, err := hex.DecodeString(f.sb.ManifestKey)
 					if err != nil {
@@ -221,6 +210,9 @@ func TestCheckpointCleanupCLICommitAndRetry(t *testing.T) {
 						}
 						restarted := testOrchCfgAt(t, f.o.cfg, f.dbPath)
 						restarted.lc, restarted.vs, restarted.executables = f.lc, f.vs, f.o.executables
+						// Bind shutdown to this exact owner and drain its startup GC
+						// before testOrchCfgAt closes the restarted store.
+						checkpointGCLifecycle(t, restarted)
 						if err := restarted.ReconcileSandboxes(ctx); err != nil {
 							t.Fatal(err)
 						}
