@@ -110,6 +110,11 @@ type NodeRepository interface {
 	CleanupKeyPair(context.Context, ReapClaim, Versioned[NodeKeyPair]) error
 	FinalizeReap(context.Context, ReapClaim) (bool, error)
 	ListReaping(context.Context, Cursor, int) (Page[ReapClaim], error)
+	// ListExpiredNodeProfiles examines at most one bounded profile page and
+	// returns live profiles whose positive heartbeat is at or before cutoffUnix.
+	// An empty Items page can still have Next. Candidates are observations only;
+	// BeginReap must compare their original Version after checking connection state.
+	ListExpiredNodeProfiles(context.Context, int64, Cursor, int) (Page[Versioned[NodeProfileRecord]], error)
 }
 
 type OwnershipRepository interface {

@@ -361,6 +361,20 @@ func (s *Store) ListReaping(ctx context.Context, cursor metadata.Cursor, limit i
 	return out, nil
 }
 
+func (s *Store) ListExpiredNodeProfiles(ctx context.Context, cutoffUnix int64, cursor metadata.Cursor, limit int) (metadata.Page[metadata.Versioned[metadata.NodeProfileRecord]], error) {
+	values, err := listTyped[metadata.NodeProfileRecord](ctx, s, s.key("node-profile"), cursor, limit)
+	if err != nil {
+		return metadata.Page[metadata.Versioned[metadata.NodeProfileRecord]]{}, err
+	}
+	out := metadata.Page[metadata.Versioned[metadata.NodeProfileRecord]]{Next: values.Next}
+	for _, value := range values.Items {
+		if value.Value.State == metadata.NodeLive && value.Value.LastHeartbeatUnix > 0 && value.Value.LastHeartbeatUnix <= cutoffUnix {
+			out.Items = append(out.Items, value)
+		}
+	}
+	return out, nil
+}
+
 func bucket(nodeID string) byte { return sha256.Sum256([]byte(nodeID))[0] }
 func projectNode(value metadata.NodeProfileRecord) metadata.NodeListEntry {
 	return metadata.NodeListEntry{NodeID: value.NodeID, Labels: value.Labels, Capacity: value.Capacity, BuildRegistrationCapacity: value.BuildRegistrationCapacity, BuildExecutionCapacity: value.BuildExecutionCapacity, APIEndpoint: value.APIEndpoint, DataEndpoint: value.DataEndpoint, RuntimeDigest: value.RuntimeDigest, Draining: value.Draining}

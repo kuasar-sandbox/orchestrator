@@ -525,6 +525,7 @@ func (s *Store) Register(ctx context.Context, expected metadata.Version, p metad
 	if s.nodes[p.NodeID].Version != expected {
 		return metadata.NodeSnapshot{}, metadata.ErrConflict
 	}
+	p.State = metadata.NodeLive
 	v := s.next()
 	n := metadata.NodeSnapshot{Exists: true, Version: v, Value: clone(p), Registration: metadata.Registration{NodeID: p.NodeID, LinkOwner: p.LinkOwner, Fence: v}}
 	s.nodes[p.NodeID] = n
@@ -541,6 +542,7 @@ func (s *Store) UpdateProfile(ctx context.Context, reg metadata.Registration, ex
 	if !n.Exists || n.Reaping || n.Registration != reg || n.Version != expected || p.LinkOwner != reg.LinkOwner {
 		return metadata.Version{}, metadata.ErrConflict
 	}
+	p.State = metadata.NodeLive
 	v := s.next()
 	n.Value = clone(p)
 	n.Version = v
@@ -692,6 +694,19 @@ func (s *Store) ListReaping(ctx context.Context, cursor metadata.Cursor, limit i
 		}
 	}
 	return page(m, "", cursor, limit), ctx.Err()
+}
+
+func (s *Store) ListExpiredNodeProfiles(ctx context.Context, cutoffUnix int64, cursor metadata.Cursor, limit int) (metadata.Page[metadata.Versioned[metadata.NodeProfileRecord]], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	values := page(s.nodes, "", cursor, limit)
+	out := metadata.Page[metadata.Versioned[metadata.NodeProfileRecord]]{Next: values.Next}
+	for _, value := range values.Items {
+		if value.Value.State == metadata.NodeLive && value.Value.LastHeartbeatUnix > 0 && value.Value.LastHeartbeatUnix <= cutoffUnix {
+			out.Items = append(out.Items, metadata.Versioned[metadata.NodeProfileRecord]{Exists: value.Exists, Version: value.Version, Value: value.Value})
+		}
+	}
+	return out, ctx.Err()
 }
 
 func (s *Store) ReadSandboxOwner(ctx context.Context, node, id string) (metadata.Versioned[metadata.NodeSandboxRef], error) {

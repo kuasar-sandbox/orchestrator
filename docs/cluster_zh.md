@@ -1136,6 +1136,7 @@ driver 区分 `Conflict`、`Unavailable`、`Unknown` 和容量错误。只有被
 - Build 注册 intent 与 node reference 同事务提交。Acceptance 与合法节点报告在事务内合并，保留已经推进的 ready/error 投影。明确拒绝只清理匹配 intent 与归属；ambiguous dispatch 保持原绑定。
 - Register 返回不可变 node fence。Heartbeat/profile update 必须携带原始 fence；读取较新 profile 不会授权旧 stream 接管新注册。
 - Reaping 原子 claim 预期的过期 profile，并撤回其目录项。每一页清理都验证 claim、记录版本和精确归属；符合条件的引用清空后才能 finalize，恢复执行的旧 worker 不能删除新注册数据。
+- Registry 启动时及每个 `node_dead_after` 周期恢复持久 claim，并通过有界分页发现过期 profile，补偿 claim 前因进程退出而丢失的断连定时器。连接仍活跃或探测结果不确定时不发起新 claim；发现候选后的心跳和重新注册会使其原始版本失效。网络不可达不构成节点已断连的证明，后续继续重试；配置中已无 owner 时沿用既有 `NodeOwner` 契约。
 - Key-pair ACK 必须匹配完整 current desired material 与 lease。过期、替换与迟到 ACK 不能确认另一组凭据。
 - Import-source checkpoint 验证 owner、run ID、term 和 lease，page 全部成功后才前移 cursor。
 

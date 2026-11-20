@@ -1780,7 +1780,8 @@ func (r *Registry) getNodeForLinkUpdate(ctx context.Context, nodeID string) (*No
 }
 
 // RunReaper configures event-driven dead-node cleanup. A node-link disconnect
-// schedules cleanup for that node only; recovery enumerates durable reap claims.
+// schedules cleanup for that node only; recovery enumerates durable reap claims
+// and expired profiles whose disconnect timer was lost before acquiring a claim.
 func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	if deadAfter <= 0 {
 		deadAfter = 30 * time.Second
@@ -1789,7 +1790,9 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	r.reaperCtx = ctx
 	r.deadAfter = deadAfter
 	r.mu.Unlock()
-	// Reaping markers survive Registry crashes. Only this bounded index is scanned.
+	// Resume committed claims, then discover crashes before BeginReap. Profile
+	// discovery reads bounded pages and never enumerates a node's child refs until
+	// its original profile version has been claimed.
 	resume := func() {
 		for cursor := metadata.Cursor(""); ; {
 			page, err := r.stores.nodes.ListReaping(ctx, cursor, 128)
@@ -1807,6 +1810,7 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 		}
 	}
 	resume()
+	r.recoverExpiredNodes(ctx, deadAfter)
 	ticker := time.NewTicker(deadAfter)
 	defer ticker.Stop()
 	for {
@@ -1815,7 +1819,53 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 			return
 		case <-ticker.C:
 			resume()
+			r.recoverExpiredNodes(ctx, deadAfter)
 		}
+	}
+}
+
+func (r *Registry) recoverExpiredNodes(ctx context.Context, deadAfter time.Duration) {
+	cutoff := time.Now().Add(-deadAfter).Unix()
+	uncertainOwners := make(map[string]bool)
+	for cursor := metadata.Cursor(""); ; {
+		page, err := r.stores.nodes.ListExpiredNodeProfiles(ctx, cutoff, cursor, 128)
+		if err != nil {
+			r.log.Warn("registry: list expired node profiles", "err", err)
+			return
+		}
+		for _, profile := range page.Items {
+			if uncertainOwners[profile.Value.LinkOwner] {
+				continue
+			}
+			if _, connected := r.node(profile.Value.NodeID); connected {
+				continue
+			}
+			// The owner can be another Registry. A live stream still protects its
+			// profile when persisted heartbeats are delayed; an uncertain probe is
+			// retried on a later pass instead of being treated as a disconnect.
+			probeCtx, cancel := context.WithTimeout(ctx, deadAfter)
+			probeErr := r.nodeOwner.Connected(probeCtx, profile.Value.NodeID)
+			cancel()
+			if !errors.Is(probeErr, ErrNodeGone) {
+				// A failed owner must not impose one full probe timeout per node.
+				// Retry it on the next pass; successful probes remain per-node.
+				if probeErr != nil {
+					uncertainOwners[profile.Value.LinkOwner] = true
+				}
+				continue
+			}
+			// Never refresh the candidate's version here: a heartbeat or Register
+			// since discovery must invalidate this attempt, even for the same owner.
+			claim, err := r.stores.nodes.BeginReap(ctx, profile.Value.NodeID, profile.Version)
+			if err != nil {
+				continue
+			}
+			r.cleanupReap(ctx, claim)
+		}
+		if page.Next == "" {
+			return
+		}
+		cursor = page.Next
 	}
 }
 
@@ -1866,6 +1916,17 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	// abandon cleanup because both timestamps rounded to the same second.
 	if rec.LastHeartbeatUnix <= 0 || rec.LastHeartbeatUnix > cutoff {
 		return
+	}
+	// An old disconnect timer can outlive a reconnect through another Registry.
+	// Check that owner's stream before claiming the version read above; delayed
+	// persisted heartbeats alone do not make an active remote stream dead.
+	if rec.LinkOwner != r.stores.WriterID() {
+		probeCtx, cancel := context.WithTimeout(ctx, deadAfter)
+		probeErr := r.nodeOwner.Connected(probeCtx, nodeID)
+		cancel()
+		if !errors.Is(probeErr, ErrNodeGone) {
+			return
+		}
 	}
 	claim, err := r.stores.nodes.BeginReap(ctx, nodeID, rec.Version)
 	if err != nil {
