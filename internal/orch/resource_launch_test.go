@@ -187,6 +187,7 @@ func TestStartupCreateUsesSameResolverForStaticAndDynamicArtifacts(t *testing.T)
 					o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 					if controller == "dynamic" {
 						o.SetResourceControllerSocketIdentity(filepath.Join(cfg.Paths.RunRoot, "resource.sock"))
+						attachPressure(t, o)
 					}
 					vs := &resourcePreflightVS{}
 					o.vs = vs

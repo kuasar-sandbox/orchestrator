@@ -116,14 +116,16 @@ type AssignmentResponse struct {
 }
 
 type RunSessionRequest struct {
-	Kind  string `json:"kind"`
-	RunID string `json:"run_id"`
+	Kind     string   `json:"kind"`
+	RunID    string   `json:"run_id"`
+	Features []string `json:"features,omitempty"`
 }
 
 type RunSessionResponse struct {
-	Kind  string `json:"kind,omitempty"`
-	RunID string `json:"run_id,omitempty"`
-	Error string `json:"error,omitempty"`
+	Kind       string              `json:"kind,omitempty"`
+	RunID      string              `json:"run_id,omitempty"`
+	Error      string              `json:"error,omitempty"`
+	Retirement *RunRetirementEvent `json:"retirement,omitempty"`
 }
 
 // RunSessionRegistration is the provider-owned generation for one long-lived
@@ -566,6 +568,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskBuildBootstrap, s.handleBuildBootstrap)
 	mux.HandleFunc("POST "+PathTaskBuildPrepare, s.handleBuildPrepare)
 	mux.HandleFunc("PUT "+PathRunSession, s.handleRunSession)
+	mux.HandleFunc("POST "+PathRunSession, s.handleRunRole)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunSandboxResult, s.handleSandboxResult)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
@@ -806,7 +809,13 @@ func (s *Server) handleRunSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, &RunSessionResponse{Error: "not authorized"})
 		return
 	}
-	session, ok, err := s.deps.Provider.RegisterRunSession(r.Context(), req.Kind, req.RunID)
+	var session RunSessionRegistration
+	var err error
+	if provider, supported := s.deps.Provider.(RunRetirementProvider); supported {
+		session, ok, err = provider.RegisterRunSessionFeatures(r.Context(), req.Kind, req.RunID, req.Features)
+	} else {
+		session, ok, err = s.deps.Provider.RegisterRunSession(r.Context(), req.Kind, req.RunID)
+	}
 	if err != nil {
 		s.log.Warn("configsock run session", "kind", req.Kind, "run_id", req.RunID, "err", err)
 		writeJSON(w, http.StatusInternalServerError, &RunSessionResponse{Error: err.Error()})
@@ -827,7 +836,24 @@ func (s *Server) handleRunSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
-	<-r.Context().Done()
+	var events <-chan RunRetirementEvent
+	if session, ok := session.(RunRetirementSession); ok {
+		events = session.Retirements()
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			if err := json.NewEncoder(w).Encode(&RunSessionResponse{Kind: req.Kind, RunID: req.RunID, Retirement: &event}); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {

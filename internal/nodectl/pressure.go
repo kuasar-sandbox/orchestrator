@@ -347,7 +347,7 @@ func (s *State) ObserveResourceObligation(sid string, version uint64, phase stri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.observeObligationLocked(sid, version, phase, owner || (accountCharge && s.bySID[sid] != nil), owner, accountCharge)
+	s.observeObligationLocked(sid, version, phase, owner || (accountCharge && (s.bySID[sid] != nil || s.retainedBytes[sid] != 0)), owner, accountCharge)
 }
 
 func (s *State) observeObligationLocked(sid string, version uint64, phase string, cleanup, owner, accountCharge bool) {

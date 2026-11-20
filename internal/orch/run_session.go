@@ -17,12 +17,18 @@ type runSessionKey struct {
 }
 
 type runSessionGeneration struct {
-	owner *Orchestrator
-	key   runSessionKey
-	gen   uint64
+	owner            *Orchestrator
+	key              runSessionKey
+	gen              uint64
+	holderRetirement bool
+	retirements      chan configsock.RunRetirementEvent
 }
 
 func (o *Orchestrator) RegisterRunSession(ctx context.Context, kind, runID string) (configsock.RunSessionRegistration, bool, error) {
+	return o.RegisterRunSessionFeatures(ctx, kind, runID, nil)
+}
+
+func (o *Orchestrator) RegisterRunSessionFeatures(ctx context.Context, kind, runID string, features []string) (configsock.RunSessionRegistration, bool, error) {
 	if !validRunID(kind, runID) {
 		return nil, false, nil
 	}
@@ -37,12 +43,26 @@ func (o *Orchestrator) RegisterRunSession(ctx context.Context, kind, runID strin
 		return nil, known, err
 	}
 	o.runSessionsNext++
-	session := &runSessionGeneration{owner: o, key: key, gen: o.runSessionsNext}
+	session := &runSessionGeneration{owner: o, key: key, gen: o.runSessionsNext, retirements: make(chan configsock.RunRetirementEvent, 1)}
+	for _, feature := range features {
+		if kind == runKindSandbox && feature == configsock.FeatureCheckpointHolderRetirementV1 {
+			session.holderRetirement = true
+		}
+	}
 	if o.runSessions == nil {
 		o.runSessions = make(map[runSessionKey]*runSessionGeneration)
 	}
 	o.runSessions[key] = session
+	if session.holderRetirement {
+		if m, ok := o.runs.ownership(runID); ok && m.Role == store.RunRoleMemoryHolder {
+			session.retirements <- runRetirementEvent(m)
+		}
+	}
 	return session, true, nil
+}
+
+func (s *runSessionGeneration) Retirements() <-chan configsock.RunRetirementEvent {
+	return s.retirements
 }
 
 func (o *Orchestrator) runSessionKnownOwner(ctx context.Context, kind, runID string) (bool, error) {
@@ -88,6 +108,10 @@ func (o *Orchestrator) closeRunSession(key runSessionKey, gen uint64, shutdown b
 }
 
 func (o *Orchestrator) handleRunSessionDisconnect(kind, runID string, disconnectedGen uint64) {
+	if m, ok := o.runs.ownership(runID); ok && m.RetirementOperationID != "" {
+		o.startSandboxRunEndCheck(runID)
+		return
+	}
 	if o.retireUnassignedRun(kind, runID, disconnectedGen) {
 		return
 	}
@@ -274,7 +298,7 @@ func (o *Orchestrator) sandboxRunEndWorker(ctx context.Context, finish func()) {
 		}
 		o.wakeSandboxRunEndLocked()
 		o.runEndMu.Unlock()
-		if err != nil {
+		if err != nil && !retirementIsPending(err) {
 			o.log.Warn("sandbox run end check incomplete; retaining retry ownership", "run_id", runID, "err", err)
 		}
 	}
@@ -283,6 +307,9 @@ func (o *Orchestrator) sandboxRunEndWorker(ctx context.Context, finish func()) {
 func (o *Orchestrator) checkDisconnectedRunOnce(ctx context.Context, kind, runID string) error {
 	if kind != runKindSandbox {
 		return nil
+	}
+	if m, ok := o.runs.ownership(runID); ok && m.RetirementOperationID != "" {
+		return o.reconcileRetiredRun(ctx, m)
 	}
 	checkCtx, cancel := cleanupContext()
 	defer cancel()

@@ -22,6 +22,8 @@ type CaptureRequest struct {
 	Checkpoint  bool
 	IfIdle      bool
 	IfIdleSince *time.Time
+	// Waiting happens before accepting a pause and never changes its state.
+	NoWaitForPreviousMemorySave bool
 	// IdleSinceBootNS is an internal same-host anchor, never decoded from JSON.
 	IdleSinceBootNS int64
 	Kind            types.CaptureKind

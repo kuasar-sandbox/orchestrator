@@ -217,6 +217,9 @@ var ErrAlreadyPaused = errors.New("already paused")
 
 var ErrSandboxBusy = errors.New("sandbox is not idle")
 
+var ErrPreviousMemorySavePending = errors.New("previous checkpoint memory save is still pending; retry after it completes")
+var ErrPauseRunChanged = errors.New("sandbox run changed while waiting to pause")
+
 var ErrCheckpointLimit = errors.New("max_checkpoints=1 reached; export or delete the retained checkpoint first")
 
 // ErrSandboxStarting is returned when an operation such as Pause cannot run
@@ -362,12 +365,13 @@ type CreateReq struct {
 // PauseRequest carries the E2B capture selector and action-scoped Snapshot-only
 // policy. A nil Memory value has the E2B default true.
 type PauseRequest struct {
-	Checkpoint           bool       `json:"checkpoint,omitempty"`
-	IfIdle               bool       `json:"ifIdle,omitempty"`
-	IfIdleSince          *time.Time `json:"ifIdleSince,omitempty"`
-	Memory               *bool      `json:"memory,omitempty"`
-	CheckpointMergeRef   *bool      `json:"checkpoint_merge_ref,omitempty"`
-	CheckpointDropCaches *bool      `json:"checkpoint_drop_caches,omitempty"`
+	NoWaitForPreviousMemorySave bool       `json:"noWaitForPreviousMemorySave,omitempty"`
+	Checkpoint                  bool       `json:"checkpoint,omitempty"`
+	IfIdle                      bool       `json:"ifIdle,omitempty"`
+	IfIdleSince                 *time.Time `json:"ifIdleSince,omitempty"`
+	Memory                      *bool      `json:"memory,omitempty"`
+	CheckpointMergeRef          *bool      `json:"checkpoint_merge_ref,omitempty"`
+	CheckpointDropCaches        *bool      `json:"checkpoint_drop_caches,omitempty"`
 }
 
 // ImportOptions selects the durable state kept by a newly imported target.
@@ -842,8 +846,11 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 	}
 	checkpointID, err := a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), sandboxcfg.CaptureRequest{
 		Kind: kind, SnapshotPolicy: override, Checkpoint: req.Checkpoint, IfIdle: req.IfIdle, IfIdleSince: req.IfIdleSince,
+		NoWaitForPreviousMemorySave: req.NoWaitForPreviousMemorySave,
 	})
 	switch {
+	case errors.Is(err, ErrPreviousMemorySavePending), errors.Is(err, ErrPauseRunChanged):
+		writeErr(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrSandboxBusy):
 		writeErr(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrCheckpointLimit):

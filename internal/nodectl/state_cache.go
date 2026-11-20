@@ -30,6 +30,9 @@ type CacheGrantResult struct {
 // changeCacheLocked is the only cache-reservation aggregate mutation. It is
 // serialized with Admit, Guest grow, StateSync, and Release by the same mutex.
 func (s *State) changeCacheLocked(r *Reservation, current uint64) error {
+	if r.RetentionPrepared && current > r.CacheReservation {
+		return fmt.Errorf("checkpoint memory capture freezes cache growth")
+	}
 	if r.CacheReservation == current {
 		return nil
 	}

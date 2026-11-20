@@ -145,7 +145,11 @@ class H(BaseHTTPRequestHandler):
     def do_PUT(self):
         global sequence
         req = self.read_request()
-        if self.path != "/internal/run/session" or req != {"kind": "sandbox", "run_id": run_id} or not self.authenticated():
+        if (self.path != "/internal/run/session"
+                or req.get("kind") != "sandbox" or req.get("run_id") != run_id
+                or set(req) - {"kind", "run_id", "features"}
+                or req.get("features", []) != ["checkpoint_holder_retirement_v1"]
+                or not self.authenticated()):
             self.reply({"error": "invalid session identity"}, 403)
             return
         with lock:

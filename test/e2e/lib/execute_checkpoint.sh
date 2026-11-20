@@ -3,6 +3,11 @@
 checkpoint_local_metadata() { # SID, output
     python3 "$SCRIPT_DIR/disk_checkpoint.py" metadata "$WORK/lib/node-ctl.db" "$1" >"$2"
 }
+checkpoint_managed_memory() { # SID, paused|running, output
+    python3 "$SCRIPT_DIR/disk_checkpoint.py" managed-memory "$WORK/lib/node-ctl.db" "$1" \
+        "$ORCH_BIN_DIR/node-ctl" "$WORK/node-ctl.socket" "$WORK/sandbox-resource.sock" \
+        "$ORCH_LOG" "$2" >"$3"
+}
 checkpoint_disk_state() { # SID, output
     python3 "$SCRIPT_DIR/disk_checkpoint.py" disks "$CHECKPOINT_ROOT/$1/checkpoint/diffs" >"$2"
 }

@@ -149,6 +149,21 @@ func (o *Orchestrator) restoreResourcePlacements(ctx context.Context, state *nod
 		}
 	}
 	for _, m := range rows {
+		// A producer may have committed and retired before its CLI reply or the
+		// paused database transaction reached the host. Recover that role before
+		// rebuilding placement capacity or classifying an old unit as orphaned.
+		if m.RetirementOperationID != "" {
+			record, readErr := o.readRunCapture(ctx, m)
+			if readErr != nil {
+				o.log.Warn("retaining unresolved checkpoint runner during recovery", "run_id", m.RunID, "err", readErr)
+			}
+			if readErr == nil && record != nil && record.Committed && record.RuntimeRetired {
+				m.Role, m.MemoryID, m.MemoryEpoch = store.RunRoleMemoryHolder, record.MemoryID, record.Epoch
+				if err := o.st.SaveRunPoolOwnership(ctx, m); err != nil {
+					return err
+				}
+			}
+		}
 		if _, found := live[m.RunID]; !found {
 			// Configuration may have removed/renamed a template. Query its
 			// persisted actual unit before deciding the execution has exited.
@@ -163,16 +178,18 @@ func (o *Orchestrator) restoreResourcePlacements(ctx context.Context, state *nod
 			}
 		}
 		if actual, ok := live[m.RunID]; !ok {
-			if err := o.st.DeleteRunPoolOwnership(ctx, m.RunID); err != nil {
-				return err
+			if m.RetirementOperationID == "" {
+				if err := o.st.DeleteRunPoolOwnership(ctx, m.RunID); err != nil {
+					return err
+				}
+				continue
 			}
-			continue
 		} else if actual != m.Unit {
 			return fmt.Errorf("run %s unit differs from persisted owner", m.RunID)
 		}
 		recorded[m.RunID] = true
 		pool := byName[m.Kind+":"+m.Pool]
-		if pool == nil || pool.resourcePool != m.ResourcePool || pool.unitName(m.RunID) != m.Unit {
+		if m.Role != store.RunRoleMemoryHolder && (pool == nil || pool.resourcePool != m.ResourcePool || pool.unitName(m.RunID) != m.Unit) {
 			return fmt.Errorf("persisted run %s no longer matches its pool/template", m.RunID)
 		}
 		if state != nil {
@@ -194,10 +211,13 @@ func (o *Orchestrator) restoreResourcePlacements(ctx context.Context, state *nod
 		if o.runs.metadata == nil {
 			o.runs.metadata = map[string]store.RunPoolOwnership{}
 		}
-		o.runs.owners[m.RunID], o.runs.metadata[m.RunID] = pool, m
+		o.runs.metadata[m.RunID] = m
+		if m.Role != store.RunRoleMemoryHolder {
+			o.runs.owners[m.RunID] = pool
+		}
 		o.runs.mu.Unlock()
 		o.runs.restore(m.RunID, m.Unit)
-		if state != nil && m.TaskID != "" && m.CapacityMemory > 0 {
+		if state != nil && m.Role != store.RunRoleMemoryHolder && m.TaskID != "" && m.CapacityMemory > 0 {
 			if err := state.RestorePlacement(nodectl.Placement{SandboxID: m.TaskID, Identity: m.RunID, Pool: m.ResourcePool, Capacity: nodectl.Resources{MemoryBytes: m.CapacityMemory, CPUMilli: m.CapacityCPU}}); err != nil {
 				return err
 			}

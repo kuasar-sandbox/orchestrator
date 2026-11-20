@@ -34,16 +34,21 @@ func runSandbox(args []string, log *slog.Logger) error {
 	if *pidfile == "" || *socket == "" || *runID == "" {
 		return fmt.Errorf("run-sandbox: --pidfile, --config-socket, and --run-id required")
 	}
+	var session *configsock.RunSessionKeeper
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
-		lockPidfile:    lockPidfile,
-		prepareCgroup:  func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
-		openSession:    openRunSessionKeeper,
+		lockPidfile:   lockPidfile,
+		prepareCgroup: func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
+		openSession: func(ctx context.Context, socket, kind, runID string) (runSessionCloser, error) {
+			var err error
+			session, err = configsock.OpenRunSessionKeeperWithFeatures(ctx, socket, kind, runID, []string{configsock.FeatureCheckpointHolderRetirementV1})
+			return session, err
+		},
 		waitAssignment: configsock.WaitAssignment,
 		connectReady:   connectReadinessSocket,
 		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
-			return launchTask(ctx, stop, socket, sid, runID, ready, cgroup, log)
+			return launchTask(ctx, stop, socket, sid, runID, ready, cgroup, log, session.Retirements())
 		},
 	})
 }

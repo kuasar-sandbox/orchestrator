@@ -1210,6 +1210,13 @@ func (s *Store) AcceptSandboxExecutionResult(ctx context.Context, id, runID stri
 }
 
 func (s *Store) CommitPaused(ctx context.Context, id, runID string, source types.ResumeSource, checkpointID string) (bool, error) {
+	return s.CommitPausedWithRetirement(ctx, id, runID, source, checkpointID, nil)
+}
+
+// CommitPausedWithRetirement atomically publishes the captured source and the
+// exact holder role. The prior prepare intent covers producer commit/EOF before
+// this transaction; clearing the current runner can never orphan that holder.
+func (s *Store) CommitPausedWithRetirement(ctx context.Context, id, runID string, source types.ResumeSource, checkpointID string, retirement *RunPoolOwnership) (bool, error) {
 	if !source.Valid() {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: invalid resume source", id)
 	}
@@ -1236,6 +1243,26 @@ func (s *Store) CommitPaused(ctx context.Context, id, runID string, source types
 	if checkpointID != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO sandbox_checkpoints(sandbox_id,checkpoint_id,source_kind,source_ref,sandbox_ref) VALUES(?,?,?,?,?)`, id, checkpointID, string(source.Kind), source.Ref, source.SandboxRef); err != nil {
 			return false, fmt.Errorf("store: retain checkpoint: %w", err)
+		}
+	}
+	if retirement != nil {
+		if retirement.RunID != runID || retirement.TaskID != id || retirement.Role != RunRoleMemoryHolder || retirement.RetirementOperationID == "" || retirement.MemoryID == "" || retirement.MemoryEpoch == 0 {
+			return false, fmt.Errorf("store: invalid paused holder identity")
+		}
+		raw, err := json.Marshal(retirement)
+		if err != nil {
+			return false, err
+		}
+		r, err := tx.ExecContext(ctx, `UPDATE run_pool_ownership SET ownership=? WHERE run_id=? AND json_extract(ownership,'$.retirement_operation_id')=? AND json_extract(ownership,'$.task_id')=?`, string(raw), runID, retirement.RetirementOperationID, id)
+		if err != nil {
+			return false, err
+		}
+		n, err := r.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if n != 1 {
+			return false, fmt.Errorf("store: paused holder ownership changed")
 		}
 	}
 	if err := tx.Commit(); err != nil {

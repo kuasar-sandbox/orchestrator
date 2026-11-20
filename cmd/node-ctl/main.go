@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -77,6 +78,10 @@ func main() {
 		err = checkSnapshotRuntimeCmd(os.Stdin, os.Stdout)
 	case "checkpoint-cleanup":
 		err = checkpointCleanupCmd(os.Args[2:])
+		if errors.Is(err, errCheckpointCleanupDeferred) {
+			log.Info("checkpoint garbage collection deferred", "err", err)
+			os.Exit(checkpointCleanupDeferredExitCode)
+		}
 	case "manifest-key":
 		err = manifestKeyCmd(os.Args[2:], log)
 	case "workspace":
