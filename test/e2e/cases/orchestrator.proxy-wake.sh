@@ -456,15 +456,34 @@ done
 [ -n "$restored" ] || fail "primary held memory/identity did not survive Snapshot"
 # The saved baseline exceeds the ordinary startup pool; runtime admission must
 # have restored the full Snapshot budget through the serialized saved lane.
-grep -Eq 'restore BudgetAtSnapshot reserved=' "$WORK/orch-pressure.log" ||     journalctl KUASAR_SANDBOX_ID="$FIRST" --no-pager -o cat > "$WORK/pressure-restore.journal"
-python3 - "$WORK/orch-pressure.log" "$WORK/pressure-restore.journal" "$WORK/pressure-status.json" <<'PY_BUDGET' || fail "complete Snapshot budget admission"
+restore_budget=""
+restore_run_id="$(sandbox_run_id "$FIRST")"
+[ -n "$restore_run_id" ] || fail "restored Snapshot lost its run-id"
+# Runner stdout can reach journald after the restored primary answers exec.
+# Bound that observation to 20s; an older run's records cannot establish this
+# admission, and a delivered but incorrect budget must still fail immediately.
+restore_budget_deadline=$((SECONDS + 20))
+while [ "$SECONDS" -lt "$restore_budget_deadline" ]; do
+    timeout 3 journalctl KUASAR_SANDBOX_ID="$FIRST" KUASAR_RUN_ID="$restore_run_id" \
+        --no-pager -o cat > "$WORK/pressure-restore.journal" || fail "read restored Snapshot journal"
+    if python3 - "$WORK/pressure-restore.journal" "$WORK/pressure-status.json" <<'PY_BUDGET'
 import re, sys
 from pathlib import Path
-text="\n".join(Path(p).read_text() for p in sys.argv[1:3] if Path(p).exists())
+text=Path(sys.argv[1]).read_text()
 budgets=[int(n) for n in re.findall(r'restore BudgetAtSnapshot reserved=(\d+)',text)]
-pool=__import__("json").load(open(sys.argv[3]))["pool_memory"]
+if not budgets:
+    raise SystemExit(75)  # Only incomplete journal delivery is retryable.
+pool=__import__("json").load(open(sys.argv[2]))["pool_memory"]
 assert any(int(pool*.4)<n<=pool for n in budgets), budgets
 PY_BUDGET
+    then restore_budget=1; break
+    else
+        budget_status=$?
+        [ "$budget_status" -eq 75 ] || fail "complete Snapshot budget admission"
+    fi
+    sleep .2
+done
+[ -n "$restore_budget" ] || fail "complete Snapshot budget admission"
 # ---- background policy hold followed by actual resource relief ---------
 # Re-enable the second saved workload once, then send no more Wake/Connect.
 # Background recovery must not recreate raw red pressure merely to rotate
