@@ -1,3 +1,5 @@
+//go:build fdb && cgo
+
 package main
 
 import (
@@ -369,6 +371,17 @@ func TestPlacerLocalErrorsBeforeNetwork(t *testing.T) {
 	}
 }
 
+// An explicit ELF loader changes /proc/self/exe to the loader itself. Preserve
+// the Go test executable from argv and use the same private runtime for children.
+func placerTestSubprocess(ctx context.Context, args ...string) *exec.Cmd {
+	binary := os.Args[0]
+	if loader := os.Getenv("CLUSTER_NATIVE_TEST_LOADER"); loader != "" {
+		args = append([]string{"--inhibit-cache", "--library-path", os.Getenv("CLUSTER_NATIVE_TEST_LIBRARY_PATH"), binary}, args...)
+		return exec.CommandContext(ctx, loader, args...)
+	}
+	return exec.CommandContext(ctx, binary, args...)
+}
+
 func TestPlacerCommandSignals(t *testing.T) {
 	if path := os.Getenv("PLACER_BOOTSTRAP_TEST_CONFIG"); path != "" {
 		os.Args = []string{"cluster-ctl", "placer", "--config", path}
@@ -380,13 +393,9 @@ func TestPlacerCommandSignals(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
 			defer srv.Close()
 			path := writeStartupConfig(t, srv.URL, nil)
-			exe, err := os.Executable()
-			if err != nil {
-				t.Fatal(err)
-			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, exe, "-test.run=^TestPlacerCommandSignals$")
+			cmd := placerTestSubprocess(ctx, "-test.run=^TestPlacerCommandSignals$")
 			cmd.Env = append(os.Environ(), "PLACER_BOOTSTRAP_TEST_CONFIG="+path)
 			pipe, err := cmd.StderrPipe()
 			if err != nil {
@@ -431,13 +440,9 @@ func TestPlacerCommandRecoversSameProcess(t *testing.T) {
 	addr := ln.Addr().String()
 	ln.Close()
 	path := writeStartupConfig(t, "http://"+addr, nil)
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestPlacerCommandSignals$")
+	cmd := placerTestSubprocess(ctx, "-test.run=^TestPlacerCommandSignals$")
 	cmd.Env = append(os.Environ(), "PLACER_BOOTSTRAP_TEST_CONFIG="+path)
 	pipe, err := cmd.StderrPipe()
 	if err != nil {

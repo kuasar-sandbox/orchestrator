@@ -81,7 +81,7 @@ Draft pull requests are welcome for early feedback, but they are not merge candi
 | `internal/orch` | Node lifecycle, Build pools, local route authority, unit generation and restart reconciliation |
 | `internal/nodectl` | Reservation admission, pools/watermarks/grants, inventory/StateSync recovery and audit; not the Sandbox balloon/cgroup loop |
 | `internal/nodelink` | Conductor–Registry registration, heartbeat, events and commands over framed JSON/h2c |
-| `internal/{registry,router,placer}` | Replicated shardkv namespaces, Reserve/Build state and node-link key cache; unified E2B ingress/active cache; provider/importer, WATCH_LIST and P2C placement |
+| `internal/{registry,router,placer}` | Typed FoundationDB metadata, Reserve/Build state and node-link key cache; unified E2B ingress/active cache; provider/importer, WATCH_LIST and P2C placement |
 | `internal/api` | E2B control REST, X-API-KEY authentication, export/import and ExecAccessToken issuance |
 | `internal/proxy`, `internal/proxyshm`, `internal/proxyadmission`, `internal/routesync` | L7 forwarding, service-addressed CONNECT/native-exec gate, fixed shared route view, independent inflight arena, confidential MMDS heap, park/wake and generation cleanup; route/node-link register/bookmark/typed results |
 | `internal/configsock` | Run/task/admin/plugin/API planes, exact-run bootstrap/prepare, manifest-key/MMDS/Builder administration and controlled routes; SO_PEERCRED/pidfile authentication |

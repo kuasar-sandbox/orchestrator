@@ -39,9 +39,9 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.NodeLink.HeartbeatInterval != "10s" || c.NodeLink.NodeDeadAfter != "30s" {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
-	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.WatchRetention != 10000 ||
+	if c.RouteLink.ParkTimeout != "30s" || c.FoundationDB.ClusterFile != "/etc/foundationdb/fdb.cluster" || c.FoundationDB.Prefix != "kuasar-sandbox/cluster/" ||
 		c.PlacerLink.PlaceTimeout != "2s" {
-		t.Fatalf("link defaults not filled: route=%+v node_list=%+v scale=%+v", c.RouteLink, c.NodeList, c.PlacerLink)
+		t.Fatalf("link defaults not filled: route=%+v foundationdb=%+v scale=%+v", c.RouteLink, c.FoundationDB, c.PlacerLink)
 	}
 }
 
@@ -153,10 +153,6 @@ membership:
 	owners := c.Membership.OwnerVersions()
 	if len(owners) != 1 || owners[0].Version != 2 {
 		t.Fatalf("old_grace version must not be part of owner views: %+v", owners)
-	}
-	shards := c.Membership.ShardVersions()
-	if len(shards) != 2 || shards[0].Version != 2 || shards[1].Version != 1 {
-		t.Fatalf("shard versions should include active then old_grace: %+v", shards)
 	}
 	members := c.Membership.MemberVersions()
 	if len(members) != 2 || members[0].Version != 2 || members[1].Version != 1 {

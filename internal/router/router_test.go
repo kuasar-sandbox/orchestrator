@@ -907,7 +907,7 @@ func TestControlForwardEvictionPreservesNewRoute(t *testing.T) {
 	}
 	g1 := g0
 	g1.NodeSandboxID = "sb-1-g1"
-	g1.RouteRevision++
+	g1.RouteRevision = routeVersionForTest(2, 0)
 	rt.rememberRoute(&g1)
 	close(release)
 	released = true

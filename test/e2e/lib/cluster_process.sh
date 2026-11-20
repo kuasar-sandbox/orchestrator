@@ -151,7 +151,73 @@ EOF
     step "wrote placer file group source for $GROUP"
 }
 
+cluster_fdb_cli() {
+    env -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT \
+        "$CLUSTER_FDB_RUNTIME/ld.so" --inhibit-cache --library-path "$CLUSTER_FDB_RUNTIME" \
+        "$FDB_CLI_TEST_BIN" -C "$CLUSTER_FDB_FILE" "$@"
+}
+
+start_cluster_fdb() {
+    if [ -n "${CLUSTER_FDB_PID:-}" ]; then
+        kill -0 "$CLUSTER_FDB_PID" 2>/dev/null || fail "case FoundationDB server exited"
+        return
+    fi
+    [ -n "${FDB_SERVER_TEST_BIN:-}" ] && [ -x "$FDB_SERVER_TEST_BIN" ] \
+        || fail "prepared FoundationDB server helper is missing"
+    [ -n "${FDB_CLI_TEST_BIN:-}" ] && [ -x "$FDB_CLI_TEST_BIN" ] \
+        || fail "prepared FoundationDB CLI helper is missing"
+    CLUSTER_FDB_RUNTIME="$(dirname "$BIN")/lib/cluster-ctl"
+    [ -x "$CLUSTER_FDB_RUNTIME/ld.so" ] && [ -r "$CLUSTER_FDB_RUNTIME/libfdb_c.so" ] \
+        || fail "prepared cluster native runtime is missing"
+    local port identity address
+    port="$(free_port)"
+    identity="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    address="127.0.0.1:$port"
+    CLUSTER_FDB_FILE="$WORK/fdb/fdb.cluster"
+    CLUSTER_FDB_PREFIX="/orchestrator-e2e/$identity/"
+    mkdir -p "$WORK/fdb/data" "$WORK/fdb/logs"
+    printf 'test:%s@%s\n' "$identity" "$address" > "$CLUSTER_FDB_FILE"
+    env -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT \
+        "$CLUSTER_FDB_RUNTIME/ld.so" --inhibit-cache --library-path "$CLUSTER_FDB_RUNTIME" \
+        "$FDB_SERVER_TEST_BIN" -C "$CLUSTER_FDB_FILE" -p "$address" \
+        -d "$WORK/fdb/data" -L "$WORK/fdb/logs" \
+        --locality-machineid test-machine --locality-zoneid test-zone >"$WORK/fdb-server.log" 2>&1 &
+    CLUSTER_FDB_PID=$!
+    PIDS+=("$CLUSTER_FDB_PID")
+
+    # A new SSD database needs time to recruit its roles. These are bounded
+    # infrastructure waits, not retries of a Registry business operation.
+    local configured="" attempt
+    for attempt in 1 2 3; do
+        kill -0 "$CLUSTER_FDB_PID" 2>/dev/null || fail "case FoundationDB exited before configuration"
+        if cluster_fdb_cli --exec 'configure new single ssd' --timeout 20 >>"$WORK/fdb-configure.log" 2>&1; then
+            configured=1
+            break
+        fi
+        # A timed-out configure may have committed. Read its status before
+        # issuing another configure instead of mistaking the timeout for loss.
+        if cluster_fdb_cli --exec 'status minimal' --timeout 2 >"$WORK/fdb-status.log" 2>&1 \
+            && grep -Fq 'The database is available' "$WORK/fdb-status.log"; then
+            configured=1
+            break
+        fi
+        sleep 0.1
+    done
+    [ -n "$configured" ] || fail "case FoundationDB configuration failed"
+    for attempt in $(seq 1 40); do
+        kill -0 "$CLUSTER_FDB_PID" 2>/dev/null || fail "case FoundationDB exited during readiness"
+        if cluster_fdb_cli --exec 'status minimal' --timeout 2 >"$WORK/fdb-status.log" 2>&1 \
+            && grep -Fq 'The database is available' "$WORK/fdb-status.log"; then
+            step "FoundationDB 7.3.77 ready (isolated single SSD)"
+            return
+        fi
+        sleep 0.1
+    done
+    fail "case FoundationDB did not become available"
+}
+
 write_registry_configs() {
+    start_cluster_fdb
     CONTROL_PORTS=()
     local registries="$1"
     for _ in $(seq 1 "$registries"); do
@@ -174,6 +240,9 @@ write_registry_configs() {
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
+foundationdb:
+  cluster_file: "$CLUSTER_FDB_FILE"
+  prefix: "$CLUSTER_FDB_PREFIX"
 membership:
   active: 1
   versions:
@@ -239,7 +308,7 @@ start_cluster_control_plane() {
     for i in $(seq 1 "$registries"); do
         local port="${CONTROL_PORTS[$((i-1))]}"
         step "starting registry-$i (:${port})"
-        "$BIN/cluster-ctl" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
+        "$BIN/run-cluster-ctl" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
         PIDS+=("$!")
         REGISTRY_PIDS+=("$!")
         wait_port "$port" "registry-$i"
@@ -260,12 +329,12 @@ assert active_versions[0].get("label", active_versions[0].get("Label")), m
 PY
 
     step "starting placer (:${PLACER_PORT})"
-    "$BIN/cluster-ctl" placer --config "$WORK/placer.yaml" > >(tee "$WORK/placer.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" placer --config "$WORK/placer.yaml" > >(tee "$WORK/placer.log" >&2) 2>&1 &
     PIDS+=("$!")
     wait_port "$PLACER_PORT" placer
 
     step "starting router (:${ROUTER_PORT})"
-    "$BIN/cluster-ctl" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
     ROUTER_PID=$!
     PIDS+=("$ROUTER_PID")
     wait_port "$ROUTER_PORT" router

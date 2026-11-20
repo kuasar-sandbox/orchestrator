@@ -12,9 +12,7 @@
 - `router`:e2b 兼容统一入口,按 sandbox-group 定位 route owner,热路径直转 node。
 - `placer`:group provider/importer 与放置调度器,消费 `node_list`,向 registry 提供 Place / verify-key。
 
-Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 组织的一致性 KV。所有
-`node_link`、`route_link`、`node_list`、`placer_link` 记录都复用这套模型:分片间不遍历,分片内全复制,
-通过 quorum 读写、CAS、WATCH 和 read-repair 收敛。
+Registry 通过类型化 repository 访问 FoundationDB 7.3.77 持久执行元数据。事务、复制与存储恢复由 FoundationDB 负责；Registry 保留生命周期规则、node 连接归属与命令下发。Router 和 Placer 继续使用业务协议，不引入数据库 client。
 
 **阅读路径：** [公共入口](#client-access) · [Group 与放置](#groups-and-placement) · [角色配置](#configuration) · [状态所有权](#membership-and-state) · [Link 协议](#protocols) · [故障与恢复](#failure-and-recovery)
 
@@ -29,11 +27,12 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
 ```mermaid
 flowchart TD
   client["Client / E2B SDK"] --> router["Router"]
-  router -->|"Reserve / Resolve"| registry["Registry state cluster"]
+  router -->|"Reserve / Resolve"| registry["Registry services"]
   router -->|"Known target data"| node["Node Conductor and Proxy"]
   registry <-->|"node_link commands and state"| node
   registry <-->|"placer_link / Place"| placer["Placer and Group provider"]
   registry -->|"node_list WATCH_LIST"| placer
+  registry -->|"Typed metadata transactions"| fdb["FoundationDB"]
 ```
 
 稳态数据面不经过 registry.只有显式 create/connect/exec-session,以及数据面 target 缺失或
@@ -53,11 +52,9 @@ typed stale fallback 路径需要 registry:
 
 1. **group 是业务分片键**:所有 cluster 北向请求必须携带 `X-Kuasar-Sandbox-Group` 或等价 group
    身份。当前不支持无 group 的 cluster 数据面入口。
-2. **registry 是可靠状态集群**:执行态由 registry 成员直接复制。配置三个 owner 的逻辑 owner set 容忍单成员故障，单 owner 配置没有冗余；
-   整套 registry 丢失执行态后不要求自动恢复运行中 sandbox。
-3. **分片间不遍历**:registry 不能跨 group/node shard 扫描,不能把多个无关 shard 的局部结果合并成事实。
-4. **分片内全复制**:同一 `namespace + shard key + recordSet` 的 owner 均持有完整视图,可响应点读、
-   CAS 和 WATCH。非 owner 可作为协调者转发点读/CAS,但不能提供本地完整 Snapshot/WATCH。
+2. **持久元数据由 FoundationDB 保存**：Registry 进程故障不会擦除元数据。数据库可用性由独立的 FoundationDB 冗余和故障域决定，不取决于 Registry owner 数。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
+3. **操作保持类型化范围**：Route/Build 使用 group 与记录身份，node 操作使用 NodeID，低频目录按 bucket 有界分页。不能把无关局部列表拼成权威事实。
+4. **原子性对应业务不变量**：耦合的 intent/ownership、生命周期 fence 与投影通过类型化事务提交，Registry 成员不维护彼此的元数据副本。
 5. **成员健康不参与分片计算**:成员表来自版本化配置;`LocateN` 输入只使用 membership members。
    memberlist 只做健康检测和 meta 传播。
 6. **node 是运行态真相之源**:sandbox/build 是否仍存在以 node 上报为准。整机重启会丢失运行进程；保留的 durable row 仍须按实际 unit、checkpoint 与 cleanup ownership
@@ -74,7 +71,7 @@ typed stale fallback 路径需要 registry:
 
 | 角色 | 职责 |
 |---|---|
-| registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `placer_link` 执行态和 membership |
+| registry member | 承载业务协议、实际 node 连接与 membership，通过类型化 repository 访问持久元数据 |
 | router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,按 create/connect/exec-session/data 调用 Reserve;热路径使用本地 route cache |
 | placer | 消费 `node_list` WATCH_LIST;通过 provider/importer 导入 group;维护 placement 与 selector patch;提供 Place / verify-key |
 | node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/exec_session/delete/build/key 命令 |
@@ -607,14 +604,7 @@ sourceOwners race:
   POST /placer-link/import-source-lease
 ```
 
-source lease 存在 registry shardkv:
-
-```text
-namespace = placer_link
-shardKey  = import/source/<source_id>
-recordSet = import
-recordKey = state
-```
+source lease 是以 `source_id` 为 key 的持久 `ImportSourceRepository` 记录。业务键 `import/source/<source_id>` 选择服务候选，不选择存储副本。
 
 lease 请求携带 `source_id`、`owner_id`、`run_id` 和 `ttl_ms`。只有 lease 胜者执行该 source 的
 `Importer.Range(cursor, limit)`。
@@ -743,7 +733,7 @@ placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 3. selector patch 要么携带完整 pair,要么完全不携带凭据字段。两项各带 typed carrier 和完整
    64-hex SHA-256 指纹;半对拒绝。
 4. registry/node owner 以完整 `APISecretFingerprint` 为 record key,把 desired pair 写入 node_link
-   `key_pair` recordSet,并在 owner set 内 CAS 复制。
+   `KeyPairRepository` 持久记录；事务校验完整 pair 身份与 lease，替换使旧 ACK 失效。
 5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行原子 `key_put`;只有匹配
    当前完整 desired pair 和 lease 的 ACK 才推进已交付状态。
 6. 同一 APISecret 完整指纹只能绑定完全相同的 pair material;冲突不得覆盖。
@@ -774,8 +764,7 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbo
 
 registry 默认只有一个控制面监听。node_link 可以配置独立监听用于隔离 node 长连接流量,但不改变 owner
 规则。下面三成员示例展示 membership 与时序字段；`https://` advertise 还要求匹配的
-`member.tls` 配置与对端信任，单凭地址不会启用 TLS。内置默认配置只有一个成员，各 namespace
-只有一个 owner。
+`member.tls` 配置与对端信任，单凭地址不会启用 TLS。内置默认配置只有一个成员，各业务范围只有一个服务候选；独立配置外部数据库。
 
 ```yaml
 member:
@@ -785,7 +774,7 @@ member:
 membership:
   active: 1
   # next: 2                    # joint 阶段目标版本
-  # old_grace: 1               # cutover 后保留旧成员作为 read-only shardkv 证书/快照来源
+  # old_grace: 1               # cutover 后保留旧 peer，以承接其已有 stream 的命令
   reload_ready_timeout: 10s
   versions:
     - version: 1
@@ -807,8 +796,9 @@ node_link:
 route_link:
   park_timeout: 30s
 
-node_list:
-  watch_retention: 10000
+foundationdb:
+  cluster_file: /etc/foundationdb/fdb.cluster
+  prefix: "kuasar-sandbox/cluster/"
 
 placer_link:
   placer_label: placer.default
@@ -824,7 +814,6 @@ placer_link:
 /node-link/*
 /route-link/*
 /placer-link/*
-/internal/registry-member/shardkv
 /internal/node-owner
 /internal/node-link/relay
 /internal/memberlist/packet
@@ -834,12 +823,36 @@ placer_link:
 registry 对外地址写在 `membership.versions[].members[].advertise`;
 redirect-capable node 使用 `membership.versions[].members[].node_advertise`。
 
+
+<a id="native-build-and-runtime"></a>
+
+### 原生构建、运行包与验证
+
+只有 `cluster-ctl` 要求 CGO 与 `fdb` tag；`node-ctl`、`node-stub-ctl`、`e2b-key-ctl` 保持 CGO=0。构建使用对应架构的 Linux x86_64 / aarch64 主机，提供 Go、C compiler、Python 3.9+ 与 `readelf`；不安装 Debian 系统包，也不要求 `dpkg-deb`。
+
+```sh
+make build-core
+make build-cluster-native
+make test-core
+python3 -B scripts/with-test-fdb.py -- make test-cluster-native
+```
+
+`make build` 组合两条构建路径。Native target 只取得 [cluster-native-lock.json](../scripts/cluster-native-lock.json) 中 SHA256 锁定的官方 7.3.77 client/SDK 与 Debian runtime，检查 ELF 依赖和符号版本闭包，再通过包内 loader 执行真实命令的 `version`。SDK 来自官方 clients 包，因为该版本独立 headers tar 缺少必需头文件。Native 测试覆盖 driver、command 装配，以及同一套 cluster-stub 业务测试在真实、显式选择的测试数据库上的行为。`with-test-fdb.py` 只启动和清理自己的隔离本地测试库；也可显式设置 `FDB_CLUSTER_FILE` 指向已有测试库。缺少变量会报错，不会跳过 native gate。
+
+发行包包含 `bin/cluster-ctl`、`bin/run-cluster-ctl`、`lib/cluster-ctl/` 下固定运行库，以及 `share/licenses/orchestrator/native/` 下许可证和来源锁。Launcher 以显式 library path 调用包内 loader；应完整安装 archive 并通过 `run-cluster-ctl` 启动角色。配套 systemd unit 使用 `/usr/bin/run-cluster-ctl`。官方 x86_64 client 要求 AVX，此要求独立于 Go 的 `GOAMD64`。ARM 包使用原生 ARM 运行库，不带模拟器专用设置。
+
+Registry 需要可读取的外部 FoundationDB cluster file，并与 peer 使用相同 prefix。Coordinator 文件自动更新是否需要写权限，应按数据库部署配置。Router/Placer 共享 native executable，但不打开 Registry 存储。此 archive 提供 client runtime，不安装生产数据库 server；FoundationDB 的冗余、存储介质与运维恢复由独立数据库部署负责。
+
+发行校验继续保留 source revision、选定依赖及 Go module 检查。只有 cluster-ctl 允许 CGO=1 并要求 `fdb` tag，其他 payload 和 trusted archive validator 保持 CGO=0。Native library 名称、字节、loader、license 与 provenance 都受固定 allowlist 约束。Validate 不执行异架构 payload，不下载依赖。`make test-release` 包含实际 native linkage/launcher 与打包负例，使用匹配当前主机架构的 fixture。
+
+Prepared product 的 cluster 用例通过[声明式 helper 清单](../release/helper-inputs.json)取得固定的 `fdbserver-test` 和 `fdbcli-test`。Source-build 阶段验证官方包摘要和两个 ELF 对 product runtime 的依赖闭合。每个用例启动自己独立的 single-SSD 数据库、connection file 和 prefix，给该用例全部 Registry 写入相同配置，并清理自己启动的进程。Prepared 运行阶段只使用交付的 launcher、libraries 和 helpers，不编译、不下载依赖，也不选择机器上的默认数据库。该隔离 fixture 验证部署装配，不代表生产数据库的冗余配置。
+
 <a id="router-command"></a>
 
 ### Router 命令
 
 ```text
-cluster-ctl router --config /etc/cluster-ctl/router.yaml
+run-cluster-ctl router --config /etc/cluster-ctl/router.yaml
 ```
 
 <a id="router-configuration"></a>
@@ -886,7 +899,7 @@ Router→node 的 `APIEndpoint` 和 `DataEndpoint` 固定使用明文 HTTP/CONNE
 ### Placer 命令
 
 ```text
-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
+run-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
 standalone placer 必须配置至少一个 `import_groups` source。嵌入式或生产集成可以直接注入自定义
@@ -968,7 +981,7 @@ registry 侧 `placer_link.placer_label` 指定 placer memberlist 域;`placer_lin
 `cluster-ctl registry/router/placer` 编排。node-link 复用 routesync 的帧化 JSON over h2c 引擎
 (node-proxy.md [routesync 与共享路由视图](node-proxy_zh.md#route-synchronization)),但角色相反:node 是本节点路由 / 构建权威,registry 是订阅者和命令下发方.
 
-本节只讲 node 侧行为。registry 的 owner 选择、redirect/relay、shardkv 复制和 membership 变更由
+本节只讲 node 侧行为。registry 的 owner 选择、redirect/relay、类型化元数据事务和 membership 变更由
 [cluster_zh.md](cluster_zh.md) 定义。
 
 ```text
@@ -989,7 +1002,7 @@ registry node_link owner or relay holder
 
 <a id="membership-and-state"></a>
 
-## Membership、复制状态与所有权
+## Membership、持久状态与所有权
 
 以下是 Registry 一致性与角色成员关系契约，不增加公共 Sandbox API。
 
@@ -1001,30 +1014,15 @@ registry node_link owner or relay holder
 
 #### 版本化成员表
 
-registry 成员表只来自运维分发的配置文件。每个版本有稳定 label:
+Registry 成员表来自运维分发的配置文件，每个版本具有稳定 label：`registry.<version>.<sha256(sort(member_ids))>`。这是服务成员表；FoundationDB 独立维护数据库拓扑。
 
-```text
-registry.<version>.<sha256(sort(member_ids))>
-```
+| 视图 | 业务用途 |
+|---|---|
+| `active` | 当前 route、node、node_list、placer_link 服务候选 |
+| `next` | 受控连接转换期间预备的候选视图 |
+| `old_grace` | 为已有 node stream 与转发 owner RPC 保留的旧 peer，不参与新连接 owner 选择 |
 
-registry 可同时持有三个视图:
-
-- `active`:客户端定位 route/node/node_list/placer_link owner 的版本。
-- `next`:joint 阶段的目标版本。写入必须同时满足 active quorum 和 next quorum。
-- `old_grace`:cutover 后保留的旧版本。旧成员可作为 peer/node_link 接入或 node-owner RPC 目标,
-  并作为 shardkv read-only set 提供旧 head 的 snapshot/certificate;但不参与写 owner set,也不能用旧视图提交写入。
-
-```text
-stable(v1)
-  -> load_config(active=v1,next=v2)
-  -> wait_memberlist_ready(v2)
-  -> joint owner set: owners(v1) ∪ owners(v2)
-  -> cutover active=v2, old_grace=v1
-  -> retire(v1)
-```
-
-reload 只能从 stable 加载/取消 `next`,或从已配置的 `next` 切换为新的 `active`。不能从
-stable(v1) 直接跳到 stable(v2)。
+Reload 可从 stable 加载/取消 `next`，再将已配置的 `next` 晋升为 `active` 并保留 `old_grace`；不能从 stable v1 直接跳到 stable v2。转换仍受 memberlist readiness 约束。所有视图使用同一元数据数据库，转换不包含 Registry 存储 quorum 或 snapshot transfer 阶段。
 
 <a id="registry-memberlist-boundaries"></a>
 
@@ -1077,370 +1075,105 @@ Place / verify-key 候选。
 
 ### Registry 状态模型
 
+Registry 将执行元数据持久化到独立的 FoundationDB 7.3.77 数据库。同一集群的所有 Registry 进程使用相同的 `foundationdb.cluster_file` 与 `foundationdb.prefix`。FoundationDB 负责存储复制、事务提交、冲突检测和持久恢复；Registry 负责业务状态转换与实际 node 连接。
+
 <a id="registry-data-hierarchy"></a>
 
-#### 数据层级
+#### 分层目标与最小接口
 
-```text
-namespace
-  └── shardKey
-        └── recordSet
-              ├── commit Rev
-              ├── recordKey -> value
-              └── tombstone(recordKey)
-```
+| 层次 | 目标 | 对调用方的最小接口 |
+|---|---|---|
+| Router / Placer | 鉴权转发，或基于已校验目录提出 placement | 既有 route_link / placer_link / node_list HTTP 契约 |
+| Registry 业务服务 | 校验生命周期与归属、下发命令、处理节点报告 | Route、Build、Node、Ownership、KeyPair、Directory、ImportSource 类型化能力 |
+| `internal/cluster/metadata` | 定义中立记录、完整版本、领域结果与有界列表 | `Versioned[T]`、`Version`、领域 repository 方法、`Invalidation`、`ObservationAdmission` |
+| `internal/observebudget` | 在创建 native 观察前限制资源，管理顺序重臂 | 预留和释放；由共享数据库 owner 提供此能力 |
+| `internal/fdbdriver` | 通过官方 client 实现原子元数据操作 | 只返回类型化 repository；数据库、事务句柄和物理 key 保持私有 |
+| FoundationDB | 持久事务与复制 | 仅供 native driver 使用的官方 Go/C API |
 
-- `namespace`:逻辑域,例如 `route_link`、`node_link`。
-- `shardKey`:成员分片键,例如 group 或 node_id。
-- `recordSet`:数据复制、Rev 和 WATCH 域。
-- `recordKey`:recordSet 内的记录键。
-- `Rev`:recordSet commit version。record 的 `rev` 是该 record 最后修改时的 recordSet Rev。
-
-shard 是成员分片单位;recordSet 是数据复制单位。Rev 不放在 shard 层,否则会把一个 shard 内原本可独立
-演进的 profile/sandbox/build/key 等数据域强行绑定。
+仓库保持单一 Go module。`metadata`、Registry、Router、Placer 与业务 membership 都是纯 Go。native driver 与 `cmd/cluster-ctl` 全部源文件要求 `fdb && cgo`；仅 command 的 Registry 装配打开数据库。不提供公开 generic KV/事务闭包、进程内版本 handle、生产内存 backend 或旧复制回退。接口定义见 [metadata/repositories.go](../internal/cluster/metadata/repositories.go)。
 
 <a id="registry-owner-resolution"></a>
 
-#### owner 解析
+#### 业务 owner 与存储位置
 
-```text
-(namespace, shardKey)
-        │
-        ▼
-ShardResolver
-        │  LocateN(shardKey, versioned members, owner_count)
-        ▼
-owner set
-   ┌──────────┬──────────┬──────────┐
-   ▼          ▼          ▼
- registry A  registry B  registry C
- full copy   full copy   full copy
-```
+`membership.owners.route_link/node_link/placer_link/node_list` 控制 Registry 服务候选与 node 连接 affinity。`LocateN` 和 Placer Maglev 仍承担业务路由职责，不选择 FoundationDB 存储副本，也不定义数据库复制因子。`ConnectionOwners` 只暴露本进程成员 ID 与某个 NodeID 的有序连接候选，不包含存储 API。
 
-`membership.owners.route_link/node_link/placer_link/node_list` 分别控制各 namespace 的 owner 数量。
-owner count 是 registry 内部复制因子。`placer_link.placer_replica_count` 只控制 registry 调 ready placer
-的 failover 候选数,不是 `placer_link` namespace 的 owner count。
+Registry 可通过共享数据库读写获授权的记录，无需向 peer 获取本地副本。`link_owner` 仍表示实际持有 node stream 的进程，命令仍经 node-owner RPC 抵达它。`placer_link.placer_replica_count` 继续限定 ready placer 的 failover 候选数。
 
 <a id="registry-namespace-schema"></a>
 
-#### namespace schema
+#### 类型化记录范围
 
-| namespace | shard key | recordSet | record key | 内容 |
-|---|---|---|---|---|
-| `route_link` | group | `sandbox` | route_key | route 记录 |
-| `route_link` | group | `build` | build_id | build 执行态 |
-| `node_link` | node_id | `profile` | `profile` | node profile、labels、liveness、link_owner、低频容量 |
-| `node_link` | node_id | `sandbox` | node_sandbox_id | node 维度 sandbox 归属表,值含 sandbox_id + sandbox_generation + group + route_key + profile + api_secret_fingerprint |
-| `node_link` | node_id | `build` | build_id | node 维度 build 归属表,值含 group |
-| `node_link` | node_id | `key_pair` | api_secret_fingerprint | node APISecret+ManifestKey pair cache |
-| `node_list` | `node_list` | `nodes` | node_id | 低频节点目录和 WATCH_LIST |
-| `placer_link` | `import/source/<source_id>` | `import` | `state` | import source lease/cursor |
+| 能力 | 身份 | 持久内容及原子边界 |
+|---|---|---|
+| Route | `(group, route_key)` | 稳定 sandbox 身份与当前 node generation；创建 intent 与精确 node ownership 同事务提交 |
+| Build | `(group, build_id)` | 注册 intent、已接受的 node 投影、template index 与精确 node ownership；完成操作与最新合法投影合并 |
+| Node | `node_id` | profile、不可变注册 fence、reaping claim 与低频目录投影 |
+| Ownership | `(node_id, node_sandbox_id)` 或 `(node_id, build_id)` | 用于授权报告与清理的精确反向引用 |
+| KeyPair | `(node_id, api_secret_fingerprint)` | desired pair、租约和匹配的 ACK；替换会使旧 ACK 失效 |
+| Directory | 固定 256 个低频节点投影 bucket | 分页校验后的完整 view 与 bucket change token |
+| ImportSource | `source_id` | 租约 owner、run ID、业务 term 与成功 page 的 cursor |
 
-当前 recordSet 集合由固定 schema 定义。如果未来某 namespace 引入动态 recordSet 名称,recordSet 目录也必须
-作为同 shard 下的保留 recordSet 维护,并遵守同一套 CAS/WATCH 规则。
+点操作只访问一个业务身份。列表接口接收范围限定的 opaque cursor 与有界 page size，不在每次写入时复制整个 group 或 node 的记录集合。较大的 payload 由 driver 在同一事务内分块，并受记录及事务大小限制；分块不会取消 FoundationDB 的事务大小和存活时间限制。列表 cursor 是某个类型化范围内的续读位置，不是可长期持有的数据库快照。
 
 <a id="registry-readwrite-protocol"></a>
 
-#### 读写协议
+#### 事务、版本与结果分类
 
-shardkv 要解决的问题是:registry 不引入每 group/node 的 primary,但任意接入成员都能在目标 shard owner set
-内完成 CAS、读取和 WATCH;同时在单成员故障、membership joint view、局部 repair、tombstone 回收时仍保持
-recordSet committed history 单调一致。
+存储版本为记录自身的完整 **10-byte committed versionstamp**：8-byte commit version 加 2-byte transaction batch order。JSON/text 固定为 20 个十六进制字符，例如 `0102030405060708fffe`。末尾两字节必须完整穿过持久化、DTO 与缓存比较。该版本不是时间戳，也不是 node 生命周期的 `state_version`；import-source term 与 sandbox generation 保留各自业务语义。
 
-解决思路是把“成员分片”和“数据复制”分开:
+CAS 对完整十字节做相等判断。缺失记录用零值表达 expected-absence；live Route 与目录项必须携带非零 committed stamp，错误编码和未提交占位版本被拒绝。同内容记录删除后重建也不会复用旧 expected version。返回的版本属于记录提交，不取读取事务的 read version。见 [metadata/version.go](../internal/cluster/metadata/version.go)。
 
-- `shardKey` 只决定 owner set。
-- `recordSet` 是 CAS、Rev、WATCH 和提交证书的复制单元。
-- 写入使用唯一 ballot `(round, writer_id)` 和两阶段 prepare/accept。
-- accepted state 先不可见;只有被 quorum 选择出的 committed snapshot 才能安装到 committed view。
-- committed snapshot 携带 `CommitCertificate`,让后续读写即使只看到一个最新副本也能证明该 Rev 已被 quorum
-  决定。
+同一数据库历史、同一 Route 记录还可按完整字节序比较。Router 在较新 cache entry 仍驻留时拒绝迟到的旧响应，并拒绝相同版本却指向不同 node target 的响应。相同版本、相同 target 可刷新 endpoint，因为 node profile 可以独立变化。Eviction/TTL 会移除该条目的版本屏障，Router 不保存无界历史水位。恢复或新数据库历史不能与旧进程缓存混合排序。
 
-shardkv 在每个 shard view 内区分两个集合:
-
-- `WriteSets`:允许 prepare/accept/install 的集合。stable 为 active;joint 为 active+next;
-  cutover old_grace 阶段为 active。
-- `ReadSets`:允许 read/snapshot/certificate 验证的集合。stable 为 active;joint 为 active+next;
-  cutover old_grace 阶段为 active+old_grace。
-
-stable 模式提交条件是当前 `WriteSets` quorum;joint 模式提交条件是 active quorum + next quorum。
-old_grace 只参与读取和证明旧 head,不参与新写提交。
-
-```text
-coordinator
-   │ prepare(ballot)
-   ├──────────────► owner A
-   ├──────────────► owner B
-   └──────────────► owner C
-          quorum promise
-   │ fetch committed snapshot from read members
-   │ install current head on write owners
-   │ accept(record, new_rev)
-   ├──────────────► owner A
-   ├──────────────► owner B
-   └──────────────► owner C
-          quorum accepted
-   │ install(snapshot, commit_certificate)
-   ├──────────────► owner A
-   ├──────────────► owner B
-   └──────────────► owner C
-          quorum installed, laggards repaired best-effort
-```
+driver 区分 `Conflict`、`Unavailable`、`Unknown` 和容量错误。只有被 native client 明确证明未提交的错误，才可在当前 context 和原始业务前提下重试。无法证明提交结果时返回 `Unknown`；超时不等于回滚。调用方应读取持久状态协调，不能因 commit reply 或 command ACK 丢失而盲目重投节点副作用。
 
 <a id="registry-invariants"></a>
 
-##### 不变量
+#### 生命周期与归属不变量
 
-shardkv 的正确性建立在以下不变量上:
+- Route intent 与精确 sandbox ownership 在 dispatch 前原子提交。Rollback 校验本次完整版本和身份，迟到补偿不能擦除较新 generation。
+- Build 注册 intent 与 node reference 同事务提交。Acceptance 与合法节点报告在事务内合并，保留已经推进的 ready/error 投影。明确拒绝只清理匹配 intent 与归属；ambiguous dispatch 保持原绑定。
+- Register 返回不可变 node fence。Heartbeat/profile update 必须携带原始 fence；读取较新 profile 不会授权旧 stream 接管新注册。
+- Reaping 原子 claim 预期的过期 profile，并撤回其目录项。每一页清理都验证 claim、记录版本和精确归属；符合条件的引用清空后才能 finalize，恢复执行的旧 worker 不能删除新注册数据。
+- Registry 启动时及每个 `node_dead_after` 周期恢复持久 claim，并通过有界分页发现过期 profile，补偿 claim 前因进程退出而丢失的断连定时器。连接仍活跃或探测结果不确定时不发起新 claim；发现候选后的心跳和重新注册会使其原始版本失效。网络不可达不构成节点已断连的证明，后续继续重试；配置中已无 owner 时沿用既有 `NodeOwner` 契约。
+- Key-pair ACK 必须匹配完整 current desired material 与 lease。过期、替换与迟到 ACK 不能确认另一组凭据。
+- Import-source checkpoint 验证 owner、run ID、term 和 lease，page 全部成功后才前移 cursor。
 
-1. **复制单元是 recordSet**。同一 `(namespace, shardKey, recordSet)` 下只有一条单调递增的 `Rev`
-   序列。一次 commit 最多改变一个 `recordKey`,但它占用整个 recordSet 的下一个 `Rev`。
-2. **成员分片和数据复制分离**。`shardKey` 只决定 owner set;`recordSet` 决定 Rev、CAS 和 WATCH 域。
-   同一 shard 下不同 recordSet 的 Rev 独立递增。
-3. **ballot 全局作用于 recordSet**。`prepare` 会提升 recordSet 级 promise。这样不同 key 的并发写也会
-   在同一 recordSet Rev 序列上定序,不会各自分配相同 `Rev+1`。
-4. **accept 不可见**。owner 收到 `accept` 后只保存 pending accepted record,不写入 committed records,
-   不触发 WATCH,不让普通读返回。只有带提交证书的 install 或 quorum 可验证的 snapshot 才进入
-   committed view。
-5. **每个 owner 持有完整 committed view**。ready owner 可以在本地提供 Snapshot/WATCH;未 ready 的本地
-   view 只能参与 quorum 协议,不能作为完整本地读源。
-
-系统假设 registry 成员是 crash/fail-stop 模型,不会伪造对端响应;通信可能超时、断开、重复,但请求体不被
-拜占庭篡改。`UpdatedAt` 只服务 TTL/GC,不参与一致性排序。
-
-<a id="registry-commit-certificates"></a>
-
-##### 提交证书
-
-accept quorum 已经决定了某个 `Rev` 的值,但只把 accepted state 留在内存里会带来一个可用性问题:如果
-随后一个 accepted 成员故障,剩余 quorum 可能只看到一个最新副本和一个旧副本,无法通过“相同 snapshot
-达到 quorum”恢复最新提交。
-
-因此 coordinator 在 accept quorum 后生成 `CommitCertificate`:
-
-```text
-CommitCertificate {
-  rev      = committed recordSet Rev
-  digest   = hash(rev + canonical live records)
-  ballot   = accepted ballot
-  labels   = membership labels whose owner set accepted quorum
-  members  = accept quorum member ids
-}
-```
-
-`canonical live records` 只包含未删除记录。删除操作仍推进 recordSet `Rev`,因此 delete commit 会改变
-`digest`;但过期 tombstone 是否仍被某个 owner 本地保留,不影响该 `Rev` 的逻辑 committed state。
-
-install 把 full committed snapshot 和 certificate 一起写到 owner。之后 quorum 读 snapshot 时,可用两种方式
-确认 committed head:
-
-```text
-case A: same (rev,digest) snapshot is returned by quorum
-case B: one snapshot carries valid certificate, and certificate.members proves one ReadSet quorum
-```
-
-`case B` 允许“m1/m2 已提交, m3 当时故障;随后 m1 故障, m2+m3 仍可继续写”:m2 携带的 certificate 证明
-`Rev` 已被 m1/m2 accept quorum 决定,coordinator 可把该 snapshot repair 到 m3 后继续分配 `Rev+1`。
-
-`labels` 解决 membership 变更阶段的旧 head 识别问题。V1 稳定阶段提交的 certificate 带 `labels=[V1]`。
-进入 V1+V2 joint 后,第一次触达某个冷 recordSet 时,V2 owner 可能还没有该 head;只要某个 snapshot 携带的
-certificate 对 V1 owner set 满足 quorum,它仍然是已提交 head。coordinator 先把这个 head install/repair 到
-joint owner set,再执行下一次写。joint 阶段产生的新 certificate 会同时带 V1/V2 labels,因为新写必须满足
-old quorum + new quorum。
-
-cutover 到 `active=V2,old_grace=V1` 后,V1 不再进入 `WriteSets`,但仍进入 `ReadSets`。冷 recordSet 第一次
-由 V2 访问时,V1 certificate 仍可证明旧 head;registry 会把旧 head repair 到 V2 write owners 后继续读写。
-一旦 V2 write owners 已持有带 certificate 的 committed head,后续读写只要求 V2 write quorum 在线;不再要求
-V1 old_grace quorum 同时在线。
-只有 `old_grace` 退出后,V1 certificate 才不再作为当前 shard view 的证明来源。切换期间仍禁止绕过 joint view
-的 old-only 写和 new-only 写并发执行。
-
-如果 coordinator 在 accept quorum 之后、install quorum 之前失败,下一次写的 prepare 会读到 pending accepted
-record。新 coordinator 必须先用新 ballot 完成该 pending record 并安装 certificate,再处理自己的写。对调用方而言,
-这种阶段性失败的 CAS 返回 `ErrQuorum` 时结果是 unknown:调用方必须按 `(recordKey, expectRev)` 重新读/重试,
-不能假设该写一定未发生。
-
-install 还必须遵守本地单调规则:
-
-- 本地 view 已持有提交证书时,不能被更低 `Rev` 覆盖。
-- 同一 `Rev` 下,只有 canonical digest 相同的 snapshot 才能互相替换;这用于 tombstone 保留/压缩形态转换。
-- 同一 `Rev` 下 canonical digest 不同,代表两个不同 committed histories,必须拒绝并让上层重试/报冲突。
-- 无证书本地 view 只视为待修复缓存,可被 quorum 选择出的 committed snapshot 覆盖。
-
-<a id="registry-write-correctness"></a>
-
-##### 写正确性
-
-一次成功 CAS 的线性化点是 accept quorum 决定该 `Rev` 的时刻;成功返回则额外要求 install quorum 已保存
-committed snapshot/certificate,保证后续即使另一个成员故障也能恢复该提交。
-
-为什么两个不同值不能同时以同一 Rev 提交:
-
-- 每次写使用唯一 ballot `(round, writer_id)`。
-- 任意两个 quorum 在同一个 member set 内相交;joint view 要求 old quorum 和 new quorum 都满足,因此与
-  old-only / new-only 操作也保持交集。membership 变更期间不能允许绕过 joint view 的 old-only 写和
-  new-only 写并发执行。
-- 相交 owner 在 prepare 后会拒绝更低 ballot 的 accept。
-- 如果相交 owner 已保存 pending accepted record,后续更高 ballot 的 writer 会在 prepare 响应中看到它,
-  并先完成该 record。新写不会跳过已 accepted 的 `head+1`。
-- owner 拒绝 `rec.rev > local_rev+1` 的 accept,防止 coordinator 跳过中间 Rev。
-
-因此 recordSet 的 committed history 是一条线性序列。CAS 的 `expectRev` 匹配的是目标 record 的最后修改
-Rev;当目标 key 未变化而其他 key 推进了 recordSet Rev 时,该 key 的 `expectRev` 不会被无关写破坏。
-
-<a id="registry-read-correctness"></a>
-
-##### 读正确性
-
-点读默认走 quorum,但不必每次都拉取 full snapshot:
-
-```text
-read(key) from all ReadSet members
-  ├─ if same record version is visible on WriteSet quorum: return it and repair write laggards
-  ├─ if ReadSet quorum reports not found and no ReadSet member reports a record: return not found
-  └─ otherwise fetch committed snapshot, choose committed head, install/repair, then read key
-```
-
-返回某个 record version 的条件是该版本本身在 quorum 中可见。若该 key 在更高 Rev 被修改/删除,成功返回的
-写已把新版本安装到 `WriteSets` quorum;读到的 `ReadSets` 与当前/旧提交证书集合相交,不会把旧版本误判为
-quorum-visible。not found 也必须由 `ReadSets` quorum 证明;old_grace 阶段不能只凭 active 空副本判定旧
-recordSet 不存在。若存在单副本高版本、或不同副本冲突,点读必须退回 committed snapshot 选择逻辑。
-
-Snapshot/EnsureReady 总是先选择 committed head,再 install 到本地并标记 `(label, Rev)` ready。
-若本地 recordSet 视图已经 ready,调用方可使用 `ReadOptions`:
-
-| 选项 | 行为 |
-|---|---|
-| `ReadDefault` | quorum 读 |
-| `ReadDefault + MinRev` | 本地 ready view 的 Rev 满足时直接读本地,否则回退 quorum |
-| `ReadLocal` | 只读本地 ready view;未 ready 返回 local-view-behind |
-| `ReadLocal + MinRev` | 本地 ready view 的 Rev 不足时返回 local-view-behind |
-
-本地完整视图只由 `EnsureReady` / `Snapshot` / `Watch` 建立。普通 accept 只保存 pending accepted;
-read-repair 可安装单条 committed record,但不会把该 recordSet 标记为完整 ready。
+这些约束由领域 repository 方法表达，消费者不能把原子操作拆成彼此独立的 generic write。
 
 <a id="registry-watch-correctness"></a>
+<a id="registry-watch"></a>
 
-##### WATCH 正确性
+#### Read/observe 与目录发布
 
-WATCH 只基于 committed records:
+`ReadAndObserveRoute` 在同一事务中读取 current Route 并安装 native observation。返回的 observation 是一次性“需要重读”通知，不是保留的事件流或转换计数。Registry Reserve leader 在业务 mutation 前预留观察容量，顺序重臂复用此预留；setup、active future 与取消后尚未回收的资源都计入同一 database owner 的预算。Catalog observation 共享此预算并保留目录容量，不能再建立另一个独立 Registry limiter 掩盖或超出 native 使用量。
 
-- accept pending 不入 watch log,也不会唤醒订阅者。
-- 连续单条 commit 以 put/delete delta 追加 watch log。
-- install snapshot 若不是本地 `rev+1` 的单条提交,会 reset 订阅者,要求消费者重新接收完整 snapshot。
-- token 包含 epoch、membership label、recordSet 身份和 recordSet Rev。epoch/label/recordSet 不匹配或 log 被压缩时,消费者必须
-  重新订阅 reset。
+目录保存 256 个 bucket token。`Load` 分页读取，校验 token，重读发生变化的 bucket，完整检查后才发布 view。`Observe` 先比较传入 token 再安装 watch；load 到 observe 之间的变化会立即触发 invalidation，避免漏唤醒。这是可供 placement 使用的已检查 view，不是长期持有的 MVCC 读取事务。
 
-因此 WATCH 是 committed view 的增量缓存,不是复制协议本身。复制和修复仍由 quorum read/CAS/install 保证。
+Registry 将其适配到既有 node_list 协议：reset、初始条目、bookmark，然后输出后续已检查 view 的差异。Token 是 bucket 版本的 opaque 编码。每次重连都重新执行 reset/bookmark，旧 token 不意味着可回放保留的事件历史。慢订阅者或错误断线后重新建立完整 view。Router 仍不订阅 Route 或 node_list。
 
 <a id="registry-efficiency-boundaries"></a>
 
-##### 效率边界
+#### 规模与时延边界
 
-当前实现优先优化“海量 shard、每个 recordSet 小到中等规模”的场景:
+千万级 sandbox 的设计目标不等于为每个 sandbox 分配 watch、Registry 副本或 cache entry。Router 热路径使用有界 cache 并直连 node；元数据写入只访问受影响的身份、精确索引与归属；列表及 reaping 使用分页。高频 node usage 不进入低频目录。
 
-| 操作 | RPC 轮次 | 载荷 | 说明 |
-|---|---:|---|---|
-| 点读命中 quorum-visible record | 1 | O(1) record | 热路径;可顺带 repair laggard |
-| 点读全 quorum miss | 1 | O(1) record | 没有 ReadSet 成员返回该 key 时直接 not found |
-| 点读冲突/落后 | read + snapshot/install | O(recordSet) snapshot | 用于确认 committed head |
-| CAS | prepare + snapshot + head install + accept + commit install | snapshot/install 为 O(recordSet) | 冷路径；每阶段并行调用 owner set |
-| Snapshot/Watch 初始 | snapshot + install | O(recordSet) | 建立本地完整 ready view |
-| WATCH delta | 0 额外 RPC | O(1) event | 仅本地 committed install 后广播 |
-
-`N=3` 时一次无冲突稳定写通常经过 5 个顺序阶段：prepare、snapshot read、当前 head install、
-accept、新 commit install；各阶段内并行调用 owner。Reserve/create/build/import lease 都是冷路径,相对沙箱启动和构建
-耗时可接受;router 数据面热路径不写 shardkv。成本主要随单个 recordSet 的记录数增长,不随全局 group/node
-数量增长,因为 registry 不跨 shard 扫描。
-
-设计约束:
-
-- recordSet 不应承载无界大表。group 下 sandbox/build、node 下 sandbox/build/key、node_list 低频目录都应
-  保持可分页/可淘汰/可按事实源重投影。
-- 如果未来某 recordSet 需要高频大表写,应把提交证书改成基于前一 digest 的 delta certificate,或拆分
-  recordSet;不能继续依赖 full snapshot install。
-- member readiness 只做 fail-fast 和 liveness,不改变 quorum 计算;owner count=3 时运行期只承诺逻辑分片视角
-  的单成员故障容忍。
-
-<a id="registry-watch"></a>
-
-#### WATCH
-
-WATCH 是 recordSet 层能力。初始帧是 reset/snapshot，随后 bookmark 表示初始视图完整，再发送 live delta。
-
-```text
-watch(from token)
-  -> reset(records, rev, token)
-  -> bookmark(rev, token)
-  -> put/delete(..., rev, token)
-```
-
-watch token 编码本地 epoch、shard view label、recordSet 身份和 Rev。epoch/label/recordSet 不匹配或 changelog 已压缩时,消费者必须
-重新订阅并获取 reset + full snapshot。
-
-route owner 内部也使用 shardkv watch log 唤醒本进程 waiter,但这不是 router watch。router 不订阅 route。
+持久事务时延仍在冷 Reserve/注册路径中。性能比较必须对齐 workload、并发、数据量及持久化条件；旧内存/no-WAL 基线不能作为相同持久性下的时延承诺。接口、native ABI 与正确性测试通过，不等于已经达到千万对象容量或 p99 SLO；这些需要交付负载实测。
 
 <a id="registry-gc"></a>
 
-#### GC
+#### 删除与清理
 
-GC 要解决的是本地存储和 WATCH reset snapshot 膨胀,不是数据迁移。它必须保持两个边界:
-
-- 不跨 shard 枚举。
-- 不改变 recordSet committed history。
-
-tombstone 是 delete 后的保留记录,用于短期 `GetRecord`、WATCH reset 和调试;逻辑读写只关心“该 key 当前是否
-存在”。因此 tombstone 保留期到期后可以只在本地删除。提交证书的 canonical digest 排除 deleted records,
-所以同一 `Rev` 下“仍保留 tombstone”和“已压缩 tombstone”的 owner 是等价 committed snapshot,不会产生
-同 Rev 冲突。
-
-compactor 的执行规则:
-
-- tombstone 保留期到期且 owner 成员 ready 时,删除本地 tombstone。
-- compact 前先通过 recordSet 的 committed-head 选择修复本地视图,避免在落后副本上回收。
-- 非 pinned namespace 的空闲本地 shard 到期后释放。
-
-GC 不触发数据迁移。活跃记录仍由对应 namespace 的事实源和同 shard 读写触达。
+FoundationDB 负责物理 value/version 回收。Registry 不执行 peer snapshot repair 或本地副本 tombstone compaction。领域删除使用完整 expected version 与精确归属。业务记录是否可删除，由 node terminal retention 与有界、claim-fenced reaping 决定；存储清理不新增生命周期 TTL。
 
 <a id="registry-membership-changes"></a>
 
 ### Membership 变更
 
-对同一个 shard key:
+既有 active/next/old_grace 顺序控制服务发现、node-link affinity 和 peer 可达性。Active/next 重叠期间，client 与 `ConnectionOwners` 使用配置的候选视图；cutover 后 old_grace peer 仍可接收其已经持有 stream 的命令。新连接使用当前 owner 候选。
 
-```text
-oldOwners   = LocateN(shardKey, V1)
-newOwners   = LocateN(shardKey, V2)
-jointOwners = oldOwners ∪ newOwners
-
-write/read quorum = quorum(oldOwners) + quorum(newOwners)
-repair            = best-effort to jointOwners
-```
-
-示例:
-
-```text
-V1 owners for group G: A,B,C
-V2 owners for group G: B,D,E
-
-joint write sets: A,B,C + B,D,E
-commit requires: quorum(A,B,C) + quorum(B,D,E)
-```
-
-普通并集 majority 不安全,因为它可能读不到只落在旧 quorum 的已提交值。重叠成员可同时计入 old quorum
-和 new quorum。
-
-membership 切换不是全局迁移任务。registry 不扫描所有 group/node。数据通过以下事实源自然进入新 owner:
-
-- 活动 node 连接、心跳、sandbox/build 事件持续写入当前 node_link owner set。
-- node owner 按当前 membership 持续把低频 profile 投影到 node_list。
-- group 请求、node 上报、group-scoped list/export 触达对应 route_link recordSet 时做 catch-up/read-repair；这不增加 operator 执行态 export/import，边界见 [状态所有权与灾备边界](#registry-state-ownership-and-disaster-recovery-boundaries)。
-- placer import/source lease、cursor、selector patch 通过 `placer_link` 当前 owner set 维护。
-
-首次触达旧 recordSet 时,旧 membership certificate 可证明旧 head,随后由同一次读写 repair 到当前 `WriteSets`。
-因此 joint/cutover 变更不需要跨 shard 扫描。cutover 后的 `old_grace` 继续作为 `ReadSets` 的 read-only 来源,
-保证冷 recordSet 不会被 active 空副本误判为不存在。但 cutover 必须是受控动作:在 active/next joint 期间,
-所有新写都必须使用 joint view;不能让部分成员提前只按 next view 写,否则不同 membership quorum 之间不再有协议保证。
+此过程不搬迁元数据，不建立数据库写 quorum，也不复制 group/node snapshot。所有成员始终访问同一 FoundationDB 数据库与 prefix。FoundationDB 拓扑、冗余与 backup/restore 独立于 Registry membership 管理。配置 reload 仍要求受控 active → next → active 转换，以保持连接路由一致。
 
 <a id="router-membership"></a>
 
@@ -1505,43 +1238,25 @@ registry 只根据 memberlist meta 选择 ready placer:
 
 <a id="registry-connection-redirect-and-relay"></a>
 
-#### 接入、redirect 与 relay
+#### 连接、redirect 与 relay
 
-node 可以连接任意 registry 成员。接入成员先按 `LocateN(node_id,N)` 找到 node owner set。
+Node 可接入任一 Registry 成员。接入成员通过 `ConnectionOwners` 在配置视图上按 `LocateN(node_id, N)` 获得有序的业务连接候选。
 
-```text
-node X connects registry A
+| 接入成员 | 处理 |
+|---|---|
+| 自身是连接候选 | 接收 stream，并通过类型化 Node repository 持久化 registration/profile |
+| 自身不是候选，且 node 支持 redirect | 返回配置的候选 endpoint，由 node 重连 |
+| 自身不是候选，且没有可用 redirect | 按候选顺序逐个 relay，直到某个 owner 接受 |
 
-hash(node X) -> node owners = B,C,D
+Profile 的 `link_owner` 标识实际持有 h2 stream 的 Registry 进程，route-owner 的 create/connect/delete/build/key 命令仍通过 node-owner RPC 到达它。应用访问的是 FoundationDB 中同一份持久元数据；接收 stream 不启动 peer 元数据复制。
 
-case 1: A ∈ owners
-node X ─────► A
-              │ subscribe node stream
-              ├── replicate profile/sandbox/build/key ─► C
-              └── replicate profile/sandbox/build/key ─► D
-
-case 2: A ∉ owners, node supports redirect
-node X ─────► A
-              │ hello{redirect:[B,C,D]}
-              ▼
-node X reconnects B/C/D
-
-case 3: A ∉ owners, no redirect target
-node X ─────► A ── relay ──► first successful owner in B,C,D
-```
-
-relay 必须按 owner 顺序逐个尝试,首个成功响应者承接订阅。node profile 记录携带 `link_owner`,表示实际持有
-h2 stream 的 registry 成员。route owner 下发 create/connect/delete/build/key 命令时,经 node-owner RPC
-转发到 `link_owner`。
-
-`old_grace` 阶段旧成员不进入 owner set,但可继续作为 `link_owner` 接收转发命令;node 断开后重连时按当前
-membership 重新解析 owner。
+`old_grace` 期间，旧成员可以继续作为 `link_owner` 接收转发命令。Node 断开后使用当前候选重连。不可变 registration fence 防止重叠旧 session 接管新 profile 或擦除其 ownership。
 
 <a id="registry-node-records"></a>
 
 #### node 记录
 
-node_link 维护以下 recordSet:
+node_link 维护以下类型化记录域:
 
 - `profile`:node_id,labels,runtime_digest,api_endpoint,data_endpoint,Build registration/execution capacity 与 durable usage,draining,liveness,link_owner;heartbeat 的 `allocated` memory 是本节点全部 sandbox 的 NodeReservation 之和,`pool` 是 node allocatable pool,不是 host `memory.current`,VMM charge 或 guest demand;其中低频 `node_list` 投影包含两个 endpoint 与 capacity,usage 保留在 node owner 的实时 profile 中.
 - `sandbox`:该 node 上 sandbox 的
@@ -1550,11 +1265,10 @@ node_link 维护以下 recordSet:
 - `build`:该 node 上 build 的 `build_id -> {group,template_id}` 完整归属表。
 - `key_pair`:selector patch 刷新的 APISecret+ManifestKey pair cache。
 
-心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`key_pair`
-recordSet。sandbox/build 表由 cluster 在任务下发前写入。registration usage 只统计无 cancel/delete 意图的 registered/waiting/building 行. execution usage 独立统计全部 claim, 包含取消及清理中的任务. 意图提交释放注册容量; exact host cleanup 与终态提交后才释放执行容量. 无归属终态历史不占准入额度. 归属保留到显式删除或节点 terminal retention 实际删除 Build 行并发送 `BuildDelete`;
+心跳只更新 `profile` 中的 runtime/liveness 字段，不得重写 `sandbox`、`build`、`key_pair` 记录。sandbox/build 表由 cluster 在任务下发前写入。registration usage 只统计无 cancel/delete 意图的 registered/waiting/building 行. execution usage 独立统计全部 claim, 包含取消及清理中的任务. 意图提交释放注册容量; exact host cleanup 与终态提交后才释放执行容量. 无归属终态历史不占准入额度. 归属保留到显式删除或节点 terminal retention 实际删除 Build 行并发送 `BuildDelete`;
 Registry 随后 exact-delete 对应 Build projection 与 owner ref。key_pair 由 selector patch 更新。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
-build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
+build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。高频 profile 更新不重写无关 ownership 记录。
 
 同一 node 内 `node_sandbox_id` 归属以 CAS 写入:相同完整归属重放为幂等刷新,不同归属返回
 冲突且不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED
@@ -1596,8 +1310,9 @@ pending 重放幂等.standalone 与 cluster Delete 使用同一 finalizer,node-l
 
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
 以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
-验证连接，失败候选加入本次 placement 的排除集合并重选。node_link profile 写入失败会拒绝订阅；node_list
-投影失败不应断开 node_link，后续 register/heartbeat/resync 会重试待完成的目录投影。
+验证连接，失败候选加入本次 placement 的排除集合并重选。注册将 profile、不可变 fence 与目录投影原子提交，
+失败时拒绝订阅。Profile 更新若改变目录字段，会在同一事务中更新投影和 bucket token；
+仅更新 usage/liveness 的 heartbeat 不改写目录。
 
 <a id="registry-incremental-subscriptions"></a>
 
@@ -1811,72 +1526,21 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 
 ### node_list
 
-node_list 是固定 shard key 的特殊 namespace:
-
-```text
-namespace = node_list
-shardKey  = node_list
-recordSet = nodes
-recordKey = node_id
-```
-
-```text
-node_link owner
-  │ labels/capacity/endpoints/runtime/draining low-frequency projection
-  ▼
-node_list owner set: LocateN("node_list", M)
-  ┌─────────────┬─────────────┬─────────────┐
-  ▼             ▼             ▼
- owner A       owner B       owner C
- full view     full view     full view
-  ▲
-  │ WATCH_LIST
-  ▼
-placer consumes one owner at a time
-```
-
-node_list owner 分片内全复制,所以 placer 不需要也不能把多个 owner 的结果做片间合并。若当前 owner 断线,
-placer 清空该源视图并切换到另一个 owner 重新 reset + bookmark。
-
-node_list 未 ready 时,只能从同一 node_list owner set 做 list + repair。不能跨 node shard 扫描,也不能从
-node_link 重建第二条事实传播路径。
+Node_list 是类型化 Node 事务生成、通过 `NodeDirectory` 读取的低频投影。它在 FoundationDB 中使用固定 256 个 bucket，与 Registry 服务 membership 独立。业务路由 key `node_list` 仍用于选择 HTTP WATCH_LIST 服务候选。
 
 <a id="placer-node-list"></a>
 
 #### node_list WATCH_LIST
 
-node_list 由 registry 的 node owner 投影低频节点字段:
+View 包含 NodeID、labels、runtime digest、分离的 API/Data endpoint、配置 capacity、Build registration/execution limit 与 draining。高频 usage/headroom 仍保留在 node owner 的 live profile。每个条目携带投影记录自身的完整 committed `Version`；Placer 拒绝缺失/未提交版本，并在合并已检查来源中的同一 node 身份时比较全部十字节。
 
-- node_id
-- labels
-- runtime_digest
-- api_endpoint
-- data_endpoint
-- registration/execution Build configured capacity(usage/headroom 不进入低频视图)
-- draining
-- liveness timestamp
+1. Placer 同时只消费一个服务候选的完整 view。
+2. Reset 创建 shadow snapshot，items 填充它，bookmark 原子发布该来源并标记 ready。
+3. Registry 有界分页读取目录并验证 bucket change token，检查完成后才发布；随后 invalidation 触发新的 checked load，并输出相对上次完整 view 的差异。
+4. Token 是 opaque bucket-version bookmark。每次重连重新 reset/bookmark，不按事件历史回放，也不使用 Registry 本地数值 revision。
+5. 普通 heartbeat usage 不更新目录。低频 profile/draining/liveness 变化及 reaping 在同一事务更新投影与对应 bucket token。
 
-```text
-registry node owners
-  │ low-frequency projection
-  ▼
-node_list owner set
-  │ reset + delta + bookmark
-  ▼
-placer local node view
-```
-
-WATCH_LIST 语义:
-
-1. placer 按 active membership 得到 node_list owner 候选,任一时刻只消费其中一个 owner 的完整 WATCH_LIST。
-2. 首帧为 reset,随后 delta,bookmark 标记初始视图完整。
-3. watch token 编入 registry 本地 epoch、node_list shard view label 和 Rev。
-4. epoch/label 不匹配或 changelog 已压缩时,placer 全量重订。
-5. 普通 heartbeat 不触发 WATCH_LIST;draining 变化和粗粒度 liveness refresh 触发 node_list 更新。
-
-node_list owner 分片内全复制。placer 不需要也不能把多个 node_list owner 的结果合并。当前 owner 断线时,
-placer 清空该源视图并 failover 到另一个候选 owner,重新 reset + bookmark。完成 bookmark 前 placer
-不应声明 ready。
+断线/failover 时，Placer 清除旧来源，等待新候选 bookmark 后才 ready。它不能将多个局部服务 snapshot 拼成权威目录，也不扫描 node ownership 重建目录。数据库错误与容量失败向上传递，部分 load 绝不冒充完整 node list 发布。
 
 <a id="route-link"></a>
 
@@ -1996,8 +1660,7 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
 不复制进 SandboxRecord;control/build 固定使用 APIEndpoint,data/exec 固定使用 DataEndpoint.
 Router→node 当前固定使用明文 HTTP/CONNECT,所以这两个值必须指向各自可达的明文内部 listener;
 对外 TLS 在 Router 终止,node-link mTLS 与此独立.
-`route_revision` 取当前 group route recordSet 的已提交 revision,供 Router 拒绝迟到的旧节点
-结果。Router 不订阅 route_link 更新。
+`route_revision` 是 Route 记录自身完整 10-byte committed version，以 20hex 编码；供 Router 在较新条目仍缓存时拒绝迟到结果。Router 不订阅 route_link 更新。
 
 CmdConnect/CmdExecSession 的 `CmdID` 只关联当前 Command 与 Ack waiter,不是持久幂等键.
 Registry 不在 Ack 超时、链路中断或 node 重启后自动重投同一个 Command/`CmdID`;本次调用
@@ -2041,32 +1704,11 @@ registry 不对 placer 做 P2C。P2C 属于 placer 内部从 node 候选中选�
 
 <a id="importsource"></a>
 
-#### import/source
+#### Import/source
 
-```text
-source_id = file-prod-a
+`source_id` 是 Importer 唯一执行单位。Ready placer 通过 `LocateN(source_id, readyPlacers, import_source_owner_count)` 选出竞争候选，经 Registry 竞争 `ImportSourceRepository.Acquire(source_id, owner_id, run_id, ttl)`。这是数据库中的原子 lease；候选路由 key 不定义存储 shard。
 
-ready placers ── LocateN(source_id, readyPlacers, import_source_owner_count)
-       │
-       ▼
-candidates race CAS lease:
-  namespace = placer_link
-  shardKey  = import/source/file-prod-a
-  recordSet = import
-  recordKey = state
-
-lease winner
-  │ Range(cursor, limit)
-  │ GetPlacementHint/GetKey/GetAPISecret(group)
-  │ selector patch with lease fencing
-  │ cursor checkpoint after page success
-  ▼
-node_link key_pair cache refreshed
-```
-
-`source_id` 是 importer 的唯一执行单元。多个 placer 配置相同 `source_id` 时,它们竞争同一条
-`placer_link` source execution record。Provider 的点查可以跨多个 source 去重;Importer 的 Range 不把多个
-source 合并成一个视图。
+胜者有界分页 Range 单个 source，读取各 group 的 placement hint 和 credential pair，发送 selector patch。只有该 page 每一项成功，才能以相同 owner、run ID 和 term checkpoint cursor；过期或已替换 lease 不得推进 cursor。Provider 点查可跨 source 去重，Importer Range 不能将多个 source 合成一个执行 view。
 
 <a id="router-boundary"></a>
 
@@ -2167,9 +1809,7 @@ value:
 `envd_access_token` 用于 e2b envd 端口,`forward_access_token` 用于其他 forward 目标。
 `traffic_access_token` 随受保护 route 保存并在 create 响应中返回,cluster router 不用它执行数据面鉴权。
 
-`route_revision` 是 group route recordSet 的已提交 revision。新结果的 revision 更低时不覆盖 cache;
-revision 相同但 NodeSandboxID 不同时也拒绝覆盖。这使迟到的旧代际 Resolve/Reserve 结果不能
-回退已切换的新节点目标。
+`route_revision` 是 Route 记录自身完整 10-byte committed stamp，以固定 20hex 编码。同一数据库历史与 cache identity 下，比较全部字节：较旧版本不能覆盖驻留条目，相同版本但 NodeSandboxID 不同也拒绝覆盖；相同版本与 target 可刷新 endpoint。零值与未提交版本不得入缓存。Eviction/TTL 移除该条目屏障，不保留跨 eviction 的无界历史。
 
 端口不从 route_key 解析.Legacy 实际端口来自
 `E2b-Sandbox-Port`,`<port>-<sandbox_id>` Host,CONNECT authority 或 route_link 返回的
@@ -2225,7 +1865,7 @@ Resolve,不会隐式创建 sandbox。
 
 ### Build
 
-Build 记录按 group 存在 `route_link` 的 `build` recordSet。node 拥有 durable registration/execution
+Build 记录由 group-scoped `BuildRepository` 访问。node 拥有 durable registration/execution
 claim 和 usage；node-link owner 持有当前连接与 profile 投影供 Registry 检查。
 
 ```text
@@ -2265,7 +1905,7 @@ profile 写入 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bar
 但仍不接受 e2b 专属的 start/ready 命令。
 
 Build Register 与普通 Create 共用 resource/network/launch/init/mounts/files/metadata 的 strict
-header/metadata 归一化，也传递 `envVars`。Registry 的 replicated BuildRecord 保存非秘密 config/env/
+header/metadata 归一化，也传递 `envVars`。Registry 的 durable BuildRecord 保存非秘密 config/env/
 secure 和 credentials/MMDS values 的不可逆 digest；原始 credentials 与 MMDS initial values 只存在于
 本次 dispatch envelope，节点验证后分别加密进 task-local Build 状态。显式 Image/顶层 Sandbox E
 对 instance-only 输入的拒绝、restore 的无条件拒绝、target 与输出 ref 的一致性由 Router、Registry、
@@ -2314,9 +1954,9 @@ node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/bu
 转移。terminal build 仍是一次节点执行的查询投影;可持久复用的是 build 产出的 template/manifest,
 不是 BuildRecord。
 
-registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
+FoundationDB 数据库 backup/restore 保存的是数据库记录，与应用层 import 不同。恢复须与 node 事实协调，并重启旧数据库历史的缓存消费者；恢复元数据本身不能证明旧进程仍然存在。registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
 build execution、node ref、admission 或本机 checkpoint。节点虽持久化 cluster sandbox 的独立系统上下文,
-但当前 node-link full report 不回传 Registry-owned identity;registry 执行 shard 完全丢失时不能仅靠 route event
+但当前 node-link full report 不回传 Registry-owned identity;元数据数据库不可恢复地丢失时不能仅靠 route event
 重建 ownership,也不能预装 ownership 让旧事件看似合法。这条显式 recovery/bootstrap 协议尚未实现;
 [issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 是以 not planned 关闭的历史提案,不是可用恢复步骤;当前不得用手工写入执行 row 规避该限制。
 
@@ -2348,10 +1988,10 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 | node_link 断线 | node owner 立即拒绝该 node 的新提交；route owner 排除并重选；断线节点最后心跳超过 node_dead_after 后，通过 revision fence 接管过期 profile，清理目录和符合条件的执行投影；dead/deleting Sandbox 管理行及精确归属仍保留，in-flight reservation 不被 sweep；node 重连后全量/增量重报 |
 | conductor 进程重启 | 依据 systemd unit reconcile durable row：接管活 sandbox/builder，重试 deleting/paused cleanup、已接纳的中断 restore，并清理/失败缺失的新执行；这不是整机重启 |
 | node 整机重启 | 运行进程丢失。SQLite/artifact 保留时仍 reconcile paused row、已接纳的中断 restore、cleanup owner 和保留的 Build；缺失执行经节点上报/exact route 清理收敛，不无条件删除全部 durable row 或自动重建全部旧 sandbox |
-| registry 单成员故障 | owner set quorum 足够时继续服务；恢复后由同 shard 访问或事实源上报触发 read-repair；单 owner 部署不能容忍其 owner 丢失 |
-| registry 多成员故障导致 quorum 不足 | 对应 shard 停写,不降级乱写 |
-| registry 执行 shard 全失但 node 存活 | 不导入备份执行 row；按 node 持久事实重建投影所需的 recovery/bootstrap 协议不可用（#34 是未实现的历史提案） |
-| membership 变更 | active/next joint 写 quorum + old_grace read-only 证书/快照来源 |
+| registry 单成员故障 | 其他服务候选仍可访问 FoundationDB 持久元数据；stream owner 故障的 node 重连，registration fence 拒绝重叠旧 session |
+| FoundationDB 不可用或无法提交 | 元数据操作失败或返回明确 Unknown commit 结果，不回退到 Registry 本地写入 |
+| FoundationDB 元数据不可恢复地丢失但 node 存活 | 普通 route event 无法重建丢失 ownership，应用 recovery/bootstrap 协议仍不可用（#34 是历史提案） |
+| membership 变更 | 改变服务候选与 node-link affinity；各视图继续使用同一数据库和 prefix |
 | 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。provider 数据与 portable template/manifest 仍可复用，但不能恢复丢失的 Registry 执行归属。migration-token route 恢复（#33）是未实现的历史提案，不是执行 row import 或可用兜底 |
 
 <a id="registry-performance"></a>
@@ -2361,8 +2001,8 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 - 数据面热路径:router 命中完整 node target 后直转 node,包括 pausing/paused/starting,不访问 registry。
 - Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner 当前连接/usage 检查 -> node 权威准入；明确失败的候选排除后重选，ambiguous Build dispatch 保持原绑定。
 - 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
-- 海量 node:node_link 按 node_id 分片;node_list 只承载低频目录,不承载高频水位。
-- membership 变更:不做全局 promoter;由 node 上报、group 请求、source import、read-repair 自然收敛。
+- 海量 node:profile/ownership 按 NodeID 定界；bucketed node_list 只承载低频目录，不承载高频水位。
+- membership 变更:不搬迁元数据或执行 peer read-repair；连接重注册与报告通过共享数据库协调业务状态。
 
 <a id="registry-cluster-stub-e2e"></a>
 
@@ -2482,6 +2122,6 @@ Delete 并等待 node-local finalization. 该序列在 node-link 恢复后经过
 
 ### Placer 引用
 
-- [cluster_zh.md](cluster_zh.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
+- [cluster_zh.md](cluster_zh.md) — Registry membership、类型化 FoundationDB 元数据、node_link、route_link、placer_link 总设计。
 - [cluster_zh.md](#client-access) — router Reserve 消费、route cache 和数据面转发.
 - [node_zh.md](node_zh.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。

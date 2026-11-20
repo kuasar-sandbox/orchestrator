@@ -37,10 +37,9 @@ type MemberConfig struct {
 }
 
 // MembershipConfig is the versioned registry member view. The active version is
-// the client routing input. When next is set, registry writes use joint owner
-// sets: active quorum and next quorum must both commit before the write returns.
-// old_grace keeps a previous version reachable for peer/node-owner RPC without
-// adding it to owner quorums.
+// the client routing input. Active and next are business connection candidates;
+// old_grace retains peer reachability while existing Node streams drain. These
+// views do not configure database replicas or commit quorums.
 type MembershipConfig struct {
 	Active             int64                 `yaml:"active" json:"active"`
 	Next               int64                 `yaml:"next,omitempty" json:"next,omitempty"`
@@ -83,8 +82,11 @@ type RouteLinkConfig struct {
 	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router -> 503
 }
 
-type NodeListConfig struct {
-	WatchRetention int `yaml:"watch_retention"`
+// FoundationDBConfig identifies the external metadata database and key space.
+// All Registry processes in a cluster must use the same database and prefix.
+type FoundationDBConfig struct {
+	ClusterFile string `yaml:"cluster_file"`
+	Prefix      string `yaml:"prefix"`
 }
 
 // PlacerLinkConfig configures placer discovery/placement over the unified member listener.
@@ -293,22 +295,6 @@ func (m MembershipConfig) OwnerVersions() []MembershipVersion {
 	return out
 }
 
-func (m MembershipConfig) ShardVersions() []MembershipVersion {
-	seen := map[int64]bool{}
-	out := make([]MembershipVersion, 0, 3)
-	for _, v := range m.OwnerVersions() {
-		if seen[v.Version] {
-			continue
-		}
-		seen[v.Version] = true
-		out = append(out, v)
-	}
-	if oldGrace, ok := m.OldGraceVersion(); ok && !seen[oldGrace.Version] {
-		out = append(out, oldGrace)
-	}
-	return out
-}
-
 func (m MembershipConfig) MemberVersions() []MembershipVersion {
 	seen := map[int64]bool{}
 	out := make([]MembershipVersion, 0, len(m.Versions))
@@ -392,12 +378,12 @@ func validateDurations(m map[string]string) error {
 // listener for node_link, route_link, placer_link, and member RPC. node_link.listen
 // may split long-lived node streams onto another listener.
 type RegistryConfig struct {
-	Member     MemberConfig     `yaml:"member"`
-	Membership MembershipConfig `yaml:"membership"`
-	NodeLink   NodeLinkConfig   `yaml:"node_link"`
-	RouteLink  RouteLinkConfig  `yaml:"route_link"`
-	NodeList   NodeListConfig   `yaml:"node_list"`
-	PlacerLink PlacerLinkConfig `yaml:"placer_link"`
+	Member       MemberConfig       `yaml:"member"`
+	Membership   MembershipConfig   `yaml:"membership"`
+	NodeLink     NodeLinkConfig     `yaml:"node_link"`
+	RouteLink    RouteLinkConfig    `yaml:"route_link"`
+	FoundationDB FoundationDBConfig `yaml:"foundationdb"`
+	PlacerLink   PlacerLinkConfig   `yaml:"placer_link"`
 }
 
 // DefaultRegistry returns the registry config with all non-required fields set.
@@ -412,10 +398,10 @@ func DefaultRegistry() RegistryConfig {
 			}},
 			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, PlacerLink: 1, NodeList: 1},
 		},
-		NodeLink:   NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
-		RouteLink:  RouteLinkConfig{ParkTimeout: "30s"},
-		NodeList:   NodeListConfig{WatchRetention: 10000},
-		PlacerLink: PlacerLinkConfig{PlacerReplicaCount: 3, MinReadyPlacers: 1, PlacerLabel: "placer.default", PlaceTimeout: "2s"},
+		NodeLink:     NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
+		RouteLink:    RouteLinkConfig{ParkTimeout: "30s"},
+		FoundationDB: FoundationDBConfig{ClusterFile: "/etc/foundationdb/fdb.cluster", Prefix: "kuasar-sandbox/cluster/"},
+		PlacerLink:   PlacerLinkConfig{PlacerReplicaCount: 3, MinReadyPlacers: 1, PlacerLabel: "placer.default", PlaceTimeout: "2s"},
 	}
 }
 
@@ -481,8 +467,11 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.RouteLink.ParkTimeout == "" {
 		c.RouteLink.ParkTimeout = d.RouteLink.ParkTimeout
 	}
-	if c.NodeList.WatchRetention == 0 {
-		c.NodeList.WatchRetention = d.NodeList.WatchRetention
+	if c.FoundationDB.ClusterFile == "" {
+		c.FoundationDB.ClusterFile = d.FoundationDB.ClusterFile
+	}
+	if c.FoundationDB.Prefix == "" {
+		c.FoundationDB.Prefix = d.FoundationDB.Prefix
 	}
 	if c.PlacerLink.PlacerReplicaCount == 0 {
 		c.PlacerLink.PlacerReplicaCount = d.PlacerLink.PlacerReplicaCount
@@ -591,8 +580,11 @@ func (c *RegistryConfig) Validate() error {
 	if c.Membership.Owners.NodeList <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_list must be positive")
 	}
-	if c.NodeList.WatchRetention <= 0 {
-		return fmt.Errorf("clustercfg: node_list.watch_retention must be positive")
+	if strings.TrimSpace(c.FoundationDB.ClusterFile) == "" {
+		return fmt.Errorf("clustercfg: foundationdb.cluster_file is required")
+	}
+	if strings.TrimSpace(c.FoundationDB.Prefix) == "" || len(c.FoundationDB.Prefix) > 256 || strings.ContainsRune(c.FoundationDB.Prefix, '\x00') {
+		return fmt.Errorf("clustercfg: foundationdb.prefix must contain 1 to 256 bytes without NUL")
 	}
 	if c.PlacerLink.PlacerReplicaCount <= 0 {
 		return fmt.Errorf("clustercfg: placer_link.placer_replica_count must be positive")

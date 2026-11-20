@@ -60,7 +60,7 @@ PR 应聚焦明确的问题与解决方案，关联已有 issue，在行为变�
 | `internal/orch` | 节点生命周期、Build pool、本地路由权威、单元生成与重启对账 |
 | `internal/nodectl` | reservation 准入、pool/水位/grant、inventory/StateSync 恢复与审计;不接管 Sandbox balloon/cgroup 闭环 |
 | `internal/nodelink` | Conductor–Registry 注册、心跳、事件与命令,帧化 JSON/h2c |
-| `internal/{registry,router,placer}` | 复制 shardkv namespace、Reserve/Build 状态与 node-link key cache;E2B 统一入口/active cache;provider/importer、WATCH_LIST、P2C 放置 |
+| `internal/{registry,router,placer}` | 类型化 FoundationDB 元数据、Reserve/Build 状态与 node-link key cache;E2B 统一入口/active cache;provider/importer、WATCH_LIST、P2C 放置 |
 | `internal/api` | E2B 控制 REST、X-API-KEY 鉴权、export/import 与 ExecAccessToken 签发 |
 | `internal/proxy`, `internal/proxyshm`, `internal/proxyadmission`, `internal/routesync` | L7 转发、service-addressed CONNECT/native exec gate、固定共享 route view、独立 inflight arena、MMDS confidential heap、park/wake 与 generation cleanup;route/node-link 注册/bookmark/typed result |
 | `internal/configsock` | Run/task/admin/plugin/API、exact-run bootstrap/prepare、manifest-key/MMDS/Builder 管理与受控 route;SO_PEERCRED/pidfile 鉴权 |

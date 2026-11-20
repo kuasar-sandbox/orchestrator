@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
@@ -91,28 +92,44 @@ type execSessionResult struct {
 	ExecAccessToken string `json:"exec_access_token"`
 }
 type routeResolve struct {
-	SandboxID              string `json:"sandbox_id"`
-	NodeSandboxID          string `json:"node_sandbox_id"`
-	RouteRevision          int64  `json:"route_revision"`
-	Group                  string `json:"group"`
-	RouteKey               string `json:"route_key"`
-	NodeID                 string `json:"node_id"`
-	APIEndpoint            string `json:"api_endpoint"`
-	DataEndpoint           string `json:"data_endpoint"`
-	Profile                string `json:"profile"`
-	TemplateID             string `json:"template_id"`
-	StableID               string `json:"stable_id"`
-	APISecret              string `json:"api_secret"`
-	APISecretFingerprint   string `json:"api_secret_fingerprint"`
-	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
-	ServiceSecret          string `json:"service_secret"`
-	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
-	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
-	ForwardAccessToken     string `json:"forward_access_token"`
-	TargetPort             int    `json:"target_port,omitempty"`
-	State                  string `json:"state"`
+	SandboxID              string           `json:"sandbox_id"`
+	NodeSandboxID          string           `json:"node_sandbox_id"`
+	RouteRevision          metadata.Version `json:"route_revision"`
+	Group                  string           `json:"group"`
+	RouteKey               string           `json:"route_key"`
+	NodeID                 string           `json:"node_id"`
+	APIEndpoint            string           `json:"api_endpoint"`
+	DataEndpoint           string           `json:"data_endpoint"`
+	Profile                string           `json:"profile"`
+	TemplateID             string           `json:"template_id"`
+	StableID               string           `json:"stable_id"`
+	APISecret              string           `json:"api_secret"`
+	APISecretFingerprint   string           `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string           `json:"manifest_key_fingerprint"`
+	ServiceSecret          string           `json:"service_secret"`
+	EnvdAccessToken        string           `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string           `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string           `json:"forward_access_token"`
+	TargetPort             int              `json:"target_port,omitempty"`
+	State                  string           `json:"state"`
 	cachedAt               time.Time
 	lastUsed               time.Time
+}
+
+// UnmarshalJSON only accepts a route carrying its complete committed record
+// version. A missing version or an uncommitted placeholder cannot fence cache
+// updates, even when the response otherwise contains a valid route identity.
+func (rr *routeResolve) UnmarshalJSON(data []byte) error {
+	type wireRoute routeResolve
+	var wire wireRoute
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if !wire.RouteRevision.IsCommitted() {
+		return errors.New("router: route response has no committed version")
+	}
+	*rr = routeResolve(wire)
+	return nil
 }
 
 type activeRoute struct {
@@ -1997,7 +2014,7 @@ func (rt *Router) beginActiveRoute(rr *routeResolve) func() {
 }
 
 func (rt *Router) rememberRoute(rr *routeResolve) {
-	if rr == nil || rr.Group == "" || rr.RouteKey == "" || rr.SandboxID == "" || rr.NodeSandboxID == "" {
+	if rr == nil || rr.Group == "" || rr.RouteKey == "" || rr.SandboxID == "" || rr.NodeSandboxID == "" || !rr.RouteRevision.IsCommitted() {
 		return
 	}
 	cp := *rr
@@ -2007,7 +2024,10 @@ func (rt *Router) rememberRoute(rr *routeResolve) {
 	key := routeCacheID(cp.Group, cp.RouteKey, cp.SandboxID)
 	rt.cacheMu.Lock()
 	if current := rt.cache[key]; current != nil {
-		if cp.RouteRevision < current.RouteRevision ||
+		// Compare the record's full commit stamp within this database and
+		// cache identity. The final two bytes order transactions sharing a
+		// database version; a local handle or uint64 truncation loses that order.
+		if cp.RouteRevision.Compare(current.RouteRevision) < 0 ||
 			(cp.RouteRevision == current.RouteRevision && cp.NodeSandboxID != current.NodeSandboxID) {
 			rt.cacheMu.Unlock()
 			return

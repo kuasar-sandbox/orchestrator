@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -40,13 +40,14 @@ func TestReserveBuildEndpointLossAfterACKPreservesAcceptedIdentity(t *testing.T)
 		name string
 		err  error
 	}{
-		{"profile-quorum", shardkv.ErrQuorum},
+		{"profile-quorum", metadata.ErrUnavailable},
 		{"node-disconnected", ErrNodeGone},
 		{"profile-missing", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			reg := testReg(t)
+			seedTestNode(t, reg.stores, "n1")
 			reg.SetPlacer(placementWithToken("n1"))
 			target := &types.BuildTarget{Kind: types.BuildTargetSandbox}
 			owner := &endpointLossAfterACKOwner{

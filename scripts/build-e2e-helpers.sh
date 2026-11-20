@@ -16,3 +16,6 @@ e2e_go -C "$ROOT" build -trimpath -ldflags '-X main.version=inplace-target' \
     -o "$2/node-ctl-inplace-target" ./cmd/node-ctl
 e2e_go -C "$ROOT" build -trimpath -ldflags '-buildid=orchestrator-inplace-target' \
     -o "$2/custom-proxy-inplace-target" ./examples/custom-proxy
+# Official, SHA256-pinned test infrastructure. The prepared runner only receives
+# these ELF helpers; the product archive supplies their verified native runtime.
+python3 -B "$ROOT/scripts/test_fdb_assets.py" --arch "$1" --output "$2"

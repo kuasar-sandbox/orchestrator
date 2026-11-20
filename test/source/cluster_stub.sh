@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NODES_EXPLICIT="${NODES+x}"
 SCALERS_EXPLICIT="${SCALERS+x}"
 BIN="${BIN:-$ROOT/bin/$(uname -m)}"
-CLUSTER_CTL="${CLUSTER_CTL:-$BIN/cluster-ctl}"
+CLUSTER_CTL="${CLUSTER_CTL:-$BIN/run-cluster-ctl}"
 NODE_STUB_CTL="${NODE_STUB_CTL:-$BIN/node-stub-ctl}"
 E2B_KEY_CTL="${E2B_KEY_CTL:-$BIN/e2b-key-ctl}"
 DOMAIN="${DOMAIN:-cluster.stub.local}"
@@ -41,10 +41,17 @@ fail() {
 build_cluster_stub_binaries() {
     command -v go >/dev/null 2>&1 || fail "go not on PATH"
     mkdir -p "$BIN"
-    (cd "$ROOT" && go build -trimpath -o "$CLUSTER_CTL" ./cmd/cluster-ctl)
+    (cd "$ROOT" && python3 scripts/cluster-native.py build --arch "$(uname -m)" --output "$BIN" --go "$(command -v go)" -- -trimpath)
     (cd "$ROOT" && go build -trimpath -o "$NODE_STUB_CTL" ./cmd/node-stub-ctl)
     (cd "$ROOT" && go build -trimpath -o "$E2B_KEY_CTL" ./cmd/e2b-key-ctl)
 }
+
+# All Registry processes in a case share one real FDB database. The fixture owns
+# the disposable SSD process; no system database is required or modified.
+if [ -z "${FDB_CLUSTER_FILE:-}" ]; then
+    exec python3 "$ROOT/scripts/with-test-fdb.py" -- bash "$0"
+fi
+[ -f "$FDB_CLUSTER_FILE" ] || fail "FDB_CLUSTER_FILE is not a readable test cluster file"
 
 if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
     build_cluster_stub_binaries
@@ -282,6 +289,9 @@ for i in $(seq 1 "$REGISTRIES"); do
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
+foundationdb:
+  cluster_file: "$FDB_CLUSTER_FILE"
+  prefix: "cluster-stub/${WORK##*/}/"
 membership:
   active: 1
 ${NEXT_LINE}  versions:
@@ -755,6 +765,9 @@ PY
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
+foundationdb:
+  cluster_file: "$FDB_CLUSTER_FILE"
+  prefix: "cluster-stub/${WORK##*/}/"
 membership:
   active: 2
   old_grace: 1

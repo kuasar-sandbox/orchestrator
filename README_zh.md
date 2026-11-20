@@ -87,9 +87,9 @@
 | `node-ctl resource ...` | 检查或 drain 节点资源 reservation |
 | `node-ctl builder status` | 检查 Build 执行状态 |
 | `node-ctl export-sandbox` / `import-sandbox` | 跨节点移动 portable Sandbox 状态 |
-| `cluster-ctl registry` | 启动 Registry |
-| `cluster-ctl router` | 启动集群控制与数据统一入口 |
-| `cluster-ctl placer` | 启动放置服务 |
+| `run-cluster-ctl registry` | 启动 Registry |
+| `run-cluster-ctl router` | 启动集群控制与数据统一入口 |
+| `run-cluster-ctl placer` | 启动放置服务 |
 | `e2b-key-ctl ...` | 生成和派生租户凭据 |
 
 move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkpoint 的物理清理可能
@@ -109,7 +109,7 @@ move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkp
 
 ## 部署概览
 
-独立节点运行 Conductor 与 Proxy；按需独立启动 Telemetry。Telemetry 复用 Plugin Plane，不加入 Create/Resume barrier，其故障不改变 Sandbox lifecycle。示例配置显式启用 embedded Prometheus TSDB；本地存储必须通过 `local.enabled` 选择，未配置的 query backend 默认 `none`，写入与查询独立装配。完整选择见[观测](docs/observability_zh.md#telemetry)。集群另加 Registry、Router、Placer，配置样例与 systemd unit 位于 `deploy/`。
+独立节点运行 Conductor 与 Proxy；按需独立启动 Telemetry。Telemetry 复用 Plugin Plane，不加入 Create/Resume barrier，其故障不改变 Sandbox lifecycle。示例配置显式启用 embedded Prometheus TSDB；本地存储必须通过 `local.enabled` 选择，未配置的 query backend 默认 `none`，写入与查询独立装配。完整选择见[观测](docs/observability_zh.md#telemetry)。集群另加 Registry、Router、Placer，并使用独立 FoundationDB 数据库。完整安装 native runtime bundle，通过 `run-cluster-ctl` 启动集群角色；Registry peer 使用相同 cluster file 和 prefix。配置样例与 systemd unit 位于 `deploy/`，详见[原生构建与运行包](docs/cluster_zh.md#native-build-and-runtime)。
 
 面向用户的发布件安装流程见项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)。生产部署应使用持久存储、生产 TLS、受保护凭据、明确网络策略及基于实际 workload 验证的容量设置。
 
@@ -139,9 +139,9 @@ node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # 可选集群角色,各使用独立服务/终端。
-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
+run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
+run-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
+run-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 
 # 独立模式开发,替换 host 与 canonical template 占位符。
 export E2B_API_URL=http://host:3000

@@ -21,7 +21,7 @@ func TestResetTerminalManagementAndCreateFences(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := r.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "http://api:8080", DataEndpoint: "http://proxy:8081", LastHeartbeatUnix: 1}); err != nil {
+			if err := putTestNode(r.stores, ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "http://api:8080", DataEndpoint: "http://proxy:8081", LastHeartbeatUnix: 1}); err != nil {
 				t.Fatal(err)
 			}
 			ref := testNodeSandboxRef("/g", "rk", "retained", "e2b", testAPIFingerprint)
@@ -52,7 +52,7 @@ func TestResetTerminalManagementAndCreateFences(t *testing.T) {
 			// A reconnect snapshot rebuilds the same terminal projection.
 			route := testRouteFromRecord(record, record.NodeSandboxID, string(state))
 			route.InstanceID, route.PressureVersion = record.InstanceID, record.StateVersion
-			r.applyRoute(ctx, "n1", &route)
+			testApplyRoute(r, ctx, "n1", &route)
 			got, _, _, err := r.stores.GetSandbox(ctx, "/g", "rk")
 			if err != nil || got.State != state || !got.AutoReset {
 				t.Fatalf("reconnect changed owner policy: %+v %v", got, err)
@@ -88,7 +88,7 @@ func TestResetProjectionRejectsOldRunAndAcceptsCommittedPaused(t *testing.T) {
 	} {
 		route := testRouteFromRecord(record, record.NodeSandboxID, tc.state)
 		route.InstanceID, route.PressureVersion = tc.instance, tc.version
-		r.applyRoute(ctx, "n1", &route)
+		testApplyRoute(r, ctx, "n1", &route)
 		got, _, found, err := r.stores.GetSandbox(ctx, "/g", "rk")
 		if err != nil || !found || got.State != tc.want {
 			t.Fatalf("projection %+v => %+v %v %v", tc, got, found, err)

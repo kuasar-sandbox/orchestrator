@@ -1,5 +1,5 @@
-# cluster-ctl registry config — cluster-ctl registry --config /etc/cluster-ctl/registry.yaml.
-# Validate with `cluster-ctl config registry --config registry.yaml`.
+# Registry config — run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml.
+# Validate with `run-cluster-ctl config registry --config registry.yaml`.
 
 member:
   id: registry-1
@@ -8,7 +8,7 @@ member:
 
 membership:
   active: 1
-  # next: 2                         # joint owner set target during membership change
+  # next: 2                         # additional business connection candidates during membership change
   # old_grace: 1                    # previous version kept as peer/node_link ingress after cutover
   reload_ready_timeout: 10s
   versions:
@@ -29,8 +29,10 @@ node_link:
 route_link:
   park_timeout: 30s
 
-node_list:
-  watch_retention: 10000
+# All Registry members use the same external database and isolated key prefix.
+foundationdb:
+  cluster_file: /etc/foundationdb/fdb.cluster
+  prefix: kuasar-sandbox/cluster/
 
 placer_link:
   placer_label: placer.default

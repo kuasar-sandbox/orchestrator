@@ -22,7 +22,7 @@ func testNodeKeyPair(apiSecret, manifestKey string, expiresUnix int64) clusterst
 
 func TestUpsertNodeKeyPairRejectsFingerprintRebinding(t *testing.T) {
 	ctx := context.Background()
-	stores := NewStores()
+	stores := newTestStores()
 	original := testNodeKeyPair(
 		"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
 		"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
@@ -39,7 +39,7 @@ func TestUpsertNodeKeyPairRejectsFingerprintRebinding(t *testing.T) {
 	if err := stores.UpsertNodeKeyPair(ctx, "n1", conflict); err == nil {
 		t.Fatal("same API secret fingerprint was rebound to a different manifest key")
 	}
-	got, _, found, err := stores.getNodeKeyPairShard(ctx, "n1", original.APISecretFingerprint)
+	got, _, found, err := testReadNodeKeyPair(stores, ctx, "n1", original.APISecretFingerprint)
 	if err != nil || !found || got.ManifestKeyFingerprint != original.ManifestKeyFingerprint || got.ExpiresUnix != original.ExpiresUnix {
 		t.Fatalf("original pair changed after conflict: found=%v err=%v pair=%+v", found, err, got)
 	}
@@ -48,7 +48,7 @@ func TestUpsertNodeKeyPairRejectsFingerprintRebinding(t *testing.T) {
 func TestConcurrentUpsertNodeKeyPairCannotRebindFingerprint(t *testing.T) {
 	ctx := context.Background()
 	for iteration := 0; iteration < 25; iteration++ {
-		stores := NewStores()
+		stores := newTestStores()
 		left := testNodeKeyPair(
 			"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
 			strings.Repeat("2", 64), 123,
@@ -76,7 +76,7 @@ func TestConcurrentUpsertNodeKeyPairCannotRebindFingerprint(t *testing.T) {
 		if first.err != nil {
 			winner = second.pair
 		}
-		got, _, found, err := stores.getNodeKeyPairShard(ctx, "n1", left.APISecretFingerprint)
+		got, _, found, err := testReadNodeKeyPair(stores, ctx, "n1", left.APISecretFingerprint)
 		if err != nil || !found || !sameNodeKeyPairMaterial(got, winner) {
 			t.Fatalf("iteration %d stored pair=%+v found=%v err=%v; winner=%+v", iteration, got, found, err, winner)
 		}
@@ -86,7 +86,7 @@ func TestConcurrentUpsertNodeKeyPairCannotRebindFingerprint(t *testing.T) {
 func TestSelectorPatchRejectsHalfPairWithoutProjection(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{

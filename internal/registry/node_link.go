@@ -10,8 +10,23 @@ import (
 	"sync"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
+
+type nodeRegistrationContextKey struct{}
+
+func withNodeRegistration(ctx context.Context, registration metadata.Registration) context.Context {
+	return context.WithValue(ctx, nodeRegistrationContextKey{}, registration)
+}
+
+func nodeStreamRegistration(ctx context.Context, nodeID string) (metadata.Registration, error) {
+	registration, ok := ctx.Value(nodeRegistrationContextKey{}).(metadata.Registration)
+	if !ok || registration.NodeID != nodeID || registration.LinkOwner == "" || !registration.Fence.IsCommitted() {
+		return metadata.Registration{}, metadata.ErrConflict
+	}
+	return registration, nil
+}
 
 const NodeLinkRelayPath = "/internal/node-link/relay"
 
@@ -300,10 +315,15 @@ func (r *Registry) ServeNodeLinkRelay(w http.ResponseWriter, req *http.Request) 
 func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush func(), body io.Reader, nr *routesync.NodeRegister) error {
 	registered, err := r.updateNodeRegister(ctx, nr)
 	if err != nil {
+		// Register may already have committed its profile and directory before
+		// a later aggregate read failed. Reuse the liveness-based cleanup path;
+		// a successful reconnect advances the fence before this timer can claim.
+		r.scheduleNodeReap(nr.NodeID)
 		r.log.Error("node-link: register", "node", nr.NodeID, "err", err)
 		return fmt.Errorf("node-link: register failed: %w", err)
 	}
 
+	ctx = withNodeRegistration(ctx, registered.Registration)
 	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flush}
 
 	// Write Hello BEFORE exposing the node_link. After addNode, heartbeat
@@ -313,13 +333,13 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	fullExpected := append([]clusterstate.NodeSandboxRef(nil), registered.Sandboxes...)
 	buildExpected := append([]clusterstate.NodeBuildRef(nil), registered.Builds...)
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom}}); err != nil {
+		r.scheduleNodeReap(nr.NodeID)
 		return nil
 	}
 	flush()
 
 	r.addNode(conn)
 	defer r.removeNode(conn)
-	go r.projectRegisteredNode(ctx, registered)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
 	heartbeatCh := make(chan *routesync.Heartbeat, 1)
@@ -345,10 +365,14 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 				if collectingFull && m.Route.SandboxID != "" {
 					fullSeen[m.Route.SandboxID] = struct{}{}
 				}
-				r.applyRoute(ctx, nr.NodeID, m.Route)
+				if err := r.applyRoute(ctx, nr.NodeID, m.Route); err != nil {
+					return fmt.Errorf("node-link: apply route Upsert: %w", err)
+				}
 			}
 		case routesync.TypeDelete:
-			r.applyDeleteBySID(ctx, nr.NodeID, m.SID)
+			if err := r.applyDeleteBySID(ctx, nr.NodeID, m.SID); err != nil {
+				return fmt.Errorf("node-link: apply route Delete: %w", err)
+			}
 		case routesync.TypeHeartbeat:
 			if m.Beat != nil {
 				queueLatestHeartbeat(heartbeatCh, m.Beat)
@@ -406,7 +430,9 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 				return errors.New("node-link: Bookmark before Build full sync completed")
 			}
 			if collectingFull && m.FullSync {
-				r.applyNodeFullSnapshot(ctx, nr.NodeID, fullExpected, fullSeen)
+				if err := r.applyNodeFullSnapshot(ctx, nr.NodeID, fullExpected, fullSeen); err != nil {
+					return fmt.Errorf("node-link: finish route full sync: %w", err)
+				}
 			}
 			collectingFull = false
 			fullSeen = nil

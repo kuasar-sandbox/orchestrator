@@ -249,7 +249,7 @@ PY_CLUSTER_BUILD
             for i in "${!PIDS[@]}"; do
                 [ "${PIDS[$i]}" != "$ROUTER_PID" ] || PIDS[$i]=""
             done
-            "$BIN/cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
+            "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
             ROUTER_PID=$!
             PIDS+=("$ROUTER_PID")
             wait_port "$ROUTER_PORT" router-restarted
