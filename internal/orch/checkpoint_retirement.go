@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -27,6 +28,23 @@ var errCaptureNotStarted = errors.New("checkpoint capture command was not starte
 
 func retirementIsPending(err error) bool {
 	return errors.Is(err, errRetirementPending) || errors.Is(err, errCaptureOutcomePending) || errors.Is(err, api.ErrPreviousMemorySavePending)
+}
+
+// ConfigureMemoryPressure publishes the controller before Listen restores its
+// inventory. During that interval, absence in State is not release evidence.
+// Keep the exact capture/owner available for the existing lifecycle retry.
+func (o *Orchestrator) retirementResourceState() (*nodectl.State, error) {
+	p := o.memoryPressure.Load()
+	if p != nil {
+		if p.state.InventoryReady() {
+			return p.state, nil
+		}
+		return nil, fmt.Errorf("%w: resource controller inventory is not ready", errRetirementPending)
+	}
+	if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
+		return nil, fmt.Errorf("%w: resource controller is unavailable", errRetirementPending)
+	}
+	return nil, nil
 }
 
 func (o *Orchestrator) ensureRetiredMemoryReleased(ctx context.Context, sid string) error {
@@ -86,17 +104,19 @@ func (o *Orchestrator) releaseRetiredRun(ctx context.Context, m store.RunPoolOwn
 	if record == nil || !record.RAMReleased {
 		return api.ErrPreviousMemorySavePending
 	}
-	if p := o.memoryPressure.Load(); p != nil {
-		if err := p.state.ReconcileRetainedMemory(m.TaskID); err != nil {
+	state, err := o.retirementResourceState()
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		if err := state.ReconcileRetainedMemory(m.TaskID); err != nil {
 			return err
 		}
-		if retained, ok := p.state.RetainedMemory(m.TaskID); ok && retained.MemoryID == record.MemoryID && retained.Epoch == record.Epoch {
+		if retained, ok := state.RetainedMemory(m.TaskID); ok && retained.MemoryID == record.MemoryID && retained.Epoch == record.Epoch {
 			// The controller must persist settlement while its capture proof is
 			// still readable. A later hard delete may remove that proof.
 			return api.ErrPreviousMemorySavePending
 		}
-	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
-		return fmt.Errorf("%w: resource controller is unavailable for memory settlement", errRetirementPending)
 	}
 	if err := o.fenceSandboxRunner(ctx, m.RunID); err != nil {
 		return err
@@ -189,12 +209,14 @@ func (o *Orchestrator) discardAbsentCapture(ctx context.Context, m store.RunPool
 	if record != nil {
 		return errCaptureOutcomePending
 	}
-	if p := o.memoryPressure.Load(); p != nil {
-		if _, pending := p.state.RetainedMemory(m.TaskID); pending {
+	state, err := o.retirementResourceState()
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		if _, pending := state.RetainedMemory(m.TaskID); pending {
 			return api.ErrPreviousMemorySavePending
 		}
-	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
-		return fmt.Errorf("%w: resource controller is unavailable for absent capture verification", errRetirementPending)
 	}
 	return o.runs.forget(m.RunID)
 }
@@ -362,17 +384,19 @@ func (o *Orchestrator) prepareCheckpointRetirement(ctx context.Context, sb *type
 }
 
 func (o *Orchestrator) abortCheckpointRetirement(ctx context.Context, sb *types.Sandbox, permit ctl.HostRetirementPermit) error {
-	if p := o.memoryPressure.Load(); p != nil {
-		if err := p.state.ReconcileRetainedMemory(sb.ID); err != nil {
+	state, err := o.retirementResourceState()
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		if err := state.ReconcileRetainedMemory(sb.ID); err != nil {
 			return err
 		}
-		if _, pending := p.state.RetainedMemory(sb.ID); pending {
+		if _, pending := state.RetainedMemory(sb.ID); pending {
 			return api.ErrPreviousMemorySavePending
 		}
-	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
-		return fmt.Errorf("%w: resource controller is unavailable for capture rollback", errRetirementPending)
 	}
-	_, err := o.mutateRetirement(ctx, sb.RunID, func(m *store.RunPoolOwnership) error {
+	_, err = o.mutateRetirement(ctx, sb.RunID, func(m *store.RunPoolOwnership) error {
 		if m.TaskID != sb.ID || m.RetirementOperationID != permit.OperationID || m.Role != "" {
 			return errors.New("cannot abort committed runner retirement")
 		}
@@ -564,12 +588,14 @@ func (o *Orchestrator) retireHolderExecution(m store.RunPoolOwnership) error {
 	if m.Role != store.RunRoleMemoryHolder || !m.ParentRetired || m.TaskID == "" || m.RunID == "" {
 		return errRetirementPending
 	}
-	if p := o.memoryPressure.Load(); p != nil {
-		if err := p.state.RetireExecution(m.TaskID, m.RunID); err != nil {
+	state, err := o.retirementResourceState()
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		if err := state.RetireExecution(m.TaskID, m.RunID); err != nil {
 			return errors.Join(errRetirementPending, err)
 		}
-	} else if o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled {
-		return fmt.Errorf("%w: resource controller is unavailable for execution retirement", errRetirementPending)
 	}
 	o.runs.releaseRuntimeSlot(m.RunID)
 	return nil

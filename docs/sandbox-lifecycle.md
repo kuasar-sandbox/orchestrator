@@ -373,6 +373,14 @@ Resume and export use the same local Snapshot view while saving, then switch to
 the completed file. Resume allocates its own writable memory. The previous
 holder's memory remains accounted for until all readers have released it.
 
+After a controller restart, memory retirement and deletion remain pending until
+the complete durable inventory has been recovered. Creating or publishing the
+controller's State does not establish readiness. Cleanup keeps the capture proof
+until the recovered controller has persisted settlement. A settled historical
+receipt has no remaining source-pool memory charge and does not require that old
+pool to remain configured; any successor budget still belongs to its own live
+lease and resource pool.
+
 A second Pause waits for this previous memory save by default. The wait is
 cancelable, leaves the sandbox `running`, and holds neither the SID lifecycle lock
 nor the source-operation grant. After waiting, admission rechecks the exact

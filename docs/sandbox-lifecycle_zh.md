@@ -392,6 +392,11 @@ checkpoint 元数据引用该 holder。保存期间 Resume 和 Export 使用同�
 视图，文件完成后切换到文件。Resume 分配独立的可写内存；旧 holder 的内存只有在所有
 读者释放后才释放资源记账。
 
+资源控制器重启后，内存退役和删除继续保留待重试状态，直到完整恢复持久库存；仅创建或
+发布控制器 State 不代表已经就绪。恢复后的控制器持久结清记账之前，清理不能删除捕获
+证明。已结清的历史 receipt 不再占用源池内存，因此不要求旧源池继续存在于配置中；
+后继运行的预算仍由自己的有效 lease 和资源池负责。
+
 再次 Pause 默认等待上一轮内存保存。等待可取消，沙箱保持 `running`，不持有 SID
 生命周期锁或 source-operation grant；结束后重新验证实例及 RunID。请求
 `{"noWaitForPreviousMemorySave":true}` 可以在保存仍未完成时立即返回 409。

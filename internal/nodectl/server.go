@@ -42,6 +42,10 @@ type Server struct {
 // Listen binds the UDS. Must be called before Serve. Removes any
 // stale socket file at the path.
 func (s *Server) Listen() error {
+	if s.State == nil {
+		return errors.New("server: resource state is required")
+	}
+	s.State.retentionOwner().inventoryReady.Store(false)
 	if s.Logf == nil {
 		s.Logf = func(string, ...any) {}
 	}
@@ -102,6 +106,10 @@ func (s *Server) Listen() error {
 		return fail(fmt.Errorf("server: chmod: %w", err))
 	}
 	s.listener = l
+	// Host lifecycle workers can already see State while Listen is restoring
+	// inventory. Publish absence/settlement authority only after every recovery
+	// scan and listener initialization has succeeded under the owner lock.
+	s.State.retentionOwner().inventoryReady.Store(true)
 	s.Logf("controller listening on %s", s.Path)
 	return nil
 }
@@ -112,6 +120,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		return errors.New("server: not listening")
 	}
 	defer func() {
+		s.State.retentionOwner().inventoryReady.Store(false)
 		_ = s.Owner.Close()
 	}()
 	go func() {
@@ -152,6 +161,9 @@ func (s *Server) Serve(ctx context.Context) error {
 // Stop closes the listener (in-flight handlers continue until they
 // return).
 func (s *Server) Stop() error {
+	if s.State != nil {
+		s.State.retentionOwner().inventoryReady.Store(false)
+	}
 	s.mu.Lock()
 	s.stopped = true
 	s.mu.Unlock()

@@ -361,6 +361,16 @@ func (s *State) restoreRetained(r *retainedReceipt) error {
 		}
 		return fmt.Errorf("conflicting retained memory inventory")
 	}
+	if r.Settled {
+		// A release tombstone preserves exact replay/owner identity, but no
+		// longer projects a charge into its historical source pool. Operators
+		// may remove or rename that fully drained pool before this restart.
+		if root.retained == nil {
+			root.retained = make(map[string]*retainedReceipt)
+		}
+		root.retained[r.SandboxID] = cloneRetained(r)
+		return nil
+	}
 	p := root.retainedPool(r.Memory.SourcePool)
 	if p == nil {
 		return fmt.Errorf("unknown retained memory pool %q", r.Memory.SourcePool)
@@ -371,7 +381,7 @@ func (s *State) restoreRetained(r *retainedReceipt) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if r.Stage == retentionPrepared && !r.Settled {
+	if r.Stage == retentionPrepared {
 		active := cloneReservation(&r.Source)
 		active.Conn, active.RetentionPrepared = nil, true
 		active.LastHeartbeatAt = time.Time{}
@@ -381,7 +391,7 @@ func (s *State) restoreRetained(r *retainedReceipt) error {
 		if root.pools != nil {
 			root.bindings[r.SandboxID] = r.Memory.SourcePool
 		}
-	} else if !r.Settled {
+	} else {
 		next, err := checkedAggregateAdd(p.reservedMemory, r.Memory.Bytes, "retained memory")
 		if err != nil {
 			return err

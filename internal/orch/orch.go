@@ -274,6 +274,11 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 	if st != nil {
 		o.runs.persist = func(m store.RunPoolOwnership) error { return st.SaveRunPoolOwnership(context.Background(), m) }
 		o.runs.erase = func(m store.RunPoolOwnership) error {
+			if m.RetirementOperationID != "" {
+				if _, err := o.retirementResourceState(); err != nil {
+					return err
+				}
+			}
 			if p := o.memoryPressure.Load(); p != nil && m.TaskID != "" {
 				if err := p.state.RetireExecution(m.TaskID, m.RunID); err != nil {
 					return err

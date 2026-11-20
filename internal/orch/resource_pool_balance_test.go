@@ -29,6 +29,7 @@ func balanceFixture(t *testing.T) (*Orchestrator, *nodectl.State, *types.Sandbox
 	if err := o.ConfigureMemoryPressure(context.Background(), s, a, r.Pressure); err != nil {
 		t.Fatal(err)
 	}
+	listenResourceStateForTest(t, s)
 	sb := &types.Sandbox{ID: "moving", RunID: "run-moving", State: types.StateRunning, RunningSinceUnixNano: time.Now().Add(-time.Minute).UnixNano()}
 	capacity := nodectl.Resources{MemoryBytes: 1 << 30, CPUMilli: 2000}
 	if _, err := s.ReservePlacement(sb.ID, sb.RunID, capacity, nodectl.OperationCreate, "numa1", nil); err != nil {

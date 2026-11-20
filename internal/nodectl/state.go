@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
@@ -165,6 +166,9 @@ type cacheDemandAge struct {
 
 type State struct {
 	mu sync.Mutex
+	// Configuration publishes State before durable inventory is recovered.
+	// Only the server that owns the controller socket may publish readiness.
+	inventoryReady atomic.Bool
 	// The root gate covers routed insertions and checkpoint ownership changes.
 	// Holding it across route + mutation prevents a stale Sync from recreating
 	// the same SID in its previous pool after a cross-pool handoff.
@@ -208,6 +212,14 @@ type State struct {
 	OperationalMargin Resources
 	AllocatablePool   Resources
 	Wm                Watermarks
+}
+
+// InventoryReady reports whether the controller has recovered its durable
+// inventory and initialized its listener. An empty State before that boundary
+// cannot prove the absence of a retained memory obligation. Pool ledgers share
+// the readiness of their controller root.
+func (s *State) InventoryReady() bool {
+	return s != nil && s.retentionOwner().inventoryReady.Load()
 }
 
 func NewState(physicalMem uint64, physicalCPUMilli uint64,

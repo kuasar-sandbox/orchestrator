@@ -101,8 +101,12 @@ func (o *Orchestrator) previousMemorySavePending(ctx context.Context, sb *types.
 }
 
 func (o *Orchestrator) retainedMemoryPending(ctx context.Context, sid string) (bool, error) {
-	if p := o.memoryPressure.Load(); p != nil {
-		if _, ok := p.state.RetainedMemory(sid); ok {
+	state, err := o.retirementResourceState()
+	if err != nil {
+		return true, err
+	}
+	if state != nil {
+		if _, ok := state.RetainedMemory(sid); ok {
 			return true, nil
 		}
 	}

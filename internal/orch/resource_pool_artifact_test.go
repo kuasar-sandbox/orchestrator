@@ -82,6 +82,7 @@ func TestResourcePoolArtifactPreparationMovesBeforeFinalLaunch(t *testing.T) {
 	if err := o.ConfigureMemoryPressure(ctx, s, a, resolved.Pressure); err != nil {
 		t.Fatal(err)
 	}
+	listenResourceStateForTest(t, s)
 	if err := o.StartRunPools(ctx); err != nil {
 		t.Fatal(err)
 	}
