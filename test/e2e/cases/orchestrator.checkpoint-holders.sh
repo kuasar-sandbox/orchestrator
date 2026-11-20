@@ -326,7 +326,28 @@ ledger 0 0 all-settled
 resume_checkpoint_guest 0
 check_memory final
 ledger 0 1 final-running
-delete_checkpoint_guest
+# Reintroduce the same private storage fault after verifying ordinary recovery.
+# Terminal deletion must cancel every pending save before waiting for its unit;
+# serial SIGTERM waits would consume 20 seconds per detached holder.
+python3 - "$CHECKPOINT_ROOT" "$FILLER" <<'PY'
+import os,sys
+v=os.statvfs(sys.argv[1]);amount=v.f_bavail*v.f_frsize-64*1024*1024
+assert amount>0
+with open(sys.argv[2],'wb') as f:os.posix_fallocate(f.fileno(),0,amount);os.fsync(f.fileno())
+PY
+advance_memory 4
+pause_checkpoint_guest snapshot 0
+hold_payload_failure terminal-a
+ledger 1 0 terminal-a-paused
+resume_checkpoint_guest 0
+check_memory terminal-b
+advance_memory 5
+pause_checkpoint_guest snapshot 0
+hold_payload_failure terminal-b
+ledger 2 0 terminal-b-paused
+code=$(req DELETE "/sandboxes/$SID" "$AK")
+[ "$code" = 204 ] || fail "pending-holder delete=$code"
+wait_sandbox_state "$SID" missing 120 || fail 'terminal cleanup waited for pending holder saves'
 python3 - "$WORK/sandbox-resource.sock.retained" "$SID" <<'PY'
 import json,pathlib,sys
 assert not [p for p in pathlib.Path(sys.argv[1]).glob('*.json') if json.loads(p.read_text())['sandbox_id']==sys.argv[2]],'terminal empty account remains'

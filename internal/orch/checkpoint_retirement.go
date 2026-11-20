@@ -158,6 +158,34 @@ func (o *Orchestrator) discardRetiredMemoryForDelete(ctx context.Context, sb *ty
 	if sb.State != types.StateDeleting || g == nil || g.sid != sb.ID || g.instanceID != sb.InstanceID || g.baseDir != sb.BaseDir {
 		return errors.New("discarding checkpoint memory requires deleting source ownership")
 	}
+	// Deleting ownership and its source grant have withdrawn every durable
+	// root. Revoke all committed holders before waiting for any unit: a newer
+	// save can retain an older holder's RAM pin until its own cancellation.
+	// SIGTERM alone leaves detached executables waiting for their saves and
+	// makes each blocked holder consume systemd's full stop timeout.
+	for _, m := range retiring {
+		record, err := o.readRunCapture(ctx, m)
+		if err != nil {
+			return err
+		}
+		if record == nil || !record.Committed || !record.RuntimeRetired || record.Aborted || record.RAMReleased {
+			continue
+		}
+		dir := filepath.Join(m.RetirementBaseDir, "checkpoint")
+		ref := memorycheckpoint.Reference{CheckpointID: record.CheckpointID, MemoryID: record.MemoryID}
+		// Supplement the external source grant with the SDK's publication fence.
+		guard, err := artifact.LockCheckpointSources(ctx, dir)
+		if err != nil {
+			return err
+		}
+		err = memorycheckpoint.DeleteCheckpoint(ctx, dir, ref)
+		err = errors.Join(err, guard.Close())
+		if err != nil {
+			// An unavailable/old holder still uses the existing destruction-only
+			// path below. Its exact unit and physical reader proofs remain required.
+			o.log.Warn("terminal holder cancellation unavailable; fencing units", "sid", sb.ID, "run_id", m.RunID, "err", err)
+		}
+	}
 	// Fence the new runtime as well as old holders: a resumed VM may still own
 	// an immutable predecessor memfd. No proof is published from disconnection.
 	fenced := map[string]bool{}
