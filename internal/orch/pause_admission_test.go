@@ -287,7 +287,7 @@ func TestCaptureSynchronousFallbackPreservesPreviousMemoryWithoutNewIntent(t *te
 	if err := f.o.st.Put(context.Background(), f.sb); err != nil {
 		t.Fatal(err)
 	}
-	current := store.RunPoolOwnership{RunID: f.sb.RunID, Kind: runKindSandbox, TaskID: f.sb.ID, Pool: old.Pool, Unit: "sandbox-runner@" + f.sb.RunID + ".service"}
+	current := store.RunPoolOwnership{RunID: f.sb.RunID, Kind: runKindSandbox, TaskID: f.sb.ID, Pool: old.Pool, ResourcePool: old.ResourcePool, Unit: "sandbox-runner@" + f.sb.RunID + ".service"}
 	if err := f.o.st.SaveRunPoolOwnership(context.Background(), current); err != nil {
 		t.Fatal(err)
 	}
