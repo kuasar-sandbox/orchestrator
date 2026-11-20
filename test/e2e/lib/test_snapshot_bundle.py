@@ -113,6 +113,10 @@ class SnapshotBundleGraph(unittest.TestCase):
         result = self.validate(extra_cfg={"Boot": {"Root": {"Base": located("1" * 64)}}})
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_fixed_runtime_digest_ref_is_not_a_bundle_manifest_selector(self):
+        result = self.validate(extra_cfg={"Boot": {"RuntimeRef": "file://sandbox-runtime.bundle@digest:" + A}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_c_composition_requires_new_history_and_separate_carriers(self):
         parser = shipped_assertion("PY_BUNDLE")
         result = self.validate(parser=parser)

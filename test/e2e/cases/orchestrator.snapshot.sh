@@ -396,7 +396,7 @@ def strings(value):
     elif isinstance(value, list):
         for nested in value:
             yield from strings(nested)
-bad = [value for value in strings(cfg) if value.startswith("file://") and
+bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value and
        re.fullmatch(r"file://([0-9a-f]{64})\.bundle@manifest:\1@location:bundle", value) is None]
 if bad:
     raise SystemExit(f"unpublished physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
