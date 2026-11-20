@@ -34,7 +34,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 )
 
 var version = "0.2.0-dev"
@@ -72,7 +71,7 @@ func main() {
 	case "config":
 		err = configCmd(os.Args[2:], log)
 	case "workspace-storage":
-		err = workspacedisk.Serve(context.Background(), os.Stdin, os.Stdout)
+		err = workspaceStorageCmd(os.Stdin, os.Stdout)
 	case "check-snapshot-runtime":
 		err = checkSnapshotRuntimeCmd(os.Stdin, os.Stdout)
 	case "checkpoint-cleanup":
