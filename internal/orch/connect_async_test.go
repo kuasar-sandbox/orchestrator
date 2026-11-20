@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 func TestConnectExistingTargetIgnoresMalformedMigrationToken(t *testing.T) {
@@ -724,6 +725,11 @@ func newAsyncConnectTestOrchestratorWithLogger(t *testing.T, cfg *config.Config,
 	t.Cleanup(func() { _ = st.Close() })
 	o := New(cfg, st, lc, stubVS{}, logger)
 	o.allowLegacyAssignmentWithoutRunSession = true
+	// This launcher models readiness without starting a ctl server. Its
+	// runtime has the explicit legacy response for the new read-only query.
+	o.captureStateReader = func(context.Context, string, ctl.CaptureStateQuery) (ctl.CaptureState, error) {
+		return ctl.CaptureState{}, ctl.ErrCaptureStateUnsupported
+	}
 	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())

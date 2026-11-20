@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config{}) }
@@ -107,6 +108,12 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 	t.Cleanup(func() { st.Close() })
 	o := New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	o.allowLegacyAssignmentWithoutRunSession = true
+	// Most lifecycle fixtures exercise an older runtime through a fake CLI.
+	// Model its explicit unsupported reply; holder tests replace this with a
+	// real protocol server or a precise capture-state reader.
+	o.captureStateReader = func(context.Context, string, ctl.CaptureStateQuery) (ctl.CaptureState, error) {
+		return ctl.CaptureState{}, ctl.ErrCaptureStateUnsupported
+	}
 	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
 	// General unit fixtures model a controller after startup reconciliation.
 	// Recovery-boundary tests construct Orchestrator directly and control this

@@ -28,7 +28,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 wait_paused_cleanup "$SID" || fail "baseline cleanup"
 B_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 B_ARTIFACT="$(readlink -f "$B_LOCAL")"
-B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
+B_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$B_LOCAL") || fail "invalid B capture pair"
 "$BIN/sandbox-ctl" info --json "$B_LOCAL" >"$WORK/b-local.json"
 checkpoint_local_metadata "$SID" "$WORK/b-checkpoint.json"
 exec_through_connect "$SID" "$EXEC_TOKEN" "BASELINE_RESTORE_$RANDOM"
@@ -67,8 +67,9 @@ wait_unit_journal_contains "$PORTABLE_W_UNIT" \
     || { tail -40 "$WORK/w-portable-local.journal" | sed 's/^/  unit| /'; fail "working-set Pause did not preserve guest page cache"; }
 wait_paused_cleanup "$SID" || fail "W checkpoint cleanup did not finish"
 checkpoint_local_metadata "$SID" "$WORK/w-checkpoint.json"
-B_RUNTIME_ARTIFACT=$(python3 - "$WORK/b-local.json" "$WORK/w-portable-local.json" "$B_SNAPSHOT_BASENAME" "$WORK/b-checkpoint.json" "$WORK/w-checkpoint.json" <<'PY'
+B_RUNTIME_ARTIFACT=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$WORK/b-local.json" "$WORK/w-portable-local.json" "$B_LOCAL_PAIR" "$WORK/b-checkpoint.json" "$WORK/w-checkpoint.json" "$W_PORTABLE_ARTIFACT" <<'PY'
 import json, os, sys
+from disk_checkpoint import memory_descriptor, wait_memory_collected
 
 with open(sys.argv[1], encoding="utf-8") as source:
     parent = json.load(source)
@@ -77,22 +78,34 @@ with open(sys.argv[2], encoding="utf-8") as source:
 
 parent_refs = parent.get("FromRefs") or []
 memory_refs = working.get("FromRefs") or []
-if len(memory_refs) != len(parent_refs) + 1 or not memory_refs[0].startswith("file://"):
-    raise SystemExit(f"working-set from_refs={memory_refs!r}, want local B plus {parent_refs!r}")
-memory_path = memory_refs[0][len("file://"):].split("@", 1)[0]
-if os.path.basename(memory_path) != sys.argv[3]:
-    raise SystemExit(f"working-set memory lower={memory_refs[0]!r}, want {sys.argv[3]!r}")
-if memory_refs[1:] != parent_refs:
-    raise SystemExit(f"working-set lower tail={memory_refs[1:]!r}, want inherited {parent_refs!r}")
+# Fast local capture stores its exact local parent in the descriptor; only
+# the opaque external suffix belongs to snapshot.cfg. Publication below must
+# still materialize one historical H before that unchanged external suffix.
+if memory_refs != parent_refs:
+    raise SystemExit(f"working-set external suffix={memory_refs!r}, want {parent_refs!r}")
+descriptor = memory_descriptor(sys.argv[6])
+parent_ref = json.loads(sys.argv[3])[2]
+expected_parent = "file://" + os.path.join(os.path.dirname(sys.argv[6]), parent_ref.removeprefix("file://"))
+assert descriptor.get("parents") == [expected_parent], (descriptor, expected_parent)
+assert descriptor.get("working_set") is True, descriptor
+parent_path = expected_parent.removeprefix("file://").split("@", 1)[0]
+parent_descriptor = memory_descriptor(parent_path)
+assert descriptor["memory_id"] != parent_descriptor["memory_id"], (descriptor, parent_descriptor)
 
 with open(sys.argv[4], encoding="utf-8") as source:
     before = json.load(source)
 with open(sys.argv[5], encoding="utf-8") as source:
     after = json.load(source)
 assert before["checkpoint_id"] != after["checkpoint_id"], (before, after)
+assert descriptor["checkpoint_id"] == after["checkpoint_id"], (descriptor, after)
+assert parent_descriptor["checkpoint_id"] == before["checkpoint_id"], (parent_descriptor, before)
 assert before["root"] == after["root"], (before, after)
 assert (before.get("disks") or []) == (after.get("disks") or []), (before, after)
 assert before["artifact"] != after["artifact"], (before, after)
+# wait_paused_cleanup already proved RunDir is gone. Holder-protected BaseDir
+# garbage is collected asynchronously after saving, without delaying Pause.
+print("checkpoint GC:", json.dumps(wait_memory_collected(os.path.dirname(sys.argv[6]),
+      descriptor["memory_id"], [before["artifact"]])), file=sys.stderr)
 print(before["artifact"])
 PY
 ) || fail "local B/W graph validation failed"
@@ -148,6 +161,8 @@ if invalid_refs:
     raise SystemExit(f"portable W has non-manifest memory refs: {invalid_refs!r}")
 if refs[0] == sys.argv[3]:
     raise SystemExit("portable W self and B memory lower collapsed to one ref")
+if refs[1:] != parent_refs:
+    raise SystemExit(f"portable W changed the external suffix: {refs[1:]!r}, want {parent_refs!r}")
 print(refs[0][len("manifest://"):], len(refs))
 PY
 ) || fail "portable W/B layer validation failed"
@@ -293,6 +308,7 @@ BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 BUNDLE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 case "$BUNDLE_TARGET" in *.bundle) ;; *) fail "bundle symlink target is not .bundle: $BUNDLE_TARGET" ;; esac
 BUNDLE_A_KEY=$(basename "$BUNDLE_TARGET" .bundle)
+BUNDLE_A_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle A capture pair"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_LOCAL" >"$WORK/bundle-local.json" \
     || fail "local Manifest Bundle is unreadable"
@@ -317,13 +333,36 @@ BUNDLE_B_KEY=$(basename "$BUNDLE_B_TARGET" .bundle)
     || fail "bundle B target does not encode its root ManifestKey: $BUNDLE_B_TARGET"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_B_TARGET" >"$WORK/bundle-b.json" || fail "bundle B snapshot.cfg is unreadable"
-# A working-set parent can be trimmed into a new historical S even when it is
-# the only local parent (sandboxer#380). Validate B's actual memory graph, not
-# an identity that was only stable for legacy/all-dirty A. Restore below still
-# has to prove that the embedded history preserves A's guest state.
-python3 - "$WORK/bundle-b.json" "$WORK/bundle-local.json" "$BUNDLE_B_TARGET" "$BUNDLE_B_KEY" <<'PY_BUNDLE_B' \
-    || fail "bundle B does not own its bounded manifest-only memory graph"
-import json, re, sys, zipfile
+BUNDLE_B_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle B capture pair"
+# Local capture keeps its history behind the memory descriptor, just like
+# tarstream. Its public snapshot.cfg retains only the external suffix. A is
+# still a necessary carrier; the actual B restore below must consume it.
+python3 - "$WORK/bundle-b.json" "$WORK/bundle-local.json" "$BUNDLE_A_PAIR" "$BUNDLE_B_PAIR" "$BUNDLE_B_KEY" <<'PY_BUNDLE_LOCAL_B' \
+    || fail "local Bundle B changed its external suffix or capture identity"
+import json, sys
+current, first = (json.load(open(path)) for path in sys.argv[1:3])
+assert (current.get("FromRefs") or []) == (first.get("FromRefs") or []), (current, first)
+before, after = (json.loads(raw) for raw in sys.argv[3:5])
+assert after[2] == "file://" + sys.argv[5] + ".bundle@manifest:" + sys.argv[5], after
+assert before[2] != after[2] and before[3] != after[3], (before, after)
+PY_BUNDLE_LOCAL_B
+[ -e "$BUNDLE_TARGET" ] || fail "local Bundle B lost necessary A memory carrier"
+
+# Ordinary publication materializes one portable H. A named location stores
+# each logical object in its own Bundle; it does not embed full local A/B into
+# the new root. Validate that existing format through the public CLI.
+BUNDLE_PUBLISH_DIR="$WORK/bundle-portable"
+BUNDLE_B_PORTABLE_REF=$(MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" publish --quiet \
+    --manifest-config "$WORK/manifest.yaml" --to-ref-location "bundle=file://$BUNDLE_PUBLISH_DIR" "$BUNDLE_B_TARGET") \
+    || fail "publish local Bundle B to portable Bundle graph"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    --ref-location "bundle=file://$BUNDLE_PUBLISH_DIR" "$BUNDLE_B_PORTABLE_REF" >"$WORK/bundle-b-portable.json" \
+    || fail "portable Bundle B is unreadable"
+[ "$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL")" = "$BUNDLE_B_PAIR" ] \
+    || fail "portable Bundle B publication changed the retained local pair"
+python3 - "$WORK/bundle-b-portable.json" "$WORK/bundle-local.json" "$BUNDLE_PUBLISH_DIR" "$BUNDLE_B_PORTABLE_REF" "$BUNDLE_A_KEY" "$BUNDLE_B_KEY" <<'PY_BUNDLE_B' \
+    || fail "portable Bundle B does not own one historical memory layer"
+import json, pathlib, re, sys, zipfile
 with open(sys.argv[1], encoding="utf-8") as stream:
     cfg = json.load(stream)
 with open(sys.argv[2], encoding="utf-8") as stream:
@@ -331,20 +370,23 @@ with open(sys.argv[2], encoding="utf-8") as stream:
 refs, suffix = cfg.get("FromRefs") or [], parent.get("FromRefs") or []
 if len(refs) != 1 + len(suffix) or refs[1:] != suffix:
     raise SystemExit(f"B memory refs={refs!r}, want one history plus inherited {suffix!r}")
-if any(not isinstance(ref, str) or re.fullmatch(r"manifest://[0-9a-f]{64}", ref) is None for ref in refs):
-    raise SystemExit(f"B memory refs are not logical Manifest references: {refs!r}")
-if "manifest://" + sys.argv[4] in refs:
+def located_key(ref):
+    match = re.fullmatch(r"file://([0-9a-f]{64})\.bundle@manifest:\1@location:bundle", ref) if isinstance(ref, str) else None
+    if not match:
+        raise SystemExit(f"not a canonical published Bundle selector: {ref!r}")
+    return match[1]
+root, history = located_key(sys.argv[4]), located_key(refs[0])
+if root == history:
     raise SystemExit("B memory graph references its own root")
-with zipfile.ZipFile(sys.argv[3]) as archive:
-    names = set(archive.namelist())
-if "bundle/refs" in names:
-    raise SystemExit("bundle B unexpectedly retained external Bundle locations")
-# Only the new local history is owned by B. The inherited suffix retains its
-# portable remote provenance; requiring those published template manifests to
-# be copied into B would cross the external boundary we just verified above.
-member = "manifest/" + refs[0].removeprefix("manifest://")
-if member not in names:
-    raise SystemExit(f"bundle B omits referenced memory history manifest {member!r}")
+if root in sys.argv[5:] or history in sys.argv[5:]:
+    raise SystemExit("portable B reused a full local Snapshot as root/history")
+for key in (root, history):
+    with zipfile.ZipFile(pathlib.Path(sys.argv[3]) / (key + ".bundle")) as archive:
+        names = set(archive.namelist())
+    if "bundle/refs" in names:
+        raise SystemExit("portable Bundle unexpectedly retained external Bundle locations")
+    if {name for name in names if name.startswith("manifest/")} != {"manifest/" + key}:
+        raise SystemExit(f"portable Bundle is not the exact single-root carrier {key!r}")
 def strings(value):
     if isinstance(value, str):
         yield value
@@ -354,13 +396,14 @@ def strings(value):
     elif isinstance(value, list):
         for nested in value:
             yield from strings(nested)
-bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value]
+bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value and
+       re.fullmatch(r"file://([0-9a-f]{64})\.bundle@manifest:\1@location:bundle", value) is None]
 if bad:
-    raise SystemExit(f"physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
+    raise SystemExit(f"unpublished physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
 PY_BUNDLE_B
 
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_CHAIN_RESTORE_$RANDOM"
-wait_sandbox_state "$SID" running 20 || fail "bundle B with embedded memory history did not restore"
+wait_sandbox_state "$SID" running 20 || fail "local Bundle B with descriptor memory history did not restore"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-chain-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-chain-read.out" \
@@ -380,27 +423,49 @@ BUNDLE_ROOT_KEY=$(basename "$BUNDLE_PROMOTE_TARGET" .bundle)
 wait_paused_cleanup "$SID" || fail "Bundle C checkpoint cleanup remained pending"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_PROMOTE_TARGET" >"$WORK/bundle-c.json" || fail "bundle C snapshot.cfg is unreadable"
-python3 - "$WORK/bundle-c.json" "$WORK/bundle-local.json" "$BUNDLE_PROMOTE_TARGET" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY_BUNDLE' \
-    || fail "Bundle C failed bounded historical memory composition"
-import json, sys, zipfile
+BUNDLE_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle C capture pair"
+python3 - "$WORK/bundle-c.json" "$WORK/bundle-local.json" "$BUNDLE_B_PAIR" "$BUNDLE_LOCAL_PAIR" "$BUNDLE_ROOT_KEY" <<'PY_BUNDLE_LOCAL_C' \
+    || fail "local Bundle C changed its external suffix or capture identity"
+import json, sys
+current, first = (json.load(open(path)) for path in sys.argv[1:3])
+assert (current.get("FromRefs") or []) == (first.get("FromRefs") or []), (current, first)
+before, after = (json.loads(raw) for raw in sys.argv[3:5])
+assert after[2] == "file://" + sys.argv[5] + ".bundle@manifest:" + sys.argv[5], after
+assert before[2] != after[2] and before[3] != after[3], (before, after)
+PY_BUNDLE_LOCAL_C
+[ -e "$BUNDLE_B_TARGET" ] && [ -e "$BUNDLE_TARGET" ] \
+    || fail "local Bundle C lost necessary A/B memory carriers"
+BUNDLE_C_PORTABLE_REF=$(MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" publish --quiet \
+    --manifest-config "$WORK/manifest.yaml" --to-ref-location "bundle=file://$BUNDLE_PUBLISH_DIR" "$BUNDLE_PROMOTE_TARGET") \
+    || fail "publish local Bundle C to portable Bundle graph"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    --ref-location "bundle=file://$BUNDLE_PUBLISH_DIR" "$BUNDLE_C_PORTABLE_REF" >"$WORK/bundle-c-portable.json" \
+    || fail "portable Bundle C is unreadable"
+python3 - "$WORK/bundle-c-portable.json" "$WORK/bundle-local.json" "$BUNDLE_PUBLISH_DIR" "$BUNDLE_C_PORTABLE_REF" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" "$BUNDLE_ROOT_KEY" <<'PY_BUNDLE' \
+    || fail "portable Bundle C failed bounded historical memory composition"
+import json, pathlib, re, sys, zipfile
 current, first = (json.load(open(path)) for path in sys.argv[1:3])
 refs, suffix = current.get("FromRefs") or [], first.get("FromRefs") or []
 if len(refs) != 1 + len(suffix) or refs[1:] != suffix:
     raise SystemExit(f"C memory refs={refs!r}, want one new history plus {suffix!r}")
-history = refs[0].removeprefix("manifest://")
-if len(history) != 64 or history in sys.argv[4:]:
+def located_key(ref):
+    match = re.fullmatch(r"file://([0-9a-f]{64})\.bundle@manifest:\1@location:bundle", ref) if isinstance(ref, str) else None
+    if not match:
+        raise SystemExit(f"not a canonical published Bundle selector: {ref!r}")
+    return match[1]
+root, history = located_key(sys.argv[4]), located_key(refs[0])
+if history == root or history in sys.argv[5:] or root in sys.argv[5:]:
     raise SystemExit(f"history did not receive a new immutable identity: {refs[0]}")
-with zipfile.ZipFile(sys.argv[3]) as archive:
-    names = set(archive.namelist())
-if "bundle/refs" in names or "manifest/" + history not in names:
-    raise SystemExit("C does not own its historical memory member")
-for old in sys.argv[4:]:
-    if "manifest/" + old in names:
-        raise SystemExit(f"C copied retired full Snapshot {old} instead of composing memory")
+for key in (root, history):
+    with zipfile.ZipFile(pathlib.Path(sys.argv[3]) / (key + ".bundle")) as archive:
+        names = set(archive.namelist())
+    if "bundle/refs" in names or {name for name in names if name.startswith("manifest/")} != {"manifest/" + key}:
+        raise SystemExit("portable C copied full local Snapshots instead of publishing separate single-root memory carriers")
 PY_BUNDLE
-[ ! -e "$BUNDLE_B_TARGET" ] && [ ! -e "$BUNDLE_TARGET" ] \
-    || fail "Bundle C cleanup retained obsolete A/B carriers"
-BUNDLE_LOCAL_PAIR=$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL") || fail "invalid Bundle capture pair"
+[ "$(checkpoint_pair "$SID" snapshot "$BUNDLE_LOCAL")" = "$BUNDLE_LOCAL_PAIR" ] \
+    || fail "portable Bundle C publication changed the retained local pair"
+[ -e "$BUNDLE_B_TARGET" ] && [ -e "$BUNDLE_TARGET" ] \
+    || fail "portable publication removed still-required local A/B carriers"
 E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --json --socket "$WORK/node-ctl.socket" >"$WORK/bundle-publish.json" \
     || fail "bundle keep-source export failed"
@@ -418,6 +483,15 @@ BUNDLE_REMOTE_REF=$(json_field "$WORK/bundle-publish.json" snapshotRef)
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
     || fail "published Bundle root $BUNDLE_REMOTE_REF is unreadable from Store"
+python3 - "$WORK/bundle-remote.json" "$WORK/bundle-local.json" "$BUNDLE_REMOTE_REF" "$BUNDLE_A_KEY" "$BUNDLE_B_KEY" "$BUNDLE_ROOT_KEY" <<'PY_BUNDLE_STORE' \
+    || fail "Store publication changed the bounded portable memory graph"
+import json, re, sys
+current, first = (json.load(open(path)) for path in sys.argv[1:3])
+refs, suffix = current.get("FromRefs") or [], first.get("FromRefs") or []
+assert len(refs) == 1 + len(suffix) and refs[1:] == suffix, (refs, suffix)
+assert all(isinstance(ref, str) and re.fullmatch(r"manifest://[0-9a-f]{64}", ref) for ref in refs), refs
+assert refs[0] != sys.argv[3] and refs[0].removeprefix("manifest://") not in sys.argv[4:], refs
+PY_BUNDLE_STORE
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_LOCAL_RESUME_$RANDOM"
 wait_sandbox_state "$SID" running 20 || fail "retained Bundle C did not resume from its local checkpoint"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
@@ -526,5 +600,5 @@ wait_sandbox_state "$SID" missing 120 || fail "portable E move finalizer retaine
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$E_BUNDLE_REMOTE_REF" >"$WORK/portable-e-moved-remote.json" \
     || fail "portable E move removed shared published output"
-echo "==> PASS: Bundle drove self-contained S chain plus E capture, exact publish, retained-local Wake, and cold Store restore via KMT"
+echo "==> PASS: Bundle drove local S history and bounded portable publication, E capture, retained-local Wake, and cold Store restore via KMT"
 echo "PASS orchestrator.snapshot.sh"

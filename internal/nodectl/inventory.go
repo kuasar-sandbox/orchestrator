@@ -56,6 +56,9 @@ func (i *Inventory) Recover(state *State) error {
 		return fmt.Errorf("lease inventory mkdir: %w", err)
 	}
 	controlPIDs := make(map[int]bool)
+	if err := i.recoverRetained(state, controlPIDs); err != nil {
+		return err
+	}
 	if err := i.scanLeases(state, controlPIDs); err != nil {
 		return err
 	}
@@ -134,6 +137,10 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 				break
 			}
 			lease.ControllerSocket = controllerSocket
+			if state.retainedSourceLease(lease.SandboxID, owner, lease.CgroupPath) {
+				// The source is represented exactly once by its prepared B or R.
+				break
+			}
 			cacheMaximum, cacheErr := resource.CacheMaximumFromFeatures(lease.ClientFeatures)
 			if cacheErr != nil {
 				if err := i.installUnknownLease(state, path, owner, cacheErr); err != nil {
@@ -365,7 +372,7 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 				}
 				return err
 			}
-			if !populated || state.HasCgroup(path) {
+			if !populated || state.retainedSourceCgroup(path) || state.HasCgroup(path) {
 				return nil
 			}
 			pids, err := readCgroupPIDs(path)

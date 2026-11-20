@@ -32,7 +32,22 @@ func attachPressure(t *testing.T, o *Orchestrator) *nodectl.State {
 	if err := o.ConfigureMemoryPressure(context.Background(), s, a, nodectl.DefaultPressurePolicy()); err != nil {
 		t.Fatal(err)
 	}
+	listenResourceStateForTest(t, s)
 	return s
+}
+
+// State-only fixtures still cross the real controller readiness boundary.
+// No RPC worker is needed when the test invokes the ledger directly.
+func listenResourceStateForTest(t *testing.T, state *nodectl.State) {
+	t.Helper()
+	server := &nodectl.Server{Path: filepath.Join(shortOrchestratorTestDir(t), "resource.sock"), State: state}
+	if err := server.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Stop()
+		_ = server.Owner.Close()
+	})
 }
 
 func resourcePausedFixture(t *testing.T) (*Orchestrator, *types.Sandbox, string, *nodectl.State, string) {

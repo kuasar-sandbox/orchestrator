@@ -309,7 +309,7 @@ func (o *Orchestrator) pauseForPressureMode(ctx context.Context, candidate *type
 	if fs.Type == unix.TMPFS_MAGIC || fs.Type == unix.RAMFS_MAGIC {
 		return errors.New("resource pause requires disk-backed checkpoint storage")
 	}
-	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: ifIdle}
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: ifIdle, NoWaitForPreviousMemorySave: true}
 	request.SnapshotPolicy, err = o.resolveSnapshotPolicy(sb.Metadata, sandboxcfg.SnapshotPolicy{})
 	if err != nil {
 		return err

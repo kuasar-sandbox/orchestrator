@@ -110,6 +110,13 @@ func (r *runnerMetrics) usageSample(ctx context.Context, offline bool) {
 	if err != nil {
 		return
 	}
+	r.emitUsageView(ctx, view, offline)
+}
+
+// The holder retirement path captures the view before acknowledging that a new
+// run may own the shared paths. Publishing this value performs no further file
+// or ctl.sock reads.
+func (r *runnerMetrics) emitUsageView(ctx context.Context, view nativeusage.View, offline bool) {
 	if view.Live != nil {
 		r.currentEpoch = view.Live.RunEpoch
 	}
@@ -141,7 +148,7 @@ func (r *runnerMetrics) usageSample(ctx context.Context, offline bool) {
 	}
 	// Status and saved measurements keep their own timestamps in the same
 	// request. A stalled receiver costs at most one send on the exit path.
-	err = r.usage.Emit(ctx, status)
+	err := r.usage.Emit(ctx, status)
 	if err == nil || errors.Is(err, hostmetrics.ErrPartialAcceptance) {
 		r.lastSaved = sequence
 	}

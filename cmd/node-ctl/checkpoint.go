@@ -12,15 +12,20 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
 
-// This short-lived, tenant-key-bound tool is invoked only after conductor has
-// committed S/E and fenced its users. Sandboxer owns interpretation/deletion;
-// this adapter supplies the existing node ref-location policy.
+const checkpointCleanupDeferredExitCode = orch.CheckpointMemoryReadersBusyExitCode
+
+var errCheckpointCleanupDeferred = errors.New("checkpoint cleanup deferred while memory readers are active")
+
+// This tenant-key-bound tool collects a committed paused source. Active memory
+// readers produce an explicit deferred result; Sandboxer owns interpretation
+// and deletion, and this adapter supplies the existing node ref-location policy.
 func checkpointCleanupCmd(args []string) error {
 	fs := flag.NewFlagSet("checkpoint-cleanup", flag.ContinueOnError)
 	sid := fs.String("sandbox-id", "", "capture producer identity")
@@ -73,5 +78,14 @@ func checkpointCleanupCmd(args []string) error {
 	} else {
 		err = storage.CleanupCheckpoint(ctx, checkpoint)
 	}
-	return errors.Join(err, storage.Close())
+	return checkpointCleanupResult(err, storage.Close(), *list)
+}
+
+func checkpointCleanupResult(cleanupErr, closeErr error, inspect bool) error {
+	// Preserve every genuine I/O/close error. The SDK exposes this sentinel
+	// only when the memory-reader lock is busy and cleanup changed no files.
+	if !inspect && closeErr == nil && errors.Is(cleanupErr, artifact.ErrCheckpointMemoryReadersBusy) {
+		return fmt.Errorf("%w: %v", errCheckpointCleanupDeferred, cleanupErr)
+	}
+	return errors.Join(cleanupErr, closeErr)
 }

@@ -156,7 +156,8 @@ func (o *Orchestrator) abandonSandboxDeleteWorker(sid string) {
 }
 
 // startPausedCleanupRetry coalesces cleanup for a paused row whose exact
-// runner, network, or RunDir owner could not yet be released and persisted.
+// runner, network, or RunDir owner could not yet be released and persisted, or
+// whose BaseDir still needs checkpoint GC after those runtime fields are clear.
 // The worker is part of acceptedOps so orderly shutdown keeps dependencies
 // alive until the current attempt finishes; lifecycle cancellation stops later
 // retries and leaves the durable paused owner for startup reconciliation.
@@ -238,6 +239,11 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 	if sb.State != types.StateRunning && sb.State != types.StatePausing && sb.State != types.StateDeleting {
 		return fmt.Errorf("orch: terminal cleanup requires running or deleting sandbox %s", sb.ID)
 	}
+	if sb.State == types.StateDeleting {
+		if err := o.discardRetiredMemoryForDelete(ctx, sb); err != nil {
+			return err
+		}
+	}
 	if sb.RunID != "" {
 		if err := o.fenceSandboxRunner(ctx, sb.RunID); err != nil {
 			return err
@@ -261,6 +267,16 @@ func (o *Orchestrator) cleanupSandboxTerminalOwnership(ctx context.Context, sb *
 	if sb.RunDir != "" {
 		if err := removeRunDir(sb.RunDir); err != nil {
 			return fmt.Errorf("remove sandbox RunDir %s: %w", sb.RunDir, err)
+		}
+	}
+	if sb.State != types.StateDeleting {
+		// An exited successor owns neither an old holder's RAM nor its service
+		// directory. Finish this exact run's fence/network/RunDir before waiting
+		// for SID history. The exact-run fence above still protects a pending
+		// holder when it is itself the current run; hard delete keeps all of its
+		// original generation and reader fences before removing BaseDir.
+		if err := o.ensureRetiredMemoryReleased(ctx, sb.ID); err != nil {
+			return err
 		}
 	}
 	removeBaseDir := o.removeSandboxBaseDir
@@ -510,6 +526,14 @@ func (o *Orchestrator) retirePausedCleanupWorker(sid string) (bool, error) {
 	if pausedCleanupPending(current) {
 		return false, nil
 	}
+	if current != nil && current.State == types.StatePaused {
+		// Runtime fields are already clear. Keep only the paused BaseDir's GC
+		// retry responsibility, including reader-busy and source-lock errors.
+		// Select fresh refs under the same lock as retiring this SID worker.
+		if _, err := o.inspectOrCleanupCheckpoint(ctx, current, false); err != nil {
+			return false, err
+		}
+	}
 	o.pausedCleanupMu.Lock()
 	delete(o.pausedCleanupActive, sid)
 	o.pausedCleanupMu.Unlock()
@@ -647,6 +671,17 @@ func sandboxHasLocalOwnership(sb *types.Sandbox) bool {
 // directory is removed. An already missing/inactive unit is an equivalent Stop
 // result, but ResetFailed and the final liveness readback remain mandatory.
 func (o *Orchestrator) fenceSandboxRunner(ctx context.Context, runID string) error {
+	if err := o.ensureRunnerMayFence(ctx, runID); err != nil {
+		return err
+	}
+	return o.fenceSandboxRunnerUnit(ctx, runID)
+}
+
+// Destruction callers must first own the deleting SID and its exclusive source
+// grant. Unstarted capture recovery additionally holds the preparation writer
+// fence and proves no capture or retained charge exists. Other callers use
+// fenceSandboxRunner's pending-memory guard.
+func (o *Orchestrator) fenceSandboxRunnerUnit(ctx context.Context, runID string) error {
 	unit, err := o.resolveRunUnit(ctx, runKindSandbox, runID)
 	if err != nil {
 		return err

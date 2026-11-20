@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -41,6 +43,35 @@ type RunPoolOwnership struct {
 	TaskID         string `json:"task_id,omitempty"`
 	CapacityMemory uint64 `json:"capacity_memory,omitempty"`
 	CapacityCPU    uint64 `json:"capacity_cpu,omitempty"`
+	// A retiring runner remains an owned unit after its normal runtime leaves.
+	// Scalars preserve the exact comparable identity used by runIndex CASes.
+	RetirementOperationID  string `json:"retirement_operation_id,omitempty"`
+	RetirementCheckpointID string `json:"retirement_checkpoint_id,omitempty"`
+	RetirementInstanceID   string `json:"retirement_instance_id,omitempty"`
+	RetirementBaseDir      string `json:"retirement_base_dir,omitempty"`
+	RetainCheckpoint       bool   `json:"retain_checkpoint,omitempty"`
+	Role                   string `json:"role,omitempty"`
+	MemoryID               string `json:"memory_id,omitempty"`
+	MemoryEpoch            uint64 `json:"memory_epoch,omitempty"`
+	ParentRetired          bool   `json:"parent_retired,omitempty"`
+}
+
+const RunRoleMemoryHolder = "memory-holder"
+
+func (s *Store) RunPoolOwnership(ctx context.Context, runID string) (RunPoolOwnership, bool, error) {
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT ownership FROM run_pool_ownership WHERE run_id=?`, runID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunPoolOwnership{}, false, nil
+	}
+	if err != nil {
+		return RunPoolOwnership{}, false, err
+	}
+	var r RunPoolOwnership
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		return r, false, err
+	}
+	return r, true, nil
 }
 
 func (s *Store) SaveRunPoolOwnership(ctx context.Context, r RunPoolOwnership) error {

@@ -154,6 +154,23 @@ func (r *runIndex) assigned(runID string, reservation *runReservation) {
 	}
 }
 
+// releaseRuntimeSlot retains the exact unit and its durable holder role while
+// returning only the normal runtime slot. forget is reserved for confirmed
+// holder exit; its erase callback may retire the resource execution identity.
+func (r *runIndex) releaseRuntimeSlot(runID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m, ok := r.metadata[runID]; !ok || m.Role != store.RunRoleMemoryHolder || !m.ParentRetired {
+		return
+	}
+	delete(r.waiting, runID)
+	delete(r.owners, runID)
+	if r.states == nil {
+		r.states = map[string]string{}
+	}
+	r.states[runID] = store.RunRoleMemoryHolder
+}
+
 func (r *runIndex) markState(runID, state string) {
 	if r == nil {
 		return

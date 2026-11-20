@@ -76,7 +76,8 @@ wait_sandbox_state() { # $1=sandbox id, $2=state, $3=attempts(optional)
 wait_paused_cleanup() { # $1=sandbox id, $2=attempts(optional)
     local sid="$1" attempts="${2:-120}"
     for _ in $(seq 1 "$attempts"); do
-        if python3 - "$WORK/lib/node-ctl.db" "$sid" "$WORK/lib/sandboxes/$sid" <<'PY'
+        if python3 - "$WORK/lib/node-ctl.db" "$sid" "$WORK/lib/sandboxes/$sid" "$EXECUTE_RUN_ROOT/sandboxes/$sid" <<'PY'
+from pathlib import Path
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute("""
@@ -85,10 +86,15 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
           from sandboxes where id=?
     """, (sys.argv[2],)).fetchone()
 want = ("paused", "", "", "", "", "", "", "", "", sys.argv[3])
-raise SystemExit(0 if row == want else 1)
+if row != want or not Path(sys.argv[3]).is_dir():
+    raise SystemExit(1)
+# A checkpoint holder owns an independent sibling directory. Ordinary RunDir
+# must be absent while saving may continue in that separately owned directory.
+run_dir = Path(sys.argv[4])
+raise SystemExit(0 if not run_dir.exists() and not run_dir.is_symlink() else 1)
 PY
         then
-            [ ! -e "$EXECUTE_RUN_ROOT/sandboxes/$sid" ] && [ -d "$WORK/lib/sandboxes/$sid" ] && return 0
+            return 0
         fi
         sleep 0.1
     done

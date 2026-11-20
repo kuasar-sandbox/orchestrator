@@ -362,6 +362,111 @@ Explicit Pause body may be empty or:
 
 Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field, even with a null value, returns 400 before freeze/capture/lifecycle side effects. Explicit merge_ref/drop_caches fields in the Pause Header have the same restriction. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
 
+### Checkpoint memory saving
+
+`checkpoint.mode=local` (tarstream) and `bundle` select saving formats. Both
+support holder handoff and background saving.
+
+For a runtime started with checkpoint support, a memory capture with an actual
+checkpoint ID can complete Pause after freezing its immutable memory, releasing
+runtime resources and removing the complete ordinary RunDir. The existing
+`sandbox-ctl` remains an owned memory holder while it writes the payload. Its
+temporary socket lives in an exclusively created sibling of the canonical RunDir,
+with a short identity hash and random suffix. The capture record binds the exact
+directory path, device/inode and immutable identity marker; the holder owns that
+directory's lock independently of the ordinary runtime. Cleanup removes only its
+own socket, marker and directory, never the RunDir or an ancestor. A replaced or
+locked directory and unknown contents remain protected. Creating the sibling
+requires write permission on RunDir's parent and must succeed before capture commit.
+Resume and export use the same local Snapshot view while saving, then switch to
+the completed file. Resume allocates its own writable memory. The previous
+holder's memory remains accounted for until all readers have released it.
+
+After a controller restart, memory retirement and deletion remain pending until
+the complete durable inventory has been recovered. Creating or publishing the
+controller's State does not establish readiness. Cleanup keeps the capture proof
+until the recovered controller has persisted settlement. A settled historical
+receipt has no remaining source-pool memory charge and does not require that old
+pool to remain configured; any successor budget still belongs to its own live
+lease and resource pool.
+
+Physical RAM release and file availability are separate persistent facts. The
+holder transfers a read-only memfd and its RAM lifetime pin in one SCM_RIGHTS
+message, protecting queued descriptors as well as accepted readers. Readers close
+RAM FDs and mappings before their pin; file-only GC pins and resource ACK retries
+do not retain RAM. Normal completion and crash recovery require an exclusive lock
+on the original, record-bound RAM-pin inode before publishing `RAMReleased`.
+Recovery additionally checks the stable record writer and exact PID/start-time
+death. Publishing `RAMReleased` also requires `Committed` and `RuntimeRetired`.
+For an uncommitted preparation, the same proof can publish only `Aborted`.
+The host retains its exact cleanup owner until the independent holder directory
+is removed, then clears the prepared intent and uses ordinary run-end cleanup.
+Aborting this preparation does not itself release ordinary B or prove VM retirement.
+The host and resource controller share this nonblocking SDK proof. Neither a dead
+process, a missing socket, nor a complete-looking payload is sufficient alone.
+Valid capture records, including aborted intents, and their stable writer/RAM
+lock inodes remain until terminal BaseDir deletion. Advancing the current-memory
+locator cannot hide the exact proof still needed by a retained resource receipt.
+Each retry after an aborted preparation has its own memoryID, increasing epoch,
+JSON and nonce-bound RAM pin; the preparation writer lock is shared across
+attempts of the logical checkpoint.
+This metadata retention does not retain unreferenced payloads: their ordinary
+reference graph continues to determine data-file garbage collection.
+
+If the producer exits without `FileReady`, existing RAM readers retain their
+charge until they close. After the last pin disappears, recovery records
+`RAMReleased` and settles the exact source-pool R even though that snapshot is lost.
+It does not fabricate `FileReady` or mark the capture explicitly discarded. Only
+the exact old run still in `pausing` converges to `dead`, retaining BaseDir and its
+previous historical source. Already-paused rows and running successors keep their
+business state; selecting the lost source for restore/export fails explicitly.
+Unknown identity, missing/replaced proof or unconfirmed runtime retirement keeps
+the responsibility and diagnostic for existing fenced deletion/reset recovery.
+
+Terminal cleanup fences the exact current run, clears its network and removes its
+RunDir before waiting for an older run's RAM or directory cleanup. The exact-run
+fence still protects a current holder that owns pending RAM. Hard deletion retains
+its original all-generation fencing and reader-proof requirements before BaseDir
+removal. Once R is durably settled and the old unit fenced, an independent holder
+directory cleanup error retains only retry ownership; it cannot recreate R or
+block controller startup. Capture JSON, original proof and unsettled-resource
+errors keep their existing failure semantics. Startup's accepted-running/dead
+paths defer only the identified retirement/save-pending conditions to existing
+workers; they never hide malformed records under a broad pending category.
+Startup inventories live admitted handoff candidates before the ledger is ready.
+An intent whose capture never started is cleared only after exact fencing, a
+stable preparation lock and a recheck that no capture/R exists; BaseDir and the
+previous ResumeSource remain available.
+
+A capture that can add a new frozen-RAM obligation waits for the previous
+`RAMReleased` by default; `FileReady` is insufficient. The host uses the SDK
+runtime's explicit capability for admission, independently of saving format or
+whether the API retains a named user checkpoint. Disk-only captures and known
+synchronous fallbacks skip this gate and create no retirement permit. The wait is
+cancelable, leaves the sandbox `running`, and holds neither the SID lifecycle lock
+nor the source-operation grant. After waiting, admission rechecks the exact
+sandbox instance and RunID. To return 409 immediately while the save remains
+pending, send `{"noWaitForPreviousMemorySave":true}`. TTL, idle and resource-pressure
+workers use this no-wait behavior with their existing retry machinery. Restoring
+an older checkpoint does not bypass the same sandbox's outstanding save.
+When the producer is confirmed dead without a published file, a default wait
+returns an explicit unavailable error while RAM remains, without entering
+`pausing`. Physical completion is checked before historical save errors: once
+RAM is released, a successor restored from an intact older checkpoint can pause
+again even if the previous capture is lost. No replacement holder is started.
+
+This is the existing checkpoint capture behavior, not an additional launch mode.
+Non-checkpoint runtimes and captures without a checkpoint ID keep synchronous
+saving. Managed asynchronous saving requires positive support from the current
+Conductor, node-ctl parent, sandboxer runtime, and the resource controller when
+enabled. An older component that explicitly lacks support keeps synchronous
+capture; unknown capability or an unresolved retirement cannot authorize it.
+A new runtime must understand any existing save obligation before it becomes
+`running`. Before rolling back Conductor/node-ctl, finish all outstanding saves.
+Downgrading sandboxer to a reader without the local checkpoint descriptor also
+requires exporting the local checkpoint as a portable S/E and restoring that
+representation; merely waiting for the payload file is insufficient.
+
 `ifIdleSince` optionally adds a continuous-idle threshold to `ifIdle=true`.
 Use an RFC 3339 timestamp with a timezone (subsecond precision is retained).
 Omitted/null keeps the existing behavior. A missing `ifIdle=true`, malformed
@@ -401,9 +506,11 @@ old result in both storage and live views, and a valid paused source remains
 exportable. Reports from a retired RunID cannot change a subsequent run.
 If capture succeeds but the paused transaction fails, the uncommitted operation
 remains pausing for existing recovery; it must not be advertised as running.
-Restart never adopts an interrupted durable pausing
-row merely because its runner is live: it fences that exact runner and uses existing terminal
-cleanup because no new source was committed.
+Restart reconciles a managed retirement against its exact durable capture record.
+A committed, retired and available capture finishes the paused/source transaction;
+a physically released capture without a published file instead finishes the exact
+pausing run as dead. An unknown outcome retains its owner for retry. Without a retirement intent, an interrupted
+pausing row keeps the existing exact-run fencing and terminal cleanup behavior.
 
 `checkpoint=true` atomically retains the immutable E or S/E pair with paused/source and returns
 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Sandbox option
@@ -450,7 +557,26 @@ validates the complete structured result before committing pausing→paused;
 Snapshot stores the actual S/E pair, while E-only capture clears the old Snapshot
 and its association. Capture failure never commits a partial pair.
 
-Ordering is resolve request/quota → accept operation → online Proxy handshake → running→pausing → capture runtime → CommitPaused(id, exact RunID, source, checkpointID) → stop/reset exact runner → detach exact network → selectively clean checkpoint → remove RunDir → publish paused. State/source commit is atomic; remaining RunID/port/RunDir means cleanup pending. Successful stop/detach clears its field by exact CAS. Checkpoint or RunDir cleanup failure blocks new Resume/Wake/Exec ownership and is retried at admission or startup. BaseDir/checkpoint remains. Capture failure restores running only while the same RunID still owns the pausing row and no exit result has been accepted; an accepted exit follows existing terminal cleanup. Failed attempts retain the old source and create no success alias, never downgrading S to E.
+Pause waits for a previous memory save before accepting its operation or entering
+`pausing`. It then resolves request/quota, completes the online Proxy handshake,
+captures the runtime and atomically commits the exact RunID's source and paused
+state. Synchronous capture stops/resets the old runner. Checkpoint memory saving
+instead commits its holder role and waits for the old parent to stop/join metrics,
+read its final usage into a private value and acknowledge retirement. It keeps the
+holder unit and its generation directory alive. Both paths detach the exact
+network, attempt selective checkpoint cleanup and clear normal RunDir ownership
+before publishing paused. Memory-reader pins defer only garbage collection; they
+do not delay ordinary runtime cleanup. The holder's payload write and final RAM
+release continue later.
+
+Remaining RunID/port/RunDir means runtime cleanup is pending. Exact CASes clear
+only successfully released ownership; failures block new Resume/Wake/Exec
+ownership and retry at admission or startup. BaseDir/checkpoint remains. A managed
+capture's committed record drives recovery forward even if the command response
+is lost. Only definite precommit rejection/abort permits rollback; an unknown
+outcome preserves the retirement intent. Ordinary synchronous failure keeps its
+existing exact-run rollback/result behavior. No failed capture publishes a partial
+S/E pair or silently changes a memory snapshot into a disk-only source.
 
 <a id="local-disk-checkpoints"></a>
 
@@ -646,14 +772,29 @@ cleanup precondition; a successful Pause does not imply path validation happened
 at node startup. Published artifact retention and deletion remain the caller's
 responsibility, separate from owned checkpoint cleanup.
 
-A committed Pause remains successful if cleanup fails. The last durable RunDir
-ownership marker remains until checkpoint cleanup and ordinary paused cleanup
-succeed. The existing worker retries with a freshly loaded current source under
-the SID lifecycle lock, including after restart. Active or detached exports keep
+A committed Pause remains successful if cleanup fails. A memory-reader pin makes
+the SDK return `artifact.ErrCheckpointMemoryReadersBusy` before modifying aliases
+or deleting anything. For ordinary cleanup, `node-ctl checkpoint-cleanup` maps only
+this result, with successful storage close, to its internal deferred exit code 80.
+The owner defers garbage collection and finishes ordinary paused cleanup without
+waiting for the memory save. After RAM settlement and runner fencing, the holder
+run-end worker releases the old run ownership and schedules the existing SID
+paused-cleanup worker. The current paused row owns the remaining BaseDir GC work,
+including when RunDir is empty and after restart. Reader/source-fence contention
+and I/O failures keep this worker retrying; they do not retain RAM accounting or
+recreate runtime ownership. Each attempt selects the current source under the SID
+lifecycle lock. A running successor is skipped, and a paused successor is checked
+against its own current source rather than the retired run's selection.
+
+For other failures during ordinary paused cleanup, the last durable RunDir ownership marker remains until
+checkpoint cleanup and ordinary paused cleanup succeed. The existing worker
+retries with a freshly loaded current source under the SID lifecycle lock,
+including after restart. Active or detached exports keep
 their read fence; cleanup never waits for an export while holding the lock it
 needs. Resume/Wake/Exec obey the existing pending-cleanup admission contract.
 Missing candidates count as finished; permission, I/O, and identity errors retain
-retry ownership. Ordinary Kill and terminal BuildBaseDir deletion retain their
+retry ownership. Inspection and hard deletion do not accept deferred collection as
+permission to delete. Ordinary Kill and terminal BuildBaseDir deletion retain their
 existing finalizers. Shared/external artifacts are never reclaimed by this step.
 
 <a id="releasing-disk-versions-after-resume"></a>
@@ -1107,7 +1248,7 @@ Create/Connect/Wake/route activation/native exec/exec-session/migration import s
 
 After durable acceptance, finalizer waits for late launch ownership to finish, then stops/resets exact unit with inactive readback, detaches inside allocation fence, full-owner-CAS clears network tuple, removes RunDir and BaseDir and exactly hard-deletes. Only successful durable network clear releases the detached-port fence. Later directory/row failures retain path/runner ownership without blocking new Attach. Hard-delete publishes terminal Extension/object observation and the final route Delete. Failures retain unfinished ownership and retry in-process or after startup. Fresh Create's route-applied barrier precedes resource launch; failed acceptance cleans runtime ownership while retaining formed data, then exactly commits dead with automatic responsibility and publishes its management projection.
 
-CommitPaused atomically stores state/source. RunID, port and RunDir clear individually only after successful Stop/Reset fencing, Detach, selective checkpoint cleanup and RemoveAll. RunDir CAS also clears its envd/CI UDS paths. Each failure retains remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
+CommitPaused atomically stores state/source. RunID, port and RunDir clear individually after exact runtime retirement or Stop/Reset fencing, Detach, selective checkpoint cleanup and ordinary RunDir removal. Only the explicit memory-reader busy result permits deferring collection while this runtime cleanup completes. RunDir CAS also clears its envd/CI UDS paths. Other failures retain remaining retry fields. Fully cleaned paused state retains BaseDir with checkpoint data and its source-operation lock, plus the source. Resume/Wake/Exec finish cleanup backlog before taking a new runtime owner and atomically restore canonical RunDir/UDS on paused→starting. Runtime cleanup never removes paused BaseDir; explicit Delete removes it and then the row.
 
 When `resource_listen` is enabled, local admission uses the selected resource pool's
 source-independent [effective-zone matrix](node-resource.md#rawzone-and-effective-zone).

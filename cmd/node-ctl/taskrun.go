@@ -30,7 +30,7 @@ import (
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
 // optional task-local artifact preparation, and starts the sandbox-ctl child.
 // runAssignedSandbox has locked the run pidfile before this function is called.
-func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
+func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger, retirements ...<-chan configsock.RunRetirementEvent) error {
 	// Keep a registered signal channel across the handoff from preparation to
 	// the runtime, including the file baseline read before Start.
 	stopSignals := make(chan os.Signal, 2)
@@ -47,7 +47,7 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 			metricsIdentity = runnerMetricsIdentity{sandboxID: sandboxID, stableID: spec.StableID, runID: runID, baseDir: spec.BaseDir, runDir: spec.Workdir}
 		},
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
-			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log)
+			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log, retirements...)
 		},
 		log: log,
 	})
@@ -363,7 +363,7 @@ type sandboxRunReportedError struct{ err error }
 func (e sandboxRunReportedError) Error() string { return e.err.Error() }
 func (e sandboxRunReportedError) Unwrap() error { return e.err }
 
-func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File, metricID runnerMetricsIdentity, stopSignals <-chan os.Signal, log *slog.Logger) error {
+func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File, metricID runnerMetricsIdentity, stopSignals <-chan os.Signal, log *slog.Logger, retirements ...<-chan configsock.RunRetirementEvent) error {
 	metrics := newRunnerMetrics(metricID, log)
 	if metrics != nil {
 		metrics.captureUsageBaseline(context.Background())
@@ -402,10 +402,47 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 		sampled = make(chan struct{})
 		go metrics.sampleUntil(sampleCtx, sampled)
 	}
-	err := cmd.Wait()
+	var events <-chan configsock.RunRetirementEvent
+	if len(retirements) > 0 {
+		events = retirements[0]
+	}
+	retirement := newParentRetirement(socket, sandboxID, runID, metrics, func() {
+		if stop != nil {
+			stop()
+			<-sampled
+			stop = nil
+		}
+	}, log)
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	var err error
+	for waiting := true; waiting; {
+		select {
+		case event, open := <-events:
+			if !open {
+				events = nil
+				continue
+			}
+			retirement.accept(event)
+		case err = <-waited:
+			waiting = false
+		}
+	}
+	retirement.stopSampling()
+	if len(retirements) > 0 && !retirement.retired {
+		if roleErr := retirement.resolveExitedRole(); roleErr != nil {
+			// Unknown role cannot authorize a final read of shared paths or a
+			// normal execution report. Durable host reconciliation owns recovery.
+			return sandboxRunReportedError{err: errors.Join(err, roleErr)}
+		}
+	}
+	if retirement.retired {
+		if err != nil {
+			return sandboxRunReportedError{err: err}
+		}
+		return nil
+	}
 	if metrics != nil {
-		stop()
-		<-sampled
 		finalCtx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 		metrics.usageSample(finalCtx, true)
 		cancel()
