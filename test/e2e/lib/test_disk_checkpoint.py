@@ -85,6 +85,57 @@ class DiskCheckpoint(unittest.TestCase):
                 carrier.addfile(tarfile.TarInfo(name))
         return checkpoint
 
+    def memory_attempt(self, *, memory="memory-one", epoch=1, legacy=False):
+        locator = {"checkpoint_id": IDENTITY, "memory_id": memory, "epoch": epoch}
+        digest = disk_checkpoint.hashlib.sha256(IDENTITY.encode()).hexdigest()
+        path = self.checkpoint / "memory" / (digest + ".json") if legacy else self.checkpoint / "memory" / digest / (memory + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(locator))
+        return locator, path
+
+    def test_memory_record_uses_exact_current_attempt_not_latest_or_legacy(self):
+        locator, path = self.memory_attempt()
+        self.memory_attempt(memory="memory-newer", epoch=2)
+        self.memory_attempt(memory="legacy-other", epoch=3, legacy=True)
+        (self.checkpoint / "current-memory.json").write_text(json.dumps(locator))
+        self.assertEqual(disk_checkpoint.memory_record(self.checkpoint), locator)
+        # Polling a captured locator must not switch to a subsequently published
+        # attempt when the current pointer advances.
+        (self.checkpoint / "current-memory.json").write_text(json.dumps(
+            {"checkpoint_id": IDENTITY, "memory_id": "memory-newer", "epoch": 2}))
+        self.assertEqual(disk_checkpoint.memory_record(self.checkpoint, locator), locator)
+
+    def test_memory_record_reads_legacy_only_for_the_exact_locator(self):
+        locator, path = self.memory_attempt(legacy=True)
+        self.assertEqual(disk_checkpoint.memory_record(self.checkpoint, locator), locator)
+        for field, value in (("checkpoint_id", "another-checkpoint"), ("memory_id", "another-memory"), ("epoch", 2), ("epoch", True)):
+            changed = {**locator, field: value}
+            path.write_text(json.dumps(changed))
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                disk_checkpoint.memory_record(self.checkpoint, locator)
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            disk_checkpoint.memory_record(self.checkpoint, locator)
+
+    def test_memory_record_rejects_present_invalid_attempt_without_legacy_fallback(self):
+        locator, path = self.memory_attempt()
+        self.memory_attempt(legacy=True)
+        for field, value in (("checkpoint_id", "another-checkpoint"), ("memory_id", "another-memory"), ("epoch", 2), ("epoch", True)):
+            path.write_text(json.dumps({**locator, field: value}))
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                disk_checkpoint.memory_record(self.checkpoint, locator)
+        path.write_text("invalid json")
+        with self.assertRaises(json.JSONDecodeError):
+            disk_checkpoint.memory_record(self.checkpoint, locator)
+
+    def test_memory_record_rejects_invalid_locator_before_opening_attempt(self):
+        locator, path = self.memory_attempt()
+        for field, value in (("memory_id", "../memory-one"), ("memory_id", "back\\\\slash"),
+                             ("memory_id", "."), ("memory_id", ""), ("checkpoint_id", ""),
+                             ("epoch", 0), ("epoch", True), ("epoch", "1"), ("epoch", 1 << 64)):
+            with self.subTest(field=field, value=value), self.assertRaises(AssertionError):
+                disk_checkpoint.memory_record(self.checkpoint, {**locator, field: value})
+
     def test_artifact_payload_is_stable_across_zip_clock_boundary(self):
         with mock.patch("zipfile.time.localtime", return_value=(2026, 1, 1, 0, 0, 0, 3, 1, -1)):
             self.artifact_payload()

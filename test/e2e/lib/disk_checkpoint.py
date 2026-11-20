@@ -136,6 +136,31 @@ def local_metadata(database, sid):
     return result
 
 
+def memory_record(directory, locator=None):
+    """Read only the attempt named by the current (or captured) locator."""
+    directory = Path(directory)
+    if locator is None:
+        locator = json.loads((directory / "current-memory.json").read_text())
+    checkpoint = locator["checkpoint_id"]
+    memory = locator["memory_id"]
+    epoch = locator["epoch"]
+    assert isinstance(checkpoint, str) and checkpoint, locator
+    assert isinstance(memory, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", memory) and memory not in (".", ".."), locator
+    assert type(epoch) is int and 0 < epoch < 1 << 64, locator
+    digest = hashlib.sha256(checkpoint.encode()).hexdigest()
+    path = directory / "memory" / digest / (memory + ".json")
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        # Older captures retain their original receipt path. Never select a
+        # newer attempt or fall back after a present record fails validation.
+        path = directory / "memory" / (digest + ".json")
+        raw = path.read_text()
+    record = json.loads(raw)
+    assert type(record["epoch"]) is int and (record["checkpoint_id"], record["memory_id"], record["epoch"]) == (checkpoint, memory, epoch), record
+    return record
+
+
 def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log, phase):
     """Prove the managed path, including a save that finished before observation."""
     with sqlite3.connect(database, timeout=5) as db:
@@ -144,8 +169,7 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
     assert row and row[0] == phase and row[4] == "snapshot", row
     directory = Path(row[1]) / "checkpoint"
     locator = json.loads((directory / "current-memory.json").read_text())
-    record_path = directory / "memory" / (hashlib.sha256(locator["checkpoint_id"].encode()).hexdigest() + ".json")
-    record = json.loads(record_path.read_text())
+    record = memory_record(directory, locator)
     producer = record["producer"]
     assert record["committed"] and record["runtime_retired"] and not record.get("aborted") and not record.get("discarded"), record
     assert producer["sandbox_id"] == sid and producer["instance_id"] == row[2] and producer["run_id"], producer
@@ -197,7 +221,7 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
         else:
             assert row[3] and row[3] != producer["run_id"] and len(current) == 1, "resume did not obtain one new run and B"
             assert current[0]["peer_pid"] != record["holder"]["pid"] and current[0]["allocatable_memory"] > 0, current
-        latest = json.loads(record_path.read_text())
+        latest = memory_record(directory, locator)
         if receipt.get("settled"):
             assert latest["ram_released"], "R was released before the physical RAM fact"
         projected = sum(item["memory"]["bytes"] for item in receipts if not item.get("settled") and item["stage"] != "prepared")
