@@ -2937,7 +2937,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	for _, sb := range acceptedRunning {
 		o.log.Info("reconcile: accepted result for running sandbox", "sid", sb.ID, "run_id", sb.RunID)
 		if err := o.finalizeSandboxResultOnce(ctx, sb.ID, sb.RunID); err != nil {
-			if errors.Is(err, errSourceOperationBusy) {
+			if errors.Is(err, errSourceOperationBusy) || errors.Is(err, errRetirementPending) || errors.Is(err, api.ErrPreviousMemorySavePending) {
 				o.startSandboxResultCleanup(sb.ID, sb.RunID)
 				continue
 			}
@@ -2947,7 +2947,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		if err := o.finalizeMissingRunningSandboxOnce(ctx, sb); err != nil {
-			if errors.Is(err, errSourceOperationBusy) {
+			if errors.Is(err, errSourceOperationBusy) || errors.Is(err, errRetirementPending) || errors.Is(err, api.ErrPreviousMemorySavePending) {
 				o.startMissingRunningSandboxCleanup(sb)
 				continue
 			}
