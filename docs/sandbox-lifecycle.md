@@ -397,7 +397,11 @@ RAM FDs and mappings before their pin; file-only GC pins and resource ACK retrie
 do not retain RAM. Normal completion and crash recovery require an exclusive lock
 on the original, record-bound RAM-pin inode before publishing `RAMReleased`.
 Recovery additionally checks the stable record writer and exact PID/start-time
-death, and applies only after `Committed` and `RuntimeRetired` are established.
+death. Publishing `RAMReleased` also requires `Committed` and `RuntimeRetired`.
+For an uncommitted preparation, the same proof can publish only `Aborted`.
+The host retains its exact cleanup owner until the independent holder directory
+is removed, then clears the prepared intent and uses ordinary run-end cleanup.
+Aborting this preparation does not itself release ordinary B or prove VM retirement.
 The host and resource controller share this nonblocking SDK proof. Neither a dead
 process, a missing socket, nor a complete-looking payload is sufficient alone.
 Valid capture records, including aborted intents, and their stable writer/RAM

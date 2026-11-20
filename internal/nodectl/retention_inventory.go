@@ -169,7 +169,7 @@ func recoverRetentionCapture(r *retainedReceipt) (*memorycheckpoint.CaptureRecor
 	if err := validateRetentionProof(r, proof); err != nil {
 		return nil, err
 	}
-	if !proof.Committed || !proof.RuntimeRetired || proof.RAMReleased || proof.Aborted || proof.Discarded {
+	if proof.Committed && !proof.RuntimeRetired || proof.RAMReleased || proof.Aborted || proof.Discarded {
 		return proof, nil
 	}
 	recovered, err := memorycheckpoint.RecoverMemoryRelease(context.Background(), r.Capture.CapturePath, *proof)

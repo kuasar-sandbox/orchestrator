@@ -280,7 +280,7 @@ func (o *Orchestrator) readRunCapture(ctx context.Context, m store.RunPoolOwners
 // All proof locks are nonblocking, including when a lifecycle caller owns SID.
 func (o *Orchestrator) recoverRunCapture(ctx context.Context, m store.RunPoolOwnership) (*artifact.CaptureRecord, error) {
 	record, err := o.readRunCapture(ctx, m)
-	if err != nil || record == nil || !record.Committed || !record.RuntimeRetired || record.RAMReleased || record.Aborted || record.Discarded {
+	if err != nil || record == nil || record.Committed && !record.RuntimeRetired || record.RAMReleased || record.Aborted || record.Discarded {
 		return record, err
 	}
 	path, err := memorycheckpoint.RecordPath(filepath.Join(m.RetirementBaseDir, "checkpoint"), m.RetirementCheckpointID, record.MemoryID)
@@ -292,7 +292,7 @@ func (o *Orchestrator) recoverRunCapture(ctx context.Context, m store.RunPoolOwn
 		return nil, err
 	}
 	record = &recovered.Record
-	if recovered.ProducerExited && !record.FileReady && !record.RAMReleased {
+	if recovered.ProducerExited && !record.Aborted && !record.FileReady && !record.RAMReleased {
 		// Existing readers can still own frozen RAM. Keep the physical obligation
 		// retryable without advertising this source as a successful new capture.
 		return record, errors.Join(api.ErrPreviousMemorySavePending,
@@ -695,6 +695,12 @@ func (o *Orchestrator) reconcileRetiredRun(ctx context.Context, observed store.R
 	if record.Aborted {
 		unlock := o.lifecycle.Lock(current.TaskID)
 		defer unlock()
+		// A killed preparation cannot perform the SDK's ordinary private
+		// directory cleanup. Keep its exact owner until this cleanup succeeds;
+		// never follow or remove the successor's canonical RunDir.
+		if err := memorycheckpoint.RemoveHolderDirectory(*record); err != nil {
+			return errors.Join(errRetirementPending, err)
+		}
 		producer := &types.Sandbox{ID: current.TaskID, RunID: current.RunID}
 		if err := o.abortCheckpointRetirement(ctx, producer, ctl.HostRetirementPermit{OperationID: current.RetirementOperationID}); err != nil {
 			return err

@@ -409,8 +409,11 @@ socket、marker 和本代目录，不处理 RunDir 或任何父目录；替换�
 结束 RAM FD/映射，再关闭 pin；文件型 GC pin 与资源 ACK 重试不能延长 RAM 占有。
 正常完成和异常恢复均须对记录绑定的原 RAM pin inode 取得排他锁，才发布
 `RAMReleased`。异常恢复还须取得稳定 record writer 锁、确认准确 PID/start-time 已退出，
-且仅处理已经 `Committed` 和 `RuntimeRetired` 的捕获。host 与资源控制器共用 SDK
-非阻塞证明；进程死亡、socket 消失或看似完整的 payload 都不能单独证明释放。
+发布 `RAMReleased` 还须确认 `Committed` 与 `RuntimeRetired`。未提交的准备记录在
+同样证明下只能发布 `Aborted`；host 保留准确清理所有权直到独立 holder 目录删除，
+再清除准备 intent 并沿既有 run-end 流程清理普通执行。准备回滚本身不释放普通 B，
+也不证明 VM 已退役。host 与资源控制器共用同一非阻塞证明；进程死亡、socket 消失
+或看似完整的 payload 都不能单独证明释放。
 有效捕获记录（包括 Aborted intent）及其稳定 writer/RAM 锁 inode 随 BaseDir 保留到
 终端删除，current-memory locator 前移不会隐藏尚待资源 receipt 结算的准确证明。
 Aborted 准备后的每次重试使用独立 memoryID、递增 epoch、JSON 和绑定 nonce 的 RAM pin；

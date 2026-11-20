@@ -28,10 +28,11 @@ import (
 )
 
 type holderProcessSpec struct {
-	Directory string
-	RunDir    string
-	Record    memorycheckpoint.CaptureRecord
-	Retired   bool
+	Directory   string
+	RunDir      string
+	Record      memorycheckpoint.CaptureRecord
+	Retired     bool
+	Uncommitted bool
 }
 
 // Use the actual SDK holder in another kernel process, including its record
@@ -62,11 +63,13 @@ func TestCheckpointHolderProcessHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Record().Update(func(r *memorycheckpoint.CaptureRecord) {
-		r.Committed, r.RuntimeRetired = true, spec.Retired
-		r.SnapshotRef, r.SandboxRef = checkpointSnapshotRef, checkpointSandboxRef
-	}); err != nil {
-		t.Fatal(err)
+	if !spec.Uncommitted {
+		if err := h.Record().Update(func(r *memorycheckpoint.CaptureRecord) {
+			r.Committed, r.RuntimeRetired = true, spec.Retired
+			r.SnapshotRef, r.SandboxRef = checkpointSnapshotRef, checkpointSandboxRef
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	_, _ = fmt.Fprintln(os.Stdout, "ready")
 	scan := bufio.NewScanner(os.Stdin)
@@ -94,13 +97,16 @@ type checkpointHolderProcess struct {
 	spec  holderProcessSpec
 }
 
-func startCheckpointHolder(t *testing.T, f sandboxFinalizerFixture, owner store.RunPoolOwnership, retired bool) *checkpointHolderProcess {
+func startCheckpointHolder(t *testing.T, f sandboxFinalizerFixture, owner store.RunPoolOwnership, retired bool, uncommitted ...bool) *checkpointHolderProcess {
 	t.Helper()
 	spec := holderProcessSpec{Directory: filepath.Join(owner.RetirementBaseDir, "checkpoint"), RunDir: f.sb.RunDir, Retired: retired,
 		Record: memorycheckpoint.CaptureRecord{Version: memorycheckpoint.Version,
 			Producer:     memorycheckpoint.RunIdentity{SandboxID: owner.TaskID, InstanceID: owner.RetirementInstanceID, RunID: owner.RunID},
 			CheckpointID: owner.RetirementCheckpointID, HostOperationID: owner.RetirementOperationID,
 			MemoryID: owner.MemoryID, Epoch: owner.MemoryEpoch, SaveError: "injected interrupted save"}}
+	if len(uncommitted) != 0 {
+		spec.Uncommitted = uncommitted[0]
+	}
 	if err := os.MkdirAll(spec.Directory, 0700); err != nil {
 		t.Fatal(err)
 	}
