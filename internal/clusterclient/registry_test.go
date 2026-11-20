@@ -134,7 +134,7 @@ func TestNodeListEndpointsUseLocatedJointOwners(t *testing.T) {
 	wantSet := map[string]bool{}
 	for _, version := range []clustercfg.MembershipVersion{active, next} {
 		view := clusterstate.MemberView{Version: version.Version, Members: version.MemberIDs()}
-		owners, err := view.Owners(string(clusterstate.NodeListShard), 2)
+		owners, err := view.Owners(clusterstate.NodeListRoutingKey, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -182,7 +182,7 @@ func TestPlacerLinkEndpointsUseLocatedJointOwners(t *testing.T) {
 		return jsonResponse(200, membership), nil
 	})}
 	reg := NewRegistryWithClient("http://bootstrap:7700", client)
-	shardKey := string(clusterstate.PlacerImportSourceShard("source-a"))
+	shardKey := clusterstate.ImportSourceRoutingKey("source-a")
 	eps, err := reg.PlacerLinkEndpoints(t.Context(), shardKey)
 	if err != nil {
 		t.Fatalf("placer_link endpoints: %v", err)

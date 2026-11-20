@@ -50,7 +50,7 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 		result := routerTestReserveResult(t, "stable", "/g", "rk", "node.invalid:9443", types.ProfileBare)
 		result.Route.State = "reserved"
 		result.Route.NodeSandboxID = "stable-g3"
-		result.Route.RouteRevision = 9
+		result.Route.RouteRevision = routeVersionForTest(9, 0)
 		result.ExecSession = &execSessionResult{ExecAccessToken: "kat1.exec"}
 		_ = json.NewEncoder(w).Encode(result)
 	}))
@@ -91,7 +91,7 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 		t.Fatalf("public response = %#v", payload)
 	}
 	cached := rt.cachedRoute("/g", "rk", "stable")
-	if cached == nil || cached.NodeSandboxID != "stable-g3" || cached.State != "reserved" || cached.RouteRevision != 9 {
+	if cached == nil || cached.NodeSandboxID != "stable-g3" || cached.State != "reserved" || cached.RouteRevision != routeVersionForTest(9, 0) {
 		t.Fatalf("cached current route = %+v", cached)
 	}
 }

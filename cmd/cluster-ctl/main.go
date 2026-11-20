@@ -1,3 +1,5 @@
+//go:build fdb && cgo
+
 // Command cluster-ctl is the kuasar-sandbox cluster control plane (cluster.md).
 //
 //	cluster-ctl registry  --config <registry.yaml>   # state cluster + node_link hub

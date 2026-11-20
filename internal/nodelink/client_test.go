@@ -193,7 +193,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
+	reg := registry.New(newTestRegistryStores(t), testPlacer{}, 5*time.Second, log)
 	rawAPISecret, err := hex.DecodeString(testAPISecret)
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +289,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		t.Fatalf("create reserve returned a connect result: %+v", res.Connect)
 	}
 	route := &res.Route
-	if route.RouteRevision <= 0 || route.NodeID != "n1" || route.SandboxID == "" ||
+	if !route.RouteRevision.IsCommitted() || route.NodeID != "n1" || route.SandboxID == "" ||
 		route.NodeSandboxID != registry.EncodeNodeSandboxID(route.SandboxID, 0) {
 		t.Fatalf("reserve result: %+v", res)
 	}
@@ -310,7 +310,7 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
+	reg := registry.New(newTestRegistryStores(t), testPlacer{}, 5*time.Second, log)
 
 	ownerMux := http.NewServeMux()
 	ownerMux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)

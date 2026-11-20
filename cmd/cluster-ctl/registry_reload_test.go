@@ -1,3 +1,5 @@
+//go:build fdb && cgo
+
 package main
 
 import (
@@ -12,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/testutil/metadatastore"
 )
 
 func TestRegistryReloadRejectsDirectActiveSwitchWithoutJointConfig(t *testing.T) {
@@ -23,7 +26,7 @@ func TestRegistryReloadRejectsDirectActiveSwitchWithoutJointConfig(t *testing.T)
 	}))
 	cfgState, reg := newRegistryReloadTestRuntime(t, old)
 
-	err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg, nil, nil)
+	err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg, nil)
 	if err == nil {
 		t.Fatal("direct active membership switch without prior joint config should be rejected")
 	}
@@ -42,7 +45,7 @@ func TestRegistryReloadAllowsCutoverFromConfiguredNextMembership(t *testing.T) {
 	}))
 	cfgState, reg := newRegistryReloadTestRuntime(t, old)
 
-	if err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg, nil, nil); err != nil {
+	if err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg, nil); err != nil {
 		t.Fatalf("cutover from old next membership should reload: %v", err)
 	}
 	if got := cfgState.get().Membership.Active; got != 2 {
@@ -50,7 +53,7 @@ func TestRegistryReloadAllowsCutoverFromConfiguredNextMembership(t *testing.T) {
 	}
 }
 
-func TestBuildRegistryTopologyMarksOldGraceReadOnly(t *testing.T) {
+func TestBuildRegistryTopologySeparatesOldGraceFromConnectionOwners(t *testing.T) {
 	cfg := loadRegistryReloadTestConfig(t, `member:
   id: registry-b
   listen: "127.0.0.1:0"
@@ -78,8 +81,8 @@ membership:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(views) != 2 || views[0].Version != 2 || views[0].ReadOnly || views[1].Version != 1 || !views[1].ReadOnly {
-		t.Fatalf("old_grace version must enter shard views as read-only: %+v", views)
+	if len(views) != 1 || views[0].Version != 2 {
+		t.Fatalf("old_grace version must not become a new connection candidate: %+v", views)
 	}
 	if !strings.HasPrefix(views[0].Label, "registry.2.") {
 		t.Fatalf("owner view label = %q, want computed registry.2 label", views[0].Label)
@@ -89,20 +92,23 @@ membership:
 	}
 }
 
-func TestRegistryMemberClientsSeparateShardAndNodeOwnerTimeouts(t *testing.T) {
-	_, nodeOwnerClient, err := registryMemberClient("http://registry-a.example.test", clustercfg.TLS{})
+func TestRegistryNodeOwnerClientRetainsCommandTimeout(t *testing.T) {
+	_, client, err := registryMemberClient("http://registry-a.example.test", clustercfg.TLS{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if nodeOwnerClient.Timeout <= 2*time.Second {
-		t.Fatalf("node-owner member client timeout=%s, want longer than shard short RPC timeout", nodeOwnerClient.Timeout)
+	if client.Timeout != 60*time.Second {
+		t.Fatalf("node-owner timeout=%s", client.Timeout)
 	}
-	_, shardClient, err := registryMemberShortClient("http://registry-a.example.test", clustercfg.TLS{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if shardClient.Timeout != 2*time.Second {
-		t.Fatalf("shard member client timeout=%s, want 2s", shardClient.Timeout)
+}
+
+func TestRegistryReloadRejectsDatabaseReplacement(t *testing.T) {
+	raw := registryReloadTestConfig(1, 0, "registry-a", map[int][]string{1: {"registry-a"}})
+	old := loadRegistryReloadTestConfig(t, raw)
+	cfgState, reg := newRegistryReloadTestRuntime(t, old)
+	path := writeRegistryReloadTestConfig(t, raw+"foundationdb:\n  cluster_file: /different/fdb.cluster\n")
+	if err := reloadRegistryConfig(t.Context(), path, old, cfgState, reg, nil); err == nil || !strings.Contains(err.Error(), "foundationdb") {
+		t.Fatalf("reload err=%v", err)
 	}
 }
 
@@ -130,13 +136,13 @@ func TestRegistryMemberRuntimeWaitReadyRejectsMissingOwner(t *testing.T) {
 
 func newRegistryReloadTestRuntime(t *testing.T, cfg *clustercfg.RegistryConfig) (*registryRuntimeConfig, *registry.Registry) {
 	t.Helper()
-	stores, remoteNodeOwners, err := newRegistryStores(cfg, nil)
+	stores, owners, remoteNodeOwners, err := newRegistryStores(cfg, metadatastore.New().Repositories())
 	if err != nil {
 		t.Fatal(err)
 	}
 	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg.SetRemoteNodeOwners(remoteNodeOwners)
-	return newRegistryRuntimeConfig(cfg), reg
+	return newRegistryRuntimeConfig(cfg, owners), reg
 }
 
 func loadRegistryReloadTestConfig(t *testing.T, raw string) *clustercfg.RegistryConfig {

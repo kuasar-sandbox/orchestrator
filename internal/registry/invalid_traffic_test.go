@@ -23,7 +23,7 @@ func TestInvalidTrafficUpdateDoesNotDeleteRegistryOwnership(t *testing.T) {
 			}
 			route := testE2BRoute(sid, state)
 			route.TrafficPolicyInvalid = true
-			reg.applyRoute(ctx, "n1", &route)
+			testApplyRoute(reg, ctx, "n1", &route)
 			stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 			if err != nil || !found || stored.NodeSandboxID != record.NodeSandboxID {
 				t.Fatalf("lost sandbox=%+v found=%v err=%v", stored, found, err)

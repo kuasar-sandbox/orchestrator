@@ -93,7 +93,7 @@ func TestReserveCreateRollbackDoesNotCrossRecreatedLineage(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+				if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 					t.Fatal(err)
 				}
 				commands := make(chan *routesync.Command, 1)
@@ -192,7 +192,7 @@ func TestReserveConnectReadyReturnsTypedAckWithoutWaitingForReadyEvent(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	var command *routesync.Command
@@ -217,7 +217,7 @@ func TestReserveConnectReadyReturnsTypedAckWithoutWaitingForReadyEvent(t *testin
 	}
 	if result.Connect == nil || result.Connect.NodeSandboxID != record.NodeSandboxID ||
 		result.Route.SandboxID != record.SandboxID || result.Route.NodeSandboxID != record.NodeSandboxID ||
-		result.Route.State != string(StateReady) || result.Route.RouteRevision <= initialRevision {
+		result.Route.State != string(StateReady) || result.Route.RouteRevision.Compare(initialRevision) <= 0 {
 		t.Fatalf("connect result=%+v", result)
 	}
 	stored, _, found, err := reg.stores.GetSandbox(ctx, record.Group, record.RouteKey)
@@ -234,7 +234,7 @@ func TestReserveConnectReservedReturnsItsOwnTypedAckWithoutWaitingForRouteEvent(
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -260,7 +260,7 @@ func TestReserveConnectAuthenticatesStoredAPISecretWithoutSideEffects(t *testing
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	commands := 0
@@ -293,7 +293,7 @@ func TestReserveConnectRejectRollsPausedStateBackWithoutConsumingGeneration(t *t
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -319,7 +319,7 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -374,7 +374,7 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 	}
 	if placements != 2 || result.Connect == nil || result.Route.SandboxID != original.SandboxID ||
 		result.Route.NodeSandboxID != EncodeNodeSandboxID(original.SandboxID, 2) || result.Route.NodeID != "n2" ||
-		result.Route.RouteRevision <= initialRevision {
+		result.Route.RouteRevision.Compare(initialRevision) <= 0 {
 		t.Fatalf("migration result=%+v placements=%d", result, placements)
 	}
 	mu.Lock()
@@ -402,10 +402,10 @@ func checkMigratedParentProjection(t *testing.T, reg *Registry, original, target
 	ctx := context.Background()
 	running := testRouteFromRecord(target, target.NodeSandboxID, routesync.StateRunning)
 	running.InstanceID, running.PressureVersion = "imported-parent", 1
-	reg.applyRoute(ctx, target.NodeID, &running)
+	testApplyRoute(reg, ctx, target.NodeID, &running)
 	late := testRouteFromRecord(original, original.NodeSandboxID, routesync.StateDead)
 	late.InstanceID, late.PressureVersion = original.InstanceID, original.StateVersion+1
-	reg.applyRoute(ctx, original.NodeID, &late)
+	testApplyRoute(reg, ctx, original.NodeID, &late)
 	stored, _, found, err := reg.stores.GetSandbox(ctx, target.Group, target.RouteKey)
 	if err != nil || !found || stored.State != StateReady || stored.InstanceID != running.InstanceID || stored.StateVersion != 1 {
 		t.Fatalf("destination projection state=%+v found=%v err=%v", stored, found, err)
@@ -430,7 +430,7 @@ func TestReserveConnectMigrationStopsOnRequestWideNodeRejection(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, nodeID := range []string{"n1", "n2"} {
-				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+				if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -482,7 +482,7 @@ func TestReserveConnectMigrationRollbackPreservesPlacementTimeRecord(t *testing.
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -529,7 +529,7 @@ func TestReserveConnectMigratesReservedTargetAfterNodeLoss(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -569,7 +569,7 @@ func TestReserveConnectRequiresLiveDataEndpoint(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -590,13 +590,13 @@ func TestReserveDataReadyAuthenticatesTargetTokenAndRequiresEndpoint(t *testing.
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
 
 	result, err := reg.ReserveSandbox(ctx, testDataReserve(record, 49983, record.EnvdAccessToken))
-	if err != nil || result.Route.DataEndpoint != "127.0.0.1:9443" || result.Route.RouteRevision <= 0 || result.Connect != nil {
+	if err != nil || result.Route.DataEndpoint != "127.0.0.1:9443" || !result.Route.RouteRevision.IsCommitted() || result.Connect != nil {
 		t.Fatalf("ready data result=%+v err=%v", result, err)
 	}
 	if _, err := reg.ReserveSandbox(ctx, testDataReserve(record, 49983, record.ForwardAccessToken)); !errors.Is(err, ErrReserveUnauthorized) {
@@ -621,7 +621,7 @@ func TestReserveDataWaiterRetriesWhenConcurrentActivationRollsBack(t *testing.T)
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	firstCommand := make(chan *routesync.Command, 1)
@@ -648,7 +648,7 @@ func TestReserveDataWaiterRetriesWhenConcurrentActivationRollsBack(t *testing.T)
 			})
 			route := testRouteFromRecord(record, cmd.SID, routesync.StateRunning)
 			route.TemplateID = record.TemplateID
-			reg.applyRoute(context.Background(), "n1", &route)
+			testApplyRoute(reg, context.Background(), "n1", &route)
 		}()
 	}})
 

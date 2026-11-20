@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strconv"
 
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -28,7 +28,7 @@ const (
 	RouteLinkDeletePath       = "/route-link/delete"        // DELETE ?group=&route_key=&sid= -> node-link CmdDelete
 	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,profile,resources,metadata} -> BuildReserveResult
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
-	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
+	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox list
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 	maxConnectReserveBody     = 64 << 10
 	maxCreateReserveBody      = 16 << 20
@@ -38,26 +38,26 @@ var errReserveBodyTooLarge = errors.New("reserve body is too large")
 
 // RouteResolve projects the current node control and data targets for a sid.
 type RouteResolve struct {
-	SandboxID              string `json:"sandbox_id"`
-	NodeSandboxID          string `json:"node_sandbox_id"`
-	Group                  string `json:"group"`
-	RouteKey               string `json:"route_key"`
-	NodeID                 string `json:"node_id"`
-	APIEndpoint            string `json:"api_endpoint"`
-	DataEndpoint           string `json:"data_endpoint"`
-	Profile                string `json:"profile"`
-	TemplateID             string `json:"template_id"`
-	StableID               string `json:"stable_id"`
-	APISecret              string `json:"api_secret"`
-	APISecretFingerprint   string `json:"api_secret_fingerprint"`
-	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
-	ServiceSecret          string `json:"service_secret"`
-	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
-	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
-	ForwardAccessToken     string `json:"forward_access_token"`
-	TargetPort             int    `json:"target_port,omitempty"`
-	State                  string `json:"state"`
-	RouteRevision          int64  `json:"route_revision"`
+	SandboxID              string           `json:"sandbox_id"`
+	NodeSandboxID          string           `json:"node_sandbox_id"`
+	Group                  string           `json:"group"`
+	RouteKey               string           `json:"route_key"`
+	NodeID                 string           `json:"node_id"`
+	APIEndpoint            string           `json:"api_endpoint"`
+	DataEndpoint           string           `json:"data_endpoint"`
+	Profile                string           `json:"profile"`
+	TemplateID             string           `json:"template_id"`
+	StableID               string           `json:"stable_id"`
+	APISecret              string           `json:"api_secret"`
+	APISecretFingerprint   string           `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string           `json:"manifest_key_fingerprint"`
+	ServiceSecret          string           `json:"service_secret"`
+	EnvdAccessToken        string           `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string           `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string           `json:"forward_access_token"`
+	TargetPort             int              `json:"target_port,omitempty"`
+	State                  string           `json:"state"`
+	RouteRevision          metadata.Version `json:"route_revision"`
 }
 
 // SandboxReserveReq is the router-to-registry create payload. Config remains a
@@ -110,8 +110,8 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ListItem is one row of a group's sandbox listing (docs/cluster.md#router-addressing: list is
-// served from the group's SandboxStore shard, no cross-group).
+// ListItem is one row of a group's sandbox listing. The typed repository scopes
+// every page to that group and strips protected credentials before projection.
 type ListItem struct {
 	IdleTimeout *int64 `json:"idleTimeout"`
 	SandboxID   string `json:"sandboxID"`
@@ -369,15 +369,22 @@ func (r *Registry) serveDelete(w http.ResponseWriter, req *http.Request) {
 }
 
 // ResolveSID maps a group-scoped (route_key, sid) pair to its data-plane
-// forwarding target. The lookup is exact and quorum-backed; it does not trust
+// forwarding target. The lookup reads Route and Node profile in one storage snapshot; it does not trust
 // this process's local sid index or scan the whole group.
 func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) (*RouteResolve, bool, error) {
 	if group == "" || routeKey == "" || sid == "" {
 		return nil, false, nil
 	}
-	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
-	if err != nil || !found {
-		return nil, found, err
+	resolution, err := r.stores.routes.ReadResolution(ctx, metadata.RouteKey{Group: group, RouteKey: routeKey})
+	if err != nil || !resolution.Route.Exists {
+		return nil, resolution.Route.Exists, err
+	}
+	rec, rev := &resolution.Route.Value, resolution.Route.Version
+	if !rev.IsCommitted() {
+		return nil, false, errors.New("registry: uncommitted route version")
+	}
+	if err := validateSandboxRecord(rec); err != nil {
+		return nil, false, err
 	}
 	if rec.SandboxID != sid {
 		return nil, false, nil
@@ -387,14 +394,17 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 			return nil, false, err
 		}
 	}
-	dataEndpoint := r.nodeDataEndpoint(ctx, rec.NodeID)
+	apiEndpoint, dataEndpoint := "", ""
+	if resolution.Node.Exists && r.nodeOwner != nil && r.nodeOwner.Connected(ctx, rec.NodeID) == nil {
+		apiEndpoint, dataEndpoint = resolution.Node.Value.APIEndpoint, resolution.Node.Value.DataEndpoint
+	}
 	if rec.State == StateDead || rec.State == StateDeleting {
 		dataEndpoint = ""
 	}
 	return &RouteResolve{
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID), DataEndpoint: dataEndpoint,
+		APIEndpoint: apiEndpoint, DataEndpoint: dataEndpoint,
 		Profile: rec.Profile, TemplateID: rec.TemplateID,
 		StableID: rec.StableID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
@@ -416,7 +426,7 @@ func routeLinkStatus(err error) int {
 		return rejected.status
 	}
 	switch {
-	case errors.Is(err, ErrReserveConflict):
+	case errors.Is(err, ErrReserveConflict), errors.Is(err, metadata.ErrConflict), errors.Is(err, metadata.ErrOwnershipConflict):
 		return http.StatusConflict
 	case errors.Is(err, ErrReserveBadRequest), errors.Is(err, errInvalidSandboxConfig):
 		return http.StatusBadRequest
@@ -426,7 +436,9 @@ func routeLinkStatus(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, ErrSandboxNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, clusterstate.ErrQuorum):
+	case errors.Is(err, metadata.ErrCapacity):
+		return http.StatusTooManyRequests
+	case errors.Is(err, metadata.ErrUnavailable), errors.Is(err, metadata.ErrUnknown):
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusServiceUnavailable

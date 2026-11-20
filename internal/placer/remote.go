@@ -772,7 +772,7 @@ func (s *Service) acquireImportSourceLeaseToken(ctx context.Context, sourceID st
 	if self == "" {
 		self = "local"
 	}
-	links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
+	links := s.scaleLinkLinks(ctx, clusterstate.ImportSourceRoutingKey(sourceID))
 	var lastErr error
 	for _, link := range links {
 		resp, err := s.acquireImportSourceLease(ctx, link, sourceID, self)
@@ -832,7 +832,7 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 		SourceID: sourceID, OwnerID: lease.lease.OwnerID, RunID: lease.lease.RunID, Term: lease.lease.Term,
 		Cursor: cursor, Complete: complete, Error: lastErr,
 	}
-	links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
+	links := s.scaleLinkLinks(ctx, clusterstate.ImportSourceRoutingKey(sourceID))
 	var lastPostErr error
 	for _, link := range links {
 		if err := s.postJSON(ctx, link, registry.PlacerLinkSourceCursorPath, reqBody); err != nil {
@@ -863,7 +863,7 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 			apiFP, apiType, apiValue, apiRef = "", "", "", ""
 			manifestFP, manifestType, manifestValue, manifestRef = "", "", "", ""
 		}
-		links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
+		links := s.scaleLinkLinks(ctx, clusterstate.ImportSourceRoutingKey(sourceID))
 		linkSig := registryLinkSignature(links)
 		key := selectorPatchSignature(selectors, nodeIDs,
 			apiFP, apiType, apiValue, apiRef,
@@ -1151,12 +1151,12 @@ func decodeNode(raw json.RawMessage) (*registry.NodeRecord, bool) {
 
 func decodeNodeList(raw json.RawMessage) (*registry.NodeRecord, bool) {
 	var n clusterstate.NodeListEntry
-	if json.Unmarshal(raw, &n) != nil {
+	if json.Unmarshal(raw, &n) != nil || !n.Version.IsCommitted() {
 		return nil, false
 	}
 	return &registry.NodeRecord{
-		Meta:   n.SourceMeta,
-		NodeID: n.NodeID, Labels: n.Labels, Capacity: n.Capacity,
+		Version: n.Version,
+		NodeID:  n.NodeID, Labels: n.Labels, Capacity: n.Capacity,
 		BuildRegistrationCapacity: n.BuildRegistrationCapacity, BuildExecutionCapacity: n.BuildExecutionCapacity,
 		APIEndpoint: n.APIEndpoint, DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
 	}, true
@@ -1369,14 +1369,10 @@ func (v *nodeView) values() []*registry.NodeRecord {
 }
 
 func fresherNode(a, b *registry.NodeRecord) bool {
-	if a.Meta.Ballot.Less(b.Meta.Ballot) {
-		return false
-	}
-	if b.Meta.Ballot.Less(a.Meta.Ballot) {
-		return true
-	}
-	if a.Meta.Rev != b.Meta.Rev {
-		return a.Meta.Rev > b.Meta.Rev
+	// The merged sources describe the same node_list record in one database.
+	// Compare all ten bytes, including the transaction order within a commit.
+	if order := a.Version.Compare(b.Version); order != 0 {
+		return order > 0
 	}
 	return a.NodeID < b.NodeID
 }

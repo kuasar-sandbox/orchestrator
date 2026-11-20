@@ -160,7 +160,7 @@ func (o *routingNodeOwner) ownerFor(ctx context.Context, nodeID string) NodeOwne
 	if err == nil && found && node.LinkOwner != "" {
 		return o.ownerByMember(node.LinkOwner)
 	}
-	return o.ownerForShard(ctx, nodeID)
+	return o.ownerForCandidates(ctx, nodeID)
 }
 
 func (o *routingNodeOwner) ownerByMember(memberID string) NodeOwner {
@@ -173,7 +173,7 @@ func (o *routingNodeOwner) ownerByMember(memberID string) NodeOwner {
 	return missingNodeOwner{memberID: memberID}
 }
 
-func (o *routingNodeOwner) ownerForShard(ctx context.Context, nodeID string) NodeOwner {
+func (o *routingNodeOwner) ownerForCandidates(ctx context.Context, nodeID string) NodeOwner {
 	owners, err := o.reg.stores.NodeOwnerCandidates(ctx, nodeID)
 	if err != nil || len(owners) == 0 {
 		return o.local

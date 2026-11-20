@@ -434,7 +434,7 @@ func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	freshRoute := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(fresh.URL, "http://"), types.ProfileBare)
 	freshRoute.APIEndpoint = strings.TrimPrefix(api.URL, "http://")
 	freshRoute.NodeSandboxID = "stable-g1"
-	freshRoute.RouteRevision = 2
+	freshRoute.RouteRevision = routeVersionForTest(2, 0)
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/route-link/route":
@@ -480,7 +480,7 @@ func TestClusterExecPausedReserveRechecksKATAndUsesCurrentNode(t *testing.T) {
 	paused.State = "paused"
 	current := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
 	current.NodeSandboxID = "stable-g7"
-	current.RouteRevision = 7
+	current.RouteRevision = routeVersionForTest(7, 0)
 	var routeHits, reserveHits atomic.Int32
 	var reserveService, reserveToken string
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

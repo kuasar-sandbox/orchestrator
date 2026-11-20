@@ -74,7 +74,7 @@ func TestReserveExecDataAcceptsKATAndIgnoresOptionalPortForAuth(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
@@ -101,7 +101,7 @@ func TestRouteLinkReserveDataCarriesExecServiceHeaderWithoutBody(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})

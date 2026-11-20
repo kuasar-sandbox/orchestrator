@@ -32,7 +32,7 @@ func TestWorkspaceReserveBindsFirstSourceToReservation(t *testing.T) {
 		}
 		return &Placement{NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
 	}))
-	if err := r.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(r.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var commands []*routesync.Command
@@ -73,6 +73,7 @@ func TestWorkspaceReserveBindsFirstSourceToReservation(t *testing.T) {
 func TestWorkspaceBuildReplayIdentity(t *testing.T) {
 	ctx := context.Background()
 	r := testReg(t)
+	seedTestNode(t, r.stores, "n1")
 	r.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
 	r.SetNodeOwner(owner)

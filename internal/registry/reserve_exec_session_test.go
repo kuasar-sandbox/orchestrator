@@ -31,7 +31,7 @@ func TestServeReserveExecSessionCarriesQueryAndReturnsTypedResult(t *testing.T) 
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	var command *routesync.Command
@@ -62,7 +62,7 @@ func TestServeReserveExecSessionCarriesQueryAndReturnsTypedResult(t *testing.T) 
 	}
 	if result.ExecSession == nil || result.ExecSession.ExecAccessToken != "kat1.exec" || result.Connect != nil ||
 		result.Route.SandboxID != record.SandboxID || result.Route.NodeSandboxID != record.NodeSandboxID ||
-		result.Route.State != string(StateReserved) || result.Route.RouteRevision <= 0 {
+		result.Route.State != string(StateReserved) || !result.Route.RouteRevision.IsCommitted() {
 		t.Fatalf("reserve result = %+v", result)
 	}
 	if command == nil || command.Kind != routesync.CmdExecSession || command.SID != record.NodeSandboxID ||
@@ -91,7 +91,7 @@ func TestReserveExecSessionAuthenticatesBeforeStateOrCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	commands := 0
@@ -131,7 +131,7 @@ func TestReserveExecSessionRejectsTTLOverflowBeforeStateOrCommand(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	commands := 0
@@ -163,7 +163,7 @@ func TestReserveExecSessionRejectsTTLOutsideTimeRepresentationBeforeStateOrComma
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	commands := 0
@@ -222,7 +222,7 @@ func TestReserveExecSessionIssuesEveryRequestWithoutWaitingForReady(t *testing.T
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
@@ -271,7 +271,7 @@ func TestReserveExecSessionDoesNotMutateExistingReadyOrReservedWorkflow(t *testi
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+				if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 					t.Fatal(err)
 				}
 				commands := 0
@@ -329,7 +329,7 @@ func TestReserveExecSessionRejectsInvalidTypedResultAndRollsBack(t *testing.T) {
 			if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+			if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 				t.Fatal(err)
 			}
 			reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -354,7 +354,7 @@ func TestReserveExecSessionReplacesLostNodeWithMigrationToken(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	var command *routesync.Command
@@ -417,7 +417,7 @@ func TestReserveExecSessionReplacementRetriesRejectedCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -498,7 +498,7 @@ func TestReserveExecSessionReplacementStopsOnRequestWideNodeRejection(t *testing
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -549,7 +549,7 @@ func TestReserveExecSessionReturnsRouteCurrentAfterAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
 			t.Fatal(err)
 		}
 	}
