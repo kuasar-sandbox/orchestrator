@@ -68,13 +68,20 @@ wait_sandbox_state "$SID" running 1200 || fail 'cold create did not run'
 checkpoint_guest /bin/true
 checkpoint_guest /bin/sh -c 'cat > /home/user/holder-memory.py <<'"'"'PY'"'"'
 import hashlib,json,os,time
-memory=bytearray(os.urandom(128*1024*1024));expected=hashlib.sha256(memory).hexdigest();counter=0
+memory=bytearray(os.urandom(128*1024*1024));expected=hashlib.sha256(memory).hexdigest();counter=0;generation=0
 while True:
+    try:
+        with open("/home/user/holder-generation") as f:wanted=int(f.read())
+    except FileNotFoundError:wanted=generation
+    if wanted!=generation:
+        assert wanted==generation+1
+        memory[:]=os.urandom(len(memory))
+        expected=hashlib.sha256(memory).hexdigest();generation=wanted
     for offset in range(0,len(memory),4096):
         memory[offset]^=1;memory[offset]^=1
     assert hashlib.sha256(memory).hexdigest()==expected
     counter+=1
-    with open("/home/user/holder-status.tmp","w") as f:json.dump({"hash":expected,"counter":counter},f)
+    with open("/home/user/holder-status.tmp","w") as f:json.dump({"hash":expected,"counter":counter,"generation":generation},f)
     os.replace("/home/user/holder-status.tmp","/home/user/holder-status")
     time.sleep(.2)
 PY
@@ -87,12 +94,80 @@ python3 - "$CASE_OUT/memory-before.json" <<'PY'
 import json,sys
 assert json.load(open(sys.argv[1]))['counter']>0
 PY
+cp "$CASE_OUT/memory-before.json" "$CASE_OUT/memory-expected.json"
 check_memory() {
     checkpoint_guest /bin/cat /home/user/holder-status >"$CASE_OUT/memory-$1.json"
-    python3 - "$CASE_OUT/memory-before.json" "$CASE_OUT/memory-$1.json" <<'PY'
+    python3 - "$CASE_OUT/memory-expected.json" "$CASE_OUT/memory-$1.json" <<'PY'
 import json,sys
 a,b=(json.load(open(p)) for p in sys.argv[1:])
-assert a['hash']==b['hash'] and b['counter']>=a['counter'],(a,b)
+assert a['generation']==b['generation'] and a['hash']==b['hash'] and b['counter']>=a['counter'],(a,b)
+PY
+}
+# Every successor must own fresh incompressible pages. Touching then restoring
+# the same bytes can deduplicate the payload and accidentally settle a holder.
+advance_memory() {
+    checkpoint_guest python3 -c '
+import json,pathlib,sys,time
+wanted=int(sys.argv[1]);pathlib.Path("/home/user/holder-generation").write_text(str(wanted))
+deadline=time.monotonic()+30
+while True:
+    status=json.loads(pathlib.Path("/home/user/holder-status").read_text())
+    if status["generation"]==wanted:print(json.dumps(status));break
+    assert time.monotonic()<deadline,"guest did not publish the requested generation"
+    time.sleep(.05)
+' "$1" >"$CASE_OUT/memory-generation-$1.json"
+    python3 - "$CASE_OUT/memory-expected.json" "$CASE_OUT/memory-generation-$1.json" <<'PY'
+import json,sys
+a,b=(json.load(open(p)) for p in sys.argv[1:])
+assert b['generation']==a['generation']+1 and b['hash']!=a['hash'] and b['counter']>a['counter'],(a,b)
+PY
+    cp "$CASE_OUT/memory-generation-$1.json" "$CASE_OUT/memory-expected.json"
+}
+
+hold_payload_failure() {
+    python3 - "$CHECKPOINT_ROOT/$SID/checkpoint" "$CASE_OUT" "$1" <<'PY'
+import json,os,pathlib,resource,sys,time
+root,out,label=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]),sys.argv[3]
+known={json.loads(p.read_text())['capture_path'] for p in out.glob('*-file-limit.json')}
+paths=[p for p in root.glob('memory/*/*.json') if str(p) not in known]
+assert len(paths)==1,paths
+path=paths[0];r=json.loads(path.read_text());holder=r['holder']
+def identity():
+    parts=pathlib.Path(f"/proc/{holder['pid']}/stat").read_text().rsplit(')',1)[1].split()
+    assert parts[0]!='Z' and int(parts[19])==holder['start_time'],'retired holder identity changed'
+deadline=time.monotonic()+30
+while True:
+    r=json.loads(path.read_text())
+    assert r['committed'] and r['runtime_retired'] and not r['file_ready'] and not r['ram_released'],'capture did not retain the new RAM obligation'
+    identity()
+    if 'no space left on device' in r.get('save_error',''):break
+    assert time.monotonic()<deadline,'holder did not encounter the injected ENOSPC'
+    time.sleep(.02)
+# Bound only this exact, retired writer after observing the intended fault.
+# This leaves metadata room for successors while preserving the original hard
+# limit; neither the live VM nor a later holder inherits this soft limit.
+old=resource.prlimit(holder['pid'],resource.RLIMIT_FSIZE);limit=1024*1024
+assert old[0]==resource.RLIM_INFINITY or old[0]>limit,old
+resource.prlimit(holder['pid'],resource.RLIMIT_FSIZE,(limit,old[1]))
+(out/(label+'-file-limit.json')).write_text(json.dumps({'holder':holder,'previous':old,'soft_limit':limit,
+    'capture_path':str(path),'checkpoint_id':r['checkpoint_id'],'memory_id':r['memory_id'],'observed_error':r['save_error']}))
+while os.statvfs(root).f_bavail*os.statvfs(root).f_frsize<32*1024*1024:
+    identity()
+    assert time.monotonic()<deadline,'holder did not free the failed partial payload'
+    time.sleep(.02)
+print('retired holder payload bounded after real ENOSPC:',label,flush=True)
+PY
+}
+release_payload_failures() {
+    python3 - "$CASE_OUT" <<'PY'
+import json,pathlib,resource,sys
+proofs=list(pathlib.Path(sys.argv[1]).glob('*-file-limit.json'));assert len(proofs)==4
+for path in proofs:
+    p=json.loads(path.read_text());h=p['holder']
+    parts=pathlib.Path(f"/proc/{h['pid']}/stat").read_text().rsplit(')',1)[1].split()
+    assert parts[0]!='Z' and int(parts[19])==h['start_time'],'retired holder identity changed'
+    assert resource.prlimit(h['pid'],resource.RLIMIT_FSIZE)==(p['soft_limit'],p['previous'][1])
+    resource.prlimit(h['pid'],resource.RLIMIT_FSIZE,tuple(p['previous']))
 PY
 }
 python3 - "$CHECKPOINT_ROOT" "$FILLER" <<'PY'
@@ -125,7 +200,7 @@ while True:
         assert record['producer']==r['producer'] and record['memory_id']==r['memory']['memory_id']
         if r['stage']=='settled':assert record['ram_released'],'settled before exact RAM release'
     if len(held)==pending and len(current)==active and pressure['reserved_memory']==all_r+all_b:break
-    assert time.monotonic()<deadline,(pending,active,own,rows,pressure)
+    assert time.monotonic()<deadline,{'expected_held':pending,'actual_held':len(held),'expected_active':active,'actual_active':len(current),'reserved_bytes':pressure['reserved_memory'],'calculated_bytes':all_r+all_b,'capture_stages':[r['stage'] for r in entries]}
     time.sleep(.1)
 report={'sid':sid,'stage':own[0]['stage'],'account_id':own[0]['id'],'revision':own[0]['revision'],
  'active_bytes':sum(r['allocatable_memory'] for r in current),'retained_bytes':sum(r['memory']['bytes'] for r in held),
@@ -143,12 +218,15 @@ named_pause() { # label; leaves exact selected ID in NAMED_ID
 }
 named_pause a
 A=$NAMED_ID
+hold_payload_failure a
 ledger 1 0 a-paused
 resume_checkpoint_guest 0
 check_memory b
 ledger 1 1 b-running
+advance_memory 1
 named_pause b
 B=$NAMED_ID
+hold_payload_failure b
 ledger 2 0 b-paused
 
 # Restart with less headroom than R1+R2+B. Accepted Connect may be starting,
@@ -199,7 +277,9 @@ check_memory c
 ledger 2 1 c-running
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":true,"checkpoint":true}')
 [ "$code" = 409 ] && [ "$(sandbox_state "$SID")" = running ] || fail 'quota did not reject before freeze'
+advance_memory 2
 pause_checkpoint_guest snapshot 0
+hold_payload_failure c
 ledger 3 0 c-paused
 
 # Name deletion frees one slot, while descendants keep A's backend available.
@@ -217,12 +297,15 @@ PY
 resume_checkpoint_guest 0
 check_memory d
 ledger 3 1 d-running
+advance_memory 3
 named_pause d
+hold_payload_failure d
 ledger 4 0 d-paused
 stop_orchestrator
 start_orchestrator "$WORK/orch-four-holders.log"
 ledger 4 0 four-recovered
 rm -f -- "$FILLER"
+release_payload_failures
 for _ in $(seq 1 300); do
     if python3 - "$CHECKPOINT_ROOT/$SID/checkpoint" <<'PY'
 import json,pathlib,sys
