@@ -111,7 +111,7 @@ func (o *Orchestrator) releaseRetiredRun(ctx context.Context, m store.RunPoolOwn
 		if err := state.ReconcileRetainedMemory(m.TaskID); err != nil {
 			return err
 		}
-		if retained, ok := state.RetainedMemory(m.TaskID); ok && retained.MemoryID == record.MemoryID && retained.Epoch == record.Epoch {
+		if _, ok := state.RetainedCapture(m.TaskID, record.MemoryID, record.Epoch); ok {
 			// The controller must persist settlement while its capture proof is
 			// still readable. A later hard delete may remove that proof.
 			return api.ErrPreviousMemorySavePending
@@ -157,6 +157,37 @@ func (o *Orchestrator) discardRetiredMemoryForDelete(ctx context.Context, sb *ty
 	g := sourceGrant(ctx)
 	if sb.State != types.StateDeleting || g == nil || g.sid != sb.ID || g.instanceID != sb.InstanceID || g.baseDir != sb.BaseDir {
 		return errors.New("discarding checkpoint memory requires deleting source ownership")
+	}
+	// Deleting ownership and its source grant have withdrawn every durable
+	// root. Revoke all committed holders before waiting for any unit: a newer
+	// save can retain an older holder's RAM pin until its own cancellation.
+	// SIGTERM alone leaves detached executables waiting for their saves and
+	// makes each blocked holder consume systemd's full stop timeout.
+	for _, m := range retiring {
+		record, err := o.readRunCapture(ctx, m)
+		if err != nil {
+			return err
+		}
+		if record == nil || !record.Committed || !record.RuntimeRetired || record.Aborted || record.RAMReleased {
+			continue
+		}
+		dir := filepath.Join(m.RetirementBaseDir, "checkpoint")
+		ref := memorycheckpoint.Reference{CheckpointID: record.CheckpointID, MemoryID: record.MemoryID}
+		// Supplement the external source grant with the SDK's publication fence.
+		guard, err := artifact.LockCheckpointSources(ctx, dir)
+		if err != nil {
+			return err
+		}
+		err = memorycheckpoint.DeleteCheckpoint(ctx, dir, ref)
+		err = errors.Join(err, guard.Close())
+		if err != nil {
+			// An unavailable/old holder still uses the existing destruction-only
+			// path below. Its exact unit and physical reader proofs remain required.
+			o.log.Warn("terminal holder cancellation unavailable; fencing units", "sid", sb.ID, "run_id", m.RunID, "err", err)
+			// Do not spend the entire cleanup budget on more unavailable RPCs:
+			// the existing unit fence must get a chance to make progress.
+			break
+		}
 	}
 	// Fence the new runtime as well as old holders: a resumed VM may still own
 	// an immutable predecessor memfd. No proof is published from disconnection.
@@ -216,7 +247,7 @@ func (o *Orchestrator) discardAbsentCapture(ctx context.Context, m store.RunPool
 		return err
 	}
 	if state != nil {
-		if _, pending := state.RetainedMemory(m.TaskID); pending {
+		if state.RetainedCaptureOperation(memorycheckpoint.RunIdentity{SandboxID: m.TaskID, InstanceID: m.RetirementInstanceID, RunID: m.RunID}, m.RetirementCheckpointID, m.RetirementOperationID) {
 			return api.ErrPreviousMemorySavePending
 		}
 	}
@@ -382,7 +413,7 @@ func (o *Orchestrator) abortCheckpointRetirement(ctx context.Context, sb *types.
 		if err := state.ReconcileRetainedMemory(sb.ID); err != nil {
 			return err
 		}
-		if _, pending := state.RetainedMemory(sb.ID); pending {
+		if state.RetainedCaptureOperation(memorycheckpoint.RunIdentity{SandboxID: sb.ID, InstanceID: sb.InstanceID, RunID: sb.RunID}, permit.CheckpointID, permit.OperationID) {
 			return api.ErrPreviousMemorySavePending
 		}
 	}
@@ -850,7 +881,7 @@ func (o *Orchestrator) reconcileUnstartedCapture(ctx context.Context, observed s
 			return err
 		}
 		if state != nil {
-			if _, pending := state.RetainedMemory(current.TaskID); pending {
+			if state.RetainedCaptureOperation(memorycheckpoint.RunIdentity{SandboxID: current.TaskID, InstanceID: current.RetirementInstanceID, RunID: current.RunID}, current.RetirementCheckpointID, current.RetirementOperationID) {
 				return api.ErrPreviousMemorySavePending
 			}
 		}

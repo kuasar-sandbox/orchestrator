@@ -63,7 +63,10 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		logger.Warn("chmod db", "err", err)
 	}
 
-	lifecycle, err := launcher.NewSystemd(ctx)
+	// The bus connection must outlive request cancellation: deferred launch
+	// rollback still stops and verifies exact units before lifecycle.Close.
+	// D-Bus binds the connection lifetime to this context, not just dialing.
+	lifecycle, err := launcher.NewSystemd(context.WithoutCancel(ctx))
 	if err != nil {
 		cancel()
 		return err

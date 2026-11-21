@@ -46,51 +46,29 @@ func rememberCaptureAdmission(ctx context.Context, sb *types.Sandbox, pending bo
 	}
 }
 
-// lockPauseAdmission leaves a pending runtime running. Neither its lifecycle
-// lock nor the cross-process source grant is retained during the cancellable
-// wait. A request that waited for one run may never pause its successor.
+// Capture capability is checked under the same lifecycle/source grant as
+// the new intent. Historical RAM does not make this admission wait.
 func (o *Orchestrator) lockPauseAdmission(ctx context.Context, sid string, request sandboxcfg.CaptureRequest, validate func(*types.Sandbox) error) (context.Context, func(), *types.Sandbox, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var expected *types.Sandbox
-	for {
-		guardCtx, unlock, err := o.lockLifecycleMutation(ctx, sid)
-		if err != nil {
-			return ctx, nil, nil, err
-		}
-		sb, err := o.st.Get(guardCtx, sid)
-		if err == nil && validate != nil {
-			err = validate(sb)
-		}
-		if err == nil && expected != nil && (sb == nil || sb.ID != expected.ID || sb.InstanceID != expected.InstanceID || sb.RunID != expected.RunID || sb.State != types.StateRunning) {
-			err = api.ErrPauseRunChanged
-		}
-		if err != nil {
-			unlock()
-			return ctx, nil, nil, err
-		}
-		if sb == nil || sb.State != types.StateRunning {
-			return guardCtx, unlock, sb, nil
-		}
-		guardCtx = context.WithValue(guardCtx, captureAdmissionKey{}, &captureAdmissionState{})
-		pending, err := o.captureMemorySavePending(guardCtx, sb, request, true)
-		if err != nil || !pending {
-			if err != nil {
-				unlock()
-				return ctx, nil, nil, err
-			}
-			return guardCtx, unlock, sb, nil
-		}
-		expected = cloneSandbox(sb)
-		unlock()
-		if request.NoWaitForPreviousMemorySave {
-			return ctx, nil, nil, api.ErrPreviousMemorySavePending
-		}
-		if _, err := o.captureMemorySavePending(ctx, expected, request, false); err != nil {
-			return ctx, nil, nil, err
-		}
+	guardCtx, unlock, err := o.lockLifecycleMutation(ctx, sid)
+	if err != nil {
+		return ctx, nil, nil, err
 	}
+	sb, err := o.st.Get(guardCtx, sid)
+	if err == nil && validate != nil {
+		err = validate(sb)
+	}
+	if err == nil && sb != nil && sb.State == types.StateRunning {
+		guardCtx = context.WithValue(guardCtx, captureAdmissionKey{}, &captureAdmissionState{})
+		_, err = o.captureMemorySavePending(guardCtx, sb, request, true)
+	}
+	if err != nil {
+		unlock()
+		return ctx, nil, nil, err
+	}
+	return guardCtx, unlock, sb, nil
 }
 
 // Only an operation that may retain another frozen generation needs this
@@ -161,10 +139,11 @@ func (o *Orchestrator) previousMemorySavePending(ctx context.Context, sb *types.
 		return false, api.ErrPauseRunChanged
 	}
 	if len(forCapture) != 0 && forCapture[0] {
-		if state.RetentionSupported != nil && !*state.RetentionSupported {
-			state.Pending = false
+		if state.LifecycleVersion != ctl.CheckpointLifecycleVersion {
+			return false, fmt.Errorf("capture requires checkpoint lifecycle v%d", ctl.CheckpointLifecycleVersion)
 		}
-		rememberCaptureAdmission(ctx, sb, state.Pending, state.RetentionSupported)
+		state.Pending = false
+		rememberCaptureAdmission(ctx, sb, false, state.RetentionSupported)
 	}
 	return state.Pending, nil
 }
@@ -218,6 +197,9 @@ func (o *Orchestrator) requirePreviousMemorySaveSupport(ctx context.Context, sb 
 	}
 	if state.SandboxID != sb.ID || state.InstanceID != sb.InstanceID || state.RunID != sb.RunID {
 		return api.ErrPauseRunChanged
+	}
+	if state.LifecycleVersion != ctl.CheckpointLifecycleVersion {
+		return fmt.Errorf("resume requires checkpoint lifecycle v%d", ctl.CheckpointLifecycleVersion)
 	}
 	return nil
 }

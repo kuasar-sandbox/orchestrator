@@ -1286,11 +1286,7 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 			err = api.ErrNotFound
 		}
 		if err == nil {
-			checkpoint, getErr := o.st.Checkpoint(ctx, id)
-			err = getErr
-			if checkpoint != nil {
-				err = api.ErrCheckpointLimit
-			}
+			err = o.st.CheckCheckpointQuota(ctx, id)
 		}
 		unlock()
 		if err != nil {
@@ -1502,12 +1498,8 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		return "", api.ErrPreviousMemorySavePending
 	}
 	if request.Checkpoint {
-		retained, err := o.st.Checkpoint(ctx, sb.ID)
-		if err != nil {
+		if err := o.st.CheckCheckpointQuota(ctx, sb.ID); err != nil {
 			return "", err
-		}
-		if retained != nil {
-			return "", api.ErrCheckpointLimit
 		}
 	}
 	ctx, release, err := o.trySourceOperation(ctx, sb)

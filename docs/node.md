@@ -727,6 +727,7 @@ sandbox_mmds_route_secret_values
                sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
 run_pool_ownership          run_id PK, ownership JSON
+sandbox_checkpoints        (sandbox_id, checkpoint_id) PK, source_kind, source_ref, sandbox_ref
 resource_pool_pressure      name PK, record JSON
 resource_recovery_placement sandbox_id PK, placement JSON
 manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,

@@ -101,6 +101,7 @@ type SandboxRecord struct {
 	BuildReason            string                    `json:"build_reason,omitempty"`
 	CreatedU               int64                     `json:"created_unix,omitempty"`
 	IdleTimeout            *int64                    `json:"idle_timeout,omitempty"`
+	MaxCheckpoints         int                       `json:"max_checkpoints,omitempty"`
 	AutoPauseMemory        bool                      `json:"auto_pause_memory"`
 	AutoReset              bool                      `json:"auto_reset"`
 }

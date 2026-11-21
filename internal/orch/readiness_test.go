@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -306,11 +307,75 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	}
 }
 
+// Observe the existing phase events: launch acceptance/runner assignment and
+// failure rollback have separate lifetimes and are outside the readiness budget.
+type launchBudgetObserver struct {
+	slog.Handler
+	phases chan slog.Record
+}
+
+func (h *launchBudgetObserver) Handle(_ context.Context, record slog.Record) error {
+	if record.Message == "sandbox launch phase" {
+		record.Attrs(func(a slog.Attr) bool {
+			if a.Key == "phase" && (a.Value.String() == "runtime_ready_duration" || a.Value.String() == "envd_init_duration") {
+				h.phases <- record.Clone()
+			}
+			return true
+		})
+	}
+	return nil
+}
+
+func (h *launchBudgetObserver) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &launchBudgetObserver{Handler: h.Handler.WithAttrs(attrs), phases: h.phases}
+}
+
+func (h *launchBudgetObserver) WithGroup(name string) slog.Handler {
+	return &launchBudgetObserver{Handler: h.Handler.WithGroup(name), phases: h.phases}
+}
+
+func newLaunchBudgetObserver() *launchBudgetObserver {
+	return &launchBudgetObserver{Handler: slog.NewTextHandler(io.Discard, nil), phases: make(chan slog.Record, 2)}
+}
+
+func (h *launchBudgetObserver) elapsed(t *testing.T) time.Duration {
+	t.Helper()
+	var started, finished time.Time
+	for _, want := range []string{"runtime_ready_duration", "envd_init_duration"} {
+		var record slog.Record
+		select {
+		case record = <-h.phases:
+		default:
+			t.Fatalf("missing completed launch phase %s", want)
+		}
+		var phase string
+		var duration time.Duration
+		record.Attrs(func(a slog.Attr) bool {
+			if a.Key == "phase" {
+				phase = a.Value.String()
+			}
+			if a.Key == "duration" {
+				duration = a.Value.Duration()
+			}
+			return true
+		})
+		if phase != want {
+			t.Fatalf("phase=%q, want %q", phase, want)
+		}
+		if started.IsZero() {
+			started = record.Time.Add(-duration)
+		}
+		finished = record.Time
+	}
+	return finished.Sub(started)
+}
+
 func TestE2BInitMustCompleteWithinLaunchDeadline(t *testing.T) {
 	lc := &countingLauncher{}
 	cfg := &config.Config{}
 	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	observer := newLaunchBudgetObserver()
+	o, ctx := newAsyncConnectTestOrchestratorWithLogger(t, cfg, lc, slog.New(observer))
 	o.sandboxReadyTimeout = 180 * time.Millisecond
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "init-launch-deadline")
 	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
@@ -323,14 +388,13 @@ func TestE2BInitMustCompleteWithinLaunchDeadline(t *testing.T) {
 		<-r.Context().Done()
 	}))
 
-	started := time.Now()
 	err := runFreshLaunchForTest(t, o, ctx, sb, tmpl)
-	elapsed := time.Since(started)
+	elapsed := observer.elapsed(t)
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "envd /init") {
 		t.Fatalf("launch error = %v, want mandatory envd /init deadline failure", err)
 	}
 	if elapsed < 140*time.Millisecond || elapsed > 500*time.Millisecond {
-		t.Fatalf("launch elapsed %s, want the 180ms launch budget", elapsed)
+		t.Fatalf("readiness/init elapsed %s, want the 180ms launch budget", elapsed)
 	}
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("envd /init attempts = %d, want one attempt before the shared launch deadline", got)
@@ -338,21 +402,41 @@ func TestE2BInitMustCompleteWithinLaunchDeadline(t *testing.T) {
 }
 
 func TestE2BRuntimeAndInitShareLaunchDeadline(t *testing.T) {
-	lc := &countingLauncher{readinessDelay: 120 * time.Millisecond}
+	stopEntered, stopGate := make(chan struct{}, 1), make(chan struct{})
+	lc := &countingLauncher{readinessDelay: 700 * time.Millisecond, stopEntered: stopEntered, stopGate: stopGate}
 	cfg := &config.Config{}
 	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
-	o.sandboxReadyTimeout = 220 * time.Millisecond
+	observer := newLaunchBudgetObserver()
+	o, ctx := newAsyncConnectTestOrchestratorWithLogger(t, cfg, lc, slog.New(observer))
+	o.sandboxReadyTimeout = time.Second
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "shared-deadline")
 
-	started := time.Now()
-	err := runFreshLaunchForTest(t, o, ctx, sb, tmpl)
-	elapsed := time.Since(started)
+	t.Cleanup(func() {
+		select {
+		case <-stopGate:
+		default:
+			close(stopGate)
+		}
+	})
+	done := make(chan error, 1)
+	go func() { done <- runFreshLaunchForTest(t, o, ctx, sb, tmpl) }()
+	// Keep rollback blocked while examining the completed budget. The test
+	// must not time runner preparation or wait for post-deadline cleanup.
+	select {
+	case <-stopEntered:
+	case err := <-done:
+		t.Fatalf("launch returned before rollback: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("launch did not reach rollback")
+	}
+	elapsed := observer.elapsed(t)
+	close(stopGate)
+	err := <-done
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "envd /init") {
 		t.Fatalf("launch error = %v, want envd /init deadline failure", err)
 	}
-	if elapsed < 180*time.Millisecond || elapsed > 500*time.Millisecond {
-		t.Fatalf("launch elapsed %s; runtime and envd /init did not share the 220ms budget", elapsed)
+	if elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Fatalf("readiness/init elapsed %s; runtime and envd /init did not share the 1s budget", elapsed)
 	}
 }
 

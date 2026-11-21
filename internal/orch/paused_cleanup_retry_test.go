@@ -111,7 +111,7 @@ func TestPausedCleanupRetryReloadsAfterCompetingAttempt(t *testing.T) {
 
 	// Pin the original failure's cause without weakening the ownership CAS:
 	// the old direct helper invocation still rejects the now-stale snapshot.
-	if err := fixture.o.cleanupPausedOwnership(context.Background(), stale); err == nil || !strings.Contains(err.Error(), "paused RunDir ownership changed") {
+	if err := fixture.o.cleanupPausedOwnership(context.Background(), stale); err == nil || !strings.Contains(err.Error(), "checkpoint source ownership changed") {
 		t.Fatalf("stale cleanup did not preserve ownership fence: %v", err)
 	}
 	if err := fixture.o.finalizePausedCleanupOnce(fixture.sb.ID); err != nil {

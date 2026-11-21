@@ -8,19 +8,21 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
-func prepareRetentionStateTest(t *testing.T, s *State, sid string) *retainedReceipt {
+func prepareRetentionStateTest(t *testing.T, s *State, sid string) *retainedAccount {
 	t.Helper()
 	active, ok := s.retentionReservation(sid)
 	if !ok {
 		t.Fatal("missing active reservation")
 	}
-	r := &retainedReceipt{Version: 1, SandboxID: sid, Stage: retentionPrepared, Source: active,
-		Capture:    resource.CaptureRetention{CapturePath: filepath.Join(t.TempDir(), "capture.json"), MemoryID: "memory-one", Epoch: 1, OperationID: "checkpoint-one"},
-		Memory:     resource.RetainedMemory{MemoryID: "memory-one", Epoch: 1, SourcePool: s.SandboxPool(sid), Bytes: active.ReservationMemory},
-		OwnerLease: resource.Lease{PID: active.PeerPID}, OwnerToken: active.Token}
-	if err := s.prepareRetained(r); err != nil {
+	entry := &retainedCapture{Stage: retentionPrepared, Source: active,
+		Capture: resource.CaptureRetention{CapturePath: filepath.Join(t.TempDir(), "capture.json"), MemoryID: "memory-one", Epoch: 1, OperationID: "checkpoint-one"},
+		Memory:  resource.RetainedMemory{MemoryID: "memory-one", Epoch: 1, SourcePool: s.SandboxPool(sid), Bytes: active.ReservationMemory}}
+	r := &retainedAccount{Version: 2, ID: "account-one", Revision: 1, SandboxID: sid, Stage: retentionActive,
+		Captures: []*retainedCapture{entry}, OwnerLease: resource.Lease{PID: active.PeerPID}, OwnerToken: active.Token}
+	if err := s.prepareRetained(r, entry.Capture); err != nil {
 		t.Fatal(err)
 	}
+
 	return r
 }
 
@@ -28,7 +30,7 @@ func TestRetainedMemoryProtectsPreparedAndCountsOneSource(t *testing.T) {
 	s := makeState(8<<30, 0)
 	spec := AdmitSpec{SandboxID: "sid", Token: "old", PeerPID: 101, Capacity: Resources{MemoryBytes: 1 << 30, CPUMilli: 1000},
 		ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20, CPUMilli: 500}, InitialBudget: 256 << 20, InitialCache: 4 << 20,
-		CacheMax: 32 << 20, ClientFeatures: []string{resource.FeatureCacheBudgetV1, resource.FeatureRetainedMemoryV1}}
+		CacheMax: 32 << 20, ClientFeatures: []string{resource.FeatureCacheBudgetV1, resource.FeatureRetainedMemoryV2}}
 	if _, _, err := s.Admit(spec); err != nil {
 		t.Fatal(err)
 	}
@@ -45,11 +47,11 @@ func TestRetainedMemoryProtectsPreparedAndCountsOneSource(t *testing.T) {
 	if got := s.ResourceSnapshot(); got.Reserved.MemoryBytes != 256<<20 || got.CacheAllocated != 4<<20 {
 		t.Fatalf("prepared charge: %+v", got)
 	}
-	r.Stage = retentionHolding
-	if _, err := s.commitRetained(r); err != nil {
+	r = heldRetainedCapture(r, r.Captures[0].Capture)
+	if _, err := s.commitRetained(r, r.Captures[0].Capture); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.commitRetained(r); err != nil {
+	if _, err := s.commitRetained(r, r.Captures[0].Capture); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.ResourceSnapshot(); got.Reserved.MemoryBytes != 256<<20 || got.Reserved.CPUMilli != 0 || got.CacheAllocated != 0 || got.StartupInFlight != 0 || got.ReservationCount != 0 {
@@ -65,7 +67,7 @@ func TestRetainedMemoryProtectsPreparedAndCountsOneSource(t *testing.T) {
 		t.Fatalf("old Release affected R: %+v %v", got, ok)
 	}
 	r.Stage = retentionAdopting
-	r.Handoff = &retainedHandoff{ID: "adopt-new", Lease: resource.Lease{PID: 202}}
+	r.Handoff = &retainedHandoff{ID: "adopt-new", InitialBudget: spec.InitialBudget, Lease: resource.Lease{PID: 202}}
 	if err := s.setRetainedReceipt(r); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +88,7 @@ func TestRetainedMemoryProtectsPreparedAndCountsOneSource(t *testing.T) {
 	if got := s.ResourceSnapshot().Reserved.MemoryBytes; got != 256<<20 {
 		t.Fatalf("new Release erased R: %d", got)
 	}
-	if err := s.releaseRetained("sid", r.Capture); err != nil {
+	if err := s.releaseRetained(settledRetainedCapture(s.retainedSnapshot("sid"), r.Captures[0].Capture), r.Captures[0].Capture); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := s.RetainedMemory("sid"); ok {
@@ -106,8 +108,8 @@ func TestRetainedMemorySourcePoolAndStaleCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := prepareRetentionStateTest(t, s, "sid")
-	r.Stage = retentionHolding
-	if _, err := s.commitRetained(r); err != nil {
+	r = heldRetainedCapture(r, r.Captures[0].Capture)
+	if _, err := s.commitRetained(r, r.Captures[0].Capture); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RetireExecution("sid", "run-sid"); err != nil {
@@ -116,7 +118,7 @@ func TestRetainedMemorySourcePoolAndStaleCleanup(t *testing.T) {
 	if _, err := s.ReservePlacement("sid", "new-run", capacity, OperationRecovery, "", func(name string) bool { return name == "numa1" }); err != nil {
 		t.Fatal(err)
 	}
-	r.Stage, r.Handoff = retentionAdopting, &retainedHandoff{ID: "new-owner", Lease: resource.Lease{PID: 202}}
+	r.Stage, r.Handoff = retentionAdopting, &retainedHandoff{ID: "new-owner", InitialBudget: spec.InitialBudget, Lease: resource.Lease{PID: 202}}
 	if err := s.setRetainedReceipt(r); err != nil {
 		t.Fatal(err)
 	}
@@ -148,23 +150,28 @@ func TestRetainedMemorySourcePoolAndStaleCleanup(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if err := s.releaseRetained("sid", r.Capture); err != nil {
+	if err := s.releaseRetained(settledRetainedCapture(s.retainedSnapshot("sid"), r.Captures[0].Capture), r.Captures[0].Capture); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.PoolStates()["numa0"].ResourceSnapshot().Reserved.MemoryBytes; got != 0 {
 		t.Fatalf("source R not released: %d", got)
 	}
-	newCapture := r.Capture
+	newCapture := r.Captures[0].Capture
 	newCapture.MemoryID, newCapture.Epoch = "memory-two", 2
 	active, _ := s.retentionReservation("sid")
-	next := &retainedReceipt{SandboxID: "sid", Stage: retentionPrepared, Source: active, Capture: newCapture,
-		Memory: resource.RetainedMemory{MemoryID: "memory-two", Epoch: 2, SourcePool: "numa1", Bytes: active.ReservationMemory}}
-	if err := s.prepareRetained(next); err != nil {
+	next := s.retainedSnapshot("sid")
+	next.Revision++
+	newCapture.CapturePath = filepath.Join(t.TempDir(), "capture-two.json")
+	next.Captures = append(next.Captures, &retainedCapture{Stage: retentionPrepared, Source: active, Capture: newCapture,
+		Memory: resource.RetainedMemory{MemoryID: "memory-two", Epoch: 2, SourcePool: "numa1", Bytes: active.ReservationMemory}})
+	if err := s.prepareRetained(next, newCapture); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.releaseRetained("sid", r.Capture); err == nil {
-		t.Fatal("late old generation release accepted")
+	// The old exact release is now an idempotent no-op; it cannot release R2.
+	if err := s.releaseRetained(settledRetainedCapture(s.retainedSnapshot("sid"), r.Captures[0].Capture), r.Captures[0].Capture); err != nil {
+		t.Fatal(err)
 	}
+
 	if _, ok := s.RetainedMemory("sid"); !ok {
 		t.Fatal("late release cleared next capture")
 	}

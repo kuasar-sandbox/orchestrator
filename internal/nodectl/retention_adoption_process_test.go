@@ -22,7 +22,7 @@ func startHoldingRetentionProcess(t *testing.T, dir, socket string) *retentionCl
 	return source
 }
 
-func waitRetentionStage(t *testing.T, socket, want string) *retainedReceipt {
+func waitRetentionStage(t *testing.T, socket, want string) *retainedAccount {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
 	for {
@@ -138,7 +138,7 @@ func TestRetainedMemoryRPCSamePIDClosedCandidateRetries(t *testing.T) {
 	writeFakeCgroupRoot(t, root)
 	controller := startRecoveryController(t, socket, root, "retention_admitted")
 	source := startHoldingRetentionProcess(t, dir, socket)
-	capture := waitRetentionStage(t, socket, retentionHolding).Capture
+	capture := waitRetentionStage(t, socket, retentionHolding).Captures[0].Capture
 	cgroup := filepath.Join(root, "embedded-sdk")
 	writeFakeCgroup(t, cgroup, "536870912", os.Getpid())
 	cfg := recoverySandboxConfig(socket, cgroup)

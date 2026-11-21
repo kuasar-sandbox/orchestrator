@@ -95,7 +95,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		}
 		savedSource := sb.ResumeSource
 		if checkpointID != "" {
-			checkpoint, err := o.st.Checkpoint(opCtx, sid)
+			checkpoint, err := o.st.Checkpoint(opCtx, sid, checkpointID)
 			if err != nil {
 				unlock()
 				return types.ExportResult{}, err
