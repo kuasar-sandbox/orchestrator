@@ -347,7 +347,29 @@ hold_payload_failure terminal-b
 ledger 2 0 terminal-b-paused
 code=$(req DELETE "/sandboxes/$SID" "$AK")
 [ "$code" = 204 ] || fail "pending-holder delete=$code"
-wait_sandbox_state "$SID" missing 120 || fail 'terminal cleanup waited for pending holder saves'
+wait_sandbox_state "$SID" missing 120 || {
+    # Preserve the failure boundary before cleanup releases the storage fault.
+    # Emit lifecycle facts only; configuration, tokens and payload stay private.
+    python3 - "$CHECKPOINT_ROOT/$SID/checkpoint" "$SID" <<'PY'
+import json,pathlib,re,subprocess,sys
+root,sid=pathlib.Path(sys.argv[1]),sys.argv[2]
+fields=('checkpoint_id','memory_id','epoch','committed','deleted','runtime_retired','file_ready','ram_released','discarded')
+units=set()
+for path in sorted(root.glob('memory/*/*.json')):
+    try:r=json.loads(path.read_text())
+    except (FileNotFoundError,json.JSONDecodeError):continue
+    if r['producer']['sandbox_id']!=sid:continue
+    run=r['producer']['run_id']
+    print('terminal-capture',json.dumps(dict(run_id=run,**{k:r.get(k,False) for k in fields})),flush=True)
+    if re.fullmatch(r'sr-[0-9a-f-]{36}',run):units.add('sandbox-runner@'+run+'.service')
+for unit in sorted(units):
+    print('terminal-unit',unit,flush=True)
+    subprocess.run(['systemctl','show',unit,'--property=ActiveState,SubState,Result,ExecMainPID,ExecMainCode,ExecMainStatus,TimeoutStopUSec'],timeout=5,check=False)
+    subprocess.run(['journalctl','-u',unit,'_COMM=systemd','--no-pager','-n','12','-o','short-precise'],timeout=5,check=False)
+PY
+    grep -F 'terminal holder cancellation unavailable' "$WORK/orch-four-holders.log" || true
+    fail 'terminal cleanup waited for pending holder saves'
+}
 python3 - "$WORK/sandbox-resource.sock.retained" "$SID" <<'PY'
 import json,pathlib,sys
 assert not [p for p in pathlib.Path(sys.argv[1]).glob('*.json') if json.loads(p.read_text())['sandbox_id']==sys.argv[2]],'terminal empty account remains'
