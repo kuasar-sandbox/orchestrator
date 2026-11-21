@@ -223,3 +223,52 @@ func TestTerminalDeleteHonorsCheckpointPublicationFence(t *testing.T) {
 		t.Fatal("fenced publisher's unit was stopped")
 	}
 }
+
+func TestTerminalDeleteCancellationFailureEntersFenceFallback(t *testing.T) {
+	f := pendingPauseFixture(t)
+	stopRetirementWorkers(t, f.o)
+	first := retiredTestOwnership(t, f)
+	// A live writer whose control endpoint cannot be reached forces fallback.
+	// Repeating bounded RPC waits for every holder could otherwise spend the
+	// whole cleanup context before even attempting an exact unit stop.
+	_ = testCaptureRecord(t, f, first)
+	second := first
+	second.RunID = "sr-ffffffff-ffff-7fff-8fff-ffffffffffff"
+	second.Unit = "sandbox-runner@" + second.RunID + ".service"
+	second.RetirementCheckpointID, second.RetirementOperationID = "capture-fallback", "capture-fallback"
+	second.MemoryID = "memory-fallback"
+	if first.RunID >= second.RunID {
+		t.Fatal("fixture must encounter the unavailable holder first")
+	}
+	if err := f.o.st.SaveRunPoolOwnership(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	w := testCaptureRecord(t, f, second, func(r *memorycheckpoint.CaptureRecord) {
+		r.Producer.RunID, r.MemoryID = second.RunID, second.MemoryID
+	})
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	beginDeletingForTest(t, f)
+	sb, err := f.o.st.Get(context.Background(), f.sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, release, err := f.o.trySourceOperation(context.Background(), sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	// The synthetic live writer cannot yet prove destruction. The original
+	// fenced cleanup path must nevertheless have started, retaining its owner.
+	if err := f.o.discardRetiredMemoryForDelete(ctx, sb); err == nil {
+		t.Fatal("discarded a live writer")
+	}
+	if _, stops := f.lc.stopSnapshot(); stops == 0 {
+		t.Fatal("cancellation failure did not attempt unit fencing")
+	}
+	record, err := f.o.readRunCapture(context.Background(), second)
+	if err != nil || record == nil || record.Deleted {
+		t.Fatalf("continued bulk cancellation instead of entering fence fallback: %v", err)
+	}
+}

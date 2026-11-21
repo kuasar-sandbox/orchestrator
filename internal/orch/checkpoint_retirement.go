@@ -184,6 +184,9 @@ func (o *Orchestrator) discardRetiredMemoryForDelete(ctx context.Context, sb *ty
 			// An unavailable/old holder still uses the existing destruction-only
 			// path below. Its exact unit and physical reader proofs remain required.
 			o.log.Warn("terminal holder cancellation unavailable; fencing units", "sid", sb.ID, "run_id", m.RunID, "err", err)
+			// Do not spend the entire cleanup budget on more unavailable RPCs:
+			// the existing unit fence must get a chance to make progress.
+			break
 		}
 	}
 	// Fence the new runtime as well as old holders: a resumed VM may still own
