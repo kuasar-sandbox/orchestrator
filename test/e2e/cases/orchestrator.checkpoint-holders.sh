@@ -368,8 +368,10 @@ for unit in sorted(units):
     subprocess.run(['systemctl','show',unit,'--property=ActiveState,SubState,Result,ExecMainPID,ExecMainCode,ExecMainStatus,TimeoutStopUSec'],timeout=5,check=False)
     subprocess.run(['journalctl','-u',unit,'_COMM=systemd','--no-pager','-n','12','-o','short-precise'],timeout=5,check=False)
 PY
-    grep -F 'terminal holder cancellation unavailable' "$WORK/orch-four-holders.log" || true
-    fail 'terminal cleanup waited for pending holder saves'
+    grep -F -e 'terminal holder cancellation unavailable' \
+        -e 'sandbox delete cleanup incomplete' \
+        -e 'sandbox delete worker retirement failed' "$WORK/orch-four-holders.log" || true
+    fail 'terminal cleanup did not converge after holder cancellation'
 }
 python3 - "$WORK/sandbox-resource.sock.retained" "$SID" <<'PY'
 import json,pathlib,sys
