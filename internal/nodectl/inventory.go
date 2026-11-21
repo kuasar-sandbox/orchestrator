@@ -372,9 +372,12 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 				}
 				return err
 			}
-			if !populated || state.retainedSourceCgroup(path) || state.HasCgroup(path) {
+			if !populated || state.HasCgroup(path) {
 				return nil
 			}
+			// Full retained inventory has registered every exact live holder
+			// PID. A historical cgroup pathname alone cannot suppress a new,
+			// unrelated consumer after that path is reused.
 			pids, err := readCgroupPIDs(path)
 			if err != nil {
 				if os.IsNotExist(err) {

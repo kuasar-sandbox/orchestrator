@@ -332,6 +332,18 @@ func TestReconcileCompletesPausedExactOwnershipCleanup(t *testing.T) {
 	lc := &reconcileLauncher{units: []launcher.Unit{{Name: unit, ActiveState: "active"}}}
 	vs := &reconcileVS{}
 	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Reconciliation also schedules paused BaseDir GC. Drain that accepted
+	// work before closing SQLite or removing the fixture's directories.
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	o.SetLifecycleContext(lifecycleCtx)
+	t.Cleanup(func() {
+		cancelLifecycle()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := o.DrainPauses(ctx); err != nil {
+			t.Errorf("drain paused cleanup: %v", err)
+		}
+	})
 	if err := o.ReconcileSandboxes(context.Background()); err != nil {
 		t.Fatal(err)
 	}

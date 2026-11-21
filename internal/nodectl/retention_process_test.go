@@ -349,18 +349,22 @@ func TestRetainedMemoryRPCProcessHandoff(t *testing.T) {
 			if pid, locked, err := resource.LeaseLockOwner(resource.LeasePath(socket, "retained-sid")); err != nil || !locked || pid != successor.cmd.Process.Pid {
 				t.Fatalf("old Close removed successor lease: %d %v %v", pid, locked, err)
 			}
-			if !tc.releaseBeforeAdmit && !tc.queued {
+			if !tc.releaseBeforeAdmit && !tc.queued && tc.name != "pending" {
 				source.run(t, "ram_released")
 			}
 			if tc.name == "pending" {
-				// Data readiness may precede the source's resource ACK. The
-				// successor settles that precise old proof before preparing R2.
+				// R1 remains physically pending while the successor freezes
+				// only its B into R2. No previous-RAM wait or forced settlement.
 				successor.run(t, "prepare_next")
-				waitRetainedCharge(t, socket, 256<<20, 1)
+				waitRetainedCharge(t, socket, 512<<20, 1)
 				successor.run(t, "commit_capture")
 				successor.run(t, "close_runtime")
 				successor.run(t, "retire")
-				waitRetainedCharge(t, socket, 256<<20, 0)
+				waitRetainedCharge(t, socket, 512<<20, 0)
+				controller.kill(t)
+				controller = startRecoveryController(t, socket, root, "")
+				waitRetainedCharge(t, socket, 512<<20, 0)
+				source.run(t, "ram_released")
 				// The late producer receives its ACK and can exit, but its
 				// distinct memory ID cannot clear R2 even with equal epochs.
 				source.run(t, "release_retained")

@@ -1,8 +1,6 @@
 package nodectl
 
 import (
-	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -68,8 +66,8 @@ func TestRetainedMemoryUncommittedProducerDeathAbortsPreparedReceipt(t *testing.
 			if _, found := state.RetainedMemory("sid"); found {
 				t.Fatal("abandoned prepared capture remained charged")
 			}
-			if _, err := os.Stat(retentionPath(socket, "sid")); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("prepared receipt remained: %v", err)
+			if account, err := readRetainedReceipt(retentionPath(socket, "sid")); err != nil || len(account.Captures) != 0 {
+				t.Fatalf("abandoned capture left entries or lost SID header: %+v %v", account, err)
 			}
 			record, err := memorycheckpoint.ReadCaptureRecord(producer.path)
 			if err != nil || !record.Aborted || record.RuntimeRetired || record.RAMReleased || record.Committed {

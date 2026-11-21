@@ -24,22 +24,25 @@ if [ "$1" = check-snapshot-runtime ]; then
 fi
 [ "$1" = checkpoint-cleanup ] || exit 64
 shift
-sid= pathid= base= from=
+sid= pathid= base= from= retain= list=0
 while [ "$#" -gt 0 ]; do
+  if [ "$1" = --list-versions ]; then list=1; shift; continue; fi
   [ "$#" -ge 2 ] || exit 64
   case "$1" in
     --sandbox-id) sid=$2 ;;
     --path-id) pathid=$2 ;;
     --base-root) base=$2 ;;
     --from) from=$2 ;;
+    --retain) retain=$2 ;;
     --restore|--manifest-config|--ref-location-parent) ;;
     *) exit 64 ;;
   esac
   shift 2
 done
-[ -n "$sid" ] && [ "$pathid" = "$sid" ] && [ -n "$from" ]
+[ -n "$sid" ] && [ "$pathid" = "$sid" ] && [ -n "$retain" ]
 [ -d "$base/$sid/checkpoint" ]
 [ "${#MANIFEST_KEY}" = 64 ]
+if [ "$list" = 1 ]; then printf '%s\n' '[]'; fi
 `
 	if err := os.WriteFile(filepath.Join(dir, "node-ctl"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)

@@ -240,6 +240,8 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 // the response (or nil if the message has no reply).
 func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *string) *Message {
 	switch req.Type {
+	case resource.TypeGetRetainedAccount:
+		return s.handleRetainedAccount(req)
 	case resource.TypePrepareRetained, resource.TypeCommitRetained, resource.TypeAbortRetained, resource.TypeReleaseRetained:
 		return s.handleRetained(peerPID, req, *token)
 	case resource.TypeAdoptRetained:
@@ -300,7 +302,7 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: "missing retained capture identity"}
 		}
 		proof, err := readRetentionCapture(req.SandboxID, *req.Retention)
-		if err == nil && proof.RAMReleased {
+		if err == nil && proof.RAMReleased && resource.HasFeature(req.ClientFeatures, resource.FeatureRetainedMemoryV2) && releasedRetentionInventory(req.SandboxID, *req.Retention, proof) == nil {
 			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Reason: resource.ReasonRetentionSettledMissing,
 				ClientFeatures: featureResponse(req.ClientFeatures), Msg: "capture RAM released; use ordinary lease admission"}
 		}
@@ -906,6 +908,9 @@ func cacheGrantReason(result CacheGrantResult) string {
 // The node advertises a feature only when the client requested it.
 func featureResponse(features []string, coordinated ...bool) []string {
 	var out []string
+	if resource.HasFeature(features, resource.FeatureRetainedMemoryV2) {
+		out = append(out, resource.FeatureRetainedMemoryV2)
+	}
 	if resource.HasFeature(features, resource.FeatureRetainedMemoryV1) {
 		out = append(out, resource.FeatureRetainedMemoryV1)
 	}

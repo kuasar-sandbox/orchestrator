@@ -52,8 +52,10 @@ import (
 // and synchronous Pause activity ACKs. Version 10 retains dead/deleting management
 // entries with parent identity/state versions; mixed peers fail closed.
 // Version 11 adds historical idle evidence and activity observations.
-// Hold traffic is an optional v11 feature negotiated at registration.
-const Version = 11
+// Hold traffic remains an optional negotiated feature.
+// Version 12 carries the accepted named-checkpoint quota on Create; mixed peers
+// must not silently replace it with the historical one-slot policy.
+const Version = 12
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -432,6 +434,11 @@ func ReadMsg(r io.Reader) (*Msg, error) {
 }
 
 func validateMessageLimits(m *Msg) error {
+	if m != nil && m.Cmd != nil && m.Cmd.MaxCheckpoints != nil {
+		if m.Cmd.Kind != CmdCreate || *m.Cmd.MaxCheckpoints <= 0 {
+			return errors.New("routesync: max_checkpoints requires Create and a positive integer")
+		}
+	}
 	if m != nil && m.Cmd != nil && len(m.Cmd.MigrationToken) > migrationtoken.MaxWireSize {
 		return migrationtoken.ErrTokenTooLarge
 	}

@@ -415,6 +415,7 @@ func TestRunEndAcceptedResultDelegatesPausedAndDeletingOwners(t *testing.T) {
 			current.State = state
 			checkpoint := filepath.Join(current.BaseDir, "checkpoint", "keep")
 			if state == types.StatePaused {
+				checkpointCleanupTool(t, f.o, "exit 0\n")
 				current.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("a", 64)}
 				if err := os.MkdirAll(filepath.Dir(checkpoint), 0o700); err != nil {
 					t.Fatal(err)

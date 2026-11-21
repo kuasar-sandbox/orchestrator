@@ -56,7 +56,7 @@ func TestDeletingCheckpointWaitsForPublishedControllerInventory(t *testing.T) {
 	lease, err := resource.CreateLease(resource.Lease{Version: resource.LeaseVersion, SandboxID: f.sb.ID, PID: os.Getpid(),
 		ControllerSocket: socket, CgroupPath: filepath.Join(cgroups, "source"), CapacityMemory: 1 << 30, CapacityCPUMilli: 1000,
 		FloorMemory: 128 << 20, FloorCPUMilli: 500, StartupMemory: 256 << 20,
-		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}})
+		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestDeletingCheckpointWaitsForPublishedControllerInventory(t *testing.T) {
 	if _, _, err := oldState.Admit(nodectl.AdmitSpec{SandboxID: f.sb.ID, PeerPID: os.Getpid(), Token: "source-token", CgroupPath: filepath.Join(cgroups, "source"),
 		Capacity: nodectl.Resources{MemoryBytes: 1 << 30, CPUMilli: 1000}, InitialBudget: 256 << 20,
 		ConfiguredAllocatable: nodectl.Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
-		ClientFeatures:        []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}, LeasePath: lease.Path()}); err != nil {
+		ClientFeatures:        []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}, LeasePath: lease.Path()}); err != nil {
 		t.Fatal(err)
 	}
 	start, err := memorycheckpoint.ProcessStartTime(os.Getpid())
@@ -120,12 +120,14 @@ func TestDeletingCheckpointWaitsForPublishedControllerInventory(t *testing.T) {
 			t.Fatal(err)
 		}
 		var receipt struct {
-			Settled bool `json:"settled"`
+			Captures []struct {
+				Stage string `json:"stage"`
+			} `json:"captures"`
 		}
 		if err := json.Unmarshal(data, &receipt); err != nil {
 			t.Fatal(err)
 		}
-		return receipt.Settled
+		return len(receipt.Captures) == 1 && receipt.Captures[0].Stage == "settled"
 	}
 	if readSettled() {
 		t.Fatal("test accidentally persisted memory settlement before restart")
@@ -190,7 +192,10 @@ func TestDeletingCheckpointWaitsForPublishedControllerInventory(t *testing.T) {
 	if _, found, err := f.o.st.RunPoolOwnership(context.Background(), m.RunID); err != nil || found {
 		t.Fatalf("ready-controller cleanup retained holder identity: %v %v", found, err)
 	}
-	if _, err := os.Stat(w.Path()); !os.IsNotExist(err) || !readSettled() {
-		t.Fatalf("source removal did not follow durable settlement: %v", err)
+	if _, err := os.Stat(w.Path()); !os.IsNotExist(err) {
+		t.Fatalf("terminal source remains: %v", err)
+	}
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("terminal SID retained empty account header: %v", err)
 	}
 }

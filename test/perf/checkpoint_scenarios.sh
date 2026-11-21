@@ -144,6 +144,7 @@ perf_retention_workloads() {
 import json, sys
 meta, refs = (json.load(open(path)) for path in sys.argv[1:])
 want = {(disk['diff_id'], meta['checkpoint_id']) for disk in [meta['root'], *(meta.get('disks') or [])]}
+refs = [ref for ref in refs if ref.get('diff_id')]
 assert refs and {(ref['diff_id'], ref['id']) for ref in refs} == want, (refs, want)
 PY
     fi

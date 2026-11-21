@@ -172,12 +172,11 @@ type State struct {
 	// The root gate covers routed insertions and checkpoint ownership changes.
 	// Holding it across route + mutation prevents a stale Sync from recreating
 	// the same SID in its previous pool after a cross-pool handoff.
-	retentionMu     sync.Mutex
-	retentionOps    sync.Mutex // serializes durable receipt transactions, never held by ordinary RPCs
-	retentionRoot   *State
-	retained        map[string]*retainedReceipt
-	retainedBytes   map[string]uint64
-	retainedCgroups map[string]string
+	retentionMu   sync.Mutex
+	retentionOps  sync.Mutex // serializes durable receipt transactions, never held by ordinary RPCs
+	retentionRoot *State
+	retained      map[string]*retainedAccount
+	retainedBytes map[string]uint64
 	// A multi-pool State routes the existing controller's operations to ledgers.
 	// Ledgers have no server, admission worker or lifecycle owner of their own.
 	pools         map[string]*State
