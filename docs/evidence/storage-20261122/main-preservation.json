@@ -1,0 +1,12 @@
+{
+  "main_paths": 74,
+  "unchanged_from_main": 68,
+  "overlap": [
+    "internal/registry/registry.go",
+    "internal/registry/registry_test.go",
+    "internal/registry/reserve_operation.go",
+    "internal/registry/route_link.go",
+    "internal/registry/store.go",
+    "internal/router/router.go"
+  ]
+}

@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore
+cpu: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
+BenchmarkStorage/sqlite/ReadResolution-8         	     500	    116234 ns/op	         0 errors	      8603 ops/s	        96.50 p50-us	       193.8 p95-us	       304.7 p99-us	    9786 B/op	     154 allocs/op
+BenchmarkStorage/sqlite/ReadResolution-8         	     500	    117288 ns/op	         0 errors	      8526 ops/s	        97.60 p50-us	       193.8 p95-us	       417.0 p99-us	    9813 B/op	     154 allocs/op
+BenchmarkStorage/sqlite/ReadResolution-8         	     500	    107015 ns/op	         0 errors	      9344 ops/s	        90.50 p50-us	       169.9 p95-us	       347.2 p99-us	    9733 B/op	     153 allocs/op
+BenchmarkStorage/sqlite/IntentAndOwnership-8     	     500	   7807939 ns/op	         0 errors	       128.1 ops/s	      7631 p50-us	      8912 p95-us	     14195 p99-us	   19274 B/op	     319 allocs/op
+BenchmarkStorage/sqlite/IntentAndOwnership-8     	     500	  10027814 ns/op	         0 errors	        99.72 ops/s	      7747 p50-us	     22418 p95-us	     32476 p99-us	   19349 B/op	     319 allocs/op
+BenchmarkStorage/sqlite/IntentAndOwnership-8     	     500	   7816523 ns/op	         0 errors	       127.9 ops/s	      7526 p50-us	     10029 p95-us	     15222 p99-us	   19568 B/op	     319 allocs/op
+BenchmarkStorage/sqlite/List128-8                	     500	   1813787 ns/op	         0 errors	       551.3 ops/s	      1658 p50-us	      2789 p95-us	      3199 p99-us	  488173 B/op	    3428 allocs/op
+BenchmarkStorage/sqlite/List128-8                	     500	   1815350 ns/op	         0 errors	       550.9 ops/s	      1661 p50-us	      2843 p95-us	      3392 p99-us	  488918 B/op	    3428 allocs/op
+BenchmarkStorage/sqlite/List128-8                	     500	   1857398 ns/op	         0 errors	       538.4 ops/s	      1701 p50-us	      2825 p95-us	      3453 p99-us	  488632 B/op	    3428 allocs/op
+BenchmarkStorage/sqlite/ReadObserveWriteWake-8   	     500	   7693561 ns/op	         0 errors	       130.0 ops/s	      7573 p50-us	      8779 p95-us	     11755 p99-us	   28013 B/op	     422 allocs/op
+BenchmarkStorage/sqlite/ReadObserveWriteWake-8   	     500	   7960044 ns/op	         0 errors	       125.6 ops/s	      7815 p50-us	      8924 p95-us	     12044 p99-us	   27783 B/op	     422 allocs/op
+BenchmarkStorage/sqlite/ReadObserveWriteWake-8   	     500	   7746327 ns/op	         0 errors	       129.1 ops/s	      7538 p50-us	      8517 p95-us	     15097 p99-us	   27847 B/op	     422 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	34.862s

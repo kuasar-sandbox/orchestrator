@@ -1,0 +1,31 @@
+{
+  "arch": "aarch64",
+  "started": 1795322965.4980052,
+  "go": "go version go1.26.8 linux/arm64",
+  "postgres_image": "sha256:be2f4eb4b9824567b746dcbee82ad8644c9920349d8e8f47153ddd70f98599a4",
+  "native-arm-r4": {
+    "exit_code": 0,
+    "log": "native-arm-r4.log"
+  },
+  "observe-arm": {
+    "exit_code": 0,
+    "log": "observe-arm.log"
+  },
+  "postgres-http-arm": {
+    "exit_code": 0,
+    "log": "postgres-http-arm.log"
+  },
+  "purego-arm": {
+    "exit_code": 0,
+    "log": "purego-arm.log"
+  },
+  "native-build-arm": {
+    "exit_code": 0,
+    "log": "native-build-arm.log"
+  },
+  "native-launcher-arm": {
+    "exit_code": 0,
+    "log": "native-launcher-arm.log"
+  },
+  "finished": 1795323070.404272
+}

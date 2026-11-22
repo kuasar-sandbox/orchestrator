@@ -1,0 +1,29 @@
+{
+  "test-core-final": {
+    "exit_code": 0
+  },
+  "vet-final": {
+    "exit_code": 0
+  },
+  "business-race-final": {
+    "exit_code": 0
+  },
+  "postgres-http-final": {
+    "exit_code": 0
+  },
+  "purego-build-final": {
+    "exit_code": 0
+  },
+  "binary_sha256": "aa4c0a43f0375564fff8ed3d591bb869dc712c19af04c8ac2b222bca80140085",
+  "binary_type": "/home/grayc/work/storage-engine-pr563-20261122/cluster-ctl-purego: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=mEDd7ApiQyfqt69_IPWW/VsajL4_ze_d6R29bZKAv/Y2ZhCTCSbndtjMKxm8O_/hm_LN3tei-0Fe7DPVndz, BuildID[sha1]=7e23f9eac448f8abeb2d0577caf8c9e0d50cf775, with debug_info, not stripped",
+  "sqlite-binary-smoke": {
+    "http_membership": 200,
+    "graceful_exit": 0,
+    "fdb_runtime": false
+  },
+  "postgres-binary-smoke": {
+    "http_membership": 200,
+    "graceful_exit": 0,
+    "fdb_runtime": false
+  }
+}

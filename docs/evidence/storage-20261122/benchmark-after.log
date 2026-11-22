@@ -1,0 +1,30 @@
+FoundationDB 7.3 (v7.3.77)
+source version 3ea44ce1d9003ad095e408039e1f755c319c4dfb
+protocol fdb00b073000000
+test FoundationDB ready (7.3.77, single SSD; ordinary read/write checked)
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/fdbdriver	0.009s
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore
+cpu: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
+BenchmarkStorage/fdb/ReadResolution-8         	     500	   1399571 ns/op	         0 errors	       714.5 ops/s	      1328 p50-us	      2060 p95-us	      2394 p99-us	    6745 B/op	      99 allocs/op
+BenchmarkStorage/fdb/ReadResolution-8         	     500	   1325123 ns/op	         0 errors	       754.6 ops/s	      1256 p50-us	      1826 p95-us	      2080 p99-us	    6808 B/op	      99 allocs/op
+BenchmarkStorage/fdb/ReadResolution-8         	     500	   1289806 ns/op	         0 errors	       775.3 ops/s	      1231 p50-us	      1854 p95-us	      2269 p99-us	    6808 B/op	      99 allocs/op
+BenchmarkStorage/fdb/IntentAndOwnership-8     	     500	  14050331 ns/op	         0 errors	        71.17 ops/s	     11445 p50-us	     26446 p95-us	     43942 p99-us	   14349 B/op	     211 allocs/op
+BenchmarkStorage/fdb/IntentAndOwnership-8     	     500	  10727900 ns/op	         0 errors	        93.21 ops/s	     10553 p50-us	     12431 p95-us	     16670 p99-us	   14122 B/op	     211 allocs/op
+BenchmarkStorage/fdb/IntentAndOwnership-8     	     500	  10585751 ns/op	         0 errors	        94.47 ops/s	     10384 p50-us	     11904 p95-us	     13839 p99-us	   14048 B/op	     211 allocs/op
+BenchmarkStorage/fdb/List128-8                	     500	   6831568 ns/op	         0 errors	       146.4 ops/s	      6681 p50-us	      8653 p95-us	      9641 p99-us	  496045 B/op	    3071 allocs/op
+BenchmarkStorage/fdb/List128-8                	     500	   7306449 ns/op	         0 errors	       136.9 ops/s	      7034 p50-us	      9437 p95-us	     10835 p99-us	  494848 B/op	    3071 allocs/op
+BenchmarkStorage/fdb/List128-8                	     500	   6811440 ns/op	         0 errors	       146.8 ops/s	      6642 p50-us	      8502 p95-us	      9467 p99-us	  497451 B/op	    3071 allocs/op
+BenchmarkStorage/fdb/ReadObserveWriteWake-8   	     500	  16295800 ns/op	         0 errors	        61.37 ops/s	     16052 p50-us	     18045 p95-us	     26692 p99-us	   18230 B/op	     247 allocs/op
+BenchmarkStorage/fdb/ReadObserveWriteWake-8   	     500	  16245381 ns/op	         0 errors	        61.56 ops/s	     15932 p50-us	     19017 p95-us	     23409 p99-us	   17773 B/op	     247 allocs/op
+BenchmarkStorage/fdb/ReadObserveWriteWake-8   	     500	  15812726 ns/op	         0 errors	        63.24 ops/s	     15556 p50-us	     17424 p95-us	     22651 p99-us	   18221 B/op	     247 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	64.188s
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/sqlengine	0.008s
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/cmd/cluster-ctl	0.015s
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/test/e2e/cluster_stub	0.012s
