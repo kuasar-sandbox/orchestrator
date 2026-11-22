@@ -78,9 +78,10 @@ check_target_binary() {
 }
 
 check_go_binary() {
-  local file="$1" info name
+  local file="$1" info name expected_cgo=0
   name="$(basename "$file")"
   case "$name" in node-ctl|cluster-ctl|node-stub-ctl|e2b-key-ctl) ;; *) fail "unexpected Go release payload: $name" ;; esac
+  [ "$name" != cluster-ctl ] || expected_cgo=1
   local target_arch="$2" go_arch
   case "$target_arch" in x86_64) go_arch=amd64 ;; aarch64) go_arch=arm64 ;; *) fail "invalid target: $target_arch" ;; esac
   info="$(go version -m "$file" 2>/dev/null)" \
@@ -90,12 +91,21 @@ check_go_binary() {
     $2 == "mod" { modules++; if ($3 != "github.com/kuasar-sandbox/orchestrator") bad=1 }
     END { exit bad || paths != 1 || modules != 1 }
   ' <<< "$info" || fail "Go release payload must be the $name main package: $file"
-  awk -F '\t' -v expected_arch="$go_arch" '
+  awk -F '\t' -v expected_arch="$go_arch" -v expected_cgo="$expected_cgo" '
     $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
     $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=" expected_arch) bad=1 }
-    $2 == "build" && $3 ~ /^CGO_ENABLED=/ { cgo++; if ($3 != "CGO_ENABLED=0") bad=1 }
+    $2 == "build" && $3 ~ /^CGO_ENABLED=/ { cgo++; if ($3 != "CGO_ENABLED=" expected_cgo) bad=1 }
     END { exit bad || os != 1 || arch != 1 || cgo != 1 }
-  ' <<< "$info" || fail "Go release payload must target linux/$go_arch with CGO_ENABLED=0: $file"
+  ' <<< "$info" || fail "Go release payload must target linux/$go_arch with CGO_ENABLED=$expected_cgo: $file"
+  if [ "$name" = cluster-ctl ]; then
+    awk -F '\t' '
+      $2 == "build" && $3 ~ /^-tags=/ {
+        tags=substr($3, 7); count=split(tags, values, /[, ]/)
+        for (i=1; i<=count; i++) if (values[i] == "fdb") found=1
+      }
+      END { exit !found }
+    ' <<< "$info" || fail "cluster-ctl must be built with the fdb tag: $file"
+  fi
   check_target_binary "$file" "$target_arch"
 }
 
@@ -141,6 +151,7 @@ validate_bundle() {
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file" "$arch"
   done
+  python3 -B "${TOOL_ROOT:-$ROOT}/scripts/cluster-native.py" validate --arch "$arch" --root "$extract"
   release_materials_validate "$extract" "$NAME"
   for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     release_materials_validate_go "$extract" "$NAME" "bin/$file"
@@ -216,6 +227,8 @@ package_release() {
     check_go_binary "$STAGE/bin/$binary" "$arch"
     release_materials_require_go_revision "$STAGE/bin/$binary" "$project_sha"
   done
+  python3 -B "${TOOL_ROOT:-$ROOT}/scripts/cluster-native.py" install --arch "$arch" \
+    --root "$bin_dir/cluster-runtime" --output "$STAGE"
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
   sandboxer_version="$(release_materials_git_version "$sandboxer_source" "$sandboxer_version" "$sandboxer_sha")"
@@ -254,6 +267,8 @@ package_release() {
 $NAME $version for Linux.
 
 Download the archive for your architecture, verify its native GitHub asset size and digest, then extract it into a Kuasar Sandbox deployment root. Documentation and E2E suites from this exact tag are collected by the aggregate platform release.
+
+Run cluster roles through bin/run-cluster-ctl, which loads the bundled FoundationDB 7.3.77 client and C runtime. Linux x86_64 hosts require AVX. Configure the registry with its FoundationDB cluster file; the archive contains the client runtime and does not install a database server.
 EOF
   validate_bundle "$version" "$arch" "$output"
   echo "==> prepared $output for $version"

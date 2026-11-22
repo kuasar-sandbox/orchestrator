@@ -31,7 +31,7 @@ func commandClusterContext(t *testing.T, cmd *routesync.Command) *routesync.Clus
 func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cluster := newShardStoreCluster(t, []string{"ingress", "peer", "owner"}, 3, 1, 1, 1)
+	cluster := newTestStoreCluster(t, []string{"ingress", "peer", "owner"}, 3, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
@@ -79,7 +79,7 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	cluster := newTestStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
@@ -156,7 +156,7 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	cluster := newTestStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
@@ -209,7 +209,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 }
 
 func TestNodeLinkRedirectDoesNotFallbackToRelayEndpoint(t *testing.T) {
-	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	cluster := newTestStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
 	ingress := New(cluster["ingress"], nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ingress.SetNodeLinkRelayPeers(map[string]NodeLinkRelayPeer{"owner": {
 		Endpoint: "http://owner-control.example.test",

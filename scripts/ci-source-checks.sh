@@ -8,6 +8,11 @@ go test -count=1 -timeout=5m ./...
 # Give each race-instrumented package the source Workbench's two CPUs. Tests
 # retain their own goroutine/subprocess concurrency and per-package deadline.
 CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m ./...
+# Native repositories and command wiring run against an isolated SSD database,
+# through the same pinned loader and client runtime as the shipped executable.
+python3 -B scripts/with-test-fdb.py -- \
+    python3 -B scripts/cluster-native.py test --arch "$(uname -m)" -- \
+    -race -p=1 -count=1 -timeout=5m
 go vet ./...
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-telemetry-image-pull.py

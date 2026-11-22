@@ -25,7 +25,6 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -34,7 +33,7 @@ import (
 
 func testRegWithBox(t *testing.T) *Registry {
 	t.Helper()
-	return New(NewStores(), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(newTestStores(), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
@@ -105,7 +104,7 @@ func testRouteFromRecord(record *SandboxRecord, sid, state string) routesync.Rou
 }
 
 func updateHeartbeatAndRefreshKeyPairs(reg *Registry, ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
-	reg.updateHeartbeat(ctx, nodeID, hb)
+	reg.updateHeartbeat(testNodeSession(ctx, reg.stores, nodeID), nodeID, hb)
 	rec, found, err := reg.getNodeForLinkUpdate(ctx, nodeID)
 	if err == nil && found {
 		reg.refreshNodeKeyPairs(ctx, rec)
@@ -134,7 +133,7 @@ func placementWithToken(nodeID string) Placer {
 func TestSelectorPatchRefreshesNodeLinkKeyCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
 		cmds = append(cmds, c)
@@ -175,7 +174,7 @@ func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
 	now := time.Now().Unix()
 	key := testNodeKeyPair(testAPISecret, testMK, now+int64(keyLeaseTTL.Seconds()))
 	key.AckedExpiresUnix = now + int64((keyRenewBefore / 2).Seconds())
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
 		t.Fatal(err)
 	}
 	var cmds []*routesync.Command
@@ -196,7 +195,7 @@ func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
 		t.Fatalf("node found=%v err=%v", found, err)
 	}
 	node.KeyPairs[0].AckedExpiresUnix = now + int64((keyRenewBefore + time.Hour).Seconds())
-	if err := reg.stores.PutNode(ctx, node); err != nil {
+	if err := putTestNode(reg.stores, ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	updateHeartbeatAndRefreshKeyPairs(reg, ctx, "n1", &routesync.Heartbeat{})
@@ -209,7 +208,7 @@ func TestHeartbeatRetriesRejectedManifestKey(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	key := testNodeKeyPair(testAPISecret, testMK, time.Now().Add(keyLeaseTTL).Unix())
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
 		t.Fatal(err)
 	}
 	sends := 0
@@ -238,7 +237,7 @@ func TestRejectedManifestKeyDoesNotBlockOtherKeys(t *testing.T) {
 		testNodeKeyPair(testAPISecret, testMK, expires),
 		testNodeKeyPair("1111111111111111111111111111111111111111111111111111111111111111", "2222222222222222222222222222222222222222222222222222222222222222", expires),
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", KeyPairs: keys}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", KeyPairs: keys}); err != nil {
 		t.Fatal(err)
 	}
 	var sends []string
@@ -273,7 +272,7 @@ func TestRejectedManifestKeyDoesNotBlockOtherKeys(t *testing.T) {
 func TestHeartbeatRetriesManifestKeyAfterMissingAck(t *testing.T) {
 	reg := testRegWithBox(t)
 	key := testNodeKeyPair(testAPISecret, testMK, time.Now().Add(keyLeaseTTL).Unix())
-	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
+	if err := putTestNode(reg.stores, context.Background(), &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
 		t.Fatal(err)
 	}
 	sends := 0
@@ -314,7 +313,7 @@ func TestMissingManifestKeyAckStopsCurrentRefreshBatch(t *testing.T) {
 		testNodeKeyPair(testAPISecret, testMK, expires),
 		testNodeKeyPair("1111111111111111111111111111111111111111111111111111111111111111", "2222222222222222222222222222222222222222222222222222222222222222", expires),
 	}
-	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", KeyPairs: keys}); err != nil {
+	if err := putTestNode(reg.stores, context.Background(), &NodeRecord{NodeID: "n1", KeyPairs: keys}); err != nil {
 		t.Fatal(err)
 	}
 	sends := 0
@@ -336,7 +335,7 @@ func TestMissingManifestKeyAckStopsCurrentRefreshBatch(t *testing.T) {
 func TestHeartbeatRetriesManifestKeyAfterDisconnect(t *testing.T) {
 	reg := testRegWithBox(t)
 	key := testNodeKeyPair(testAPISecret, testMK, time.Now().Add(keyLeaseTTL).Unix())
-	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
+	if err := putTestNode(reg.stores, context.Background(), &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
 		t.Fatal(err)
 	}
 	linkCtx, disconnect := context.WithCancel(context.Background())
@@ -368,7 +367,7 @@ func TestStaleManifestKeyAckDoesNotOverwriteNewDesiredLease(t *testing.T) {
 	initial := testNodeKeyPair(testAPISecret, testMK, time.Now().Add(2*time.Hour).Unix())
 	newer := initial
 	newer.ExpiresUnix = initial.ExpiresUnix + int64(time.Hour.Seconds())
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{initial}}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{initial}}); err != nil {
 		t.Fatal(err)
 	}
 	var expiries []int64
@@ -404,7 +403,7 @@ func TestManifestKeyAckWaitDoesNotBlockOtherNode(t *testing.T) {
 			manifestKey = "2222222222222222222222222222222222222222222222222222222222222222"
 		}
 		key := testNodeKeyPair(apiSecret, manifestKey, expires)
-		if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: nodeID, KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
+		if err := putTestNode(reg.stores, context.Background(), &NodeRecord{NodeID: nodeID, KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -443,7 +442,7 @@ func TestManifestKeyAckWaitDoesNotDelayHeartbeatState(t *testing.T) {
 	defer cancel()
 	reg := testRegWithBox(t)
 	key := testNodeKeyPair(testAPISecret, testMK, time.Now().Add(keyLeaseTTL).Unix())
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", KeyPairs: []clusterstate.NodeKeyPair{key}}); err != nil {
 		t.Fatal(err)
 	}
 	keyStarted := make(chan struct{})
@@ -454,7 +453,7 @@ func TestManifestKeyAckWaitDoesNotDelayHeartbeatState(t *testing.T) {
 	heartbeats := make(chan *routesync.Heartbeat, 2)
 	done := make(chan struct{})
 	go func() {
-		reg.runNodeHeartbeatUpdates(ctx, "n1", heartbeats)
+		reg.runNodeHeartbeatUpdates(testNodeSession(ctx, reg.stores, "n1"), "n1", heartbeats)
 		close(done)
 	}()
 	heartbeats <- &routesync.Heartbeat{Allocated: 1, Pool: 10}
@@ -488,7 +487,7 @@ func TestManifestKeyAckWaitDoesNotDelayHeartbeatState(t *testing.T) {
 func TestDeleteSandboxRouteSendsNodeLinkCommand(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:1"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-1", "n1", StateReady)); err != nil {
@@ -517,7 +516,7 @@ func TestDeleteSandboxRouteSendsNodeLinkCommand(t *testing.T) {
 func TestSelectorPatchRetriesFailedManifestKeyCacheWrite(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}}); err != nil {
 		t.Fatal(err)
 	}
 	owner := &flakyKeyPairOwner{remoteLifecycleOwner: remoteLifecycleOwner{reg: reg}}
@@ -569,7 +568,7 @@ func TestSelectorPatchWritesManifestKeyTargetsConcurrently(t *testing.T) {
 func TestKeyDropOnLeave(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
 		cmds = append(cmds, c)
@@ -600,8 +599,8 @@ func TestKeyDropOnLeave(t *testing.T) {
 func TestSelectorPatchWritesOnlySelectedNodeKeyCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2", Labels: map[string]string{"zone": "west"}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n2", Labels: map[string]string{"zone": "west"}})
 	cmds := map[string][]*routesync.Command{}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds["n1"] = append(cmds["n1"], c) }})
 	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(c *routesync.Command) { cmds["n2"] = append(cmds["n2"], c) }})
@@ -637,7 +636,7 @@ func TestSelectorPatchWritesOnlySelectedNodeKeyCache(t *testing.T) {
 func TestSelectorPatchDoesNotDropRemovedTargetAndRotatesKey(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
@@ -678,7 +677,7 @@ func TestSelectorPatchDoesNotDropRemovedTargetAndRotatesKey(t *testing.T) {
 func TestSelectorPatchCachesKeysInNodeLink(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
@@ -712,7 +711,7 @@ func TestSelectorPatchCachesKeysInNodeLink(t *testing.T) {
 func TestManifestKeyTTLExpiresNodeLinkCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
@@ -759,7 +758,7 @@ func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
 	if err := reg.applySelectorPatch(ctx, stale); !errors.Is(err, errStaleImportSourceLease) {
 		t.Fatalf("stale source owner patch err=%v, want errStaleImportSourceLease", err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	if node, found, err := reg.stores.GetNode(ctx, "n1"); err != nil || !found || len(node.KeyPairs) != 0 {
@@ -781,7 +780,7 @@ func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
 func testReg(t *testing.T) *Registry {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := New(NewStores(), nil, 5*time.Second, log)
+	reg := New(newTestStores(), nil, 5*time.Second, log)
 	enableTestCreateAuth(t, reg)
 	return reg
 }
@@ -1033,7 +1032,7 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1052,7 +1051,7 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		go reg.applyRoute(context.Background(), "n1", &route)
+		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
 
@@ -1089,7 +1088,7 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1114,7 +1113,7 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 			t.Errorf("idle policy not forwarded: %v", cmd.IdleTimeout)
 		}
 		route.IdleTimeout = new(int64(5)) // effective create hook policy
-		go reg.applyRoute(context.Background(), "n1", &route)
+		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
 
@@ -1139,7 +1138,7 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1212,7 +1211,7 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 
 func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 	ctx := context.Background()
-	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 3, 1, 1, 1)
+	cluster := newTestStoreCluster(t, []string{"a", "b", "c"}, 3, 1, 1, 1)
 	nodeID := "node-remote"
 	waiter := New(cluster["a"], placementWithToken(nodeID), 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reporter := New(cluster["b"], nil, 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1224,11 +1223,12 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 				time.Sleep(20 * time.Millisecond)
 				route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 				route.TemplateID = cmd.TemplateRef
-				reporter.applyRoute(context.Background(), nodeID, &route)
+				testApplyRoute(reporter, context.Background(), nodeID, &route)
 			}()
 		},
 	}
 	waiter.SetNodeOwner(owner)
+	seedTestNode(t, waiter.stores, nodeID)
 
 	res, err := waiter.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
@@ -1247,7 +1247,7 @@ func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1258,7 +1258,7 @@ func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		go reg.applyRoute(context.Background(), "n1", &route)
+		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
 
@@ -1278,7 +1278,7 @@ func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 func TestReadyRoutePreservesCredentials(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1"})
 	want := testEnvdAccessToken
 	reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-ready", "n1", StateReady))
@@ -1340,7 +1340,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		placement.Config[sandboxcfg.NsTraffic] = `{"max_inflight":{"total":20,"forward":8}}`
 		return placement, nil
 	}))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var got *routesync.Command
@@ -1353,7 +1353,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		got = &cp
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		go reg.applyRoute(context.Background(), "n1", &route)
+		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
 
@@ -1431,7 +1431,7 @@ func TestReserveSandboxLeafMergesPlacementAndRequestResources(t *testing.T) {
 		placement.Config[sandboxcfg.NsResource] = `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":0.5}}`
 		return placement, nil
 	}))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var command *routesync.Command
@@ -1441,7 +1441,7 @@ func TestReserveSandboxLeafMergesPlacementAndRequestResources(t *testing.T) {
 		command = &copy
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		go reg.applyRoute(context.Background(), "n1", &route)
+		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}})
 
 	_, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "resource-leaves", map[string]string{
@@ -1475,7 +1475,7 @@ func TestReserveSandboxDoesNotHideInvalidPlacementResourceWithRequest(t *testing
 			Config: map[string]string{sandboxcfg.NsResource: `{"control":{}}`},
 		}, nil
 	}))
-	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, context.Background(), &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { commands++ }})
@@ -1567,9 +1567,9 @@ func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
 
 func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 	ctx := context.Background()
-	reg := New(NewStores(), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := New(newTestStores(), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableTestCreateAuth(t, reg)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
 	owner := &remoteLifecycleOwner{reg: reg}
@@ -1586,12 +1586,12 @@ func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 
 func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 	ctx := context.Background()
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		t.Fatal("ready route should not call placer")
 		return nil, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableTestCreateAuth(t, reg)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
 	owner := &remoteLifecycleOwner{reg: reg}
@@ -1610,7 +1610,7 @@ func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 func TestReserveSandboxDoesNotReplaceReadyRouteOnRuntimeError(t *testing.T) {
 	ctx := context.Background()
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return &Placement{NodeID: "replacement", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1666,7 +1666,7 @@ func TestSendAndWaitTimeout(t *testing.T) {
 func TestCreateRejectFastFails(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	conn := &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind == routesync.CmdCreate {
 			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "bad template"})
@@ -1716,7 +1716,7 @@ func TestDeadReportRetainsManagementUntilFinalDelete(t *testing.T) {
 	}
 
 	route := testE2BRoute("sb-dead", routesync.StateDead)
-	reg.applyRoute(ctx, "n1", &route)
+	testApplyRoute(reg, ctx, "n1", &route)
 
 	if got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk"); err != nil || !found || got.State != StateDead {
 		t.Fatalf("dead management location = %+v, %v, %v", got, found, err)
@@ -1724,7 +1724,7 @@ func TestDeadReportRetainsManagementUntilFinalDelete(t *testing.T) {
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", route.SandboxID); err != nil || !found {
 		t.Fatalf("dead lost node ownership: %v, %v", found, err)
 	}
-	reg.applyDeleteBySID(ctx, "n1", route.SandboxID)
+	testApplyDeleteBySID(reg, ctx, "n1", route.SandboxID)
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "rk"); found {
 		t.Fatal("final Delete retained management location")
 	}
@@ -1750,7 +1750,7 @@ func TestStartingReportPreservesRegistryRouteState(t *testing.T) {
 			}
 
 			route := testE2BRoute(sid, routesync.StateStarting)
-			reg.applyRoute(ctx, "n1", &route)
+			testApplyRoute(reg, ctx, "n1", &route)
 
 			stored, revision, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 			if err != nil || !found || revision != initialRevision || stored.State != state ||
@@ -1775,11 +1775,11 @@ func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("sb-old", 0), State: routesync.StateDead})
+	testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("sb-old", 0), State: routesync.StateDead})
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", EncodeNodeSandboxID("sb-old", 0)); err != nil || !found {
 		t.Fatalf("late dead prematurely removed ownership: %v, %v", found, err)
 	}
-	reg.applyDeleteBySID(ctx, "n1", EncodeNodeSandboxID("sb-old", 0))
+	testApplyDeleteBySID(reg, ctx, "n1", EncodeNodeSandboxID("sb-old", 0))
 
 	rec, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || rec.SandboxID != "sb-new" {
@@ -1806,7 +1806,7 @@ func TestStaleLiveReportRetainsOwnershipUntilFinalDelete(t *testing.T) {
 		}
 	}})
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("sb-old", 0), State: routesync.StateRunning})
+	testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("sb-old", 0), State: routesync.StateRunning})
 	if deletes != 1 {
 		t.Fatalf("stale live report sent %d delete commands, want 1", deletes)
 	}
@@ -1814,11 +1814,11 @@ func TestStaleLiveReportRetainsOwnershipUntilFinalDelete(t *testing.T) {
 		t.Fatalf("stale live ownership was removed before DEAD: found=%v err=%v", found, err)
 	}
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("sb-old", 0), State: routesync.StateDead})
+	testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("sb-old", 0), State: routesync.StateDead})
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", EncodeNodeSandboxID("sb-old", 0)); err != nil || !found {
 		t.Fatalf("dead prematurely removed ownership: %v, %v", found, err)
 	}
-	reg.applyDeleteBySID(ctx, "n1", EncodeNodeSandboxID("sb-old", 0))
+	testApplyDeleteBySID(reg, ctx, "n1", EncodeNodeSandboxID("sb-old", 0))
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", EncodeNodeSandboxID("sb-old", 0)); err != nil || found {
 		t.Fatalf("stale ownership remained after DEAD: found=%v err=%v", found, err)
 	}
@@ -1844,7 +1844,7 @@ func TestRouteReportProfileMustMatchOwnership(t *testing.T) {
 		}
 	}})
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
+	testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{
 		SandboxID: EncodeNodeSandboxID("sb-profile", 0), Profile: "bare", State: routesync.StateRunning,
 	})
 
@@ -1924,7 +1924,7 @@ func TestReservedRouteWithMaterializedCredentialsRejectsRebinding(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg.applyRoute(ctx, "n1", &rebound)
+	testApplyRoute(reg, ctx, "n1", &rebound)
 
 	stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || stored.State != StateReserved || !sameRouteCredentials(stored, current) {
@@ -1944,7 +1944,7 @@ func TestUnownedRouteReportDoesNotDeleteNodeLocalSandbox(t *testing.T) {
 	}})
 
 	for _, state := range []string{routesync.StateRunning, routesync.StatePaused, routesync.StateDead} {
-		reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "sb-local", State: state})
+		testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "sb-local", State: state})
 	}
 	if len(cmds) != 0 {
 		t.Fatalf("unowned node-local sandbox received cluster command: %+v", cmds)
@@ -1972,7 +1972,7 @@ func TestRouteEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 	}
 
 	route := testE2BRoute("same-sandbox", routesync.StateRunning)
-	reg.applyRoute(ctx, "n1", &route)
+	testApplyRoute(reg, ctx, "n1", &route)
 	g1, _, found, err := reg.stores.GetSandbox(ctx, "/g1", "rk1")
 	if err != nil || !found || g1.State != StateReady || g1.EnvdAccessToken != testEnvdAccessToken {
 		t.Fatalf("g1 route=%+v found=%v err=%v", g1, found, err)
@@ -1986,7 +1986,7 @@ func TestRouteEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var firstSID string
@@ -2015,7 +2015,7 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 			route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 			route.SandboxID = cmd.SID
-			reg.applyRoute(ctx, "n1", &route)
+			testApplyRoute(reg, ctx, "n1", &route)
 		}()
 	}})
 
@@ -2039,10 +2039,10 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 
 func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
-	reg := New(NewStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := New(newTestStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableTestCreateAuth(t, reg)
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	var sid string
 	var deletes int
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -2071,18 +2071,18 @@ func TestParkTimeoutRollback(t *testing.T) {
 
 	// A create that completed after the caller timed out is still recognized as
 	// registry-owned, deleted, and retained until the node confirms DEAD.
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: sid, State: routesync.StateRunning})
+	testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: sid, State: routesync.StateRunning})
 	if deletes != 1 {
 		t.Fatalf("late running route sent %d delete commands, want 1", deletes)
 	}
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || !found {
 		t.Fatalf("late running ownership was removed before DEAD: found=%v err=%v", found, err)
 	}
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: sid, State: routesync.StateDead})
+	testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: sid, State: routesync.StateDead})
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || !found {
 		t.Fatalf("dead prematurely removed late-create ownership: %v, %v", found, err)
 	}
-	reg.applyDeleteBySID(ctx, "n1", sid)
+	testApplyDeleteBySID(reg, ctx, "n1", sid)
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || found {
 		t.Fatalf("late sandbox ownership remained after DEAD: found=%v err=%v", found, err)
 	}
@@ -2100,7 +2100,7 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "new"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "new"}); err != nil {
 		t.Fatal(err)
 	}
 	ref := testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)
@@ -2137,7 +2137,7 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	ref := testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)
@@ -2171,7 +2171,7 @@ func TestRollbackReserveRestoresOriginalCredentialBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	ref := testNodeSandboxRef("/g", "rk", reserved.SandboxID, "e2b", reserved.APISecretFingerprint)
@@ -2273,7 +2273,7 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"old", "candidate"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2315,7 +2315,7 @@ func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"old", "new"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2331,7 +2331,7 @@ func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
 		replacementSID = cmd.SID
 		go func() {
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-			reg.applyDeleteBySID(context.Background(), "new", cmd.SID)
+			testApplyDeleteBySID(reg, context.Background(), "new", cmd.SID)
 			close(deleted)
 		}()
 	}})
@@ -2368,7 +2368,7 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "old"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
@@ -2402,7 +2402,7 @@ func TestReadyReplacementRejectsProfileChange(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "old"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
@@ -2428,7 +2428,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "new"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "new"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
@@ -2454,7 +2454,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 			TrafficAccessToken: original.TrafficAccessToken,
 			ForwardAccessToken: original.ForwardAccessToken,
 		}
-		go reg.applyRoute(context.Background(), "new", &route)
+		go testApplyRoute(reg, context.Background(), "new", &route)
 	}})
 
 	requestOverride := strings.Repeat("2", 64)
@@ -2512,7 +2512,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2576,7 +2576,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		t.Fatal("replacement retry did not persist the original credential binding")
 	}
 	route := testRouteFromRecord(original, reserved.NodeSandboxID, routesync.StateRunning)
-	reg.applyRoute(ctx, "n2", &route)
+	testApplyRoute(reg, ctx, "n2", &route)
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || ready.State != StateReady || ready.CreateCredentials != nil || ready.MaxCheckpoints != 17 ||
 		!sameRouteCredentials(ready, original) {
@@ -2596,7 +2596,7 @@ func TestMaterializedReservedRetryRejectsBindingChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2801,7 +2801,7 @@ func TestCreateCredentialsPersistWithReservedAndClearOnReady(t *testing.T) {
 			Config: map[string]string{sandboxcfg.NsCredentials: `{"envd_access_token":"placement-fallback"}`},
 		}, nil
 	}))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var command *routesync.Command
@@ -2841,7 +2841,7 @@ func TestCreateCredentialsPersistWithReservedAndClearOnReady(t *testing.T) {
 
 	route := testE2BRoute(reserved.SandboxID, routesync.StateRunning)
 	route.SandboxID = reserved.NodeSandboxID
-	reg.applyRoute(ctx, "n1", &route)
+	testApplyRoute(reg, ctx, "n1", &route)
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || ready.State != StateReady || ready.CreateCredentials != nil {
 		t.Fatalf("ready route retained create credentials: route=%+v found=%v err=%v", ready, found, err)
@@ -2868,7 +2868,7 @@ func TestCreateCredentialsCASRetryUsesCommittedWinner(t *testing.T) {
 		}
 		return &Placement{NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
 	}))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var commandConfig map[string]string
@@ -2912,7 +2912,7 @@ func TestCreateCredentialsCASRetryDropsRolledBackWinner(t *testing.T) {
 		}
 		return &Placement{NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
 	}))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var commandConfig map[string]string
@@ -2944,7 +2944,7 @@ func TestReservedWithoutCreateCredentialsRejectsLaterFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg.SetPlacer(placementWithToken("n1"))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var commandConfig map[string]string
@@ -3008,7 +3008,7 @@ func TestReadyReplacementCASRetryPreservesConcurrentCredentialBinding(t *testing
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "candidate"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "candidate"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "candidate"})
@@ -3047,7 +3047,7 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"old", "new"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3103,16 +3103,16 @@ func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 		report func(context.Context, *Registry)
 	}{
 		{name: "delete by SID", report: func(ctx context.Context, reg *Registry) {
-			reg.applyDeleteBySID(ctx, "n1", EncodeNodeSandboxID("same-sandbox", 0))
+			testApplyDeleteBySID(reg, ctx, "n1", EncodeNodeSandboxID("same-sandbox", 0))
 		}},
 		{name: "dead then final delete", report: func(ctx context.Context, reg *Registry) {
-			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b",
+			testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b",
 				SandboxID: EncodeNodeSandboxID("same-sandbox", 0), State: routesync.StateDead,
 			})
 			if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", EncodeNodeSandboxID("same-sandbox", 0)); err != nil || !found {
 				t.Fatalf("old dead lost ownership before deletion: %v, %v", found, err)
 			}
-			reg.applyDeleteBySID(ctx, "n1", EncodeNodeSandboxID("same-sandbox", 0))
+			testApplyDeleteBySID(reg, ctx, "n1", EncodeNodeSandboxID("same-sandbox", 0))
 		}},
 	}
 	for _, tt := range tests {
@@ -3126,7 +3126,7 @@ func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 			if _, err := reg.stores.PutSandbox(ctx, current); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+			if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 				t.Fatal(err)
 			}
 			currentRef := testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", testAPIFingerprint)
@@ -3163,7 +3163,7 @@ func TestLateRouteEventsDoNotCrossCredentialBinding(t *testing.T) {
 			reg.SetNodeOwner(owner)
 			oldFingerprint := testAPIFingerprint
 			currentFingerprint := strings.Repeat("b", 64)
-			if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+			if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 				t.Fatal(err)
 			}
 			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", oldFingerprint)); err != nil {
@@ -3178,7 +3178,7 @@ func TestLateRouteEventsDoNotCrossCredentialBinding(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("same-sandbox", 0), State: state})
+			testApplyRoute(reg, ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: EncodeNodeSandboxID("same-sandbox", 0), State: state})
 
 			route, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 			if err != nil || !found || route.APISecretFingerprint != currentFingerprint {
@@ -3206,8 +3206,8 @@ func TestReplaceOnRejectSucceeds(t *testing.T) {
 		}
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n2"})
 	creates := 0
 	var createCredentials []string
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -3227,7 +3227,7 @@ func TestReplaceOnRejectSucceeds(t *testing.T) {
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		route.SandboxID = cmd.SID
-		go reg.applyRoute(context.Background(), "n2", &route)
+		go testApplyRoute(reg, context.Background(), "n2", &route)
 	}})
 
 	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
@@ -3257,10 +3257,10 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 		}
 		return &Placement{NodeID: "stale", APISecretFingerprint: testAPIFingerprint}, nil
 	}))
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "stale"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "stale"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "live"}); err != nil {
 		t.Fatal(err)
 	}
 	original := testE2BSandboxRecord("/g", "rk", "sb-stale", "stale", StateReady)
@@ -3273,7 +3273,7 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testRouteFromRecord(original, cmd.SID, routesync.StateRunning)
-		go reg.applyRoute(context.Background(), "live", &route)
+		go testApplyRoute(reg, context.Background(), "live", &route)
 	}})
 
 	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
@@ -3288,7 +3288,7 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 func TestReserveSandboxDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 	ctx := context.Background()
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -3310,11 +3310,12 @@ func TestReserveSandboxDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 func TestReserveSandboxDoesNotRePlaceAfterCreateAckTimeout(t *testing.T) {
 	ctx := context.Background()
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableTestCreateAuth(t, reg)
+	seedTestNode(t, reg.stores, "n1")
 	owner := &remoteRouteWriteOwner{
 		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
 		ackErr: context.DeadlineExceeded,
@@ -3332,11 +3333,12 @@ func TestReserveSandboxDoesNotRePlaceAfterCreateAckTimeout(t *testing.T) {
 func TestReserveSandboxParksAfterAmbiguousCommandError(t *testing.T) {
 	ctx := context.Background()
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	enableTestCreateAuth(t, reg)
+	seedTestNode(t, reg.stores, "n1")
 	owner := &remoteRouteWriteOwner{
 		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
 		ackErr: errors.New("node-owner response lost"),
@@ -3354,7 +3356,7 @@ func TestReserveSandboxParksAfterAmbiguousCommandError(t *testing.T) {
 func TestReservePausedResume(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	want := testEnvdAccessToken
 	// Resume keeps both the stable public ID and the current node-local ID, and
 	// ignores create-only credential overrides.
@@ -3381,7 +3383,7 @@ func TestReservePausedResume(t *testing.T) {
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testRouteFromRecord(original, original.NodeSandboxID, routesync.StateRunning)
-		go reg.applyRoute(context.Background(), "n1", &route)
+		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
 
@@ -3401,7 +3403,7 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	lastBeat := time.Now().Unix()
-	reg.stores.PutNode(ctx, &NodeRecord{
+	putTestNode(reg.stores, ctx, &NodeRecord{
 		NodeID: "n1", Labels: map[string]string{"pool": "p"}, Capacity: 10,
 		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{MaxBuilds: 16, Resources: &routesync.BuildResources{CPU: 64000}},
 		BuildExecutionCapacity:    &routesync.BuildAdmissionLimit{MaxBuilds: 4, Resources: &routesync.BuildResources{CPU: 16000}},
@@ -3449,78 +3451,10 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	}
 }
 
-func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.SetPlacerReadyLabel("registry.1.test")
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
-		t.Fatal(err)
-	}
-	mux := http.NewServeMux()
-	reg.ServePlacerLink(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + PlacerLinkNodeListWatchPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reset := readViewFrame(t, resp.Body)
-	if reset.Type != "reset" {
-		t.Fatalf("initial first frame = %+v, want reset", reset)
-	}
-	_ = readViewFrame(t, resp.Body) // n1 snapshot
-	bookmark := readViewFrame(t, resp.Body)
-	if bookmark.Type != "bookmark" || bookmark.Token == "" {
-		t.Fatalf("initial bookmark missing watch token: %+v", bookmark)
-	}
-
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
-		t.Fatal(err)
-	}
-	live := readViewFrame(t, resp.Body)
-	if live.Type != "put" || live.Key != "n2" || live.Token == "" {
-		t.Fatalf("live event should carry token, got %+v", live)
-	}
-	resp.Body.Close()
-
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n3", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
-		t.Fatal(err)
-	}
-	resp, err = http.Get(srv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape(live.Token))
-	if err != nil {
-		t.Fatal(err)
-	}
-	delta := readViewFrame(t, resp.Body)
-	if delta.Type != "put" || delta.Key != "n3" {
-		t.Fatalf("live token should replay later delta without reset, got %+v", delta)
-	}
-	resp.Body.Close()
-
-	resp, err = http.Get(srv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	delta = readViewFrame(t, resp.Body)
-	if delta.Type != "put" || delta.Key != "n2" {
-		t.Fatalf("matching token should replay delta without reset, got %+v", delta)
-	}
-
-	resp2, err := http.Get(srv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape("registry.2.test:1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp2.Body.Close()
-	if got := readViewFrame(t, resp2.Body); got.Type != "reset" {
-		t.Fatalf("mismatched token should force full snapshot reset, got %+v", got)
-	}
-}
-
 func TestNodeListWatchTokenResetsAcrossRegistryRestart(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
@@ -3560,7 +3494,7 @@ func TestNodeListWatchTokenResetsAcrossRegistryRestart(t *testing.T) {
 func TestSelectorPatchHTTPRejectsMissingImportSourceLease(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
@@ -3592,62 +3526,41 @@ func TestSelectorPatchHTTPRejectsMissingImportSourceLease(t *testing.T) {
 	}
 }
 
-func TestRunCompactorWithNilLogger(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	reg := New(NewStores(), nil, time.Second, nil)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		reg.RunCompactor(ctx, time.Millisecond)
-	}()
-	time.Sleep(5 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("compactor did not stop")
-	}
-}
-
 func TestNodeListWatchIgnoresHeartbeatWatermarks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reg := testReg(t)
-	now := time.Now().Unix()
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: now}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
-	rev, err := reg.stores.NodeListRev(ctx)
+	ctx = testNodeSession(ctx, reg.stores, "n1")
+	view, err := reg.stores.directory.Load(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch, err := reg.stores.WatchNodeList(ctx, rev)
+	watch, err := reg.stores.directory.Observe(ctx, view.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	defer watch.Cancel()
 	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{Allocated: 100, Pool: 200, Counts: 5})
 	select {
-	case ev := <-ch:
-		t.Fatalf("watermark-only heartbeat emitted node_list event: %+v", ev)
-	case <-time.After(100 * time.Millisecond):
+	case <-watch.Done():
+		t.Fatal("watermark-only heartbeat invalidated directory")
+	case <-time.After(20 * time.Millisecond):
 	}
-
 	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{Allocated: 100, Pool: 200, Counts: 5, Draining: true})
 	select {
-	case ev := <-ch:
-		if ev.Type != WatchEventPut || ev.Key != "n1" {
-			t.Fatalf("draining update event=%+v", ev)
-		}
-		var raw map[string]any
-		if err := json.Unmarshal(ev.Value, &raw); err != nil {
-			t.Fatal(err)
-		}
-		if raw["draining"] != true {
-			t.Fatalf("draining update value=%v", raw)
-		}
+	case <-watch.Done():
 	case <-time.After(time.Second):
-		t.Fatal("draining heartbeat did not emit node_list event")
+		t.Fatal("draining change did not invalidate directory")
+	}
+	next, err := reg.stores.directory.Load(ctx)
+	if err != nil || len(next.Nodes) != 1 || !next.Nodes[0].Draining {
+		t.Fatalf("directory=%+v err=%v", next, err)
+	}
+	if !next.Nodes[0].Version.IsCommitted() || next.Nodes[0].Version.Compare(view.Nodes[0].Version) <= 0 {
+		t.Fatal("directory lost projection version ordering")
 	}
 }
 
@@ -3767,51 +3680,18 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 	}
 }
 
-func TestRangeSandboxesWarmsGroupViewAndPublishesRouteWatch(t *testing.T) {
-	ctx := context.Background()
-	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
-	stores := cluster["r1"]
-	seed := testSandboxIdentityRecord("/g", "rk", "sb-warm", "n1", StateReady)
-	seedRouteShardRecord(t, ctx, cluster["r2"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
-	seedRouteShardRecord(t, ctx, cluster["r3"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
-
-	ch, err := stores.WatchRouteGroup(ctx, "/g", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var got []string
-	if err := stores.RangeSandboxes(ctx, "/g", func(s *SandboxRecord) error {
-		got = append(got, s.SandboxID)
-		return nil
-	}); err != nil {
-		t.Fatalf("range warm: %v", err)
-	}
-	if len(got) != 1 || got[0] != "sb-warm" {
-		t.Fatalf("range got %v, want [sb-warm]", got)
-	}
-	select {
-	case ev := <-ch:
-		if ev.Type != WatchEventPut || ev.Key != "rk" {
-			t.Fatalf("route watch event=%+v", ev)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("route watch did not receive warmup repair")
-	}
-}
-
 func TestNodeFullSnapshotDeletesMissingSandboxRefs(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	keepRef := testNodeSandboxRef("/g", "keep", "sb-keep", "e2b", testAPIFingerprint)
 	goneRef := testNodeSandboxRef("/g", "gone", "sb-gone", "e2b", testAPIFingerprint)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Sandboxes: []clusterstate.NodeSandboxRef{keepRef, goneRef}}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Sandboxes: []clusterstate.NodeSandboxRef{keepRef, goneRef}}); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = reg.stores.PutSandbox(ctx, testSandboxIdentityRecord("/g", "keep", "sb-keep", "n1", StateReady))
 	_, _ = reg.stores.PutSandbox(ctx, testSandboxIdentityRecord("/g", "gone", "sb-gone", "n1", StateReady))
 
-	reg.applyNodeFullSnapshot(ctx, "n1", []clusterstate.NodeSandboxRef{keepRef, goneRef}, map[string]struct{}{keepRef.NodeSandboxID: {}})
+	testApplyNodeFullSnapshot(reg, ctx, "n1", []clusterstate.NodeSandboxRef{keepRef, goneRef}, map[string]struct{}{keepRef.NodeSandboxID: {}})
 
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "gone"); found {
 		t.Fatal("full snapshot should delete route missing from node range")
@@ -3846,7 +3726,7 @@ func TestNodeFullSnapshotKeepsAssignmentAddedAfterBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg.applyNodeFullSnapshot(ctx, "n1", []clusterstate.NodeSandboxRef{baseline}, nil)
+	testApplyNodeFullSnapshot(reg, ctx, "n1", []clusterstate.NodeSandboxRef{baseline}, nil)
 
 	ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", current.NodeSandboxID)
 	if err != nil || !found || ref.Group != current.Group {
@@ -3878,7 +3758,7 @@ func TestNodeFullSnapshotKeepsReboundCredentialIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg.applyNodeFullSnapshot(ctx, "n1", []clusterstate.NodeSandboxRef{baseline}, nil)
+	testApplyNodeFullSnapshot(reg, ctx, "n1", []clusterstate.NodeSandboxRef{baseline}, nil)
 
 	ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", current.NodeSandboxID)
 	if err != nil || !found || ref.APISecretFingerprint != current.APISecretFingerprint {
@@ -3887,106 +3767,6 @@ func TestNodeFullSnapshotKeepsReboundCredentialIdentity(t *testing.T) {
 	route, _, found, err := reg.stores.GetSandbox(ctx, current.Group, current.RouteKey)
 	if err != nil || !found || route.APISecretFingerprint != current.APISecretFingerprint {
 		t.Fatalf("current route=%+v found=%v err=%v", route, found, err)
-	}
-}
-
-func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
-	ctx := context.Background()
-	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
-	stores := cluster["r1"]
-	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	seed := testSandboxIdentityRecord("/g", "rk", "sb-q", "n1", StateReady)
-	seedRouteShardRecord(t, ctx, cluster["r1"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
-	seedRouteShardRecord(t, ctx, cluster["r3"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
-	if !localShardHasRecord(t, ctx, cluster["r1"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey("rk")) {
-		t.Fatal("seed route did not land on local shard")
-	}
-
-	got, rev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found {
-		t.Fatalf("GetSandbox found=%v err=%v", found, err)
-	}
-	if got.SandboxID != "sb-q" || got.NodeSandboxID != EncodeNodeSandboxID("sb-q", 0) || got.State != StateReady || rev == 0 {
-		t.Fatalf("route from quorum = %+v rev=%d", got, rev)
-	}
-	if !localShardHasRecord(t, ctx, cluster["r2"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey("rk")) {
-		t.Fatalf("lagging route owner was not repaired")
-	}
-}
-
-func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
-	ctx := context.Background()
-	cluster := newShardStoreCluster(t, []string{"n1", "n2", "n3"}, 1, 3, 1, 1)
-	stores := cluster["n1"]
-	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	seed := &NodeRecord{NodeID: "node-q", Labels: map[string]string{"pool": "p"}, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443"}
-	seedNodeProfileShardRecord(t, ctx, cluster["n1"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
-	seedNodeProfileShardRecord(t, ctx, cluster["n3"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
-	if !localShardHasRecord(t, ctx, cluster["n1"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord) {
-		t.Fatal("seed node did not land on local shard")
-	}
-
-	got, found, err := reg.stores.GetNode(ctx, "node-q")
-	if err != nil || !found {
-		t.Fatalf("GetNode found=%v err=%v", found, err)
-	}
-	if got.APIEndpoint != "10.0.0.1:7443" || got.DataEndpoint != "10.0.0.1:8443" || got.Labels["pool"] != "p" {
-		t.Fatalf("node from quorum = %+v", got)
-	}
-	if !localShardHasRecord(t, ctx, cluster["n2"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord) {
-		t.Fatalf("lagging node owner was not repaired")
-	}
-}
-
-func seedRouteShardRecord(t *testing.T, ctx context.Context, store *Stores, route *SandboxRecord, ballot shardkv.Ballot, rev uint64) {
-	t.Helper()
-	value, err := clusterstate.EncodeShardValue(route)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.ShardStore().Handle(ctx, shardkv.Request{
-		Op:        shardkv.OpRepair,
-		Namespace: shardkv.Namespace(clusterstate.NamespaceRouteLink),
-		Shard:     clusterstate.RouteLinkShard(route.Group),
-		RecordSet: clusterstate.RecordSetRouteSandbox,
-		Record: shardkv.Record{
-			Namespace: shardkv.Namespace(clusterstate.NamespaceRouteLink),
-			Shard:     clusterstate.RouteLinkShard(route.Group),
-			RecordSet: clusterstate.RecordSetRouteSandbox,
-			Key:       clusterstate.RouteSandboxRecordKey(route.RouteKey),
-			Value:     value,
-			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},
-		},
-	})
-	if err != nil {
-		t.Fatalf("seed route shard: %v", err)
-	}
-}
-
-func seedNodeProfileShardRecord(t *testing.T, ctx context.Context, store *Stores, node *NodeRecord, ballot shardkv.Ballot, rev uint64) {
-	t.Helper()
-	value, err := clusterstate.EncodeShardValue(nodeProfileFromRegistry(node))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.ShardStore().Handle(ctx, shardkv.Request{
-		Op:        shardkv.OpRepair,
-		Namespace: shardkv.Namespace(clusterstate.NamespaceNodeLink),
-		Shard:     clusterstate.NodeLinkShard(node.NodeID),
-		RecordSet: clusterstate.RecordSetNodeProfile,
-		Record: shardkv.Record{
-			Namespace: shardkv.Namespace(clusterstate.NamespaceNodeLink),
-			Shard:     clusterstate.NodeLinkShard(node.NodeID),
-			RecordSet: clusterstate.RecordSetNodeProfile,
-			Key:       clusterstate.NodeLinkProfileRecord,
-			Value:     value,
-			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},
-		},
-	})
-	if err != nil {
-		t.Fatalf("seed node shard: %v", err)
 	}
 }
 
@@ -4002,7 +3782,7 @@ func TestSweepKeepsInflightReserved(t *testing.T) {
 	reg := testReg(t)
 	liveRef := testNodeSandboxRef("/g", "live", "sb-r", "e2b", testAPIFingerprint)
 	staleRef := testNodeSandboxRef("/g", "stale", "sb-s", "e2b", testAPIFingerprint)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{liveRef, staleRef}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{liveRef, staleRef}})
 	// A RESERVED row whose single-flight is still in flight must survive the sweep.
 	reg.stores.PutSandbox(ctx, testSandboxIdentityRecord("/g", "live", "sb-r", "dead", StateReserved))
 	reg.mu.Lock()
@@ -4024,99 +3804,16 @@ func TestSweepKeepsInflightReserved(t *testing.T) {
 	}
 }
 
-func TestClaimedNodeProfileRejectsStaleRuntimeWriters(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	const nodeID = "reaping"
-	oldRef := testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{
-		NodeID: nodeID, LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
-		Sandboxes: []clusterstate.NodeSandboxRef{oldRef},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	stale, found, err := reg.getNodeForLinkUpdate(ctx, nodeID)
-	if err != nil || !found || len(stale.Sandboxes) != 1 {
-		t.Fatalf("stale node=%+v found=%v err=%v", stale, found, err)
-	}
-	claimed, err := reg.stores.claimNodeProfileReapShard(ctx, nodeID, stale.Meta.Rev)
-	if err != nil || !claimed {
-		t.Fatalf("claim=%v err=%v", claimed, err)
-	}
-	reg.updateHeartbeat(ctx, nodeID, &routesync.Heartbeat{Allocated: 9})
-	reg.updateNodeResume(ctx, nodeID, "stale-resume")
-	if _, found, err := reg.stores.GetNodeProfile(ctx, nodeID); err != nil || found {
-		t.Fatalf("runtime update recreated claimed profile: found=%v err=%v", found, err)
-	}
-	stale.APIEndpoint = "stale-api"
-	stale.DataEndpoint = "stale-data"
-	if _, ok, err := reg.stores.casNodeProfileShard(ctx, stale, stale.Meta.Rev); err != nil || ok {
-		t.Fatalf("stale registration CAS ok=%v err=%v", ok, err)
-	}
-	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID:       nodeID,
-		APIEndpoint:  "fresh-api",
-		DataEndpoint: "fresh-data",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if registered.APIEndpoint != "fresh-api" || registered.DataEndpoint != "fresh-data" || len(registered.Sandboxes) != 0 {
-		t.Fatalf("registration reused stale node view: %+v", registered)
-	}
-}
-
-func TestRuntimeProfileWriterDoesNotRetryIntoReconnectGeneration(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	const nodeID = "runtime-generation-fence"
-	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID:       nodeID,
-		APIEndpoint:  "old-api",
-		DataEndpoint: "old-data",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var interleaveErr error
-	interleaved := false
-	_, found, err := reg.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
-		if !interleaved {
-			interleaved = true
-			claimed, claimErr := reg.stores.claimNodeProfileReapShard(ctx, nodeID, rec.Meta.Rev)
-			if claimErr != nil || !claimed {
-				interleaveErr = fmt.Errorf("claim=%v err=%w", claimed, claimErr)
-				return
-			}
-			_, interleaveErr = reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-				NodeID:       nodeID,
-				APIEndpoint:  "fresh-api",
-				DataEndpoint: "fresh-data",
-			})
-		}
-		rec.ResumeToken = "stale-session"
-	})
-	if interleaveErr != nil {
-		t.Fatal(interleaveErr)
-	}
-	if !errors.Is(err, shardkv.ErrConflict) || found {
-		t.Fatalf("stale runtime writer found=%v err=%v", found, err)
-	}
-	profile, found, err := reg.stores.GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || profile.APIEndpoint != "fresh-api" || profile.DataEndpoint != "fresh-data" || profile.ResumeToken != "" {
-		t.Fatalf("fresh profile=%+v found=%v err=%v", profile, found, err)
-	}
-}
-
 func TestSweepDeadNodes(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	// Disconnected node with a stale heartbeat + a READY sandbox → both swept.
 	deadRef := testNodeSandboxRef("/g", "rk", "sb-1", "e2b", testAPIFingerprint)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{deadRef}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{deadRef}})
 	reg.stores.PutSandbox(ctx, testSandboxIdentityRecord("/g", "rk", "sb-1", "dead", StateReady))
 	// Connected node with a stale heartbeat → NOT swept (a live channel isn't dead).
 	liveRef := testNodeSandboxRef("/g2", "rk", "sb-2", "e2b", testAPIFingerprint)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{liveRef}})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "live", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{liveRef}})
 	reg.addNode(&fakeConn{nodeID: "live"})
 	reg.stores.PutSandbox(ctx, testSandboxIdentityRecord("/g2", "rk", "sb-2", "live", StateReady))
 
@@ -4143,7 +3840,7 @@ func TestSweepDeadNodeDoesNotDeleteReboundCredentialIdentity(t *testing.T) {
 	oldFingerprint := testAPIFingerprint
 	currentFingerprint := strings.Repeat("b", 64)
 	oldRef := testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", oldFingerprint)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{
 		NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
 		Sandboxes: []clusterstate.NodeSandboxRef{oldRef},
 	}); err != nil {
@@ -4180,7 +3877,7 @@ func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
 		{Group: "/g", BuildID: "orphan"},
 		{Group: "/g", BuildID: "moved"},
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{
 		NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Builds: refs,
 	}); err != nil {
 		t.Fatal(err)

@@ -1,0 +1,12 @@
+{
+  "purego": {
+    "sha256": "aa4c0a43f0375564fff8ed3d591bb869dc712c19af04c8ac2b222bca80140085",
+    "bytes": 44984208,
+    "vcs_info_embedded": false
+  },
+  "native": {
+    "sha256": "303f9e215daa0127df214a92fa65a861e3dd255b1468051fdb91ca2fde9db7ce",
+    "bytes": 44793424,
+    "vcs_info_embedded": false
+  }
+}

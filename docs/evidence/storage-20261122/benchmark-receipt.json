@@ -1,0 +1,38 @@
+{
+  "started": 1795321923.4104035,
+  "platform": "Linux-6.18.40.1-microsoft-kuasar-WSL2-x86_64-with-glibc2.39",
+  "machine": "x86_64",
+  "cpu_count": 6,
+  "gomaxprocs": 8,
+  "iterations": 500,
+  "rounds": 3,
+  "race": false,
+  "workloads": "serial public metadata calls; identical metadatabench source",
+  "fixture_sha256": "0af57fa723a1e603113342c83fab342b70bdc3b0a29120aa1d1e8f0ab609a178",
+  "baseline_commit": "5c72e418c49bd333e312b10fba1000d7c0d918b3",
+  "new_base_commit": "f1cd0c5e99b170c04094a785c3d07699f31041d5",
+  "new_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "fdb": "7.3.77 isolated single SSD; same machine, native runtime and source dependencies",
+  "sqlite": "WAL synchronous=FULL",
+  "postgres": "16.15 fsync=on, SERIALIZABLE, synchronous_commit=on",
+  "source_status": "",
+  "source_tree": "36a645311cd6faae920f853c1a2064f06a939b2e",
+  "go": "go version go1.26.8 linux/amd64",
+  "benchmark-before": {
+    "exit_code": 0,
+    "log": "benchmark-before.log"
+  },
+  "benchmark-after": {
+    "exit_code": 0,
+    "log": "benchmark-after.log"
+  },
+  "benchmark-sqlite": {
+    "exit_code": 0,
+    "log": "benchmark-sqlite.log"
+  },
+  "benchmark-postgres": {
+    "exit_code": 0,
+    "log": "benchmark-postgres.log"
+  },
+  "finished": 1795322267.5070057
+}

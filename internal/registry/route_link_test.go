@@ -19,8 +19,8 @@ import (
 
 func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 	ctx := context.Background()
-	reg := New(NewStores(), nil, 0, nil)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "127.0.0.1:7443", DataEndpoint: "127.0.0.1:8443"}); err != nil {
+	reg := New(newTestStores(), nil, 0, nil)
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "127.0.0.1:7443", DataEndpoint: "127.0.0.1:8443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
@@ -45,7 +45,7 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 	}
 	if got.SandboxID != want.SandboxID || got.NodeSandboxID != want.NodeSandboxID ||
 		got.Profile != want.Profile || got.APIEndpoint != "127.0.0.1:7443" || got.DataEndpoint != "127.0.0.1:8443" ||
-		got.RouteRevision <= 0 ||
+		!got.RouteRevision.IsCommitted() ||
 		got.StableID != want.StableID || got.APISecret != want.APISecret ||
 		got.APISecretFingerprint != want.APISecretFingerprint ||
 		got.ManifestKeyFingerprint != want.ManifestKeyFingerprint ||
@@ -58,7 +58,7 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 
 func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 	mux := http.NewServeMux()
-	New(NewStores(), nil, 0, nil).ServeRouteLink(mux)
+	New(newTestStores(), nil, 0, nil).ServeRouteLink(mux)
 
 	for _, tc := range []struct {
 		method string
@@ -83,6 +83,7 @@ func TestServeReserveBuildPreservesDefinitiveNodeStatus(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusConflict, http.StatusTooManyRequests} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			reg := testReg(t)
+			seedTestNode(t, reg.stores, "n1")
 			reg.SetPlacer(placementWithToken("n1"))
 			reg.SetNodeOwner(&recordingNodeOwner{allow: true, ack: &routesync.CmdAck{
 				Status: routesync.AckRejected, HTTPStatus: status, Reason: "definitive node rejection",
@@ -107,7 +108,7 @@ func TestServeReserveBuildPreservesDefinitiveNodeStatus(t *testing.T) {
 
 func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 	mux := http.NewServeMux()
-	reg := New(NewStores(), nil, 0, nil)
+	reg := New(newTestStores(), nil, 0, nil)
 	enableTestCreateAuth(t, reg)
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`)
@@ -121,7 +122,7 @@ func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 }
 
 func TestServeReserveConnectStrictlyBoundsTypedBody(t *testing.T) {
-	reg := New(NewStores(), nil, 0, nil)
+	reg := New(newTestStores(), nil, 0, nil)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	for _, test := range []struct {
@@ -166,7 +167,7 @@ func TestServeReserveAcceptsResourceAndTrafficConfig(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			placements := 0
-			reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+			reg := New(newTestStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
 				placements++
 				for key, want := range tc.config {
 					if got := req.Config[key]; got != want {
@@ -207,7 +208,7 @@ func TestServeReserveRejectsInvalidResourceAndTrafficBeforePlacement(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			placements := 0
-			reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+			reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 				placements++
 				return nil, ErrNoNode
 			}), 0, nil)
@@ -238,7 +239,7 @@ func TestServeReserveRejectsInvalidResourceAndTrafficBeforePlacement(t *testing.
 
 func TestServeReserveRejectsUnsupportedConfigBeforeReservation(t *testing.T) {
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 0, nil)
@@ -263,7 +264,7 @@ func TestServeReserveRejectsUnsupportedConfigBeforeReservation(t *testing.T) {
 
 func TestServeReserveAcceptsCredentialsWithoutSendingThemToPlacer(t *testing.T) {
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
 		placements++
 		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
 			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
@@ -288,7 +289,7 @@ func TestServeReserveAcceptsCredentialsWithoutSendingThemToPlacer(t *testing.T) 
 
 func TestServeReserveRejectsInvalidCredentialsBeforePlacement(t *testing.T) {
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return nil, ErrNoNode
 	}), 0, nil)
@@ -312,7 +313,7 @@ func TestServeReserveRejectsInvalidCredentialsBeforePlacement(t *testing.T) {
 }
 
 func TestServeReserveRejectsCredentialsInvalidForPlacedProfile(t *testing.T) {
-	reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
 		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
 			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
 		}
@@ -399,7 +400,7 @@ func TestServeReserveConnectReturnsNestedRouteAndTypedResult(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -428,7 +429,7 @@ func TestServeReserveConnectReturnsNestedRouteAndTypedResult(t *testing.T) {
 	}
 	if result.Connect == nil || result.Connect.NodeSandboxID != record.NodeSandboxID ||
 		result.Route.SandboxID != record.SandboxID || result.Route.NodeSandboxID != record.NodeSandboxID ||
-		result.Route.RouteRevision <= 0 {
+		!result.Route.RouteRevision.IsCommitted() {
 		t.Fatalf("reserve result=%+v", result)
 	}
 }
@@ -440,7 +441,7 @@ func TestServeReserveConnectPropagatesTypedNodeRejection(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {

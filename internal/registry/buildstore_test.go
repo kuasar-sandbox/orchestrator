@@ -11,7 +11,7 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -98,8 +98,9 @@ func buildAckConn(reg *Registry, nodeID string) *fakeConn {
 func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "node-api:7443", DataEndpoint: "node-data:8443"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "node-api:7443", DataEndpoint: "node-data:8443"})
 	reg.addNode(buildAckConn(reg, "n1"))
 	admitter := &recordingNodeOwner{allow: true, runtime: map[string]*NodeRecord{
 		"n1": {NodeID: "n1", APIEndpoint: "node-api:7443", DataEndpoint: "node-data:8443"},
@@ -133,6 +134,7 @@ func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 func TestReserveBuildRejectsAcceptedAckWithoutBuildResult(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
 	reg.SetNodeOwner(&recordingNodeOwner{ack: &routesync.CmdAck{Status: routesync.AckAccepted}})
 
@@ -151,6 +153,7 @@ func TestReserveBuildRejectsAcceptedAckWithoutBuildResult(t *testing.T) {
 
 func TestReserveBuildUsesSharedBuildIDBoundary(t *testing.T) {
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{allow: true}
 	reg.SetNodeOwner(owner)
@@ -182,6 +185,7 @@ func TestReserveBuildUsesSharedBuildIDBoundary(t *testing.T) {
 
 func TestReserveBuildRejectsRuntimeOwnedResourceBeforePlacement(t *testing.T) {
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	_, err := reg.ReserveBuild(context.Background(), BuildReserveReq{
 		Group: "/g", Profile: types.ProfileE2B,
 		Metadata: map[string]string{sandboxcfg.NsResource: `{"allocatable":{"deflate_on_oom":false}}`},
@@ -194,6 +198,7 @@ func TestReserveBuildRejectsRuntimeOwnedResourceBeforePlacement(t *testing.T) {
 func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{allow: true}
 	reg.SetNodeOwner(owner)
@@ -206,7 +211,7 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	if first.NodeID != "n1" {
 		t.Fatalf("first placement=%+v", first)
 	}
-	if err := reg.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)}); err != nil {
+	if err := testApplyBuildUpsert(reg, ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()}); !errors.Is(err, errNodeBuildIDConflict) {
@@ -240,7 +245,7 @@ func TestBuildUpsertsResolveSameIDByNodeOwnerTable(t *testing.T) {
 		}
 	}
 
-	if err := reg.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)}); err != nil {
+	if err := testApplyBuildUpsert(reg, ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)}); err != nil {
 		t.Fatal(err)
 	}
 	g1, found, err := reg.stores.GetBuildInGroup(ctx, "/g1", "same-build")
@@ -264,7 +269,7 @@ func TestBuildDeleteRemovesExactNodeProjectionAndOwnerRef(t *testing.T) {
 	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: record.Group, BuildID: buildID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.applyBuildDelete(ctx, "n1", buildID, ""); err != nil {
+	if err := testApplyBuildDelete(reg, ctx, "n1", buildID, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := reg.stores.GetBuildInGroup(ctx, record.Group, buildID); err != nil || found {
@@ -283,7 +288,7 @@ func TestBuildDeleteRemovesExactNodeProjectionAndOwnerRef(t *testing.T) {
 	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: replacement.Group, BuildID: buildID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.applyBuildDelete(ctx, "n1", buildID, ""); err != nil {
+	if err := testApplyBuildDelete(reg, ctx, "n1", buildID, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err := reg.stores.GetBuildInGroup(ctx, replacement.Group, buildID)
@@ -300,7 +305,7 @@ func TestBuildDeleteOwnerRefRevisionFencePreservesRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, staleRevision, found, err := reg.lookupNodeBuildRefVersion(ctx, "n1", ref.BuildID)
-	if err != nil || !found || got != ref || staleRevision == 0 {
+	if err != nil || !found || got != ref || !staleRevision.IsCommitted() {
 		t.Fatalf("captured owner ref=%+v revision=%d found=%v err=%v", got, staleRevision, found, err)
 	}
 
@@ -309,7 +314,7 @@ func TestBuildDeleteOwnerRefRevisionFencePreservesRefresh(t *testing.T) {
 	if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := reg.stores.removeNodeBuildRefShardAtRevision(ctx, "n1", ref.BuildID, staleRevision); err != nil || deleted {
+	if deleted, err := reg.stores.removeNodeBuildRefAtRevision(ctx, "n1", ref.BuildID, staleRevision); err != nil || deleted {
 		t.Fatalf("stale delete removed refreshed owner ref: deleted=%v err=%v", deleted, err)
 	}
 	if got, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", ref.BuildID); err != nil || !found || got != ref {
@@ -335,7 +340,7 @@ func TestSupersededNodeLinkBuildDeleteCannotRemoveReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := reg.withActiveNodeBuildFrame(oldSession, func() error {
-		return reg.applyBuildDelete(ctx, nodeID, buildID, "")
+		return testApplyBuildDelete(reg, ctx, nodeID, buildID, "")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +358,7 @@ func TestSupersededNodeLinkBuildDeleteCannotRemoveReplacement(t *testing.T) {
 	called := false
 	err := reg.withActiveNodeBuildFrame(oldSession, func() error {
 		called = true
-		return reg.applyBuildDelete(ctx, nodeID, buildID, "")
+		return testApplyBuildDelete(reg, ctx, nodeID, buildID, "")
 	})
 	if !errors.Is(err, errSupersededNodeBuildSession) || called {
 		t.Fatalf("superseded BuildDelete called=%v err=%v", called, err)
@@ -397,7 +402,7 @@ func TestBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := reg.applyNodeBuildFullSnapshot(ctx, "n1", expected, map[string]struct{}{"kept-ready": {}}); err != nil {
+	if err := testApplyNodeBuildFullSnapshot(reg, ctx, "n1", expected, map[string]struct{}{"kept-ready": {}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "kept-ready"); err != nil || !found {
@@ -429,7 +434,7 @@ func TestBuildReconnectFullSyncPreservesAmbiguousStartingBinding(t *testing.T) {
 	// The node may omit this row because the original command was never
 	// delivered, or because its durable acceptance raced the snapshot. Neither
 	// case is a definitive rejection of the immutable selected-node intent.
-	if err := reg.applyNodeBuildFullSnapshot(ctx, "n1", []clusterstate.NodeBuildRef{ref}, map[string]struct{}{}); err != nil {
+	if err := testApplyNodeBuildFullSnapshot(reg, ctx, "n1", []clusterstate.NodeBuildRef{ref}, map[string]struct{}{}); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err := reg.stores.GetBuildInGroup(ctx, ref.Group, ref.BuildID)
@@ -455,7 +460,7 @@ func TestBuildFullSyncBaselineDoesNotPruneConcurrentRegistration(t *testing.T) {
 	}
 	// expected is the NodeRegister baseline. The second ref appeared after that
 	// point and therefore cannot be inferred absent from this snapshot.
-	if err := reg.applyNodeBuildFullSnapshot(ctx, "n1", []clusterstate.NodeBuildRef{old}, map[string]struct{}{}); err != nil {
+	if err := testApplyNodeBuildFullSnapshot(reg, ctx, "n1", []clusterstate.NodeBuildRef{old}, map[string]struct{}{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", old.BuildID); err != nil || found {
@@ -468,12 +473,12 @@ func TestBuildFullSyncBaselineDoesNotPruneConcurrentRegistration(t *testing.T) {
 
 func TestDeadBuildCASDoesNotOverwriteReplacement(t *testing.T) {
 	ctx := context.Background()
-	stores := NewStores()
+	stores := newTestStores()
 	original := &BuildRecord{Group: "/g", BuildID: "same-build", NodeID: "n1", State: BuildRegistered, TemplateID: "old"}
 	if err := stores.PutBuild(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	stale, rev, found, err := stores.getRouteBuildShard(ctx, original.Group, original.BuildID)
+	stale, rev, found, err := stores.getBuild(ctx, original.Group, original.BuildID)
 	if err != nil || !found {
 		t.Fatalf("stale build found=%v err=%v", found, err)
 	}
@@ -482,7 +487,7 @@ func TestDeadBuildCASDoesNotOverwriteReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	stale.State, stale.Reason = BuildError, "node disconnected"
-	if _, ok, err := stores.casRouteBuildShard(ctx, stale, rev); err != nil || ok {
+	if _, ok, err := stores.casBuild(ctx, stale, rev); err != nil || ok {
 		t.Fatalf("stale dead-build CAS ok=%v err=%v", ok, err)
 	}
 	got, found, err := stores.GetBuildInGroup(ctx, replacement.Group, replacement.BuildID)
@@ -491,49 +496,46 @@ func TestDeadBuildCASDoesNotOverwriteReplacement(t *testing.T) {
 	}
 }
 
-func TestBuildProjectionCASPreservesConcurrentRegistrationAcceptance(t *testing.T) {
+func TestBuildReportPreservesConcurrentRegistrationAcceptance(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	const (
-		group   = "/g"
-		buildID = "concurrent-acceptance"
-		nodeID  = "n1"
-	)
-	if err := reg.stores.PutBuild(ctx, &BuildRecord{
-		Group: group, BuildID: buildID, NodeID: nodeID, State: BuildStarting,
-		RegistrationImageRepo: "registry.example/image", RegistrationRegistryAuth: "secret",
-	}); err != nil {
+	const group = "/g"
+	const buildID = "concurrent-acceptance"
+	const nodeID = "n1"
+	const templateID = "transient-concurrent"
+	if err := reg.stores.PutBuild(ctx, &BuildRecord{Group: group, BuildID: buildID, NodeID: nodeID, State: BuildStarting, TemplateID: templateID, RegistrationImageRepo: "registry.example/image", RegistrationRegistryAuth: "secret"}); err != nil {
 		t.Fatal(err)
 	}
-
-	want := &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
-	firstUpdate := true
-	var acceptErr error
-	err := reg.updateBuildProjection(ctx, group, buildID, nodeID, func(rec *BuildRecord) {
-		// Force registration acceptance after this update has read its revision.
-		// The first CAS must lose, re-read the accepted record, and merge the
-		// projection without erasing its target.
-		if firstUpdate {
-			firstUpdate = false
-			_, acceptErr = reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, "", want)
-		}
-		rec.State = BuildBuilding
-	})
-	if acceptErr != nil {
-		t.Fatalf("mark registration accepted: %v", acceptErr)
+	if err := reg.stores.AddNodeBuildRef(ctx, nodeID, clusterstate.NodeBuildRef{Group: group, BuildID: buildID, TemplateID: templateID}); err != nil {
+		t.Fatal(err)
 	}
-	if err != nil {
-		t.Fatalf("update build projection: %v", err)
+	want := &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		_, err := reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, templateID, want)
+		results <- err
+	}()
+	go func() {
+		<-start
+		results <- testApplyBuildUpsert(reg, ctx, nodeID, &routesync.BuildEvent{BuildID: buildID, TemplateID: templateID, State: "building"})
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
 	}
 	got, found, err := reg.stores.GetBuildInGroup(ctx, group, buildID)
 	if err != nil || !found {
 		t.Fatalf("build found=%v err=%v", found, err)
 	}
 	if got.State != BuildBuilding || !got.RegistrationTargetSet || got.RegistrationTarget == nil || *got.RegistrationTarget != *want {
-		t.Fatalf("merged build = %+v, want building with target %+v", got, want)
+		t.Fatalf("merged build=%+v target=%+v", got, want)
 	}
 	if got.RegistrationImageRepo != "" || got.RegistrationRegistryAuth != "" {
-		t.Fatalf("accepted build retained transient registration credentials: %+v", got)
+		t.Fatal("accepted build retained pull credentials")
 	}
 }
 
@@ -547,7 +549,7 @@ func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
 		}
 		attempts++
 		if attempts < 3 {
-			return shardkv.ErrQuorum
+			return metadata.ErrUnavailable
 		}
 		return nil
 	})
@@ -563,9 +565,9 @@ func TestTerminalBuildStoreFailureReturnsForSessionReplay(t *testing.T) {
 	attempts := 0
 	err := retryTerminalBuildStore(context.Background(), func(context.Context) error {
 		attempts++
-		return shardkv.ErrQuorum
+		return metadata.ErrUnavailable
 	})
-	if !errors.Is(err, shardkv.ErrQuorum) {
+	if !errors.Is(err, metadata.ErrUnavailable) {
 		t.Fatalf("retry terminal build store error = %v, want quorum failure", err)
 	}
 	if attempts != terminalBuildStoreAttempts {
@@ -576,6 +578,7 @@ func TestTerminalBuildStoreFailureReturnsForSessionReplay(t *testing.T) {
 func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{allow: true, ackErr: context.DeadlineExceeded}
 	reg.SetNodeOwner(owner)
@@ -622,6 +625,7 @@ func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 func TestReserveBuildRecoversTargetWhenStateEventOutrunsAck(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
 	reg.SetNodeOwner(owner)
@@ -632,7 +636,7 @@ func TestReserveBuildRecoversTargetWhenStateEventOutrunsAck(t *testing.T) {
 	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
 		t.Fatalf("ambiguous reserve result=%+v err=%v", res, err)
 	}
-	if err := reg.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{
+	if err := testApplyBuildUpsert(reg, ctx, "n1", &routesync.BuildEvent{
 		BuildID: req.BuildID, State: string(BuildRegistered),
 	}); err != nil {
 		t.Fatal(err)
@@ -666,6 +670,7 @@ func TestReserveBuildRecoversTargetWhenStateEventOutrunsAck(t *testing.T) {
 func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
 	reg.SetNodeOwner(owner)
@@ -747,6 +752,7 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 func TestReserveBuildKeepsCommittedBuildAfterAmbiguousCommandError(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	placements := 0
 	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
@@ -790,6 +796,7 @@ func TestReserveBuildKeepsCommittedBuildAfterAmbiguousCommandError(t *testing.T)
 func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	var sawExclusion bool
 	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
 		for _, nodeID := range req.ExcludeNodeIDs {
@@ -801,7 +808,7 @@ func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 		return &Placement{NodeID: "stale", APISecretFingerprint: testAPIFingerprint}, nil
 	}))
 	for _, nodeID := range []string{"stale", "live"} {
-		if err := reg.stores.PutNode(ctx, &NodeRecord{
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{
 			NodeID: nodeID, BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 2000}},
 		}); err != nil {
 			t.Fatal(err)
@@ -823,6 +830,7 @@ func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 func TestReserveBuildFiltersByHolderRegistrationHeadroom(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	var sawFullExclusion bool
 	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
 		for _, nodeID := range req.ExcludeNodeIDs {
@@ -852,6 +860,8 @@ func TestReserveBuildFiltersByHolderRegistrationHeadroom(t *testing.T) {
 		},
 	}}
 	reg.SetNodeOwner(owner)
+	seedTestNode(t, reg.stores, "full")
+	seedTestNode(t, reg.stores, "free")
 
 	result, err := reg.ReserveBuild(ctx, BuildReserveReq{
 		Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources(),
@@ -870,7 +880,7 @@ func TestReserveBuildFiltersByHolderRegistrationHeadroom(t *testing.T) {
 func TestReserveBuildDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 	ctx := context.Background()
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, nil)
@@ -889,7 +899,7 @@ func TestReserveBuildDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 func TestLocalNodeOwnerRequiresLiveConnection(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{
 		NodeID: "n1", BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 2000}},
 	}); err != nil {
 		t.Fatal(err)
@@ -905,6 +915,7 @@ func TestLocalNodeOwnerRequiresLiveConnection(t *testing.T) {
 
 func TestReserveBuildRequiresProfile(t *testing.T) {
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	if _, err := reg.ReserveBuild(context.Background(), BuildReserveReq{Group: "/g"}); err == nil {
 		t.Fatal("ReserveBuild accepted a missing profile")
 	}
@@ -928,16 +939,16 @@ func TestLocalNodeOwnerConnectedDoesNotRequireProfile(t *testing.T) {
 
 func TestReserveBuildRequiresCanonicalResources(t *testing.T) {
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	_, err := reg.ReserveBuild(context.Background(), BuildReserveReq{Group: "/g", Profile: types.ProfileE2B})
 	if err == nil || !strings.Contains(err.Error(), "resources are required") {
 		t.Fatalf("missing resources error = %v", err)
 	}
 }
 
-func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing.T) {
+func TestBuildStoreDoesNotLeakToSandboxList(t *testing.T) {
 	ctx := context.Background()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2", "r3"}}
-	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
+	cluster := newTestStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
 	stores := cluster["r1"]
 
 	if err := stores.PutBuild(ctx, &BuildRecord{
@@ -946,11 +957,6 @@ func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing
 	}); err != nil {
 		t.Fatalf("PutBuild: %v", err)
 	}
-	owners, err := view.Owners("/g", 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteBuild, clusterstate.RouteBuildRecordKey("bld-1"), owners)
 
 	var sandboxes []string
 	if err := stores.RangeSandboxes(ctx, "/g", func(s *SandboxRecord) error {
@@ -972,8 +978,9 @@ func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing
 func TestReserveBuildPinsConnectionLossToSameNode(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1", err: ErrNodeGone})
 	req := BuildReserveReq{Group: "/g", BuildID: "bld-fixed", TemplateID: "transient-fixed", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
 
@@ -994,8 +1001,9 @@ func TestReserveBuildPinsConnectionLossToSameNode(t *testing.T) {
 func TestReserveBuildReleasesAdmissionOnRejectedAck(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	seedTestNode(t, reg.stores, "n1")
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	reject := true
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdBuildRegister {

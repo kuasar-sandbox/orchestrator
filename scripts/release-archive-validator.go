@@ -19,6 +19,32 @@ type entryContract struct {
 }
 
 var archiveContract = map[string]entryContract{
+	"./bin/run-cluster-ctl":                                     {typeflag: tar.TypeReg, mode: 0o755},
+	"./lib/":                                                    {typeflag: tar.TypeDir, mode: 0o755},
+	"./lib/cluster-ctl/":                                        {typeflag: tar.TypeDir, mode: 0o755},
+	"./lib/cluster-ctl/ld.so":                                   {typeflag: tar.TypeReg, mode: 0o755},
+	"./lib/cluster-ctl/libc.so.6":                               {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/libdl.so.2":                              {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/libfdb_c.so":                             {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/liblzma.so.5":                            {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/libm.so.6":                               {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/libpthread.so.0":                         {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/libresolv.so.2":                          {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/librt.so.1":                              {typeflag: tar.TypeReg, mode: 0o644},
+	"./lib/cluster-ctl/libz.so.1":                               {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/":                     {typeflag: tar.TypeDir, mode: 0o755},
+	"./share/licenses/orchestrator/native/Apache-2.0":           {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/GPL-2":                {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/LGPL-2.1":             {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/foundationdb/":        {typeflag: tar.TypeDir, mode: 0o755},
+	"./share/licenses/orchestrator/native/foundationdb/LICENSE": {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/libc6/":               {typeflag: tar.TypeDir, mode: 0o755},
+	"./share/licenses/orchestrator/native/libc6/copyright":      {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/liblzma5/":            {typeflag: tar.TypeDir, mode: 0o755},
+	"./share/licenses/orchestrator/native/liblzma5/copyright":   {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/runtime.json":         {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/orchestrator/native/zlib1g/":              {typeflag: tar.TypeDir, mode: 0o755},
+	"./share/licenses/orchestrator/native/zlib1g/copyright":     {typeflag: tar.TypeReg, mode: 0o644},
 	"./":                                            {typeflag: tar.TypeDir, mode: 0o755},
 	"./bin/":                                        {typeflag: tar.TypeDir, mode: 0o755},
 	"./deploy/":                                     {typeflag: tar.TypeDir, mode: 0o755},
@@ -46,6 +72,10 @@ var archiveContract = map[string]entryContract{
 }
 
 func materialContract(name string) (entryContract, bool) {
+	// Native licenses and provenance are fixed just like the runtime libraries.
+	if strings.HasPrefix(name, "./share/licenses/orchestrator/native/") {
+		return entryContract{}, false
+	}
 	for _, directory := range []string{
 		"./share/",
 		"./share/licenses/",

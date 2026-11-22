@@ -233,11 +233,19 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         driver.chmod(0o755)
         alternate = self.root / 'alternate'
         self.fake_go(alternate, 'wrong-path-driver', 47)
+        native_log = self.root / 'native-assets.jsonl'
+        native_driver = alternate / 'python3'
+        native_driver.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
+            'if len(sys.argv)>2 and sys.argv[1]=="-B" and sys.argv[2].endswith("/scripts/test_fdb_assets.py"):\n'
+            '    with open(os.environ["NATIVE_LOG"],"a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
+            'else: os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
+        native_driver.chmod(0o755)
         output = self.root / 'declared'; output.mkdir()
         log = self.root / 'driver.jsonl'
         env = dict(os.environ, KUASAR_E2E_GO=str(driver), GOROOT=str(self.root/'invalid-goroot'),
                    PATH=str(alternate)+os.pathsep+os.environ['PATH'], DRIVER_LOG=str(log),
-                   GOWORK=str(self.root/'fixed.work'), GOTOOLCHAIN='local', CC='preserved-cc')
+                   GOWORK=str(self.root/'fixed.work'), GOTOOLCHAIN='local', CC='preserved-cc',
+                   NATIVE_LOG=str(native_log))
         wrapper = owner / 'scripts/build-e2e-helpers.sh'
         for arch, goarch in [('x86_64','amd64'),('aarch64','arm64')]:
             with self.subTest(arch=arch):
@@ -259,6 +267,8 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
                 self.assertIn('-X main.buildIdentity=target', rows[4]['argv'])
                 self.assertIn('-X main.version=inplace-target', rows[5]['argv'])
                 self.assertIn('-buildid=orchestrator-inplace-target', rows[6]['argv'])
+                self.assertEqual(json.loads(native_log.read_text().splitlines()[-1]),
+                    ['-B', str(owner/'scripts/test_fdb_assets.py'), '--arch', arch, '--output', str(output)])
         selected_root = self.root / 'selected-root'
         (selected_root/'bin').mkdir(parents=True)
         shutil.copy2(driver,selected_root/'bin/go')

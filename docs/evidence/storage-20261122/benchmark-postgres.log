@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore
+cpu: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
+BenchmarkStorage/postgres/ReadResolution-8         	     500	   2783141 ns/op	         0 errors	       359.3 ops/s	      2564 p50-us	      4300 p95-us	      6166 p99-us	   11644 B/op	     170 allocs/op
+BenchmarkStorage/postgres/ReadResolution-8         	     500	   2934004 ns/op	         0 errors	       340.8 ops/s	      2808 p50-us	      3991 p95-us	      4574 p99-us	   11776 B/op	     170 allocs/op
+BenchmarkStorage/postgres/ReadResolution-8         	     500	   2792726 ns/op	         0 errors	       358.1 ops/s	      2569 p50-us	      4445 p95-us	      6231 p99-us	   11452 B/op	     170 allocs/op
+BenchmarkStorage/postgres/IntentAndOwnership-8     	     500	  10732571 ns/op	         0 errors	        93.17 ops/s	     10083 p50-us	     14042 p95-us	     26489 p99-us	   25140 B/op	     379 allocs/op
+BenchmarkStorage/postgres/IntentAndOwnership-8     	     500	  10517080 ns/op	         0 errors	        95.08 ops/s	      9631 p50-us	     15126 p95-us	     28710 p99-us	   24840 B/op	     379 allocs/op
+BenchmarkStorage/postgres/IntentAndOwnership-8     	     500	  10319769 ns/op	         0 errors	        96.90 ops/s	      9493 p50-us	     16359 p95-us	     30074 p99-us	   25129 B/op	     379 allocs/op
+BenchmarkStorage/postgres/List128-8                	     500	   3712978 ns/op	         0 errors	       269.3 ops/s	      3536 p50-us	      5232 p95-us	      6132 p99-us	  499403 B/op	    3443 allocs/op
+BenchmarkStorage/postgres/List128-8                	     500	   3789563 ns/op	         0 errors	       263.9 ops/s	      3626 p50-us	      5284 p95-us	      6181 p99-us	  500047 B/op	    3443 allocs/op
+BenchmarkStorage/postgres/List128-8                	     500	   4530494 ns/op	         0 errors	       220.7 ops/s	      4290 p50-us	      6576 p95-us	      8195 p99-us	  501201 B/op	    3444 allocs/op
+BenchmarkStorage/postgres/ReadObserveWriteWake-8   	     500	  13781216 ns/op	         0 errors	        72.56 ops/s	     12759 p50-us	     19812 p95-us	     31303 p99-us	   34579 B/op	     505 allocs/op
+BenchmarkStorage/postgres/ReadObserveWriteWake-8   	     500	  13905091 ns/op	         0 errors	        71.92 ops/s	     13191 p50-us	     18943 p95-us	     28850 p99-us	   34339 B/op	     505 allocs/op
+BenchmarkStorage/postgres/ReadObserveWriteWake-8   	     500	  12893034 ns/op	         0 errors	        77.56 ops/s	     12568 p50-us	     14945 p95-us	     25384 p99-us	   33787 B/op	     503 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	54.616s

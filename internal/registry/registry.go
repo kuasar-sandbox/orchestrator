@@ -17,8 +17,9 @@ import (
 	"unicode/utf8"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/observebudget"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	nodestore "github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -44,7 +45,6 @@ var (
 )
 
 const lifecycleAckTimeout = 5 * time.Second
-const nodeListProjectionRetryInterval = 200 * time.Millisecond
 const selectorPatchWriteConcurrency = 16
 
 // nodeConn is the registry's handle to one connected node's channel — it sends
@@ -89,7 +89,7 @@ type Placer interface {
 	Place(ctx context.Context, req PlaceRequest) (*Placement, error)
 }
 
-// Registry owns the route_link/node_link/placer_link shardkv views and accepts
+// Registry owns the typed route, node and import-source services and accepts
 // node_link streams.
 type Registry struct {
 	stores      *Stores
@@ -103,21 +103,16 @@ type Registry struct {
 	// the active node-link session. Entries remain stable for the process
 	// lifetime so a delayed frame can never escape onto a newly allocated lock.
 	buildFrameFences map[string]*nodeBuildFrameFence
-	inflight         map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
+	inflight         map[string]*reserveCall
+	reserveLeaders   chan struct{}                     // single-flight ReserveSandbox per (group,route_key)
 	acks             map[string]chan *routesync.CmdAck // cmd_id -> command acknowledgement waiter
 
-	localNodeOwner      NodeOwner
-	nodeOwner           NodeOwner
-	deadAfter           time.Duration
-	reaperCtx           context.Context
-	nodeLinkRelayMu     sync.RWMutex
-	nodeLinkRelayPeers  map[string]NodeLinkRelayPeer
-	nodeListProjectMu   sync.Mutex
-	nodeListProject     map[string]clusterstate.NodeListEntry
-	nodeListProjectCtx  context.Context
-	nodeListProjectGen  uint64
-	nodeListProjectRoot bool
-	nodeListProjectRun  bool
+	localNodeOwner     NodeOwner
+	nodeOwner          NodeOwner
+	deadAfter          time.Duration
+	reaperCtx          context.Context
+	nodeLinkRelayMu    sync.RWMutex
+	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
 
 	placerMu         sync.Mutex
 	scaleReadyLabel  string
@@ -173,14 +168,14 @@ type reserveRollbackFence struct {
 	SandboxID         string
 	NodeSandboxID     string
 	SandboxGeneration uint64
-	Revision          int64
+	Revision          metadata.Version
 }
 
 func (f reserveRollbackFence) valid() bool {
-	return f.SandboxID != "" && f.NodeSandboxID != "" && f.Revision > 0
+	return f.SandboxID != "" && f.NodeSandboxID != "" && f.Revision.IsCommitted()
 }
 
-func (f reserveRollbackFence) matches(rec *SandboxRecord, revision int64) bool {
+func (f reserveRollbackFence) matches(rec *SandboxRecord, revision metadata.Version) bool {
 	return f.valid() && rec != nil && rec.State == StateReserved &&
 		revision == f.Revision && rec.SandboxID == f.SandboxID &&
 		rec.NodeSandboxID == f.NodeSandboxID && rec.SandboxGeneration == f.SandboxGeneration
@@ -214,8 +209,8 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		nodes:            make(map[string]nodeConn),
 		buildFrameFences: make(map[string]*nodeBuildFrameFence),
 		inflight:         make(map[string]*reserveCall),
+		reserveLeaders:   make(chan struct{}, observebudget.DefaultReserveLeaderLimit),
 		acks:             make(map[string]chan *routesync.CmdAck),
-		nodeListProject:  make(map[string]clusterstate.NodeListEntry),
 		placerReplicas:   1,
 		minReadyPlacers:  1,
 		placerTimeout:    2 * time.Second,
@@ -529,9 +524,23 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		r.mu.Unlock()
 	}()
 
+	select {
+	case r.reserveLeaders <- struct{}{}:
+		defer func() { <-r.reserveLeaders }()
+	default:
+		err := &metadata.CapacityError{Resource: "reserve leaders"}
+		r.finish(key, nil, err)
+		return nil, err
+	}
+	ctx, releaseObservation, err := r.stores.observations.ReserveObservation(ctx)
+	if err != nil {
+		r.finish(key, nil, err)
+		return nil, err
+	}
+	defer releaseObservation()
 	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory, autoReset, opts); err != nil {
 		r.finish(key, nil, err)
-		if fence, ok := r.reserveRollbackFence(key); ok {
+		if fence, ok := r.reserveRollbackFence(key); ok && !errors.Is(err, metadata.ErrUnknown) {
 			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
 			r.rollbackReserveAtFence(group, routeKey, fence, rec, found, dropCurrentRef)
 		}
@@ -563,7 +572,7 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		// it doesn't strand the route. Keep the ownership ref because command
 		// delivery may have succeeded; a late live event must still be deleted as
 		// registry-owned rather than ignored as a node-local sandbox.
-		if fence, ok := r.reserveRollbackFence(key); ok {
+		if fence, ok := r.reserveRollbackFence(key); ok && !errors.Is(rerr, metadata.ErrUnknown) && !errors.Is(rerr, metadata.ErrCapacity) {
 			r.rollbackReserveAtFence(group, routeKey, fence, rec, found, false)
 		}
 		r.finish(key, nil, rerr)
@@ -573,7 +582,7 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 	return res, nil
 }
 
-func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey string) (*SandboxRecord, int64, bool, error) {
+func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey string) (*SandboxRecord, metadata.Version, bool, error) {
 	for {
 		rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 		if !transientRouteRead(err) {
@@ -583,7 +592,7 @@ func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey str
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, 0, false, ctx.Err()
+			return nil, metadata.Version{}, false, ctx.Err()
 		case <-timer.C:
 		}
 	}
@@ -601,49 +610,23 @@ func (r *Registry) rollbackReserveAtFence(group, routeKey string, fence reserveR
 	return r.rollbackReservedAtRevision(ctx, group, routeKey, cur, rev, orig, found, dropCurrentRef)
 }
 
-func (r *Registry) rollbackReservedAtRevision(ctx context.Context, group, routeKey string, cur *SandboxRecord, rev int64, orig *SandboxRecord, found, dropCurrentRef bool) bool {
-	if found {
-		if orig == nil {
-			return false
-		}
-		restored := *orig
-		if cur.SandboxID == orig.SandboxID && cur.NextSandboxGeneration > restored.NextSandboxGeneration {
-			restored.NextSandboxGeneration = cur.NextSandboxGeneration
-		}
-		if _, ok, err := r.stores.CASSandbox(ctx, &restored, rev); err != nil || !ok {
-			return false
-		}
-		if dropCurrentRef && cur.NodeID != "" && !sameSandboxGeneration(cur, orig) {
-			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.NodeSandboxID)
-		}
-		if orig.NodeID != "" {
-			_ = r.stores.AddNodeSandboxRef(ctx, orig.NodeID, clusterstate.NodeSandboxRef{
-				Group: group, RouteKey: routeKey, SandboxID: orig.SandboxID,
-				SandboxGeneration: orig.SandboxGeneration, NodeSandboxID: orig.NodeSandboxID,
-				Profile:              orig.Profile,
-				APISecretFingerprint: orig.APISecretFingerprint,
-			})
-		}
-		return true
-	}
-	return r.deleteSandboxAtRevision(ctx, group, routeKey, cur, rev, dropCurrentRef)
-}
-
-func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey string, cur *SandboxRecord, rev int64, dropCurrentRef bool) bool {
-	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
-	if err != nil || !deleted {
+func (r *Registry) rollbackReservedAtRevision(ctx context.Context, group, routeKey string, cur *SandboxRecord, rev metadata.Version, orig *SandboxRecord, found, dropCurrentRef bool) bool {
+	if found && orig == nil {
 		return false
 	}
-	if dropCurrentRef && cur != nil && cur.NodeID != "" {
-		_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.NodeSandboxID)
+	var restore *SandboxRecord
+	if found {
+		copy := *orig
+		restore = &copy
 	}
-	return true
+	_, err := r.stores.routes.RollbackIntent(ctx, metadata.RouteKey{Group: group, RouteKey: routeKey}, rev, restore, dropCurrentRef)
+	return err == nil
 }
 
 // startReserve drives the placement + command for the leader of a single-flight.
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
-func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory, autoReset bool, options ...createOptions) error {
+func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev metadata.Version, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory, autoReset bool, options ...createOptions) error {
 	var opts createOptions
 	if len(options) > 0 {
 		opts = options[0]
@@ -669,21 +652,12 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		if rec.State == StatePaused {
 			reserved.State = StateReserved
 			var ok bool
-			reservedRev, ok, err = r.stores.CASSandbox(ctx, &reserved, rev)
+			reservedRev, ok, err = r.stores.commitSandboxIntent(ctx, &reserved, rev)
 			if err != nil || !ok {
 				return cas(err, ok)
 			}
 			r.setReserveRollbackFence(flightKey(group, routeKey), &reserved, reservedRev)
-			if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{
-				Group: group, RouteKey: routeKey, SandboxID: rec.SandboxID,
-				SandboxGeneration: rec.SandboxGeneration, NodeSandboxID: rec.NodeSandboxID,
-				Profile:              rec.Profile,
-				APISecretFingerprint: rec.APISecretFingerprint,
-			}); err != nil {
-				dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
-				_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, dropCurrentRef)
-				return err
-			}
+
 		}
 		ccmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.NodeSandboxID,
@@ -916,12 +890,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err := routesync.ValidateMessage(&routesync.Msg{Type: routesync.TypeCommand, Cmd: cmd}); err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 		}
-		ref := clusterstate.NodeSandboxRef{
-			Group: group, RouteKey: routeKey, SandboxID: sandboxID,
-			SandboxGeneration: generation, NodeSandboxID: nodeSandboxID,
-			Profile: string(template.Profile), APISecretFingerprint: placement.APISecretFingerprint,
-		}
-		expect := int64(0)
+		expect := metadata.Version{}
 		if curFound {
 			expect = curRev
 		}
@@ -938,8 +907,14 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			AutoReset: autoReset,
 		}
 		copyRouteCredentials(reserved, selectedReplacement)
-		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
+		reservedRev, ok, cerr := r.stores.commitSandboxIntent(ctx, reserved, expect)
 		if cerr != nil {
+			if errors.Is(cerr, metadata.ErrOwnershipConflict) {
+				// The transaction definitely aborted. Keep the stable identity,
+				// advance its node generation and retry placement on this node.
+				nextGeneration = generation + 1
+				continue
+			}
 			return cerr
 		} else if !ok {
 			if casConflicts == 0 {
@@ -957,18 +932,6 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			workflowReplacement = &copy
 		} else {
 			workflowReplacement = nil
-		}
-		if err := r.stores.AddNodeSandboxRef(ctx, nodeID, ref); err != nil {
-			if errors.Is(err, errNodeSandboxIDConflict) {
-				if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
-					replaceReady, replaceReady != nil, false) {
-					return err
-				}
-				continue
-			}
-			// Keep RESERVED in place so ReserveSandbox's outer rollback can
-			// restore the previous row (or remove a newly-created row).
-			return err
 		}
 
 		if r.nodeOwner == nil {
@@ -1161,30 +1124,25 @@ func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 // applyRoute is called by the channel reader for each sandbox route the node
 // streams up. It converges SandboxStore and, on a running route, satisfies a
 // waiting ReserveSandbox (docs/cluster.md#route-link).
-func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry) {
+func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry) error {
 	if e == nil || e.SandboxID == "" {
-		return
+		return nil
 	}
 	ref, found, err := r.lookupNodeSandboxRef(ctx, nodeID, e.SandboxID)
 	if err != nil {
 		r.log.Warn("registry: lookup node sandbox", "node", nodeID, "sid", e.SandboxID, "err", err)
-		return
+		return err
 	}
 	if !found {
 		// The node may host sandboxes created outside the cluster route plane.
 		// Only an ownership ref authorizes this registry to mutate one.
-		return
-	}
-	if e.Profile != ref.Profile {
-		r.log.Warn("registry: ignored route with mismatched profile", "node", nodeID, "sid", e.SandboxID, "profile", e.Profile, "expected_profile", ref.Profile)
-		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint)
-		return
+		return nil
 	}
 	if e.State == routesync.StateStarting {
 		// Keep the Registry-owned reservation/paused state while the node makes
 		// starting visible to its proxy MMDS. Only running/paused are terminal
 		// route facts for the cluster state machine.
-		return
+		return nil
 	}
 	rec := &SandboxRecord{
 		InstanceID: e.InstanceID, StateVersion: e.PressureVersion,
@@ -1215,9 +1173,9 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		rec.State = StateDeleting
 	default:
 		r.log.Warn("registry: ignored unknown route state", "node", nodeID, "sid", e.SandboxID, "state", e.State)
-		return
+		return nil
 	}
-	r.applyLiveRoute(ctx, nodeID, e, rec)
+	return r.applyLiveRoute(ctx, nodeID, e, rec)
 }
 
 func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerprint, expectedStableID string) error {
@@ -1297,93 +1255,58 @@ func (r *Registry) lookupNodeSandboxRef(ctx context.Context, nodeID, nodeSandbox
 	return ref, found, err
 }
 
-func (r *Registry) applyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) {
+func (r *Registry) applyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) error {
 	const attempts = 5
+	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
 			}
 		}
-		if r.tryApplyLiveRoute(ctx, nodeID, e, rec) {
-			return
+		err = r.tryApplyLiveRoute(ctx, nodeID, e, rec)
+		// A conflict is a definite non-commit. Re-evaluate this same report
+		// with its original ownership and stream fence; a native retry cannot
+		// refresh its pinned preconditions. Unknown must leave this stream
+		// without another mutation or a bookmark that skips the report.
+		if err == nil || !errors.Is(err, metadata.ErrConflict) {
+			return err
 		}
 	}
 	r.log.Warn("registry: route report did not converge", "group", rec.Group, "route_key", rec.RouteKey, "sid", e.SandboxID)
+	return err
 }
 
-func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) bool {
-	// Route owner fences orphan reports. A node reporting a sandbox whose
-	// (group, route_key, sandbox_id) is absent or has been replaced means the
-	// sandbox has already been deleted/replaced in control state; tell that node
-	// to kill its local copy instead of resurrecting the route.
-	cur, rev, found, err := r.stores.GetSandbox(ctx, rec.Group, rec.RouteKey)
+func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) error {
+	ref := metadata.NodeSandboxRef{Group: rec.Group, RouteKey: rec.RouteKey, SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID, SandboxGeneration: rec.SandboxGeneration, Profile: rec.Profile, APISecretFingerprint: rec.APISecretFingerprint}
+	registration, err := nodeStreamRegistration(ctx, nodeID)
 	if err != nil {
-		if transientRouteRead(err) {
-			return false
+		return err
+	}
+	result, err := r.stores.routes.ApplyRouteReport(ctx, registration, ref, *e)
+	if err != nil {
+		r.log.Warn("registry: apply route report", "group", rec.Group, "route_key", rec.RouteKey, "err", err)
+		return err
+	}
+	switch result.Disposition {
+	case metadata.ReportOrphan:
+		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint)
+	case metadata.ReportWritten:
+		next := result.Record.Value
+		if next.State == StateReady {
+			route, err := r.routeFromRecord(ctx, &next, result.Record.Version)
+			if err != nil {
+				r.finish(flightKey(next.Group, next.RouteKey), nil, err)
+			} else {
+				r.finish(flightKey(next.Group, next.RouteKey), &ReserveResult{Route: *route}, nil)
+			}
+		} else if next.State == StateDead || next.State == StateDeleting {
+			r.finish(flightKey(next.Group, next.RouteKey), nil, ErrReserveConflict)
 		}
-		r.log.Warn("registry: read sandbox route", "group", rec.Group, "err", err)
-		return true
 	}
-	if !found || cur.SandboxID != rec.SandboxID || cur.NodeSandboxID != e.SandboxID ||
-		cur.SandboxGeneration != rec.SandboxGeneration ||
-		(cur.NodeID != "" && cur.NodeID != nodeID) ||
-		cur.Profile != rec.Profile ||
-		cur.APISecretFingerprint != rec.APISecretFingerprint {
-		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey, rec.APISecretFingerprint)
-		return true
-	}
-	if err := validateRouteCredentials(e, rec.APISecretFingerprint, rec.SandboxID); err != nil {
-		r.log.Warn("registry: ignored route with invalid credentials", "node", nodeID, "sid", e.SandboxID, "err", err)
-		return true
-	}
-	// Full snapshots and retried projections cannot roll a newer lifecycle back.
-	// A reused node-local SID must first acquire a new registry generation.
-	if cur.InstanceID != "" && (rec.InstanceID != cur.InstanceID || rec.StateVersion < cur.StateVersion) {
-		return true
-	}
-	if cur.InstanceID != "" && rec.StateVersion == cur.StateVersion && (cur.State == StateDead || cur.State == StateDeleting) && rec.State != cur.State {
-		return true
-	}
-	if rec.TemplateID == "" {
-		rec.TemplateID = cur.TemplateID
-	}
-	if hasRouteCredentials(cur) && !sameRouteCredentials(rec, cur) {
-		r.log.Warn("registry: ignored route credential rebinding", "node", nodeID, "sid", e.SandboxID)
-		return true
-	}
-	if rec.TargetPort == 0 {
-		rec.TargetPort = cur.TargetPort
-	}
-	rec.AutoPauseMemory = cur.AutoPauseMemory
-	rec.MaxCheckpoints = cur.MaxCheckpoints
-	rec.IdleTimeout = types.CloneIdleTimeout(e.IdleTimeout)
-	rec.AutoReset = cur.AutoReset
-	rec.NextSandboxGeneration = cur.NextSandboxGeneration
-	committedRev, ok, err := r.stores.CASSandbox(ctx, rec, rev)
-	if err != nil || !ok {
-		if transientRouteRead(err) {
-			return false
-		}
-		if err == nil && !ok {
-			return false
-		}
-		r.log.Warn("registry: put sandbox route", "group", rec.Group, "err", err)
-		return true
-	}
-	if rec.State == StateReady {
-		route, err := r.routeFromRecord(ctx, rec, committedRev)
-		if err != nil {
-			r.finish(flightKey(rec.Group, rec.RouteKey), nil, err)
-		} else {
-			r.finish(flightKey(rec.Group, rec.RouteKey), &ReserveResult{Route: *route}, nil)
-		}
-	} else if rec.State == StateDead || rec.State == StateDeleting {
-		r.finish(flightKey(rec.Group, rec.RouteKey), nil, ErrReserveConflict)
-	}
-	return true
+	return nil
 }
 
 func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, routeKey, apiSecretFingerprint string) {
@@ -1398,47 +1321,41 @@ func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, 
 // applyDelete converges a removed route only while it still names the reporting
 // node and sandbox. A late DEAD from a replaced instance must not delete its
 // successor's route.
-func (r *Registry) applyDelete(ctx context.Context, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint string) bool {
-	if nodeID == "" || nodeSandboxID == "" || group == "" || routeKey == "" ||
-		!validFullFingerprint(apiSecretFingerprint) {
-		return false
+func (r *Registry) applyDelete(ctx context.Context, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint string) error {
+	if nodeID == "" || nodeSandboxID == "" || group == "" || routeKey == "" || !validFullFingerprint(apiSecretFingerprint) {
+		return metadata.ErrInvalidRecord
 	}
-	const attempts = 5
-	for attempt := 0; attempt < attempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return false
-			case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
-			}
-		}
-		if r.tryApplyDelete(ctx, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint) {
-			return true
-		}
-	}
-	r.log.Warn("registry: delete route report did not converge", "node", nodeID, "sid", nodeSandboxID, "group", group, "route_key", routeKey)
-	return false
+	// A conflict can be replayed by the next authoritative node snapshot. In
+	// particular, an Unknown must not be reread as absence and clear ownership.
+	return r.tryApplyDelete(ctx, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint)
 }
 
-func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint string) bool {
+func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint string) error {
 	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil {
-		return false
+		return err
 	}
-	if !found {
-		return true
+	if found && rec.NodeID == nodeID && rec.NodeSandboxID == nodeSandboxID && rec.APISecretFingerprint == apiSecretFingerprint {
+		if applies, err := r.tryRollbackCreateReserveDelete(ctx, group, routeKey, rec, rev); applies {
+			return err
+		}
 	}
-	if rec.NodeID != nodeID || rec.NodeSandboxID != nodeSandboxID || rec.APISecretFingerprint != apiSecretFingerprint {
-		return true
-	}
-	if applies, rolledBack := r.tryRollbackCreateReserveDelete(ctx, group, routeKey, rec, rev); applies {
-		return rolledBack
-	}
-	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
+	ref, refFound, err := r.stores.GetNodeSandboxRef(ctx, nodeID, nodeSandboxID)
 	if err != nil {
-		return false
+		return err
 	}
-	return deleted
+	if !refFound {
+		return nil
+	}
+	if ref.Group != group || ref.RouteKey != routeKey || ref.APISecretFingerprint != apiSecretFingerprint {
+		return nil
+	}
+	registration, err := nodeStreamRegistration(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	err = r.stores.routes.ApplyRouteDelete(ctx, registration, rev, metadata.NodeSandboxRef(ref), nil)
+	return err
 }
 
 // tryRollbackCreateReserveDelete preserves the pre-reserve route when a node
@@ -1447,25 +1364,34 @@ func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, nodeSandboxID, gr
 // uses to restore a replaced route (or remove a fresh reservation). A paused
 // resume is excluded: its ordinary launch failure reports paused, while an
 // actual Delete remains authoritative for that existing sandbox.
-func (r *Registry) tryRollbackCreateReserveDelete(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64) (applies, rolledBack bool) {
+func (r *Registry) tryRollbackCreateReserveDelete(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev metadata.Version) (applies bool, err error) {
 	if rec == nil || rec.State != StateReserved {
-		return false, false
+		return false, nil
 	}
 	key := flightKey(group, routeKey)
 	r.mu.Lock()
 	call := r.inflight[key]
 	if call == nil || !call.rollbackFence.matches(rec, rev) || (call.orig != nil && call.orig.State == StatePaused) {
 		r.mu.Unlock()
-		return false, false
+		return false, nil
 	}
 	orig, found := call.orig, call.found
 	r.mu.Unlock()
-	return true, r.rollbackReservedAtRevision(ctx, group, routeKey, rec, rev, orig, found, true)
+	registration, err := nodeStreamRegistration(ctx, rec.NodeID)
+	if err != nil {
+		return true, err
+	}
+	var restore *SandboxRecord
+	if found {
+		restore = orig
+	}
+	err = r.stores.routes.ApplyRouteDelete(ctx, registration, rev, metadata.SandboxRef(*rec), restore)
+	return true, err
 }
 
-func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, expected []clusterstate.NodeSandboxRef, seen map[string]struct{}) {
+func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, expected []clusterstate.NodeSandboxRef, seen map[string]struct{}) error {
 	if nodeID == "" {
-		return
+		return nil
 	}
 	for _, ref := range expected {
 		if ref.Group == "" || ref.RouteKey == "" ||
@@ -1477,27 +1403,29 @@ func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, exp
 			continue
 		}
 		current, found, err := r.stores.GetNodeSandboxRef(ctx, nodeID, ref.NodeSandboxID)
-		if err != nil || !found || current.Group != ref.Group || current.RouteKey != ref.RouteKey ||
+		if err != nil {
+			return err
+		}
+		if !found || current.Group != ref.Group || current.RouteKey != ref.RouteKey ||
 			current.SandboxID != ref.SandboxID || current.SandboxGeneration != ref.SandboxGeneration ||
 			current.Profile != ref.Profile || current.APISecretFingerprint != ref.APISecretFingerprint {
 			continue
 		}
-		if r.applyDelete(ctx, nodeID, ref.NodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
-			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, ref.NodeSandboxID)
+		if err := r.applyDelete(ctx, nodeID, ref.NodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 // applyDeleteBySID converges a route delete. The node-link owner resolves the
 // node-local sandbox ID through the per-node ownership table.
-func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, nodeSandboxID string) {
+func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, nodeSandboxID string) error {
 	ref, found, err := r.lookupNodeSandboxRef(ctx, nodeID, nodeSandboxID)
 	if err != nil || !found {
-		return
+		return err
 	}
-	if r.applyDelete(ctx, nodeID, nodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
-		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, nodeSandboxID)
-	}
+	return r.applyDelete(ctx, nodeID, nodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint)
 }
 
 // finish satisfies the single-flight call for key (idempotent — first wins). It
@@ -1518,7 +1446,7 @@ func (r *Registry) finish(key string, res *ReserveResult, err error) {
 	})
 }
 
-func (r *Registry) setReserveRollbackFence(key string, rec *SandboxRecord, revision int64) {
+func (r *Registry) setReserveRollbackFence(key string, rec *SandboxRecord, revision metadata.Version) {
 	fence := reserveRollbackFence{Revision: revision}
 	if rec != nil {
 		fence.SandboxID = rec.SandboxID
@@ -1575,42 +1503,49 @@ func waitCall(ctx context.Context, call *reserveCall) (*ReserveResult, error) {
 }
 
 func (r *Registry) waitReserveCall(ctx context.Context, call *reserveCall) (*ReserveResult, error) {
-	rev, _ := r.stores.RouteGroupRev(ctx, call.group)
-	watchCtx, cancelWatch := context.WithCancel(ctx)
-	defer cancelWatch()
-	ch, _ := r.stores.WatchRouteGroup(watchCtx, call.group, rev)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-call.done:
 			return call.result, call.err
 		default:
 		}
-		expectedSandboxID := r.reserveExpectedSandboxID(flightKey(call.group, call.routeKey))
-		if res, ready, err := r.reserveReadyResult(ctx, call.group, call.routeKey, expectedSandboxID); expectedSandboxID == "" {
-			// The create leader has not committed its stable lineage yet.
-		} else if transientRouteRead(err) {
-			// A route owner may be accepting the node's READY update concurrently;
-			// keep the parked reserve until the event/read settles or times out.
-		} else if err != nil {
+		current, observation, err := r.stores.routes.ReadAndObserveRoute(ctx, metadata.RouteKey{Group: call.group, RouteKey: call.routeKey})
+		if err != nil {
 			return nil, err
-		} else if ready {
-			return res, nil
+		}
+		expected := r.reserveExpectedSandboxID(flightKey(call.group, call.routeKey))
+		if expected != "" {
+			if !current.Exists || current.Value.SandboxID != expected {
+				observation.Cancel()
+				return nil, ErrSandboxNotFound
+			}
+			if current.Value.State == StateReady {
+				result, ready, err := r.readyResultFromRecord(ctx, &current.Value, current.Version)
+				if err != nil || ready {
+					observation.Cancel()
+					return result, err
+				}
+			}
 		}
 		select {
 		case <-call.done:
+			observation.Cancel()
 			return call.result, call.err
-		case <-ch:
-		case <-ticker.C:
 		case <-ctx.Done():
+			observation.Cancel()
 			return nil, ctx.Err()
+		case <-observation.Done():
+		}
+		err = observation.Err()
+		observation.Cancel()
+		if err != nil {
+			return nil, err
 		}
 	}
 }
 
 func transientRouteRead(err error) bool {
-	return errors.Is(err, clusterstate.ErrQuorum) || errors.Is(err, clusterstate.ErrConflict)
+	return errors.Is(err, metadata.ErrUnavailable) || errors.Is(err, metadata.ErrConflict)
 }
 
 func (r *Registry) reserveReadyResult(ctx context.Context, group, routeKey, expectedSandboxID string) (*ReserveResult, bool, error) {
@@ -1627,7 +1562,7 @@ func (r *Registry) reserveReadyResult(ctx context.Context, group, routeKey, expe
 	return r.readyResultFromRecord(ctx, rec, rev)
 }
 
-func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord, routeRevision int64) (*ReserveResult, bool, error) {
+func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord, routeRevision metadata.Version) (*ReserveResult, bool, error) {
 	if rec == nil || rec.NodeID == "" || r.nodeOwner == nil {
 		return nil, false, nil
 	}
@@ -1680,12 +1615,8 @@ func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sand
 		if !errors.Is(err, ErrNodeGone) {
 			return false, err
 		}
-		deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
-		if err != nil || !deleted {
-			return false, err
-		}
-		_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, rec.NodeSandboxID)
-		return true, nil
+		err := r.stores.routes.DeleteRouteAndOwnership(ctx, metadata.RouteKey{Group: group, RouteKey: routeKey}, rev, rec.NodeID, metadata.SandboxRef(*rec))
+		return err == nil, err
 	}
 	return true, nil
 }
@@ -1770,239 +1701,51 @@ func (r *Registry) removeNode(c nodeConn) {
 // that deletes the profile between read and write makes the CAS retry from an
 // empty node view, so stale child refs cannot be replayed into the new session.
 func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeRegister) (*NodeRecord, error) {
-	rec, _, err := r.updateNodeProfile(ctx, nr.NodeID, true, func(rec *NodeRecord) {
-		rec.Labels = nr.Labels
-		rec.Capacity = nr.Capacity
-		rec.BuildRegistrationCapacity = nr.BuildRegistrationCapacity
-		rec.BuildExecutionCapacity = nr.BuildExecutionCapacity
-		rec.APIEndpoint = nr.APIEndpoint
-		rec.DataEndpoint = nr.DataEndpoint
-		rec.RuntimeDigest = nr.RuntimeDigest
-		rec.LastHeartbeatUnix = time.Now().Unix()
-		rec.LinkOwner = r.stores.WriterID()
-	})
-	return rec, err
+	for attempt := 0; attempt < 5; attempt++ {
+		current, err := r.stores.nodes.ReadNodeProfile(ctx, nr.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		next := current.Value
+		next.NodeID = nr.NodeID
+		next.State = metadata.NodeLive
+		next.Labels = cloneStringMap(nr.Labels)
+		next.Capacity = nr.Capacity
+		next.BuildRegistrationCapacity = cloneBuildAdmissionLimit(nr.BuildRegistrationCapacity)
+		next.BuildExecutionCapacity = cloneBuildAdmissionLimit(nr.BuildExecutionCapacity)
+		next.APIEndpoint, next.DataEndpoint, next.RuntimeDigest = nr.APIEndpoint, nr.DataEndpoint, nr.RuntimeDigest
+		next.LastHeartbeatUnix = time.Now().Unix()
+		next.LinkOwner = r.stores.WriterID()
+		registered, err := r.stores.nodes.Register(ctx, current.Version, next)
+		if errors.Is(err, metadata.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		rec, found, err := r.stores.GetNode(ctx, nr.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		if !found || rec.Registration != registered.Registration {
+			return nil, metadata.ErrConflict
+		}
+		return rec, nil
+	}
+	return nil, metadata.ErrConflict
 }
 
-func (r *Registry) projectRegisteredNode(ctx context.Context, rec *NodeRecord) {
-	if rec == nil {
-		return
-	}
-	if _, live := r.node(rec.NodeID); !live {
-		return
-	}
-	r.putNodeListProjection(ctx, rec)
-}
-
-// updateHeartbeat folds a node's water level into its record + stamps liveness.
+// updateHeartbeat is fenced by the registration captured when this stream opened.
 func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
-	oldDraining := false
-	rec, found, err := r.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
-		oldDraining = rec.Draining
+	_, _, err := r.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
 		rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
 		rec.BuildRegistrationUsage, rec.BuildExecutionUsage = hb.BuildRegistrationUsage, hb.BuildExecutionUsage
 		rec.Counts, rec.Draining = hb.Counts, hb.Draining
 		rec.LastHeartbeatUnix = time.Now().Unix()
 	})
-	if err != nil || !found {
-		return
+	if err != nil && !errors.Is(err, metadata.ErrConflict) {
+		r.log.Warn("node-link: heartbeat update failed", "node", nodeID, "err", err)
 	}
-	if rec.Draining != oldDraining {
-		r.putNodeListProjection(ctx, rec)
-		return
-	}
-	r.retryPendingNodeListProjection(ctx, rec)
-}
-
-func (r *Registry) putNodeListProjection(ctx context.Context, rec *NodeRecord) {
-	if r == nil || r.stores == nil || rec == nil || rec.NodeID == "" {
-		return
-	}
-	r.applyNodeListProjection(ctx, projectNodeListRecord(rec))
-}
-
-func (r *Registry) deleteNodeListProjection(ctx context.Context, nodeID string, source clusterstate.RecordMeta) {
-	if r == nil || r.stores == nil || nodeID == "" {
-		return
-	}
-	r.applyNodeListProjection(ctx, clusterstate.NodeListEntry{NodeID: nodeID, SourceMeta: source, Deleted: true})
-}
-
-func (r *Registry) applyNodeListProjection(ctx context.Context, entry clusterstate.NodeListEntry) {
-	if err := r.writeNodeListProjection(ctx, entry); err == nil {
-		r.clearPendingNodeListProjection(entry)
-		return
-	} else if ctx.Err() != nil {
-		return
-	} else if !isNodeListProjectionRetryable(err) {
-		r.log.Warn("node-link: node_list projection rejected", "node", entry.NodeID, "deleted", entry.Deleted, "err", err)
-		return
-	}
-	r.enqueueNodeListProjection(ctx, entry)
-}
-
-func (r *Registry) writeNodeListProjection(ctx context.Context, entry clusterstate.NodeListEntry) error {
-	if entry.Deleted {
-		return r.stores.DeleteNodeListWithSource(ctx, entry.NodeID, entry.SourceMeta)
-	}
-	return r.stores.PutNodeListEntry(ctx, entry)
-}
-
-func (r *Registry) retryPendingNodeListProjection(ctx context.Context, rec *NodeRecord) {
-	if r == nil || rec == nil || rec.NodeID == "" {
-		return
-	}
-	r.nodeListProjectMu.Lock()
-	_, pending := r.nodeListProject[rec.NodeID]
-	r.nodeListProjectMu.Unlock()
-	if pending {
-		r.putNodeListProjection(ctx, rec)
-	}
-}
-
-func (r *Registry) enqueueNodeListProjection(ctx context.Context, entry clusterstate.NodeListEntry) {
-	if r == nil || entry.NodeID == "" || ctx.Err() != nil {
-		return
-	}
-	retryCtx := ctx
-	lifecycleCtx := false
-	if entry.Deleted {
-		r.mu.Lock()
-		if r.reaperCtx != nil {
-			retryCtx = r.reaperCtx
-			lifecycleCtx = true
-		}
-		r.mu.Unlock()
-	}
-	next := cloneNodeListProjection(entry)
-	r.nodeListProjectMu.Lock()
-	if cur, found := r.nodeListProject[next.NodeID]; !found || nodeListProjectionNewer(next, cur) {
-		r.nodeListProject[next.NodeID] = next
-	}
-	replaceCtx := r.nodeListProjectCtx == nil || r.nodeListProjectCtx.Err() != nil
-	if lifecycleCtx && !r.nodeListProjectRoot {
-		replaceCtx = true
-	}
-	if replaceCtx {
-		r.nodeListProjectCtx = retryCtx
-		r.nodeListProjectGen++
-		r.nodeListProjectRoot = lifecycleCtx
-	}
-	if !r.nodeListProjectRun {
-		r.nodeListProjectRun = true
-		go r.runNodeListProjectionRetry()
-	}
-	r.nodeListProjectMu.Unlock()
-}
-
-func (r *Registry) runNodeListProjectionRetry() {
-	ticker := time.NewTicker(nodeListProjectionRetryInterval)
-	defer ticker.Stop()
-	for {
-		r.nodeListProjectMu.Lock()
-		ctx := r.nodeListProjectCtx
-		ctxGen := r.nodeListProjectGen
-		if ctx == nil || ctx.Err() != nil {
-			r.nodeListProjectRun = false
-			r.nodeListProjectCtx = nil
-			r.nodeListProjectRoot = false
-			r.nodeListProjectMu.Unlock()
-			return
-		}
-		r.nodeListProjectMu.Unlock()
-		r.flushNodeListProjection(ctx)
-		r.nodeListProjectMu.Lock()
-		if len(r.nodeListProject) == 0 {
-			r.nodeListProjectRun = false
-			r.nodeListProjectCtx = nil
-			r.nodeListProjectRoot = false
-			r.nodeListProjectMu.Unlock()
-			return
-		}
-		nextCtxGen := r.nodeListProjectGen
-		r.nodeListProjectMu.Unlock()
-		if nextCtxGen != ctxGen {
-			continue
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-		}
-	}
-}
-
-func (r *Registry) flushNodeListProjection(ctx context.Context) {
-	if err := ctx.Err(); err != nil {
-		return
-	}
-	r.nodeListProjectMu.Lock()
-	batch := make([]clusterstate.NodeListEntry, 0, len(r.nodeListProject))
-	for _, entry := range r.nodeListProject {
-		batch = append(batch, cloneNodeListProjection(entry))
-	}
-	r.nodeListProjectMu.Unlock()
-	for _, entry := range batch {
-		r.flushNodeListProjectionEntry(ctx, entry)
-	}
-}
-
-func (r *Registry) flushNodeListProjectionEntry(ctx context.Context, entry clusterstate.NodeListEntry) {
-	if !r.nodeListProjectionPending(entry) {
-		return
-	}
-	if !entry.Deleted {
-		if _, connected := r.node(entry.NodeID); !connected {
-			r.clearPendingNodeListProjection(entry)
-			return
-		}
-	}
-	if err := r.writeNodeListProjection(ctx, entry); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		if !isNodeListProjectionRetryable(err) {
-			r.log.Warn("node-link: node_list projection retry rejected", "node", entry.NodeID, "deleted", entry.Deleted, "err", err)
-			r.clearPendingNodeListProjection(entry)
-		}
-		return
-	}
-	r.clearPendingNodeListProjection(entry)
-}
-
-func (r *Registry) nodeListProjectionPending(entry clusterstate.NodeListEntry) bool {
-	if r == nil || entry.NodeID == "" {
-		return false
-	}
-	r.nodeListProjectMu.Lock()
-	defer r.nodeListProjectMu.Unlock()
-	cur, found := r.nodeListProject[entry.NodeID]
-	return found && compareProjectionSource(cur, entry) == 0 && cur.Deleted == entry.Deleted
-}
-
-func (r *Registry) clearPendingNodeListProjection(entry clusterstate.NodeListEntry) {
-	if r == nil || entry.NodeID == "" {
-		return
-	}
-	r.nodeListProjectMu.Lock()
-	defer r.nodeListProjectMu.Unlock()
-	cur, found := r.nodeListProject[entry.NodeID]
-	if !found || !nodeListProjectionNewer(cur, entry) {
-		delete(r.nodeListProject, entry.NodeID)
-	}
-}
-
-func cloneNodeListProjection(entry clusterstate.NodeListEntry) clusterstate.NodeListEntry {
-	entry.Labels = cloneStringMap(entry.Labels)
-	entry.BuildRegistrationCapacity = cloneBuildAdmissionLimit(entry.BuildRegistrationCapacity)
-	entry.BuildExecutionCapacity = cloneBuildAdmissionLimit(entry.BuildExecutionCapacity)
-	return entry
-}
-
-func isNodeListProjectionRetryable(err error) bool {
-	return errors.Is(err, shardkv.ErrQuorum) ||
-		errors.Is(err, shardkv.ErrConflict) ||
-		errors.Is(err, shardkv.ErrReplicaUnavailable) ||
-		errors.Is(err, context.DeadlineExceeded)
 }
 
 func (r *Registry) refreshNodeKeyPairs(ctx context.Context, rec *NodeRecord) {
@@ -2025,41 +1768,34 @@ func (r *Registry) updateNodeProfile(ctx context.Context, nodeID string, create 
 	if nodeID == "" {
 		return nil, false, nil
 	}
-	for attempt := 0; attempt < 5; attempt++ {
-		rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
-		if err != nil {
-			return nil, false, err
-		}
-		if !found {
-			if !create {
-				return nil, false, nil
-			}
-			rec = &NodeRecord{NodeID: nodeID}
-		}
-		expectRev := rec.Meta.Rev
-		mutate(rec)
-		if _, ok, err := r.stores.casNodeProfileShard(ctx, rec, expectRev); err != nil {
-			return nil, false, err
-		} else if ok {
-			return rec, true, nil
-		}
-		if !create {
-			return nil, false, shardkv.ErrConflict
-		}
+	registration, ok := ctx.Value(nodeRegistrationContextKey{}).(metadata.Registration)
+	if !ok || registration.NodeID != nodeID || !registration.Fence.IsCommitted() {
+		return nil, false, metadata.ErrConflict
 	}
-	return nil, false, shardkv.ErrConflict
+	rec, found, err := r.stores.GetNodeProfile(ctx, nodeID)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	if rec.Reaping || rec.Registration != registration {
+		return nil, false, metadata.ErrConflict
+	}
+	expected := rec.Version
+	mutate(rec)
+	version, err := r.stores.nodes.UpdateProfile(ctx, registration, expected, nodeProfile(rec))
+	if err != nil {
+		return nil, false, err
+	}
+	rec.Version = version
+	return rec, true, nil
 }
 
 func (r *Registry) getNodeForLinkUpdate(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
-	rec, found, err := r.stores.GetNode(ctx, nodeID)
-	if errors.Is(err, shardkv.ErrInvalidView) {
-		return r.stores.GetNodeProfile(ctx, nodeID)
-	}
-	return rec, found, err
+	return r.stores.GetNode(ctx, nodeID)
 }
 
 // RunReaper configures event-driven dead-node cleanup. A node-link disconnect
-// schedules cleanup for that node only; registry never scans node shards globally.
+// schedules cleanup for that node only; recovery enumerates durable reap claims
+// and expired profiles whose disconnect timer was lost before acquiring a claim.
 func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	if deadAfter <= 0 {
 		deadAfter = 30 * time.Second
@@ -2068,47 +1804,82 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	r.reaperCtx = ctx
 	r.deadAfter = deadAfter
 	r.mu.Unlock()
-	r.nodeListProjectMu.Lock()
-	pendingDelete := false
-	for _, entry := range r.nodeListProject {
-		if entry.Deleted {
-			pendingDelete = true
-			break
+	// Resume committed claims, then discover crashes before BeginReap. Profile
+	// discovery reads bounded pages and never enumerates a node's child refs until
+	// its original profile version has been claimed.
+	resume := func() {
+		for cursor := metadata.Cursor(""); ; {
+			page, err := r.stores.nodes.ListReaping(ctx, cursor, 128)
+			if err != nil {
+				r.log.Warn("registry: list reaping nodes", "err", err)
+				return
+			}
+			for _, claim := range page.Items {
+				r.cleanupReap(ctx, claim)
+			}
+			if page.Next == "" {
+				return
+			}
+			cursor = page.Next
 		}
 	}
-	if pendingDelete {
-		r.nodeListProjectCtx = ctx
-		r.nodeListProjectGen++
-		r.nodeListProjectRoot = true
-		if !r.nodeListProjectRun {
-			r.nodeListProjectRun = true
-			go r.runNodeListProjectionRetry()
-		}
-	}
-	r.nodeListProjectMu.Unlock()
-	<-ctx.Done()
-}
-
-func (r *Registry) RunCompactor(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	resume()
+	r.recoverExpiredNodes(ctx, deadAfter)
+	ticker := time.NewTicker(deadAfter)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-t.C:
-			stats, err := r.stores.Compact(ctx, now)
-			if err != nil {
-				r.log.Warn("registry: shardkv compaction failed", "err", err)
+		case <-ticker.C:
+			resume()
+			r.recoverExpiredNodes(ctx, deadAfter)
+		}
+	}
+}
+
+func (r *Registry) recoverExpiredNodes(ctx context.Context, deadAfter time.Duration) {
+	cutoff := time.Now().Add(-deadAfter).Unix()
+	uncertainOwners := make(map[string]bool)
+	for cursor := metadata.Cursor(""); ; {
+		page, err := r.stores.nodes.ListExpiredNodeProfiles(ctx, cutoff, cursor, 128)
+		if err != nil {
+			r.log.Warn("registry: list expired node profiles", "err", err)
+			return
+		}
+		for _, profile := range page.Items {
+			if uncertainOwners[profile.Value.LinkOwner] {
 				continue
 			}
-			if stats.Tombstones > 0 || stats.Shards > 0 {
-				r.log.Debug("registry: shardkv compacted", "tombstones", stats.Tombstones, "shards", stats.Shards)
+			if _, connected := r.node(profile.Value.NodeID); connected {
+				continue
 			}
+			// The owner can be another Registry. A live stream still protects its
+			// profile when persisted heartbeats are delayed; an uncertain probe is
+			// retried on a later pass instead of being treated as a disconnect.
+			probeCtx, cancel := context.WithTimeout(ctx, deadAfter)
+			probeErr := r.nodeOwner.Connected(probeCtx, profile.Value.NodeID)
+			cancel()
+			if !errors.Is(probeErr, ErrNodeGone) {
+				// A failed owner must not impose one full probe timeout per node.
+				// Retry it on the next pass; successful probes remain per-node.
+				if probeErr != nil {
+					uncertainOwners[profile.Value.LinkOwner] = true
+				}
+				continue
+			}
+			// Never refresh the candidate's version here: a heartbeat or Register
+			// since discovery must invalidate this attempt, even for the same owner.
+			claim, err := r.stores.nodes.BeginReap(ctx, profile.Value.NodeID, profile.Version)
+			if err != nil {
+				continue
+			}
+			r.cleanupReap(ctx, claim)
 		}
+		if page.Next == "" {
+			return
+		}
+		cursor = page.Next
 	}
 }
 
@@ -2135,24 +1906,8 @@ func (r *Registry) scheduleNodeReap(nodeID string) {
 	}()
 }
 
-type sandboxReapPlan struct {
-	ref         nodeReapSandboxRef
-	record      *SandboxRecord
-	revision    int64
-	deleteRoute bool
-}
-
-type buildReapPlan struct {
-	ref       nodeReapBuildRef
-	record    *BuildRecord
-	revision  uint64
-	markDead  bool
-	removeRef bool
-}
-
-// sweepNode claims a stale profile revision before applying any destructive
-// cleanup. Route/build and child-ref writes are then limited to revisions read
-// before that claim, so a reconnect can safely win either side of the CAS.
+// sweepNode acquires a durable lifecycle claim before any cleanup. Reconnects
+// replace its fence; every bounded cleanup transaction rechecks that same claim.
 func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.Duration) {
 	if nodeID == "" {
 		return
@@ -2164,114 +1919,93 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	if err != nil || !found {
 		return
 	}
+	if rec.Reaping {
+		claim := metadata.ReapClaim{NodeID: nodeID, LinkOwner: rec.LinkOwner, ProfileVersion: rec.Version, Fence: rec.Registration.Fence}
+		r.cleanupReap(ctx, claim)
+		return
+	}
 	cutoff := time.Now().Add(-deadAfter).Unix()
-	if rec.LastHeartbeatUnix <= 0 || rec.LastHeartbeatUnix >= cutoff {
+	// Heartbeats use whole seconds. Equality is expired: the one-shot
+	// disconnect timer has already waited deadAfter and must not silently
+	// abandon cleanup because both timestamps rounded to the same second.
+	if rec.LastHeartbeatUnix <= 0 || rec.LastHeartbeatUnix > cutoff {
 		return
 	}
-	snapshot, err := r.stores.snapshotNodeReapShard(ctx, nodeID)
-	if err != nil || snapshot == nil {
+	// An old disconnect timer can outlive a reconnect through another Registry.
+	// Check that owner's stream before claiming the version read above; delayed
+	// persisted heartbeats alone do not make an active remote stream dead.
+	if rec.LinkOwner != r.stores.WriterID() {
+		probeCtx, cancel := context.WithTimeout(ctx, deadAfter)
+		probeErr := r.nodeOwner.Connected(probeCtx, nodeID)
+		cancel()
+		if !errors.Is(probeErr, ErrNodeGone) {
+			return
+		}
+	}
+	claim, err := r.stores.nodes.BeginReap(ctx, nodeID, rec.Version)
+	if err != nil {
 		return
 	}
-	sandboxPlans := make([]sandboxReapPlan, 0, len(snapshot.Sandboxes))
-	for _, child := range snapshot.Sandboxes {
-		ref := child.Ref
-		s, rev, routeFound, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
+	r.cleanupReap(ctx, claim)
+}
+func (r *Registry) cleanupReap(ctx context.Context, claim metadata.ReapClaim) {
+	for cursor := metadata.Cursor(""); ; {
+		page, err := r.stores.ownership.ListSandboxOwners(ctx, claim.NodeID, cursor, 128)
 		if err != nil {
 			return
 		}
-		plan := sandboxReapPlan{ref: child}
-		if !routeFound || s.NodeID != nodeID || s.SandboxID != ref.SandboxID ||
-			s.NodeSandboxID != ref.NodeSandboxID || s.SandboxGeneration != ref.SandboxGeneration ||
-			s.Profile != ref.Profile ||
-			s.APISecretFingerprint != ref.APISecretFingerprint {
-			sandboxPlans = append(sandboxPlans, plan)
-			continue
-		}
-		// Retained terminal storage remains on this exact node. A reconnect must
-		// recover its management binding, not turn the route into a new Create.
-		if s.State == StateDead || s.State == StateDeleting {
-			continue
-		}
-		shouldReset := s.State == StateReady || s.State == StatePausing || s.State == StatePaused
-		if s.State == StateReserved {
-			if r.hasInflight(flightKey(s.Group, s.RouteKey)) {
-				continue
+		for _, ref := range page.Items {
+			route, err := r.stores.routes.ReadRoute(ctx, metadata.RouteKey{Group: ref.Value.Group, RouteKey: ref.Value.RouteKey})
+			if err != nil {
+				return
 			}
-			shouldReset = true
+			allowReserved := !r.hasInflight(flightKey(ref.Value.Group, ref.Value.RouteKey))
+			if err := r.stores.nodes.CleanupSandbox(ctx, claim, ref, route.Version, allowReserved); err != nil {
+				return
+			}
 		}
-		if !shouldReset {
-			sandboxPlans = append(sandboxPlans, plan)
-			continue
+		if page.Next == "" {
+			break
 		}
-		plan.record, plan.revision, plan.deleteRoute = s, rev, true
-		sandboxPlans = append(sandboxPlans, plan)
+		cursor = page.Next
 	}
-	buildPlans := make([]buildReapPlan, 0, len(snapshot.Builds))
-	for _, child := range snapshot.Builds {
-		ref := child.Ref
-		b, rev, buildFound, err := r.stores.getRouteBuildShard(ctx, ref.Group, ref.BuildID)
+	for cursor := metadata.Cursor(""); ; {
+		page, err := r.stores.ownership.ListBuildOwners(ctx, claim.NodeID, cursor, 128)
 		if err != nil {
 			return
 		}
-		plan := buildReapPlan{ref: child}
-		if !buildFound || b.NodeID != nodeID {
-			plan.removeRef = true
-			buildPlans = append(buildPlans, plan)
-			continue
-		}
-		if !b.occupies() {
-			buildPlans = append(buildPlans, plan)
-			continue
-		}
-		plan.record, plan.revision, plan.markDead = b, rev, true
-		buildPlans = append(buildPlans, plan)
-	}
-	claimed, err := r.stores.claimNodeProfileReapShard(ctx, nodeID, rec.Meta.Rev)
-	if err != nil || !claimed {
-		return
-	}
-	r.deleteNodeListProjection(ctx, nodeID, rec.Meta)
-	reset := 0
-	for _, plan := range sandboxPlans {
-		if plan.deleteRoute && !r.deleteSandboxAtRevision(ctx, plan.record.Group, plan.record.RouteKey, plan.record, plan.revision, false) {
-			continue
-		}
-		if _, err := r.stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, plan.ref.Ref.NodeSandboxID, plan.ref.Revision); err != nil {
-			r.log.Warn("registry: remove reaped sandbox ownership", "node", nodeID, "sandbox", plan.ref.Ref.NodeSandboxID, "err", err)
-			continue
-		}
-		if plan.deleteRoute {
-			reset++
-		}
-	}
-	deadBuilds := 0
-	for _, plan := range buildPlans {
-		if plan.markDead {
-			plan.record.State, plan.record.Reason = BuildError, "node disconnected"
-			// A BUILD_STARTING intent retains registry pull credentials only so an
-			// ambiguous delivery can be replayed to the same live node. Once the
-			// owner is reaped and the record becomes terminal, that replay is no
-			// longer possible or useful.
-			plan.record.RegistrationImageRepo = ""
-			plan.record.RegistrationRegistryAuth = ""
-			if _, ok, err := r.stores.casRouteBuildShard(ctx, plan.record, plan.revision); err != nil || !ok {
-				continue
+		for _, ref := range page.Items {
+			build, err := r.stores.builds.ReadBuild(ctx, metadata.BuildKey{Group: ref.Value.Group, BuildID: ref.Value.BuildID})
+			if err != nil {
+				return
 			}
-			deadBuilds++
+			if err := r.stores.nodes.CleanupBuild(ctx, claim, ref, build.Version); err != nil {
+				return
+			}
 		}
-		if !plan.removeRef {
-			continue
+		if page.Next == "" {
+			break
 		}
-		if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, plan.ref.Ref.BuildID, plan.ref.Revision); err != nil {
-			r.log.Warn("registry: remove reaped build ownership", "node", nodeID, "build", plan.ref.Ref.BuildID, "err", err)
-		}
+		cursor = page.Next
 	}
-	for _, pair := range snapshot.KeyPairs {
-		if _, err := r.stores.dropNodeKeyPairShardAtRevision(ctx, nodeID, pair.APISecretFingerprint, pair.Revision); err != nil {
-			r.log.Warn("registry: remove reaped key pair", "node", nodeID, "err", err)
+	for cursor := metadata.Cursor(""); ; {
+		page, err := r.stores.keyPairs.ListKeyPairs(ctx, claim.NodeID, cursor, 128)
+		if err != nil {
+			return
 		}
+		for _, pair := range page.Items {
+			if err := r.stores.nodes.CleanupKeyPair(ctx, claim, pair); err != nil {
+				return
+			}
+		}
+		if page.Next == "" {
+			break
+		}
+		cursor = page.Next
 	}
-	r.log.Warn("registry: swept dead node", "node", nodeID, "sandboxes_reset", reset, "builds_errored", deadBuilds)
+	if _, err := r.stores.nodes.FinalizeReap(ctx, claim); err != nil {
+		r.log.Warn("registry: finalize reaping node", "node", claim.NodeID, "err", err)
+	}
 }
 
 func (r *Registry) hasInflight(key string) bool {

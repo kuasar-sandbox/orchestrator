@@ -45,7 +45,7 @@ func TestPlacerLinkResolverUsesCachedMembership(t *testing.T) {
 	resolver := newPlacerLinkResolver(regClient)
 
 	for _, source := range []string{"source-a", "source-b", "source-c"} {
-		links, err := resolver(context.Background(), string(clusterstate.PlacerImportSourceShard(source)))
+		links, err := resolver(context.Background(), string(clusterstate.ImportSourceRoutingKey(source)))
 		if err != nil {
 			t.Fatalf("resolve %s: %v", source, err)
 		}

@@ -88,9 +88,9 @@ For security architecture and deployment trust boundaries, see the [project syst
 | `node-ctl resource ...` | Inspect or drain node resource reservations |
 | `node-ctl builder status` | Inspect build execution state |
 | `node-ctl export-sandbox` / `import-sandbox` | Move portable sandbox state across nodes |
-| `cluster-ctl registry` | Start a Registry process |
-| `cluster-ctl router` | Start the unified cluster control- and data-plane ingress |
-| `cluster-ctl placer` | Start the placement service |
+| `run-cluster-ctl registry` | Start a Registry process |
+| `run-cluster-ctl router` | Start the unified cluster control- and data-plane ingress |
+| `run-cluster-ctl placer` | Start the placement service |
 | `e2b-key-ctl ...` | Generate and derive tenant credentials |
 
 A successful move export accepts source deletion durably; RunDir, BaseDir and
@@ -110,7 +110,7 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 
 ## Deployment overview
 
-A standalone node runs Conductor and Proxy; start the independent Telemetry service when needed. Telemetry uses the Plugin Plane without joining Create/Resume barriers, and its failure does not change Sandbox lifecycle. The example configuration explicitly enables embedded Prometheus TSDB. Local storage requires `local.enabled`; an unconfigured query backend defaults to `none`, and writes and queries are assembled independently. See [observability](docs/observability.md#telemetry). A cluster adds Registry, Router and Placer. Configuration examples and systemd units are under `deploy/`.
+A standalone node runs Conductor and Proxy; start the independent Telemetry service when needed. Telemetry uses the Plugin Plane without joining Create/Resume barriers, and its failure does not change Sandbox lifecycle. The example configuration explicitly enables embedded Prometheus TSDB. Local storage requires `local.enabled`; an unconfigured query backend defaults to `none`, and writes and queries are assembled independently. See [observability](docs/observability.md#telemetry). A cluster adds Registry, Router and Placer, backed by an external FoundationDB database. Install the complete native runtime bundle and start cluster roles through `run-cluster-ctl`; Registry peers must use the same cluster file and prefix. Configuration examples and systemd units are under `deploy/`; see [native build and runtime](docs/cluster.md#native-build-and-runtime).
 
 The release-based installation path is the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md). Production deployments should use durable storage, production TLS, protected credentials, an explicit network policy and capacity settings validated against their workloads.
 
@@ -137,9 +137,9 @@ node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # Optional cluster roles, each in its own service/terminal.
-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
+run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
+run-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
+run-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 
 # Standalone development; replace host and the canonical template placeholder.
 export E2B_API_URL=http://host:3000

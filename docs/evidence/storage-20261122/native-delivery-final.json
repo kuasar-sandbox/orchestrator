@@ -1,0 +1,8 @@
+{
+  "command": [
+    "python3",
+    "/mnt/d/CodexTaskData/storage-engine-pr563-20261122/premerge/native_delivery_smoke.py"
+  ],
+  "exit_code": 0,
+  "seconds": 16.161
+}

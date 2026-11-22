@@ -1,0 +1,8 @@
+/var/tmp/e2e-contract-j77e1twe/prepared
+disk before selected images path=/var/tmp/e2e-contract-j77e1twe/run: available_bytes=90318540800 available_inodes=7997856
+==> basic.fixture.sh
+disk before basic.fixture.sh path=/var/tmp/e2e-contract-j77e1twe/run: available_bytes=90318446592 available_inodes=7997833
+cluster-ctl 0.1.0-dev
+disk after basic.fixture.sh path=/var/tmp/e2e-contract-j77e1twe/run: available_bytes=90317455360 available_inodes=7997591
+PASS basic.fixture.sh
+{"architecture": "x86_64", "orchestrator_head": "377de1e327575d563406a690c44a5128a6332519", "platform_head": "4fdcbfe89614266dcb14677c9185ae0ac6033886", "attachments": 19, "gates": ["actual ELF ABI and hashes", "component archive admission", "aggregate archive extraction", "source collection", "public preparation and sealed provenance", "public runner bundled launcher", "node-infra private library staging"]}

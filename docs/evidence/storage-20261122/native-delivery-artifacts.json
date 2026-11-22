@@ -1,0 +1,37 @@
+{
+  "architecture": "x86_64",
+  "orchestrator_head": "377de1e327575d563406a690c44a5128a6332519",
+  "platform_head": "4fdcbfe89614266dcb14677c9185ae0ac6033886",
+  "attachments": 19,
+  "files": {
+    "bin/run-cluster-ctl": "2392c6af26deb0420a23d876a9eeb986d27fff1504fbbf7f9161f212322f1e79",
+    "lib/cluster-ctl/ld.so": "02bcda52c1a5dfc236f94d9e5255b4a0e26347d8a372a5223b650e31f291ce3c",
+    "lib/cluster-ctl/libc.so.6": "6b4a45352fd0c540a9c7c718f35ce8c8e46a4e482f9d3885a910c32d1a0e1421",
+    "lib/cluster-ctl/libdl.so.2": "95d521b2c39fd0333271b6fdcdddff878ae82001a304313a837b8e728ebe3cb1",
+    "lib/cluster-ctl/libfdb_c.so": "e4ad7fed7b7580bf5f7b38f0a4279d37e698f69d534182e5de0b8beeef6cd1b1",
+    "lib/cluster-ctl/liblzma.so.5": "983464a4e0e840f85b519cb7b6153b60c75d6473f4d4c32a5a37b3f9894c52c3",
+    "lib/cluster-ctl/libm.so.6": "7f2ca87f652f56b094462474b076749e90e689d0ecb9cb63c7679820b271b4e7",
+    "lib/cluster-ctl/libpthread.so.0": "b93a680da8a05b939b235c1533572e7a2f6d3d8808bf70209997edc64ea5fedc",
+    "lib/cluster-ctl/libresolv.so.2": "ac3924c6cdb26cdfff10fec2ab2748705c83931b39c7f6e638a2b31ae34d420b",
+    "lib/cluster-ctl/librt.so.1": "41c72def458b8cfb6aab96a7dbada7454dd216d89aac65fb085eb52bead51def",
+    "lib/cluster-ctl/libz.so.1": "7e2a72b4c4b38c61e6962de6e3f4a5e9ae692e732c68deead10a7ce2135a7f68",
+    "share/licenses/orchestrator/native/Apache-2.0": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "share/licenses/orchestrator/native/GPL-2": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+    "share/licenses/orchestrator/native/LGPL-2.1": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95",
+    "share/licenses/orchestrator/native/foundationdb/LICENSE": "2f841c1cd8c117763475eb8317f4a4afa0172212f8684a84c38fb937a8c1b220",
+    "share/licenses/orchestrator/native/libc6/copyright": "40c7e1f2118531f038ca22999bd976901254e1bc5cd1b0f0211bdd064c599987",
+    "share/licenses/orchestrator/native/liblzma5/copyright": "a2dc8fac0f496e1c58aff67018cf0c6b88336316afa5642f9335b71642e28aa8",
+    "share/licenses/orchestrator/native/runtime.json": "15066c5ca7710338138dbc705f752b8ffeff2aaa17f11c1cb60033b11f314e67",
+    "share/licenses/orchestrator/native/zlib1g/copyright": "9e5b96d63773a5d177ba264254390f792be07e41748ebd94730981c6cac31cc6",
+    "bin/cluster-ctl": "412ea60ffce987742f02d8dc34e8057857ffadbfc1a11d8a1deff0572107e97e"
+  },
+  "gates": [
+    "actual ELF ABI and hashes",
+    "component archive admission",
+    "aggregate archive extraction",
+    "source collection",
+    "public preparation and sealed provenance",
+    "public runner bundled launcher",
+    "node-infra private library staging"
+  ]
+}

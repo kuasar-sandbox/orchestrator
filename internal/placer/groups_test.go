@@ -493,6 +493,9 @@ func writeGroupFile(t *testing.T, dir, name string, group clusterstate.SandboxGr
 
 func putNodeList(t *testing.T, svc *Service, n clusterstate.NodeListEntry) {
 	t.Helper()
+	if n.Version.IsZero() {
+		n.Version = nodeVersionForTest(1, 0)
+	}
 	raw, err := json.Marshal(n)
 	if err != nil {
 		t.Fatal(err)

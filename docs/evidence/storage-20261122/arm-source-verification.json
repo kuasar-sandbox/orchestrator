@@ -1,0 +1,13 @@
+{
+  "checked_files": 2376,
+  "mismatches": [],
+  "host_arch": "aarch64",
+  "purego": {
+    "sha256": "dde75efac3aa26ffe87bdd894290866f164ff18f84594822a1295fe3c9ae4de9",
+    "bytes": 42701559
+  },
+  "native": {
+    "sha256": "12764d61bf651da06de9586a81d49b5a1a44d5433683d7ec24b9a92611fcae6b",
+    "bytes": 42296208
+  }
+}

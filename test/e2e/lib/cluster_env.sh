@@ -9,6 +9,8 @@ SWITCH="${SWITCH:-c${BASHPID}}"
 : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
 E2E_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
 : "${ZOT_BIN:?ZOT_BIN must point to the prepared registry binary}"
+: "${FDB_SERVER_TEST_BIN:?FDB_SERVER_TEST_BIN must point to the prepared FoundationDB server}"
+: "${FDB_CLI_TEST_BIN:?FDB_CLI_TEST_BIN must point to the prepared FoundationDB CLI}"
 SW_NETNS="${SW_NETNS:-e2ec_${BASHPID}}"
 
 step() { echo "==> $*" >&2; }
@@ -45,7 +47,7 @@ fail() {
 }
 
 
-for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl cloud-hypervisor; do
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cluster-ctl run-cluster-ctl cloud-hypervisor; do
     [ -x "$BIN/$b" ] || fail "missing $BIN/$b"
 done
 [ -f "$BIN/vmlinux" ] || fail "missing $BIN/vmlinux"
@@ -54,6 +56,8 @@ command -v python3 >/dev/null 2>&1 || fail "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || fail "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || fail "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || fail "prepared registry is missing: $ZOT_BIN"
+[ -x "$FDB_SERVER_TEST_BIN" ] && [ -x "$FDB_CLI_TEST_BIN" ] || fail "prepared FoundationDB helpers are missing"
+[ -x "$(dirname "$BIN")/lib/cluster-ctl/ld.so" ] || fail "prepared cluster native runtime is missing"
 command -v ip >/dev/null 2>&1 || fail "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || fail "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm not available (rw)"
@@ -84,6 +88,7 @@ declare -a TAGS=()
 SW_STARTED=""
 NETNS_CREATED=""
 CLUSTER_EXEC_PID=""
+CLUSTER_FDB_PID=""
 
 cleanup() {
     set +e
@@ -102,6 +107,7 @@ cleanup() {
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
     mkdir -p "$CASE_OUT/runtime"
     cp "$WORK"/*.log "$CASE_OUT/runtime/" 2>/dev/null || true
+    [ ! -d "$WORK/fdb/logs" ] || cp -a "$WORK/fdb/logs" "$CASE_OUT/runtime/fdb-logs"
     [ ! -f "$WORK/build-actions.json" ] || cp "$WORK/build-actions.json" "$CASE_OUT/runtime/"
     [ -n "${E2E_KEEP:-}" ] && step "kept runtime directory: $WORK" || rm -rf "$WORK"
 }

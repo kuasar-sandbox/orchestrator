@@ -72,7 +72,7 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	stores := registry.NewStores()
+	stores := newTestRegistryStores(t)
 
 	reg := registry.New(stores, nil, 5*time.Second, log)
 	httpPlacer := registry.NewHTTPPlacer(reg, 1, 2*time.Second)
@@ -382,7 +382,7 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reservedRoute.RouteRevision <= 0 || reservedRoute.SandboxID != created.SandboxID || reservedRoute.NodeSandboxID != create.SID ||
+	if !reservedRoute.RouteRevision.IsCommitted() || reservedRoute.SandboxID != created.SandboxID || reservedRoute.NodeSandboxID != create.SID ||
 		reservedRoute.StableID != create.Cluster.StableID || reservedRoute.APISecret != testAPISecret ||
 		reservedRoute.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
 		reservedRoute.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||

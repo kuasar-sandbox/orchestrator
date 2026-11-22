@@ -14,6 +14,7 @@ require (
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/kuasar-sandbox/accelerator v0.2.0
 	github.com/kuasar-sandbox/connector v0.2.0
 	github.com/kuasar-sandbox/sandboxer v0.2.0
@@ -81,6 +82,7 @@ require (
 	github.com/antchfx/xpath v1.3.5 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/apex/log v1.9.0 // indirect
+	github.com/apple/foundationdb/bindings/go v0.0.0-20260416192139-3ea44ce1d900
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.23 // indirect
@@ -148,6 +150,9 @@ require (
 	github.com/iancoleman/strcase v0.3.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/josharian/native v1.1.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

@@ -21,7 +21,7 @@ func TestReservePausingPreservesOwner(t *testing.T) {
 				if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 					t.Fatal(err)
 				}
-				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"}); err != nil {
+				if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"}); err != nil {
 					t.Fatal(err)
 				}
 				if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", original.SandboxID, original.Profile, original.APISecretFingerprint)); err != nil {
@@ -44,7 +44,7 @@ func TestReservePausingPreservesOwner(t *testing.T) {
 					// A node may publish capture completion while Connect is queued.
 					// Rejection must not roll this progress back to pausing.
 					paused := testRouteFromRecord(original, original.NodeSandboxID, routesync.StatePaused)
-					reg.applyRoute(ctx, "n1", &paused)
+					testApplyRoute(reg, ctx, "n1", &paused)
 					status := routesync.AckRejected
 					if accepted {
 						status = routesync.AckAccepted
@@ -52,7 +52,7 @@ func TestReservePausingPreservesOwner(t *testing.T) {
 					go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: status})
 					if accepted {
 						running := testRouteFromRecord(original, original.NodeSandboxID, routesync.StateRunning)
-						reg.applyRoute(ctx, "n1", &running)
+						testApplyRoute(reg, ctx, "n1", &running)
 					}
 				}})
 				var err error

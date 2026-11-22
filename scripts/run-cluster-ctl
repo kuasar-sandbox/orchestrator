@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# Resolve the development symlink as well as an installed release launcher.
+launcher=$(readlink -f -- "$0")
+bundle_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")/.." && pwd)
+runtime_dir="$bundle_dir/lib/cluster-ctl"
+
+# The official x86_64 FoundationDB client requires AVX independently of Go's
+# GOAMD64 setting. Report that requirement before entering the native library.
+if [ "$(uname -m)" = x86_64 ] && ! grep -Eq '^flags[[:space:]]*:.*[[:space:]]avx([[:space:]]|$)' /proc/cpuinfo; then
+    echo 'cluster-ctl: the FoundationDB 7.3.77 x86_64 client requires AVX' >&2
+    exit 1
+fi
+
+exec "$runtime_dir/ld.so" --inhibit-cache --library-path "$runtime_dir" "$bundle_dir/bin/cluster-ctl" "$@"

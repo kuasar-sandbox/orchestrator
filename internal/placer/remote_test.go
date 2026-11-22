@@ -21,12 +21,13 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/testutil/metadatastore"
 )
 
 func TestPlacerDirectPlace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
-	stores := registry.NewStores()
+	stores := testMetadataStores(t)
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n1", Labels: map[string]string{"pool": "p"}, Counts: 5})
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n2", Labels: map[string]string{"pool": "p"}, Counts: 0})
 
@@ -489,7 +490,8 @@ func TestReconcileRunsWhenReadyNodeListChanges(t *testing.T) {
 
 	sink := svc.nodes.sourceWithNotify("node_list", svc.notifyNodeListChanged)
 	raw, err := json.Marshal(clusterstate.NodeListEntry{
-		NodeID: "n1", Labels: map[string]string{"pool": "p"},
+		Version: nodeVersionForTest(1, 0),
+		NodeID:  "n1", Labels: map[string]string{"pool": "p"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -739,7 +741,8 @@ func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
 	sink := svc.nodes.source("node_list")
 	sink.reset()
 	raw, err := json.Marshal(clusterstate.NodeListEntry{
-		NodeID: nodeID, Labels: map[string]string{"pool": "p"},
+		Version: nodeVersionForTest(1, 0),
+		NodeID:  nodeID, Labels: map[string]string{"pool": "p"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -750,6 +753,7 @@ func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
 
 func TestDecodeNodeListPreservesSplitEndpoints(t *testing.T) {
 	raw, err := json.Marshal(clusterstate.NodeListEntry{
+		Version:      nodeVersionForTest(1, 0),
 		NodeID:       "n1",
 		APIEndpoint:  "10.0.0.1:7443",
 		DataEndpoint: "10.0.0.1:8443",
@@ -840,7 +844,7 @@ func (s *countingGroupSource) Range(context.Context, string, int) (clusterstate.
 
 func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*registry.Registry, *httptest.Server) {
 	t.Helper()
-	stores := registry.NewStores()
+	stores := testMetadataStores(t)
 	if err := stores.PutNode(ctx, &registry.NodeRecord{NodeID: nodeID, Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
@@ -851,9 +855,19 @@ func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*regis
 }
 
 func TestHTTPPlacerNoPlacer(t *testing.T) {
-	reg := registry.New(registry.NewStores(), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := registry.New(testMetadataStores(t), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	placer := registry.NewHTTPPlacer(reg, 1, 200*time.Millisecond)
 	if _, err := placer.Place(context.Background(), registry.PlaceRequest{Group: "/g"}); err != registry.ErrNoNode {
 		t.Fatalf("no placer → want ErrNoNode, got %v", err)
 	}
+}
+
+func testMetadataStores(t *testing.T) *registry.Stores {
+	t.Helper()
+	db := metadatastore.New()
+	stores, err := registry.NewStores(db.Repositories(), metadatastore.Owners{ID: "registry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stores
 }

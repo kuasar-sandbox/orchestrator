@@ -1,0 +1,63 @@
+FoundationDB 7.3 (v7.3.77)
+source version 3ea44ce1d9003ad095e408039e1f755c319c4dfb
+protocol fdb00b073000000
+test FoundationDB ready (7.3.77, single SSD; ordinary read/write checked)
+go: downloading github.com/apple/foundationdb/bindings/go v0.0.0-20260416192139-3ea44ce1d900
+go: downloading golang.org/x/net v0.58.0
+go: downloading golang.org/x/sys v0.47.0
+go: downloading gopkg.in/yaml.v3 v3.0.1
+go: downloading github.com/google/uuid v1.6.0
+go: downloading github.com/jackc/pgx/v5 v5.13.0
+go: downloading modernc.org/sqlite v1.40.1
+go: downloading github.com/hashicorp/memberlist v0.5.4
+go: downloading github.com/jackc/pgpassfile v1.0.0
+go: downloading github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761
+go: downloading golang.org/x/text v0.41.0
+go: downloading cel.dev/cel-go v0.32.0
+go: downloading golang.org/x/sync v0.22.0
+go: downloading google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa
+go: downloading google.golang.org/protobuf v1.36.11
+go: downloading google.golang.org/genproto v0.0.0-20260217215200-42d3e9bedb6d
+go: downloading go.opentelemetry.io/collector/confmap v1.54.0
+go: downloading go.opentelemetry.io/collector v0.145.0
+go: downloading github.com/jackc/puddle/v2 v2.2.3
+go: downloading github.com/google/btree v1.1.3
+go: downloading github.com/hashicorp/go-metrics v0.5.4
+go: downloading github.com/hashicorp/go-msgpack/v2 v2.1.5
+go: downloading github.com/hashicorp/go-multierror v1.1.1
+go: downloading github.com/hashicorp/go-sockaddr v1.0.7
+go: downloading github.com/miekg/dns v1.1.72
+go: downloading github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529
+go: downloading cel.dev/expr v0.25.2
+go: downloading go.uber.org/multierr v1.11.0
+go: downloading go.uber.org/zap v1.27.1
+go: downloading go.yaml.in/yaml/v3 v3.0.4
+go: downloading google.golang.org/grpc v1.83.2
+go: downloading github.com/golang/snappy v1.0.0
+go: downloading golang.org/x/crypto v0.56.0
+go: downloading github.com/armon/go-metrics v0.4.1
+go: downloading github.com/hashicorp/errwrap v1.1.0
+go: downloading github.com/antlr4-go/antlr/v4 v4.13.1
+go: downloading github.com/go-viper/mapstructure/v2 v2.5.0
+go: downloading github.com/gobwas/glob v0.2.3
+go: downloading github.com/knadh/koanf/maps v0.1.2
+go: downloading github.com/knadh/koanf/providers/confmap v1.0.0
+go: downloading github.com/knadh/koanf/v2 v2.3.3
+go: downloading google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa
+go: downloading github.com/hashicorp/go-immutable-radix v1.3.1
+go: downloading golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
+go: downloading github.com/mitchellh/copystructure v1.2.0
+go: downloading go.opentelemetry.io/collector/featuregate v1.54.0
+go: downloading github.com/hashicorp/golang-lru v0.6.0
+go: downloading github.com/mitchellh/reflectwalk v1.0.2
+go: downloading github.com/hashicorp/go-version v1.8.0
+go: downloading modernc.org/libc v1.66.10
+go: downloading modernc.org/mathutil v1.7.1
+go: downloading github.com/dustin/go-humanize v1.0.1
+go: downloading modernc.org/memory v1.11.0
+go: downloading github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec
+ok  	github.com/kuasar-sandbox/orchestrator/internal/fdbdriver	1.326s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	7.681s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/sqlengine	4.145s
+ok  	github.com/kuasar-sandbox/orchestrator/cmd/cluster-ctl	4.902s
+ok  	github.com/kuasar-sandbox/orchestrator/test/e2e/cluster_stub	2.576s

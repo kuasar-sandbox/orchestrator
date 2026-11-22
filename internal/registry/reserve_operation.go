@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -246,30 +246,23 @@ func (r *Registry) reserveConnect(ctx context.Context, req SandboxReserveRequest
 		}
 		return result, err
 	}
-	return nil, clusterstate.ErrConflict
+	return nil, metadata.ErrConflict
 }
 
-func (r *Registry) connectCurrent(ctx context.Context, req SandboxReserveRequest, rec *SandboxRecord, rev int64) (*ReserveResult, bool, error) {
+func (r *Registry) connectCurrent(ctx context.Context, req SandboxReserveRequest, rec *SandboxRecord, rev metadata.Version) (*ReserveResult, bool, error) {
 	before := *rec
 	current := *rec
 	if current.State == StatePaused {
 		current.State = StateReserved
 	}
-	currentRev, ok, err := r.stores.CASSandbox(ctx, &current, rev)
+	currentRev, ok, err := r.stores.commitSandboxIntent(ctx, &current, rev)
 	if err != nil {
 		return nil, false, err
 	}
 	if !ok {
 		return nil, true, nil
 	}
-	if err := r.stores.AddNodeSandboxRef(ctx, current.NodeID, clusterstate.NodeSandboxRef{
-		Group: current.Group, RouteKey: current.RouteKey, SandboxID: current.SandboxID,
-		SandboxGeneration: current.SandboxGeneration, NodeSandboxID: current.NodeSandboxID,
-		Profile: current.Profile, APISecretFingerprint: current.APISecretFingerprint,
-	}); err != nil {
-		r.rollbackConnect(&current, currentRev, &before, true)
-		return nil, false, err
-	}
+
 	ack, err := r.nodeOwner.SendCommandAndWait(ctx, current.NodeID, connectCommand(req, &current), lifecycleAckTimeout)
 	if err != nil {
 		r.rollbackConnect(&current, currentRev, &before, !errors.Is(err, ErrNodeGone))
@@ -376,10 +369,10 @@ func (r *Registry) reserveExecSession(ctx context.Context, req SandboxReserveReq
 		}
 		return result, err
 	}
-	return nil, clusterstate.ErrConflict
+	return nil, metadata.ErrConflict
 }
 
-func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveRequest, rec *SandboxRecord, rev int64) (*ReserveResult, bool, error) {
+func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveRequest, rec *SandboxRecord, rev metadata.Version) (*ReserveResult, bool, error) {
 	before := *rec
 	current := *rec
 	currentRev := rev
@@ -388,7 +381,7 @@ func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveReq
 		current.State = StateReserved
 		var ok bool
 		var err error
-		currentRev, ok, err = r.stores.CASSandbox(ctx, &current, rev)
+		currentRev, ok, err = r.stores.commitSandboxIntent(ctx, &current, rev)
 		if err != nil {
 			return nil, false, err
 		}
@@ -396,14 +389,7 @@ func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveReq
 			return nil, true, nil
 		}
 		transitioned = true
-		if err := r.stores.AddNodeSandboxRef(ctx, current.NodeID, clusterstate.NodeSandboxRef{
-			Group: current.Group, RouteKey: current.RouteKey, SandboxID: current.SandboxID,
-			SandboxGeneration: current.SandboxGeneration, NodeSandboxID: current.NodeSandboxID,
-			Profile: current.Profile, APISecretFingerprint: current.APISecretFingerprint,
-		}); err != nil {
-			r.rollbackConnect(&current, currentRev, &before, true)
-			return nil, false, err
-		}
+
 	}
 	ack, err := r.nodeOwner.SendCommandAndWait(ctx, current.NodeID, execSessionCommand(req, &current), lifecycleAckTimeout)
 	if err != nil {
@@ -470,7 +456,7 @@ func (r *Registry) currentExecSessionRoute(ctx context.Context, req SandboxReser
 	return r.routeWithDataEndpoint(ctx, current, rev)
 }
 
-func (r *Registry) rollbackConnect(current *SandboxRecord, currentRev int64, before *SandboxRecord, retainOwnership bool) {
+func (r *Registry) rollbackConnect(current *SandboxRecord, currentRev metadata.Version, before *SandboxRecord, retainOwnership bool) {
 	if current == nil || before == nil {
 		return
 	}
@@ -531,7 +517,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		}
 		if !sameSandboxGeneration(current, original) ||
 			(current.State != StateReserved && current.State != StateReady && current.State != StatePausing && current.State != StatePaused) {
-			return nil, clusterstate.ErrConflict
+			return nil, metadata.ErrConflict
 		}
 		if current.NextSandboxGeneration == math.MaxUint64 {
 			return nil, errors.New("registry: sandbox generation exhausted")
@@ -548,26 +534,14 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		if !validNodeSandboxIdentity(target.SandboxID, target.NodeSandboxID, target.SandboxGeneration) {
 			return nil, errors.New("registry: generated node sandbox identity is invalid")
 		}
-		targetRev, ok, err := r.stores.CASSandbox(ctx, &target, rev)
+		targetRev, ok, err := r.stores.commitSandboxIntent(ctx, &target, rev)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
-			return nil, clusterstate.ErrConflict
+			return nil, metadata.ErrConflict
 		}
-		if err := r.stores.AddNodeSandboxRef(ctx, target.NodeID, clusterstate.NodeSandboxRef{
-			Group: target.Group, RouteKey: target.RouteKey, SandboxID: target.SandboxID,
-			SandboxGeneration: target.SandboxGeneration, NodeSandboxID: target.NodeSandboxID,
-			Profile: target.Profile, APISecretFingerprint: target.APISecretFingerprint,
-		}); err != nil {
-			r.rollbackConnect(&target, targetRev, current, true)
-			if errors.Is(err, errNodeSandboxIDConflict) {
-				lastFailure = err
-				excluded.add(target.NodeID)
-				continue
-			}
-			return nil, err
-		}
+
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, connectCommand(req, &target), lifecycleAckTimeout)
 		if err != nil {
 			ambiguous := !errors.Is(err, ErrNodeGone)
@@ -687,7 +661,7 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 		}
 		if !sameSandboxGeneration(current, original) ||
 			(current.State != StateReserved && current.State != StateReady && current.State != StatePausing && current.State != StatePaused) {
-			return nil, clusterstate.ErrConflict
+			return nil, metadata.ErrConflict
 		}
 		if current.NextSandboxGeneration == math.MaxUint64 {
 			return nil, errors.New("registry: sandbox generation exhausted")
@@ -704,26 +678,14 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 		if !validNodeSandboxIdentity(target.SandboxID, target.NodeSandboxID, target.SandboxGeneration) {
 			return nil, errors.New("registry: generated node sandbox identity is invalid")
 		}
-		targetRev, ok, err := r.stores.CASSandbox(ctx, &target, rev)
+		targetRev, ok, err := r.stores.commitSandboxIntent(ctx, &target, rev)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
-			return nil, clusterstate.ErrConflict
+			return nil, metadata.ErrConflict
 		}
-		if err := r.stores.AddNodeSandboxRef(ctx, target.NodeID, clusterstate.NodeSandboxRef{
-			Group: target.Group, RouteKey: target.RouteKey, SandboxID: target.SandboxID,
-			SandboxGeneration: target.SandboxGeneration, NodeSandboxID: target.NodeSandboxID,
-			Profile: target.Profile, APISecretFingerprint: target.APISecretFingerprint,
-		}); err != nil {
-			r.rollbackConnect(&target, targetRev, current, true)
-			if errors.Is(err, errNodeSandboxIDConflict) {
-				lastFailure = err
-				excluded.add(target.NodeID)
-				continue
-			}
-			return nil, err
-		}
+
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, execSessionCommand(req, &target), lifecycleAckTimeout)
 		if err != nil {
 			ambiguous := !errors.Is(err, ErrNodeGone)
@@ -762,7 +724,7 @@ func (r *Registry) reserveData(ctx context.Context, req SandboxReserveRequest) (
 
 func (r *Registry) reserveDataAttempt(ctx context.Context, req SandboxReserveRequest, attempt int) (*ReserveResult, error) {
 	if attempt >= 5 {
-		return nil, clusterstate.ErrConflict
+		return nil, metadata.ErrConflict
 	}
 	rec, rev, found, err := r.getSandboxForReserve(ctx, req.Group, req.RouteKey)
 	if err != nil {
@@ -776,6 +738,16 @@ func (r *Registry) reserveDataAttempt(ctx context.Context, req SandboxReserveReq
 	}
 	if err := authenticateRecordAccessToken(rec, req.Port, req.Service, req.AccessToken, time.Now()); err != nil {
 		return nil, err
+	}
+	// A ready lookup does not consume observation capacity. Waiting or waking a
+	// paused route reserves its slot before any lifecycle mutation or command.
+	if rec.State == StateReserved || rec.State == StatePaused {
+		admitted, release, err := r.stores.observations.ReserveObservation(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		ctx = admitted
 	}
 	switch rec.State {
 	case StateReady, StatePausing:
@@ -832,34 +804,37 @@ func (r *Registry) reserveDataAttempt(ctx context.Context, req SandboxReserveReq
 	}
 }
 
-func (r *Registry) waitForLineageTransition(ctx context.Context, group, routeKey, expectedSandboxID string) (*SandboxRecord, int64, error) {
+func (r *Registry) waitForLineageTransition(ctx context.Context, group, routeKey, expectedSandboxID string) (*SandboxRecord, metadata.Version, error) {
 	wctx, cancel := context.WithTimeout(ctx, r.parkTimeout)
 	defer cancel()
-	rev, _ := r.stores.RouteGroupRev(wctx, group)
-	watch, _ := r.stores.WatchRouteGroup(wctx, group, rev)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
 	for {
-		rec, routeRev, found, err := r.getSandboxForReserve(wctx, group, routeKey)
+		current, observation, err := r.stores.routes.ReadAndObserveRoute(wctx, metadata.RouteKey{Group: group, RouteKey: routeKey})
 		if err != nil {
-			return nil, 0, err
+			return nil, metadata.Version{}, err
 		}
-		if !found || rec.SandboxID != expectedSandboxID {
-			return nil, 0, ErrSandboxNotFound
+		if !current.Exists || current.Value.SandboxID != expectedSandboxID {
+			observation.Cancel()
+			return nil, metadata.Version{}, ErrSandboxNotFound
 		}
-		if rec.State == StateReady || rec.State == StatePausing || rec.State == StatePaused {
-			return rec, routeRev, nil
+		if current.Value.State == StateReady || current.Value.State == StatePausing || current.Value.State == StatePaused {
+			observation.Cancel()
+			return &current.Value, current.Version, nil
 		}
 		select {
-		case <-watch:
-		case <-ticker.C:
 		case <-wctx.Done():
-			return nil, 0, wctx.Err()
+			observation.Cancel()
+			return nil, metadata.Version{}, wctx.Err()
+		case <-observation.Done():
+		}
+		err = observation.Err()
+		observation.Cancel()
+		if err != nil {
+			return nil, metadata.Version{}, err
 		}
 	}
 }
 
-func (r *Registry) routeWithDataEndpoint(ctx context.Context, rec *SandboxRecord, routeRevision int64) (*RouteResolve, error) {
+func (r *Registry) routeWithDataEndpoint(ctx context.Context, rec *SandboxRecord, routeRevision metadata.Version) (*RouteResolve, error) {
 	route, err := r.routeFromRecord(ctx, rec, routeRevision)
 	if err != nil {
 		return nil, err
@@ -879,8 +854,8 @@ func (r *Registry) routeWithDataEndpoint(ctx context.Context, rec *SandboxRecord
 	return route, nil
 }
 
-func (r *Registry) routeFromRecord(ctx context.Context, rec *SandboxRecord, routeRevision int64) (*RouteResolve, error) {
-	if rec == nil || rec.SandboxID == "" || rec.NodeSandboxID == "" || routeRevision <= 0 {
+func (r *Registry) routeFromRecord(ctx context.Context, rec *SandboxRecord, routeRevision metadata.Version) (*RouteResolve, error) {
+	if rec == nil || rec.SandboxID == "" || rec.NodeSandboxID == "" || !routeRevision.IsCommitted() {
 		return nil, errors.New("registry: sandbox route is incomplete")
 	}
 	if _, _, err := replacementCredentials(rec); err != nil {

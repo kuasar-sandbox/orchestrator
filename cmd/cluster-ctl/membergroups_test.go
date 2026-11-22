@@ -33,7 +33,7 @@ func TestPlacerLinkRegisterSeedsPlacerObserverMemberlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer observer.group.Shutdown()
-	reg := registry.New(registry.NewStores(), nil, time.Second, log)
+	reg := registry.New(newTestRegistryStores(t), nil, time.Second, log)
 	reg.SetPlacerMemberlistLabel("placer.default")
 	reg.SetPlacerSeedJoiner(observer.JoinSeed)
 	reg.SetPlacerPeerSource(observer.ReadyPlacers)

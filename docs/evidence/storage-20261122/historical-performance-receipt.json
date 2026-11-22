@@ -1,0 +1,1735 @@
+{
+  "scope": "Historical shardkv to first FDB measurement, 2026-11-20; not a current-head benchmark",
+  "archive_sha256": "89e6f44d76e12916d23ae4ce4bf1d0104e3e764906aa76d6aeaf10b0b1605c21",
+  "cases": [
+    {
+      "case": "fdb-build/build.json",
+      "sha256": "95242cdf55f21cfb5726a0b9ae3987b70591ebd2dddd172ef76f0f53695600d2",
+      "run_sha256": "6d9212490e709433aa6cda62bbcfca83e763f3435ee23159932281b88b5ea64d",
+      "pipeline_sha256": "c3f398af0de1d29aa9fdceba587e66936037c971d75c01a0732248810c8700dd",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "build",
+        "requests": 6000,
+        "concurrency": 256,
+        "warmup": 0,
+        "rate": 100,
+        "offered_warmup": "20s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-build"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:06:22.775584+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "arrival": {
+            "warmup": {
+              "offered_per_second": 100,
+              "max_in_flight": 256,
+              "max_launch_lag_ms": 10,
+              "planned": 2000,
+              "admitted": 2000,
+              "completed": 2000,
+              "succeeded": 2000,
+              "http_failed": 0,
+              "scheduler_late": 0,
+              "capacity_dropped": 0,
+              "accounting_ok": true,
+              "offer_seconds": 20,
+              "wall_seconds": 20.019313789,
+              "started_utc": "2026-11-20T07:06:22.854684697Z",
+              "dispatch_lag": {
+                "samples": 2000,
+                "mean_ms": 0.4613562570000004,
+                "p50_ms": 0.434843,
+                "p95_ms": 0.961548,
+                "p99_ms": 1.036716,
+                "max_ms": 1.05709,
+                "over_budget": 0
+              },
+              "goroutine_scheduling_lag": {
+                "samples": 2000,
+                "mean_ms": 0.002351915999999997,
+                "p50_ms": 0.002128,
+                "p95_ms": 0.003539,
+                "p99_ms": 0.004749,
+                "max_ms": 0.082303,
+                "over_budget": 0
+              },
+              "success_client_operation": {
+                "samples": 2000,
+                "mean_ms": 27.295433898499972,
+                "p50_ms": 27.279022,
+                "p95_ms": 31.151908,
+                "p99_ms": 32.546733,
+                "max_ms": 36.823529,
+                "over_budget": 2000
+              },
+              "success_scheduled_to_finish": {
+                "samples": 2000,
+                "mean_ms": 27.759142071500012,
+                "p50_ms": 27.798349,
+                "p95_ms": 31.700527,
+                "p99_ms": 32.913715,
+                "max_ms": 37.012176,
+                "over_budget": 2000
+              },
+              "failed_client_operation": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "failed_scheduled_to_finish": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "comparison_budget_ms": 20,
+              "comparison_passed": false
+            },
+            "offered_per_second": 100,
+            "max_in_flight": 256,
+            "max_launch_lag_ms": 10,
+            "planned": 6000,
+            "admitted": 6000,
+            "completed": 6000,
+            "succeeded": 6000,
+            "http_failed": 0,
+            "scheduler_late": 0,
+            "capacity_dropped": 0,
+            "accounting_ok": true,
+            "offer_seconds": 60,
+            "wall_seconds": 60.017429738,
+            "started_utc": "2026-11-20T07:06:42.88141505Z",
+            "dispatch_lag": {
+              "samples": 6000,
+              "mean_ms": 0.45103900449999956,
+              "p50_ms": 0.419244,
+              "p95_ms": 0.969529,
+              "p99_ms": 1.038087,
+              "max_ms": 1.061379,
+              "over_budget": 0
+            },
+            "goroutine_scheduling_lag": {
+              "samples": 6000,
+              "mean_ms": 0.0023181139999999987,
+              "p50_ms": 0.002114,
+              "p95_ms": 0.003427,
+              "p99_ms": 0.004883,
+              "max_ms": 0.022396,
+              "over_budget": 0
+            },
+            "success_client_operation": {
+              "samples": 6000,
+              "mean_ms": 27.45391412916662,
+              "p50_ms": 27.373386,
+              "p95_ms": 31.414625,
+              "p99_ms": 34.290448,
+              "max_ms": 69.83799,
+              "over_budget": 6000
+            },
+            "success_scheduled_to_finish": {
+              "samples": 6000,
+              "mean_ms": 27.907271247666674,
+              "p50_ms": 27.865184,
+              "p95_ms": 31.928632,
+              "p99_ms": 34.725129,
+              "max_ms": 70.068237,
+              "over_budget": 6000
+            },
+            "failed_client_operation": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "failed_scheduled_to_finish": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "comparison_budget_ms": 20,
+            "comparison_passed": false
+          },
+          "heartbeat_completed_calls": 5106,
+          "phase": "build",
+          "requests": 6000,
+          "concurrency": 256,
+          "elapsed_seconds": 60.017429738,
+          "completed_per_second": 99.97095887298725,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 27.865184,
+            "p95_ms": 31.928632,
+            "p99_ms": 34.725129,
+            "max_ms": 70.068237,
+            "over_budget": 6000
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_ack": 1,
+              "node_command:build_register": 1,
+              "placer_auth_http": 1,
+              "placer_call": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-c8/build.json",
+      "sha256": "fea9d4d600d1dae83e869b93865ae396e0620178d499ac4412b4d4f60f9f672c",
+      "run_sha256": "4354a27b26ff61fd403e1e03d9b5024e31bee4e8e54f11d18118a12279111fa5",
+      "pipeline_sha256": "3a1ac01166f0183046d8793aab6108d18a65d371f5e74249f2f410f25d2aad11",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:53.534426+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 27,
+          "phase": "build",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.392099456,
+          "completed_per_second": 255.03733420124917,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 28.517802,
+            "p95_ms": 44.271217,
+            "p99_ms": 47.300336,
+            "max_ms": 47.411113,
+            "over_budget": 100
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_ack": 1,
+              "node_command:build_register": 1,
+              "placer_call": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-c8/create.json",
+      "sha256": "749bf449d61bce00cc40fddf05e209fa1c2e7f33ca0bb7e1458526cb571ba7ec",
+      "run_sha256": "9faaa05e3340588eb9dbb70c5483fbb6c4db78780b516d4476e05c192606a92b",
+      "pipeline_sha256": "3a1ac01166f0183046d8793aab6108d18a65d371f5e74249f2f410f25d2aad11",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:52.072942+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 38,
+          "phase": "create",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.502449046,
+          "completed_per_second": 199.0251564732795,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 38.25833,
+            "p95_ms": 43.760229,
+            "p99_ms": 48.947184,
+            "max_ms": 48.948769,
+            "over_budget": 100
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_ack": 1,
+              "node_command:create": 1,
+              "node_ready_event": 1,
+              "placer_auth_http": 1,
+              "placer_call": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-c8/hot.json",
+      "sha256": "a5d35d6c9e86a4c0837133d49bad7c4a4a158993d3ec5b59cd12480ec6d3c140",
+      "run_sha256": "4246901d7996b185cf980a3a3d512824fa40800c603e70905605f86f3636cea5",
+      "pipeline_sha256": "3a1ac01166f0183046d8793aab6108d18a65d371f5e74249f2f410f25d2aad11",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:51.770507+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 0,
+          "phase": "hot",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.010427777,
+          "completed_per_second": 9589.77162630156,
+          "budget_ms": 5,
+          "latency": {
+            "p50_ms": 0.680186,
+            "p95_ms": 2.991165,
+            "p99_ms": 3.066999,
+            "max_ms": 3.102601,
+            "over_budget": 0
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_http_forward": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-c8/router-cold.json",
+      "sha256": "aef9028598bb1c00970932c293195a5142fad3c6ad68b925e5aa2318fc75db57",
+      "run_sha256": "0b66cffabacea5388f2002b75e891453cdc759b09d823ef6c484d7310ff586cc",
+      "pipeline_sha256": "3a1ac01166f0183046d8793aab6108d18a65d371f5e74249f2f410f25d2aad11",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:51.860223+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 0,
+          "phase": "router-cold",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.061744663,
+          "completed_per_second": 1619.5731767132652,
+          "budget_ms": 5,
+          "latency": {
+            "p50_ms": 4.271081,
+            "p95_ms": 6.853102,
+            "p99_ms": 16.256372,
+            "max_ms": 17.473511,
+            "over_budget": 14
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_http_forward": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-cold/router-cold.json",
+      "sha256": "0796c5f0b1bdc7e571ea89ba0cdbb2af526129b7f091ee9e613d1c6539816002",
+      "run_sha256": "52427e1fdf927be897328a800093f45c98c73a18924cd5f72ed3e2c47239af8b",
+      "pipeline_sha256": "525faab1bc04c33c76f7cb6682ac923b14478ab429e0444620ffc505da711cf3",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "router-cold",
+        "requests": 60000,
+        "concurrency": 256,
+        "warmup": 0,
+        "rate": 1000,
+        "offered_warmup": "20s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-cold"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:00:15.284485+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "arrival": {
+            "warmup": {
+              "offered_per_second": 1000,
+              "max_in_flight": 256,
+              "max_launch_lag_ms": 10,
+              "planned": 20000,
+              "admitted": 19956,
+              "completed": 19956,
+              "succeeded": 19956,
+              "http_failed": 0,
+              "scheduler_late": 0,
+              "capacity_dropped": 44,
+              "accounting_ok": true,
+              "offer_seconds": 20,
+              "wall_seconds": 20.002702501,
+              "started_utc": "2026-11-20T07:00:15.340133572Z",
+              "dispatch_lag": {
+                "samples": 19956,
+                "mean_ms": 0.3596813875526155,
+                "p50_ms": 0.274295,
+                "p95_ms": 0.957388,
+                "p99_ms": 1.026132,
+                "max_ms": 7.801351,
+                "over_budget": 3
+              },
+              "goroutine_scheduling_lag": {
+                "samples": 19956,
+                "mean_ms": 0.0026594707857285817,
+                "p50_ms": 0.001865,
+                "p95_ms": 0.004972,
+                "p99_ms": 0.009515,
+                "max_ms": 2.769673,
+                "over_budget": 0
+              },
+              "success_client_operation": {
+                "samples": 19956,
+                "mean_ms": 5.81340658879535,
+                "p50_ms": 3.534585,
+                "p95_ms": 4.481624,
+                "p99_ms": 106.696965,
+                "max_ms": 299.522607,
+                "over_budget": 539
+              },
+              "success_scheduled_to_finish": {
+                "samples": 19956,
+                "mean_ms": 6.175747447133681,
+                "p50_ms": 3.899602,
+                "p95_ms": 5.01134,
+                "p99_ms": 107.363993,
+                "max_ms": 299.557328,
+                "over_budget": 1010
+              },
+              "failed_client_operation": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "failed_scheduled_to_finish": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "comparison_budget_ms": 5,
+              "comparison_passed": false
+            },
+            "offered_per_second": 1000,
+            "max_in_flight": 256,
+            "max_launch_lag_ms": 10,
+            "planned": 60000,
+            "admitted": 60000,
+            "completed": 60000,
+            "succeeded": 60000,
+            "http_failed": 0,
+            "scheduler_late": 0,
+            "capacity_dropped": 0,
+            "accounting_ok": true,
+            "offer_seconds": 60,
+            "wall_seconds": 60.003731483,
+            "started_utc": "2026-11-20T07:00:35.355787287Z",
+            "dispatch_lag": {
+              "samples": 60000,
+              "mean_ms": 0.3586335540666658,
+              "p50_ms": 0.267927,
+              "p95_ms": 0.954628,
+              "p99_ms": 1.023072,
+              "max_ms": 1.071582,
+              "over_budget": 0
+            },
+            "goroutine_scheduling_lag": {
+              "samples": 60000,
+              "mean_ms": 0.0022556686333333464,
+              "p50_ms": 0.001889,
+              "p95_ms": 0.00416,
+              "p99_ms": 0.006613,
+              "max_ms": 0.601378,
+              "over_budget": 0
+            },
+            "success_client_operation": {
+              "samples": 60000,
+              "mean_ms": 3.613790406733393,
+              "p50_ms": 3.546435,
+              "p95_ms": 4.756829,
+              "p99_ms": 4.993003,
+              "max_ms": 11.791906,
+              "over_budget": 594
+            },
+            "success_scheduled_to_finish": {
+              "samples": 60000,
+              "mean_ms": 3.9746796294333384,
+              "p50_ms": 3.923746,
+              "p95_ms": 5.067018,
+              "p99_ms": 5.780977,
+              "max_ms": 12.405337,
+              "over_budget": 3294
+            },
+            "failed_client_operation": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "failed_scheduled_to_finish": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "comparison_budget_ms": 5,
+            "comparison_passed": false
+          },
+          "heartbeat_completed_calls": 0,
+          "phase": "router-cold",
+          "requests": 60000,
+          "concurrency": 256,
+          "elapsed_seconds": 60.003731483,
+          "completed_per_second": 999.9378124841943,
+          "budget_ms": 5,
+          "latency": {
+            "p50_ms": 3.923746,
+            "p95_ms": 5.067018,
+            "p99_ms": 5.780977,
+            "max_ms": 12.405337,
+            "over_budget": 3294
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_http_forward": 1,
+              "placer_auth_http": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-create/create.json",
+      "sha256": "909dd55fbdbe5335d246e65c22bafa34416c996aa1a7d332541bf8c8f4c0945b",
+      "run_sha256": "fb0d54ad1facb329ea8a946f51aed5389f6ba917bf671f08c3435289872a7b01",
+      "pipeline_sha256": "1dbd8c5ab60e3952a034ff7778bdaed88b769eb05a796302b382d837e070a196",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "create",
+        "requests": 6000,
+        "concurrency": 256,
+        "warmup": 0,
+        "rate": 100,
+        "offered_warmup": "20s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "fdb-create"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:03:09.617788+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "arrival": {
+            "warmup": {
+              "offered_per_second": 100,
+              "max_in_flight": 256,
+              "max_launch_lag_ms": 10,
+              "planned": 2000,
+              "admitted": 2000,
+              "completed": 2000,
+              "succeeded": 2000,
+              "http_failed": 0,
+              "scheduler_late": 0,
+              "capacity_dropped": 0,
+              "accounting_ok": true,
+              "offer_seconds": 20,
+              "wall_seconds": 20.037168753,
+              "started_utc": "2026-11-20T07:03:09.713653303Z",
+              "dispatch_lag": {
+                "samples": 2000,
+                "mean_ms": 0.37960006549999964,
+                "p50_ms": 0.320574,
+                "p95_ms": 0.9211,
+                "p99_ms": 1.033152,
+                "max_ms": 1.060126,
+                "over_budget": 0
+              },
+              "goroutine_scheduling_lag": {
+                "samples": 2000,
+                "mean_ms": 0.002426493499999997,
+                "p50_ms": 0.002175,
+                "p95_ms": 0.003589,
+                "p99_ms": 0.006026,
+                "max_ms": 0.038086,
+                "over_budget": 0
+              },
+              "success_client_operation": {
+                "samples": 2000,
+                "mean_ms": 90.41995163449995,
+                "p50_ms": 40.872091,
+                "p95_ms": 471.009999,
+                "p99_ms": 858.997671,
+                "max_ms": 1018.537263,
+                "over_budget": 2000
+              },
+              "success_scheduled_to_finish": {
+                "samples": 2000,
+                "mean_ms": 90.80197819349998,
+                "p50_ms": 41.282939,
+                "p95_ms": 471.053384,
+                "p99_ms": 859.182194,
+                "max_ms": 1018.546084,
+                "over_budget": 2000
+              },
+              "failed_client_operation": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "failed_scheduled_to_finish": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "comparison_budget_ms": 20,
+              "comparison_passed": false
+            },
+            "offered_per_second": 100,
+            "max_in_flight": 256,
+            "max_launch_lag_ms": 10,
+            "planned": 6000,
+            "admitted": 6000,
+            "completed": 6000,
+            "succeeded": 6000,
+            "http_failed": 0,
+            "scheduler_late": 0,
+            "capacity_dropped": 0,
+            "accounting_ok": true,
+            "offer_seconds": 60,
+            "wall_seconds": 60.026959307,
+            "started_utc": "2026-11-20T07:03:29.751761246Z",
+            "dispatch_lag": {
+              "samples": 6000,
+              "mean_ms": 0.3420197281666669,
+              "p50_ms": 0.273868,
+              "p95_ms": 0.890777,
+              "p99_ms": 1.010169,
+              "max_ms": 1.062816,
+              "over_budget": 0
+            },
+            "goroutine_scheduling_lag": {
+              "samples": 6000,
+              "mean_ms": 0.0022909541666666683,
+              "p50_ms": 0.002121,
+              "p95_ms": 0.003384,
+              "p99_ms": 0.004978,
+              "max_ms": 0.049843,
+              "over_budget": 0
+            },
+            "success_client_operation": {
+              "samples": 6000,
+              "mean_ms": 40.99109449616672,
+              "p50_ms": 41.582042,
+              "p95_ms": 46.65962,
+              "p99_ms": 49.825787,
+              "max_ms": 61.744826,
+              "over_budget": 6000
+            },
+            "success_scheduled_to_finish": {
+              "samples": 6000,
+              "mean_ms": 41.33540517849994,
+              "p50_ms": 41.930924,
+              "p95_ms": 46.998958,
+              "p99_ms": 50.073311,
+              "max_ms": 61.877767,
+              "over_budget": 6000
+            },
+            "failed_client_operation": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "failed_scheduled_to_finish": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "comparison_budget_ms": 20,
+            "comparison_passed": false
+          },
+          "heartbeat_completed_calls": 5271,
+          "phase": "create",
+          "requests": 6000,
+          "concurrency": 256,
+          "elapsed_seconds": 60.026959307,
+          "completed_per_second": 99.95508800160589,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 41.930924,
+            "p95_ms": 46.998958,
+            "p99_ms": 50.073311,
+            "max_ms": 61.877767,
+            "over_budget": 6000
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_ack": 1,
+              "node_command:create": 1,
+              "node_ready_event": 1,
+              "placer_auth_http": 1,
+              "placer_call": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "fdb-g10k/create.json",
+      "sha256": "2f5140f480fd9d64e02b3c56f44dc08a0e6cc20ef1457f9969b69d3189ccca30",
+      "run_sha256": "ae3c287590a94f0c3b7a2e18cef0a22ccc0dcffcb5c6677df2467ad768834f9d",
+      "pipeline_sha256": "2bdb617f5b14916d97613ef1feefc25d133c6fa51d734a464c977bf4b9851d98",
+      "binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+      "parameters": {
+        "backend": "fdb",
+        "phases": "create",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 10000,
+        "ready_delay": "2ms",
+        "timeout": 300,
+        "label": "fdb-g10k"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:09:58.232342+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": null,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 36,
+          "phase": "create",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.620060836,
+          "completed_per_second": 161.2744979107179,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 48.721241,
+            "p95_ms": 52.178726,
+            "p99_ms": 54.172271,
+            "max_ms": 54.215689,
+            "over_budget": 100
+          },
+          "errors": 0,
+          "single_request_fixture_markers": {
+            "markers": {
+              "node_ack": 1,
+              "node_command:create": 1,
+              "node_ready_event": 1,
+              "placer_auth_http": 1,
+              "placer_call": 1
+            }
+          },
+          "aggregate_fixture_markers": {
+            "markers": {}
+          }
+        }
+      ]
+    },
+    {
+      "case": "old-build/build.json",
+      "sha256": "e8726fd34f62143a745f904d0a984d31600351ea1e4dd8aa157e06af62e3b373",
+      "run_sha256": "2a13a751fd13ed07fca70699af884a924f4731a0bf6b4d976c495e67051ca2d4",
+      "pipeline_sha256": "00d66d0242ea8404cba125d16fb42fb159f666db875bd4fece36e7bbbcc5abc8",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "build",
+        "requests": 6000,
+        "concurrency": 256,
+        "warmup": 0,
+        "rate": 100,
+        "offered_warmup": "20s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-build"
+      },
+      "exit_code": 1,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:04:29.943539+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "arrival": {
+            "warmup": {
+              "offered_per_second": 100,
+              "max_in_flight": 256,
+              "max_launch_lag_ms": 10,
+              "planned": 2000,
+              "admitted": 517,
+              "completed": 517,
+              "succeeded": 471,
+              "http_failed": 46,
+              "scheduler_late": 1,
+              "capacity_dropped": 1482,
+              "accounting_ok": true,
+              "offer_seconds": 20,
+              "wall_seconds": 39.416797052,
+              "started_utc": "2026-11-20T07:04:30.064341342Z",
+              "dispatch_lag": {
+                "samples": 517,
+                "mean_ms": 0.34787976595744674,
+                "p50_ms": 0.161636,
+                "p95_ms": 1.310581,
+                "p99_ms": 2.817801,
+                "max_ms": 6.617406,
+                "over_budget": 0
+              },
+              "goroutine_scheduling_lag": {
+                "samples": 517,
+                "mean_ms": 0.0055897678916827865,
+                "p50_ms": 0.003258,
+                "p95_ms": 0.008752,
+                "p99_ms": 0.081187,
+                "max_ms": 0.17879,
+                "over_budget": 0
+              },
+              "success_client_operation": {
+                "samples": 471,
+                "mean_ms": 14127.242656847136,
+                "p50_ms": 16240.402792,
+                "p95_ms": 19645.328633,
+                "p99_ms": 19807.386195,
+                "max_ms": 19991.291464,
+                "over_budget": 471
+              },
+              "success_scheduled_to_finish": {
+                "samples": 471,
+                "mean_ms": 14127.588494747351,
+                "p50_ms": 16240.520333,
+                "p95_ms": 19645.48668,
+                "p99_ms": 19807.40936,
+                "max_ms": 19993.10575,
+                "over_budget": 471
+              },
+              "failed_client_operation": {
+                "samples": 46,
+                "mean_ms": 20000.41203273913,
+                "p50_ms": 20000.280875,
+                "p95_ms": 20001.037336,
+                "p99_ms": 20001.26333,
+                "max_ms": 20001.26333,
+                "over_budget": 46
+              },
+              "failed_scheduled_to_finish": {
+                "samples": 46,
+                "mean_ms": 20000.84364356522,
+                "p50_ms": 20000.665549,
+                "p95_ms": 20001.780895,
+                "p99_ms": 20002.806701,
+                "max_ms": 20002.806701,
+                "over_budget": 46
+              },
+              "error_samples": [
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+              ],
+              "comparison_budget_ms": 20,
+              "comparison_passed": false
+            },
+            "offered_per_second": 100,
+            "max_in_flight": 256,
+            "max_launch_lag_ms": 10,
+            "planned": 6000,
+            "admitted": 891,
+            "completed": 891,
+            "succeeded": 45,
+            "http_failed": 846,
+            "scheduler_late": 1,
+            "capacity_dropped": 5108,
+            "accounting_ok": true,
+            "offer_seconds": 60,
+            "wall_seconds": 73.140353127,
+            "started_utc": "2026-11-20T07:05:09.48131774Z",
+            "dispatch_lag": {
+              "samples": 891,
+              "mean_ms": 0.3411997620650953,
+              "p50_ms": 0.227617,
+              "p95_ms": 0.877222,
+              "p99_ms": 1.810709,
+              "max_ms": 8.507996,
+              "over_budget": 0
+            },
+            "goroutine_scheduling_lag": {
+              "samples": 891,
+              "mean_ms": 0.004044709315375984,
+              "p50_ms": 0.00321,
+              "p95_ms": 0.006454,
+              "p99_ms": 0.016199,
+              "max_ms": 0.168478,
+              "over_budget": 0
+            },
+            "success_client_operation": {
+              "samples": 45,
+              "mean_ms": 10974.850316422224,
+              "p50_ms": 10950.604778,
+              "p95_ms": 19874.86677,
+              "p99_ms": 19994.748203,
+              "max_ms": 19994.748203,
+              "over_budget": 45
+            },
+            "success_scheduled_to_finish": {
+              "samples": 45,
+              "mean_ms": 10975.082085777782,
+              "p50_ms": 10950.930937,
+              "p95_ms": 19874.949815,
+              "p99_ms": 19995.121823,
+              "max_ms": 19995.121823,
+              "over_budget": 45
+            },
+            "failed_client_operation": {
+              "samples": 846,
+              "mean_ms": 18817.61849305319,
+              "p50_ms": 20000.085911,
+              "p95_ms": 20000.897178,
+              "p99_ms": 20005.992634,
+              "max_ms": 20008.468097,
+              "over_budget": 846
+            },
+            "failed_scheduled_to_finish": {
+              "samples": 846,
+              "mean_ms": 18817.96977343498,
+              "p50_ms": 20000.292617,
+              "p95_ms": 20001.46089,
+              "p99_ms": 20006.225314,
+              "max_ms": 20009.153855,
+              "over_budget": 846
+            },
+            "error_samples": [
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:32871/v3/templates\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+            ],
+            "comparison_budget_ms": 20,
+            "comparison_passed": false
+          },
+          "heartbeat_completed_calls": 395,
+          "phase": "build",
+          "requests": 6000,
+          "concurrency": 256,
+          "elapsed_seconds": 73.140353127,
+          "completed_per_second": 12.182057672771673,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 10950.930937,
+            "p95_ms": 19874.949815,
+            "p99_ms": 19995.121823,
+            "max_ms": 19995.121823,
+            "over_budget": 45
+          },
+          "errors": 846
+        }
+      ]
+    },
+    {
+      "case": "old-c8/build.json",
+      "sha256": "1c9508b67348c90f787ba0a570a52c8fee415bccced0cbac06b8a536593c92fb",
+      "run_sha256": "d7c46bb8ed2315fd8bcf1578a6b4e9fb76b550ec15ae9085aba3a7cfd4a57626",
+      "pipeline_sha256": "5ad3d2f0c557c1ece464c931e93e218da658634d8306932716132f9cab269c6b",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:45.682893+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 59,
+          "phase": "build",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 4.407735327,
+          "completed_per_second": 22.687387644952395,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 351.753845,
+            "p95_ms": 412.801432,
+            "p99_ms": 415.6341,
+            "max_ms": 416.346873,
+            "over_budget": 100
+          },
+          "errors": 0
+        }
+      ]
+    },
+    {
+      "case": "old-c8/create.json",
+      "sha256": "507057c0f7c6f77b35789b7f32fd88f0b3e7f40914a77d8aa79bfb41d67f9b9a",
+      "run_sha256": "5e925ead3fa58252aa75a7b3d8b37d631791ce8a23818e03658047887b87c3df",
+      "pipeline_sha256": "5ad3d2f0c557c1ece464c931e93e218da658634d8306932716132f9cab269c6b",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:38.447310+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 60,
+          "phase": "create",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 5.06172607,
+          "completed_per_second": 19.756106635774543,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 383.032322,
+            "p95_ms": 464.948615,
+            "p99_ms": 471.29039,
+            "max_ms": 474.617498,
+            "over_budget": 100
+          },
+          "errors": 0
+        }
+      ]
+    },
+    {
+      "case": "old-c8/hot.json",
+      "sha256": "f2d40412e5cbe1a46de60aa92aada7cb2109c7398d297befe3768745afd352a4",
+      "run_sha256": "005b3683e8b895a02134e932796030ca8281e765f6db86912d41c0b75599381e",
+      "pipeline_sha256": "5ad3d2f0c557c1ece464c931e93e218da658634d8306932716132f9cab269c6b",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:37.664561+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 0,
+          "phase": "hot",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.011279386,
+          "completed_per_second": 8865.730811943133,
+          "budget_ms": 5,
+          "latency": {
+            "p50_ms": 0.816603,
+            "p95_ms": 1.571751,
+            "p99_ms": 2.13444,
+            "max_ms": 2.618138,
+            "over_budget": 0
+          },
+          "errors": 0
+        }
+      ]
+    },
+    {
+      "case": "old-c8/router-cold.json",
+      "sha256": "0d3a43cfeed5daeb2aee3b857d0fa8fc8a8ca7450de90668da521fdcf26d8fb8",
+      "run_sha256": "d65092cd58a1adc0b0b933709225027b67b751a6b1fc2d70053bb59bcbee2363",
+      "pipeline_sha256": "5ad3d2f0c557c1ece464c931e93e218da658634d8306932716132f9cab269c6b",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "hot,router-cold,create,build",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-c8"
+      },
+      "exit_code": 0,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:37.763429+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "heartbeat_completed_calls": 0,
+          "phase": "router-cold",
+          "requests": 100,
+          "concurrency": 8,
+          "elapsed_seconds": 0.258215059,
+          "completed_per_second": 387.2740822602449,
+          "budget_ms": 5,
+          "latency": {
+            "p50_ms": 19.542016,
+            "p95_ms": 24.688753,
+            "p99_ms": 27.294131,
+            "max_ms": 27.543781,
+            "over_budget": 100
+          },
+          "errors": 0
+        }
+      ]
+    },
+    {
+      "case": "old-cold/router-cold.json",
+      "sha256": "b1c5a85ea885d4c9dc61b8818b14dc6726cb00649c5b7e7387fef478839fbcc0",
+      "run_sha256": "a283c5d0b32f402d5e8a078e74af950377931613fd0830ad8e67dcaa59916a55",
+      "pipeline_sha256": "89febe396ca374a3bc65f9540b14b9d9971b52c5f7cbe2b854e35177f29d344f",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "router-cold",
+        "requests": 60000,
+        "concurrency": 256,
+        "warmup": 0,
+        "rate": 1000,
+        "offered_warmup": "20s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-cold"
+      },
+      "exit_code": 1,
+      "timed_out": false,
+      "started_utc": "2026-11-20T06:58:54.739867+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "arrival": {
+            "warmup": {
+              "offered_per_second": 1000,
+              "max_in_flight": 256,
+              "max_launch_lag_ms": 10,
+              "planned": 20000,
+              "admitted": 15320,
+              "completed": 15320,
+              "succeeded": 15320,
+              "http_failed": 0,
+              "scheduler_late": 10,
+              "capacity_dropped": 4670,
+              "accounting_ok": true,
+              "offer_seconds": 20,
+              "wall_seconds": 20.130180074,
+              "started_utc": "2026-11-20T06:58:54.812956017Z",
+              "dispatch_lag": {
+                "samples": 15320,
+                "mean_ms": 1.1880462892950374,
+                "p50_ms": 0.880749,
+                "p95_ms": 3.375297,
+                "p99_ms": 5.251478,
+                "max_ms": 9.248465,
+                "over_budget": 181
+              },
+              "goroutine_scheduling_lag": {
+                "samples": 15320,
+                "mean_ms": 0.37276146677545685,
+                "p50_ms": 0.004591,
+                "p95_ms": 1.746868,
+                "p99_ms": 4.048267,
+                "max_ms": 17.110573,
+                "over_budget": 96
+              },
+              "success_client_operation": {
+                "samples": 15320,
+                "mean_ms": 324.97830714438635,
+                "p50_ms": 313.880975,
+                "p95_ms": 596.965597,
+                "p99_ms": 716.698916,
+                "max_ms": 1004.294435,
+                "over_budget": 15320
+              },
+              "success_scheduled_to_finish": {
+                "samples": 15320,
+                "mean_ms": 326.5391149004571,
+                "p50_ms": 315.550463,
+                "p95_ms": 598.455202,
+                "p99_ms": 718.546321,
+                "max_ms": 1004.634109,
+                "over_budget": 15320
+              },
+              "failed_client_operation": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "failed_scheduled_to_finish": {
+                "samples": 0,
+                "mean_ms": 0,
+                "p50_ms": 0,
+                "p95_ms": 0,
+                "p99_ms": 0,
+                "max_ms": 0,
+                "over_budget": 0
+              },
+              "comparison_budget_ms": 5,
+              "comparison_passed": false
+            },
+            "offered_per_second": 1000,
+            "max_in_flight": 256,
+            "max_launch_lag_ms": 10,
+            "planned": 60000,
+            "admitted": 46032,
+            "completed": 46032,
+            "succeeded": 46032,
+            "http_failed": 0,
+            "scheduler_late": 44,
+            "capacity_dropped": 13924,
+            "accounting_ok": true,
+            "offer_seconds": 60,
+            "wall_seconds": 60.139945107,
+            "started_utc": "2026-11-20T06:59:14.953928621Z",
+            "dispatch_lag": {
+              "samples": 46032,
+              "mean_ms": 1.1844817280152964,
+              "p50_ms": 0.875941,
+              "p95_ms": 3.306532,
+              "p99_ms": 4.99291,
+              "max_ms": 9.912812,
+              "over_budget": 456
+            },
+            "goroutine_scheduling_lag": {
+              "samples": 46032,
+              "mean_ms": 0.3956244750173787,
+              "p50_ms": 0.004366,
+              "p95_ms": 1.766548,
+              "p99_ms": 4.478412,
+              "max_ms": 18.902822,
+              "over_budget": 338
+            },
+            "success_client_operation": {
+              "samples": 46032,
+              "mean_ms": 325.26799612091537,
+              "p50_ms": 315.861593,
+              "p95_ms": 604.847978,
+              "p99_ms": 719.238693,
+              "max_ms": 990.066598,
+              "over_budget": 46032
+            },
+            "success_scheduled_to_finish": {
+              "samples": 46032,
+              "mean_ms": 326.8481023239478,
+              "p50_ms": 317.612119,
+              "p95_ms": 606.328824,
+              "p99_ms": 720.119489,
+              "max_ms": 990.319532,
+              "over_budget": 46032
+            },
+            "failed_client_operation": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "failed_scheduled_to_finish": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "comparison_budget_ms": 5,
+            "comparison_passed": false
+          },
+          "heartbeat_completed_calls": 0,
+          "phase": "router-cold",
+          "requests": 60000,
+          "concurrency": 256,
+          "elapsed_seconds": 60.139945107,
+          "completed_per_second": 765.4147325558848,
+          "budget_ms": 5,
+          "latency": {
+            "p50_ms": 317.612119,
+            "p95_ms": 606.328824,
+            "p99_ms": 720.119489,
+            "max_ms": 990.319532,
+            "over_budget": 46032
+          },
+          "errors": 0
+        }
+      ]
+    },
+    {
+      "case": "old-create/create.json",
+      "sha256": "22b6798ba49620c899b955d7dc02cb9c370b79acbe53359d4e81718982b07188",
+      "run_sha256": "4e080c4991b9ffe11353d22199e8a6e483e390fba6e3c084897f89d4ac3f4e28",
+      "pipeline_sha256": "e12eed76254577fb2afcd75fa8f258e40f411243ae06ca09cd8a4b0ea0c93bfe",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "create",
+        "requests": 6000,
+        "concurrency": 256,
+        "warmup": 0,
+        "rate": 100,
+        "offered_warmup": "20s",
+        "group_rows": 0,
+        "ready_delay": "2ms",
+        "timeout": 240,
+        "label": "old-create"
+      },
+      "exit_code": 1,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:01:35.558448+00:00",
+      "fatal_error": null,
+      "failed_stage": null,
+      "preload_completed_rows": 0,
+      "phases": [
+        {
+          "arrival": {
+            "warmup": {
+              "offered_per_second": 100,
+              "max_in_flight": 256,
+              "max_launch_lag_ms": 10,
+              "planned": 2000,
+              "admitted": 310,
+              "completed": 310,
+              "succeeded": 54,
+              "http_failed": 256,
+              "scheduler_late": 11,
+              "capacity_dropped": 1679,
+              "accounting_ok": true,
+              "offer_seconds": 20,
+              "wall_seconds": 31.171017709,
+              "started_utc": "2026-11-20T07:01:35.712242982Z",
+              "dispatch_lag": {
+                "samples": 310,
+                "mean_ms": 0.6980217838709679,
+                "p50_ms": 0.242544,
+                "p95_ms": 2.726375,
+                "p99_ms": 4.827645,
+                "max_ms": 8.695108,
+                "over_budget": 0
+              },
+              "goroutine_scheduling_lag": {
+                "samples": 310,
+                "mean_ms": 0.03676753225806452,
+                "p50_ms": 0.003401,
+                "p95_ms": 0.096885,
+                "p99_ms": 1.506619,
+                "max_ms": 2.583662,
+                "over_budget": 0
+              },
+              "success_client_operation": {
+                "samples": 54,
+                "mean_ms": 3126.8525462222224,
+                "p50_ms": 2077.451841,
+                "p95_ms": 9633.637245,
+                "p99_ms": 10631.425915,
+                "max_ms": 10631.425915,
+                "over_budget": 54
+              },
+              "success_scheduled_to_finish": {
+                "samples": 54,
+                "mean_ms": 3126.983971314814,
+                "p50_ms": 2077.46981,
+                "p95_ms": 9633.651291,
+                "p99_ms": 10631.788109,
+                "max_ms": 10631.788109,
+                "over_budget": 54
+              },
+              "failed_client_operation": {
+                "samples": 256,
+                "mean_ms": 20003.01389277343,
+                "p50_ms": 20001.012914,
+                "p95_ms": 20011.494088,
+                "p99_ms": 20030.586538,
+                "max_ms": 20032.713289,
+                "over_budget": 256
+              },
+              "failed_scheduled_to_finish": {
+                "samples": 256,
+                "mean_ms": 20003.875954230472,
+                "p50_ms": 20002.303502,
+                "p95_ms": 20011.506971,
+                "p99_ms": 20031.347941,
+                "max_ms": 20032.767877,
+                "over_budget": 256
+              },
+              "error_samples": [
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+              ],
+              "comparison_budget_ms": 20,
+              "comparison_passed": false
+            },
+            "offered_per_second": 100,
+            "max_in_flight": 256,
+            "max_launch_lag_ms": 10,
+            "planned": 6000,
+            "admitted": 768,
+            "completed": 768,
+            "succeeded": 0,
+            "http_failed": 768,
+            "scheduler_late": 14,
+            "capacity_dropped": 5218,
+            "accounting_ok": true,
+            "offer_seconds": 60,
+            "wall_seconds": 62.580834557,
+            "started_utc": "2026-11-20T07:02:06.883404556Z",
+            "dispatch_lag": {
+              "samples": 768,
+              "mean_ms": 0.5311345156249999,
+              "p50_ms": 0.310467,
+              "p95_ms": 1.633267,
+              "p99_ms": 4.300194,
+              "max_ms": 9.831152,
+              "over_budget": 0
+            },
+            "goroutine_scheduling_lag": {
+              "samples": 768,
+              "mean_ms": 0.00921909765625,
+              "p50_ms": 0.003722,
+              "p95_ms": 0.01184,
+              "p99_ms": 0.152938,
+              "max_ms": 0.659243,
+              "over_budget": 0
+            },
+            "success_client_operation": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "success_scheduled_to_finish": {
+              "samples": 0,
+              "mean_ms": 0,
+              "p50_ms": 0,
+              "p95_ms": 0,
+              "p99_ms": 0,
+              "max_ms": 0,
+              "over_budget": 0
+            },
+            "failed_client_operation": {
+              "samples": 768,
+              "mean_ms": 20000.884605937496,
+              "p50_ms": 20000.318331,
+              "p95_ms": 20003.95003,
+              "p99_ms": 20009.760986,
+              "max_ms": 20031.940662,
+              "over_budget": 768
+            },
+            "failed_scheduled_to_finish": {
+              "samples": 768,
+              "mean_ms": 20001.424959550768,
+              "p50_ms": 20000.814295,
+              "p95_ms": 20004.787823,
+              "p99_ms": 20010.306711,
+              "max_ms": 20031.95436,
+              "over_budget": 768
+            },
+            "error_samples": [
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              "Post \"http://127.0.0.1:44823/sandboxes\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+            ],
+            "comparison_budget_ms": 20,
+            "comparison_passed": false
+          },
+          "heartbeat_completed_calls": 274,
+          "phase": "create",
+          "requests": 6000,
+          "concurrency": 256,
+          "elapsed_seconds": 62.580834557,
+          "completed_per_second": 12.272127807763393,
+          "budget_ms": 20,
+          "latency": {
+            "p50_ms": 0,
+            "p95_ms": 0,
+            "p99_ms": 0,
+            "max_ms": 0,
+            "over_budget": 0
+          },
+          "errors": 768
+        }
+      ]
+    },
+    {
+      "case": "old-g10k/create.json",
+      "sha256": "ead1ba3b6425a2b0944f894cb76ff6c8d64568394744dd058002a853721f7493",
+      "run_sha256": "6b4469562a1f4ce13b6b1ef400fd14e928066f6e7307168078d2a2bd713c3cfe",
+      "pipeline_sha256": "e2fa487b171450484d2e90c3ad295152a99d053267796ed0eca764c998864fef",
+      "binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+      "parameters": {
+        "backend": "custom2",
+        "phases": "create",
+        "requests": 100,
+        "concurrency": 8,
+        "warmup": 20,
+        "rate": 0,
+        "offered_warmup": "0s",
+        "group_rows": 10000,
+        "ready_delay": "2ms",
+        "timeout": 300,
+        "label": "old-g10k"
+      },
+      "exit_code": 1,
+      "timed_out": false,
+      "started_utc": "2026-11-20T07:08:56.012820+00:00",
+      "fatal_error": "preload row 1064 of 10000 after 1064 completed: shardkv: quorum unavailable",
+      "failed_stage": "fixture-setup-and-real-cas-preload",
+      "preload_completed_rows": 1064,
+      "phases": []
+    }
+  ],
+  "final-benchmark-source-equivalence.json": {
+    "sha256": "ea8084cf8f35e77b1f70f2733d42311e17b5b2050f56bd8a245a10db485b39a5",
+    "receipt": {
+      "final_head": "5841d20e43f670f31e0dbd485c130cd636bcbb54",
+      "benchmark_head": "dc2d06b9d517403f2ff658bc404d8aca349298fa",
+      "tracked_go_count": 862,
+      "mismatches": []
+    }
+  },
+  "x86_64-current-baseline-build.json": {
+    "sha256": "cf3ec8c274d711f34595f1d94f332ee0b6ea8d461299218a013a87b1b44af4d0"
+  },
+  "x86_64-formal-fdbbench-build.json": {
+    "sha256": "55ef94ecb32832c933b14adc053aee4973e3f6532d5bac91dd910a313fae32f6"
+  },
+  "performance-configure.json": {
+    "sha256": "c629d59f5e57cee22b06c34b16d1f9e0035afa7f0827905a31d185e3004c3948"
+  },
+  "performance-status-before.json": {
+    "sha256": "4db24180d533dc79eb76b1d2837d959c238c8f55b280a44809cf92b6f5ef4a87"
+  },
+  "performance-status-after.json": {
+    "sha256": "7446f456b65044b973e211afaff15171926377fc34d20ca641592fa633fb1492"
+  },
+  "identities": {
+    "old_commit": "c4a6f534ec412710aaf0f24ef35815a449c8cdbe",
+    "fdb_benchmark_commit": "dc2d06b9d517403f2ff658bc404d8aca349298fa",
+    "fdb_final_source": "5841d20e43f670f31e0dbd485c130cd636bcbb54",
+    "fixture_overlay": "Both measured workspaces include benchmark fixtures and report vcs.modified=true.",
+    "old_binary_sha256": "4bf6ce421bb34d5635cf762a9a6f9ce0b3563f5cc11582dcae5bca213a7cf165",
+    "fdb_binary_sha256": "1b8dc0978becc82b1e42405e80c05f0701eabd1ef72e878d166191ac64713063",
+    "reverified": "2026-11-22, read-only on bms.dev-x86; raw result/run digests, binary hashes and source-equivalence receipt"
+  }
+}

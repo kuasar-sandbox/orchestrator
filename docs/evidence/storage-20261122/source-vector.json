@@ -1,0 +1,39 @@
+{
+  "orchestrator": {
+    "additional_test_after_measured_head": "internal/storage/observe/manager_test.go",
+    "head": "f1cd0c5e99b170c04094a785c3d07699f31041d5",
+    "tree": "36a645311cd6faae920f853c1a2064f06a939b2e",
+    "code_sha256": "eb97fe1215ed4c3a1cba7727f70b2f818a865b939d871b01ca2e57b750605fdb",
+    "files": 1016
+  },
+  "sandboxer": {
+    "head": "a63a8df3e5acdb156a8895da0ede4cc86ee99b92",
+    "tree": "a3780530bd6633f99f4c9e2cf5752d83a56b2efb",
+    "code_sha256": "d65b40d396ccbdbb1eeb9426b56f89cd9128a37b426fc5347763ba4a5a673261",
+    "files": 725,
+    "source_status": "",
+    "published_equivalent_commit": "3d546021e3b84b1a0acf7ecca9aa320aec1db79d",
+    "published_equivalent_tag": "v0.2.0-preview.20261121.2"
+  },
+  "accelerator": {
+    "head": "3a7740e28327f0001c17d37b9c7da25fba53b65d",
+    "tree": "8d7c095d3d2e6ba3023f245237f5307289d3c99b",
+    "code_sha256": "75fe903fdb695c4050152076878b38eb2d5ee30afe2ac7adbb88de9d57b9b960",
+    "files": 414,
+    "source_status": ""
+  },
+  "connector": {
+    "head": "6b48c8f450dac707b708a08980a463c1d66ff847",
+    "tree": "904e541f1fddd838fd3a2349871e0cd53459df45",
+    "code_sha256": "cdcb967fc71ffdc090f773e809f23f96a35a660dc57082569e9d40509daa4b3b",
+    "files": 134,
+    "source_status": ""
+  },
+  "guest-runtime": {
+    "head": "a6329f958319ebea4a389d99a34d3bb63f72ed1b",
+    "tree": "e41962ec9b4acfdb193a447845fbc696a15fba8c",
+    "code_sha256": "868ad3249ea71696001fb754724ea571fba154bd9298962c33a43092e2b38ce3",
+    "files": 87,
+    "source_status": ""
+  }
+}

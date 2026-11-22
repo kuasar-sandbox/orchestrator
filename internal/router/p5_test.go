@@ -808,7 +808,7 @@ func TestServeDataPausedUsesOperationAwareReserve(t *testing.T) {
 			}
 			result := routerTestReserveResult(t, "sb-1", "/g", "rk", nodeHost, types.ProfileBare)
 			result.Route.NodeSandboxID = "sb-1-g1"
-			result.Route.RouteRevision = 2
+			result.Route.RouteRevision = routeVersionForTest(2, 0)
 			_ = json.NewEncoder(w).Encode(result)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -865,7 +865,7 @@ func TestServeDataPausedSignedFileUsesEnvdTokenOnlyOutside(t *testing.T) {
 			reserveToken = r.Header.Get(HeaderAccessTok)
 			result := routerTestReserveResult(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B)
 			result.Route.NodeSandboxID = "sb-1-g1"
-			result.Route.RouteRevision = 2
+			result.Route.RouteRevision = routeVersionForTest(2, 0)
 			_ = json.NewEncoder(w).Encode(result)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -1018,7 +1018,7 @@ func TestServeDataTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	freshRoute := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(fresh.URL, "http://"), types.ProfileBare)
 	freshRoute.APIEndpoint = strings.TrimPrefix(api.URL, "http://")
 	freshRoute.NodeSandboxID = "sb-1-g1"
-	freshRoute.RouteRevision = 2
+	freshRoute.RouteRevision = routeVersionForTest(2, 0)
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/route-link/route":

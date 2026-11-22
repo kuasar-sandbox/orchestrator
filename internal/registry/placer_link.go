@@ -14,7 +14,7 @@ import (
 
 // Node view watches are low-frequency control-plane streams for placer views.
 // Router does not subscribe to a global route stream. node_list is projected from
-// node_link quorum state; sandbox-group data is imported on placer/provider side.
+// committed node profiles; sandbox-group data is imported on placer/provider side.
 const (
 	PlacerLinkNodeListWatchPath = "/placer-link/watch-node-list" // placer node_list WATCH_LIST
 	PlacerLinkRegisterPath      = "/placer-link/register"
@@ -31,7 +31,6 @@ type ViewEvent struct {
 	Type  string          `json:"type"` // "reset" | "put" | "delete" | "bookmark"
 	Key   string          `json:"key,omitempty"`
 	Value json.RawMessage `json:"value,omitempty"`
-	Rev   int64           `json:"rev,omitempty"`
 	Token string          `json:"token,omitempty"`
 }
 
@@ -229,13 +228,13 @@ func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher 
 			var ve *ViewEvent
 			switch ev.Type {
 			case WatchEventReset:
-				ve = &ViewEvent{Type: "reset", Rev: ev.Rev, Token: ev.Token}
+				ve = &ViewEvent{Type: "reset", Token: ev.Token}
 			case WatchEventPut:
-				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Rev: ev.Rev, Token: ev.Token}
+				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Token: ev.Token}
 			case WatchEventDelete:
-				ve = &ViewEvent{Type: "delete", Key: ev.Key, Rev: ev.Rev, Token: ev.Token}
+				ve = &ViewEvent{Type: "delete", Key: ev.Key, Token: ev.Token}
 			case WatchEventBookmark:
-				ve = &ViewEvent{Type: "bookmark", Rev: ev.Rev, Token: ev.Token}
+				ve = &ViewEvent{Type: "bookmark", Token: ev.Token}
 			default:
 				continue
 			}

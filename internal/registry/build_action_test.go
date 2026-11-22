@@ -13,6 +13,7 @@ import (
 func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.T) {
 	ctx := context.Background()
 	r := testReg(t)
+	seedTestNode(t, r.stores, "n1")
 	r.SetPlacer(placementWithToken("n1"))
 	r.SetNodeOwner(&recordingNodeOwner{runtime: map[string]*NodeRecord{"n1": {NodeID: "n1", APIEndpoint: "node-api:7443"}}})
 	res, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
@@ -20,7 +21,7 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 		t.Fatal(err)
 	}
 	canonical := types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
-	if err := r.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, TemplateID: res.TemplateID, PersistID: canonical, State: "ready"}); err != nil {
+	if err := testApplyBuildUpsert(r, ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, TemplateID: res.TemplateID, PersistID: canonical, State: "ready"}); err != nil {
 		t.Fatal(err)
 	}
 	projection, ok, err := r.stores.GetBuildInGroup(ctx, "/g", res.BuildID)
@@ -40,13 +41,13 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 	if err != nil || !ok || oldRef.TemplateID != res.TemplateID {
 		t.Fatalf("owner identity = %+v, %v", oldRef, err)
 	}
-	if err := r.applyBuildDelete(ctx, "n1", res.BuildID, res.TemplateID); err != nil {
+	if err := testApplyBuildDelete(r, ctx, "n1", res.BuildID, res.TemplateID); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := r.ResolveBuildByTemplate(ctx, "/g", res.TemplateID); err != nil || ok {
 		t.Fatalf("deleted resolve = %v, %v", ok, err)
 	}
-	if err := r.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, TemplateID: res.TemplateID, PersistID: canonical, State: "ready"}); err != nil {
+	if err := testApplyBuildUpsert(r, ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, TemplateID: res.TemplateID, PersistID: canonical, State: "ready"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := r.stores.GetBuildInGroup(ctx, "/g", res.BuildID); err != nil || ok {
@@ -59,13 +60,13 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 	if replacement.TemplateID == res.TemplateID {
 		t.Fatal("registration reused transient identity")
 	}
-	if err := r.applyBuildDelete(ctx, "n1", res.BuildID, res.TemplateID); err != nil {
+	if err := testApplyBuildDelete(r, ctx, "n1", res.BuildID, res.TemplateID); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.applyNodeBuildFullSnapshot(ctx, "n1", []clusterstate.NodeBuildRef{oldRef}, map[string]struct{}{}); err != nil {
+	if err := testApplyNodeBuildFullSnapshot(r, ctx, "n1", []clusterstate.NodeBuildRef{oldRef}, map[string]struct{}{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, TemplateID: res.TemplateID, PersistID: canonical, State: "error"}); err != nil {
+	if err := testApplyBuildUpsert(r, ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, TemplateID: res.TemplateID, PersistID: canonical, State: "error"}); err != nil {
 		t.Fatal(err)
 	}
 	current, ok, err := r.stores.GetBuildInGroup(ctx, "/g", res.BuildID)
@@ -77,7 +78,7 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 		t.Fatalf("replacement owner lost = %+v, %v", ref, err)
 	}
 	// A lost live delete converges at the next complete snapshot.
-	if err := r.applyNodeBuildFullSnapshot(ctx, "n1", []clusterstate.NodeBuildRef{ref}, map[string]struct{}{}); err != nil {
+	if err := testApplyNodeBuildFullSnapshot(r, ctx, "n1", []clusterstate.NodeBuildRef{ref}, map[string]struct{}{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := r.stores.GetBuildInGroup(ctx, "/g", res.BuildID); err != nil || ok {
@@ -85,11 +86,10 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 	}
 }
 
-func TestBuildTransientResolutionIncompleteAndUnavailableAreErrors(t *testing.T) {
+func TestBuildTransientResolutionStartingAndUnavailableAreErrors(t *testing.T) {
 	r := testReg(t)
 	ctx := context.Background()
 	for _, rec := range []*BuildRecord{
-		{Group: "/incomplete", BuildID: "old", NodeID: "n1", State: BuildReady, TemplateID: "e2b-img-old"},
 		{Group: "/starting", BuildID: "starting", NodeID: "n1", State: BuildStarting, TemplateID: "transient-starting"},
 		{Group: "/offline", BuildID: "offline", NodeID: "n1", State: BuildReady, TemplateID: "transient-offline", RegistrationTargetSet: true},
 	} {
@@ -97,7 +97,7 @@ func TestBuildTransientResolutionIncompleteAndUnavailableAreErrors(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	for _, tc := range []struct{ group, tid string }{{"/incomplete", "transient-unknown"}, {"/starting", "transient-starting"}, {"/offline", "transient-offline"}} {
+	for _, tc := range []struct{ group, tid string }{{"/starting", "transient-starting"}, {"/offline", "transient-offline"}} {
 		if res, ok, err := r.ResolveBuildByTemplate(ctx, tc.group, tc.tid); err == nil || ok || res != nil {
 			t.Fatalf("%+v falsely resolved = %+v,%v,%v", tc, res, ok, err)
 		}

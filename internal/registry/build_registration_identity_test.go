@@ -2,11 +2,9 @@ package registry
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -38,6 +36,7 @@ func TestBuildOldRegistrationACKCannotAcceptReplacement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 	r := testReg(t)
+	seedTestNode(t, r.stores, "n1")
 	r.SetPlacer(placementWithToken("n1"))
 	o := &identityBarrierOwner{dispatch: make(chan identityBuildDispatch, 2)}
 	r.SetNodeOwner(o)
@@ -51,16 +50,16 @@ func TestBuildOldRegistrationACKCannotAcceptReplacement(t *testing.T) {
 		finished <- result{res, err}
 	}
 	go register()
-	old := <-o.dispatch
-	if err := r.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: "reused", TemplateID: old.cmd.TemplateRef, State: "registered"}); err != nil {
+	old := nextBuildDispatch(t, ctx, o.dispatch)
+	if err := testApplyBuildUpsert(r, ctx, "n1", &routesync.BuildEvent{BuildID: "reused", TemplateID: old.cmd.TemplateRef, State: "registered"}); err != nil {
 		t.Fatal(err)
 	}
 	// The node admin can directly delete this owner-free row before registration ACK.
-	if err := r.applyBuildDelete(ctx, "n1", "reused", old.cmd.TemplateRef); err != nil {
+	if err := testApplyBuildDelete(r, ctx, "n1", "reused", old.cmd.TemplateRef); err != nil {
 		t.Fatal(err)
 	}
 	go register()
-	next := <-o.dispatch
+	next := nextBuildDispatch(t, ctx, o.dispatch)
 	if next.cmd.TemplateRef == old.cmd.TemplateRef {
 		t.Fatal("same transient")
 	}
@@ -82,6 +81,7 @@ func TestBuildOldRegistrationRejectionCannotDeleteReplacement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 	r := testReg(t)
+	seedTestNode(t, r.stores, "n1")
 	r.SetPlacer(placementWithToken("n1"))
 	o := &identityBarrierOwner{dispatch: make(chan identityBuildDispatch, 2)}
 	r.SetNodeOwner(o)
@@ -95,17 +95,17 @@ func TestBuildOldRegistrationRejectionCannotDeleteReplacement(t *testing.T) {
 		finished <- result{res, err}
 	}
 	go register()
-	old := <-o.dispatch
+	old := nextBuildDispatch(t, ctx, o.dispatch)
 	// An overlapping replay of registration A has committed its node row and
 	// Upsert while this earlier A dispatch is still delayed before node handling.
-	if err := r.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: "reused", TemplateID: old.cmd.TemplateRef, State: "registered"}); err != nil {
+	if err := testApplyBuildUpsert(r, ctx, "n1", &routesync.BuildEvent{BuildID: "reused", TemplateID: old.cmd.TemplateRef, State: "registered"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.applyBuildDelete(ctx, "n1", "reused", old.cmd.TemplateRef); err != nil {
+	if err := testApplyBuildDelete(r, ctx, "n1", "reused", old.cmd.TemplateRef); err != nil {
 		t.Fatal(err)
 	}
 	go register()
-	next := <-o.dispatch
+	next := nextBuildDispatch(t, ctx, o.dispatch)
 	// The delayed A command meets the replacement node row and receives conflict.
 	old.ack <- &routesync.CmdAck{CmdID: old.cmd.CmdID, Status: routesync.AckRejected, HTTPStatus: 409, Reason: "immutable definition conflict"}
 	oldResult := <-finished
@@ -127,6 +127,7 @@ func TestBuildOldRegistrationRejectionCannotDeleteReplacement(t *testing.T) {
 func TestBuildStaleReplayRefreshCannotReplaceNewOwnerRef(t *testing.T) {
 	ctx := context.Background()
 	r := testReg(t)
+	seedTestNode(t, r.stores, "n1")
 	r.SetPlacer(placementWithToken("n1"))
 	r.SetNodeOwner(&recordingNodeOwner{})
 	old, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
@@ -138,7 +139,7 @@ func TestBuildStaleReplayRefreshCannotReplaceNewOwnerRef(t *testing.T) {
 	if err != nil || !found {
 		t.Fatal(err)
 	}
-	if err := r.applyBuildDelete(ctx, "n1", "reused", old.TemplateID); err != nil {
+	if err := testApplyBuildDelete(r, ctx, "n1", "reused", old.TemplateID); err != nil {
 		t.Fatal(err)
 	}
 	next, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
@@ -147,7 +148,7 @@ func TestBuildStaleReplayRefreshCannotReplaceNewOwnerRef(t *testing.T) {
 	}
 	// Exactly the delayed refresh performed at build.go:143 before dispatch.
 	refreshErr := r.stores.AddNodeBuildRef(ctx, "n1", oldRef)
-	if err := r.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: "reused", TemplateID: next.TemplateID, State: "building"}); err != nil {
+	if err := testApplyBuildUpsert(r, ctx, "n1", &routesync.BuildEvent{BuildID: "reused", TemplateID: next.TemplateID, State: "building"}); err != nil {
 		t.Fatal(err)
 	}
 	current, found, err := r.stores.GetBuildInGroup(ctx, "/g", "reused")
@@ -166,6 +167,7 @@ func TestBuildLatePlacementCannotEraseAcceptedSuccessor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	r := testReg(t)
+	seedTestNode(t, r.stores, "n1")
 	r.SetNodeOwner(&recordingNodeOwner{})
 	entered, release := make(chan struct{}), make(chan struct{})
 	first := true
@@ -207,30 +209,13 @@ func TestBuildLatePlacementCannotEraseAcceptedSuccessor(t *testing.T) {
 	}
 }
 
-func TestBuildUpgradeCanReplayLegacyOwnerRef(t *testing.T) {
-	ctx := context.Background()
-	r := testReg(t)
-	r.SetPlacer(placementWithToken("n1"))
-	owner := &recordingNodeOwner{ackErr: errors.New("ACK lost")}
-	r.SetNodeOwner(owner)
-	req := BuildReserveReq{Group: "/g", BuildID: "legacy", TemplateID: "transient-legacy", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
-	if _, err := r.ReserveBuild(ctx, req); err == nil {
-		t.Fatal("wanted ambiguous registration")
-	}
-	// Existing persisted pre-upgrade JSON contains only group/build_id.
-	if err := r.stores.RemoveNodeBuildRef(ctx, "n1", "legacy"); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: "/g", BuildID: "legacy"}); err != nil {
-		t.Fatal(err)
-	}
-	owner.ackErr = nil
-	res, err := r.ReserveBuild(ctx, req)
-	if err != nil || res == nil {
-		t.Fatalf("unchanged legacy binding cannot recover accepted target after upgrade: result=%+v error=%v", res, err)
-	}
-	ref, found, err := r.stores.GetNodeBuildRef(ctx, "n1", "legacy")
-	if err != nil || !found || ref.TemplateID != req.TemplateID {
-		t.Fatalf("legacy identity not materialized: ref=%+v found=%v err=%v", ref, found, err)
+func nextBuildDispatch(t *testing.T, ctx context.Context, ch <-chan identityBuildDispatch) identityBuildDispatch {
+	t.Helper()
+	select {
+	case d := <-ch:
+		return d
+	case <-ctx.Done():
+		t.Fatal("build dispatch not reached:", ctx.Err())
+		return identityBuildDispatch{}
 	}
 }

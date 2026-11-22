@@ -361,7 +361,7 @@ func (r *Registry) NodeListEndpoints(ctx context.Context) ([]Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.jointOwnerEndpoints(ctx, m, string(clusterstate.NodeListShard), m.Owners.NodeList)
+	return r.jointOwnerEndpoints(ctx, m, clusterstate.NodeListRoutingKey, m.Owners.NodeList)
 }
 
 func (r *Registry) PlacerLinkEndpoints(ctx context.Context, shardKey string) ([]Endpoint, error) {

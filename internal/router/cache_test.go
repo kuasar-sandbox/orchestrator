@@ -14,8 +14,8 @@ func TestStableSandboxCacheDoesNotPinOrEvictNewNodeIdentity(t *testing.T) {
 		cache:  map[string]*routeResolve{},
 		active: map[string]*activeRoute{},
 	}
-	g0 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g0", RouteRevision: 10}
-	g1 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g1", RouteRevision: 11}
+	g0 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g0", RouteRevision: routeVersionForTest(10, 0)}
+	g1 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g1", RouteRevision: routeVersionForTest(11, 0)}
 	rt.rememberRoute(g0)
 	done := rt.beginActiveRoute(g0)
 	defer done()

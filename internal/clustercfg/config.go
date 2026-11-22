@@ -37,10 +37,9 @@ type MemberConfig struct {
 }
 
 // MembershipConfig is the versioned registry member view. The active version is
-// the client routing input. When next is set, registry writes use joint owner
-// sets: active quorum and next quorum must both commit before the write returns.
-// old_grace keeps a previous version reachable for peer/node-owner RPC without
-// adding it to owner quorums.
+// the client routing input. Active and next are business connection candidates;
+// old_grace retains peer reachability while existing Node streams drain. These
+// views do not configure database replicas or commit quorums.
 type MembershipConfig struct {
 	Active             int64                 `yaml:"active" json:"active"`
 	Next               int64                 `yaml:"next,omitempty" json:"next,omitempty"`
@@ -83,8 +82,21 @@ type RouteLinkConfig struct {
 	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router -> 503
 }
 
-type NodeListConfig struct {
-	WatchRetention int `yaml:"watch_retention"`
+// StorageConfig selects a generic metadata backend. Namespace is shared by all
+// Registry processes; SQLite supports one configured Registry member. PostgreSQL
+// credentials are read from an environment variable, never config diagnostics.
+type StorageConfig struct {
+	Backend        string `yaml:"backend"`
+	Namespace      string `yaml:"namespace"`
+	SQLitePath     string `yaml:"sqlite_path,omitempty"`
+	PostgresDSNEnv string `yaml:"postgres_dsn_env,omitempty"`
+}
+
+// FoundationDBConfig identifies the external metadata database and key space.
+// All Registry processes in a cluster must use the same database and prefix.
+type FoundationDBConfig struct {
+	ClusterFile string `yaml:"cluster_file"`
+	Prefix      string `yaml:"prefix"`
 }
 
 // PlacerLinkConfig configures placer discovery/placement over the unified member listener.
@@ -293,22 +305,6 @@ func (m MembershipConfig) OwnerVersions() []MembershipVersion {
 	return out
 }
 
-func (m MembershipConfig) ShardVersions() []MembershipVersion {
-	seen := map[int64]bool{}
-	out := make([]MembershipVersion, 0, 3)
-	for _, v := range m.OwnerVersions() {
-		if seen[v.Version] {
-			continue
-		}
-		seen[v.Version] = true
-		out = append(out, v)
-	}
-	if oldGrace, ok := m.OldGraceVersion(); ok && !seen[oldGrace.Version] {
-		out = append(out, oldGrace)
-	}
-	return out
-}
-
 func (m MembershipConfig) MemberVersions() []MembershipVersion {
 	seen := map[int64]bool{}
 	out := make([]MembershipVersion, 0, len(m.Versions))
@@ -392,12 +388,13 @@ func validateDurations(m map[string]string) error {
 // listener for node_link, route_link, placer_link, and member RPC. node_link.listen
 // may split long-lived node streams onto another listener.
 type RegistryConfig struct {
-	Member     MemberConfig     `yaml:"member"`
-	Membership MembershipConfig `yaml:"membership"`
-	NodeLink   NodeLinkConfig   `yaml:"node_link"`
-	RouteLink  RouteLinkConfig  `yaml:"route_link"`
-	NodeList   NodeListConfig   `yaml:"node_list"`
-	PlacerLink PlacerLinkConfig `yaml:"placer_link"`
+	Storage      StorageConfig      `yaml:"storage"`
+	Member       MemberConfig       `yaml:"member"`
+	Membership   MembershipConfig   `yaml:"membership"`
+	NodeLink     NodeLinkConfig     `yaml:"node_link"`
+	RouteLink    RouteLinkConfig    `yaml:"route_link"`
+	FoundationDB FoundationDBConfig `yaml:"foundationdb"`
+	PlacerLink   PlacerLinkConfig   `yaml:"placer_link"`
 }
 
 // DefaultRegistry returns the registry config with all non-required fields set.
@@ -412,10 +409,11 @@ func DefaultRegistry() RegistryConfig {
 			}},
 			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, PlacerLink: 1, NodeList: 1},
 		},
-		NodeLink:   NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
-		RouteLink:  RouteLinkConfig{ParkTimeout: "30s"},
-		NodeList:   NodeListConfig{WatchRetention: 10000},
-		PlacerLink: PlacerLinkConfig{PlacerReplicaCount: 3, MinReadyPlacers: 1, PlacerLabel: "placer.default", PlaceTimeout: "2s"},
+		NodeLink:     NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
+		RouteLink:    RouteLinkConfig{ParkTimeout: "30s"},
+		Storage:      StorageConfig{Backend: "fdb", Namespace: "kuasar-sandbox/cluster/records-v2/", SQLitePath: "/var/lib/cluster-ctl/metadata.sqlite", PostgresDSNEnv: "CLUSTER_STORAGE_POSTGRES_DSN"},
+		FoundationDB: FoundationDBConfig{ClusterFile: "/etc/foundationdb/fdb.cluster", Prefix: "kuasar-sandbox/cluster/"},
+		PlacerLink:   PlacerLinkConfig{PlacerReplicaCount: 3, MinReadyPlacers: 1, PlacerLabel: "placer.default", PlaceTimeout: "2s"},
 	}
 }
 
@@ -423,6 +421,9 @@ func DefaultRegistry() RegistryConfig {
 func LoadRegistry(path string) (*RegistryConfig, error) {
 	c := DefaultRegistry()
 	if path != "" {
+		// Let an explicit legacy foundationdb.prefix still select its isolated
+		// namespace unless storage.namespace is supplied in the same file.
+		c.Storage.Namespace = ""
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("clustercfg: read %s: %w", path, err)
@@ -481,8 +482,23 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.RouteLink.ParkTimeout == "" {
 		c.RouteLink.ParkTimeout = d.RouteLink.ParkTimeout
 	}
-	if c.NodeList.WatchRetention == 0 {
-		c.NodeList.WatchRetention = d.NodeList.WatchRetention
+	if c.Storage.Backend == "" {
+		c.Storage.Backend = d.Storage.Backend
+	}
+	if c.Storage.SQLitePath == "" {
+		c.Storage.SQLitePath = d.Storage.SQLitePath
+	}
+	if c.Storage.PostgresDSNEnv == "" {
+		c.Storage.PostgresDSNEnv = d.Storage.PostgresDSNEnv
+	}
+	if c.FoundationDB.ClusterFile == "" {
+		c.FoundationDB.ClusterFile = d.FoundationDB.ClusterFile
+	}
+	if c.FoundationDB.Prefix == "" {
+		c.FoundationDB.Prefix = d.FoundationDB.Prefix
+	}
+	if c.Storage.Namespace == "" {
+		c.Storage.Namespace = c.FoundationDB.Prefix + "records-v2/"
 	}
 	if c.PlacerLink.PlacerReplicaCount == 0 {
 		c.PlacerLink.PlacerReplicaCount = d.PlacerLink.PlacerReplicaCount
@@ -591,8 +607,29 @@ func (c *RegistryConfig) Validate() error {
 	if c.Membership.Owners.NodeList <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_list must be positive")
 	}
-	if c.NodeList.WatchRetention <= 0 {
-		return fmt.Errorf("clustercfg: node_list.watch_retention must be positive")
+	if strings.TrimSpace(c.Storage.Namespace) == "" || len(c.Storage.Namespace) > 512 || strings.ContainsRune(c.Storage.Namespace, '\x00') || c.Storage.Namespace[0] == 0xff {
+		return fmt.Errorf("clustercfg: storage.namespace must contain 1..512 bytes without NUL or a leading 0xff")
+	}
+	switch c.Storage.Backend {
+	case "fdb":
+		if strings.TrimSpace(c.FoundationDB.ClusterFile) == "" {
+			return fmt.Errorf("clustercfg: foundationdb.cluster_file is required")
+		}
+	case "sqlite":
+		if strings.TrimSpace(c.Storage.SQLitePath) == "" || c.Storage.SQLitePath == ":memory:" {
+			return fmt.Errorf("clustercfg: storage.sqlite_path must be persistent")
+		}
+		for _, version := range c.Membership.Versions {
+			if len(version.Members) != 1 || version.Members[0].ID != c.Member.ID {
+				return fmt.Errorf("clustercfg: SQLite requires a single Registry member in every membership version")
+			}
+		}
+	case "postgres":
+		if strings.TrimSpace(c.Storage.PostgresDSNEnv) == "" {
+			return fmt.Errorf("clustercfg: storage.postgres_dsn_env is required")
+		}
+	default:
+		return fmt.Errorf("clustercfg: storage.backend must be fdb, sqlite or postgres")
 	}
 	if c.PlacerLink.PlacerReplicaCount <= 0 {
 		return fmt.Errorf("clustercfg: placer_link.placer_replica_count must be positive")
