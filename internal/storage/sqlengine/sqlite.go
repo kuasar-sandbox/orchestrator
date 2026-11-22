@@ -23,9 +23,6 @@ func OpenSQLite(ctx context.Context, path, namespace string) (*Engine, error) {
 	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	if canonical, err := filepath.EvalSymlinks(path); err == nil {
-		path = canonical
-	}
 	// Metadata includes private key material. Create a new database privately
 	// even when its parent is an existing, more permissive directory.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
@@ -33,6 +30,13 @@ func OpenSQLite(ctx context.Context, path, namespace string) (*Engine, error) {
 		return nil, err
 	}
 	if err = file.Close(); err != nil {
+		return nil, err
+	}
+	// Resolve after creation: an absent final component prevents EvalSymlinks
+	// from canonicalizing even an existing directory alias. Every handle must
+	// identify the same database before sharing its pool and observation budget.
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
 		return nil, err
 	}
 	u := url.URL{Scheme: "file", Path: path}

@@ -145,12 +145,29 @@ explicit history boundary before reclamation.
 The independent platform native-runtime PR
 [#426](https://github.com/kuasar-sandbox/kuasar-sandbox/pull/426) remains open.
 Trusted platform main `d0273490cf5551abce945d1a7ad6ee5c38173e4a` does not contain
-`ci/integration/cluster-native-runtime.json`. Its former exact #563 cutover also
-names an older base/head/merge and dependency vector. Those identities must be
-reconciled with this candidate before combined hosted delivery can be accepted.
-The historical failed component run and the platform's old successful run are
-not results for this implementation. Neither PR nor an issue is closed by this
-report.
+`ci/integration/cluster-native-runtime.json`.
+[Hosted run 44987177560](https://github.com/kuasar-sandbox/orchestrator/actions/runs/44987177560)
+failed all three cluster E2E cases on both architectures because the prepared
+products lacked `run-cluster-ctl`. One x86 MMDS recovery case also encountered a
+Proxy port collision; the occupying process was not retained. Both source gates
+and architecture builds/preparations passed. This is failed delivery acceptance,
+not a storage-conformance failure or a passing combined run.
+
+Published aggregate `release-v0.2.0-preview.20261122` now contains the needed SDK
+baseline. The obsolete exact #563 cutover is removed from refreshed platform
+PR #426; reciprocal companions use the existing current-source-set validation
+without a dependency-policy exception. Combined premerge verification is pending.
+Platform must qualify and merge first, then the remaining component must remove
+the merged companion and rerun against trusted platform main. Neither PR nor an
+issue is closed by this report.
+
+Premerge review reproduced a SQLite handle-alias bug: creating a database through
+a symlinked parent and reopening its real path split the shared admission budget
+(`first=1`, `second=0`). Canonicalization now happens after private file creation.
+The regression verifies shared admission, reservation reclamation and a surviving
+handle after closing its alias. The complete SQLite engine suite passed with the
+race detector after this startup-only change; the measured transaction paths and
+the FDB before/after benchmark inputs remain unchanged.
 
 Final benchmark logs and receipts are under
 [`evidence/storage-20261122`](evidence/storage-20261122). Detailed local run logs,
