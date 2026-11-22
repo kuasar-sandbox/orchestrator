@@ -8,17 +8,17 @@ import (
 	"testing"
 )
 
-func testVersion(commit uint64, order uint16) Version {
+func testVersion(high uint64, low uint16) Version {
 	var v Version
-	binary.BigEndian.PutUint64(v[:8], commit)
-	binary.BigEndian.PutUint16(v[8:], order)
+	binary.BigEndian.PutUint64(v[:8], high)
+	binary.BigEndian.PutUint16(v[8:], low)
 	return v
 }
 
-func TestVersionKeepsBatchOrderAndWireIdentity(t *testing.T) {
+func TestVersionKeepsFullRevisionOrderAndWireIdentity(t *testing.T) {
 	old, next := testVersion(100, 255), testVersion(100, 256)
 	if !bytes.Equal(old[:8], next[:8]) || old.Compare(next) >= 0 || next.Compare(old) <= 0 {
-		t.Fatal("complete batch order was lost")
+		t.Fatal("complete revision order was lost")
 	}
 	for _, v := range []Version{{}, old, next, testVersion(101, 0)} {
 		raw, err := json.Marshal(v)
@@ -32,7 +32,7 @@ func TestVersionKeepsBatchOrderAndWireIdentity(t *testing.T) {
 	}
 }
 
-func TestVersionRejectsTruncationAndIncompleteStamp(t *testing.T) {
+func TestVersionRejectsTruncationAndReservedRevision(t *testing.T) {
 	for _, wire := range []string{`1`, `null`, `"01"`, `"ffffffffffffffffffff"`, `"zz000000000000000000"`} {
 		v := testVersion(5, 1)
 		if err := json.Unmarshal([]byte(wire), &v); err == nil {
@@ -46,7 +46,7 @@ func TestVersionRejectsTruncationAndIncompleteStamp(t *testing.T) {
 		t.Fatal("missing version is not committed")
 	}
 	if !testVersion(5, 1).IsCommitted() {
-		t.Fatal("valid stamp rejected")
+		t.Fatal("valid revision rejected")
 	}
 }
 

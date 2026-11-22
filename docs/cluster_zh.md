@@ -828,7 +828,7 @@ redirect-capable node 使用 `membership.versions[].members[].node_advertise`。
 
 ### 原生构建、运行包与验证
 
-只有 `cluster-ctl` 要求 CGO 与 `fdb` tag；`node-ctl`、`node-stub-ctl`、`e2b-key-ctl` 保持 CGO=0。构建使用对应架构的 Linux x86_64 / aarch64 主机，提供 Go、C compiler、Python 3.9+ 与 `readelf`；不安装 Debian 系统包，也不要求 `dpkg-deb`。
+`cluster-ctl` 的 SQLite/PostgreSQL 路径支持 CGO=0；启用 FDB 时才要求 CGO 与 `fdb` tag。下述 native 发行包仍包含 FDB 能力。其他三个命令保持 CGO=0。Native 构建使用对应 Linux x86_64 / aarch64 主机，提供 Go、C compiler、Python 3.9+ 与 `readelf`；不安装 Debian 系统包。纯 Go 构建和后端配置见[存储说明](cluster-storage.md)。
 
 ```sh
 make build-core
@@ -841,7 +841,7 @@ python3 -B scripts/with-test-fdb.py -- make test-cluster-native
 
 发行包包含 `bin/cluster-ctl`、`bin/run-cluster-ctl`、`lib/cluster-ctl/` 下固定运行库，以及 `share/licenses/orchestrator/native/` 下许可证和来源锁。Launcher 以显式 library path 调用包内 loader；应完整安装 archive 并通过 `run-cluster-ctl` 启动角色。配套 systemd unit 使用 `/usr/bin/run-cluster-ctl`。官方 x86_64 client 要求 AVX，此要求独立于 Go 的 `GOAMD64`。ARM 包使用原生 ARM 运行库，不带模拟器专用设置。
 
-Registry 需要可读取的外部 FoundationDB cluster file，并与 peer 使用相同 prefix。Coordinator 文件自动更新是否需要写权限，应按数据库部署配置。Router/Placer 共享 native executable，但不打开 Registry 存储。此 archive 提供 client runtime，不安装生产数据库 server；FoundationDB 的冗余、存储介质与运维恢复由独立数据库部署负责。
+选择 FDB 时，Registry 需要可读取的 cluster file，并与 peer 使用相同 storage namespace；Coordinator 文件写权限按数据库部署配置。Router/Placer 不打开 Registry 存储。Archive 提供 FDB client runtime，不安装生产数据库；数据库冗余和恢复由部署负责。
 
 发行校验继续保留 source revision、选定依赖及 Go module 检查。只有 cluster-ctl 允许 CGO=1 并要求 `fdb` tag，其他 payload 和 trusted archive validator 保持 CGO=0。Native library 名称、字节、loader、license 与 provenance 都受固定 allowlist 约束。Validate 不执行异架构 payload，不下载依赖。`make test-release` 包含实际 native linkage/launcher 与打包负例，使用匹配当前主机架构的 fixture。
 
@@ -1075,7 +1075,7 @@ Place / verify-key 候选。
 
 ### Registry 状态模型
 
-Registry 将执行元数据持久化到独立的 FoundationDB 7.3.77 数据库。同一集群的所有 Registry 进程使用相同的 `foundationdb.cluster_file` 与 `foundationdb.prefix`。FoundationDB 负责存储复制、事务提交、冲突检测和持久恢复；Registry 负责业务状态转换与实际 node 连接。
+Registry 通过一份共享仓储实现，将执行元数据持久化到 SQLite、PostgreSQL 或 FoundationDB 7.3.77。SQLite 限于单 Registry；多 Registry 使用同一共享数据库与 namespace。数据库负责事务、冲突检测和持久恢复，Registry 负责业务转换与实际 node 连接。配置、通用契约与 schema v2 升级边界见 [存储后端说明](cluster-storage.md)。
 
 <a id="registry-data-hierarchy"></a>
 
@@ -1086,11 +1086,13 @@ Registry 将执行元数据持久化到独立的 FoundationDB 7.3.77 数据库�
 | Router / Placer | 鉴权转发，或基于已校验目录提出 placement | 既有 route_link / placer_link / node_list HTTP 契约 |
 | Registry 业务服务 | 校验生命周期与归属、下发命令、处理节点报告 | Route、Build、Node、Ownership、KeyPair、Directory、ImportSource 类型化能力 |
 | `internal/cluster/metadata` | 定义中立记录、完整版本、领域结果与有界列表 | `Versioned[T]`、`Version`、领域 repository 方法、`Invalidation`、`ObservationAdmission` |
-| `internal/observebudget` | 在创建 native 观察前限制资源，管理顺序重臂 | 预留和释放；由共享数据库 owner 提供此能力 |
-| `internal/fdbdriver` | 通过官方 client 实现原子元数据操作 | 只返回类型化 repository；数据库、事务句柄和物理 key 保持私有 |
-| FoundationDB | 持久事务与复制 | 仅供 native driver 使用的官方 Go/C API |
+| `internal/cluster/metastore` | 共享业务仓储实现 | 原子的生命周期、索引和归属操作 |
+| `internal/storage/record` | 通用记录、版本、分块与完整性 | 有条件的多记录事务及失效条件 |
+| `internal/storage` | 有序字节事务契约 | 读写、有界扫描、提交结果和观察 |
+| `internal/storage/sqlengine`、`internal/fdbdriver` | 数据库连接、事务、通知加速与错误映射 | 通用引擎，不依赖业务包 |
+| SQLite / PostgreSQL / FoundationDB | 持久存储 | 仅由 Registry 启动装配选择 |
 
-仓库保持单一 Go module。`metadata`、Registry、Router、Placer 与业务 membership 都是纯 Go。native driver 与 `cmd/cluster-ctl` 全部源文件要求 `fdb && cgo`；仅 command 的 Registry 装配打开数据库。不提供公开 generic KV/事务闭包、进程内版本 handle、生产内存 backend 或旧复制回退。接口定义见 [metadata/repositories.go](../internal/cluster/metadata/repositories.go)。
+仓库保持单一 Go module。只有 FDB driver 和 command 的 FDB 适配文件要求 `fdb && cgo`；SQLite/PostgreSQL 可使用纯 Go cluster-ctl。Registry/Router/Placer 继续只使用[业务 repository](../internal/cluster/metadata/repositories.go)，通用事务仅用于共享存储内部。不提供生产内存 backend 或旧复制回退。
 
 <a id="registry-owner-resolution"></a>
 
@@ -1114,19 +1116,19 @@ Registry 可通过共享数据库读写获授权的记录，无需向 peer 获�
 | Directory | 固定 256 个低频节点投影 bucket | 分页校验后的完整 view 与 bucket change token |
 | ImportSource | `source_id` | 租约 owner、run ID、业务 term 与成功 page 的 cursor |
 
-点操作只访问一个业务身份。列表接口接收范围限定的 opaque cursor 与有界 page size，不在每次写入时复制整个 group 或 node 的记录集合。较大的 payload 由 driver 在同一事务内分块，并受记录及事务大小限制；分块不会取消 FoundationDB 的事务大小和存活时间限制。列表 cursor 是某个类型化范围内的续读位置，不是可长期持有的数据库快照。
+点操作只访问一个业务身份。列表接口接收范围限定的 opaque cursor 与有界 page size。较大 payload 由共享记录层在同一事务内分块，同时受公共预算与后端原生限制。列表 cursor 是范围内的续读位置，不保证跨事务固定快照。
 
 <a id="registry-readwrite-protocol"></a>
 
 #### 事务、版本与结果分类
 
-存储版本为记录自身的完整 **10-byte committed versionstamp**：8-byte commit version 加 2-byte transaction batch order。JSON/text 固定为 20 个十六进制字符，例如 `0102030405060708fffe`。末尾两字节必须完整穿过持久化、DTO 与缓存比较。该版本不是时间戳，也不是 node 生命周期的 `state_version`；import-source term 与 sandbox generation 保留各自业务语义。
+存储版本是 **10-byte 的每逻辑键修订号**，在同一 namespace 内跨删除重建单调递增；JSON/text 保持 20 个十六进制字符。它不再是 FDB versionstamp，也不是全库提交顺序。完整十字节参与比较；node state_version、registration、import-source term 和 sandbox generation 保留各自业务语义。
 
-CAS 对完整十字节做相等判断。缺失记录用零值表达 expected-absence；live Route 与目录项必须携带非零 committed stamp，错误编码和未提交占位版本被拒绝。同内容记录删除后重建也不会复用旧 expected version。返回的版本属于记录提交，不取读取事务的 read version。见 [metadata/version.go](../internal/cluster/metadata/version.go)。
+CAS 比较完整十字节。可见记录缺失时以零表达 expected-absence；有效记录必须携带非零合法修订。删除后保留紧凑的持久修订单元，防止旧版本命中重建记录。版本仅在确认提交后返回。见 [record/version.go](../internal/storage/record/version.go)。
 
 同一数据库历史、同一 Route 记录还可按完整字节序比较。Router 在较新 cache entry 仍驻留时拒绝迟到的旧响应，并拒绝相同版本却指向不同 node target 的响应。相同版本、相同 target 可刷新 endpoint，因为 node profile 可以独立变化。Eviction/TTL 会移除该条目的版本屏障，Router 不保存无界历史水位。恢复或新数据库历史不能与旧进程缓存混合排序。
 
-driver 区分 `Conflict`、`Unavailable`、`Unknown` 和容量错误。只有被 native client 明确证明未提交的错误，才可在当前 context 和原始业务前提下重试。无法证明提交结果时返回 `Unknown`；超时不等于回滚。调用方应读取持久状态协调，不能因 commit reply 或 command ACK 丢失而盲目重投节点副作用。
+引擎区分明确未提交的 `ErrRetry`、`Unavailable`、`Unknown`、非法输入和容量错误；共享 metadata 提供业务 `Conflict`。只有确定回滚才能在原始前提下重试；Unknown 不自动重放，超时不代表回滚。调用方确认持久状态后再派发节点副作用。
 
 <a id="registry-invariants"></a>
 
@@ -1147,7 +1149,7 @@ driver 区分 `Conflict`、`Unavailable`、`Unknown` 和容量错误。只有被
 
 #### Read/observe 与目录发布
 
-`ReadAndObserveRoute` 在同一事务中读取 current Route 并安装 native observation。返回的 observation 是一次性“需要重读”通知，不是保留的事件流或转换计数。Registry Reserve leader 在业务 mutation 前预留观察容量，顺序重臂复用此预留；setup、active future 与取消后尚未回收的资源都计入同一 database owner 的预算。Catalog observation 共享此预算并保留目录容量，不能再建立另一个独立 Registry limiter 掩盖或超出 native 使用量。
+`ReadAndObserveRoute` 同事务读取 Route 和持久修订，建立观察时再次核对修订，封闭读取到订阅之间的竞态。返回一次性重读提示，不承担事件历史。FDB 使用原生 watch；SQL 合并检查持久条件，进程内唤醒及 PostgreSQL LISTEN/NOTIFY 仅用于加速。Reserve leader 在 mutation 前预留容量，顺序重臂复用；建立、活动观察和取消后的回收都计入 owner 预算，并保留目录容量。
 
 目录保存 256 个 bucket token。`Load` 分页读取，校验 token，重读发生变化的 bucket，完整检查后才发布 view。`Observe` 先比较传入 token 再安装 watch；load 到 observe 之间的变化会立即触发 invalidation，避免漏唤醒。这是可供 placement 使用的已检查 view，不是长期持有的 MVCC 读取事务。
 
@@ -1165,7 +1167,7 @@ Registry 将其适配到既有 node_list 协议：reset、初始条目、bookmar
 
 #### 删除与清理
 
-FoundationDB 负责物理 value/version 回收。Registry 不执行 peer snapshot repair 或本地副本 tombstone compaction。领域删除使用完整 expected version 与精确归属。业务记录是否可删除，由 node terminal retention 与有界、claim-fenced reaping 决定；存储清理不新增生命周期 TTL。
+数据库负责物理空间回收；领域删除仍使用完整 expected version 和精确归属。Node terminal retention 与有界、claim-fenced reaping 决定业务记录删除。共享层保留删除后的修订单元防止 ABA，不能按任意 TTL 清除；详见[修订保留与历史边界](cluster-storage.md#shared-implementation-and-engine-contract)。
 
 <a id="registry-membership-changes"></a>
 
@@ -1173,7 +1175,7 @@ FoundationDB 负责物理 value/version 回收。Registry 不执行 peer snapsho
 
 既有 active/next/old_grace 顺序控制服务发现、node-link affinity 和 peer 可达性。Active/next 重叠期间，client 与 `ConnectionOwners` 使用配置的候选视图；cutover 后 old_grace peer 仍可接收其已经持有 stream 的命令。新连接使用当前 owner 候选。
 
-此过程不搬迁元数据，不建立数据库写 quorum，也不复制 group/node snapshot。所有成员始终访问同一 FoundationDB 数据库与 prefix。FoundationDB 拓扑、冗余与 backup/restore 独立于 Registry membership 管理。配置 reload 仍要求受控 active → next → active 转换，以保持连接路由一致。
+此过程不搬迁元数据，不建立数据库写 quorum，也不复制 group/node snapshot。共享后端的成员始终访问同一数据库和 namespace；数据库拓扑、冗余、backup/restore 独立于 membership 管理。SQLite 拒绝多成员配置。Reload 仍要求受控 active → next → active 转换。
 
 <a id="router-membership"></a>
 

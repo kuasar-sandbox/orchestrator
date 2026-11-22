@@ -1,16 +1,14 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"context"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
-func (s *Store) keyPairScope(nodeID string) fdb.Key { return s.key("key-pair", nodeID) }
-func (s *Store) keyPairKey(nodeID, fingerprint string) fdb.Key {
+func (s *Store) keyPairScope(nodeID string) records.Key { return s.key("key-pair", nodeID) }
+func (s *Store) keyPairKey(nodeID, fingerprint string) records.Key {
 	return mainKey(s.keyPairScope(nodeID), fingerprint)
 }
 func (s *Store) PutKeyPair(ctx context.Context, nodeID string, pair metadata.NodeKeyPair) (metadata.Versioned[metadata.NodeKeyPair], error) {

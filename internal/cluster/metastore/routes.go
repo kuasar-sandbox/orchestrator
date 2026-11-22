@@ -1,25 +1,23 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"context"
 	"time"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
-func (s *Store) routeScope(group string) fdb.Key { return s.key("routes", group) }
-func (s *Store) routeKey(key metadata.RouteKey) fdb.Key {
+func (s *Store) routeScope(group string) records.Key { return s.key("routes", group) }
+func (s *Store) routeKey(key metadata.RouteKey) records.Key {
 	return mainKey(s.routeScope(key.Group), key.RouteKey)
 }
 func (s *Store) ReadRoute(ctx context.Context, key metadata.RouteKey) (out metadata.Versioned[metadata.SandboxRecord], err error) {
 	if err = validateParts(key.Group, key.RouteKey); err != nil {
 		return
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		var e error
 		out, e = readTyped[metadata.SandboxRecord](tr, s.routeKey(key))
 		if e == nil && out.Exists {
@@ -36,7 +34,7 @@ func (s *Store) ReadResolution(ctx context.Context, key metadata.RouteKey) (out 
 	if err = validateParts(key.Group, key.RouteKey); err != nil {
 		return
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		out = metadata.Resolution{}
 		var err error
 		out.Route, err = readTyped[metadata.SandboxRecord](tr, s.routeKey(key))
@@ -243,74 +241,40 @@ func (s *Store) ListRoutes(ctx context.Context, group string, cursor metadata.Cu
 	return page, nil
 }
 
-func (s *Store) ReadAndObserveRoute(ctx context.Context, key metadata.RouteKey) (out metadata.Versioned[metadata.SandboxRecord], observation metadata.Invalidation, returnedErr error) {
-	if err := validateParts(key.Group, key.RouteKey); err != nil {
-		return out, nil, err
+func (s *Store) ReadAndObserveRoute(ctx context.Context, key metadata.RouteKey) (current metadata.Versioned[metadata.SandboxRecord], observation metadata.Invalidation, err error) {
+	if err = validateParts(key.Group, key.RouteKey); err != nil {
+		return
 	}
-	ctx, opRelease, err := s.operation(ctx)
-	if err != nil {
-		return out, nil, err
-	}
-	transferred := false
-	defer func() {
-		if !transferred {
-			opRelease()
-		}
-		returnedErr = observationError(returnedErr)
-	}()
-	release, err := s.observationSlot(ctx)
-	if err != nil {
-		return out, nil, err
-	}
-	defer func() {
-		if !transferred {
-			release()
-		}
-	}()
-	tr, cleanup, err := s.newTransaction(ctx)
-	if err != nil {
-		return out, nil, err
-	}
-	defer cleanup()
 	physical := s.routeKey(key)
-	for {
-		if err = ctx.Err(); err != nil {
-			return out, nil, err
-		}
-		current, err := readTyped[metadata.SandboxRecord](tr, physical)
+	var expected []metadata.Version
+	err = s.read(ctx, func(tr *records.Tx) error {
+		current, err = readTyped[metadata.SandboxRecord](tr, physical)
 		if err != nil {
-			if retryNative(tr, err) {
-				continue
-			}
-			return out, nil, unavailable(ctx, err)
+			return err
 		}
 		if current.Exists {
-			if err = metadata.ValidateSandbox(current.Value); err != nil {
-				return out, nil, err
+			if err := metadata.ValidateSandbox(current.Value); err != nil {
+				return err
 			}
+			if current.Value.Group != key.Group || current.Value.RouteKey != key.RouteKey {
+				return invalidRecord("route key mismatch")
+			}
+			// The envelope and durable revision cell change atomically. Avoid
+			// another lookup for an existing record; absent records still need
+			// the retained revision cell to observe delete/recreate correctly.
+			expected = []metadata.Version{current.Version}
+			return nil
 		}
-		if s.afterReadBeforeWatch != nil {
-			s.afterReadBeforeWatch()
-		}
-		future := tr.Watch(physical)
-		err = tr.Commit().Get()
-		if err == nil {
-			transferred = true
-			return current, s.observeFutures(ctx, []fdb.FutureNil{future}, []func(){release}, opRelease), nil
-		}
-		cancelFutures([]fdb.FutureNil{future})
-		if ctx.Err() != nil {
-			return out, nil, ctx.Err()
-		}
-		if retryObservation(tr, err) {
-			continue
-		}
-		return out, nil, err
+		expected, err = tr.Revisions([]records.Key{physical})
+		return err
+	})
+	if err != nil {
+		return
 	}
+	observation, err = s.records.Observe(ctx, []records.Key{physical}, expected)
+	return
 }
 
-// ApplyRouteDelete is the stream-authorized delete/rollback boundary. The
-// captured registration is checked in the same transaction as route and refs.
 func (s *Store) ApplyRouteDelete(ctx context.Context, registration metadata.Registration, expected metadata.Version, ref metadata.NodeSandboxRef, restore *metadata.SandboxRecord) error {
 	if err := metadata.ValidateSandboxRef(ref); err != nil {
 		return err

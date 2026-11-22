@@ -1,6 +1,4 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import "github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 

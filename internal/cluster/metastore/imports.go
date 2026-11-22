@@ -1,16 +1,16 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"context"
 	"time"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
-func (s *Store) importKey(sourceID string) fdb.Key { return mainKey(s.key("import-source"), sourceID) }
+func (s *Store) importKey(sourceID string) records.Key {
+	return mainKey(s.key("import-source"), sourceID)
+}
 func leaseMatches(v metadata.PlacerImportSourceState, ownerID, runID string, term uint64, now int64) bool {
 	return v.OwnerID == ownerID && v.RunID == runID && v.Term == term && (v.ExpiresUnixMs <= 0 || v.ExpiresUnixMs > now)
 }
@@ -60,7 +60,7 @@ func (s *Store) Check(ctx context.Context, sourceID, ownerID, runID string, term
 		return false, nil
 	}
 	matched := false
-	err := s.read(ctx, func(tr fdb.Transaction) error {
+	err := s.read(ctx, func(tr *records.Tx) error {
 		current, err := readTyped[metadata.PlacerImportSourceState](tr, s.importKey(sourceID))
 		if err != nil {
 			return err

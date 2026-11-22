@@ -1,6 +1,4 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"bytes"
@@ -8,8 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
 func (s *Store) guardReap(m *mutation, claim metadata.ReapClaim) error {
@@ -55,7 +53,7 @@ func (s *Store) ReadNodeProfile(ctx context.Context, nodeID string) (out metadat
 	if err = validateParts(nodeID); err != nil {
 		return
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		profile, err := readTyped[metadata.NodeProfileRecord](tr, s.profileKey(nodeID))
 		if err != nil {
 			return err
@@ -328,12 +326,12 @@ func (s *Store) FinalizeReap(ctx context.Context, claim metadata.ReapClaim) (boo
 		if err := s.guardReap(m, claim); err != nil {
 			return false, err
 		}
-		for _, scope := range []fdb.Key{s.sandboxOwnerScope(claim.NodeID), s.buildOwnerScope(claim.NodeID), s.keyPairScope(claim.NodeID)} {
-			rows, err := m.tr.GetRange(rangeFor(scope), fdb.RangeOptions{Limit: 1}).GetSliceWithError()
+		for _, scope := range []records.Key{s.sandboxOwnerScope(claim.NodeID), s.buildOwnerScope(claim.NodeID), s.keyPairScope(claim.NodeID)} {
+			rows, err := m.tr.Scan(scope, nil, pageLimit(1))
 			if err != nil {
 				return false, err
 			}
-			if len(rows) > 0 {
+			if len(rows.Items) > 0 {
 				return false, nil
 			}
 		}
@@ -379,21 +377,20 @@ func bucket(nodeID string) byte { return sha256.Sum256([]byte(nodeID))[0] }
 func projectNode(value metadata.NodeProfileRecord) metadata.NodeListEntry {
 	return metadata.NodeListEntry{NodeID: value.NodeID, Labels: value.Labels, Capacity: value.Capacity, BuildRegistrationCapacity: value.BuildRegistrationCapacity, BuildExecutionCapacity: value.BuildExecutionCapacity, APIEndpoint: value.APIEndpoint, DataEndpoint: value.DataEndpoint, RuntimeDigest: value.RuntimeDigest, Draining: value.Draining}
 }
-func (s *Store) catalogScope(b byte) fdb.Key { return s.key("node-catalog", string([]byte{b})) }
-func (s *Store) catalogKey(nodeID string) fdb.Key {
+func (s *Store) catalogScope(b byte) records.Key { return s.key("node-catalog", string([]byte{b})) }
+func (s *Store) catalogKey(nodeID string) records.Key {
 	return mainKey(s.catalogScope(bucket(nodeID)), nodeID)
 }
-func (s *Store) catalogTokenKey(b byte) fdb.Key {
+func (s *Store) catalogTokenKey(b byte) records.Key {
 	return s.key("node-catalog-token", string([]byte{b}))
 }
-func (s *Store) putCatalog(tr fdb.Transaction, value metadata.NodeProfileRecord) error {
+func (s *Store) putCatalog(tr *records.Tx, value metadata.NodeProfileRecord) error {
 	if err := putJSON(tr, s.catalogKey(value.NodeID), projectNode(value)); err != nil {
 		return err
 	}
-	tr.SetVersionstampedValue(s.catalogTokenKey(bucket(value.NodeID)), stampPayload(nil))
-	return nil
+	return tr.Put(s.catalogTokenKey(bucket(value.NodeID)), nil)
 }
-func (s *Store) clearCatalog(tr fdb.Transaction, nodeID string) {
+func (s *Store) clearCatalog(tr *records.Tx, nodeID string) {
 	clearRecord(tr, s.catalogKey(nodeID))
-	tr.SetVersionstampedValue(s.catalogTokenKey(bucket(nodeID)), stampPayload(nil))
+	_ = tr.Put(s.catalogTokenKey(bucket(nodeID)), nil)
 }

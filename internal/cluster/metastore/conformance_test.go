@@ -1,81 +1,22 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/storage"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
-	"github.com/kuasar-sandbox/orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func nativeStore(t *testing.T) *Store {
-	t.Helper()
-	file := os.Getenv("FDB_CLUSTER_FILE")
-	if file == "" {
-		t.Fatal("native conformance requires explicit FDB_CLUSTER_FILE pointing to an isolated test cluster")
-	}
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		t.Fatal(err)
-	}
-	options := Options{ClusterFile: file, Prefix: "/orchestrator-native-test/" + hex.EncodeToString(id[:]) + "/"}
-	store, err := Open(options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		store.beforeCommit = nil
-		store.afterNativeCommit = nil
-		store.afterReadBeforeWatch = nil
-		store.mu.Lock()
-		closed := store.closed
-		store.mu.Unlock()
-		cleanupStore := store
-		if closed {
-			var err error
-			cleanupStore, err = Open(options)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err := cleanupStore.mutate(ctx, func(m *mutation) (bool, error) {
-			m.tr.ClearRange(rangeFor(fdb.Key(cleanupStore.prefix)))
-			return true, nil
-		})
-		if err != nil {
-			t.Errorf("cleanup isolated namespace: %v", err)
-		}
-		_ = cleanupStore.Close()
-	})
-	return store
-}
-func companion(t *testing.T, s *Store) *Store {
-	t.Helper()
-	out, err := Open(Options{ClusterFile: s.clusterFile, Prefix: string(s.prefix[:len(s.prefix)-1])})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = out.Close() })
-	return out
-}
 func check(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
@@ -93,7 +34,7 @@ func routeFixture(id string) metadata.SandboxRecord {
 func buildFixture(id string) metadata.BuildRecord {
 	return metadata.BuildRecord{Group: "/g", BuildID: id, NodeID: "node", Profile: types.ProfileBare, APISecretFingerprint: testFingerprint(strings.Repeat("11", 32)), TemplateID: "transient-" + id, State: metadata.BuildStarting, RegistrationImageRepo: "private-image", RegistrationRegistryAuth: "private-auth"}
 }
-func registerNode(t *testing.T, s *Store, nodeID string) metadata.NodeSnapshot {
+func registerNode(t *testing.T, s *testStore, nodeID string) metadata.NodeSnapshot {
 	t.Helper()
 	out, err := s.Register(context.Background(), metadata.Version{}, metadata.NodeProfileRecord{NodeID: nodeID, LinkOwner: "registry", Capacity: 100, APIEndpoint: "api:7443", DataEndpoint: "data:8080", Labels: map[string]string{"zone": "z"}})
 	check(t, err)
@@ -109,30 +50,27 @@ func awaitInvalidation(t *testing.T, o metadata.Invalidation) {
 	}
 }
 
-func TestNativeConformance(t *testing.T) {
-	if os.Getenv("FDB_CLUSTER_FILE") == "" {
-		t.Fatal("set FDB_CLUSTER_FILE to the explicitly provisioned native test database; this gate never silently skips")
-	}
-	t.Run("full_stamp_cas_delete_recreate", func(t *testing.T) {
-		s := nativeStore(t)
+func runRepositoryConformance(t *testing.T, newTestStore func(*testing.T) *testStore) {
+	t.Run("full_revision_cas_delete_recreate", func(t *testing.T) {
+		s := newTestStore(t)
 		ctx := context.Background()
 		value := routeFixture("cas")
 		key := metadata.RouteKey{Group: value.Group, RouteKey: value.RouteKey}
 		first, err := s.CompareAndPutRoute(ctx, key, metadata.Version{}, value)
 		check(t, err)
 		if !first.IsCommitted() {
-			t.Fatal("no full committed stamp")
+			t.Fatal("no committed revision")
 		}
 		read, err := s.ReadRoute(ctx, key)
 		check(t, err)
 		if read.Version != first || read.Value.NodeSandboxID != value.NodeSandboxID {
-			t.Fatal("read stamp/value")
+			t.Fatal("read revision/value")
 		}
 		forged := first
 		forged[9] ^= 1
 		_, err = s.CompareAndPutRoute(ctx, key, forged, value)
 		if !errors.Is(err, metadata.ErrConflict) {
-			t.Fatalf("batch-order byte was ignored: %v", err)
+			t.Fatalf("low revision byte was ignored: %v", err)
 		}
 		value.State = metadata.StateReady
 		second, err := s.CompareAndPutRoute(ctx, key, first, value)
@@ -150,45 +88,14 @@ func TestNativeConformance(t *testing.T) {
 			t.Fatal("recreated version ABA")
 		}
 	})
-	t.Run("known_noncommit_pins_business_expected", func(t *testing.T) {
-		s := nativeStore(t)
-		other := companion(t, s)
-		ctx := context.Background()
-		value := routeFixture("pin")
-		key := metadata.RouteKey{Group: value.Group, RouteKey: value.RouteKey}
-		version, err := s.CompareAndPutRoute(ctx, key, metadata.Version{}, value)
-		check(t, err)
-		calls := 0
-		s.beforeCommit = func(attempt int, tr fdb.Transaction) error {
-			calls++
-			if attempt == 1 {
-				replacement := value
-				replacement.State = metadata.StatePaused
-				_, err := other.CompareAndPutRoute(ctx, key, version, replacement)
-				return err
-			}
-			return nil
-		}
-		value.State = metadata.StateReady
-		_, err = s.CompareAndPutRoute(ctx, key, version, value)
-		s.beforeCommit = nil
-		if !errors.Is(err, metadata.ErrConflict) || calls != 1 {
-			t.Fatalf("retry adopted newer expected: calls=%d err=%v", calls, err)
-		}
-		current, err := s.ReadRoute(ctx, key)
-		check(t, err)
-		if current.Value.State != metadata.StatePaused {
-			t.Fatal("intervening writer overwritten")
-		}
-	})
 	t.Run("unknown_is_not_retried_and_chunk_cleanup", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		value := buildFixture("chunks")
 		value.RegistrationConfig = map[string]string{"large": strings.Repeat("x", 900_000)}
 		key := metadata.BuildKey{Group: value.Group, BuildID: value.BuildID}
 		var calls atomic.Int32
-		s.afterNativeCommit = func(int) error { calls.Add(1); return fdb.Error{Code: 1021} }
+		s.afterNativeCommit = func(int) error { calls.Add(1); return &metadata.Unknown{Cause: errors.New("fault after commit")} }
 		_, err := s.CompareAndPutBuild(ctx, key, metadata.Version{}, value)
 		s.afterNativeCommit = nil
 		if !errors.Is(err, metadata.ErrUnknown) || calls.Load() != 1 {
@@ -202,9 +109,9 @@ func TestNativeConformance(t *testing.T) {
 		value.RegistrationConfig = map[string]string{"small": "v"}
 		version, err := s.CompareAndPutBuild(ctx, key, current.Version, value)
 		check(t, err)
-		check(t, s.read(ctx, func(tr fdb.Transaction) error {
-			rows, err := tr.GetRange(chunkRange(s.buildKey(key)), fdb.RangeOptions{Limit: 1}).GetSliceWithError()
-			if err == nil && len(rows) != 0 {
+		check(t, s.backend.View(ctx, func(tr storage.ReadTx) error {
+			rows, err := tr.Scan(storage.Range{Begin: []byte{"c"[0]}, End: []byte{"d"[0]}}, storage.Limit{Rows: 1, Bytes: 1024})
+			if err == nil && len(rows.Rows) != 0 {
 				t.Fatal("shrink leaked chunks")
 			}
 			return err
@@ -215,7 +122,7 @@ func TestNativeConformance(t *testing.T) {
 		if len(page.Items) != 0 {
 			t.Fatal("delete leaked template index")
 		}
-		value.RegistrationConfig = map[string]string{"oversized": strings.Repeat("z", transactionBytes)}
+		value.RegistrationConfig = map[string]string{"oversized": strings.Repeat("z", storage.MaxTransactionBytes)}
 		_, err = s.CompareAndPutBuild(ctx, key, metadata.Version{}, value)
 		if !errors.Is(err, metadata.ErrCapacity) {
 			t.Fatalf("oversized mutation not rejected: %v", err)
@@ -227,7 +134,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("pagination_scope_and_nonunique_build_index", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		for i := 0; i < 4; i++ {
 			value := buildFixture(fmt.Sprintf("page-%d", i))
@@ -251,7 +158,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("atomic_intent_owner_and_rollback", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		registerNode(t, s, "node")
 		value := routeFixture("intent")
@@ -304,7 +211,7 @@ func TestNativeConformance(t *testing.T) {
 		check(t, s.DeleteRouteAndOwnership(ctx, key, metadata.Version{}, "node", ref))
 	})
 	t.Run("connect_preserves_ready_and_pausing", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		registerNode(t, s, "node")
 		for _, state := range []metadata.SandboxState{metadata.StateReady, metadata.StatePausing} {
@@ -330,7 +237,7 @@ func TestNativeConformance(t *testing.T) {
 	t.Run("migration_rollback_restores_route_when_old_node_is_not_live", func(t *testing.T) {
 		for _, reaping := range []bool{false, true} {
 			t.Run(fmt.Sprintf("reaping=%v", reaping), func(t *testing.T) {
-				s := nativeStore(t)
+				s := newTestStore(t)
 				ctx := context.Background()
 				current := registerNode(t, s, "node")
 				if reaping {
@@ -377,7 +284,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("build_report_ack_delete_and_unknown", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		node := registerNode(t, s, "node")
 		value := buildFixture("report")
@@ -410,7 +317,7 @@ func TestNativeConformance(t *testing.T) {
 			t.Fatal("wrong template deleted build")
 		}
 		var commits atomic.Int32
-		s.afterNativeCommit = func(int) error { commits.Add(1); return fdb.Error{Code: 1021} }
+		s.afterNativeCommit = func(int) error { commits.Add(1); return &metadata.Unknown{Cause: errors.New("fault after commit")} }
 		err = s.DeleteBuildProjection(ctx, node.Registration, ref)
 		s.afterNativeCommit = nil
 		if !errors.Is(err, metadata.ErrUnknown) || commits.Load() != 1 {
@@ -427,7 +334,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("owner_refresh_and_concurrent_key_pair_binding", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		registerNode(t, s, "node")
 		build := buildFixture("refresh")
@@ -479,7 +386,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("registration_fence_and_reaper_recovery", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		old := registerNode(t, s, "node")
 		value := routeFixture("reap")
@@ -538,7 +445,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("old_stream_cannot_report_delete_or_rollback_after_register", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		old := registerNode(t, s, "node")
 		route := routeFixture("stream-ready")
@@ -607,7 +514,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("terminal_reap_retention", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		node := registerNode(t, s, "node")
 		value := routeFixture("terminal")
@@ -645,10 +552,14 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("route_report_credentials_generation_and_terminal_order", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		node := registerNode(t, s, "node")
 		value := routeFixture("report-route")
+		value.MaxCheckpoints = 17
+		value.AutoReset = true
+		idle := int64(0)
+		value.IdleTimeout = &idle
 		ref := metadata.SandboxRef(value)
 		_, err := s.CommitIntentAndOwnership(ctx, metadata.Version{}, value, ref)
 		check(t, err)
@@ -656,10 +567,14 @@ func TestNativeConformance(t *testing.T) {
 		token, err := keys.MintForwardAccessToken(secret, value.SandboxID)
 		check(t, err)
 		event := routesync.RouteEntry{SandboxID: value.NodeSandboxID, Profile: "bare", State: routesync.StateRunning, InstanceID: "instance", PressureVersion: 8, StableID: value.SandboxID, APISecret: strings.Repeat("11", 32), APISecretFingerprint: value.APISecretFingerprint, ManifestKeyFingerprint: strings.Repeat("33", 32), ServiceSecret: secret, ForwardAccessToken: token}
+		event.IdleTimeout = &idle // current protocol reports the resolved Node value
 		result, err := s.ApplyRouteReport(ctx, node.Registration, ref, event)
 		check(t, err)
 		if result.Disposition != metadata.ReportWritten || !result.Record.Version.IsCommitted() {
 			t.Fatal("valid route not written")
+		}
+		if result.Record.Value.MaxCheckpoints != 17 || !result.Record.Value.AutoReset || result.Record.Value.IdleTimeout == nil || *result.Record.Value.IdleTimeout != 0 {
+			t.Fatal("report lost retained checkpoint policy or the explicit optional value")
 		}
 		event.State = routesync.StateDead
 		result, err = s.ApplyRouteReport(ctx, node.Registration, ref, event)
@@ -690,7 +605,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("key_pair_ack_identity_and_import_lease", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		registerNode(t, s, "node")
 		api := strings.Repeat("11", 32)
@@ -744,7 +659,7 @@ func TestNativeConformance(t *testing.T) {
 		}
 	})
 	t.Run("directory_pages_projection_and_invalidation", func(t *testing.T) {
-		s := nativeStore(t)
+		s := newTestStore(t)
 		ctx := context.Background()
 		var first metadata.NodeSnapshot
 		count := 0
@@ -796,110 +711,4 @@ func TestNativeConformance(t *testing.T) {
 			t.Fatal("projection change missing token")
 		}
 	})
-	t.Run("lost_wakeup_shared_budget_native_capacity_and_close", func(t *testing.T) {
-		s := nativeStore(t)
-		other := companion(t, s)
-		ctx := context.Background()
-		value := routeFixture("watch")
-		key := metadata.RouteKey{Group: value.Group, RouteKey: value.RouteKey}
-		version, err := s.CompareAndPutRoute(ctx, key, metadata.Version{}, value)
-		check(t, err)
-		var raced atomic.Bool
-		s.afterReadBeforeWatch = func() {
-			if raced.CompareAndSwap(false, true) {
-				next := value
-				next.State = metadata.StateReady
-				_, err := other.CompareAndPutRoute(ctx, key, version, next)
-				check(t, err)
-			}
-		}
-		current, watch, err := s.ReadAndObserveRoute(ctx, key)
-		s.afterReadBeforeWatch = nil
-		check(t, err)
-		if current.Value.State != metadata.StateReady {
-			awaitInvalidation(t, watch)
-			check(t, watch.Err())
-		}
-		watch.Cancel()
-		if s.ObservationSlots() != 0 {
-			t.Fatal("watch leaked slot")
-		}
-		check(t, s.owner.budget.Configure(300))
-		var watchers []metadata.Invalidation
-		for i := 0; i < 44; i++ {
-			_, watch, err := s.ReadAndObserveRoute(ctx, metadata.RouteKey{Group: "/watch", RouteKey: fmt.Sprint(i)})
-			check(t, err)
-			watchers = append(watchers, watch)
-		}
-		directory, err := other.Observe(ctx, metadata.DirectoryToken{})
-		check(t, err)
-		if s.ObservationSlots() != 300 {
-			t.Fatal("wrappers did not share route/catalog budget")
-		}
-		_, _, err = other.ReadAndObserveRoute(ctx, key)
-		if !errors.Is(err, metadata.ErrCapacity) {
-			t.Fatalf("capacity did not fail before setup: %v", err)
-		}
-		directory.Cancel()
-		for _, watch := range watchers {
-			watch.Cancel()
-		}
-		if s.ObservationSlots() != 0 {
-			t.Fatal("shared cancellation leaked slots")
-		}
-		check(t, s.owner.budget.Configure(1))
-		reserved, release, err := s.ReserveObservation(ctx)
-		check(t, err)
-		_, _, err = other.ReserveObservation(ctx)
-		if !errors.Is(err, metadata.ErrCapacity) {
-			t.Fatal("second wrapper bypassed held reservation")
-		}
-		_, watch, err = s.ReadAndObserveRoute(reserved, key)
-		check(t, err)
-		release()
-		awaitInvalidation(t, watch)
-		if s.ObservationSlots() != 0 {
-			t.Fatal("reservation released before native reclamation")
-		}
-		check(t, s.owner.budget.Configure(8192))
-		check(t, s.owner.db.Options().SetMaxWatches(1))
-		_, first, err := s.ReadAndObserveRoute(ctx, key)
-		check(t, err)
-		_, second, err := other.ReadAndObserveRoute(ctx, metadata.RouteKey{Group: "/g", RouteKey: "second-watch"})
-		if err == nil {
-			awaitInvalidation(t, second)
-			err = second.Err()
-			second.Cancel()
-		}
-		if !errors.Is(err, metadata.ErrCapacity) {
-			t.Fatalf("native 1032 not typed Capacity: %v", err)
-		}
-		first.Cancel()
-		check(t, s.owner.db.Options().SetMaxWatches(10000))
-		_, watch, err = s.ReadAndObserveRoute(ctx, key)
-		check(t, err)
-		check(t, s.Close())
-		awaitInvalidation(t, watch)
-		if s.ActiveObservations() != 0 || s.ObservationSlots() != 0 {
-			t.Fatal("Close returned before future cleanup")
-		}
-		_, err = other.ReadRoute(ctx, key)
-		check(t, err)
-	})
-}
-
-func TestChunkEnvelopeCorruption(t *testing.T) {
-	payload := []byte("durable")
-	raw := envelope(payload, 0)
-	raw = raw[:len(raw)-4]
-	copy(raw[:10], []byte{0, 0, 0, 0, 0, 0, 0, 1, 0, 2})
-	decoded, err := decodeRecord(fdb.Transaction{}, fdb.Key("inline"), raw)
-	check(t, err)
-	if !bytes.Equal(decoded.payload, payload) {
-		t.Fatal("inline")
-	}
-	raw[10] = 2
-	if _, err = decodeRecord(fdb.Transaction{}, fdb.Key("inline"), raw); !errors.Is(err, metadata.ErrInvalidRecord) {
-		t.Fatal("unknown schema accepted")
-	}
 }

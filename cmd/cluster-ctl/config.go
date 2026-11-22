@@ -1,5 +1,3 @@
-//go:build fdb && cgo
-
 package main
 
 import (

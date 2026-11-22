@@ -2031,9 +2031,9 @@ func (rt *Router) rememberRoute(rr *routeResolve) {
 	key := routeCacheID(cp.Group, cp.RouteKey, cp.SandboxID)
 	rt.cacheMu.Lock()
 	if current := rt.cache[key]; current != nil {
-		// Compare the record's full commit stamp within this database and
-		// cache identity. The final two bytes order transactions sharing a
-		// database version; a local handle or uint64 truncation loses that order.
+		// Compare the full per-record revision within this namespace and cache
+		// identity, including delete/recreate. Truncating any of its ten bytes
+		// loses ordering; the revision is not a database-wide commit sequence.
 		if cp.RouteRevision.Compare(current.RouteRevision) < 0 ||
 			(cp.RouteRevision == current.RouteRevision && cp.NodeSandboxID != current.NodeSandboxID) {
 			rt.cacheMu.Unlock()

@@ -392,6 +392,14 @@ github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905 h1:q3OEI9RaN/wwc
 github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905/go.mod h1:VvGYjkZoJyKqlmT1yzakUs4mfKMNB0XdODP0+rdml6k=
 github.com/ionos-cloud/sdk-go/v6 v6.3.6 h1:l/TtKgdQ1wUH3DDe2SfFD78AW+TJWdEbDpQhHkWd6CM=
 github.com/ionos-cloud/sdk-go/v6 v6.3.6/go.mod h1:nUGHP4kZHAZngCVr4v6C8nuargFrtvt7GrzH/hqn7c4=
+github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
+github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
+github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
+github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761/go.mod h1:5TJZWKEWniPve33vlWYSoGYefn3gLQRzjfDlhSJ9ZKM=
+github.com/jackc/pgx/v5 v5.13.0 h1:Hl08k64maU0nrRyVUEbwCnK6/gT0EhMrtAqBHz9/gA4=
+github.com/jackc/pgx/v5 v5.13.0/go.mod h1:u2Fi6no03HCSBYE+ZVdLxbwdu3xyi2vU+K/YNJioSds=
+github.com/jackc/puddle/v2 v2.2.3 h1:f8HoREISb3l5eO9coPgK7U3hKLhWGokOFVcThl5jrao=
+github.com/jackc/puddle/v2 v2.2.3/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af/go.mod h1:Nht3zPeWKUH0NzdCt2Blrr5ys8VGpn0CEB0cQHVjt7k=
 github.com/josharian/native v1.0.1-0.20221213033349-c1e37c09b531/go.mod h1:7X/raswPFr05uY3HiLlYeyQntB6OO7E/d2Cu7qoaN2w=
 github.com/josharian/native v1.1.0 h1:uuaP0hAbW7Y4l0ZRQ6C9zfb7Mg1mbFKry/xzDAfmtLA=

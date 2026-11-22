@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	"github.com/kuasar-sandbox/orchestrator/internal/storage"
 )
 
-var ErrCapacity = metadata.ErrCapacity
+var ErrCapacity = storage.ErrCapacity
 
-type CapacityError = metadata.CapacityError
+type CapacityError = storage.CapacityError
 
 const DefaultObservationLimit = 8192
 const DefaultReserveLeaderLimit = 7680

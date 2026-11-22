@@ -684,7 +684,7 @@ Registry's advertised address is `membership.versions[].members[].advertise`; re
 
 ### Native build, runtime and validation
 
-`cluster-ctl` alone requires CGO and the `fdb` tag. `node-ctl`, `node-stub-ctl` and `e2b-key-ctl` remain CGO=0. Use a native Linux x86_64 or aarch64 build host with Go, a C compiler, Python 3.9+ and `readelf`; the build does not install Debian packages or require `dpkg-deb`.
+`cluster-ctl` supports SQLite and PostgreSQL with CGO=0. FDB support requires CGO and the `fdb` tag; the native release below includes it. `node-ctl`, `node-stub-ctl` and `e2b-key-ctl` remain CGO=0. For the native release use a Linux x86_64 or aarch64 host with Go, a C compiler, Python 3.9+ and `readelf`; the build does not install Debian packages or require `dpkg-deb`. See [storage backends and schema v2](cluster-storage.md) for configuration and pure-Go builds.
 
 ```sh
 make build-core
@@ -697,7 +697,7 @@ python3 -B scripts/with-test-fdb.py -- make test-cluster-native
 
 The release contains `bin/cluster-ctl`, `bin/run-cluster-ctl`, fixed runtime files under `lib/cluster-ctl/`, and native licenses/provenance under `share/licenses/orchestrator/native/`. The launcher invokes the bundled loader with an explicit library path; install the complete archive and run the roles through `run-cluster-ctl`. The supplied systemd units use `/usr/bin/run-cluster-ctl`. Linux x86_64 needs AVX for the official client, independently of Go's `GOAMD64` setting. The ARM package uses native ARM libraries without emulator-specific settings.
 
-Registry must have a readable cluster file for the external FoundationDB database and the same prefix as its peers. Coordinator-file updates may require a writable connection file according to the database deployment. Router/Placer roles share the native executable but do not open Registry storage. This archive contains a client runtime, not a production database server; FoundationDB redundancy, storage media and operational recovery remain separate deployment responsibilities.
+When FDB is selected, Registry needs a readable cluster file and the same storage namespace as its peers. Coordinator-file updates may require a writable file. Router/Placer do not open Registry storage. The archive contains an FDB client runtime, not a production database server; database redundancy and recovery remain deployment responsibilities.
 
 Release validation retains source revision, selected dependency and Go module checks. Only cluster-ctl is admitted as CGO=1 with the `fdb` tag; the other payloads and trusted archive validator remain CGO=0. Native library names, bytes, loader, licenses and provenance are checked against a fixed allowlist. Validation never executes foreign-architecture payloads or downloads dependencies. `make test-release` includes native linkage/launcher and negative packaging fixtures; it uses the matching host architecture.
 
@@ -921,7 +921,7 @@ Registry considers only members satisfying `role=placer && alive && ready=true &
 
 ### Registry state model
 
-Registry persists execution metadata in an external FoundationDB 7.3.77 database. All Registry processes serving one cluster use the same `foundationdb.cluster_file` and `foundationdb.prefix`. FoundationDB owns storage replication, transaction commit, conflict detection and durable recovery. Registry owns the business transitions and the live node connections.
+Registry persists execution metadata through one shared repository implementation on SQLite, PostgreSQL or FoundationDB 7.3.77. SQLite is for one Registry; shared-database peers use the same backend and namespace. The database owns transaction commit, conflict detection and durable recovery; Registry owns business transitions and live node connections. [Storage configuration, contracts and the schema-v2 upgrade boundary](cluster-storage.md) apply to every backend.
 
 <a id="registry-data-hierarchy"></a>
 
@@ -932,11 +932,13 @@ Registry persists execution metadata in an external FoundationDB 7.3.77 database
 | Router / Placer | Authenticate and forward requests, or propose placement from a checked directory | Existing route_link / placer_link / node_list HTTP contracts |
 | Registry business services | Validate lifecycle and ownership, dispatch commands, reconcile node reports | Typed Route, Build, Node, Ownership, KeyPair, Directory and ImportSource capabilities |
 | `internal/cluster/metadata` | Define portable records, complete versions, domain outcomes and bounded lists | `Versioned[T]`, `Version`, typed repository methods, `Invalidation`, `ObservationAdmission` |
-| `internal/observebudget` | Bound observations and sequential rearming before native work is admitted | Reservation and release; the shared database owner supplies this capability |
-| `internal/fdbdriver` | Implement atomic metadata operations with the official client | Typed repositories only; native database/transaction handles and storage keys remain private |
-| FoundationDB | Durable transactions and replication | Official Go/C API, used only by the native driver |
+| `internal/cluster/metastore` | Implement the typed business repositories once | Atomic lifecycle, index and ownership operations |
+| `internal/storage/record` | Shared record, revision, chunk and integrity mechanisms | Conditional multi-key record transactions and invalidation conditions |
+| `internal/storage` | Generic ordered transaction contract | Bytes, bounded scans, exact transaction outcomes and observations |
+| `internal/storage/sqlengine`, `internal/fdbdriver` | Backend connections, transactions, notification acceleration and error mapping | Generic engine only; no business-package dependency |
+| SQLite / PostgreSQL / FoundationDB | Durable storage | Selected only by Registry startup assembly |
 
-The repository stays one Go module. `metadata`, Registry, Router, Placer and business membership are pure Go. All native driver and `cmd/cluster-ctl` sources require `fdb && cgo`; only the command's Registry assembly opens the database. There is no generic public KV/transaction closure, process-local version handle, alternate in-memory production backend or old replication fallback. The interfaces are defined in [metadata/repositories.go](../internal/cluster/metadata/repositories.go).
+The repository stays one Go module. Only the native FDB driver and its command adapter require `fdb && cgo`; only Registry assembly opens the database. Registry/Router/Placer consume [typed repositories](../internal/cluster/metadata/repositories.go), not generic transaction closures. The generic mechanism is internal to shared storage. There is no in-memory production backend or old replication fallback.
 
 <a id="registry-owner-resolution"></a>
 
@@ -960,19 +962,19 @@ A Registry may read or change an authorized record through the shared database w
 | Directory | Fixed 256 buckets of low-frequency node projections | Paginated checked view and bucket change tokens |
 | ImportSource | `source_id` | Lease holder, run ID, business term and successful-page cursor |
 
-Point operations address one business identity. Listing methods take a scoped opaque cursor and a bounded page size; they do not copy a whole group's or node's records into each write. The driver chunks payloads that need multiple values inside the same transaction and enforces record/transaction limits. It does not remove FoundationDB's transaction size and lifetime limits. A listing cursor is a continuation within one typed scope, not a permanent database snapshot.
+Point operations address one business identity. Listing methods take a scoped opaque cursor and bounded page size. The shared record layer chunks payloads inside one transaction and enforces common budgets alongside backend-native limits. A listing cursor continues one typed scope; it is not a permanent database snapshot.
 
 <a id="registry-readwrite-protocol"></a>
 
 #### Transactions, versions and outcomes
 
-A stored version is the record's complete **10-byte committed versionstamp**: the 8-byte commit version followed by the 2-byte transaction batch order. JSON/text uses exactly 20 hexadecimal characters, for example `0102030405060708fffe`. The last two bytes must survive storage, DTO encoding and cache comparison. Versions are neither timestamps nor node lifecycle `state_version`; import-source terms and sandbox generations retain their separate business meaning.
+A stored version is a **10-byte per-logical-key revision**, monotonically ordered within one namespace including deletion/recreation. JSON/text retains exactly 20 hexadecimal characters. It is not an FDB versionstamp or a global commit sequence; all ten bytes participate in comparison. Node `state_version`, registration identity, import-source terms and sandbox generations retain their separate business meaning.
 
-CAS compares all ten bytes for equality. A missing record uses the zero value as an expected-absence condition. Live route and directory entries must carry a nonzero committed stamp; malformed encodings and incomplete stamps are rejected. Deleting and recreating identical payload does not revive an old expected version. Returned versions belong to the record's commit, not a read transaction's version. See [metadata/version.go](../internal/cluster/metadata/version.go).
+CAS compares all ten bytes. Missing visible records use zero for expected absence. Live entries require a nonzero valid revision; malformed encodings and reserved values are rejected. A durable hidden revision cell survives deletion, preventing old versions from matching recreated records. Returned versions belong to successful mutations. See [record/version.go](../internal/storage/record/version.go).
 
 The same Route record in the same database history can also use full-byte ordering. Router rejects an older response while a newer cache entry is resident, and rejects an equal version that names a different node target. Equal version plus equal target may refresh endpoint information, since the node profile can change independently. Eviction/TTL removes that cache entry's ordering guard; Router does not keep an unbounded historical watermark. A restored/new database history must not be compared with stale process caches.
 
-The driver separates `Conflict`, `Unavailable`, `Unknown` and capacity errors. A native error proven not committed can be retried within the operation's context and original business preconditions. A commit whose outcome cannot be proved returns `Unknown`; timeout is not evidence of rollback. Callers reconcile against durable state and must not blindly redispatch node side effects because a commit reply or command ACK was lost.
+The engine separates definitely-aborted `ErrRetry`, `Unavailable`, `Unknown`, invalid input and capacity errors; shared metadata adds business `Conflict`. Only definitely aborted operations may be retried under the original guards. Unknown is never automatically replayed; timeout is not evidence of rollback. Callers reconcile durable state before dispatching side effects.
 
 <a id="registry-invariants"></a>
 
@@ -993,7 +995,7 @@ These rules are expressed by domain methods in the typed repositories, so a cons
 
 #### Read, observe and directory publication
 
-`ReadAndObserveRoute` reads the current route and arms its native observation in one transaction. The returned observation is a one-shot instruction to reread. It is not a retained event stream or a count of transitions. Registry Reserve leaders reserve observation capacity before mutating business state; sequential rearming retains the reservation. Setup, active futures and cancellation until reclamation all count against the same database owner's budget. Catalog observations share that budget, with reserved catalog capacity; a second Registry-local limiter must not hide or exceed native usage.
+`ReadAndObserveRoute` reads the route and durable revision together, then arms observation while rechecking that revision. This closes the read/arm race on every backend. Notifications are one-shot instructions to reread, not event history. FDB uses native watches; SQL uses coalesced persistent checks, accelerated by local wakeups and PostgreSQL LISTEN/NOTIFY. Registry Reserve leaders reserve observation capacity before mutation; sequential rearming retains it. Setup, active observation and cancellation until reclamation share the owner budget, including reserved catalog capacity.
 
 The directory stores 256 bucket tokens. `Load` assembles bounded pages, validates the bucket tokens and retries changed buckets before publishing a complete view. `Observe` compares the supplied token before installing its watches; a change between load and observation causes immediate invalidation instead of a lost wakeup. The result is a checked view suitable for placement, not an indefinitely held MVCC read transaction.
 
@@ -1011,7 +1013,7 @@ Durable transaction latency remains part of the cold Reserve/registration path. 
 
 #### Deletion and cleanup
 
-FoundationDB owns physical value/version reclamation. Registry does not run peer snapshot repair or a local replica tombstone compactor. Domain deletion uses complete expected versions and exact ownership. Node-owned terminal retention and bounded, claim-fenced reaping determine which business records may be removed; storage cleanup does not invent a new lifecycle TTL.
+Databases own physical storage reclamation. Domain deletion uses complete expected versions and exact ownership; Node retention and bounded claim-fenced reaping decide which business records may be removed. Shared revision cells survive logical deletion to prevent ABA and must not be reclaimed by an arbitrary TTL. See the [history and revision retention boundary](cluster-storage.md#shared-implementation-and-engine-contract).
 
 <a id="registry-membership-changes"></a>
 
@@ -1019,7 +1021,7 @@ FoundationDB owns physical value/version reclamation. Registry does not run peer
 
 The existing active/next/old_grace sequence controls service discovery, node-link affinity and peer availability. During active/next overlap, clients and `ConnectionOwners` use the configured candidate views; after cutover, old_grace peers may still receive commands for streams they already hold. A new connection uses current owner candidates.
 
-This sequence does not move metadata, establish database write quorums or copy group/node snapshots. All members continue to access the same FoundationDB database and prefix. FoundationDB topology, redundancy and backup/restore are managed independently of Registry membership. The configuration reload guard still requires the controlled active → next → active transition so connection routing remains coherent.
+This sequence does not move metadata, establish database write quorums or copy group/node snapshots. Shared-backend peers continue to access the same database and namespace. Database topology, redundancy and backup/restore are independent of Registry membership. SQLite rejects multi-member configurations. The reload guard retains the controlled active → next → active transition.
 
 <a id="router-membership"></a>
 

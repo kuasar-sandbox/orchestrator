@@ -12,12 +12,12 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 )
 
-// Fixture stamps model both parts of the committed version. Production versions
-// come only from the storage record, never from a client-side counter.
-func routeVersionForTest(commit uint64, batch uint16) metadata.Version {
+// Fixture revisions exercise all ten bytes, including carry in the low bytes.
+// Production versions come from the stored record, not a client-side counter.
+func routeVersionForTest(high uint64, low uint16) metadata.Version {
 	var version metadata.Version
-	binary.BigEndian.PutUint64(version[:8], commit)
-	binary.BigEndian.PutUint16(version[8:], batch)
+	binary.BigEndian.PutUint64(version[:8], high)
+	binary.BigEndian.PutUint16(version[8:], low)
 	return version
 }
 
@@ -28,7 +28,7 @@ func versionedRouteForTest(version metadata.Version, node, state string) routeRe
 	}
 }
 
-func TestRouteVersionWirePreservesCompleteStamp(t *testing.T) {
+func TestRouteVersionWirePreservesFullRevision(t *testing.T) {
 	want := versionedRouteForTest(routeVersionForTest(0x0102030405060708, 0xfffe), "stable-g1", "ready")
 	encoded, err := json.Marshal(reserveResult{Route: want})
 	if err != nil {
@@ -46,7 +46,7 @@ func TestRouteVersionWirePreservesCompleteStamp(t *testing.T) {
 	}
 }
 
-func TestRouteVersionWireRejectsMissingOrInvalidCommit(t *testing.T) {
+func TestRouteVersionWireRejectsMissingOrInvalidRevision(t *testing.T) {
 	for _, field := range []string{
 		"",
 		`,"route_revision":9`,
@@ -93,7 +93,7 @@ func TestRouteLinkRejectsUnversionedSuccessfulResponse(t *testing.T) {
 	}
 }
 
-func TestRouteCacheOrdersTransactionsWithinOneCommitVersion(t *testing.T) {
+func TestRouteCacheOrdersLowRevisionBytes(t *testing.T) {
 	rt := &Router{cache: map[string]*routeResolve{}}
 	old := versionedRouteForTest(routeVersionForTest(100, 255), "stable-g0", "ready")
 	fresh := versionedRouteForTest(routeVersionForTest(100, 256), "stable-g1", "ready")
@@ -102,7 +102,7 @@ func TestRouteCacheOrdersTransactionsWithinOneCommitVersion(t *testing.T) {
 	rt.rememberRoute(&old)
 	got := rt.cachedRoute("/g", "rk", "stable")
 	if got == nil || got.RouteRevision != fresh.RouteRevision || got.NodeSandboxID != fresh.NodeSandboxID {
-		t.Fatalf("late transaction replaced newer batch order: %+v", got)
+		t.Fatalf("late response replaced newer revision: %+v", got)
 	}
 }
 

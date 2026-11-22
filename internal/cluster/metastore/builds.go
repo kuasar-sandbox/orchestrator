@@ -1,25 +1,22 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"context"
-	"encoding/binary"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func (s *Store) buildScope(group string) fdb.Key { return s.key("builds", group) }
-func (s *Store) buildKey(key metadata.BuildKey) fdb.Key {
+func (s *Store) buildScope(group string) records.Key { return s.key("builds", group) }
+func (s *Store) buildKey(key metadata.BuildKey) records.Key {
 	return mainKey(s.buildScope(key.Group), key.BuildID)
 }
-func (s *Store) templateScope(group, templateID string) fdb.Key {
+func (s *Store) templateScope(group, templateID string) records.Key {
 	return s.key("build-template", group, templateID)
 }
-func (s *Store) buildIndexKey(v metadata.BuildRecord) fdb.Key {
+func (s *Store) buildIndexKey(v metadata.BuildRecord) records.Key {
 	return mainKey(s.templateScope(v.Group, v.TemplateID), v.BuildID)
 }
 func (s *Store) putBuild(m *mutation, current metadata.Versioned[metadata.BuildRecord], value metadata.BuildRecord) error {
@@ -43,7 +40,7 @@ func (s *Store) ReadBuild(ctx context.Context, key metadata.BuildKey) (out metad
 	if err = validateParts(key.Group, key.BuildID); err != nil {
 		return
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		var e error
 		out, e = readTyped[metadata.BuildRecord](tr, s.buildKey(key))
 		if e == nil && out.Exists && (out.Value.Group != key.Group || out.Value.BuildID != key.BuildID) {
@@ -294,68 +291,48 @@ func (s *Store) ListBuildsByTemplate(ctx context.Context, group, templateID stri
 	if err != nil {
 		return out, err
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		out = metadata.Page[metadata.Versioned[metadata.BuildRecord]]{}
-		bounds := rangeFor(scope)
-		begin := fdb.FirstGreaterOrEqual(scope)
-		if last != nil {
-			begin = fdb.FirstGreaterThan(last)
+		page, err := tr.Scan(scope, last, pageLimit(limit))
+		if err != nil {
+			return err
 		}
-		rows := tr.GetRange(fdb.SelectorRange{Begin: begin, End: fdb.FirstGreaterOrEqual(bounds.End)}, fdb.RangeOptions{Limit: limit + 1, Mode: fdb.StreamingModeSmall}).Iterator()
 		used := 0
-		var previous fdb.Key
-		for rows.Advance() {
-			row, err := rows.Get()
-			if err != nil {
-				return err
-			}
-			if len(out.Items) == limit {
-				out.Next = encodeCursor(scope, previous)
-				break
-			}
-			index, err := decodeRecord(tr, row.Key, row.Value)
-			if err != nil {
-				return err
-			}
-			pointer, err := typed[metadata.BuildKey](index)
+		var previous records.Key
+		for _, item := range page.Items {
+			pointer, err := typed[metadata.BuildKey](wrapRecord(item.Value))
 			if err != nil {
 				return err
 			}
 			if pointer.Value.Group != group {
 				return invalidRecord("build index scope")
 			}
-			key := s.buildKey(pointer.Value)
-			raw, err := tr.Get(key).Get()
+			target, err := tr.Get(s.buildKey(pointer.Value))
 			if err != nil {
 				return err
 			}
-			if _, err = recordStamp(raw); err != nil {
-				return err
-			}
-			if raw == nil {
+			if !target.Exists {
 				return invalidRecord("missing build index target")
 			}
-			size := binary.BigEndian.Uint64(raw[11:19])
-			if len(out.Items) > 0 && uint64(used)+size > maxPageBytes {
+			if len(out.Items) > 0 && used+len(target.Payload) > maxPageBytes {
 				out.Next = encodeCursor(scope, previous)
-				break
+				return nil
 			}
-			record, err := decodeRecord(tr, key, raw)
+			value, err := typed[metadata.BuildRecord](wrapRecord(target))
 			if err != nil {
 				return err
 			}
-			value, err := typed[metadata.BuildRecord](record)
-			if err != nil {
-				return err
-			}
-			if !value.Exists || value.Value.TemplateID != templateID {
-				return invalidRecord("build index target")
+			if value.Value.Group != group || value.Value.TemplateID != templateID || value.Value.BuildID != pointer.Value.BuildID {
+				return invalidRecord("build index target identity")
 			}
 			out.Items = append(out.Items, value)
-			used += len(record.payload)
-			previous = row.Key
+			used += len(target.Payload)
+			previous = item.Key
+		}
+		if page.More && previous != nil {
+			out.Next = encodeCursor(scope, previous)
 		}
 		return nil
 	})
-	return out, err
+	return
 }

@@ -1,5 +1,3 @@
-//go:build fdb && cgo
-
 package main
 
 import (
@@ -24,7 +22,6 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/orchestrator/internal/fdbdriver"
 	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -55,10 +52,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	database, err := fdbdriver.Open(fdbdriver.Options{
-		ClusterFile: cfg.FoundationDB.ClusterFile,
-		Prefix:      cfg.FoundationDB.Prefix,
-	})
+	database, err := openMetadataDatabase(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("registry metadata database: %w", err)
 	}
@@ -201,6 +195,9 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	}
 	if old.FoundationDB != next.FoundationDB {
 		return fmt.Errorf("registry reload: foundationdb connection changes require restart")
+	}
+	if old.Storage != next.Storage {
+		return fmt.Errorf("registry reload: metadata storage changes require restart")
 	}
 	if old.Member.ID != next.Member.ID {
 		return fmt.Errorf("registry reload: member.id change requires restart")

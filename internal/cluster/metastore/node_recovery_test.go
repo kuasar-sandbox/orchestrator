@@ -1,19 +1,24 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"context"
 	"errors"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"reflect"
 	"testing"
-
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 )
 
-func TestNativeExpiredNodeProfilesBoundedPaging(t *testing.T) {
-	s := nativeStore(t)
+func TestExpiredNodeRecovery(t *testing.T) {
+	for name, factory := range backendCases {
+		t.Run(name, func(t *testing.T) {
+			create := func(t *testing.T) *testStore { return newBackendStore(t, factory(t)) }
+			t.Run("bounded_pages", func(t *testing.T) { runExpiredNodeProfilesBoundedPaging(t, create) })
+			t.Run("original_claim", func(t *testing.T) { runExpiredNodeClaimConflicts(t, create) })
+		})
+	}
+}
+func runExpiredNodeProfilesBoundedPaging(t *testing.T, newTestStore func(*testing.T) *testStore) {
+	s := newTestStore(t)
 	ctx := context.Background()
 	for _, value := range []metadata.NodeProfileRecord{
 		{NodeID: "a-fresh", LastHeartbeatUnix: 11},
@@ -69,10 +74,10 @@ func TestNativeExpiredNodeProfilesBoundedPaging(t *testing.T) {
 	}
 }
 
-func TestNativeExpiredNodeClaimConflictsWithConcurrentHeartbeatOrReconnect(t *testing.T) {
+func runExpiredNodeClaimConflicts(t *testing.T, newTestStore func(*testing.T) *testStore) {
 	for _, mode := range []string{"heartbeat", "reconnect"} {
 		t.Run(mode, func(t *testing.T) {
-			s := nativeStore(t)
+			s := newTestStore(t)
 			peer := companion(t, s)
 			ctx := context.Background()
 			old, err := s.Register(ctx, metadata.Version{}, metadata.NodeProfileRecord{NodeID: "node", LinkOwner: "registry", LastHeartbeatUnix: 1})
@@ -83,7 +88,7 @@ func TestNativeExpiredNodeClaimConflictsWithConcurrentHeartbeatOrReconnect(t *te
 				t.Fatal("expected one stale candidate")
 			}
 			updated := false
-			s.beforeCommit = func(int, fdb.Transaction) error {
+			s.beforeRetry = func() error {
 				if updated {
 					return nil
 				}
@@ -98,7 +103,7 @@ func TestNativeExpiredNodeClaimConflictsWithConcurrentHeartbeatOrReconnect(t *te
 				return err
 			}
 			_, err = s.BeginReap(ctx, "node", page.Items[0].Version)
-			s.beforeCommit = nil
+			s.beforeRetry = nil
 			if !updated || !errors.Is(err, metadata.ErrConflict) {
 				t.Fatalf("concurrent %s did not fence claim: updated=%v err=%v", mode, updated, err)
 			}

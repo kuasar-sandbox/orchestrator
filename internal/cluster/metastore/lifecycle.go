@@ -1,10 +1,8 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
 type lifecycle struct {
@@ -14,9 +12,11 @@ type lifecycle struct {
 	Reaping   bool             `json:"reaping"`
 }
 
-func (s *Store) profileKey(nodeID string) fdb.Key   { return mainKey(s.key("node-profile"), nodeID) }
-func (s *Store) lifecycleKey(nodeID string) fdb.Key { return mainKey(s.key("node-lifecycle"), nodeID) }
-func (s *Store) reapingKey(nodeID string) fdb.Key   { return mainKey(s.key("node-reaping"), nodeID) }
+func (s *Store) profileKey(nodeID string) records.Key { return mainKey(s.key("node-profile"), nodeID) }
+func (s *Store) lifecycleKey(nodeID string) records.Key {
+	return mainKey(s.key("node-lifecycle"), nodeID)
+}
+func (s *Store) reapingKey(nodeID string) records.Key { return mainKey(s.key("node-reaping"), nodeID) }
 func lifeFence(value metadata.Versioned[lifecycle]) metadata.Version {
 	if value.Value.Fence.IsZero() {
 		return value.Version

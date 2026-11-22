@@ -1,20 +1,18 @@
-//go:build fdb && cgo
-
-package fdbdriver
+package metastore
 
 import (
 	"context"
 
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
-func (s *Store) sandboxOwnerScope(nodeID string) fdb.Key { return s.key("sandbox-owner", nodeID) }
-func (s *Store) sandboxOwnerKey(nodeID, sandboxID string) fdb.Key {
+func (s *Store) sandboxOwnerScope(nodeID string) records.Key { return s.key("sandbox-owner", nodeID) }
+func (s *Store) sandboxOwnerKey(nodeID, sandboxID string) records.Key {
 	return mainKey(s.sandboxOwnerScope(nodeID), sandboxID)
 }
-func (s *Store) buildOwnerScope(nodeID string) fdb.Key { return s.key("build-owner", nodeID) }
-func (s *Store) buildOwnerKey(nodeID, buildID string) fdb.Key {
+func (s *Store) buildOwnerScope(nodeID string) records.Key { return s.key("build-owner", nodeID) }
+func (s *Store) buildOwnerKey(nodeID, buildID string) records.Key {
 	return mainKey(s.buildOwnerScope(nodeID), buildID)
 }
 func (s *Store) ensureSandbox(m *mutation, nodeID string, ref metadata.NodeSandboxRef) error {
@@ -74,7 +72,7 @@ func (s *Store) ReadSandboxOwner(ctx context.Context, nodeID, sandboxID string) 
 	if err = validateParts(nodeID, sandboxID); err != nil {
 		return
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		var e error
 		out, e = readTyped[metadata.NodeSandboxRef](tr, s.sandboxOwnerKey(nodeID, sandboxID))
 		if e == nil && out.Exists {
@@ -91,7 +89,7 @@ func (s *Store) ReadBuildOwner(ctx context.Context, nodeID, buildID string) (out
 	if err = validateParts(nodeID, buildID); err != nil {
 		return
 	}
-	err = s.read(ctx, func(tr fdb.Transaction) error {
+	err = s.read(ctx, func(tr *records.Tx) error {
 		var e error
 		out, e = readTyped[metadata.NodeBuildRef](tr, s.buildOwnerKey(nodeID, buildID))
 		if e == nil && out.Exists && (out.Value.BuildID != buildID || out.Value.Group == "") {
@@ -128,7 +126,7 @@ func (s *Store) EnsureBuildOwner(ctx context.Context, nodeID string, ref metadat
 	})
 	return err
 }
-func (s *Store) removeOwner(ctx context.Context, key fdb.Key, expected metadata.Version) error {
+func (s *Store) removeOwner(ctx context.Context, key records.Key, expected metadata.Version) error {
 	_, err := s.mutate(ctx, func(m *mutation) (bool, error) {
 		current, err := m.expect(key, expected)
 		if err != nil || !current.exists {
