@@ -1,0 +1,19 @@
+{
+  "command": [
+    "python3",
+    "/mnt/d/CodexTaskData/storage-engine-pr563-20261122/run_with_databases.py",
+    "python3",
+    "scripts/with-test-fdb.py",
+    "--",
+    "python3",
+    "scripts/cluster-native.py",
+    "test",
+    "--arch",
+    "x86_64",
+    "--",
+    "-race",
+    "-count=1"
+  ],
+  "exit_code": 0,
+  "seconds": 51.087
+}

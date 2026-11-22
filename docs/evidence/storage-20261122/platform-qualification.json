@@ -1,0 +1,210 @@
+{
+  "platform_pr": 426,
+  "run_id": 44992663426,
+  "run_url": "https://github.com/kuasar-sandbox/kuasar-sandbox/actions/runs/44992663426",
+  "platform_head": "4fdcbfe89614266dcb14677c9185ae0ac6033886",
+  "platform_base": "d0273490cf5551abce945d1a7ad6ee5c38173e4a",
+  "platform_candidate": "f0a9be6007d29f181643d41351f539beb6e713a3",
+  "companion_head": "377de1e327575d563406a690c44a5128a6332519",
+  "companion_candidate": "6517130798f5856a881e1bf4038faa2c322a4c11",
+  "merge_commit": "73e65ed7b08e39f15935525074703780eb45cd4e",
+  "head_and_merged_tree": "55faa1a482603f8035847ab2b30f468b85116522",
+  "jobs": [
+    {
+      "id": 137116908736,
+      "name": "ci / resolve",
+      "conclusion": "success"
+    },
+    {
+      "id": 137116909747,
+      "name": "ci",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 137117059593,
+      "name": "ci / source-checks (B)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137117059642,
+      "name": "ci / source-checks (A)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137117059741,
+      "name": "ci / aarch64 / build",
+      "conclusion": "success"
+    },
+    {
+      "id": 137117059761,
+      "name": "ci / x86_64 / build",
+      "conclusion": "success"
+    },
+    {
+      "id": 137117060338,
+      "name": "ci / workbench-release (${{ matrix.arch }}, ${{ matrix.group }})",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 137117060432,
+      "name": "ci / workbench-native",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 137119343982,
+      "name": "ci / aarch64 / prepare",
+      "conclusion": "success"
+    },
+    {
+      "id": 137119482874,
+      "name": "ci / x86_64 / prepare",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335293,
+      "name": "ci / aarch64 / e2e (supplemental-arm--image)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335310,
+      "name": "ci / aarch64 / e2e (hosted-arm--telemetry)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335312,
+      "name": "ci / aarch64 / e2e (supplemental-arm--snapshot)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335314,
+      "name": "ci / aarch64 / e2e (supplemental-arm--orchestrator)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335349,
+      "name": "ci / aarch64 / e2e (hosted-arm--basic)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335363,
+      "name": "ci / aarch64 / e2e (supplemental-arm--network)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335367,
+      "name": "ci / aarch64 / e2e (hosted-arm--network)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335374,
+      "name": "ci / aarch64 / e2e (supplemental-arm--basic)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335376,
+      "name": "ci / aarch64 / e2e (hosted-arm--builder)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335403,
+      "name": "ci / aarch64 / e2e (supplemental-arm--telemetry)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335407,
+      "name": "ci / aarch64 / e2e (hosted-arm--orchestrator)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335409,
+      "name": "ci / aarch64 / e2e (supplemental-arm--sandbox)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335426,
+      "name": "ci / aarch64 / e2e (hosted-arm--storage)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335432,
+      "name": "ci / aarch64 / e2e (hosted-arm--image)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120335474,
+      "name": "ci / aarch64 / e2e (supplemental-arm--builder)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120336456,
+      "name": "ci / aarch64 / performance",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 137120496660,
+      "name": "ci / x86_64 / performance",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120496903,
+      "name": "ci / x86_64 / e2e (hosted-x86--basic)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120496959,
+      "name": "ci / x86_64 / e2e (hosted-x86--orchestrator)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497014,
+      "name": "ci / x86_64 / e2e (hosted-x86--image)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497017,
+      "name": "ci / x86_64 / e2e (hosted-x86--sandbox)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497018,
+      "name": "ci / x86_64 / e2e (hosted-x86--snapshot)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497019,
+      "name": "ci / x86_64 / e2e (hosted-x86--network)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497024,
+      "name": "ci / x86_64 / e2e (hosted-x86--builder)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497042,
+      "name": "ci / x86_64 / e2e (hosted-x86--storage)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137120497054,
+      "name": "ci / x86_64 / e2e (hosted-x86--telemetry)",
+      "conclusion": "success"
+    },
+    {
+      "id": 137126845091,
+      "name": "ci / x86_64 / result",
+      "conclusion": "success"
+    },
+    {
+      "id": 137132987356,
+      "name": "ci / aarch64 / result",
+      "conclusion": "success"
+    },
+    {
+      "id": 137133071210,
+      "name": "ci / finalize",
+      "conclusion": "success"
+    }
+  ],
+  "component_followup": "Remove merged companion and run against trusted platform main; final receipts go on proposal #566."
+}

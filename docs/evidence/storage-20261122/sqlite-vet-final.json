@@ -1,0 +1,9 @@
+{
+  "command": [
+    "go",
+    "vet",
+    "./internal/storage/sqlengine"
+  ],
+  "exit_code": 0,
+  "seconds": 8.975
+}

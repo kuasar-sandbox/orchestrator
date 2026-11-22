@@ -1,8 +1,9 @@
 # Storage refactor acceptance, 2026-11-22
 
-This report covers the shared storage stage of orchestrator PR #563. It does not
-claim that the subsequent Node-owned Group/create-accept-close redesign is
-implemented, or that the PR has passed combined hosted delivery acceptance.
+This report covers the storage replacement and shared storage stages of
+[proposal #566](https://github.com/kuasar-sandbox/orchestrator/issues/566) and
+orchestrator PR #563. The subsequent Node-owned Group/create-accept-close
+redesign remains a separate stage. Hosted delivery status is recorded below.
 
 ## Implementation and source identity
 
@@ -10,8 +11,11 @@ The implementation under test is `f1cd0c5e99b170c04094a785c3d07699f31041d5`
 (tree `36a645311cd6faae920f853c1a2064f06a939b2e`). It follows merge baseline
 `5c72e418c49bd333e312b10fba1000d7c0d918b3`, which combines the previous PR head
 `22314ae768a1cb87895395a4c3f155ba0d4dd6b8` and main
-`e1e34f99f7421bbb1ab3ff5226eeb8f7f1b45026`. Later changes in this delivery add
-this report, evidence and an observation-admission regression test.
+`e1e34f99f7421bbb1ab3ff5226eeb8f7f1b45026`. The final code under test is
+`377de1e327575d563406a690c44a5128a6332519`, which also adds an
+observation-admission regression and fixes SQLite handle identity when a new
+database is opened through a symlinked directory. Documentation and evidence
+updates do not change these tested production sources.
 
 | Requirement | Delivered behavior |
 |---|---|
@@ -85,12 +89,80 @@ files and readable prior caches supplied an offline file proxy, with normal
 Go checksum verification retained and a new writable task cache. No shared
 Docker configuration or original checkout was changed. The final ARM run
 executes on the target architecture; it is not a cross-build-only result.
-All 2,376 Go/module/native-harness input files match the WSL source manifest.
+All 2,377 Go/module/native-harness input files match the WSL source manifest
+for the final code. After the SQLite alias fix, the complete native three-backend
+race suite passed again on x86_64 and aarch64; both ARM binary variants and the
+bundled launcher were rebuilt and checked.
 Native and pure-Go binary hashes are recorded separately; these workspace
 builds do not embed a VCS revision, so provenance comes from the source
 manifests, recorded build inputs and artifact hashes.
 
-## Paired performance results
+## Historical shardkv to first FDB comparison
+
+The historical paired business-path measurements ran on 2026-11-20. The old
+side is `c4a6f534ec412710aaf0f24ef35815a449c8cdbe` plus benchmark fixtures; the
+FDB binary was built from `dc2d06b9d517403f2ff658bc404d8aca349298fa` plus fixtures.
+A preserved source-equivalence receipt associates its 862 tracked Go files with
+the then-final `5841d20e43f670f31e0dbd485c130cd636bcbb54` without mismatches.
+Both benchmark builds report modified workspaces. These are historical
+measurements, not a retest of `22314ae`, `377de1e` or the current shared engine.
+
+The task re-read all 16 raw results, verified their hashes against their run
+receipts, and verified both binary hashes and the source-equivalence receipt.
+The compact [historical receipt](evidence/storage-20261122/historical-performance-receipt.json)
+retains parameters, successes, failures, drops, latency statistics and original
+result hashes. Full raw records and invocation logs are retained in the task
+evidence; the original remote files were not modified.
+
+Both sides used Go 1.26.4, `GOMAXPROCS=16`, real Registry/Router HTTP paths and
+fixed Placer/auth/Node ACK/READY fixtures. No real VM creation or full image
+build was measured. The old protocol used volatile memory with a 2/2 quorum
+between x86 and ARM. FDB 7.3.77 used eight processes across those two hosts,
+`double` redundancy and `ssd-redwood-1` storage. Its before/after status recorded
+two storage and two log roles, full recovery and two remaining replicas. This
+is not an equal-durability or equal-resource pure-engine comparison. FDB storage
+processes had 32 GiB memory / 24 GiB cache limits; other processes had 8 GiB /
+512 MiB limits. The test used a 0.02 available-space ratio with a separate
+15 GiB free-space guard. No fsync/AIO-disabling option appeared in the saved
+startup arguments. These settings are not measured RSS or a hardware IOPS claim.
+
+The closed-loop comparison used concurrency 8, 20 sequential warmup requests,
+one excluded trace request and 100 measured requests per path, all successful.
+READY delay was 2 ms. Latencies below are milliseconds.
+
+| Path | Old p50 / p99 | First FDB p50 / p99 |
+|---|---:|---:|
+| Hot resolve | 0.817 / 2.134 | 0.680 / 3.067 |
+| Cold resolve | 19.542 / 27.294 | 4.271 / 16.256 |
+| Create | 383.032 / 471.290 | 38.258 / 48.947 |
+| Build registration | 351.754 / 415.634 | 28.518 / 47.300 |
+
+Fixed-arrival runs used 20 seconds of warmup, a 60-second measured window,
+at most 256 requests in flight, no queue and a 10 ms launch-lag limit.
+
+| Offered workload | Old successes | First FDB successes | Old successful scheduled p99 | First FDB scheduled p99 |
+|---|---:|---:|---:|---:|
+| Cold resolve, 1,000/s | 46,032 / 60,000 | 60,000 / 60,000 | 720.119 ms | 5.781 ms |
+| Create, 100/s | 0 / 6,000 | 6,000 / 6,000 | No successful sample | 50.073 ms |
+| Build, 100/s | 45 / 6,000 | 6,000 / 6,000 | 19,995.122 ms; only 45 samples | 34.725 ms |
+
+The old cold run dropped 44 late and 13,924 capacity-limited arrivals. Old Create
+had 768 failed calls, 14 late drops and 5,218 capacity drops; old Build had 846
+failed calls, one late drop and 5,108 capacity drops. FDB cold warmup also dropped
+44 of 20,000 arrivals for capacity, despite its successful measured window.
+Neither the historical 5 ms cold-read comparison line nor the 20 ms write line
+was met. The hot-path p99 also increased. These outcomes must not be described
+as an unconditional performance or SLO pass.
+
+For the separate single-Group preload case, the old side completed 1,064 Put
+operations and failed on attempt 1,065 before measurement. FDB completed 10,000
+Put/CAS operations and then 100 successful Create requests with p99 54.172 ms.
+Those preloaded objects were Reserved Route rows, not running sandboxes or a
+complete set of ownership references. The old snapshot-size boundary explains
+the observed failure path, but the original underlying HTTP status was not
+retained. This is not a ten-million-object capacity test.
+
+## First FDB to shared storage comparison
 
 The control is the typed FDB implementation at `5c72e41`, with only the identical
 public-repository benchmark fixture added. The new side is clean `f1cd0c5`.
@@ -132,10 +204,11 @@ comparison.
 
 These serial microbenchmarks do not establish production concurrency,
 high-availability behavior, scheduled-arrival tail latency or ten-million-object
-capacity. The earlier custom-shardkv comparison belongs to an older source
-snapshot and is not reused as evidence for this head.
+capacity. The historical comparison above and this same-fixture comparison
+answer different questions; their percentages must not be composed into an
+old-shardkv-to-current-head performance claim.
 
-## Delivery and remaining acceptance boundary
+## Delivery qualification and integration order
 
 See [storage configuration and contracts](cluster-storage.md) for schema v2,
 limits and deployment rules. There is no silent migration from the experimental
@@ -143,9 +216,10 @@ FDB layout. Hidden revision cells grow with distinct identities and require an
 explicit history boundary before reclamation.
 
 The independent platform native-runtime PR
-[#426](https://github.com/kuasar-sandbox/kuasar-sandbox/pull/426) remains open.
-Trusted platform main `d0273490cf5551abce945d1a7ad6ee5c38173e4a` does not contain
-`ci/integration/cluster-native-runtime.json`.
+[#426](https://github.com/kuasar-sandbox/kuasar-sandbox/pull/426) was squash-merged
+as `73e65ed7b08e39f15935525074703780eb45cd4e` after successful qualification.
+The previous trusted platform main `d0273490cf5551abce945d1a7ad6ee5c38173e4a`
+did not contain `ci/integration/cluster-native-runtime.json`.
 [Hosted run 44987177560](https://github.com/kuasar-sandbox/orchestrator/actions/runs/44987177560)
 failed all three cluster E2E cases on both architectures because the prepared
 products lacked `run-cluster-ctl`. One x86 MMDS recovery case also encountered a
@@ -156,18 +230,55 @@ not a storage-conformance failure or a passing combined run.
 Published aggregate `release-v0.2.0-preview.20261122` now contains the needed SDK
 baseline. The obsolete exact #563 cutover is removed from refreshed platform
 PR #426; reciprocal companions use the existing current-source-set validation
-without a dependency-policy exception. Combined premerge verification is pending.
-Platform must qualify and merge first, then the remaining component must remove
-the merged companion and rerun against trusted platform main. Neither PR nor an
-issue is closed by this report.
+without a dependency-policy exception.
+
+[Platform run 44992663426](https://github.com/kuasar-sandbox/kuasar-sandbox/actions/runs/44992663426)
+passed both source gates, both builds/preparations, all 95 selected E2E cases on
+each architecture, the x86 performance smoke and `ci / finalize`. It tested
+platform head `4fdcbfe89614266dcb14677c9185ae0ac6033886` through candidate/framework
+`f0a9be6007d29f181643d41351f539beb6e713a3`, with orchestrator head `377de1e` through
+candidate `6517130798f5856a881e1bf4038faa2c322a4c11`. The three cluster cases and
+MMDS recovery passed on both architectures. Exact per-case results, selected
+sources, provenance hashes and declared exclusions are retained in
+[x86 results](evidence/storage-20261122/platform-hosted-x86.json) and
+[ARM results](evidence/storage-20261122/platform-hosted-arm.json).
+
+This source-lane plan excludes four node-infra cases that require staged release
+assets and credentialed OBS. Local node-infra library staging verification below
+does not claim a full deployment run. The subsequent upper protocol design,
+production HA/scale qualification and automated data migration remain outside
+this delivery.
+
+After platform merge, the remaining component removes the merged companion and
+runs against trusted platform main. Its final exact CI and merge receipts must
+be attached to proposal #566 before that issue is closed; the paired platform
+result alone does not replace the component's own finalization gate.
+
+Component run `44992656729` retained the same old trusted platform framework.
+After both source gates and architecture builds/preparations passed, it was
+cancelled to release shared ARM capacity for platform qualification. Its retained
+logs again show all three cluster cases missing `run-cluster-ctl` on both
+architectures before cancellation; cancelled jobs and their failing aggregate
+checks are not counted as a pass.
 
 Premerge review reproduced a SQLite handle-alias bug: creating a database through
 a symlinked parent and reopening its real path split the shared admission budget
 (`first=1`, `second=0`). Canonicalization now happens after private file creation.
 The regression verifies shared admission, reservation reclamation and a surviving
-handle after closing its alias. The complete SQLite engine suite passed with the
-race detector after this startup-only change; the measured transaction paths and
+handle after closing its alias. The complete native suites passed on both
+architectures after this startup-only change; the measured transaction paths and
 the FDB before/after benchmark inputs remain unchanged.
+
+Platform `4fdcbfe89614266dcb14677c9185ae0ac6033886` also passed local
+`test-ci-tools`, `test-release-tools` and `test-perf-tools`. The CI-tools suite
+used the pinned EROFS 1.9.1 readers; initial attempts exposed missing Rust and
+an older system reader without `--cat`, and passed after matching the documented
+toolchain. No product assertions were weakened. An actual x86 native package
+with 19 runtime attachments passed ELF/ABI/hash admission, component and
+aggregate extraction, source collection, sealed public E2E preparation, the
+public runner's bundled launcher and Node infrastructure library staging.
+The [delivery receipt](evidence/storage-20261122/native-delivery-artifacts.json)
+records all artifact hashes and gate names.
 
 Final benchmark logs and receipts are under
 [`evidence/storage-20261122`](evidence/storage-20261122). Detailed local run logs,

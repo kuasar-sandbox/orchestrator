@@ -1,0 +1,9 @@
+FoundationDB 7.3 (v7.3.77)
+source version 3ea44ce1d9003ad095e408039e1f755c319c4dfb
+protocol fdb00b073000000
+test FoundationDB ready (7.3.77, single SSD; ordinary read/write checked)
+ok  	github.com/kuasar-sandbox/orchestrator/internal/fdbdriver	2.531s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	28.478s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/sqlengine	13.426s
+ok  	github.com/kuasar-sandbox/orchestrator/cmd/cluster-ctl	7.835s
+ok  	github.com/kuasar-sandbox/orchestrator/test/e2e/cluster_stub	5.534s

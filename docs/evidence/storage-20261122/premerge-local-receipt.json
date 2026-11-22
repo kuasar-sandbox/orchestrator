@@ -1,0 +1,49 @@
+{
+  "orchestrator_head": "377de1e327575d563406a690c44a5128a6332519",
+  "platform_head": "4fdcbfe89614266dcb14677c9185ae0ac6033886",
+  "source_files_verified_on_arm": 2377,
+  "arm_source_manifest_sha256": "ec4cff64d64245ae1bd274990b4b6daf2a25157e01817e6c02aaa5b4a3efd762",
+  "platform_ci_tools": {
+    "command": [
+      "env",
+      "PATH=/home/grayc/work/storage-engine-pr563-20261122/reader-tools/bin:/home/grayc/work/storage-engine-pr563-20261122/toolchain/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "KUASAR_RUNTIME_READER=/home/grayc/work/storage-engine-pr563-20261122/reader-tools/bin/runtime-payloads.py",
+      "make",
+      "-C",
+      "/home/grayc/work/storage-engine-pr563-20261122/platform",
+      "test-ci-tools"
+    ],
+    "exit_code": 0,
+    "seconds": 194.177
+  },
+  "platform_release_tools": {
+    "target": "test-release-tools",
+    "returncode": 0,
+    "seconds": 347.071,
+    "log": "/mnt/d/CodexTaskData/storage-engine-pr563-20261122/premerge/test-release-tools.log"
+  },
+  "platform_perf_tools": {
+    "target": "test-perf-tools",
+    "returncode": 0,
+    "seconds": 2.039,
+    "log": "/mnt/d/CodexTaskData/storage-engine-pr563-20261122/premerge/test-perf-tools.log"
+  },
+  "environment_corrections": [
+    "Install Rust for existing native-cache tests",
+    "Use pinned EROFS 1.9.1 readers required by existing artifact tests"
+  ],
+  "local_evidence_root": "D:\\CodexTaskData\\storage-engine-pr563-20261122\\premerge",
+  "files": {
+    "native-after-alias.log": "139fba914c3f84ed3152ab119fc3719fc71d7b1915638190b63420a47e0ff08e",
+    "native-after-alias.json": "8155b3db85f455cbdbdf8f12df36f101edbf788d473349f061d0c549cd592af0",
+    "native-arm-premerge.log": "ab26bb2c18839a4c64ddbd9f6acfda9f2b144fa0b292d8a29a31c41ded855a17",
+    "native-launcher-arm-premerge.log": "c2dbcee784c6a86eb26fe46dce6734910701d20e8d18c606b8328c4c2bbfc57f",
+    "arm-validation-final.json": "795f546cb798c071a2fc946299105d6dc630a3028c0477b25a40b08bb6c3a248",
+    "native-delivery-artifacts.json": "eed284dfaffe5e818e3e02965f729cd579f06786819dca0a9ba9b33eefcf26a8",
+    "native-delivery-final.log": "d231a11ad7ed5337d770e60cb9a8335922b4b7c51a6429e245b6488b257fd1a5",
+    "native-delivery-final.json": "060298f6efb99a1c4b8589d2924785d71ee642cfb4c91d8bd9cf8a0c2ce4404b",
+    "platform-ci-complete.json": "f9f1958bbd081244d191783e9069eb20cc0095bcc8fe15175a3aaca2b269d685",
+    "platform-artifacts-final.json": "7041e8b6fe9209e3d901b42168d60b046067bdf03cc002cc92cd839792f23c9b",
+    "sqlite-vet-final.json": "0350c567e8bef79c13f5211aa65f9e78e11cfd75ddd92360d35e8be3100b670e"
+  }
+}

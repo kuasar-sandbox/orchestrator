@@ -1,0 +1,11 @@
+{
+  "command": [
+    "env",
+    "PATH=/home/grayc/work/storage-engine-pr563-20261122/reader-tools/bin:/home/grayc/work/storage-engine-pr563-20261122/toolchain/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "KUASAR_RUNTIME_READER=/home/grayc/work/storage-engine-pr563-20261122/reader-tools/bin/runtime-payloads.py",
+    "python3",
+    "/home/grayc/work/storage-engine-pr563-20261122/platform/ci/integration/test-artifacts.py"
+  ],
+  "exit_code": 0,
+  "seconds": 21.207
+}

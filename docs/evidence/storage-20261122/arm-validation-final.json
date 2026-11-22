@@ -1,0 +1,33 @@
+{
+  "arch": "aarch64",
+  "started": 1795328095.5073798,
+  "go": "go version go1.26.8 linux/arm64",
+  "postgres_image": "sha256:be2f4eb4b9824567b746dcbee82ad8644c9920349d8e8f47153ddd70f98599a4",
+  "verified_source_files": 2377,
+  "orchestrator_head": "377de1e327575d563406a690c44a5128a6332519",
+  "native-arm-premerge": {
+    "exit_code": 0,
+    "log": "native-arm-premerge.log"
+  },
+  "purego-arm-premerge": {
+    "exit_code": 0,
+    "log": "purego-arm-premerge.log"
+  },
+  "native-build-arm-premerge": {
+    "exit_code": 0,
+    "log": "native-build-arm-premerge.log"
+  },
+  "native-launcher-arm-premerge": {
+    "exit_code": 0,
+    "log": "native-launcher-arm-premerge.log"
+  },
+  "purego": {
+    "sha256": "9ebc7f2677cb734b09153a1bd9fbee0f2dac4064e161de5e3d1a385b90a5692f",
+    "bytes": 42701543
+  },
+  "native": {
+    "sha256": "4dc7273619e2045084f60d2ba114a231b41f9ff5080eff9177bb719725560baf",
+    "bytes": 42296120
+  },
+  "finished": 1795328117.3936837
+}
