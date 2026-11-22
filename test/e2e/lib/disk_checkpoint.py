@@ -58,11 +58,12 @@ def fence_refs(metadata, report_path, held_path, directory, identity, baseline_p
     baseline = {(diff_id, original["checkpoint_id"]) for diff_id in ids}
     if baseline_path is not None:
         previous = json.loads(Path(baseline_path).read_text())
-        observed = {(ref["diff_id"], ref["id"]) for ref in previous}
+        observed = {(ref["diff_id"], ref["id"]) for ref in previous if ref.get("diff_id")}
         assert len(observed) == len(previous) and baseline <= observed, previous
         assert all(diff_id in ids and version != identity for diff_id, version in observed), previous
         baseline = observed
     expected = baseline | {(diff_id, identity) for diff_id in ids}
+    held = [ref for ref in held if ref.get("diff_id")]
     assert len(held) == len(expected) and {(ref["diff_id"], ref["id"]) for ref in held} == expected, (held, expected)
     return [{"diff_id": diff_id, "id": identity} for diff_id in ids]
 
@@ -249,7 +250,11 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
         receipts = [json.loads(path.read_text()) for path in Path(resource_socket + ".retained").glob("*.json")]
         exact = [item for item in receipts if item["sandbox_id"] == sid]
         assert len(exact) == 1, "managed capture did not retain a resource receipt"
-        receipt = exact[0]
+        account = exact[0]
+        entries = account.get("captures", [account])
+        matches = [item for item in entries if item["producer"] == producer and item["memory"]["memory_id"] == record["memory_id"]]
+        assert len(matches) == 1, "resource collection lost exact capture"
+        receipt = matches[0]
         assert receipt["producer"] == producer and receipt["checkpoint_id"] == record["checkpoint_id"], "resource producer changed"
         memory = receipt["memory"]
         assert memory["memory_id"] == record["memory_id"] and memory["epoch"] == record["epoch"], "resource memory generation changed"
@@ -261,9 +266,10 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
             assert row[3] and row[3] != producer["run_id"] and len(current) == 1, "resume did not obtain one new run and B"
             assert current[0]["peer_pid"] != record["holder"]["pid"] and current[0]["allocatable_memory"] > 0, current
         latest = memory_record(directory, locator)
-        if receipt.get("settled"):
+        if receipt.get("settled") or receipt["stage"] == "settled":
             assert latest["ram_released"], "R was released before the physical RAM fact"
-        projected = sum(item["memory"]["bytes"] for item in receipts if not item.get("settled") and item["stage"] != "prepared")
+        captures = [entry for item in receipts for entry in item.get("captures", [item])]
+        projected = sum(item["memory"]["bytes"] for item in captures if not item.get("settled") and item["stage"] not in ("prepared", "settled"))
         active = sum(item["allocatable_memory"] for item in rows)
         cache = sum(item.get("cache_allocated", 0) for item in pressure.get("pools", []))
         # Guest Budget and retained RAM share this pool. Host cache has its own
@@ -276,7 +282,9 @@ def managed_memory(database, sid, node_ctl, control_socket, resource_socket, log
             "memory_id": record["memory_id"], "checkpoint_id": record["checkpoint_id"],
             "runtime_retired": True, "parent_ack": True, "file_ready": latest["file_ready"],
             "ram_released": latest["ram_released"], "resource_stage": receipt["stage"],
-            "retained_bytes": 0 if receipt.get("settled") else memory["bytes"],
+            "retained_bytes": 0 if receipt.get("settled") or receipt["stage"] == "settled" else memory["bytes"],
+            "account_stage": account["stage"], "account_capture_count": len(entries),
+            "account_retained_bytes": sum(item["memory"]["bytes"] for item in entries if not item.get("settled") and item["stage"] not in ("prepared", "settled")),
             "active_bytes": sum(item["allocatable_memory"] for item in current),
             "node_reserved_bytes": pressure["reserved_memory"], "cache_allocated_bytes": cache,
             "source_pool": memory["source_pool"]}

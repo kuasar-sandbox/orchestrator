@@ -461,8 +461,9 @@ func (r *Registry) Stores() *Stores { return r.stores }
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
 type createOptions struct {
-	idleTimeout *int64
-	workspaces  []workspace.Entry
+	maxCheckpoints int
+	idleTimeout    *int64
+	workspaces     []workspace.Entry
 }
 
 // reserveCreate resolves (group, route_key) to a running sandbox, placing +
@@ -707,6 +708,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 	if _, found := createConfig[sandboxcfg.NsCredentials]; found {
 		return errors.New("registry: create credentials were not separated from config")
 	}
+	maxCheckpoints, err := retainedCheckpointLimit(opts.maxCheckpoints)
+	if err != nil {
+		return err
+	}
 	idleTimeout := types.CloneIdleTimeout(opts.idleTimeout)
 	workspaceDigest, err := workspace.InputDigest(opts.workspaces)
 	if err != nil {
@@ -732,6 +737,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		// original TTL capture policy together with its stable identity and
 		// materialized credentials instead of adopting a retrying Create body.
 		autoPauseMemory = replaceReady.AutoPauseMemory
+		maxCheckpoints, err = retainedCheckpointLimit(replaceReady.MaxCheckpoints)
+		if err != nil {
+			return err
+		}
 		idleTimeout = types.CloneIdleTimeout(replaceReady.IdleTimeout)
 		autoReset = replaceReady.AutoReset
 	}
@@ -780,6 +789,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			}
 			binding = cur
 			autoPauseMemory = cur.AutoPauseMemory
+			maxCheckpoints, err = retainedCheckpointLimit(cur.MaxCheckpoints)
+			if err != nil {
+				return err
+			}
 			idleTimeout = types.CloneIdleTimeout(cur.IdleTimeout)
 			autoReset = cur.AutoReset
 			if hasRouteCredentials(cur) {
@@ -860,8 +873,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if stableID != sandboxID {
 			return errors.New("registry: stable ID does not match SandboxID")
 		}
+		quota := maxCheckpoints
 		cmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
+			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID, MaxCheckpoints: &quota,
 			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config, Workspaces: opts.workspaces,
 			Cluster: &routesync.ClusterSandboxContext{
 				Group: group, RouteKey: routeKey, StableID: stableID,
@@ -889,7 +903,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			APISecretFingerprint: placement.APISecretFingerprint,
 			CreateCredentials:    cloneCreateCredentials(selectedCredentials), WorkspacesDigest: workspaceDigest,
 			TargetPort:      placement.TargetPort,
-			AutoPauseMemory: autoPauseMemory, IdleTimeout: types.CloneIdleTimeout(idleTimeout),
+			AutoPauseMemory: autoPauseMemory, IdleTimeout: types.CloneIdleTimeout(idleTimeout), MaxCheckpoints: maxCheckpoints,
 			AutoReset: autoReset,
 		}
 		copyRouteCredentials(reserved, selectedReplacement)
@@ -2042,4 +2056,13 @@ func fullFingerprint(secretHex string) string {
 	}
 	h := sha256.Sum256(raw)
 	return hex.EncodeToString(h[:])
+}
+
+// Before v12 the durable route omitted this field and the only legal quota was
+// one. Once RESERVED exists, retries/replacements keep its accepted policy.
+func retainedCheckpointLimit(value int) (int, error) {
+	if value == 0 {
+		return 1, nil
+	}
+	return types.ResolveMaxCheckpoints(&value)
 }

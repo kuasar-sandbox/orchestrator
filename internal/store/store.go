@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   auto_pause_memory    INTEGER NOT NULL DEFAULT 1,
  idle_timeout INTEGER,
  hold_value INTEGER CHECK(hold_value >= 0),
-  max_checkpoints      INTEGER NOT NULL DEFAULT 1 CHECK(max_checkpoints=1),
+  max_checkpoints      INTEGER NOT NULL DEFAULT 1 CHECK(typeof(max_checkpoints)='integer' AND max_checkpoints>0),
   launch_mode          TEXT NOT NULL DEFAULT '',
   service_secret_enc       TEXT NOT NULL,
   envd_access_token_enc    TEXT NOT NULL,
@@ -105,11 +105,12 @@ CREATE TABLE IF NOT EXISTS workspace_defaults (
   PRIMARY KEY(sandbox_id,name)
 );
 CREATE TABLE IF NOT EXISTS sandbox_checkpoints (
- sandbox_id TEXT PRIMARY KEY REFERENCES sandboxes(id) ON DELETE CASCADE,
+ sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
  checkpoint_id TEXT NOT NULL,
  source_kind TEXT NOT NULL,
  source_ref TEXT NOT NULL,
- sandbox_ref TEXT NOT NULL
+ sandbox_ref TEXT NOT NULL,
+ PRIMARY KEY(sandbox_id,checkpoint_id)
 );
 
 CREATE TABLE IF NOT EXISTS builds (
@@ -248,6 +249,10 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	if err := requireColumn(ctx, db, "builds", "instance_config_enc"); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := migrateCheckpointSchema(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate named checkpoints: %w", err)
 	}
 	if err := ensureColumn(ctx, db, "sandboxes", "workspace_plan_enc", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
@@ -670,8 +675,8 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	if sb.MaxCheckpoints == 0 {
 		sb.MaxCheckpoints = 1
 	}
-	if sb.MaxCheckpoints != 1 {
-		return nil, errors.New("max_checkpoints must be 1")
+	if sb.MaxCheckpoints < 1 {
+		return nil, errors.New("max_checkpoints must be a positive integer")
 	}
 	if sb.State == types.StateDead && sb.DeadUnix == 0 {
 		sb.DeadUnix = time.Now().Unix()
@@ -1241,6 +1246,9 @@ func (s *Store) CommitPausedWithRetirement(ctx context.Context, id, runID string
 		return changed, err
 	}
 	if checkpointID != "" {
+		if err := checkCheckpointQuota(ctx, tx, id); err != nil {
+			return false, err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO sandbox_checkpoints(sandbox_id,checkpoint_id,source_kind,source_ref,sandbox_ref) VALUES(?,?,?,?,?)`, id, checkpointID, string(source.Kind), source.Ref, source.SandboxRef); err != nil {
 			return false, fmt.Errorf("store: retain checkpoint: %w", err)
 		}

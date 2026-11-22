@@ -220,7 +220,7 @@ var ErrSandboxBusy = errors.New("sandbox is not idle")
 var ErrPreviousMemorySavePending = errors.New("previous checkpoint memory save is still pending; retry after it completes")
 var ErrPauseRunChanged = errors.New("sandbox run changed while waiting to pause")
 
-var ErrCheckpointLimit = errors.New("max_checkpoints=1 reached; export or delete the retained checkpoint first")
+var ErrCheckpointLimit = types.ErrCheckpointLimit
 
 // ErrSandboxStarting is returned when an operation such as Pause cannot run
 // until the accepted asynchronous launch reaches a terminal state.
@@ -350,7 +350,7 @@ type BuildLogEntry struct {
 type CreateReq struct {
 	Workspaces      []workspace.Entry `json:"-"`
 	AutoReset       bool              `json:"autoReset,omitempty"`
-	MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
+	MaxCheckpoints  *int              `json:"max_checkpoints,omitempty"`
 	TemplateID      string            `json:"templateID"`
 	TimeoutSec      int               `json:"timeout"`
 	Metadata        map[string]string `json:"metadata"`

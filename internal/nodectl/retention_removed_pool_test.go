@@ -53,7 +53,7 @@ func TestRetainedMemorySettledInventorySurvivesRemovedSourcePool(t *testing.T) {
 				t.Fatalf("settled historical pool prevented inventory startup: %v", err)
 			}
 			r := state.retainedSnapshot("sid")
-			if r == nil || !r.Settled || r.Capture != capture || r.Memory != before.Memory || r.OwnerFile != before.OwnerFile || r.OwnerToken != before.OwnerToken {
+			if r == nil || !(!r.pending()) || r.Captures[0].Capture != capture || r.Captures[0].Memory != before.Captures[0].Memory || r.OwnerFile != before.OwnerFile || r.OwnerToken != before.OwnerToken {
 				t.Fatal("restart lost settled replay or owner identity")
 			}
 			if _, pending := state.RetainedMemory("sid"); pending {
@@ -106,7 +106,7 @@ func TestRetainedMemoryUnsettledInventoryRequiresSourcePool(t *testing.T) {
 				t.Fatalf("unsettled source pool disappearance was accepted: %v", err)
 			}
 			r, err := readRetainedReceipt(retentionPath(srv.Identity, "sid"))
-			if err != nil || r.Settled || r.Stage != stage || r.Memory.SourcePool != "default" {
+			if err != nil || (!r.pending()) || (stage == retentionPrepared && r.Captures[0].Stage != retentionPrepared || stage == retentionHolding && r.Captures[0].Stage != retentionHeld) || r.Captures[0].Memory.SourcePool != "default" {
 				t.Fatalf("failed recovery rewrote source responsibility: %v", err)
 			}
 		})

@@ -65,6 +65,7 @@ type RouteResolve struct {
 // admits portable resource and traffic plus request-scoped restore, credentials, and
 // checkpoint namespaces into it.
 type SandboxReserveReq struct {
+	MaxCheckpoints  *int              `json:"max_checkpoints,omitempty"`
 	Workspaces      []workspace.Entry `json:"workspaces,omitempty"`
 	Config          map[string]string `json:"config,omitempty"`
 	IdleTimeout     *int64            `json:"idle_timeout,omitempty"`
@@ -275,7 +276,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "create reserve cannot select resume memory", http.StatusBadRequest)
 		return
 	}
-	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil || body.AutoReset != nil || body.IdleTimeout != nil) {
+	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil || body.AutoReset != nil || body.IdleTimeout != nil || body.MaxCheckpoints != nil) {
 		http.Error(w, "connect reserve contains create fields", http.StatusBadRequest)
 		return
 	}
@@ -292,7 +293,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		AccessToken:       req.Header.Get("X-Access-Token"),
 		Service:           req.Header.Get("E2b-Sandbox-Service"),
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
-		Config:            body.Config, Workspaces: body.Workspaces,
+		Config:            body.Config, Workspaces: body.Workspaces, MaxCheckpoints: body.MaxCheckpoints,
 		AutoPauseMemory: cloneOptionalBool(body.AutoPauseMemory), IdleTimeout: types.CloneIdleTimeout(body.IdleTimeout),
 		AutoReset: cloneOptionalBool(body.AutoReset),
 		Memory:    cloneOptionalBool(body.Memory),

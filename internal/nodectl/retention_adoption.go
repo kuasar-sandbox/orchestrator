@@ -61,7 +61,7 @@ func observeRetainedLease(path string) (retainedLeaseObservation, error) {
 // PID exit is one way to end a lease; an embedded SDK may close the candidate
 // while its process remains alive. Neither transport EOF nor an inspection
 // error proves that the attempt ended.
-func adoptionRecovery(socket string, r *retainedReceipt) *retainedReceipt {
+func adoptionRecovery(socket string, r *retainedAccount) *retainedAccount {
 	if r.Stage != retentionAdopting || r.Handoff == nil {
 		return r
 	}
@@ -83,6 +83,7 @@ func adoptionRecovery(socket string, r *retainedReceipt) *retainedReceipt {
 			out := cloneRetained(r)
 			out.OwnerLease, out.OwnerFile, out.OwnerToken = h.Lease, h.File, h.Token
 			out.Stage = retentionActive
+			out.Revision++
 			return out
 		}
 		// The exact published candidate has also ended. No ACK could have
@@ -98,12 +99,13 @@ func adoptionRecovery(socket string, r *retainedReceipt) *retainedReceipt {
 	// cannot be relocked/reused after the owner's lifecycle handle closes.
 	out := cloneRetained(r)
 	out.Stage, out.Handoff = retentionHolding, nil
+	out.Revision++
 	return out
 }
 
 // reconcileAdoption is independent of source RAM settlement. A completed R
 // may still have a failed, unacknowledged successor admission to clean up.
-func (i *Inventory) reconcileAdoption(state *State, r *retainedReceipt) (*retainedReceipt, error) {
+func (i *Inventory) reconcileAdoption(state *State, r *retainedAccount) (*retainedAccount, error) {
 	next := adoptionRecovery(i.ControllerSocket, r)
 	if next == r {
 		return r, nil
@@ -131,7 +133,7 @@ func (i *Inventory) reconcileAdoption(state *State, r *retainedReceipt) (*retain
 // An unpublished candidate is a distinct, live execution owner even though its
 // canonical lease still belongs to the retired producer. Only the persisted
 // handoff's complete identity can authorize recovery of this provisional B.
-func (i *Inventory) recoverRetainedCandidate(state *State, r *retainedReceipt, controlPIDs map[int]bool) error {
+func (i *Inventory) recoverRetainedCandidate(state *State, r *retainedAccount, controlPIDs map[int]bool) error {
 	if r.Stage != retentionAdopting || r.Handoff == nil {
 		return nil
 	}
@@ -177,13 +179,13 @@ func (i *Inventory) recoverRetainedCandidate(state *State, r *retainedReceipt, c
 	return nil
 }
 
-func (s *State) restoreRetainedCandidate(receipt *retainedReceipt, cacheMaximum uint64) error {
+func (s *State) restoreRetainedCandidate(receipt *retainedAccount, cacheMaximum uint64) error {
 	root := s.retentionOwner()
 	root.retentionMu.Lock()
 	defer root.retentionMu.Unlock()
 	r := root.retained[receipt.SandboxID]
 	if r == nil || r.Stage != retentionAdopting || r.Handoff == nil ||
-		!reflect.DeepEqual(r.Handoff, receipt.Handoff) || !sameCapture(r.Capture, receipt.Capture) {
+		!reflect.DeepEqual(r.Handoff, receipt.Handoff) || r.ID != receipt.ID {
 		return fmt.Errorf("retained candidate recovery intent changed")
 	}
 	h := r.Handoff
@@ -220,4 +222,29 @@ func (s *State) restoreRetainedCandidate(receipt *retainedReceipt, cacheMaximum 
 		root.bindings[r.SandboxID] = h.Pool
 	}
 	return nil
+}
+
+// Acceptance first runs the same atomic admission gates as ordinary B and
+// installs that charge, then persists its recoverable identity. No accepted
+// intent can sit between an R-only snapshot and a later unaccounted admission.
+// A failed inventory fsync is ambiguous: keep the exact B/handoff for replay or
+// candidate-close reconciliation. Failed admission never changes any R entry.
+func (s *State) acceptRetainedHandoff(next *retainedAccount, spec AdmitSpec, persist func() error) error {
+	root := s.retentionOwner()
+	root.retentionMu.Lock()
+	defer root.retentionMu.Unlock()
+	old := root.retained[next.SandboxID]
+	if old == nil || old.ID != next.ID || next.Revision != old.Revision+1 || next.Stage != retentionAdopting ||
+		next.Handoff == nil || old.Stage == retentionAdopting || old.prepared() != nil {
+		return fmt.Errorf("retained account changed before handoff acceptance")
+	}
+	h := next.Handoff
+	if spec.Token != h.Token || spec.PeerPID != h.Lease.PID || spec.InitialBudget != h.InitialBudget || spec.InitialCache != h.InitialCache || spec.RetainedAdoption != h.ID {
+		return fmt.Errorf("retained handoff Budget contract changed")
+	}
+	if _, _, err := root.admit(spec); err != nil {
+		return err
+	}
+	root.retained[next.SandboxID] = cloneRetained(next)
+	return persist()
 }

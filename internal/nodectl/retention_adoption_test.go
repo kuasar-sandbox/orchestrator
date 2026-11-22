@@ -33,8 +33,8 @@ func committedRetentionFixture(t *testing.T) (*Server, *memorycheckpoint.RecordW
 
 func adoptionCandidate(t *testing.T, srv *Server, capture resource.CaptureRetention, id string) (*resource.LeaseHandle, *Message) {
 	t.Helper()
-	lease := srv.State.retainedSnapshot("sid").Source
-	features := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(32 << 20)}
+	lease := srv.State.retainedSnapshot("sid").Captures[0].Source
+	features := []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2, resource.FeatureCacheBudgetV1, resource.CacheMaximumFeature(32 << 20)}
 	h, err := resource.CreateLeaseCandidate(resource.Lease{Version: resource.LeaseVersion, SandboxID: "sid", PID: os.Getpid(),
 		ControllerSocket: srv.Identity, CgroupPath: filepath.Join(filepath.Dir(lease.CgroupPath), id),
 		CapacityMemory: 1 << 30, CapacityCPUMilli: 1000, FloorMemory: 128 << 20, FloorCPUMilli: 500,
@@ -47,7 +47,7 @@ func adoptionCandidate(t *testing.T, srv *Server, capture resource.CaptureRetent
 	if err != nil {
 		t.Fatal(err)
 	}
-	return h, &Message{Type: resource.TypeAdoptRetained, SandboxID: "sid", Retention: &capture, HandoffID: id, LeaseCandidate: h.Path(),
+	return h, &Message{Type: resource.TypeAdoptRetained, SandboxID: "sid", Retention: &capture, RetainedAccount: srv.State.retainedSnapshot("sid").reference(), HandoffID: id, LeaseCandidate: h.Path(),
 		CapacityMemoryBytes: l.CapacityMemory, CapacityCPU: 1, FloorMemoryBytes: l.FloorMemory, FloorCPU: .5,
 		StartupBudgetMemory: l.StartupMemory, AllocatableAtSnapshot: 256 << 20, CgroupPath: l.CgroupPath,
 		ClientFeatures: features, CacheMaximum: 32 << 20, CacheInitial: 4 << 20}
@@ -91,8 +91,8 @@ func TestRetainedMemoryAdoptionClosedCandidateSamePIDRetries(t *testing.T) {
 				t.Fatal(err)
 			}
 			after := srv.State.retainedSnapshot("sid")
-			if after.Stage != retentionHolding || after.Handoff != nil || after.Settled != settled {
-				t.Fatalf("ended candidate did not recover to holding: stage=%s settled=%v", after.Stage, after.Settled)
+			if after.Stage != retentionHolding || after.Handoff != nil || (!after.pending()) != settled {
+				t.Fatalf("ended candidate did not recover to holding: stage=%s settled=%v", after.Stage, (!after.pending()))
 			}
 			wantR := uint64(256 << 20)
 			if settled {
@@ -340,7 +340,7 @@ func TestRetainedMemoryCandidateRecoveryKeepsSourceAndSuccessorPoolsSeparate(t *
 		}
 	}()
 	r := srv.State.retainedSnapshot("sid")
-	r.Memory.SourcePool, r.Source.ResourcePool, r.Handoff.Pool = "numa0", "numa0", "numa1"
+	r.Captures[0].Memory.SourcePool, r.Captures[0].Source.ResourcePool, r.Handoff.Pool = "numa0", "numa0", "numa1"
 	if err := writeRetainedReceipt(srv.Identity, r); err != nil {
 		t.Fatal(err)
 	}

@@ -30,6 +30,10 @@ type diskCheckpointPeer struct {
 
 func newDiskCheckpointFixture(t *testing.T, sid string) sandboxFinalizerFixture {
 	f := newSandboxFinalizerFixture(t, sid)
+	installExportCheckpointCleanup(t)
+	if err := os.MkdirAll(filepath.Join(f.sb.BaseDir, "checkpoint"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	f.o.cfg.Paths.RunRoot = shortOrchestratorTestDir(t)
 	f.sb.RunDir = nodepath.SandboxRunDir(f.o.cfg.Paths.RunRoot, sid)
 	if err := os.MkdirAll(f.sb.RunDir, 0700); err != nil {
@@ -88,6 +92,10 @@ func serveDiskCheckpointPeer(t *testing.T, sb *types.Sandbox) *diskCheckpointPee
 					}
 					_ = ctl.WriteCheckpointList(c, p.refs)
 				case ctl.TypeCheckpointDeleteRequest:
+					if req.CheckpointSources == nil || req.CheckpointSources.Retain == nil {
+						t.Error("delete omitted complete sources")
+						return
+					}
 					if req.CheckpointOwner != "" {
 						t.Error("online release supplied an offline owner")
 					}

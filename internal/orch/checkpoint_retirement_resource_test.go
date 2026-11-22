@@ -52,14 +52,14 @@ func TestPendingHolderRetirementReleasesPlacementBeforeMemorySave(t *testing.T) 
 	lease, err := resource.CreateLease(resource.Lease{Version: resource.LeaseVersion, SandboxID: f.sb.ID, PID: os.Getpid(),
 		ControllerSocket: socket, CgroupPath: filepath.Join(cgroups, "source"), CapacityMemory: capacity.MemoryBytes, CapacityCPUMilli: capacity.CPUMilli,
 		FloorMemory: 128 << 20, FloorCPUMilli: 500, StartupMemory: 256 << 20,
-		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}})
+		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = lease.Close() })
 	if _, _, err := state.Admit(nodectl.AdmitSpec{SandboxID: f.sb.ID, PeerPID: os.Getpid(), Token: "source-token", CgroupPath: filepath.Join(cgroups, "source"),
 		Capacity: capacity, InitialBudget: 256 << 20, ConfiguredAllocatable: nodectl.Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
-		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV1}, LeasePath: lease.Path()}); err != nil {
+		ClientFeatures: []string{resource.FeatureStateSyncV1, resource.FeatureRetainedMemoryV2}, LeasePath: lease.Path()}); err != nil {
 		t.Fatal(err)
 	}
 	start, err := memorycheckpoint.ProcessStartTime(os.Getpid())

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"slices"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
@@ -23,7 +24,14 @@ func (s *State) retentionReservation(sid string) (Reservation, bool) {
 	return Reservation{}, false
 }
 
-func (s *Server) validateRetainedSession(sid string, peerPID int, token string, r *retainedReceipt) error {
+func (s *Server) handleRetainedAccount(req *Message) *Message {
+	if req.SandboxID == "" || s.Inventory == nil || !resource.HasFeature(req.ClientFeatures, resource.FeatureRetainedMemoryV2) {
+		return &Message{Type: TypeError, Msg: "retained account capability and SID are required"}
+	}
+	return &Message{Type: TypeAck, RetainedAccount: s.State.retainedSnapshot(req.SandboxID).reference(), ClientFeatures: featureResponse(req.ClientFeatures)}
+}
+
+func (s *Server) validateRetainedSession(sid string, peerPID int, token string, r *retainedAccount, prepare bool) error {
 	if s.Inventory == nil || peerPID <= 0 {
 		return fmt.Errorf("retention inventory or peer identity unavailable")
 	}
@@ -34,7 +42,8 @@ func (s *Server) validateRetainedSession(sid string, peerPID int, token string, 
 	if err := s.Inventory.ValidateManaged(live, peerPID); err != nil {
 		return err
 	}
-	if !live.Lease.Supports(resource.FeatureRetainedMemoryV1) {
+	if prepare && !live.Lease.Supports(resource.FeatureRetainedMemoryV2) ||
+		!prepare && !live.Lease.Supports(resource.FeatureRetainedMemoryV2) && !live.Lease.Supports(resource.FeatureRetainedMemoryV1) {
 		return fmt.Errorf("checkpoint memory handoff is not negotiated")
 	}
 	_, owner, file, err := resource.InspectLeaseIdentity(live.Path)
@@ -43,7 +52,7 @@ func (s *Server) validateRetainedSession(sid string, peerPID int, token string, 
 	}
 	if r == nil {
 		active, found := s.State.retentionReservation(sid)
-		if !found || active.PeerPID != peerPID || active.Token != token || !resource.HasFeature(active.ClientFeatures, resource.FeatureRetainedMemoryV1) {
+		if !found || active.PeerPID != peerPID || active.Token != token || !resource.HasFeature(active.ClientFeatures, resource.FeatureRetainedMemoryV2) {
 			return fmt.Errorf("retention requires the current admitted session")
 		}
 		return nil
@@ -51,8 +60,8 @@ func (s *Server) validateRetainedSession(sid string, peerPID int, token string, 
 	if r.OwnerLease.PID != peerPID || r.OwnerFile != file {
 		return fmt.Errorf("retained memory owner has changed")
 	}
-	if r.Stage == retentionPrepared || r.Stage == retentionActive {
-		if active, found := s.State.retentionReservation(sid); found && (active.PeerPID != peerPID || (active.Conn != nil && !active.Provisional && active.Token != token)) {
+	if r.Stage == retentionActive {
+		if active, found := s.State.retentionReservation(sid); found && (active.PeerPID != peerPID || active.Conn != nil && !active.Provisional && active.Token != token) {
 			return fmt.Errorf("retention session token changed")
 		}
 	}
@@ -72,73 +81,29 @@ func (s *Server) handleRetained(peerPID int, req *Message, token string) *Messag
 		return bad(err)
 	}
 	r := s.State.retainedSnapshot(req.SandboxID)
-	if req.Type == resource.TypePrepareRetained && r != nil && !r.Settled && !sameCapture(r.Capture, *req.Retention) {
-		// RAM readiness and its resource ACK can race the next capture. The
-		// previous receipt is settled from its own exact proof first; the
-		// new capture's proof cannot release an old R.
-		oldProof, err := readRetentionCapture(r.SandboxID, r.Capture)
-		if err == nil {
-			err = validateRetentionProof(r, oldProof)
-		}
-		if err == nil && oldProof.RAMReleased {
-			next := cloneRetained(r)
-			next.Settled = true
-			if err := writeRetainedReceipt(s.Identity, next); err != nil {
-				return bad(err)
-			}
-			if err := s.State.releaseRetained(r.SandboxID, r.Capture); err != nil {
-				return bad(err)
-			}
-			r = next
-		} else if err == nil && oldProof.Aborted && r.Stage == retentionPrepared {
-			if err := removeRetainedReceipt(s.Identity, r.SandboxID); err != nil {
-				return bad(err)
-			}
-			if err := s.State.abortRetained(r.SandboxID, r.Capture); err != nil {
-				return bad(err)
-			}
-			r = nil
-		}
-	}
-	if r != nil && r.Settled && !sameCapture(r.Capture, *req.Retention) && req.Type == resource.TypePrepareRetained {
-		r = nil
-	}
-	if r != nil && !sameCapture(r.Capture, *req.Retention) {
-		// A newer capture may replace the settled receipt before the old
-		// producer receives its release ACK. Its exact released record and
-		// live process identity are enough for a no-op ACK, never authority
-		// over the current receipt. Memory IDs identify captures; epochs are
-		// scoped to one memory ID and need not increase between captures.
-		if req.Type == resource.TypeReleaseRetained && r.Capture.MemoryID != req.Retention.MemoryID &&
-			proof.RAMReleased && proof.Holder.PID == peerPID && peerPID > 0 {
-			start, err := retentionProcessStartTime(peerPID)
-			if err == nil && start == proof.Holder.StartTime {
-				return &Message{Type: TypeAck}
-			}
-		}
-		return bad(fmt.Errorf("another retention generation owns this SID"))
-	}
-	if r != nil {
-		if err := validateRetentionProof(r, proof); err != nil {
+	e := r.capture(*req.Retention)
+	if e != nil {
+		if err := validateRetentionProof(e, proof); err != nil {
 			return bad(err)
 		}
 	}
-	producerRelease := false
-	if req.Type == resource.TypeReleaseRetained && r != nil && proof.RAMReleased && peerPID == r.Source.PeerPID {
+	producerFinal := false
+	if e != nil && peerPID > 0 && peerPID == e.Source.PeerPID &&
+		(req.Type == resource.TypeReleaseRetained && proof.RAMReleased || req.Type == resource.TypeCommitRetained && e.Stage != retentionPrepared && proof.Committed && proof.RuntimeRetired) {
 		start, err := retentionProcessStartTime(peerPID)
-		producerRelease = err == nil && start == r.SourceStartTime
+		producerFinal = err == nil && start == e.SourceStartTime
 	}
-	if !producerRelease {
-		if err := s.validateRetainedSession(req.SandboxID, peerPID, token, r); err != nil {
+	if !producerFinal {
+		if err := s.validateRetainedSession(req.SandboxID, peerPID, token, r, req.Type == resource.TypePrepareRetained); err != nil {
 			return bad(err)
 		}
 	}
 	switch req.Type {
 	case resource.TypePrepareRetained:
-		if proof.Aborted {
-			return bad(fmt.Errorf("capture was aborted"))
+		if proof.Aborted || proof.Deleted {
+			return bad(fmt.Errorf("capture was aborted or deleted"))
 		}
-		if r == nil {
+		if e == nil {
 			if proof.Committed || proof.RuntimeRetired || proof.RAMReleased {
 				return bad(fmt.Errorf("capture already crossed its preparation boundary"))
 			}
@@ -154,66 +119,80 @@ func (s *Server) handleRetained(peerPID int, req *Message, token string) *Messag
 			if err != nil {
 				return bad(err)
 			}
-			if proof.Holder.PID != 0 && (proof.Holder.PID != peerPID || (proof.Holder.StartTime != 0 && proof.Holder.StartTime != start)) {
+			if proof.Holder.PID != peerPID || proof.Holder.StartTime != start {
 				return bad(fmt.Errorf("capture holder does not own source reservation"))
 			}
-			r = &retainedReceipt{Version: 1, SandboxID: req.SandboxID, Capture: *req.Retention,
-				Producer: proof.Producer, CheckpointID: proof.CheckpointID, Holder: proof.Holder,
+			if r == nil {
+				r = &retainedAccount{Version: 2, SandboxID: req.SandboxID, ID: NewToken(), Revision: 1, Stage: retentionActive,
+					OwnerLease: lease, OwnerFile: file, OwnerToken: token}
+			} else {
+				if r.Stage != retentionActive {
+					return bad(fmt.Errorf("capture requires an active account owner"))
+				}
+				for _, previous := range r.Captures {
+					if previous.Capture.CapturePath == req.Retention.CapturePath || previous.Capture.MemoryID == req.Retention.MemoryID && previous.Capture.Epoch == req.Retention.Epoch {
+						return bad(fmt.Errorf("retained capture identity changed"))
+					}
+				}
+				r.Revision++
+			}
+			e = &retainedCapture{Capture: *req.Retention, Producer: proof.Producer, CheckpointID: proof.CheckpointID, Holder: proof.Holder,
 				Memory: resource.RetainedMemory{MemoryID: req.Retention.MemoryID, Epoch: req.Retention.Epoch, SourcePool: s.State.SandboxPool(req.SandboxID), Bytes: active.ReservationMemory},
-				Stage:  retentionPrepared, Source: active, SourceStartTime: start, SourceFile: file, OwnerLease: lease, OwnerFile: file, OwnerToken: token}
-			if err := s.State.prepareRetained(r); err != nil {
+				Stage:  retentionPrepared, Source: active, SourceStartTime: start, SourceFile: file}
+			r.Captures = append(r.Captures, e)
+			if err := s.State.prepareRetained(r, e.Capture); err != nil {
 				return bad(err)
 			}
 		}
-		// A failed fsync is ambiguous. Keep B protected and let this exact
-		// operation replay or explicitly abort against the capture proof.
+		// Failed fsync is ambiguous: protect B until exact replay/abort.
 		if err := writeRetainedReceipt(s.Identity, r); err != nil {
 			return bad(err)
 		}
 	case resource.TypeAbortRetained:
-		if r == nil {
+		if e == nil {
 			return &Message{Type: TypeAck}
 		}
-		if r.Stage != retentionPrepared || proof.Committed || proof.RuntimeRetired || proof.RAMReleased {
+		if e.Stage != retentionPrepared || proof.Committed || proof.RuntimeRetired || proof.RAMReleased {
 			return bad(fmt.Errorf("capture can no longer be aborted"))
 		}
-		if err := removeRetainedReceipt(s.Identity, req.SandboxID); err != nil {
+		next := withoutRetainedCapture(r, e.Capture)
+		if err := writeRetainedReceipt(s.Identity, next); err != nil {
 			return bad(err)
 		}
-		if err := s.State.abortRetained(req.SandboxID, *req.Retention); err != nil {
+		if err := s.State.abortRetained(next, e.Capture); err != nil {
 			return bad(err)
 		}
 		return &Message{Type: TypeAck}
 	case resource.TypeCommitRetained:
-		if r == nil {
+		if e == nil {
 			return bad(fmt.Errorf("retention was not prepared"))
 		}
 		if !proof.Committed || !proof.RuntimeRetired {
 			return bad(fmt.Errorf("runtime retirement is not committed"))
 		}
-		if r.Stage == retentionPrepared && !r.Settled {
-			r.Stage = retentionHolding
-			if err := writeRetainedReceipt(s.Identity, r); err != nil {
-				return bad(err)
-			}
-			if _, err := s.State.commitRetained(r); err != nil {
-				return bad(err)
-			}
-		}
-	case resource.TypeReleaseRetained:
-		if r == nil {
-			return &Message{Type: TypeAck}
-		}
-		if !proof.RAMReleased {
-			return bad(fmt.Errorf("physical checkpoint RAM has not been released"))
-		}
-		if !r.Settled {
-			next := cloneRetained(r)
-			next.Settled = true
+		if e.Stage == retentionPrepared {
+			next := heldRetainedCapture(r, e.Capture)
 			if err := writeRetainedReceipt(s.Identity, next); err != nil {
 				return bad(err)
 			}
-			if err := s.State.releaseRetained(req.SandboxID, *req.Retention); err != nil {
+			if _, err := s.State.commitRetained(next, e.Capture); err != nil {
+				return bad(err)
+			}
+			r = next
+		}
+	case resource.TypeReleaseRetained:
+		if !proof.RAMReleased {
+			return bad(fmt.Errorf("physical checkpoint RAM has not been released"))
+		}
+		if e == nil {
+			return bad(fmt.Errorf("retained capture identity is unavailable"))
+		}
+		if e.Stage != retentionSettled {
+			next := settledRetainedCapture(r, e.Capture)
+			if err := writeRetainedReceipt(s.Identity, next); err != nil {
+				return bad(err)
+			}
+			if err := s.State.releaseRetained(next, e.Capture); err != nil {
 				return bad(err)
 			}
 			r = next
@@ -224,52 +203,44 @@ func (s *Server) handleRetained(peerPID int, req *Message, token string) *Messag
 	if s.Admission != nil {
 		s.Admission.PushWake()
 	}
-	return &Message{Type: TypeAck, Retained: &r.Memory}
+	return &Message{Type: TypeAck, Retained: &e.Memory, RetainedAccount: r.reference()}
 }
 
 func (s *Server) validateOrdinaryRetainedOwner(peerPID int, req *Message) error {
 	r := s.State.retainedSnapshot(req.SandboxID)
-	if r == nil || r.Settled {
+	if r == nil {
 		return nil
 	}
-	if r.Stage != retentionActive && r.Stage != retentionPrepared {
-		return fmt.Errorf("pending checkpoint memory requires explicit owner handoff")
-	}
-	if r.OwnerLease.PID != peerPID {
-		return fmt.Errorf("pending checkpoint memory belongs to another owner")
+	if r.Stage != retentionActive || r.OwnerLease.PID != peerPID {
+		return fmt.Errorf("retained account requires explicit owner handoff")
 	}
 	_, pid, file, err := resource.InspectLeaseIdentity(resource.LeasePath(s.Identity, req.SandboxID))
 	if err != nil || pid != peerPID || file != r.OwnerFile {
-		return fmt.Errorf("pending checkpoint memory lease identity changed")
+		return fmt.Errorf("retained account lease identity changed")
 	}
 	return nil
 }
 
 func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, token *string) (*Message, error) {
-	if req.Retention == nil || req.HandoffID == "" || req.LeaseCandidate == "" || s.Inventory == nil ||
-		!resource.HasFeature(req.ClientFeatures, resource.FeatureRetainedMemoryV1) || !resource.HasFeature(req.ClientFeatures, resource.FeatureStateSyncV1) {
+	if req.RetainedAccount == nil || req.HandoffID == "" || req.LeaseCandidate == "" || s.Inventory == nil ||
+		!resource.HasFeature(req.ClientFeatures, resource.FeatureRetainedMemoryV2) || !resource.HasFeature(req.ClientFeatures, resource.FeatureStateSyncV1) {
 		return nil, fmt.Errorf("retained admission requires explicit capabilities and identity")
 	}
 	root := s.State.retentionOwner()
 	root.retentionOps.Lock()
 	defer root.retentionOps.Unlock()
 	r := s.State.retainedSnapshot(req.SandboxID)
-	if r == nil || !sameCapture(r.Capture, *req.Retention) {
-		return nil, fmt.Errorf("retained capture identity unavailable or changed")
+	if r == nil || req.RetainedAccount.ID != r.ID || req.RetainedAccount.Validate() != nil {
+		return nil, fmt.Errorf("retained account identity unavailable or changed")
 	}
-	proof, err := readRetentionCapture(req.SandboxID, *req.Retention)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateRetentionProof(r, proof); err != nil {
-		return nil, err
-	}
-	if !proof.Committed || !proof.RuntimeRetired {
-		return nil, fmt.Errorf("previous runtime is not retired")
-	}
+	var err error
 	r, err = s.Inventory.reconcileAdoption(s.State, r)
 	if err != nil {
 		return nil, err
+	}
+	if (r.Handoff == nil || r.Handoff.ID != req.HandoffID) && req.RetainedAccount.Revision != r.Revision {
+		return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Reason: resource.ReasonRetentionAccountChanged,
+			ClientFeatures: featureResponse(req.ClientFeatures), Msg: "retained account changed before acceptance; refresh its reference"}, nil
 	}
 	lease, owner, file, err := resource.InspectLeaseCandidate(s.Identity, req.SandboxID, req.LeaseCandidate)
 	if os.IsNotExist(err) && r.Handoff != nil && r.Handoff.ID == req.HandoffID {
@@ -294,7 +265,7 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 	if err != nil || maximum != req.CacheMaximum {
 		return nil, fmt.Errorf("candidate cache bound differs from lease")
 	}
-	if r.Stage == retentionPrepared {
+	if r.prepared() != nil {
 		return nil, fmt.Errorf("previous retention commit has not completed")
 	}
 	launch, err := s.Admission.resolveLaunch(req.SandboxID, peerPID)
@@ -326,21 +297,36 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 			return nil, err
 		}
 		r.Stage = retentionAdopting
-		r.Handoff = &retainedHandoff{ID: req.HandoffID, Candidate: req.LeaseCandidate, File: file, Lease: lease,
+		r.Handoff = &retainedHandoff{ID: req.HandoffID, AccountRevision: req.RetainedAccount.Revision, Candidate: req.LeaseCandidate, File: file, Lease: lease,
 			Token: NewToken(), StartTime: start, Pool: s.State.SandboxPool(req.SandboxID), InitialBudget: spec.InitialBudget,
 			InitialCache: spec.InitialCache, CacheReclaim: resource.CloneCacheReclaimState(req.CacheReclaim)}
-		if err := writeRetainedReceipt(s.Identity, r); err != nil {
+		r.Revision++
+		if err := validateCacheReclaimState(lease.ClientFeatures, req.CacheReclaim, maximum); err != nil {
 			return nil, err
 		}
-		if err := s.State.setRetainedReceipt(r); err != nil {
+		if c := req.CacheReclaim; c != nil && (c.LastSeq != 0 || c.Task != nil || c.Done != nil || c.Intent != nil) {
+			return nil, fmt.Errorf("initial cache reclaim state is not empty")
+		}
+		spec.Token, spec.CacheCoordinated = r.Handoff.Token, req.CacheReclaim != nil
+		// Even an ambiguous persistence failure owns a connection/B cleanup.
+		if token != nil {
+			*token = spec.Token
+		}
+		if err := s.State.acceptRetainedHandoff(r, spec, func() error { return writeRetainedReceipt(s.Identity, r) }); err != nil {
 			return nil, err
 		}
 		if s.phaseHook != nil {
 			s.phaseHook("retention_intent")
 		}
 	} else if r.Handoff.File != file || r.Handoff.Lease.PID != peerPID || r.Handoff.Candidate != req.LeaseCandidate ||
-		r.Handoff.InitialBudget != spec.InitialBudget || r.Handoff.InitialCache != spec.InitialCache {
+		r.Handoff.InitialBudget != spec.InitialBudget || r.Handoff.InitialCache != spec.InitialCache ||
+		!reflect.DeepEqual(r.Handoff.Lease, lease) || !reflect.DeepEqual(r.Handoff.CacheReclaim, req.CacheReclaim) {
 		return nil, fmt.Errorf("handoff replay contract changed")
+	}
+	// Retry an ambiguous inventory fsync before granting/publishing this same
+	// candidate. Its B remains reserved from acceptance, even if all R settle.
+	if err := writeRetainedReceipt(s.Identity, r); err != nil {
+		return nil, err
 	}
 	spec.Token = r.Handoff.Token
 	_, old, err := s.cacheCoordinator().Admit(spec, req.CacheReclaim)
@@ -366,6 +352,7 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 	}
 	r.OwnerLease, r.OwnerFile, r.OwnerToken = lease, file, spec.Token
 	r.Stage = retentionActive
+	r.Revision++
 	if err := writeRetainedReceipt(s.Identity, r); err != nil {
 		return nil, err
 	}
@@ -374,5 +361,5 @@ func (s *Server) buildRetainedAdmitOK(conn net.Conn, peerPID int, req *Message, 
 	}
 	return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted, Token: spec.Token,
 		GrantedInitialAlloc: spec.InitialBudget, GrantedInitialCache: spec.InitialCache,
-		ClientFeatures: featureResponse(req.ClientFeatures, req.CacheReclaim != nil), Retained: &r.Memory}, nil
+		ClientFeatures: featureResponse(req.ClientFeatures, req.CacheReclaim != nil), RetainedAccount: r.reference()}, nil
 }

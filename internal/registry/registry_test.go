@@ -1100,6 +1100,9 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 		if cmd.AutoPauseMemory == nil || *cmd.AutoPauseMemory {
 			t.Errorf("create AutoPauseMemory = %v, want explicit false", cmd.AutoPauseMemory)
 		}
+		if cmd.MaxCheckpoints == nil || *cmd.MaxCheckpoints != 3 {
+			t.Errorf("create quota lost: %v", cmd.MaxCheckpoints)
+		}
 		if cmd.AutoReset == nil || !*cmd.AutoReset {
 			t.Errorf("create AutoReset = %v, want explicit true", cmd.AutoReset)
 		}
@@ -1120,11 +1123,13 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 	autoReset := true
 	request.AutoReset = &autoReset
 	request.IdleTimeout = new(int64(0))
+	quota := 3
+	request.MaxCheckpoints = &quota
 	if _, err := reg.ReserveSandbox(ctx, request); err != nil {
 		t.Fatal(err)
 	}
 	record, _, found, err := reg.stores.GetSandbox(ctx, "/g", "auto-pause-false")
-	if err != nil || !found || record.State != StateReady || record.AutoPauseMemory || !record.AutoReset || record.IdleTimeout == nil || *record.IdleTimeout != 5 {
+	if err != nil || !found || record.State != StateReady || record.AutoPauseMemory || !record.AutoReset || record.IdleTimeout == nil || *record.IdleTimeout != 5 || record.MaxCheckpoints != 3 {
 		t.Fatalf("stored explicit false record = %+v, found=%t, err=%v", record, found, err)
 	}
 }
@@ -2419,6 +2424,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
 	original.AutoPauseMemory = false
+	original.MaxCheckpoints = 17
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
@@ -2461,6 +2467,9 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	if command == nil || command.Cluster == nil || command.Cluster.StableID != original.StableID {
 		t.Fatal("replacement create did not preserve StableID")
 	}
+	if command.MaxCheckpoints == nil || *command.MaxCheckpoints != 17 {
+		t.Fatalf("replacement quota changed: %v", command.MaxCheckpoints)
+	}
 	if command.AutoPauseMemory == nil || *command.AutoPauseMemory {
 		t.Fatalf("replacement create changed durable AutoPauseMemory: %v", command.AutoPauseMemory)
 	}
@@ -2473,7 +2482,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		createCredentials.TrafficAccessToken != original.TrafficAccessToken {
 		t.Fatal("replacement create did not preserve the original credential overrides")
 	}
-	if reserved == nil || reserved.SandboxID != original.SandboxID || reserved.NodeSandboxID != command.SID || reserved.SandboxGeneration != 1 || reserved.CreateCredentials == nil || reserved.AutoPauseMemory ||
+	if reserved == nil || reserved.SandboxID != original.SandboxID || reserved.NodeSandboxID != command.SID || reserved.SandboxGeneration != 1 || reserved.CreateCredentials == nil || reserved.AutoPauseMemory || reserved.MaxCheckpoints != 17 ||
 		!sameRouteCredentials(reserved, original) {
 		t.Fatal("replacement RESERVED row did not retain materialized credentials and TTL capture policy")
 	}
@@ -2484,7 +2493,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		t.Fatal("replacement READY result changed materialized credentials")
 	}
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found || ready.CreateCredentials != nil || ready.AutoPauseMemory || !sameRouteCredentials(ready, original) {
+	if err != nil || !found || ready.CreateCredentials != nil || ready.MaxCheckpoints != 17 || ready.AutoPauseMemory || !sameRouteCredentials(ready, original) {
 		t.Fatal("replacement READY row changed credentials or TTL capture policy, or retained create overrides")
 	}
 }
@@ -2494,6 +2503,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "stable-auth-sid", "old", StateReserved)
 	original.AutoPauseMemory = false
+	original.MaxCheckpoints = 17
 	original.CreateCredentials = &sandboxcfg.Credentials{
 		ServiceSecret: original.ServiceSecret, EnvdAccessToken: original.EnvdAccessToken,
 		TrafficAccessToken: original.TrafficAccessToken,
@@ -2533,7 +2543,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	newOverride := &sandboxcfg.Credentials{
 		ServiceSecret: strings.Repeat("4", 64), EnvdAccessToken: "new-envd", TrafficAccessToken: "new-traffic",
 	}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, newOverride, nil, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, newOverride, nil, true, false, createOptions{maxCheckpoints: 29}); err != nil {
 		t.Fatal(err)
 	}
 	if placements != 2 || len(commands) != 2 {
@@ -2543,6 +2553,9 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		if cmd.Cluster == nil || cmd.Cluster.StableID != original.StableID ||
 			cmd.APISecretFingerprint != original.APISecretFingerprint {
 			t.Fatal("replacement retry changed the stable ID or credential binding")
+		}
+		if cmd.MaxCheckpoints == nil || *cmd.MaxCheckpoints != 17 {
+			t.Fatalf("retry quota changed: %v", cmd.MaxCheckpoints)
 		}
 		if cmd.AutoPauseMemory == nil || *cmd.AutoPauseMemory {
 			t.Fatalf("replacement retry changed durable AutoPauseMemory: %v", cmd.AutoPauseMemory)
@@ -2559,13 +2572,13 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	}
 	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || reserved.State != StateReserved || reserved.NodeID != "n2" ||
-		reserved.AutoPauseMemory || !sameRouteCredentials(reserved, original) {
+		reserved.AutoPauseMemory || reserved.MaxCheckpoints != 17 || !sameRouteCredentials(reserved, original) {
 		t.Fatal("replacement retry did not persist the original credential binding")
 	}
 	route := testRouteFromRecord(original, reserved.NodeSandboxID, routesync.StateRunning)
 	testApplyRoute(reg, ctx, "n2", &route)
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found || ready.State != StateReady || ready.CreateCredentials != nil ||
+	if err != nil || !found || ready.State != StateReady || ready.CreateCredentials != nil || ready.MaxCheckpoints != 17 ||
 		!sameRouteCredentials(ready, original) {
 		t.Fatal("replacement retry READY event changed the credential binding")
 	}

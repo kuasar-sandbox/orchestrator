@@ -366,7 +366,8 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var autoPauseMemory, autoReset *bool
 	var idleTimeout *int64
-	createConfig, err := createSandboxPolicies(w, r, &autoPauseMemory, &idleTimeout, &autoReset)
+	var maxCheckpoints *int
+	createConfig, err := createSandboxPoliciesWithQuota(w, r, &autoPauseMemory, &idleTimeout, &maxCheckpoints, &autoReset)
 	var entries []workspace.Entry
 	if err == nil {
 		createConfig, entries, err = workspace.Extract(createConfig)
@@ -385,7 +386,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := rt.routeLinkReserve(
 		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, autoReset, nil, nil,
-		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, createWireOptions{idleTimeout: idleTimeout, workspaces: entries},
+		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, createWireOptions{idleTimeout: idleTimeout, workspaces: entries, maxCheckpoints: maxCheckpoints},
 	)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
@@ -430,6 +431,9 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 	return createSandboxPolicies(w, r, autoPauseMemory, nil, autoReset...)
 }
 func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, idleTimeout **int64, autoReset ...**bool) (map[string]string, error) {
+	return createSandboxPoliciesWithQuota(w, r, autoPauseMemory, idleTimeout, nil, autoReset...)
+}
+func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, idleTimeout **int64, maxCheckpoints **int, autoReset ...**bool) (map[string]string, error) {
 	if _, present := r.Header[http.CanonicalHeaderKey(HeaderIdentity)]; present {
 		return nil, fmt.Errorf("%s / %s is only supported by direct conductor Create", HeaderIdentity, sandboxcfg.NsIdentity)
 	}
@@ -445,7 +449,7 @@ func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemo
 		}
 	}
 	var body struct {
-		MaxCheckpoints  int               `json:"max_checkpoints,omitempty"`
+		MaxCheckpoints  *int              `json:"max_checkpoints,omitempty"`
 		Metadata        map[string]string `json:"metadata"`
 		AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
 		IdleTimeout     *int64            `json:"idleTimeout,omitempty"`
@@ -476,8 +480,11 @@ func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemo
 	if idleTimeout != nil {
 		*idleTimeout = types.CloneIdleTimeout(body.IdleTimeout)
 	}
-	if body.MaxCheckpoints != 0 && body.MaxCheckpoints != 1 {
-		return nil, fmt.Errorf("max_checkpoints must be 1")
+	if _, err := types.ResolveMaxCheckpoints(body.MaxCheckpoints); err != nil {
+		return nil, err
+	}
+	if maxCheckpoints != nil {
+		*maxCheckpoints = body.MaxCheckpoints
 	}
 	if _, present := body.Metadata[sandboxcfg.NsIdentity]; present {
 		return nil, fmt.Errorf("%s is only supported by direct conductor Create", sandboxcfg.NsIdentity)
@@ -2061,8 +2068,9 @@ func randomHexID() string {
 // --- control client ---
 
 type createWireOptions struct {
-	idleTimeout *int64
-	workspaces  []workspace.Entry
+	maxCheckpoints *int
+	idleTimeout    *int64
+	workspaces     []workspace.Entry
 }
 
 func (rt *Router) routeLinkReserve(
@@ -2096,7 +2104,7 @@ func (rt *Router) routeLinkReserve(
 		create = opts[0]
 	}
 	if operation == "create" {
-		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, Workspaces: create.workspaces, IdleTimeout: create.idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
+		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, Workspaces: create.workspaces, MaxCheckpoints: create.maxCheckpoints, IdleTimeout: create.idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
 		if headers == nil {
 			headers = map[string]string{}
 		}

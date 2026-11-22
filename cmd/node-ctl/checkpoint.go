@@ -33,7 +33,7 @@ func checkpointCleanupCmd(args []string) error {
 	base := fs.String("base-root", "", "exclusive sandbox base root")
 	e := fs.String("from", "", "committed Sandbox E ref")
 	s := fs.String("restore", "", "committed Snapshot S ref, if present")
-	retain := fs.String("retain", "[]", "additional immutable S/E pairs to retain (JSON)")
+	retain := fs.String("retain", "", "additional immutable S/E pairs to retain (JSON)")
 	manifestPath := fs.String("manifest-config", "", "storage and crypto config")
 	parent := fs.String("ref-location-parent", "", "trusted named-location parent URI")
 	list := fs.Bool("list-versions", false, "report protected DIFF versions as JSON without cleanup")
@@ -41,12 +41,15 @@ func checkpointCleanupCmd(args []string) error {
 		return err
 	}
 	leaf, err := sandbox.ResolvePathID(*sid, *pathID)
-	if err != nil || sandbox.ValidatePathID(*sid) != nil || *base == "" || *e == "" || fs.NArg() != 0 {
-		return fmt.Errorf("checkpoint-cleanup requires --sandbox-id, --base-root and committed --from [--restore]")
+	if err != nil || sandbox.ValidatePathID(*sid) != nil || *base == "" || fs.NArg() != 0 {
+		return fmt.Errorf("checkpoint-cleanup requires --sandbox-id, --base-root and explicit --retain [--from --restore]")
 	}
 	var retained []artifact.CheckpointSource
 	if err := json.Unmarshal([]byte(*retain), &retained); err != nil {
 		return fmt.Errorf("invalid retained checkpoint roots: %w", err)
+	}
+	if retained == nil {
+		return errors.New("checkpoint-cleanup requires an explicit complete retention set, including []")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -83,7 +86,7 @@ func checkpointCleanupCmd(args []string) error {
 
 func checkpointCleanupResult(cleanupErr, closeErr error, inspect bool) error {
 	// Preserve every genuine I/O/close error. The SDK exposes this sentinel
-	// only when the memory-reader lock is busy and cleanup changed no files.
+	// only when physical collection is deferred; logical revocation may have completed.
 	if !inspect && closeErr == nil && errors.Is(cleanupErr, artifact.ErrCheckpointMemoryReadersBusy) {
 		return fmt.Errorf("%w: %v", errCheckpointCleanupDeferred, cleanupErr)
 	}

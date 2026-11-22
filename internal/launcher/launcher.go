@@ -6,6 +6,7 @@ package launcher
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/coreos/go-systemd/v22/dbus"
 )
@@ -34,7 +35,11 @@ type Launcher interface {
 }
 
 // Systemd is the systemd-D-Bus Launcher.
-type Systemd struct{ conn *dbus.Conn }
+type Systemd struct {
+	conn     *dbus.Conn
+	stopMu   sync.Mutex
+	stopping map[string]chan struct{}
+}
 
 // NewSystemd connects to the system bus' systemd manager.
 func NewSystemd(ctx context.Context) (*Systemd, error) {
@@ -59,11 +64,51 @@ func (s *Systemd) Start(ctx context.Context, unit string) error {
 }
 
 func (s *Systemd) Stop(ctx context.Context, unit string) error {
+	unlock, err := s.lockStop(ctx, unit)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	ch := make(chan string, 1)
 	if _, err := s.conn.StopUnitContext(ctx, unit, "replace", ch); err != nil {
 		return fmt.Errorf("launcher: stop %s: %w", unit, err)
 	}
 	return waitJob(ctx, unit, "stop", ch)
+}
+
+// systemd can coalesce concurrent StopUnit calls into the same job. go-systemd
+// keeps one completion channel per job, so a later call would replace the first
+// caller's channel. Serialize only stops for that unit, through job completion;
+// other units and canceled waiters remain independent. Entries live only while
+// a stop owns them, and a canceled owner lets the next caller retry the job.
+func (s *Systemd) lockStop(ctx context.Context, unit string) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		s.stopMu.Lock()
+		done := s.stopping[unit]
+		if done == nil {
+			if s.stopping == nil {
+				s.stopping = make(map[string]chan struct{})
+			}
+			done = make(chan struct{})
+			s.stopping[unit] = done
+			s.stopMu.Unlock()
+			return func() {
+				s.stopMu.Lock()
+				delete(s.stopping, unit)
+				close(done)
+				s.stopMu.Unlock()
+			}, nil
+		}
+		s.stopMu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func (s *Systemd) ResetFailed(ctx context.Context, unit string) error {

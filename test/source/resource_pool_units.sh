@@ -11,3 +11,8 @@ if [ "$(id -u)" -ne 0 ]; then privilege=(sudo -n); fi
 "${privilege[@]}" env REQUIRE_RESOURCE_POOL_SYSTEMD=1 \
   RESOURCE_POOL_NUMA_NODES="${RESOURCE_POOL_NUMA_NODES:-0}" \
   "$work/resource-pools.test" -test.v -test.timeout=90s -test.run=TestResourcePoolSystemdPlacement
+
+# Concurrent finalizers must not lose the systemd stop job's completion event.
+go test -c -o "$work/launcher.test" ./internal/launcher
+"${privilege[@]}" env REQUIRE_LAUNCHER_SYSTEMD=1 \
+  "$work/launcher.test" -test.v -test.timeout=30s -test.run=TestSystemdConcurrentStops
