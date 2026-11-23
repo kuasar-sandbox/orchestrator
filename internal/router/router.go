@@ -415,6 +415,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registry returned an invalid sandbox route", http.StatusBadGateway)
 		return
 	}
+	rt.invalidateDifferentDataRoute(route)
 	// Public create responses expose only the profile-specific sandbox tokens.
 	// Tenant and sandbox credential roots remain inside the protected route link.
 	w.Header().Set("Content-Type", "application/json")
@@ -1177,6 +1178,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registry returned an invalid connect result", http.StatusBadGateway)
 		return
 	}
+	rt.invalidateDifferentDataRoute(route)
 	out := map[string]any{
 		"sandboxID":          sandboxID,
 		"templateID":         connected.TemplateID,
@@ -1251,6 +1253,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "exec session unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	rt.invalidateDifferentDataRoute(route)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1993,6 +1996,19 @@ func (rt *Router) evictRoute(group, routeKey, sid string) {
 	rt.cacheMu.Lock()
 	rt.evictRouteLocked(group, routeKey, sid)
 	rt.cacheMu.Unlock()
+}
+
+// A successful control operation can migrate a stable sandbox to another local
+// instance. Its public projection cannot populate the data cache, but it must
+// invalidate a previously resolved target before the next data request.
+func (rt *Router) invalidateDifferentDataRoute(route *routeResolve) {
+	rt.cacheMu.Lock()
+	defer rt.cacheMu.Unlock()
+	current := rt.cache[routeCacheID(route.Group, route.RouteKey, route.SandboxID)]
+	if current != nil && route.RouteRevision.Compare(current.RouteRevision) >= 0 &&
+		(current.NodeID != route.NodeID || current.NodeSandboxID != route.NodeSandboxID) {
+		rt.evictRouteLocked(route.Group, route.RouteKey, route.SandboxID)
+	}
 }
 
 func (rt *Router) evictRouteIfCurrent(group, routeKey, sandboxID, nodeSandboxID string) {
