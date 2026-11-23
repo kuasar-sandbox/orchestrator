@@ -72,7 +72,7 @@ fi
 
 if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
     build_cluster_stub_binaries
-    cases="registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-placer-ha:3:2 registry-joint:4:1"
+    cases="registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-placer-ha:3:2 registry-joint:4:1 registry-owner-failover:2:1"
     if [ "$CLUSTER_STUB_BACKEND" = sqlite ]; then cases="registry-n1:1:1"; fi
     for spec in $cases; do
         CLUSTER_STUB_CASE="${spec%%:*}"
@@ -390,10 +390,13 @@ cat >"$WORK/groups/group.json" <<EOF
 {"group":"$GROUP","manifest_key":"$MANIFEST_KEY","api_secret":"$API_SECRET","template_ref":"e2b-snp-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
 EOF
 
+REGISTRY_PIDS=()
 for i in $(seq 1 "$REGISTRIES"); do
     port="${CONTROL_PORTS[$((i-1))]}"
     "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" >"$WORK/registry-$i.log" 2>&1 &
-    PIDS+=("$!")
+    pid="$!"
+    PIDS+=("$pid")
+    REGISTRY_PIDS+=("$pid")
     step "starting registry-$i"
     wait_tcp "$port" "registry-$i control"
 done
@@ -435,9 +438,20 @@ for i in $(seq 1 "$SCALERS"); do
     wait_tcp "$port" "placer-$i"
 done
 
+NODE_LINK_ENDPOINT="127.0.0.1:$CONTROL_PORT"
+if [ "$CLUSTER_STUB_CASE" = registry-owner-failover ]; then
+    alloc_port NODE_LINK_RELAY_PORT "NodeLink fault relay"
+    printf '%s\n' "$NODE_LINK_ENDPOINT" >"$WORK/node-link-target"
+    python3 "$ROOT/test/source/cluster_stub_relay.py" --port "$NODE_LINK_RELAY_PORT" \
+        --target-file "$WORK/node-link-target" >"$WORK/node-link-relay.log" 2>&1 &
+    PIDS+=("$!")
+    wait_tcp "$NODE_LINK_RELAY_PORT" "NodeLink fault relay"
+    NODE_LINK_ENDPOINT="127.0.0.1:$NODE_LINK_RELAY_PORT"
+fi
+
 step "starting node-stub-ctl with $NODES nodes"
 "$NODE_STUB_CTL" serve \
-    --node-link "127.0.0.1:$CONTROL_PORT" \
+    --node-link "$NODE_LINK_ENDPOINT" \
     --nodes "$NODES" \
     --node-prefix stub \
     --admin-listen "127.0.0.1:$ADMIN_PORT" \
@@ -944,6 +958,51 @@ cmds = json.load(urllib.request.urlopen(admin + "/v1/nodes/stub-1/commands", tim
 assert not any(c.get("kind") == "delete" and c.get("sid") == "sb-orphan" for c in cmds), "stub assertion failed: not any(c.get(\"kind\") == \"delete\" and c.get(\"sid\") == \"sb-orphan\" for c in cmds)"
 PY
 
+if [ "$CLUSTER_STUB_CASE" = registry-owner-failover ] || [ "$CLUSTER_STUB_BACKEND" = sqlite ]; then
+    step "killing the original Registry process after durable objects exist"
+    curl -sS --noproxy '*' "$ADMIN/v1/events" >"$WORK/events-before-registry-loss.json"
+    if [ "$CLUSTER_STUB_CASE" = registry-owner-failover ]; then
+        printf '127.0.0.1:%s\n' "${CONTROL_PORTS[1]}" >"$WORK/node-link-target.next"
+        mv "$WORK/node-link-target.next" "$WORK/node-link-target"
+    fi
+    kill -KILL "${REGISTRY_PIDS[0]}"
+    wait "${REGISTRY_PIDS[0]}" 2>/dev/null || true
+    if [ "$CLUSTER_STUB_BACKEND" = sqlite ]; then
+        "$CLUSTER_CTL" registry --config "$WORK/registry-1.yaml" >"$WORK/registry-1-restarted.log" 2>&1 &
+        PIDS+=("$!")
+        wait_tcp "$CONTROL_PORT" "restarted SQLite Registry"
+    fi
+    python3 - "$ADMIN" "$WORK/events-before-registry-loss.json" <<'PY' || fail "NodeLink did not reconnect after Registry loss"
+import json,sys,time,urllib.request
+admin,before=sys.argv[1:]
+def sessions(events):
+    return sum(event.get('type') == 'node_link_session' for event in events)
+initial=sessions(json.load(open(before)))
+for _ in range(200):
+    events=json.load(urllib.request.urlopen(admin+'/v1/events',timeout=2))
+    if sessions(events)>initial: break
+    time.sleep(.1)
+else: raise SystemExit('no new NodeLink session after process loss')
+PY
+    code="$(retry_code 201 "$WORK/recovered-session1.body" -X POST \
+        -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-Kuasar-Route-Key: user1/session1" -H "X-API-KEY: $API_KEY" \
+        -H 'Content-Type: application/json' --data '{}' \
+        "http://127.0.0.1:$ROUTER_PORT/sandboxes" || true)"
+    [ "$code" = 201 ] || fail "existing object did not recover after Registry loss ($code)"
+    python3 - "$WORK/create-session1.body" "$WORK/recovered-session1.body" "$ADMIN" <<'PY' || fail "Registry loss changed identity or repeated execution"
+import json,sys,urllib.request
+before,after,admin=sys.argv[1:]
+a,b=json.load(open(before)),json.load(open(after))
+for key in ('sandboxID','envdAccessToken','trafficAccessToken','forwardAccessToken'):
+    assert a[key]==b[key], 'existing identity/credential changed after Registry loss'
+commands=json.load(urllib.request.urlopen(admin+'/v1/commands',timeout=2))
+assert sum(c.get('kind')=='create' and c.get('cluster',{}).get('route_key')=='user1/session1' for c in commands)==1, 'existing execution was dispatched again'
+PY
+    code="$(create_sandbox "user1/after-registry-loss" "$WORK/create-after-registry-loss.body" || true)"
+    [ "$code" = 201 ] || fail "new Group admission did not recover after Registry loss ($code)"
+fi
+
 step "checking reboot-empty cleanup"
 python3 - "$ADMIN" "$WORK/first_sandbox.env" <<'PY'
 import json, shlex, sys, urllib.request
@@ -974,6 +1033,8 @@ PY
 ROUTE_LIST_PORT="$CONTROL_PORT"
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     ROUTE_LIST_PORT="${CONTROL_PORTS[3]}"
+elif [ "$CLUSTER_STUB_CASE" = registry-owner-failover ]; then
+    ROUTE_LIST_PORT="${CONTROL_PORTS[1]}"
 fi
 python3 - "$ROUTE_LIST_PORT" "$GROUP" "$SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
 import json, os, sys, time, urllib.parse, urllib.request
