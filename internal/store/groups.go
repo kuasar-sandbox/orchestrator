@@ -375,7 +375,10 @@ func (s *Store) GroupList(ctx context.Context, apiKey, cursor string, limit int)
 	}
 	var next groupCursor
 	if cursor != "" {
-		if len(cursor) > 2*(nodegroup.MaxNameBytes+128) {
+		// JSON may expand one name byte to six bytes (for example '<' to
+		// \u003c), before raw base64 expands it again. The fixed allowance
+		// covers the 64-byte owner fingerprint and JSON field syntax.
+		if len(cursor) > base64.RawURLEncoding.EncodedLen(6*nodegroup.MaxNameBytes+128) {
 			return nodegroup.Page{}, nodegroup.ErrInvalid
 		}
 		raw, err := base64.RawURLEncoding.DecodeString(cursor)
