@@ -11,6 +11,14 @@ import (
 )
 
 func init() {
+	nativeExitOpeners["fdb"] = func(t *testing.T, c nativeExitConfig) storagetest.Backend {
+		e, err := fdbdriver.OpenEngine(fdbdriver.EngineOptions{ClusterFile: os.Getenv("FDB_CLUSTER_FILE"), Prefix: "/" + c.Namespace + "/"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+
 	registryNativeBackends["fdb"] = func(t *testing.T) func() storagetest.Backend {
 		file := os.Getenv("FDB_CLUSTER_FILE")
 		if file == "" {

@@ -52,9 +52,10 @@ var errNativeIntentAbort = errors.New("fixture: abort after staging the native i
 // Unknown commits those writes and loses only the completion reply.
 type nativeIntentFaultEngine struct {
 	storage.Engine
-	mode     atomic.Int32
-	injected atomic.Int32
-	writes   atomic.Int32
+	mode        atomic.Int32
+	injected    atomic.Int32
+	writes      atomic.Int32
+	afterCommit func()
 }
 
 type countingIntentTx struct {
@@ -83,6 +84,9 @@ func (e *nativeIntentFaultEngine) Update(ctx context.Context, fn func(storage.Tx
 		return nil
 	})
 	if err == nil && mode == 2 {
+		if e.afterCommit != nil {
+			e.afterCommit()
+		}
 		return &metadata.Unknown{Cause: errors.New("fixture: native commit reply lost")}
 	}
 	return err
