@@ -341,12 +341,13 @@ start_cluster_node() {
     NODE_PORT="$(free_port)"
     NODE_DATA_PORT="$(free_port)"
     local node_id="$1"
+    local runner="${2:-sandbox-runner@.service}" builder="${3:-sandbox-builder@.service}"
     cat > "$WORK/cluster-node.yaml" <<EOF
 api: { domain: $DOMAIN, listen: "127.0.0.1:$NODE_PORT" }
 encryption_key: "$ENC_KEY"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/cr, base_root: $WORK/cl, config_socket: $WORK/cn.sock }
-units: { dir: $UNIT_DIR }
+units: { dir: $UNIT_DIR, runner: "$runner", builder: "$builder" }
 sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }

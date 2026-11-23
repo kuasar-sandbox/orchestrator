@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Real Node/SQLite/VM checks through the test-only NodeLink ordering relay."""
 import concurrent.futures
+import atexit
 import json
 import os
 import pathlib
+import signal
 import sqlite3
 import subprocess
 import time
@@ -131,6 +133,59 @@ def main():
         for key in ("envdAccessToken", "trafficAccessToken", "forwardAccessToken"):
             assert again[key] == created[key], "existing request changed public credentials"
         delete(created, route)
+
+    # The real Node has accepted a VM, while Registry has received neither its
+    # ACK nor its route facts. Restart the actual Registry process on the same
+    # FDB namespace, then recover through the real NodeLink full snapshot.
+    route = "fault/F08"
+    start = len(events())
+    mode("drop-create-results")
+    pending = pool.submit(request, router, "POST", "/sandboxes", route, {})
+    command = until(lambda: next((e for e in events()[start:] if e["action"] == "create-received"), None), "no interrupted Create delivery")
+    def accepted():
+        with sqlite3.connect(work / "cl/node-ctl.db") as db:
+            found = db.execute("select stable_id from sandboxes where id=? and state='running'", (command["sid"],)).fetchone()
+        return found[0] if found else None
+    stable = until(accepted, "Node did not accept the interrupted VM")
+    # A direct Connect to the already running Node object exposes its original
+    # public tokens; ordinary management GET intentionally omits those tokens.
+    status, node_object = request(node, "POST", "/sandboxes/" + command["sid"] + "/connect", body={})
+    assert status == 200, "accepted Node object is not independently observable"
+    pid = int(os.environ["FAULT_REGISTRY_PID"])
+    config = work / "registry-1.yaml"
+    assert str(config).encode() in pathlib.Path("/proc/" + str(pid) + "/cmdline").read_bytes(), "unexpected Registry PID"
+    os.kill(pid, signal.SIGKILL)
+    def exited():
+        try:
+            return pathlib.Path("/proc/" + str(pid) + "/stat").read_text().rsplit(") ", 1)[1].split()[0] == "Z"
+        except FileNotFoundError:
+            return True
+    until(exited, "SIGKILL Registry did not exit")
+    mode("normal")
+    with (work / "registry-restarted.log").open("w") as log:
+        restarted = subprocess.Popen([os.environ["FAULT_CLUSTER_CTL"], "registry", "--config", str(config)], stdout=log, stderr=subprocess.STDOUT)
+    def stop_registry():
+        restarted.terminate()
+        try:
+            restarted.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            restarted.kill()
+            restarted.wait(timeout=10)
+    atexit.register(stop_registry)
+    status, _ = pending.result(timeout=50)
+    assert status != 201, "interrupted Create unexpectedly completed without a delivered fact"
+    until(lambda: any(e["type"] == "node_register" for e in events()[start:]), "actual Node did not reconnect")
+    until(lambda: request(router, "GET", "/sandboxes/" + stable, route)[0] == 200, "reconnected full snapshot did not converge")
+    status, recovered = request(router, "POST", "/sandboxes", route, {})
+    assert status == 201 and recovered["sandboxID"] == stable, "owner restart rebound the logical object"
+    local = assert_live(recovered, route)
+    assert local["id"] == command["sid"], "owner restart replaced the accepted execution"
+    for key in ("envdAccessToken", "trafficAccessToken", "forwardAccessToken"):
+        assert recovered[key] == node_object[key], "owner restart changed public credentials"
+    commands = [e for e in events()[start:] if e["action"] == "create-received"]
+    assert len(commands) == 1, "owner restart blindly redelivered Create"
+    record({"case": "F08-after-Node-acceptance", "node": local, "create_deliveries": 1, "registry_signal": "SIGKILL", "full_snapshot_recovered": True})
+    delete(recovered, route)
 
     route = "fault/F06"
     start = len(events())
