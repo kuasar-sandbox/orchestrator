@@ -163,6 +163,7 @@ type ConnectionOwners interface {
 // Repositories groups constructor dependencies; consumers retain only the narrow
 // capability they use. It is not a general transaction/KV interface.
 type Repositories struct {
+	Groups       GroupSupportRepository
 	Routes       RouteRepository
 	Builds       BuildRepository
 	Nodes        NodeRepository

@@ -12,7 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/storage"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -50,7 +50,7 @@ type Context struct {
 	TemplateID    *string           `json:"templateID,omitempty"`
 	SandboxConfig map[string]string `json:"sandbox_config,omitempty"`
 	ImageRepo     string            `json:"image_repo,omitempty"`
-	RegistryAuth  *cluster.Secret   `json:"registry_auth,omitempty"`
+	RegistryAuth  *keys.Secret      `json:"registry_auth,omitempty"`
 	TargetPort    int               `json:"target_port,omitempty"`
 	ProjectID     string            `json:"project_id,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
@@ -133,6 +133,20 @@ type Page struct {
 type DefaultContext struct {
 	TemplateID string `json:"templateID"`
 }
+
+func (c *DefaultContext) UnmarshalJSON(raw []byte) error {
+	type plain DefaultContext
+	var decoded plain
+	if err := decodeStrict(raw, &decoded); err != nil {
+		return err
+	}
+	if _, err := types.ParseTemplateID(decoded.TemplateID); err != nil {
+		return fmt.Errorf("%w: default_context.templateID", ErrInvalid)
+	}
+	*c = DefaultContext(decoded)
+	return nil
+}
+
 type AuthMaterial struct {
 	APISecret string `json:"api_secret"`
 }
@@ -200,9 +214,9 @@ func Normalize(c Context) (Context, []byte, error) {
 		copy := *c.RegistryAuth
 		c.RegistryAuth = &copy
 		if c.RegistryAuth.Type == "" {
-			c.RegistryAuth.Type = cluster.SecretInline
+			c.RegistryAuth.Type = keys.SecretInline
 		}
-		if c.RegistryAuth.Type != cluster.SecretInline || c.RegistryAuth.Fingerprint != "" {
+		if c.RegistryAuth.Type != keys.SecretInline || c.RegistryAuth.Fingerprint != "" {
 			return Context{}, nil, fmt.Errorf("%w: registry_auth must contain resolved inline material", ErrInvalid)
 		}
 	}

@@ -326,7 +326,7 @@ func (s *Store) FinalizeReap(ctx context.Context, claim metadata.ReapClaim) (boo
 		if err := s.guardReap(m, claim); err != nil {
 			return false, err
 		}
-		for _, scope := range []records.Key{s.sandboxOwnerScope(claim.NodeID), s.buildOwnerScope(claim.NodeID), s.keyPairScope(claim.NodeID)} {
+		for _, scope := range []records.Key{s.sandboxOwnerScope(claim.NodeID), s.buildOwnerScope(claim.NodeID), s.keyPairScope(claim.NodeID), s.groupNodeScope(claim.NodeID)} {
 			rows, err := m.tr.Scan(scope, nil, pageLimit(1))
 			if err != nil {
 				return false, err
@@ -338,6 +338,8 @@ func (s *Store) FinalizeReap(ctx context.Context, claim metadata.ReapClaim) (boo
 		clearRecord(m.tr, s.profileKey(claim.NodeID))
 		clearRecord(m.tr, s.lifecycleKey(claim.NodeID))
 		clearRecord(m.tr, s.reapingKey(claim.NodeID))
+		clearRecord(m.tr, s.groupPublicationKey(claim.NodeID))
+		clearRecord(m.tr, s.groupProgressKey(claim.NodeID))
 		s.clearCatalog(m.tr, claim.NodeID)
 		removed = true
 		return true, nil

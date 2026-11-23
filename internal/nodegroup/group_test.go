@@ -73,3 +73,23 @@ func TestContextCanonicalAndPrivateProjection(t *testing.T) {
 		t.Fatalf("oversized context: %v", err)
 	}
 }
+
+func TestSupportDefaultContextWireContract(t *testing.T) {
+	template := "bare-snp-" + base64.RawURLEncoding.EncodeToString([]byte("manifest://"+strings.Repeat("a", 64)))
+	for _, raw := range []string{`{}`, `{"default_context":null}`, `{"default_context":{"templateID":"` + template + `"}}`} {
+		var report Support
+		if err := json.Unmarshal([]byte(raw), &report); err != nil {
+			t.Fatalf("valid default context rejected: %s: %v", raw, err)
+		}
+	}
+	for _, raw := range []string{
+		`{"default_context":{}}`, `{"default_context":{"templateID":null}}`,
+		`{"default_context":{"templateID":""}}`, `{"default_context":"` + template + `"}`,
+		`{"default_context":{"templateID":"` + template + `","sandbox_config":{}}}`,
+	} {
+		var report Support
+		if err := json.Unmarshal([]byte(raw), &report); err == nil {
+			t.Fatalf("invalid default context accepted: %s", raw)
+		}
+	}
+}
