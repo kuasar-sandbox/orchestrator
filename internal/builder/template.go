@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -68,12 +69,34 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w (%s)", err, firstLine(out))
 	}
-	bundle := filepath.Join(checkpointDir, sb.sid+".snapshot")
-	if _, err := os.Stat(bundle); err != nil {
-		return "", fmt.Errorf("snapshot bundle missing: %w", err)
+	ref, err := capturedSnapshotRef(out, checkpointDir)
+	if err != nil {
+		return "", fmt.Errorf("snapshot result: %w", err)
 	}
 	p.progress("template: snapshot taken")
-	return bundle, nil
+	return ref, nil
+}
+
+// capturedSnapshotRef preserves the capture's actual reference, including its
+// runtime declaration. The capture JSON contract supplies a safe local basename;
+// publication needs the corresponding host path in the trusted checkpoint dir.
+func capturedSnapshotRef(output []byte, directory string) (string, error) {
+	report, err := artifact.DecodeCaptureReport(output, artifact.RoleSnapshot)
+	if err != nil {
+		return "", err
+	}
+	ref, err := manifest.ParseRef(report.SnapshotRef)
+	if err != nil {
+		return "", err
+	}
+	if ref.Scheme != manifest.RefSchemeFile || ref.Location != "" {
+		return "", fmt.Errorf("template capture must return a local snapshot file reference")
+	}
+	ref.Path = filepath.Join(directory, ref.Path)
+	if _, err := os.Stat(ref.Path); err != nil {
+		return "", fmt.Errorf("snapshot artifact missing: %w", err)
+	}
+	return ref.String(), nil
 }
 
 func (p *buildPipeline) waitTemplateCommands(envdUDS string) error {
@@ -154,7 +177,7 @@ func templateSnapshotArgs(pathID, output, runRoot, mode string, policy sandboxcf
 	if mode == "" {
 		mode = "local"
 	}
-	args := []string{"snapshot", "--path-id", pathID, "--output", output, "--mode", mode, "--run-root", runRoot}
+	args := []string{"snapshot", "--json", "--path-id", pathID, "--output", output, "--mode", mode, "--run-root", runRoot}
 	if policy.MergeRef != nil {
 		args = append(args, fmt.Sprintf("--merge-ref=%t", *policy.MergeRef))
 	}

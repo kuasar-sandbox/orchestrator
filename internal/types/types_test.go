@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 )
 
 func TestParseProfile(t *testing.T) {
@@ -75,7 +77,8 @@ func TestTemplateIDRejectsNonPortableOrWrongArtifact(t *testing.T) {
 func TestTemplateIDLengthLimits(t *testing.T) {
 	fixed := "file://" + strings.Repeat("a", 64) + ".snapshot@digest:" +
 		strings.Repeat("b", 64) + "@location:"
-	ref := fixed + strings.Repeat("c", MaxPortableRefBytes-len(fixed))
+	base := fixed + strings.Repeat("c", MaxPortableBaseRefBytes-len(fixed))
+	ref := base + "@runtime:" + strings.Repeat("r", manifest.MaxRuntimeBasenameBytes-len(".bundle")) + ".bundle:digest:" + strings.Repeat("d", 64)
 	id := TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: ref}.String()
 	if len(id) != MaxTemplateIDBytes {
 		t.Fatalf("maximum template ID length = %d, want %d", len(id), MaxTemplateIDBytes)
@@ -85,6 +88,33 @@ func TestTemplateIDLengthLimits(t *testing.T) {
 	}
 	if _, err := ParseTemplateID(TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: ref + "c"}.String()); err == nil {
 		t.Fatal("overlong template ID accepted")
+	}
+	for _, raw := range []string{base + "c", base + "c@runtime:r.bundle:digest:" + strings.Repeat("d", 64)} {
+		if _, err := ParseTemplateID(TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: raw}.String()); err == nil {
+			t.Fatal("runtime extension enlarged the base reference budget")
+		}
+	}
+}
+
+func TestTemplateRuntimeCompatibility(t *testing.T) {
+	base := "manifest://" + strings.Repeat("a", 64)
+	annotation := "@runtime:runtime.bundle:digest:" + strings.Repeat("b", 64)
+	for _, raw := range []string{base, base + annotation} {
+		want := TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: raw}
+		got, err := ParseTemplateID(want.String())
+		if err != nil || got != want {
+			t.Fatalf("snapshot reference rejected: %#v, %v", got, err)
+		}
+	}
+	for _, kind := range []Kind{KindImg, KindSbx} {
+		if _, err := ParseTemplateID((TemplateID{Profile: ProfileBare, Kind: kind, Ref: base + annotation}).String()); err == nil {
+			t.Fatalf("runtime declaration accepted on %s", kind)
+		}
+	}
+	for _, suffix := range []string{"@runtime", "@runtime:", annotation + annotation, annotation + "@location:x"} {
+		if _, err := ParseTemplateID((TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: base + suffix}).String()); err == nil {
+			t.Fatalf("malformed declaration silently accepted: %q", suffix)
+		}
 	}
 }
 
