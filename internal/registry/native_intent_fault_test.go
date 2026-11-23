@@ -52,10 +52,11 @@ var errNativeIntentAbort = errors.New("fixture: abort after staging the native i
 // Unknown commits those writes and loses only the completion reply.
 type nativeIntentFaultEngine struct {
 	storage.Engine
-	mode        atomic.Int32
-	injected    atomic.Int32
-	writes      atomic.Int32
-	afterCommit func()
+	mode              atomic.Int32
+	injected          atomic.Int32
+	writes            atomic.Int32
+	afterCommit       func()
+	abortBeforeCommit atomic.Bool
 }
 
 type countingIntentTx struct {
@@ -71,18 +72,31 @@ func (e *nativeIntentFaultEngine) Update(ctx context.Context, fn func(storage.Tx
 	if mode == 0 {
 		return e.Engine.Update(ctx, fn)
 	}
-	e.injected.Add(1)
+	var writes int32
 	err := e.Engine.Update(ctx, func(tx storage.Tx) error {
 		counted := &countingIntentTx{Tx: tx}
 		if err := fn(counted); err != nil {
 			return err
 		}
-		e.writes.Add(counted.writes)
+		writes = counted.writes
+		if mode == 2 && e.abortBeforeCommit.Swap(false) {
+			return storage.ErrRetry
+		}
 		if mode == 1 {
 			return errNativeIntentAbort
 		}
 		return nil
 	})
+	if errors.Is(err, storage.ErrRetry) {
+		// A definitely aborted native attempt has not reached the requested
+		// commit boundary. Keep the fault armed for the repository retry.
+		e.mode.Store(mode)
+		return err
+	}
+	if errors.Is(err, errNativeIntentAbort) || (err == nil && mode == 2) {
+		e.injected.Add(1)
+		e.writes.Add(writes)
+	}
 	if err == nil && mode == 2 {
 		if e.afterCommit != nil {
 			e.afterCommit()
@@ -137,6 +151,9 @@ func TestRegistryNativeIntentFaults(t *testing.T) {
 						fault.mode = 1
 					case "F02_native_commit_reply_lost":
 						fault.mode = 2
+						// Force a real rolled-back attempt before the successful
+						// commit so retry scheduling cannot consume the fault.
+						engine.abortBeforeCommit.Store(true)
 					}
 					r.stores.routes = fault
 					owner := &groupCommandOwner{}
