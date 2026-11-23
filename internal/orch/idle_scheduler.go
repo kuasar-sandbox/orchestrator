@@ -227,7 +227,7 @@ func (o *Orchestrator) pauseIdleCandidate(ctx context.Context, sid string, c *id
 		defer func() {
 			o.log.Info("idle pause result", "sid", sid, "generation", c.generation, "elapsed_ms", float64(time.Since(started))/1e6, "err", err)
 		}()
-		request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true, IfIdleSince: cloneTime(&c.t0.Wall), IdleSinceBootNS: c.t0.BootNS, NoWaitForPreviousMemorySave: true}
+		request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, IfIdle: true, IfIdleSince: cloneTime(&c.t0.Wall), IdleSinceBootNS: c.t0.BootNS}
 		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(sb.Metadata, sandboxcfg.SnapshotPolicy{})
 		if err == nil {
 			_, err = o.pauseSandboxLocked(ctx, sb, request)

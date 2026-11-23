@@ -28,7 +28,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 | Operation | Method and path | Contract |
 |---|---|---|
-| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional idleTimeout/autoPauseMemory/autoReset/max_checkpoints (positive integer, default 1) plus optional X-Kuasar-Sandbox-* headers. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
+| Create | POST /sandboxes → 201 | Body templateID/timeout/metadata/envVars/optional idleTimeout/autoPauseMemory/autoReset plus optional X-Kuasar-Sandbox-* headers. Set `checkpoint.max_checkpoints` through the checkpoint Header/metadata namespace (positive integer, default 1; [Checkpoint policy input](#request-checkpoint)); a top-level `max_checkpoints` returns 400. Omitted/null/true autoPauseMemory captures S at TTL; false captures E, without changing explicit Pause's default. 201 is durable starting acceptance and does not wait for runner/runtime/envd. e2b returns Envd/Traffic/Forward tokens; bare returns Forward only |
 | Get | GET /sandboxes/{id} | Includes state/startedAt/endAt/metadata, autoReset, optional deadAt/executionResult/autoResetError ([Termination, Reset and retained data](#reset-and-retention)) |
 | Usage stats | GET /sandboxes/{id}/stats/usage | Shared native current/saved/history reader; lossless integers and coverage, online owner/offline locks, no Wake or sampling |
 | Resource stats | GET /sandboxes/{id}/stats/resource | Read-only effective resource specification and host VMM counters, with observed node reservation; sparse JSON, no guest access |
@@ -360,7 +360,7 @@ Explicit Pause body may be empty or:
 {"memory":false}
 ```
 
-Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field, even with a null value, returns 400 before freeze/capture/lifecycle side effects. Explicit merge_ref/drop_caches fields in the Pause Header have the same restriction. Header/metadata checkpoint input still permits only merge_ref/drop_caches, never memory.
+Omitted/null/true memory selects CaptureSnapshot; false selects CaptureSandbox. Explicit Pause always defaults to S independently of autoPauseMemory. Thus Create(autoPauseMemory=false) plus Pause({}) captures S, while TTL captures E. SnapshotPolicy alone owns checkpoint_merge_ref/drop_caches. With memory=false, presence of either field, even with a null value, returns 400 before freeze/capture/lifecycle side effects. Explicit merge_ref/drop_caches fields in the Pause Header have the same restriction. Pause and Build checkpoint inputs permit only `merge_ref`/`drop_caches`. The quota `max_checkpoints` is Create-only, and `memory` is never a checkpoint namespace field.
 
 ### Checkpoint memory saving
 
@@ -439,9 +439,9 @@ stable preparation lock and a recheck that no capture/R exists; BaseDir and the
 previous ResumeSource remain available.
 
 Multiple holders may coexist for one SID. A new Pause never waits for an older
-RAM release, for either Bundle or tarstream. `noWaitForPreviousMemorySave` and
-`NoWaitForPreviousMemorySave` remain accepted compatibility inputs without a
-previous-save gate. Restore adopts every unsettled SID obligation from the
+RAM release, for either Bundle or tarstream. The removed Pause input
+`noWaitForPreviousMemorySave`, including `NoWaitForPreviousMemorySave`, returns
+HTTP 400 even when its value is false or null. Restore adopts every unsettled SID obligation from the
 authoritative node inventory, independent of the chosen checkpoint or branch:
 Q = B + ΣRi. Each exact capture Ri is charged once in its original SourcePool;
 the target pool admits new B/cache. ReservationMemory, balloon, StateSync, Guest
@@ -521,8 +521,10 @@ pausing run as dead. An unknown outcome retains its owner for retry. Without a r
 pausing row keeps the existing exact-run fencing and terminal cleanup behavior.
 
 `checkpoint=true` atomically retains the immutable E or S/E pair with paused/source and returns
-HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Sandbox option
-`max_checkpoints` defaults to 1 and accepts positive integers. Direct/cluster
+HTTP 200 `{"checkpointID":"<UUID-v7>"}`. Ordinary Pause still returns 204. Create option
+`checkpoint.max_checkpoints` defaults to 1 and accepts positive integers through
+`X-Kuasar-Sandbox-Checkpoint` or `metadata["kuasar-sandbox.checkpoint"]`
+([Checkpoint policy input](#request-checkpoint)); the old top-level body field returns 400. Direct/cluster
 Create, Reserve retries and replacements preserve the accepted policy; it does
 not enter S/E or migration tokens. Named Pause checks quota before freeze and
 again in the paused/source/holder transaction, returning 409 at the limit. Ordinary Pause neither occupies this quota nor replaces it.
@@ -1128,7 +1130,7 @@ Each instance receives configuration through reserved e2b metadata namespaces `k
 | metadata | Runtime SANDBOX_CONFIG metadata, e.g. e2b.start_cmd |
 | restore | Current host prefetch policy: optional, explicit off/memory only |
 | credentials | Create-time ServiceSecret and Envd/Traffic overrides, separated from ordinary metadata and never guest config |
-| checkpoint | Host-only Create-local Pause defaults: merge_ref/drop_caches true/false/null; Sandbox row only, not runtime YAML/snapshot.cfg |
+| checkpoint | Host-only Create input: merge_ref/drop_caches true/false/null set Pause defaults; max_checkpoints sets the retained-checkpoint quota (positive integer/null, default 1). The quota becomes typed Sandbox state; only snapshot defaults remain in metadata. Neither enters runtime YAML/snapshot.cfg |
 | workspace | Portable data-disk names and mounts; create selectors are private. See [Workspace storage](#workspace-storage). |
 | mmds | Portable exact routes plus request-scoped initial secrets; split before persistence so metadata retains routes only |
 
@@ -1154,17 +1156,27 @@ Restore accepts only a strict JSON object; unknown fields, nonstring prefetch or
 
 ### Checkpoint policy input
 
-Checkpoint policy accepts Create Header or metadata:
+Create accepts checkpoint policy through either of these equivalent Header or metadata forms:
 
 ```http
-X-Kuasar-Sandbox-Checkpoint: {"merge_ref":false,"drop_caches":null}
+X-Kuasar-Sandbox-Checkpoint: {"merge_ref":true,"drop_caches":false,"max_checkpoints":3}
 ```
 
 ```json
-{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}
+{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false,\"max_checkpoints\":3}"}}
 ```
 
-Both use the same strict object parser allowing only merge_ref/drop_caches and true/false/null. Unknown fields, wrong types or trailing/second values return 400. Header overrides by field; null/absence means no override, not clearing a lower value. If all fields remain null/absent, remove the namespace. Source templates do not supply it. Build checkpoint input is defined in [Request-scoped Builder input](node-build.md#request-scoped-builder-input). Local/Bundle use identical parsing, precedence and side-effect boundaries.
+| Field | Accepted value | Scope |
+|---|---|---|
+| `merge_ref` | `true`, `false` or `null` | Create sets the Sandbox snapshot default; Pause/Build may supply capture policy |
+| `drop_caches` | `true`, `false` or `null` | Create sets the Sandbox snapshot default; Pause/Build may supply capture policy |
+| `max_checkpoints` | Positive integer or `null` | Create-only retained-checkpoint quota; defaults to 1 when unset after merging |
+
+Both sources must be strict JSON objects. Unknown or duplicate fields, wrong types, nonpositive quotas, or trailing/second values return 400; a valid Header cannot hide invalid metadata. Header values override metadata by field. Null or absence inherits the lower value. The old Create top-level body field `max_checkpoints` is rejected with 400, including false or null values.
+
+Create extracts the merged quota into typed Sandbox state before admission. Only `merge_ref`/`drop_caches` remain in checkpoint metadata; if both are null/absent, that namespace is removed even when a quota was supplied. Source templates do not supply this policy. The quota does not enter E/S artifacts or migration tokens.
+
+Pause and Build checkpoint inputs still accept only `merge_ref`/`drop_caches`; supplying `max_checkpoints` there returns 400 even when null. `memory` is not a checkpoint namespace field. Build capture rules are defined in [Request-scoped Builder input](node-build.md#request-scoped-builder-input). Local/Bundle use identical parsing, precedence and side-effect boundaries.
 
 <a id="configuration-rendering"></a>
 
@@ -1177,7 +1189,7 @@ The complete request-scoped `kuasar-sandbox.builder` input and target rules are 
 - **Precedence:** resources follow the fixed leaf chain; remaining inputs follow their declared namespace rules across node/group/current Create. Canonical TemplateID Create never reads builds.metadata_json. Build resources and final Sandbox resources are independent, without mutual defaults/comparisons/derivation. Trigger cpuCount/memoryMB only assert immutable Build resources.
 - **Capacity:** img Create uses request/group/node defaults. sbx/snp Create, paused resume and migration take portable E capacity as authority. Synchronous acceptance checks patch structure only; after runner preparation, explicit matching capacity is an assertion, while any differing leaf causes asynchronous resource_resolve failure. Unreadable capacity fails rather than falling back. Runner is already assigned, but networking/YAML/controller reservation/VM side effects have not begun; the runner delegation cgroup may already exist. Initial restore reservation exactly equals sandboxer's BudgetAtSnapshot derived from captured CH target/current; startup headroom and partial grants do not apply.
 - **Network travels with E:** cold rendering records logical network in SANDBOX_CONFIG.metadata[kuasar-sandbox.network], which enters E's sandbox.runtime.cfg. S refers to E; snapshot.cfg itself contains no metadata. Artifact tasks strictly parse/validate it and submit typed bounded network summaries, never raw metadata to conductor. Explicit current fields win over inherited artifact fields. Build template network projection is in [Request-scoped Builder input](node-build.md#request-scoped-builder-input). MigrationToken also carries metadata. Other runtime namespaces apply at cold start or are captured in memory; host restore/checkpoint policies stay separate.
-- **Host policy stays outside artifacts/templates:** restore/checkpoint originate in Create metadata. Image cold boot does not render them into runtime YAML. snp Create, later resume and migration rerender restore policy when restoring S. Checkpoint is read only by host Pause and never enters SANDBOX_CONFIG/snapshot.cfg. Connect/resume offers no temporary override.
+- **Host policy stays outside artifacts/templates:** restore/checkpoint originate in the Create request. The checkpoint quota is extracted into typed Sandbox state; its remaining metadata contains snapshot defaults only. Image cold boot does not render these policies into runtime YAML. snp Create, later resume and migration rerender restore policy when restoring S. Host Pause reads the snapshot defaults; neither they nor the quota enter SANDBOX_CONFIG/snapshot.cfg. Connect/resume offers no temporary override.
 - **Persistence:** sandboxes.metadata_json holds launch input. Build metadata/builder JSON are retention-bounded execution records, never a second template authority.
 
 <a id="node-defaults"></a>

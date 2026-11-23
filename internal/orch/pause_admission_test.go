@@ -32,27 +32,25 @@ func captureStateFor(q ctl.CaptureStateQuery, pending bool) ctl.CaptureState {
 }
 
 func TestPauseAdmissionDoesNotWaitForOlderHolders(t *testing.T) {
-	for _, noWait := range []bool{false, true} {
-		f := pendingPauseFixture(t)
-		calls := 0
-		f.o.captureStateReader = func(_ context.Context, _ string, q ctl.CaptureStateQuery) (ctl.CaptureState, error) {
-			calls++
-			if !q.ForCapture || !q.NoWaitForPreviousMemorySave {
-				t.Fatal("issued blocking save query")
-			}
-			return captureStateFor(q, true), nil
+	f := pendingPauseFixture(t)
+	calls := 0
+	f.o.captureStateReader = func(_ context.Context, _ string, q ctl.CaptureStateQuery) (ctl.CaptureState, error) {
+		calls++
+		if !q.ForCapture || !q.NoWaitForPreviousMemorySave {
+			t.Fatal("issued blocking save query")
 		}
-		ctx, unlock, sb, err := f.o.lockPauseAdmission(context.Background(), f.sb.ID, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, NoWaitForPreviousMemorySave: noWait}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pending, err := f.o.captureMemorySavePending(ctx, sb, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, true); err != nil || pending {
-			t.Fatalf("locked recheck gated capture: %t %v", pending, err)
-		}
-		unlock()
-		if calls != 1 {
-			t.Fatalf("capability queries=%d", calls)
-		}
+		return captureStateFor(q, true), nil
+	}
+	ctx, unlock, sb, err := f.o.lockPauseAdmission(context.Background(), f.sb.ID, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := f.o.captureMemorySavePending(ctx, sb, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, true); err != nil || pending {
+		t.Fatalf("locked recheck gated capture: %t %v", pending, err)
+	}
+	unlock()
+	if calls != 1 {
+		t.Fatalf("capability queries=%d", calls)
 	}
 }
 
@@ -222,7 +220,7 @@ func TestCaptureSynchronousFallbackPreservesPreviousMemoryWithoutNewIntent(t *te
 		state.RetentionSupported = &supported
 		return state, nil
 	}
-	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, NoWaitForPreviousMemorySave: true}
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}
 	ctx, unlock, sb, err := f.o.lockPauseAdmission(context.Background(), f.sb.ID, request, nil)
 	if err != nil {
 		t.Fatal(err)

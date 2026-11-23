@@ -1364,9 +1364,8 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	precondition := sandboxPrecondition(sandbox)
 	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Pause = &conductorextension.SandboxPauseRequest{
-		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
-		CaptureKind:                 conductorextension.CaptureKind(request.Kind),
-		Checkpoint:                  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
+		CaptureKind: conductorextension.CaptureKind(request.Kind),
+		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
 		CheckpointMergeRef: cloneBool(request.SnapshotPolicy.MergeRef), CheckpointDropCaches: cloneBool(request.SnapshotPolicy.DropCaches),
 	}
 	operationID := operation.ID
@@ -1382,7 +1381,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	if candidate == nil {
 		return "", fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
 	}
-	if candidate.NoWaitForPreviousMemorySave != request.NoWaitForPreviousMemorySave || types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
+	if types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
 		return "", fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
@@ -1401,9 +1400,8 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	}
 	defer unlock()
 	finalRequest := sandboxcfg.CaptureRequest{
-		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
-		Kind:                        types.CaptureKind(candidate.CaptureKind),
-		Checkpoint:                  candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
+		Kind:       types.CaptureKind(candidate.CaptureKind),
+		Checkpoint: candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
 		SnapshotPolicy: sandboxcfg.SnapshotPolicy{
 			MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
 		},
@@ -1451,7 +1449,7 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	default:
 		return api.ErrNotFound
 	}
-	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox, NoWaitForPreviousMemorySave: true}
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
 	if current.AutoPauseMemory {
 		request.Kind = types.CaptureSnapshot
 		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, sandboxcfg.SnapshotPolicy{})

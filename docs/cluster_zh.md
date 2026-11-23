@@ -206,6 +206,12 @@ Header 覆盖同名完整 object,checkpoint Header 按字段覆盖。router 始�
 `off` 均为关闭;只有本次 create 显式提供 `memory` 才启用。create body 上限为 16 MiB,
 超限返回 **413**。
 
+Create 的 `checkpoint.max_checkpoints` 仅能放在 `X-Kuasar-Sandbox-Checkpoint` 或
+`metadata["kuasar-sandbox.checkpoint"]` 内；旧的顶层 body 字段返回 400。配额允许正整数或 null，
+未指定时取 1，并与快照缺省一样按 Header 非 null 字段覆盖 metadata。Router 把配额提取到既有的
+内部 Reserve typed 字段，转发的 checkpoint config 只保留 `merge_ref`/`drop_caches`。
+已接纳配额在 Reserve 重试和 replacement 间保持不变（[Checkpoint policy 输入](sandbox-lifecycle_zh.md#request-checkpoint)）。
+
 Router 按 [Registry Reserve 协议](#reserve) 为共同的 `POST /route-link/reserve` 端点组装请求，传递对应操作的已认证上下文并保留期望的稳定身份。Create 在准入前严格归一化；Connect 保留可选 memory 选择及其缺省状态；exec-session 先严格解析公共 TTL/conditions 再转换为 Registry typed request；Data 使用既有 access-token/service/port 上下文。
 
 精确 query/Header/body schema 由 Registry 规范唯一维护，并在其边界重复校验。Conditions 不借无关 metadata、query 参数或配置 Header 传递；本篇只定义转换边界，不再维护一份可能失步的 schema 表。
@@ -1609,16 +1615,16 @@ POST /route-link/reserve
 ```
 
 Reserve body 按 operation 使用独立 typed schema:create 携 create config,exec-session 携
-`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。create body 是可选 `config` map 及独立的 `idle_timeout`、`auto_pause_memory`、`auto_reset` typed 字段，最多 16 MiB。四种 operation 的凭据和
+`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。本内部协议的 create body 是可选 `config` map 及独立的 `max_checkpoints`、`idle_timeout`、`auto_pause_memory`、`auto_reset` typed 字段，最多 16 MiB。四种 operation 的凭据和
 完成条件不同;Registry 对 exec-session body 再做严格 schema/bounds 校验,不接受旧的
 `ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
 - `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.resource`、`kuasar-sandbox.traffic`、`kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
-  `kuasar-sandbox.checkpoint`；`idle_timeout`、`auto_pause_memory`（默认 true）与 `auto_reset`（默认 false）是独立 typed body 字段，拒绝 `memory`。`idle_timeout` 是可表示为 duration 的非负整数秒；absent/null 关闭策略，0 仍表示启用，它不是 config namespace。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+  `kuasar-sandbox.checkpoint`；`max_checkpoints`（默认 1）、`idle_timeout`、`auto_pause_memory`（默认 true）与 `auto_reset`（默认 false）是独立 typed body 字段，拒绝 `memory`。Router 已提取公开 checkpoint 配额，此处 config 命名空间只携 `merge_ref`/`drop_caches`。`idle_timeout` 是可表示为 duration 的非负整数秒；absent/null 关闭策略，0 仍表示启用，它不是 config namespace。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
   attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
   Registry 内合并。
-- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;body 只允许可选 `memory`，不允许非空 config 或非 null 的 idle_timeout/auto_pause_memory/auto_reset，selector 原样进入 CmdConnect；Header 携 `X-API-KEY`,可选
+- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;body 只允许可选 `memory`，不允许非空 config 或非 null 的 max_checkpoints/idle_timeout/auto_pause_memory/auto_reset，selector 原样进入 CmdConnect；Header 携 `X-API-KEY`,可选
   `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
   对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
   排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、按同一 memory
@@ -1907,8 +1913,10 @@ profile 写入 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bar
 但仍不接受 e2b 专属的 start/ready 命令。
 
 Build Register 与普通 Create 共用 resource/network/launch/init/mounts/files/metadata 的 strict
-header/metadata 归一化，也传递 `envVars`。Registry 的 durable BuildRecord 保存非秘密 config/env/
-secure 和 credentials/MMDS values 的不可逆 digest；原始 credentials 与 MMDS initial values 只存在于
+header/metadata 归一化，也传递 `envVars`。Registry 的 durable BuildRecord 保存非秘密 config/env
+和 credentials/MMDS values 的不可逆 digest。公开 Build Register `secure` 返回 HTTP 400，包括 false/null。
+历史 secure 值继续保留在内部 dispatch、持久状态和注册重放身份中，以完成旧的在途 intent；
+它不影响执行或目标校验。原始 credentials 与 MMDS initial values 只存在于
 本次 dispatch envelope，节点验证后分别加密进 task-local Build 状态。显式 Image/顶层 Sandbox E
 对 instance-only 输入的拒绝、restore 的无条件拒绝、target 与输出 ref 的一致性由 Router、Registry、
 节点和 worker 各自 fail closed，不能靠某一跳的过滤作为信任边界。

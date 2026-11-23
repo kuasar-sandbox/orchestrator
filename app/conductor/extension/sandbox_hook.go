@@ -69,13 +69,12 @@ const (
 // action-scoped checkpoint overrides. CaptureKind is observable but immutable;
 // nil policy fields inherit sandbox and node policy.
 type SandboxPauseRequest struct {
-	NoWaitForPreviousMemorySave bool
-	Checkpoint                  bool
-	IfIdle                      bool
-	IfIdleSince                 *time.Time
-	CaptureKind                 CaptureKind
-	CheckpointMergeRef          *bool
-	CheckpointDropCaches        *bool
+	Checkpoint           bool
+	IfIdle               bool
+	IfIdleSince          *time.Time
+	CaptureKind          CaptureKind
+	CheckpointMergeRef   *bool
+	CheckpointDropCaches *bool
 }
 
 type ResumeMode string

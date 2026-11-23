@@ -112,7 +112,7 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?, secure?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应返回请求的 `target`。声明了 workspace 时须显式指定 Sandbox 目标 |
+| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应返回请求的 `target`。声明了 workspace 时须显式指定 Sandbox 目标 |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段, requested `target`, 终态 derived `kind`, 及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`, `cancelRequested`, `deleteRequested`, `executionClaimed`, `runID`, `storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [按目标执行与发布](#execution-and-publication) |
@@ -213,19 +213,20 @@ Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/met
 `envVars` 和实例选项的共享 typed parser,各 namespace 的字段与 Header/metadata 合并规则
 见 [沙箱配置传递链](sandbox-lifecycle_zh.md#request-configuration)。Register 始终拒绝 `kuasar-sandbox.identity`、
 租户提供的 node-managed cluster metadata、`restore` 与 `autoPauseMemory`。
+已移除的 Build Register 顶层 `secure` 字段只要出现就返回 HTTP 400，包括 false 或 null；它不是 Build 安全模式。
 普通 Build runtime 输入存 `builds.metadata_json`,build-only 输入存 `builds.builder_json`;
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
 Trigger 不能覆盖注册 metadata、Builder/Resource 或其他通用配置头;非空通用 metadata/header 被拒绝。
 
 - 同步接纳时,已知为 Image 的 target 拒绝归一化后仍存在的 Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
-  以及非空 `envVars`、`secure=true`、非零 credential override 或显式 MMDS routes/secrets。
-  普通 metadata label 与 Build execution resources 仍允许;空 `envVars`、`secure=false` 本身不构成拒绝条件。
+  以及非空 `envVars`、非零 credential override 或显式 MMDS routes/secrets。
+  普通 metadata label 与 Build execution resources 仍允许;空 `envVars` 本身不构成拒绝条件。
 - 所有 target 均接受 `X-Kuasar-Sandbox-Network` / `kuasar-sandbox.network` 作为 Build 执行网络,
   包括显式或自动解析的 Image target,也允许空 network 对象。网络输入不要求输出 Sandbox;
   A/B 使用它完成镜像导入和构建步骤,Sandbox target 还会将其投影到 E。
 - 同步接纳时,显式顶层 Sandbox E 接受 portable Create 配置(包括 env),但拒绝 traffic、非零 credentials、
-  显式 MMDS routes/secrets、`secure=true` 与非空 checkpoint 等 instance/action-only 输入。
-- 只有 resolved `sandbox,memory:true` 应用后一类输入。`instance_config_enc` 加密 env/secure/credentials;
+  显式 MMDS routes/secrets 与非空 checkpoint 等 instance/action-only 输入。
+- 只有 resolved `sandbox,memory:true` 应用后一类输入。`instance_config_enc` 加密 env/credentials;
   traffic/checkpoint/MMDS routes 存 metadata,MMDS values 使用独立加密表。实例/动作字段不进入 portable E/S;
   portable env 保留自身投影规则。空对象不是统一豁免:例如 `resource:{}`、`traffic:{}` 仍会被 Image 拒绝;
   空 checkpoint 与零值 credential 经各 namespace 归一化处理。
@@ -242,7 +243,8 @@ Build Register 的 routes 只服务
 从 `builds.metadata_json` 删除 routes namespace 并删除 value blob,因此两者都不进入最终
 template/snapshot/image。Build Trigger 不接受 MMDS 覆盖。
 
-Build register
+Build 的 checkpoint Header/metadata 只接受 `merge_ref`/`drop_caches`，值为 true/false/null。
+Create 专属的 `max_checkpoints` 在此返回 HTTP 400，包括 null。Build register
 只在 resolved `sandbox,memory:true` 时应用 `kuasar-sandbox.checkpoint` policy并用于 Phase C capture,且不写入最终 portable
 config。已知不兼容时同步拒绝;已接纳且依赖来源解析的 Image 不解析 checkpoint policy 或目标 Sandbox resources。
 
@@ -797,8 +799,9 @@ status/index/alias；它不是长期模板 catalog（[模板 ID 与工件权威]
 
 `resources_*` 是不可变 Build execution/admission resources；最终 Sandbox resource 属于
 `metadata_json` 中的 Create config，二者不互相推导。`instance_config_enc` 整体加密保存
-register `envVars`（sandbox target 的 portable launch env）以及 secure/credentials 等只供
-memory Phase C 的实例输入；读取后这些类别仍在 target validation/portable projection 前分离。
+register `envVars`（sandbox target 的 portable launch env）以及只供 memory Phase C 的 credentials。
+历史 secure 值仍保留在该加密状态和原始注册重放身份中，不控制执行或限制输出目标，新的公开请求无法设置它。
+读取后 environment 与 credentials 仍在 target validation/portable projection 前分离。
 不为旧 Build row/schema 增加双 reader。启动时把 `instance_config_enc` 作为
 #300 Build schema 的 clean-break marker；缺少该列的开发数据库会被明确拒绝并要求重建，
 不会原地推导、回填明文或延迟到首次 Build 查询才失败。
