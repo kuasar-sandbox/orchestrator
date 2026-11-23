@@ -3,6 +3,7 @@ package sandboxcfg
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -93,7 +94,7 @@ func TestSavedEnvdPATHOnlyChangesWithKnownProvenance(t *testing.T) {
 						if request == "empty" {
 							want = ""
 						} else if wantDefault && mode != "" {
-							want = envdDefaultPath(mode, original)
+							want = envdDefaultPath(mode, strings.TrimPrefix(original, systemdToolsPath+":"))
 						}
 						plugin := runtime.Launch.Plugin[0]
 						if plugin.Env["PATH"] != want || plugin.Env["SOURCE"] != "yes" || plugin.Env["INSTANCE"] != "yes" || plugin.PersistentSystemdPathDefault() != wantDefault || c0.Launch.Plugin[0].SystemdPathDefault != wantDefault {
@@ -104,6 +105,37 @@ func TestSavedEnvdPATHOnlyChangesWithKnownProvenance(t *testing.T) {
 						}
 					})
 				}
+			}
+		}
+	}
+}
+
+func TestEnvdDefaultModeRoundtripPreservesEveryImagePATHComponent(t *testing.T) {
+	for _, original := range []string{"", systemdToolsPath + ":/image/bin", "/image/bin:" + systemdToolsPath + ":/usr/bin", ":/image/bin::/usr/bin:"} {
+		for _, sourceMode := range []string{"off", "auto", "runtime", "provided"} {
+			for _, targetMode := range []string{"off", "auto", "runtime", "provided"} {
+				t.Run(fmt.Sprintf("%s/%s/%s", original, sourceMode, targetMode), func(t *testing.T) {
+					launch := newE2BLaunch(sourceMode, nil, false)
+					if err := ProjectNewE2BEnvironment(&launch, map[string]string{"PATH": original}); err != nil {
+						t.Fatal(err)
+					}
+					wantSource := original
+					if sourceMode != "off" {
+						wantSource = systemdToolsPath + ":" + original
+					}
+					if got := launch.Plugin[0].Env["PATH"]; got != wantSource {
+						t.Fatalf("new definition changed OCI PATH: %q; want %q", got, wantSource)
+					}
+					launch.Systemd = targetMode
+					projectSourceEnvdEnvironment(&launch, sourceMode, nil, true)
+					wantTarget := original
+					if targetMode != "off" {
+						wantTarget = systemdToolsPath + ":" + original
+					}
+					if got := launch.Plugin[0].Env["PATH"]; got != wantTarget || !launch.Plugin[0].PersistentSystemdPathDefault() {
+						t.Fatalf("mode transition lost original PATH: %q; want %q", got, wantTarget)
+					}
+				})
 			}
 		}
 	}

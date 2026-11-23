@@ -150,17 +150,6 @@ func ProjectNewE2BEnvironment(launch *rtconfig.LaunchConfig, imageEnv map[string
 }
 
 func envdDefaultPath(mode, path string) string {
-	// Provenance is established before this product-owned transformation.
-	// Remove only our exact directory component; retain every image directory
-	// and empty component, including a custom OCI default PATH.
-	parts := strings.Split(path, ":")
-	kept := parts[:0]
-	for _, part := range parts {
-		if part != systemdToolsPath {
-			kept = append(kept, part)
-		}
-	}
-	path = strings.Join(kept, ":")
 	if mode != "off" && mode != "" {
 		// Only runtime projects this directory. In provided mode an absent
 		// directory is skipped by normal PATH search; image directories remain.
@@ -282,12 +271,12 @@ func ProjectSourceLaunch(raw []byte, profile types.Profile, source *rtconfig.Por
 		}
 	}
 	if profile == types.ProfileE2B {
-		projectSourceEnvdEnvironment(&merged.Launch, requestEnv, presence.Has("launch.systemd"))
+		projectSourceEnvdEnvironment(&merged.Launch, source.Launch.Systemd, requestEnv, presence.Has("launch.systemd"))
 	}
 	return MarshalLaunchProjection(raw, merged.Launch)
 }
 
-func projectSourceEnvdEnvironment(launch *rtconfig.LaunchConfig, request map[string]string, modeOverride bool) {
+func projectSourceEnvdEnvironment(launch *rtconfig.LaunchConfig, sourceMode string, request map[string]string, modeOverride bool) {
 	// Old envd-as-primary already receives the merged Launch.Env. Only the
 	// recognized product plugin receives instance overrides. Other plugins and
 	// unknown saved layouts remain authoritative.
@@ -314,6 +303,13 @@ func projectSourceEnvdEnvironment(launch *rtconfig.LaunchConfig, request map[str
 		path, present := plugin.Env["PATH"]
 		if !present {
 			path = defaultExecPath
+		}
+		// Only a non-off product definition added this one leading component.
+		// The trusted marker grants the transformation; string equality never
+		// grants provenance. Preserve the original image PATH byte-for-byte,
+		// including its own occurrence of the same directory or empty entries.
+		if sourceMode != "" && sourceMode != "off" {
+			path = strings.TrimPrefix(path, systemdToolsPath+":")
 		}
 		if plugin.Env == nil {
 			plugin.Env = make(map[string]string)
