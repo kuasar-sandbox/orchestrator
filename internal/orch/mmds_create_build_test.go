@@ -107,7 +107,7 @@ func TestClusterBuildRegisterExtractsMMDSSecretsBeforePersistence(t *testing.T) 
 	o := testOrchCfg(t, mmdsFeatureConfig())
 	ctx := context.Background()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterBuildRegisterCommand("cluster-mmds-secret", fingerprint)
+	cmd := clusterBuildRegisterCommand(t, o, "cluster-mmds-secret", fingerprint)
 	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`
 	cmd.BuildMMDSSecrets = map[string]string{"key": "cluster-initial"}
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
@@ -139,7 +139,7 @@ func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *te
 	buildEvents, cancelBuildEvents := o.SubscribeBuilds()
 	defer cancelBuildEvents()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterBuildRegisterCommand("cluster-mmds-policy-replay", fingerprint)
+	cmd := clusterBuildRegisterCommand(t, o, "cluster-mmds-policy-replay", fingerprint)
 	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}]}`
 	cmd.BuildMMDSSecrets = map[string]string{"key": "initial"}
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {

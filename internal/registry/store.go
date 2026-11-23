@@ -59,6 +59,7 @@ type NodeRecord struct {
 // Stores keeps business storage capabilities separate from connection routing.
 // It cannot expose arbitrary keys, record sets, native transactions or replicas.
 type Stores struct {
+	groups       metadata.GroupSupportRepository
 	routes       metadata.RouteRepository
 	builds       metadata.BuildRepository
 	nodes        metadata.NodeRepository
@@ -71,10 +72,13 @@ type Stores struct {
 }
 
 func NewStores(repos metadata.Repositories, owners metadata.ConnectionOwners) (*Stores, error) {
+	if repos.Groups == nil {
+		return nil, errors.New("registry: Group support repository is required")
+	}
 	if repos.Routes == nil || repos.Builds == nil || repos.Nodes == nil || repos.Ownership == nil || repos.KeyPairs == nil || repos.Directory == nil || repos.Imports == nil || repos.Observations == nil || owners == nil || owners.LocalID() == "" {
 		return nil, errors.New("registry: all typed metadata repositories and connection owners are required")
 	}
-	return &Stores{routes: repos.Routes, builds: repos.Builds, nodes: repos.Nodes, ownership: repos.Ownership, keyPairs: repos.KeyPairs, directory: repos.Directory, imports: repos.Imports, observations: repos.Observations, owners: owners}, nil
+	return &Stores{groups: repos.Groups, routes: repos.Routes, builds: repos.Builds, nodes: repos.Nodes, ownership: repos.Ownership, keyPairs: repos.KeyPairs, directory: repos.Directory, imports: repos.Imports, observations: repos.Observations, owners: owners}, nil
 }
 func (s *Stores) WriterID() string { return s.owners.LocalID() }
 func (s *Stores) NodeOwnerCandidates(ctx context.Context, nodeID string) ([]string, error) {

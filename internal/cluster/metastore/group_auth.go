@@ -132,3 +132,22 @@ func (s *Store) ReadGroupAuth(ctx context.Context, group, authRef string) (out m
 	})
 	return
 }
+
+// The number of authentication roots is independent of object reference count.
+// Page roots, including those retained solely by existing objects, without
+// copying object records or trusting the token's short candidate fingerprint.
+func (s *Store) ListGroupAuth(ctx context.Context, group string, cursor metadata.Cursor, limit int) (metadata.Page[metadata.Versioned[metadata.GroupAuth]], error) {
+	if err := nodegroup.ValidateName(group); err != nil {
+		return metadata.Page[metadata.Versioned[metadata.GroupAuth]]{}, err
+	}
+	page, err := listTyped[metadata.GroupAuth](ctx, s, s.key("group-auth", group), cursor, limit)
+	if err != nil {
+		return page, err
+	}
+	for _, auth := range page.Items {
+		if auth.Value.Group != group || !validGroupAuth(auth.Value.AuthRef, auth.Value.APISecret) {
+			return metadata.Page[metadata.Versioned[metadata.GroupAuth]]{}, invalidRecord("Group authentication identity")
+		}
+	}
+	return page, nil
+}

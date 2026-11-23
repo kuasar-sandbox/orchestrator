@@ -50,7 +50,7 @@ func (s *Stores) commitSandboxIntent(ctx context.Context, r *SandboxRecord, expe
 	if err := validateSandboxRecord(r); err != nil {
 		return metadata.Version{}, false, err
 	}
-	ref := metadata.NodeSandboxRef{Group: r.Group, RouteKey: r.RouteKey, SandboxID: r.SandboxID, SandboxGeneration: r.SandboxGeneration, NodeSandboxID: r.NodeSandboxID, Profile: r.Profile, APISecretFingerprint: r.APISecretFingerprint}
+	ref := metadata.SandboxRef(*r)
 	v, err := s.routes.CommitIntentAndOwnership(ctx, expected, *r, ref)
 	if errors.Is(err, metadata.ErrConflict) {
 		return metadata.Version{}, false, nil
@@ -63,6 +63,16 @@ func (s *Stores) DeleteSandbox(ctx context.Context, group, key string) error {
 		return err
 	}
 	return s.routes.DeleteRoute(ctx, metadata.RouteKey{Group: group, RouteKey: key}, v)
+}
+func (s *Stores) commitGroupSandboxIntent(ctx context.Context, r *SandboxRecord, expected metadata.Version, selected metadata.GroupAdmission) (metadata.Version, bool, error) {
+	if err := validateSandboxRecord(r); err != nil {
+		return metadata.Version{}, false, err
+	}
+	v, err := s.routes.CommitGroupIntent(ctx, expected, *r, metadata.SandboxRef(*r), selected)
+	if errors.Is(err, metadata.ErrConflict) {
+		return metadata.Version{}, false, nil
+	}
+	return v, err == nil, err
 }
 func (s *Stores) DeleteSandboxIfRevision(ctx context.Context, group, key string, expected metadata.Version) (bool, error) {
 	err := s.routes.DeleteRoute(ctx, metadata.RouteKey{Group: group, RouteKey: key}, expected)

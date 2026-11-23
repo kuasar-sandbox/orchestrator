@@ -20,6 +20,14 @@ func (s *Store) buildIndexKey(v metadata.BuildRecord) records.Key {
 	return mainKey(s.templateScope(v.Group, v.TemplateID), v.BuildID)
 }
 func (s *Store) putBuild(m *mutation, current metadata.Versioned[metadata.BuildRecord], value metadata.BuildRecord) error {
+	if err := s.retainObjectAuth(m, buildRecordAuth(value), value.GroupVersion); err != nil {
+		return err
+	}
+	if current.Exists && current.Value.GroupVersion > 0 && (value.GroupVersion == 0 || current.Value.APISecretFingerprint != value.APISecretFingerprint) {
+		if err := s.releaseObjectAuth(m, buildRecordAuth(current.Value), current.Value.GroupVersion); err != nil {
+			return err
+		}
+	}
 	if current.Exists && current.Value.TemplateID != "" && current.Value.TemplateID != value.TemplateID {
 		clearRecord(m.tr, s.buildIndexKey(current.Value))
 	}
@@ -30,11 +38,15 @@ func (s *Store) putBuild(m *mutation, current metadata.Versioned[metadata.BuildR
 	}
 	return putJSON(m.tr, s.buildKey(metadata.BuildKey{Group: value.Group, BuildID: value.BuildID}), value)
 }
-func (s *Store) clearBuild(m *mutation, value metadata.BuildRecord) {
+func (s *Store) clearBuild(m *mutation, value metadata.BuildRecord) error {
+	if err := s.releaseObjectAuth(m, buildRecordAuth(value), value.GroupVersion); err != nil {
+		return err
+	}
 	clearRecord(m.tr, s.buildKey(metadata.BuildKey{Group: value.Group, BuildID: value.BuildID}))
 	if value.TemplateID != "" {
 		clearRecord(m.tr, s.buildIndexKey(value))
 	}
+	return nil
 }
 func (s *Store) ReadBuild(ctx context.Context, key metadata.BuildKey) (out metadata.Versioned[metadata.BuildRecord], err error) {
 	if err = validateParts(key.Group, key.BuildID); err != nil {
@@ -85,12 +97,20 @@ func (s *Store) DeleteBuild(ctx context.Context, key metadata.BuildKey, expected
 		if err != nil || !current.Exists {
 			return false, err
 		}
-		s.clearBuild(m, current.Value)
+		if err := s.clearBuild(m, current.Value); err != nil {
+			return false, err
+		}
 		return true, nil
 	})
 	return err
 }
 func (s *Store) CommitRegistrationIntent(ctx context.Context, value metadata.BuildRecord, ref metadata.NodeBuildRef) (metadata.Version, error) {
+	return s.commitBuildIntent(ctx, value, ref, nil)
+}
+func (s *Store) CommitGroupRegistrationIntent(ctx context.Context, value metadata.BuildRecord, ref metadata.NodeBuildRef, selected metadata.GroupAdmission) (metadata.Version, error) {
+	return s.commitBuildIntent(ctx, value, ref, &selected)
+}
+func (s *Store) commitBuildIntent(ctx context.Context, value metadata.BuildRecord, ref metadata.NodeBuildRef, selected *metadata.GroupAdmission) (metadata.Version, error) {
 	if err := metadata.ValidateBuild(value); err != nil {
 		return metadata.Version{}, err
 	}
@@ -104,6 +124,14 @@ func (s *Store) CommitRegistrationIntent(ctx context.Context, value metadata.Bui
 		if _, err := m.expect(s.buildKey(metadata.BuildKey{Group: value.Group, BuildID: value.BuildID}), metadata.Version{}); err != nil {
 			return false, err
 		}
+		if selected != nil {
+			if ref != metadata.BuildRef(value) || value.RegistrationImageRepo != "" || value.RegistrationRegistryAuth != "" {
+				return false, invalidRecord("Group Build intent inputs")
+			}
+			if err := s.guardGroupAdmission(m, *selected, value.Group, value.NodeID, value.APISecretFingerprint, value.GroupVersion, "", ""); err != nil {
+				return false, err
+			}
+		}
 		if err := s.guardLive(m, value.NodeID); err != nil {
 			return false, err
 		}
@@ -114,12 +142,23 @@ func (s *Store) CommitRegistrationIntent(ctx context.Context, value metadata.Bui
 	})
 }
 func (s *Store) AcceptBuildRegistration(ctx context.Context, key metadata.BuildKey, nodeID, templateID string, target *types.BuildTarget) (metadata.Versioned[metadata.BuildRecord], error) {
+	return s.acceptBuildRegistration(ctx, key, nodeID, templateID, target, nil)
+}
+func (s *Store) AcceptGroupBuildRegistration(ctx context.Context, registration metadata.Registration, key metadata.BuildKey, templateID string, target *types.BuildTarget) (metadata.Versioned[metadata.BuildRecord], error) {
+	return s.acceptBuildRegistration(ctx, key, registration.NodeID, templateID, target, &registration)
+}
+func (s *Store) acceptBuildRegistration(ctx context.Context, key metadata.BuildKey, nodeID, templateID string, target *types.BuildTarget, registration *metadata.Registration) (metadata.Versioned[metadata.BuildRecord], error) {
 	if err := validateParts(key.Group, key.BuildID, nodeID, templateID); err != nil {
 		return metadata.Versioned[metadata.BuildRecord]{}, err
 	}
 	var out metadata.Versioned[metadata.BuildRecord]
 	var changed bool
 	version, err := s.mutate(ctx, func(m *mutation) (bool, error) {
+		if registration != nil {
+			if err := s.guardRegistration(m, *registration); err != nil {
+				return false, err
+			}
+		}
 		current, err := getTyped[metadata.BuildRecord](m, s.buildKey(key))
 		if err != nil {
 			return false, err
@@ -143,6 +182,50 @@ func (s *Store) AcceptBuildRegistration(ctx context.Context, key metadata.BuildK
 	}
 	return out, nil
 }
+
+func (s *Store) RetireRejectedGroupBuild(ctx context.Context, registration metadata.Registration, expected metadata.Version, ref metadata.NodeBuildRef) error {
+	if !expected.IsCommitted() || ref.GroupVersion <= 0 {
+		return invalidRecord("rejected Group Build")
+	}
+	if err := validateParts(registration.NodeID, ref.Group, ref.BuildID, ref.TemplateID); err != nil {
+		return err
+	}
+	_, err := s.mutate(ctx, func(m *mutation) (bool, error) {
+		if err := s.guardRegistration(m, registration); err != nil {
+			return false, err
+		}
+		raw, err := m.expect(s.buildKey(metadata.BuildKey{Group: ref.Group, BuildID: ref.BuildID}), expected)
+		if err != nil {
+			return false, err
+		}
+		current, err := typed[metadata.BuildRecord](raw)
+		if err != nil {
+			return false, err
+		}
+		if !current.Exists || current.Value.NodeID != registration.NodeID || current.Value.State != metadata.BuildStarting || current.Value.RegistrationTargetSet || metadata.BuildRef(current.Value) != ref {
+			return false, metadata.ErrConflict
+		}
+		// Every replay refreshes this owner before sending. Its original intent
+		// version is therefore proof that no second delivery was authorized.
+		raw, err = m.expect(s.buildOwnerKey(registration.NodeID, ref.BuildID), expected)
+		if err != nil {
+			return false, err
+		}
+		owner, err := typed[metadata.NodeBuildRef](raw)
+		if err != nil {
+			return false, err
+		}
+		if !owner.Exists || owner.Value != ref {
+			return false, metadata.ErrConflict
+		}
+		if err := s.clearBuild(m, current.Value); err != nil {
+			return false, err
+		}
+		_, err = s.clearMatchingBuild(m, registration.NodeID, ref)
+		return true, err
+	})
+	return err
+}
 func (s *Store) EnsureRegistrationOwnership(ctx context.Context, key metadata.BuildKey, nodeID, templateID string) error {
 	if err := validateParts(key.Group, key.BuildID, nodeID, templateID); err != nil {
 		return err
@@ -158,7 +241,11 @@ func (s *Store) EnsureRegistrationOwnership(ctx context.Context, key metadata.Bu
 		if err = s.guardLive(m, nodeID); err != nil {
 			return false, err
 		}
-		return true, s.ensureBuild(m, nodeID, metadata.NodeBuildRef{Group: key.Group, BuildID: key.BuildID, TemplateID: templateID})
+		ref := metadata.NodeBuildRef{Group: key.Group, BuildID: key.BuildID, TemplateID: templateID}
+		if current.Value.GroupVersion > 0 {
+			ref = metadata.BuildRef(current.Value)
+		}
+		return true, s.ensureBuild(m, nodeID, ref)
 	})
 	return err
 }
@@ -175,9 +262,15 @@ func (s *Store) RejectRegistrationIntent(ctx context.Context, key metadata.Build
 			return false, metadata.ErrConflict
 		}
 		if current.Exists {
-			s.clearBuild(m, current.Value)
+			if err := s.clearBuild(m, current.Value); err != nil {
+				return false, err
+			}
 		}
-		cleared, err := s.clearMatchingBuild(m, nodeID, metadata.NodeBuildRef{Group: key.Group, BuildID: key.BuildID, TemplateID: templateID})
+		ref := metadata.NodeBuildRef{Group: key.Group, BuildID: key.BuildID, TemplateID: templateID}
+		if current.Exists && current.Value.GroupVersion > 0 {
+			ref = metadata.BuildRef(current.Value)
+		}
+		cleared, err := s.clearMatchingBuild(m, nodeID, ref)
 		return current.Exists || cleared, err
 	})
 	return err
@@ -257,10 +350,11 @@ func (s *Store) DeleteBuildProjection(ctx context.Context, registration metadata
 			if current.Value.State == metadata.BuildStarting {
 				return false, nil
 			}
-			s.clearBuild(m, current.Value)
+			if err := s.clearBuild(m, current.Value); err != nil {
+				return false, err
+			}
 		}
-		clearRecord(m.tr, s.buildOwnerKey(nodeID, ref.BuildID))
-		return true, nil
+		return s.clearMatchingBuild(m, nodeID, ref)
 	})
 	return err
 }

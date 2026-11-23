@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/storage"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -57,13 +57,8 @@ type Context struct {
 }
 
 func decodeStrict(raw []byte, into any) error {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if err := d.Decode(into); err != nil {
+	if err := strictjson.DecodeAllowNull(raw, into); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
-	}
-	if err := d.Decode(new(any)); err != io.EOF {
-		return fmt.Errorf("%w: expected one JSON value", ErrInvalid)
 	}
 	return nil
 }

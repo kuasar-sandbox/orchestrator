@@ -622,7 +622,7 @@ func TestExportMoveSameIDConflictUntilCleanupCompletes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			command := clusterCreateCommand(fingerprint, sb.ID)
+			command := clusterCreateCommand(t, o, fingerprint, sb.ID)
 			o.artifactPublisher = func(_ context.Context, _ *types.Sandbox, source types.ResumeSource) (artifact.PublishReport, error) {
 				return testPublicationReport(source.Kind, "manifest://"+strings.Repeat("d", 64)), nil
 			}

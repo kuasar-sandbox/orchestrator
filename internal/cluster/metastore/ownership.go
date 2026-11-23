@@ -23,6 +23,9 @@ func (s *Store) ensureSandbox(m *mutation, nodeID string, ref metadata.NodeSandb
 	if current.Exists && current.Value != ref {
 		return metadata.ErrOwnershipConflict
 	}
+	if err := s.retainObjectAuth(m, sandboxOwnerAuth(nodeID, ref), ref.GroupVersion); err != nil {
+		return err
+	}
 	return putJSON(m.tr, s.sandboxOwnerKey(nodeID, ref.NodeSandboxID), ref)
 }
 func (s *Store) ensureBuild(m *mutation, nodeID string, ref metadata.NodeBuildRef) error {
@@ -42,6 +45,9 @@ func (s *Store) ensureBuild(m *mutation, nodeID string, ref metadata.NodeBuildRe
 			return metadata.ErrOwnershipConflict
 		}
 	}
+	if err := s.retainObjectAuth(m, buildOwnerAuth(nodeID, ref), ref.GroupVersion); err != nil {
+		return err
+	}
 	return putJSON(m.tr, s.buildOwnerKey(nodeID, ref.BuildID), ref)
 }
 func (s *Store) clearMatchingSandbox(m *mutation, nodeID string, ref metadata.NodeSandboxRef) (bool, error) {
@@ -52,6 +58,9 @@ func (s *Store) clearMatchingSandbox(m *mutation, nodeID string, ref metadata.No
 	}
 	if !current.Exists || current.Value != ref {
 		return false, nil
+	}
+	if err := s.releaseObjectAuth(m, sandboxOwnerAuth(nodeID, ref), ref.GroupVersion); err != nil {
+		return false, err
 	}
 	clearRecord(m.tr, key)
 	return true, nil
@@ -64,6 +73,9 @@ func (s *Store) clearMatchingBuild(m *mutation, nodeID string, ref metadata.Node
 	}
 	if !current.Exists || current.Value != ref {
 		return false, nil
+	}
+	if err := s.releaseObjectAuth(m, buildOwnerAuth(nodeID, ref), ref.GroupVersion); err != nil {
+		return false, err
 	}
 	clearRecord(m.tr, key)
 	return true, nil
@@ -141,13 +153,35 @@ func (s *Store) RemoveSandboxOwner(ctx context.Context, nodeID, sandboxID string
 	if err := validateParts(nodeID, sandboxID); err != nil {
 		return err
 	}
-	return s.removeOwner(ctx, s.sandboxOwnerKey(nodeID, sandboxID), expected)
+	_, err := s.mutate(ctx, func(m *mutation) (bool, error) {
+		raw, err := m.expect(s.sandboxOwnerKey(nodeID, sandboxID), expected)
+		if err != nil {
+			return false, err
+		}
+		current, err := typed[metadata.NodeSandboxRef](raw)
+		if err != nil || !current.Exists {
+			return false, err
+		}
+		return s.clearMatchingSandbox(m, nodeID, current.Value)
+	})
+	return err
 }
 func (s *Store) RemoveBuildOwner(ctx context.Context, nodeID, buildID string, expected metadata.Version) error {
 	if err := validateParts(nodeID, buildID); err != nil {
 		return err
 	}
-	return s.removeOwner(ctx, s.buildOwnerKey(nodeID, buildID), expected)
+	_, err := s.mutate(ctx, func(m *mutation) (bool, error) {
+		raw, err := m.expect(s.buildOwnerKey(nodeID, buildID), expected)
+		if err != nil {
+			return false, err
+		}
+		current, err := typed[metadata.NodeBuildRef](raw)
+		if err != nil || !current.Exists {
+			return false, err
+		}
+		return s.clearMatchingBuild(m, nodeID, current.Value)
+	})
+	return err
 }
 func (s *Store) ListSandboxOwners(ctx context.Context, nodeID string, cursor metadata.Cursor, limit int) (metadata.Page[metadata.Versioned[metadata.NodeSandboxRef]], error) {
 	if err := validateParts(nodeID); err != nil {

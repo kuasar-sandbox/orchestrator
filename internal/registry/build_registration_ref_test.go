@@ -33,13 +33,13 @@ func TestBuildReplayCannotPublishOwnershipAfterIdentityReplacement(t *testing.T)
 	defer cancel()
 	r := testReg(t)
 	seedTestNode(t, r.stores, "n1")
-	r.SetPlacer(placementWithToken("n1"))
 	if err := putTestNode(r.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
+	publishTestGroups(t, r, "n1", "/g")
 	owner := &recordingNodeOwner{ackErr: errors.New("first ACK lost")}
 	r.SetNodeOwner(owner)
-	req := BuildReserveReq{Group: "/g", BuildID: "reused", TemplateID: "transient-old", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
+	req := BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", TemplateID: "transient-old", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
 	if _, err := r.ReserveBuild(ctx, req); err == nil {
 		t.Fatal("wanted ambiguous first dispatch")
 	}

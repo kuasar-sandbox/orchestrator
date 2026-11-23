@@ -10,7 +10,7 @@ This contract follows cluster capabilities and state ownership across Registry, 
 
 - `registry`: a reliable, stateful cluster that maintains execution state for nodes, routes and placer imports.
 - `router`: a unified e2b-compatible entry point that locates the route owner by sandbox group and forwards the hot path directly to the node.
-- `placer`: the group provider/importer and placement scheduler; it consumes `node_list` and offers Place / verify-key to Registry.
+- `placer`: imports complete Group records and maintains conditional Node updates from the `node_list` view.
 
 Registry accesses durable execution metadata through typed repositories backed by FoundationDB 7.3.77. Transaction, replication and recovery belong to FoundationDB; Registry retains lifecycle rules, node connection ownership and command dispatch. Router and Placer use the same business protocols without importing a database client.
 
@@ -30,15 +30,15 @@ flowchart TD
   router -->|"Reserve / Resolve"| registry["Registry services"]
   router -->|"Known target data"| node["Node Conductor and Proxy"]
   registry <-->|"node_link commands and state"| node
-  registry <-->|"placer_link / Place"| placer["Placer and Group provider"]
+  placer["Placer and Group source"] -->|"Conditional Group imports"| registry
   registry -->|"node_list WATCH_LIST"| placer
   registry -->|"Typed metadata transactions"| fdb["FoundationDB"]
 ```
 
 The steady-state data plane bypasses Registry. Explicit create/connect/exec-session operations and data requests with a missing target or typed stale fallback require Registry:
 
-- `POST /route-link/reserve` distinguishes four operations using `operation=create|connect|exec-session|data`. Create calls Reserve directly; Registry completes connect/exec-session through node-link; data calls Reserve only when the route lacks a complete node target or the node proxy reports typed stale state. Unknown routes do not implicitly create sandboxes. Explicit build registration calls `ReserveBuild`.
-- Registry calls the placer's `PlaceSandbox` / `PlaceBuild`.
+- `POST /route-link/v2/reserve` distinguishes four operations using `operation=create|connect|exec-session|data`. Create calls Reserve directly; Registry completes connect/exec-session through node-link; data calls Reserve only when the route lacks a complete node target or the node proxy reports typed stale state. Unknown routes do not implicitly create sandboxes. Explicit build registration calls `ReserveBuild`.
+- Registry authenticates the request and selects Nodes from a bounded GroupSupport query.
 - Registry sends create/connect/exec_session/delete/build/key commands through the node owner.
 - Nodes report sandbox/build state and the low-frequency node directory through node_link.
 
@@ -52,7 +52,7 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 4. **Atomicity follows business invariants**: coupled intent/ownership, lifecycle fences and projections commit through typed transactions. Registry members do not maintain replicas of each other's metadata.
 5. **Member health does not determine sharding**: the member list comes from versioned configuration; `LocateN` takes only membership members as input. Memberlist detects health and propagates metadata.
 6. **Nodes are the authority for runtime state**: node reports determine whether sandboxes/builds still exist. A host reboot loses running processes; surviving durable rows are reconciled against actual units and checkpoint/cleanup ownership. A conductor process restart can adopt surviving units. Neither event means blindly deleting all durable rows or automatically recreating every old sandbox; see [State ownership and disaster-recovery boundaries](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry Reliability](#registry-reliability).
-7. **Placer does not own lifecycle**: it imports groups, patches selectors, applies shuffle sharding/P2C and proposes placements. The node owner checks current connectivity/usage; the node's durable transaction makes the authoritative Build registration admission decision.
+7. **Placer does not own lifecycle**: it maintains Group definitions on static targets. Registry selects Nodes from published support; Node admission copies the business inputs and applies the existing lifecycle.
 8. **Router does not subscribe to huge numbers of groups**: create Reserve returns READY or an error; data Reserve can also return PAUSING; connect/exec-session Reserve returns after synchronous node preparation, without waiting for asynchronous resume. Router keeps only a bounded route cache; in-flight requests do not provide routes for new requests.
 
 <a id="role-boundaries"></a>
@@ -62,8 +62,8 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 | Role | Responsibility |
 |---|---|
 | Registry member | Hosts business protocols, live node links and membership; accesses durable metadata through typed repositories |
-| Router | Unified e2b entry; locates route owners by group; Resolve on a cache miss, Reserve for create/connect/exec-session/data; local route cache on the hot path |
-| Placer | Consumes `node_list` WATCH_LIST; imports groups through providers/importers; maintains placement and selector patches; offers Place / verify-key |
+| Router | Unified e2b entry; locates route owners by group; per-request control authorization, Reserve for create/connect/exec-session/data; bounded DataRoute cache on the hot path |
+| Placer | Consumes `node_list` WATCH_LIST; imports complete Group records and applies conditional Node maintenance |
 | Node | Runs sandboxes/builds; reports full inventories and events through node_link; receives create/connect/exec_session/delete/build/key commands |
 
 <a id="client-access"></a>
@@ -72,7 +72,7 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 
 The standalone `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` extension is rejected by public cluster Create and Build registration; Registry keeps allocation authority. See [Sandbox identity on Create](sandbox-lifecycle.md#create-identity).
 
-`cluster-ctl router` is the cluster's northbound ingress for both the e2b control plane and data plane. It is not a routing authority and subscribes to neither routes nor node_list. It locates route owners by group. Explicit create/connect/exec-session calls use their corresponding Reserve operation; a data-plane cache miss starts with Resolve. RouteResolve returns both `APIEndpoint` and `DataEndpoint`, each with a fixed purpose. Once a route has `NodeSandboxID + DataEndpoint`, ordinary data traffic connects directly to the final node proxy even in paused/starting states; the node handles authorized parking, Wake, and backend connection. Exec CONNECT is the exception: after public 200, the router reads and authorizes the first ctl frame before connecting to the final node. `Reserve(operation=data)` remains only a fallback for a missing target after request admission, a typed stale target before sending Raw, or the ordinary data-plane compatibility path.
+`cluster-ctl router` is the cluster's northbound ingress for both the e2b control plane and data plane. It is not a routing authority and subscribes to neither routes nor node_list. It locates route owners by group. Explicit create/connect/exec-session calls use their corresponding Reserve operation; a data-plane cache miss starts with Resolve. RouteLink v2 returns an operation-specific ControlRoute or DataRoute; only DataRoute is cached. Once a route has `NodeSandboxID + DataEndpoint`, ordinary data traffic connects directly to the final node proxy even in paused/starting states; the node handles authorized parking, Wake, and backend connection. Exec CONNECT is the exception: after public 200, the router reads and authorizes the first ctl frame before connecting to the final node. `Reserve(operation=data)` remains only a fallback for a missing target after request admission, a typed stale target before sending Raw, or the ordinary data-plane compatibility path.
 
 <a id="client-onboarding"></a>
 
@@ -82,7 +82,7 @@ Start from the existing [Registry](cluster.md), [Placer configuration and file p
 This is a one-group acceptance path, not an HA reference configuration.
 
 1. Register eligible nodes with matching runtime/kernel/artifact access and the
-   intended selector labels. Ensure node-link full sync and a ready placer for
+   intended selector labels. Ensure node-link full sync and completed GroupSupport publication for
    this group. Reuse the provider JSON schema, replacing illustrative `tmpl-1`
    with an actually published canonical `e2b-img/sbx/snp-...` ID from an exact
    ready Build. Configure its ManifestKey/APISecret under the existing protected
@@ -191,7 +191,7 @@ Create body metadata can carry `kuasar-sandbox.resource`, traffic, restore, cred
 
 Create accepts `checkpoint.max_checkpoints` only inside `X-Kuasar-Sandbox-Checkpoint` or `metadata["kuasar-sandbox.checkpoint"]`; the old top-level body field returns 400. The quota is a positive integer or null, defaults to 1 when unset, and uses the same non-null Header-over-metadata field precedence as snapshot defaults. Router extracts it into the existing typed internal Reserve field; forwarded checkpoint config retains only `merge_ref`/`drop_caches`. The accepted quota remains stable across Reserve retries and replacements ([Checkpoint policy input](sandbox-lifecycle.md#request-checkpoint)).
 
-The router constructs requests to the shared `POST /route-link/reserve` endpoint according to the [Registry Reserve protocol](#reserve). It forwards operation-specific authenticated context and preserves the requested stable identity. Create is strictly normalized before admission; Connect preserves the optional memory selection, including absence; exec-session first strictly parses public TTL/conditions and converts them to the typed Registry request. Data uses the existing access-token/service/port context.
+The router constructs requests to the shared `POST /route-link/v2/reserve` endpoint according to the [Registry Reserve protocol](#reserve). It forwards operation-specific authenticated context and preserves the requested stable identity. Create is strictly normalized before admission; Connect preserves the optional memory selection, including absence; exec-session first strictly parses public TTL/conditions and converts them to the typed Registry request. Data uses the existing access-token/service/port context.
 
 The Registry specification owns the exact query/header/body schemas and repeats validation at its boundary. Conditions are not carried in unrelated metadata, query parameters or configuration Headers. Keeping this transformation boundary separate avoids a second, potentially stale schema table here.
 
@@ -201,7 +201,7 @@ For connect/exec-session/data, `sid` is the customer's expected stable SandboxID
 
 ### Control plane
 
-API-key authentication cannot be disabled. Create/connect/exec-session pass the client's original API key to Reserve, where the registry verifies it before any lifecycle side effect. Create group admission uses a ready placer's provider APISecret; connect/exec-session use the APISecret already bound to the Sandbox business record. For other control operations, the router calls the route owner's `verify-key`, which fails over to ready placers. ManifestKey serves content paths only and does not authenticate API calls.
+API-key authentication cannot be disabled. Every control request passes the original key to Registry for complete MAC verification before lifecycle effects. New admission uses published Group support; existing objects use their retained credential binding. Control and Build follow-ups reauthorize that exact object on each request. Migration/new-object commands carry the key and expected Group version to Node admission; the key is not persisted in records, ACKs or logs. ManifestKey is for content only.
 
 | Operation | Behavior |
 |---|---|
@@ -321,7 +321,7 @@ A group/tenant has two root credential domains with separate purposes:
 
 | Name | Holders | Purpose |
 |---|---|---|
-| `APISecret` | provider/placer/node/registry/router/proxy | Signs/verifies API keys and later purpose-specific authentication material; its complete SHA-256 fingerprint identifies the credential pair |
+| `APISecret` | provider/placer/node/registry | Signs/verifies API keys and later purpose-specific authentication material; its complete SHA-256 fingerprint identifies the credential pair |
 | `ManifestKey` | provider/placer/node | Decrypts manifest/image/snapshot contents and wraps pull tokens; Router never receives it |
 
 Both are 32 bytes / 64 lowercase hex characters. If APISecret is omitted, placer derives it while materializing inline ManifestKey using the fixed KDF:
@@ -332,287 +332,83 @@ APISecret = HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")
 
 Only APISecret signs/verifies API keys. The API key's `SHA256(APISecret)[:12]` is only a candidate prefilter; node-link, lifecycle commands and business records use full 64-hex `SHA256(APISecret)`. ManifestKey has its own full 64-hex SHA-256 fingerprint to validate the paired content key.
 
-APISecret and ManifestKey are typed secrets supporting inline or out-of-band ref delivery. A selector patch either carries a complete pair—both typed carriers and both complete fingerprints—or no credential fields at all. Half-pairs must be rejected. Credential distribution occurs only through shuffle-sharding/import/selector-patch paths:
-
-```text
-placer selector patch
-  │ target node set + APISecret/ManifestKey material/ref
-  ▼
-registry/node owner
-  │ CAS node_link key_pair cache (record key = APISecretFingerprint)
-  ▼
-node_link heartbeat refresh
-  │ key_put complete pair only when missing or near lease expiry
-  ▼
-node encrypted local key store
-```
-
-The node atomically validates and installs the complete pair on `key_put`. One complete APISecret fingerprint cannot bind different pair material. `key_drop` locates a pair by full APISecret fingerprint, but correctness does not depend on it. Node leases evict entries not renewed before TTL. Distribution is a prerequisite for create/build; drop, TTL and provider updates do not alter pairs already copied into existing sandbox/build business records.
+Import sources support typed inline or out-of-band secrets. The trusted Group maintenance command resolves a complete pair and applies it with the Group CAS in one Node transaction. Public Group bodies carry no roots. Pair expiry or rotation does not rewrite credentials already bound to existing objects. Management authenticates each exact object against its retained root, not the latest Group default.
 
 ServiceSecret is not a third group root; it is an independent service credential for each node Sandbox business record. Its default derives from that Sandbox's bound APISecret and `StableID()` using a fixed domain, or the current create's `kuasar-sandbox.credentials` object can explicitly supply it. Before route/ref/command side effects, Registry validates and normalizes that object against placement Profile. The node validates and separates it again, then encrypts ServiceSecret and Envd/Traffic/Forward tokens into the Sandbox business row. Ordinary metadata, guest configuration and node-stub observation retain no credentials object.
 
 ForwardAccessToken and ExecAccessToken both use `kat1`, with separate audiences. ExecAccessToken's canonical payload fields are `v,session_id,sid,aud[,exp][,conditions]`: session ID is UUIDv7, `sid=StableID`, `aud=exec`, and there is no `iat`; normalized CEL source strings appear only when restricted conditions were requested. ServiceSecret is decoded to a 32-byte key and used directly for HMAC-SHA256, with no extra exec-specific derivation. Create/get/list does not return a default ExecAccessToken. Every exec-session API call signs independently, without a server-side session row, revocation or single-use/replay state.
 
-When Registry materializes a protected route from a node route event, it accepts APISecret, both root fingerprints, StableID, ServiceSecret and Envd/Traffic/Forward tokens. It does not accept raw ManifestKey or the existing node-link wire's MmdsSecret intended for node proxy/MMDS. Registry currently stores protected route credentials as plaintext structured fields without an extra encryption layer. They may be returned only by protected Reserve/Resolve to trusted routers, never by ordinary route watch/list, public create/get/list, logs or observation interfaces. Reserve separates `kuasar-sandbox.credentials` from ordinary config at entry, freezes it only with the RESERVED record, temporarily encodes it before CmdCreate, and clears it after READY.
+Registry retains protected object credentials from authoritative Node facts; it does not accept raw ManifestKey or proxy/MMDS-only MmdsSecret. RouteLink v2 projects a control route (API endpoint and public result tokens) or a data route (data endpoint and service authentication material). Neither projection includes APISecret, ManifestKey or their root fingerprints. Only the data projection enters Router's data cache. Create credential overrides are separated from metadata, frozen with RESERVED and cleared on READY. Root material must never enter public responses, ordinary lists, logs or observations.
 
 <a id="groups-and-placement"></a>
 
 ## Groups, providers and placement
 
-`cluster-ctl placer` is an independent placement scheduler. It holds no node connections, owns no sandbox lifecycle, and does not replicate registry state. It obtains group configuration and key material through `SandboxGroupProvider` / `SandboxGroupImporter`, consumes the registry's `node_list` WATCH_LIST, and provides `PlaceSandbox` / `PlaceBuild` / `verify-key` to the registry.
+Node owns the Group definition and the context copied into each new Sandbox or Build. Registry selects eligible Nodes from their published Group support. Placer imports desired definitions and maintains conditional Node updates; Create, Build and API-key verification no longer call Placer.
+
+### Node Group authority
+
+The same business operation serves the Node HTTP/UDS API and trusted NodeLink commands. Public requests use `X-API-KEY`; the full MAC is verified before reading private context or exposing a revision. A fingerprint prefix is only a candidate filter. Current credential pairs authorize new Group creation; retained owner roots continue to authorize management of existing Groups and objects.
+
+| Operation | Node API |
+|---|---|
+| List owner-visible names/revisions | `GET /groups?limit=128&cursor=...` |
+| Read private context | `GET /groups?group=...` |
+| Create/update | `PUT /groups?group=...` with `{"expected_version":0,"context":{...}}` |
+| Delete | `DELETE /groups?group=...&expected_version=...` |
+
+Names are query parameters, so a Group containing `/` does not become a URL path. Updates require the observed revision; zero creates only a never-existing Group. Delete retains a tombstone. Re-creation requires its known revision and is an explicit operation. Listing is bounded to 128 entries. Bodies and NodeLink envelopes have a 1 MiB limit; the context budget reserves envelope space. Unknown fields, duplicate fields, invalid templates and credential or placement fields outside their defined interfaces are rejected.
+
+Context contains optional `templateID`, `sandbox_config`, `image_repo`, `registry_auth`, `target_port`, `project_id` and metadata. Private repository credentials remain at the Node. Registry receives only the support needed for authentication and selection, including Group revision, allowed full API fingerprints and an optional default template. Group snapshots/deltas are ordered and bounded, and tied to the original Node registration. Incomplete snapshots do not make a Node selectable; overflow or a sequence error forces a fresh connection/snapshot.
+
+Local business import is explicit:
+
+```sh
+node-ctl group apply --socket /run/sandbox/node-ctl.socket -f /etc/sandbox/groups
+```
+
+It reads `E2B_API_KEY` and submits a file, or regular `.json` files in lexical directory order, through the same UDS `/groups` API. Each file contains `group`, a `context` object and optional `expected_version`. Without a revision it reads once, then performs one CAS, including an authorized tombstone revision. A conflict is reported without re-reading or retrying. Files commit independently; errors identify the failed files and do not roll back successful ones. It installs no root keys, watches no files, and never prunes missing entries.
+
+### Registry selection and request inputs
+
+Create accepts a canonical explicit `templateID`, or omission/null to use the selected Group default. Node first checks an existing object and its complete binding. For a new object it checks the expected Group revision, copies the input, and continues that invocation on the copied input even if Group is updated or deleted afterward. Default-template Create merges request overrides with Node-owned defaults; explicit-template Create uses request configuration only. Build uses the copied Node-owned repository/auth context. Registry does not construct a second source of Group defaults.
+
+The optional `X-Kuasar-Sandbox-Placement` JSON header has the same schema as `kuasar-sandbox.placement` metadata: `{"node_selectors":[{"pool":"gpu"}]}`. Selector objects are OR branches; entries inside one object are AND conditions. Both sources are validated; a supplied header replaces the whole metadata constraint, including `{}`. Constraints are removed from persisted Sandbox metadata. Limits are 8 KiB, 32 branches, 32 entries per branch, 256 entries total, and bounded key/value lengths.
+
+Registry scans bounded pages of normally published Group support, verifies the complete API-key MAC, then filters Node liveness, draining/zone state, caller selectors, runtime compatibility and Build admission capacity. It samples distinct candidates and chooses by load. The intent transaction rechecks the selected publication, original registration and relevant Node conditions. `placement.candidates` and `placement.zone_admit_max` configure this Registry decision.
+
+Valid unannotated legacy SNP templates remain usable. An annotated SNP additionally requires the same Node's runtime label to match both bundle basename and declared digest. Invalid annotations fail without stripping metadata or falling back. Selection performs no artifact I/O and does not infer identity from a host's default runtime. For an opaque migration token, the destination Node decrypts and validates the actual restored template; Registry does not substitute the Group default or historical initial template as its runtime requirement.
+
+### Acceptance, recovery and delivery order
+
+An intent owns a stable logical ID and an exact Node-local generation. Timeout, lost ACK, generic 400/409/429, NotFound and absence from a report do not prove nonexecution. Cleanup responsibility remains until authoritative object facts or existing reclamation rules resolve it. Late failure cannot regress a newer fact. Only the structured `GroupVersionConflict` produced at initial Node admission, before input copy or core effects, can retire that exact fresh delivery through the atomic intent/registration guard. The client receives the conflict; Registry does not hide it by an implicit retry. No persistent command execution journal or exactly-once promise is introduced.
+
+Reader SDKs, tools and binaries must be published and available before the snapshot producer emits annotated references. RouteLink v2 separates control and data projections; incompatible old peers must not be treated as compatible. Deployment requires a coordinated consumer/protocol upgrade before enabling new writers.
+
+### Placer import and explicit apply
+
+Placer's full-record source interface combines bounded `Range` and `Read`. Each maintenance operation reads one complete source record once and derives context, credential pair and static targets from that same value. File sources and embedded sources use the same adapter. Static selectors and optional shuffle sharding determine all intended targets, including draining/hot Nodes and Nodes currently missing a runtime. Import does not run P2C. An empty intersection stays empty.
+
+Ready importers compete for a bounded, fenced source lease through Registry. Pages advance only after every item succeeds, using the original owner/run/term. Registry validates this lease again immediately before forwarding the Node command. The trusted command can install a complete key pair and update Group context in one Node SQLite transaction; the import path creates no independent desired-key cache in Registry.
+
+Background import may create an absent Group or renew an unchanged context. A different definition is a conflict. It never silently overwrites a manual edit or revives a tombstone. `cluster-ctl placer apply --config ...` performs one explicit pass using the same sources and adapter; it reads each target revision and makes one conditional attempt. Conflicts and partial outcomes are reported per target without private context or key material.
+
+After a lost reply, the pending operation keeps its original definition, revision and absolute key expiry. A read observing equal context proves only the context state, not that key renewal committed. Only the matching positive Node ACK confirms renewal; unknown writes are retried with the original conditional identity. A changed revision is reported as conflict, without automatic rebase. The bounded in-memory cache can evict confirmed optimization entries but never discards unresolved writes to make room for new ones. Source removal or target-set shrink does not implicitly delete Groups; deletion is an explicit Node operation.
 
 <a id="placement-responsibilities"></a>
-
-### Overview
-
 <a id="placer-responsibilities"></a>
-
-#### Responsibilities
-
-```text
-SandboxGroupProvider / Importer
-          │
-          ▼
-      placer
-          │  selector patch / Place / verify-key
-          ▼
-      registry
-          │ node owner commands
-          ▼
-        node
-```
-
-The placer is responsible for:
-
-- Integrating group providers/importers.
-- Consuming the `node_list` WATCH_LIST.
-- Selector patches and APISecret/ManifestKey pair-cache refresh.
-- Shuffle sharding, static selectors, runtime matching, and P2C.
-- `PlaceSandbox` / `PlaceBuild` recommendations.
-- Provider-side API-key verification.
-
-The placer does not:
-
-- Connect to nodes.
-- Dispatch `key_put`, create, delete, or build commands.
-- Maintain route/build execution state.
-- Store the registry's group/route records.
-
 <a id="placer-principles"></a>
-
-#### Principles
-
-1. **The registry does not implement a group provider**: Provider/Importer belongs to the placer or an external platform.
-2. **WATCH_LIST serves the placer only**: the router does not consume node_list.
-3. **High-frequency load does not travel through WATCH_LIST**: WATCH_LIST carries only low-frequency directory fields; final resource confirmation occurs at node-owner admission.
-4. **source_id identifies the import execution unit**: placers configured with the same `source_id` compete for the same source lease.
-5. **Shuffle affects new placement only**: it does not migrate running sandboxes.
-6. **Credential-pair distribution affects create/build prerequisites only**: dropping a pair, lease expiry, or provider updates do not modify pairs already copied into existing sandbox/build records.
-
 <a id="placer-provider--importer"></a>
-
-### Provider / Importer
-
-The placer uses these common interfaces:
-
-```text
-SandboxGroupProvider:
-  Get(group)
-  GetPlacementHint(group)
-  GetKey(group)       # typed manifest_key
-  GetAPISecret(group) # typed APISecret
-
-SandboxGroupImporter:
-  Range(cursor, limit)
-```
-
-The built-in file source is for local development and e2e use:
-
-```yaml
-import_groups:
-  - source_id: example-file-source
-    source_type: file
-    path: /path/to/dir
-```
-
-It enumerates `*.json` files in the directory. Each file contains one `SandboxGroupRecord` JSON object. The expected file count is small, so `Get/GetPlacementHint/GetKey/GetAPISecret` can scan and parse the directory directly. Production deployments should integrate their actual group source through the interfaces.
-
-Example:
-
-```json
-{
-  "group": "/cell/project/app/group",
-  "template_ref": "tmpl-1",
-  "target_port": 49983,
-  "api_secret": {"type": "inline", "value": "<64-lowercase-hex>"},
-  "manifest_key": {"type": "inline", "value": "<64-lowercase-hex>"},
-  "node_selectors": [{"pool": "default"}]
-}
-```
-
-An explicit `api_secret` takes precedence. When an inline `manifest_key` omits `api_secret`, the placer derives the default using `HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")`. A referenced ManifestKey cannot be materialized locally by the placer and requires an explicit APISecret. Both roots and the complete fingerprints of references must be 64 lowercase hexadecimal characters.
-
-`target_port` is the enforced data-plane port returned with placement to route_link/router. It does not filter nodes; node selection still uses `node_selectors` and shuffle-sharding configuration.
-
-Distinguish these semantics when using multiple sources:
-
-- Provider point lookups can search sources in order; defining the same group in multiple sources is an error.
-- Importer Range runs independently for each `source_id`; it does not combine sources into one Range view.
-- Each `source_id` maintains its own cursor and lease.
-
-After a group disappears from the provider, new Place requests have no matching group and verify-key rejects missing credentials; neither can use the removed group. Pairs already cached in node_link are not actively deleted; registry/node TTL eviction removes them. Durable credential copies in existing sandbox/build records remain unchanged.
-
 <a id="placer-import-reconciliation"></a>
-
-### Import reconciliation
-
 <a id="placer-source-owner-selection"></a>
-
-#### Source-owner selection
-
-Each source runs independently:
-
-```text
-readyPlacers = placer memberlist nodes where ready_label == active_registry_label
-sourceOwners = LocateN(source_id, readyPlacers, import_source_owner_count)
-
-sourceOwners race:
-  POST /placer-link/import-source-lease
-```
-
-The source lease is a durable `ImportSourceRepository` record keyed by `source_id`. The business key `import/source/<source_id>` selects service candidates; it does not select storage replicas.
-
-A lease request carries `source_id`, `owner_id`, `run_id`, and `ttl_ms`. Only the lease winner executes that source's `Importer.Range(cursor, limit)`.
-
 <a id="placer-page-processing"></a>
-
-#### Page processing
-
-```text
-lease winner
-  │ Range(cursor, limit)
-  ▼
-groups in page
-  │ for each group:
-  │   GetPlacementHint
-  │   GetKey / GetAPISecret
-  │   calculate effective selectors
-  ▼
-selector patch with fencing
-  │
-  ▼
-registry refreshes node_link credential-pair cache
-  │
-  ▼
-cursor checkpoint after whole page succeeds
-```
-
-A selector patch must carry `import_source_id/import_owner_id/import_run_id/import_term`. The registry accepts it only when it matches the current source lease. Missing fencing fields or a mismatched term/run_id cause rejection.
-
-`NextCursor==""` ends the round: the cursor is cleared and the round increments. Failure or owner crash does not advance the cursor; the next lease owner resumes from the last successful cursor or replays the same page.
-
 <a id="placer-selector-patch-refresh"></a>
-
-#### Selector-patch refresh
-
-At `placement.selector_patch_refresh_interval`, the placer resends unchanged selector patches to keep the node_link credential-pair cache alive. A group disappearing from the provider does not actively delete the cache; entries expire by TTL.
-
 <a id="placer-placement"></a>
-
-### Placement
-
 <a id="placer-registry-selection-of-a-placer"></a>
-
-#### Registry selection of a placer
-
-For each group, the registry performs deterministic failover only:
-
-```text
-readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
-               and ready_label == active_registry_label
-candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
-try candidates in order until success
-```
-
-The registry does not use P2C to choose a placer. P2C is used only inside a placer to choose a placement target from node candidates.
-
 <a id="placer-placesandbox"></a>
-
-#### PlaceSandbox
-
-Input:
-
-```text
-group, route_key, sandbox_id, target_runtime_digest?, config?, exclude_node_ids?
-```
-
-`sandbox_id` is the stable public SandboxID owned by the registry. The placer does not allocate, parse, or receive NodeSandboxID or SandboxGeneration.
-
-Flow:
-
-```text
-provider.GetPlacementHint(group)
-  │
-  ▼
-filter node_list:
-  selector match
-  not draining
-  not in exclude_node_ids
-  zone <= admit max
-  runtime digest match
-  shuffle slot match
-  │
-  ▼
-P2C over candidates
-  │
-  ▼
-return node_id + create_spec + APISecret fingerprint + runtime/template hints
-```
-
-`node_list` is a low-frequency directory, not an online-status authority. Before committing, the route owner asks the node owner for the current node-link connection. Disconnected candidates, admission rejections, or command rejections add the candidate to `exclude_node_ids`, followed by another Place, until an online candidate is selected or the placer reports no candidate. The node owner is the sole liveness authority.
-
 <a id="placer-placebuild"></a>
-
-#### PlaceBuild
-
-Input:
-
-```text
-group, build_id, template_id, resources
-```
-
-Build placement resembles sandbox placement, but the placer's low-frequency view uses configured registration capacity only to exclude nodes that cannot fit the single Build even in isolation. It receives no heartbeat usage. Current headroom is read only at the Holder/node boundary:
-
-1. The placer recommends a node whose static capacity can fit the request.
-2. Through the current Holder, the registry confirms that node-link is online and reads the latest durable registration usage.
-3. If headroom is insufficient, the registry excludes that candidate and reschedules before creating a registration intent.
-4. The registry persists a STARTING intent for the selected node/build, then sends `build_register`.
-5. The node performs final registration admission in a SQLite transaction. Only a definitive rejection without side effects permits excluding the candidate. Timeout, disconnect, or lost ACK pins queries/retries to that node/BuildID.
-
 <a id="placer-key-distribution"></a>
-
-### Key distribution
-
-The placer owns selector patches and APISecret/ManifestKey pair-cache refresh:
-
-1. Obtain the group's typed `manifest_key` and `api_secret`. A missing APISecret can be derived only from an inline ManifestKey using the fixed derivation.
-2. Compute the target node set from placement selectors and shuffle results.
-3. A selector patch carries either the complete pair or no credential fields. Each member includes a typed carrier and full 64-hex SHA-256 fingerprint; half-pairs are rejected.
-4. Registry/node owners use the full `APISecretFingerprint` as the key and persist the desired pair through `KeyPairRepository`. Its transaction checks pair identity and lease; replacement invalidates a prior ACK.
-5. A node_link heartbeat performs atomic `key_put` only for entries lacking `AckAccepted` or entering the renewal window. Delivery state advances only for an ACK matching the entire current desired pair and lease.
-6. One full APISecret fingerprint can bind only identical pair material; conflicts must not overwrite it.
-7. Nodes evict unrenewed pairs by TTL. `key_drop` addresses the full APISecret fingerprint and is not a correctness dependency.
-
-Credential pairs are create/build prerequisites. Cache removal, key_drop, lease expiry, or later provider updates do not affect pairs already copied into existing sandbox/build business records.
-
 <a id="provider-import-boundary"></a>
-
-### Group provider boundary
-
-Registry does not implement `SandboxGroupProvider` / `SandboxGroupImporter`. Group configuration, placement hints, APISecret and ManifestKey belong to placer/provider. Registry retains only execution state and the credential-pair cache needed by each node.
-
-Once a group disappears from its provider, new Place/verify-key calls treat it as nonexistent. Credential pairs already cached in node_link are not proactively deleted; Registry/node TTLs evict them. Credential pairs already copied into existing sandbox/build records are unaffected.
-
 <a id="configuration"></a>
 
 ## Role configuration and node attachment
@@ -661,9 +457,10 @@ foundationdb:
 
 placer_link:
   placer_label: placer.default
-  placer_replica_count: 3      # Number of Registry-to-placer failover candidates
-  min_ready_placers: 1
-  place_timeout: 2s
+
+placement:
+  candidates: 2
+  zone_admit_max: yellow
 ```
 
 Default paths:
@@ -758,7 +555,7 @@ Public router ingress can terminate TLS; registry control connections can use in
 run-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
-A standalone placer must configure at least one `import_groups` source. Embedded or production integrations can directly inject custom `SandboxGroupProvider` / `SandboxGroupImporter` implementations.
+A standalone placer must configure at least one `import_groups` source. Embedded or production integrations can directly inject custom full-record `SandboxGroupSource` implementations.
 
 <a id="placer-configuration"></a>
 
@@ -783,11 +580,9 @@ import_groups:
     path: /var/lib/kuasar/groups
 
 placement:
-  candidates: 2
-  zone_admit_max: yellow
   import_source_owner_count: 3
   import_source_lease_ttl: 15s
-  selector_patch_refresh_interval: 1m
+  import_refresh_interval: 1m
   # shuffle_sharding:
   #   - selector: { pool: gpu }
   #     shard_by: zone
@@ -803,14 +598,12 @@ placement:
 | `placer.advertise` | Address used by the registry to call the placer, also its memberlist HTTP transport address. |
 | `placer.memberlist_label` | Placer memberlist label; defaults to `placer.default`. |
 | `import_groups[]` | Standalone placer group sources; built-in type: `source_type=file`. |
-| `placement.candidates` | Number of P2C candidates inside the placer. |
-| `placement.zone_admit_max` | Highest eligible placement water-level zone. |
 | `placement.import_source_owner_count` | Number of placer candidates allowed to compete for each source lease. |
 | `placement.import_source_lease_ttl` | Registry-side source lease TTL. |
-| `placement.selector_patch_refresh_interval` | Refresh interval for unchanged selector patches. |
+| `placement.import_refresh_interval` | Interval between import maintenance passes. |
 | `placement.shuffle_sharding` | Shuffle-sharding rules. |
 
-On the registry, `placer_link.placer_label` selects the placer memberlist domain; `placer_link.placer_replica_count` selects the number of failover candidates used to call a placer for one group. It is not the owner count of the registry's internal `placer_link` namespace.
+On Registry, `placer_link.placer_label` selects the importer memberlist domain. Scheduling runs in Registry; removed replica/min-ready/place-timeout knobs are rejected on config load.
 
 <a id="node-attachment-configuration"></a>
 
@@ -917,7 +710,7 @@ Placer uses a separate label, `placer.default` by default. Registry has no confi
 {"role":"placer","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
-Registry considers only members satisfying `role=placer && alive && ready=true && ready_label==active_registry_label` for Place / verify-key.
+Registry considers only members satisfying `role=placer && alive && ready=true && ready_label==active_registry_label` as source-lease contenders; Create/Build selection and API-key verification do not call these members.
 
 <a id="registry-registry-state-model"></a>
 
@@ -931,7 +724,7 @@ Registry persists execution metadata through one shared repository implementatio
 
 | Layer | Goal | Interface exposed to its caller |
 |---|---|---|
-| Router / Placer | Authenticate and forward requests, or propose placement from a checked directory | Existing route_link / placer_link / node_list HTTP contracts |
+| Router / Placer | Authenticate and forward requests, or import Group definitions onto checked static targets | Existing route_link / placer_link / node_list HTTP contracts |
 | Registry business services | Validate lifecycle and ownership, dispatch commands, reconcile node reports | Typed Route, Build, Node, Ownership, KeyPair, Directory and ImportSource capabilities |
 | `internal/cluster/metadata` | Define portable records, complete versions, domain outcomes and bounded lists | `Versioned[T]`, `Version`, typed repository methods, `Invalidation`, `ObservationAdmission` |
 | `internal/cluster/metastore` | Implement the typed business repositories once | Atomic lifecycle, index and ownership operations |
@@ -948,7 +741,7 @@ The repository stays one Go module. Only the native FDB driver and its command a
 
 `membership.owners.route_link/node_link/placer_link/node_list` selects Registry service candidates and node connection affinity. `LocateN` and the placer Maglev selection remain business routing mechanisms. They do not select FoundationDB storage replicas or define a database replication factor. `ConnectionOwners` exposes only the local member ID and ordered candidates for a NodeID; it has no storage API.
 
-A Registry may read or change an authorized record through the shared database without fetching a peer's local copy. The selected `link_owner` remains the process holding the node's stream, and node commands still reach it through node-owner RPC. `placer_link.placer_replica_count` continues to bound ready-placer failover candidates.
+A Registry may read or change an authorized record through the shared database without fetching a peer's local copy. The selected `link_owner` remains the process holding the node's stream, and node commands still reach it through node-owner RPC. Registry selects Nodes directly from published Group support.
 
 <a id="registry-namespace-schema"></a>
 
@@ -1062,9 +855,9 @@ Placer readiness requires:
 - Current registry membership has been fetched.
 - One active node_list WATCH_LIST has completed reset/bookmark.
 
-Group import is not a global readiness gate. Each Place resolves only its requested group. A missing group returns NoNode / unavailable without blocking other groups.
+Group import is not a global readiness gate. Registry selects only within the requested Group's completed support publication. Missing support returns NoNode / unavailable without blocking other Groups.
 
-The registry selects ready placers from memberlist metadata only:
+Source-lease contenders are ready importers discovered through memberlist metadata:
 
 ```json
 {"role":"placer","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
@@ -1107,9 +900,9 @@ Node_link uses these typed record domains:
 - `profile`: node_id, labels, runtime_digest, api_endpoint, data_endpoint, Build registration/execution capacity and durable usage, draining, liveness and link_owner. Heartbeat `allocated` memory is the sum of all sandbox NodeReservations on that node; `pool` is the node allocatable pool, not host `memory.current`, VMM charge or guest demand. The low-frequency `node_list` projection includes both endpoints and capacity; usage stays in the node owner's live profile.
 - `sandbox`: the complete per-node sandbox ownership map, `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`.
 - `build`: the complete per-node Build ownership map, `build_id -> {group,template_id}`.
-- `key_pair`: the APISecret+ManifestKey pair cache refreshed by selector patches.
+- `key_pair`: the APISecret+ManifestKey pair cache renewed by trusted conditional Group maintenance.
 
-Heartbeats update only runtime/liveness fields in `profile`; they must not rewrite the `sandbox`, `build` or `key_pair` domains. The cluster writes sandbox/build ownership before dispatch. Registration usage counts registered/waiting/building rows with neither cancel nor delete intent. Execution usage independently counts every execution claim, including cancellation and cleanup. Accepting intent releases registration capacity; exact host cleanup and terminal commit release execution capacity. Retaining owner-free terminal history does not retain admission usage. The ownership record stays until explicit deletion or node terminal retention actually deletes that Build row and emits `BuildDelete`; Registry then exactly deletes the corresponding Build projection and owner ref. Selector patches update key_pair. Nodes do not generate group/route-key, but validate and separately persist sandbox system context delivered by node-link. A Build's cluster group is a separate system field of the node Build row, outside portable metadata. High-frequency profile updates do not rewrite unrelated ownership records.
+Heartbeats update only runtime/liveness fields in `profile`; they must not rewrite the `sandbox`, `build` or `key_pair` domains. The cluster writes sandbox/build ownership before dispatch. Registration usage counts registered/waiting/building rows with neither cancel nor delete intent. Execution usage independently counts every execution claim, including cancellation and cleanup. Accepting intent releases registration capacity; exact host cleanup and terminal commit release execution capacity. Retaining owner-free terminal history does not retain admission usage. The ownership record stays until explicit deletion or node terminal retention actually deletes that Build row and emits `BuildDelete`; Registry then exactly deletes the corresponding Build projection and owner ref. Explicit administrative key maintenance may update key_pair; Group import is applied atomically at the Node. Nodes do not generate group/route-key, but validate and separately persist sandbox system context delivered by node-link. A Build's cluster group is a separate system field of the node Build row, outside portable metadata. High-frequency profile updates do not rewrite unrelated ownership records.
 
 Within a node, `node_sandbox_id` ownership is written by CAS: replaying the same complete ownership is an idempotent refresh; different ownership returns a conflict without overwriting the old value. If create encounters that conflict before sending the node command, it rolls back only this attempt's RESERVED record, preserves stable `sandbox_id`, consumes the next `sandbox_generation`, generates a new `node_sandbox_id` and retries. The node synchronously rejects an existing or currently-being-created node-local ID before asynchronous launch.
 
@@ -1229,12 +1022,12 @@ Registry sends commands to serve, which reuses e2b lifecycle primitives ([Lifecy
 
 | Command | Node action |
 |---|---|
-| `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster, idle_timeout?, auto_pause_memory?, auto_reset?}` | Cold-launch template_ref and retain/merge config ([Lifecycle and state machine](sandbox-lifecycle.md#state-and-ownership); snp means snapshot restoration for fresh Create). Full APISecret fingerprint selects an installed credential pair. Persist cluster={group,route_key,stable_id?} and profile as separate system fields; resolve and strip credentials namespace before the business insert. Before ACK, state is starting with empty run_id, an active attempt and the successful route/lease barrier. |
+| `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, group_api_key, expected_group_version, config, cluster, idle_timeout?, auto_pause_memory?, auto_reset?}` | Cold-launch template_ref and retain/merge config ([Lifecycle and state machine](sandbox-lifecycle.md#state-and-ownership); snp means snapshot restoration for fresh Create). New objects require full Group API-key authentication and the expected Group revision before copying Node-owned context; existing exact objects use their retained credential binding. Persist cluster={group,route_key,stable_id?} and profile as separate system fields; resolve and strip credentials namespace before the business insert. Before ACK, state is starting with empty run_id, an active attempt and the successful route/lease barrier. |
 | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?, memory?}` | SID is NodeSandboxID. Existing targets ignore migration tokens and validate full fingerprint, profile and cluster context; false on an existing paused S is one cold attempt that preserves its durable source. Missing targets with KMT1 synchronously authenticate the original pair and insert paused with command SID/context: false durably selects E-only; omitted/null preserves the token source; true requires S. The same selector then resolves ResumeMode ([Import selection](sandbox-lifecycle.md#import-selection)). Before ACK, clean old owners and atomically restore canonical RunDir/UDS, resolved launch mode and deadline. ACK carries ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}, without root/fingerprint. Restore is asynchronous; missing targets without tokens are rejected. |
-| `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | Reuse Connect's exact target, optional synchronous import and profile/context/full-fingerprint checks; raw API keys never enter node-link. Node authoritatively compiles conditions, generates UUIDv7 session ID and optional exp from actual issuance time. ACK contains only ExecSessionResult{ExecAccessToken}. Resume remains asynchronous without waiting for READY. Conditions never enter Sandbox rows/routes/events/metadata. |
+| `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | Reuse Connect's exact target, optional synchronous import and profile/context/full-fingerprint checks; fresh admission carries the API key and expected Group revision over the trusted NodeLink, without persisting or logging the key. Node authoritatively compiles conditions, generates UUIDv7 session ID and optional exp from actual issuance time. ACK contains only ExecSessionResult{ExecAccessToken}. Resume remains asynchronous without waiting for READY. Conditions never enter Sandbox rows/routes/events/metadata. |
 | `delete{cmd_id, sid, api_secret_fingerprint}` | Full fingerprint must match the existing row. ACK means the exact owner durably entered deleting, without awaiting finalizer completion. Publish deleting management Upsert before ACK; business-route withdrawal is not cleanup proof. Pending replay is idempotent ([Process management through systemd template units](node.md#systemd-pools) kill). |
 | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | Atomically validate/install or renew the complete pair; both fingerprints are 64-hex SHA-256. Key_drop best-effort removes by full APISecret fingerprint; TTL eviction supplies correctness ([Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)). Cluster.md specifies distribution. |
-| `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | Config.builder.target is the canonical register-only requested target and participates in replay digest/node validation. Node transactionally performs final registration admission against the same canonical Build.Resources. Persist final Sandbox Create config/resources, build-only options and cluster group separately; never derive A/B resources from target Sandbox resources. Only definitive rejection without side effects permits reselection; ambiguous outcomes retry the same node/BuildID. |
+| `build_register{build_id, template_id, profile, resources, group_api_key, expected_group_version, api_secret_fingerprint, config}` | Config.builder.target is the canonical register-only requested target and participates in replay digest/node validation. Node transactionally performs final registration admission against the same canonical Build.Resources. Persist final Sandbox Create config/resources, build-only options and cluster group separately; never derive A/B resources from target Sandbox resources. Only a structured GroupVersionConflict from initial admission permits exact intent retirement. Other errors/unknown outcomes retain the same cleanup obligation and accept late Build facts. |
 
 S-preserving automatic import checks S and its paired E metadata and runtime compatibility before insertion/ACK. A node-local four-second context covers this check and insertion, bounded earlier by caller cancellation; helper pipe cleanup adds at most 250 ms. Registry's five-second ACK wait does not cancel the node-link stream, so it is not the check's timeout. Check failure inserts no target. A new E-only import remains E after failed cold launch; an existing local S retains S. A concurrent insert winner remains authoritative. These are selected-node admission rules; placement and retry protocols are unchanged.
 
@@ -1296,6 +1089,8 @@ On disconnect/failover, Placer clears the old source and waits for the new candi
 
 ### route_link
 
+RouteLink v2 uses distinct ControlRoute and DataRoute payloads. Control calls are authenticated per object and contain only the API endpoint and public result tokens; data calls carry only the data endpoint and service authentication material. Router receives no tenant root. Older combined projections are not accepted.
+
 <a id="route-record"></a>
 
 #### Route record
@@ -1316,7 +1111,7 @@ On disconnect/failover, Placer clears the old source and waits for the new candi
 | `api_secret_fingerprint` | Complete APISecret fingerprint bound to the sandbox business record; lifecycle commands/ownership cleanup use it to prevent operations across bindings |
 | `manifest_key_fingerprint` | Complete fingerprint of the paired ManifestKey; routes neither store nor project raw ManifestKey |
 | `stable_id` | Sandbox identity retained across NodeSandboxID changes; equals `sandbox_id` in the cluster and binds ServiceSecret/KAT |
-| `api_secret` | APISecret currently bound to the sandbox; exists only in protected route storage and trusted router/proxy projections |
+| `api_secret` | APISecret bound to the sandbox, retained in protected Registry/Node storage and excluded from Router projections |
 | `service_secret` | Persisted per-sandbox service credential for signing/verifying purpose-specific KAT tokens |
 | `envd_access_token` | Data-plane token for the e2b envd port |
 | `traffic_access_token` | Token used by external gateways and e2b data-plane components; not consumed by the cluster platform layer |
@@ -1350,7 +1145,7 @@ overwrite a later run. This adds no cross-node disk recovery or node-loss replac
 #### Reserve
 
 ```text
-POST /route-link/reserve
+POST /route-link/v2/reserve
   ?operation=create|connect|exec-session|data
   &group=<group>&route_key=<route-key>
   [&sid=<stable-sandbox-id>][&port=<effective-port>]
@@ -1359,12 +1154,12 @@ POST /route-link/reserve
 
 Each operation has its own typed Reserve body: create accepts optional `config`, `max_checkpoints`, `idle_timeout`, `auto_pause_memory` and `auto_reset` top-level fields in this internal protocol (at most 16 MiB); connect accepts an optional `{"memory":true|false}` (at most 64 KiB), preserving absent/null selection; exec-session carries `{"ttl_seconds":N,"conditions":["..."]}`; data has an empty body. Credentials and completion conditions differ among the four operations. Registry strictly validates exec-session schema/bounds again; it accepts neither the legacy `ttl_seconds` query nor conditions hidden in headers/metadata/config maps:
 
-- `create`: query carries only group/route_key, header carries `X-API-KEY`, and the config map permits only `kuasar-sandbox.resource`, `kuasar-sandbox.traffic`, `kuasar-sandbox.restore`, `kuasar-sandbox.credentials` and `kuasar-sandbox.checkpoint`; optional `max_checkpoints` (default 1), `idle_timeout`, `auto_pause_memory` (default true) and `auto_reset` (default false) are separate typed body fields, and `memory` is rejected. Router has already extracted the public checkpoint quota; this config namespace carries only `merge_ref`/`drop_caches`. `idle_timeout` is a nonnegative integer number of seconds representable as a duration: absent/null disables the policy, while zero remains enabled. It is not a config namespace. Registry validates and normalizes resource/traffic patches before placement or route writes; supplied leaves override group defaults carried by placement, while omitted leaves inherit. Before placement or route writes, Registry validates the API key through the group provider, generates stable SandboxID and the first NodeSandboxID, and sends CmdCreate. Node ACK means only durable starting + active attempt. Registry still waits for the node READY event before returning `Route` to northbound create. Concurrent creates are coalesced inside Registry.
+- `create`: query carries only group/route_key, header carries `X-API-KEY`, and the config map permits only `kuasar-sandbox.resource`, `kuasar-sandbox.traffic`, `kuasar-sandbox.restore`, `kuasar-sandbox.credentials` and `kuasar-sandbox.checkpoint`; optional `max_checkpoints` (default 1), `idle_timeout`, `auto_pause_memory` (default true) and `auto_reset` (default false) are separate typed body fields, and `memory` is rejected. Router has already extracted the public checkpoint quota; this config namespace carries only `merge_ref`/`drop_caches`. `idle_timeout` is a nonnegative integer number of seconds representable as a duration: absent/null disables the policy, while zero remains enabled. It is not a config namespace. Registry validates and normalizes resource/traffic patches before placement or route writes; the Node merges supplied leaves with its copied Group defaults only for default-template creation. Before selection or route writes, Registry validates the full API key against retained Group support, generates stable SandboxID and the first NodeSandboxID, and sends CmdCreate. Node ACK means only durable starting + active attempt. Registry still waits for the node READY event before returning `Route` to northbound create. Concurrent creates are coalesced inside Registry.
 - `connect`: query must carry expected stable `sid`, with optional `timeout`; headers carry `X-API-KEY` and optional `X-Kuasar-Migration-Token`. The body accepts only the optional memory selector (no nonempty config or non-null max_checkpoints/idle_timeout/auto_pause_memory/auto_reset). Registry validates the API key with the APISecret bound to the route business record and preserves that selector in CmdConnect to the exact NodeSandboxID. If that node is unavailable and a migration token is supplied, Registry excludes it, allocates a new generation and sends CmdConnect to a new node. The node synchronously validates, optionally imports using that same memory selector (false durably selects E-only for a new target), cleans old runner/network/RunDir ownership, restores canonical RunDir/UDS during paused→starting acceptance, persists the deadline and reads credentials. ACK returns typed `ConnectResult`. Registry checks its NodeSandboxID/TemplateID/Profile/three public tokens against the route, then returns `Route + Connect`. Resume is asynchronous; connect does not wait for READY, and Router does not coalesce different requests.
-- `exec-session`: query must carry expected stable `sid`; the typed body carries nonnegative int64 `ttl_seconds` and a normalized array of CEL source strings. Headers carry the original `X-API-KEY` and optional `X-Kuasar-Migration-Token`. Registry validates the API key with the route business record's bound APISecret and checks expected stable SID. The raw key terminates at the Registry verifier; it does not enter commands, ACKs, routes, logs or error text. Registry sends `CmdExecSession{APISecretFingerprint,Profile,TTLSeconds,ExecConditions,MigrationToken?,Cluster?}` to the current/new candidate NodeSandboxID. Any other command kind carrying `ExecConditions` must be rejected. The node synchronously performs optional import, object/credential/context validation, authoritative CEL compilation and KAT signing. ACK carries only `ExecSessionResult{ExecAccessToken}`, followed by asynchronous resume under the existing contract. Compilation/minting failure precedes any resume mutation. Conditions exist only in this public request, Reserve body, Command and token; they are never persisted in Route, SandboxRecord, events or metadata, and their source is not logged. MigrationToken likewise lives only in this Reserve/command wire exchange, is never stored in route/SandboxRecord or included in logs/errors, and is discarded after synchronous import. Registry validates the typed result, rereads the current route and returns `Route + ExecSession` without waiting for READY. Router exposes only `execAccessToken` to the client. Token issuance on a READY/RESERVED route neither rewrites its revision nor takes another workflow's rollback fence; only PAUSED transitions to RESERVED under existing activation semantics. Every API call uses its own CmdID and mints a fresh KAT; exec-session Reserve calls are not coalesced.
+- `exec-session`: query must carry expected stable `sid`; the typed body carries nonnegative int64 `ttl_seconds` and a normalized array of CEL source strings. Headers carry the original `X-API-KEY` and optional `X-Kuasar-Migration-Token`. Registry validates the API key with the route business record's bound APISecret and checks expected stable SID. The key is also carried to Node Group admission for an imported target; it is excluded from ACKs, persistent records, logs and error text. Registry sends `CmdExecSession{APISecretFingerprint,Profile,TTLSeconds,ExecConditions,MigrationToken?,Cluster?}` to the current/new candidate NodeSandboxID. Any other command kind carrying `ExecConditions` must be rejected. The node synchronously performs optional import, object/credential/context validation, authoritative CEL compilation and KAT signing. ACK carries only `ExecSessionResult{ExecAccessToken}`, followed by asynchronous resume under the existing contract. Compilation/minting failure precedes any resume mutation. Conditions exist only in this public request, Reserve body, Command and token; they are never persisted in Route, SandboxRecord, events or metadata, and their source is not logged. MigrationToken likewise lives only in this Reserve/command wire exchange, is never stored in route/SandboxRecord or included in logs/errors, and is discarded after synchronous import. Registry validates the typed result, rereads the current route and returns `Route + ExecSession` without waiting for READY. Router exposes only `execAccessToken` to the client. Token issuance on a READY/RESERVED route neither rewrites its revision nor takes another workflow's rollback fence; only PAUSED transitions to RESERVED under existing activation semantics. Every API call uses its own CmdID and mints a fresh KAT; exec-session Reserve calls are not coalesced.
 - `data`: query must carry expected stable `sid`; a legacy target may supply an effective `port`, which Registry combines with route `target_port` for authentication. The logical exec service does not require a port. Headers carry `X-Access-Token`, and exec additionally carries `E2b-Sandbox-Service: exec`. For ordinary targets, Registry selects EnvdAccessToken or ForwardAccessToken by profile/port; exec validates a KAT with `StableID + ServiceSecret`. Authentication precedes any route CAS/CmdConnect. READY or PAUSING returns directly; PAUSED first CASes to RESERVED and sends CmdConnect; RESERVED waits for events in the current stable lineage. `Route` returns in READY or PAUSING with a valid DataEndpoint. A nonexistent route returns not-found without creating a sandbox.
 
-`Route` is a protected result containing stable SandboxID, current NodeSandboxID, `APIEndpoint`, `DataEndpoint` and `route_revision`. Both endpoints come from the current node runtime/profile looked up by NodeID, rather than being copied into SandboxRecord. Control/build always uses APIEndpoint; data/exec always uses DataEndpoint. Router→node currently uses plaintext HTTP/CONNECT, so each value must point to its reachable plaintext internal listener. External TLS terminates at Router; node-link mTLS is separate. `route_revision` is the Route record's complete 10-byte committed version, encoded as 20 hexadecimal characters, allowing Router to reject late results while a newer entry is cached. Router does not subscribe to route_link updates.
+RouteLink v2 returns separate protected projections. ControlRoute contains APIEndpoint and public object tokens after per-request full-MAC authorization; DataRoute contains DataEndpoint and service-scoped signing material. Neither exposes APISecret or its fingerprint. Endpoints come from the current Node profile. Router caches only DataRoute, and reauthorizes every control/Build operation. Router→Node uses plaintext internal HTTP/CONNECT; external TLS terminates at Router and NodeLink mTLS is separate. The 20-hex route_revision identifies the complete committed record version and prevents late data results from replacing a newer cached route.
 
 CmdConnect/CmdExecSession `CmdID` correlates only the current Command and ACK waiter; it is not a durable idempotency key. Registry does not automatically redeliver the same Command/`CmdID` after ACK timeout, link loss or node restart. The call returns a temporary failure, and an API retry creates a new operation/CmdID. Connect remains retryable through insert-only targets, object-binding validation and node-local launch ownership; an Exec Session retry can issue another KAT. The system persists no command digest, ACK/result or temporary deduplication state.
 
@@ -1388,24 +1183,9 @@ registry observer joins placer.default memberlist
 ready placer view from memberlist meta
 ```
 
-Registry uses deterministic failover by group:
-
-```text
-readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
-               and ready_label == active_registry_label
-candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
-try candidates in order until success
-```
-
-Registry does not apply P2C to placers. P2C belongs inside placer, where it chooses a target from node candidates.
+Memberlist supplies the ready importer contenders for each source lease. It is not a Create/Build request path. Source pages, lease fences and conditional Node commands follow [Group import](#groups-and-placement); no Place, verify-key or selector-patch endpoint is exposed.
 
 <a id="importsource"></a>
-
-#### Import/source
-
-`source_id` is the importer's sole execution unit. Ready placers use `LocateN(source_id, readyPlacers, import_source_owner_count)` to select the contenders. They race for `ImportSourceRepository.Acquire(source_id, owner_id, run_id, ttl)` through Registry. This is an atomic database lease; the candidate routing key does not define a storage shard.
-
-The winner ranges one source in bounded pages, obtains each group's placement hint and credential pair, and sends selector patches. Only after every item in that page succeeds may it checkpoint the cursor using the same owner, run ID and term. Expired/replaced leases cannot advance a cursor. Provider point lookups may deduplicate across sources, but Importer Range does not combine sources into one execution view.
 
 <a id="router-boundary"></a>
 
@@ -1444,7 +1224,7 @@ flowchart TD
 3. **The hot path prefers the route cache**: a recently resolved route with a node target lets new requests avoid Resolve/Reserve in ready, paused, and starting states. In-flight requests are not a routing source for new requests.
 4. **Fail-fast invalidation**: if the node returns typed not-found/unauthorized before accepting the inner request, the router evicts the old target, revalidates the same credential through ReserveData, refreshes the route, and retries once. Exec permits this retry only before Raw has been sent to any node. Connection failure also evicts the target; subsequent requests Resolve again.
 5. **Data-plane bytes do not enter the registry**: the registry participates only in explicit create/connect/exec-session, cache-miss Resolve, and data Reserve fallback for a missing target or typed stale response.
-6. **Root credentials have separate purposes**: Reserve requires the original API key for create/connect/exec-session. Create group admission uses a ready placer's provider APISecret; connect/exec-session use the APISecret already bound to the Sandbox record. For other control operations, the router calls the route owner's verify-key, and the registry fails over to ready placers for verification. Protected READY route results also project the sandbox's bound APISecret, ServiceSecret, and purpose-specific access tokens to trusted routers. Raw ManifestKey never enters the registry/router routing chain.
+6. **Authorization is per object**: Registry verifies the complete API key for every control/Build operation, using retained object roots where applicable. The control projection contains the API endpoint and public result tokens; the data projection contains only the data endpoint and service authentication material. Router receives no APISecret or ManifestKey.
 
 <a id="router-route-cache"></a>
 
@@ -1468,7 +1248,7 @@ request
               └─ missing node target ───► Reserve, cache route, then forward
 ```
 
-The route-resolution cache is a hot-path optimization that avoids sending every new HTTP request to the registry. Direct forwarding depends only on a complete `NodeSandboxID + DataEndpoint`, not on ready/paused/starting state. The final node performs parking, Wake, and backend connection. The router does not maintain consistency through a full route stream.
+Only the data projection enters the route-resolution cache. Control and Build follow-ups reauthorize the exact object on every request. The data cache is a hot-path optimization that avoids sending every new HTTP request to the registry. Direct forwarding depends only on a complete `NodeSandboxID + DataEndpoint`, not on ready/paused/starting state. The final node performs parking, Wake, and backend connection. The router does not maintain consistency through a full route stream.
 
 <a id="router-route-resolution-cache"></a>
 
@@ -1483,8 +1263,7 @@ Key:
 Value:
 
 ```text
-{node_id, api_endpoint, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id,
- api_secret, api_secret_fingerprint, manifest_key_fingerprint, service_secret,
+{node_id, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id, service_secret,
  envd_access_token, traffic_access_token, forward_access_token,
  target_port, route_revision, expires, last_used}
 ```
@@ -1598,7 +1377,7 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 | Event | Behavior |
 |---|---|
 | Router crash | Local cache is lost; after restart, a miss resolves again |
-| Placer crash | Registry fails over to the next ready placer for that group; the hot path is unaffected |
+| Placer crash | Existing Node Groups continue serving; another source-lease owner can resume conditional import. New definitions wait for successful import |
 | node_link disconnect | Node owner immediately rejects new submissions to that node; route owner excludes/reselects it. Once the disconnected node's last heartbeat is older than node_dead_after, revision-fenced reaping claims the stale profile and cleans its directory and eligible execution projections. Dead/deleting Sandbox management rows and their exact ownership remain; in-flight reservations are not swept. Reconnection reports full/incremental state |
 | Conductor process restart | Reconciles durable rows against systemd units: adopts live sandboxes/builders, retries deleting/paused cleanup, resumes already accepted interrupted restores, and cleans/fails missing fresh executions. This is not whole-host reboot |
 | Node host reboot | Running processes are gone. If node SQLite/artifacts survive, reconciliation still processes paused rows, accepted interrupted restores, cleanup owners and retained Builds. Missing executions converge through node reports/exact route cleanup; no blanket durable-row deletion or automatic recreation of every old sandbox |
@@ -1613,7 +1392,7 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 ### Registry Performance
 
 - Hot data path: a complete node-target cache hit forwards directly to the node, including pausing/paused/starting, without Registry access.
-- Cold Place path: group → route_link owner → ready-placer failover → node-owner connectivity/current-usage check → authoritative node admission. Definitively failed candidates are excluded before reselection; ambiguous Build dispatch stays pinned.
+- Cold control path: group → Registry full-MAC authentication and bounded GroupSupport selection → atomic intent/ownership → original node connection → Node Group admission. Generic errors and unknown delivery retain cleanup ownership; only the initial typed version conflict permits exact retirement.
 - Very many groups: Router does not subscribe to groups; Registry does not scan across them; placer import pages independently by source_id.
 - Very many nodes: profile and ownership operations are scoped to NodeID; the bucketed node_list holds low-frequency directory data, not high-frequency usage.
 - Membership changes: no metadata migration or peer read-repair; connection re-registration and reports reconcile business state through the shared database.
@@ -1681,27 +1460,13 @@ owner run; stub or helper results do not replace that run.
 
 ### Placer Reliability
 
-| Event | Behavior |
-|---|---|
-| Placer crash | The registry fails over to the next ready placer for the group; the hot path is unaffected. |
-| WATCH_LIST disconnect | The placer clears its node_list view and fully resubscribes through another owner; it remains not-ready until bookmark completes. |
-| Provider unavailable | Place/verify-key for affected groups return unavailable. |
-| Stale node labels | Node-owner admission/create provides the final rejection. |
-| Source-owner crash | After lease expiry, another candidate resumes from the committed cursor; fencing rejects old-owner patches/cursor updates. |
-| Key-renewal delivery failure | Timeout, disconnect, or rejection does not advance delivery state; create/build rejects at the node and the next heartbeat refresh retries. |
-| Build registration timeout or lost ACK | Keep the persisted selected-node/BuildID intent and query/retry that same node. Durable registration usage remains node-owned; the placer has no admission-lease timer that frees it. The node releases registration usage on its ready/error transition; terminal-history deletion later removes the Registry projection. These are separate events. See the [durable usage query](../internal/store/build_admission.go). |
-
-See the authoritative [registration dispatch and projection reconciliation](../internal/registry/build.go) and [placement predicates](../internal/placer/scaler.go). In particular, ambiguous delivery cannot be treated as proof of a side-effect-free rejection.
+An importer outage stops new maintenance and renewal; Registry continues to authenticate retained objects and select already published Groups. Node-local key expiry still controls new admissions. WATCH_LIST loss invalidates the importer's view until a complete resubscription. Source lease loss fences later forwarding/checkpoints. A conditional write conflict is reported, never rebased silently. Unknown delivery preserves its payload; observing equal context does not confirm key renewal.
 
 <a id="placer-performance"></a>
 
 ### Placer Performance
 
-- WATCH_LIST carries low-frequency fields only, avoiding high-frequency water-level fan-out.
-- Group `LocateN` distributes Place QPS across ready placers.
-- Inside the placer, P2C compares only sampled candidates using the current local directory view; it does not synchronously poll nodes for live load.
-- Import pagination is independent per source; sources are not fully merged.
-- Selector patches are a slow path and can be rate-limited; unchanged patches refresh TTL only.
+Node views and source pages are bounded. Import visits static targets rather than scheduling each request. Confirmed lease bindings are a bounded optimization; unresolved writes consume capacity until reconciled. Registry performs P2C using sampled published support, without calling Placer or reading artifacts. Performance acceptance must report both Registry request latency and import/report overhead against the same workload before and after the change.
 
 <a id="related-contracts"></a>
 
@@ -1712,7 +1477,7 @@ See the authoritative [registration dispatch and projection reconciliation](../i
 ### Registry references
 
 - [Cluster router](#client-access) — Router ingress, route cache and data forwarding.
-- [Cluster placer](#groups-and-placement) — Group provider/importer, WATCH_LIST, Place and key distribution.
+- [Cluster placer](#groups-and-placement) — Node Groups, Registry selection and conditional import.
 - [Node](node.md) — node-ctl host and node-side node-link behavior.
 - [Node proxy](node-proxy.md) — Node data proxy, routesync and CONNECT.
 - [Deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md) — Deployment topology, ports, startup/shutdown and failure domains.
@@ -1722,7 +1487,7 @@ See the authoritative [registration dispatch and projection reconciliation](../i
 ### Router references
 
 - [cluster.md](cluster.md) — registry membership, route_link, Reserve, and the data model.
-- [cluster.md](#groups-and-placement) — verify-key, Place, and key-distribution sources.
+- [cluster.md](#groups-and-placement) — object authentication, Group selection and import sources.
 - [node-proxy.md](node-proxy.md) — node-internal data-plane forwarding, CONNECT, and envd signatures.
 - [Router implementation](../internal/router/router.go) — authentication modes, cache lifetime, endpoint selection, and exec admission.
 

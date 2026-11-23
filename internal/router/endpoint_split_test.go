@@ -264,11 +264,11 @@ func TestOrdinaryHTTPPassesThroughMaxInflightWithoutRouteRefresh(t *testing.T) {
 	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(route)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits.Add(1)
 			http.Error(w, "must not refresh an overloaded route", http.StatusInternalServerError)
 		default:
@@ -421,13 +421,13 @@ func endpointRouteServer(t *testing.T, route routeResolve, build map[string]any)
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(route)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			_ = json.NewEncoder(w).Encode(reserveResult{Route: route})
-		case "/route-link/build":
+		case "/route-link/v2/build":
 			if build == nil {
 				w.WriteHeader(http.StatusNotFound)
 				return

@@ -12,14 +12,15 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
+func TestServeDataRouteReturnsOnlyDataCredentials(t *testing.T) {
 	ctx := context.Background()
-	reg := New(newTestStores(), nil, 0, nil)
+	reg := New(newTestStores(t), 0, nil)
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "127.0.0.1:7443", DataEndpoint: "127.0.0.1:8443"}); err != nil {
 		t.Fatal(err)
 	}
@@ -44,11 +45,10 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.SandboxID != want.SandboxID || got.NodeSandboxID != want.NodeSandboxID ||
-		got.Profile != want.Profile || got.APIEndpoint != "127.0.0.1:7443" || got.DataEndpoint != "127.0.0.1:8443" ||
+		got.Profile != want.Profile || got.APIEndpoint != "" || got.DataEndpoint != "127.0.0.1:8443" ||
 		!got.RouteRevision.IsCommitted() ||
-		got.StableID != want.StableID || got.APISecret != want.APISecret ||
-		got.APISecretFingerprint != want.APISecretFingerprint ||
-		got.ManifestKeyFingerprint != want.ManifestKeyFingerprint ||
+		got.StableID != want.StableID || got.APISecret != "" ||
+		got.APISecretFingerprint != "" || got.ManifestKeyFingerprint != "" ||
 		got.ServiceSecret != want.ServiceSecret || got.EnvdAccessToken != want.EnvdAccessToken ||
 		got.TrafficAccessToken != want.TrafficAccessToken ||
 		got.ForwardAccessToken != want.ForwardAccessToken {
@@ -58,7 +58,7 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 
 func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 	mux := http.NewServeMux()
-	New(newTestStores(), nil, 0, nil).ServeRouteLink(mux)
+	New(newTestStores(t), 0, nil).ServeRouteLink(mux)
 
 	for _, tc := range []struct {
 		method string
@@ -79,28 +79,35 @@ func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 	}
 }
 
-func TestServeReserveBuildPreservesDefinitiveNodeStatus(t *testing.T) {
+func TestServeReserveBuildOrdinaryNegativeACKPreservesIntent(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusConflict, http.StatusTooManyRequests} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			reg := testReg(t)
 			seedTestNode(t, reg.stores, "n1")
-			reg.SetPlacer(placementWithToken("n1"))
+			publishTestGroups(t, reg, "n1", "/g")
 			reg.SetNodeOwner(&recordingNodeOwner{allow: true, ack: &routesync.CmdAck{
-				Status: routesync.AckRejected, HTTPStatus: status, Reason: "definitive node rejection",
+				Status: routesync.AckRejected, HTTPStatus: status, Reason: "ordinary node rejection",
 			}})
 			mux := http.NewServeMux()
 			reg.ServeRouteLink(mux)
 			body, err := json.Marshal(BuildReserveReq{
-				Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources(),
+				Group: "/g", BuildID: "negative-ack", Profile: types.ProfileE2B, Resources: testWireBuildResources(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			req := httptest.NewRequest(http.MethodPost, RouteLinkReserveBuildPath, bytes.NewReader(body))
+			req.Header.Set("X-API-KEY", testAPIKeyValue())
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
-			if rec.Code != status || !strings.Contains(rec.Body.String(), "definitive node rejection") {
-				t.Fatalf("response = %d %q, want %d with node reason", rec.Code, rec.Body.String(), status)
+			if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "ordinary node rejection") {
+				t.Fatalf("response = %d %q, want ambiguous result", rec.Code, rec.Body.String())
+			}
+			if record, found, err := reg.stores.GetBuildInGroup(t.Context(), "/g", "negative-ack"); err != nil || !found || record.State != BuildStarting {
+				t.Fatalf("negative ACK erased ambiguous intent: %v %v", found, err)
+			}
+			if _, found, err := reg.stores.GetNodeBuildRef(t.Context(), "n1", "negative-ack"); err != nil || !found {
+				t.Fatalf("negative ACK lost cleanup responsibility: %v %v", found, err)
 			}
 		})
 	}
@@ -108,8 +115,13 @@ func TestServeReserveBuildPreservesDefinitiveNodeStatus(t *testing.T) {
 
 func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 	mux := http.NewServeMux()
-	reg := New(newTestStores(), nil, 0, nil)
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 0, nil)
+	if err := putTestNode(reg.stores, t.Context(), &NodeRecord{NodeID: "fixture", Draining: true}); err != nil {
+		t.Fatal(err)
+	}
+	publishTestGroups(t, reg, "fixture", "/g")
+	reads := countTestGroupReads(reg)
+	_ = reads
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`)
 	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
@@ -122,7 +134,7 @@ func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 }
 
 func TestServeReserveConnectStrictlyBoundsTypedBody(t *testing.T) {
-	reg := New(newTestStores(), nil, 0, nil)
+	reg := New(newTestStores(t), 0, nil)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	for _, test := range []struct {
@@ -166,17 +178,13 @@ func TestServeReserveAcceptsResourceAndTrafficConfig(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			placements := 0
-			reg := New(newTestStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-				placements++
-				for key, want := range tc.config {
-					if got := req.Config[key]; got != want {
-						t.Errorf("placement config[%s]=%q, want %q", key, got, want)
-					}
-				}
-				return nil, ErrNoNode
-			}), 0, nil)
-			enableTestCreateAuth(t, reg)
+			reg := New(newTestStores(t), 0, nil)
+			if err := putTestNode(reg.stores, t.Context(), &NodeRecord{NodeID: "fixture", Draining: true}); err != nil {
+				t.Fatal(err)
+			}
+			publishTestGroups(t, reg, "fixture", "/g")
+			reads := countTestGroupReads(reg)
+			_ = reads
 			mux := http.NewServeMux()
 			reg.ServeRouteLink(mux)
 			body, err := json.Marshal(SandboxReserveReq{Config: tc.config})
@@ -187,8 +195,8 @@ func TestServeReserveAcceptsResourceAndTrafficConfig(t *testing.T) {
 			req.Header.Set("X-API-KEY", testAPIKeyValue())
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
-			if rec.Code != http.StatusServiceUnavailable || placements != 1 {
-				t.Fatalf("status=%d body=%q placements=%d; want accepted config reaching unavailable placement once", rec.Code, rec.Body.String(), placements)
+			if rec.Code != http.StatusServiceUnavailable || reads.calls != 1 {
+				t.Fatalf("status=%d body=%q reads.calls=%d; want accepted config reaching unavailable placement once", rec.Code, rec.Body.String(), reads.calls)
 			}
 			if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
 				t.Fatalf("unavailable placement wrote route state: found=%v err=%v", found, err)
@@ -207,12 +215,13 @@ func TestServeReserveRejectsInvalidResourceAndTrafficBeforePlacement(t *testing.
 		{"connect traffic", "connect", sandboxcfg.NsTraffic, `{"max_inflight":{"total":3}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			placements := 0
-			reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-				placements++
-				return nil, ErrNoNode
-			}), 0, nil)
-			enableTestCreateAuth(t, reg)
+			reg := New(newTestStores(t), 0, nil)
+			if err := putTestNode(reg.stores, t.Context(), &NodeRecord{NodeID: "fixture", Draining: true}); err != nil {
+				t.Fatal(err)
+			}
+			publishTestGroups(t, reg, "fixture", "/g")
+			reads := countTestGroupReads(reg)
+			_ = reads
 			mux := http.NewServeMux()
 			reg.ServeRouteLink(mux)
 			body, err := json.Marshal(SandboxReserveReq{Config: map[string]string{tc.key: tc.value}})
@@ -227,8 +236,8 @@ func TestServeReserveRejectsInvalidResourceAndTrafficBeforePlacement(t *testing.
 			req.Header.Set("X-API-KEY", testAPIKeyValue())
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
-			if rec.Code != http.StatusBadRequest || placements != 0 {
-				t.Fatalf("status=%d body=%q placements=%d; want 400 before placement", rec.Code, rec.Body.String(), placements)
+			if rec.Code != http.StatusBadRequest || reads.calls != 0 {
+				t.Fatalf("status=%d body=%q reads.calls=%d; want 400 before placement", rec.Code, rec.Body.String(), reads.calls)
 			}
 			if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
 				t.Fatalf("invalid config wrote route state: found=%v err=%v", found, err)
@@ -238,12 +247,13 @@ func TestServeReserveRejectsInvalidResourceAndTrafficBeforePlacement(t *testing.
 }
 
 func TestServeReserveRejectsUnsupportedConfigBeforeReservation(t *testing.T) {
-	placements := 0
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}), 0, nil)
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 0, nil)
+	if err := putTestNode(reg.stores, t.Context(), &NodeRecord{NodeID: "fixture", Draining: true}); err != nil {
+		t.Fatal(err)
+	}
+	publishTestGroups(t, reg, "fixture", "/g")
+	reads := countTestGroupReads(reg)
+	_ = reads
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}","kuasar-sandbox.network":"{}"}}`)
@@ -254,24 +264,22 @@ func TestServeReserveRejectsUnsupportedConfigBeforeReservation(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q, want 400", rec.Code, rec.Body.String())
 	}
-	if placements != 0 {
-		t.Fatalf("unsupported config reached placement %d times", placements)
+	if reads.calls != 0 {
+		t.Fatalf("unsupported config reached placement %d times", reads.calls)
 	}
 	if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
 		t.Fatalf("unsupported config wrote route state: found=%v err=%v", found, err)
 	}
 }
 
-func TestServeReserveAcceptsCredentialsWithoutSendingThemToPlacer(t *testing.T) {
-	placements := 0
-	reg := New(newTestStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		placements++
-		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
-			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
-		}
-		return nil, ErrNoNode
-	}), 0, nil)
-	enableTestCreateAuth(t, reg)
+func TestServeReserveAcceptsCredentialsBeforeCapacityFailure(t *testing.T) {
+	reg := New(newTestStores(t), 0, nil)
+	if err := putTestNode(reg.stores, t.Context(), &NodeRecord{NodeID: "fixture", Draining: true}); err != nil {
+		t.Fatal(err)
+	}
+	publishTestGroups(t, reg, "fixture", "/g")
+	reads := countTestGroupReads(reg)
+	_ = reads
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"service_secret\":\"` + strings.Repeat("1", 64) + `\"}"}}`)
@@ -282,18 +290,19 @@ func TestServeReserveAcceptsCredentialsWithoutSendingThemToPlacer(t *testing.T) 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%q, want 503 after accepted config reached placement", rec.Code, rec.Body.String())
 	}
-	if placements != 1 {
-		t.Fatalf("accepted credentials reached placement %d times, want 1", placements)
+	if reads.calls != 1 {
+		t.Fatalf("accepted credentials reached placement %d times, want 1", reads.calls)
 	}
 }
 
 func TestServeReserveRejectsInvalidCredentialsBeforePlacement(t *testing.T) {
-	placements := 0
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		return nil, ErrNoNode
-	}), 0, nil)
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 0, nil)
+	if err := putTestNode(reg.stores, t.Context(), &NodeRecord{NodeID: "fixture", Draining: true}); err != nil {
+		t.Fatal(err)
+	}
+	publishTestGroups(t, reg, "fixture", "/g")
+	reads := countTestGroupReads(reg)
+	_ = reads
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"unknown\":\"credential-secret-sentinel\"}"}}`)
@@ -307,22 +316,18 @@ func TestServeReserveRejectsInvalidCredentialsBeforePlacement(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "credential-secret-sentinel") {
 		t.Fatalf("invalid credentials value leaked into error: %q", rec.Body.String())
 	}
-	if placements != 0 {
-		t.Fatalf("invalid credentials reached placement %d times", placements)
+	if reads.calls != 0 {
+		t.Fatalf("invalid credentials reached placement %d times", reads.calls)
 	}
 }
 
 func TestServeReserveRejectsCredentialsInvalidForPlacedProfile(t *testing.T) {
-	reg := New(newTestStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
-			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
-		}
-		return &Placement{
-			NodeID: "n1", TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-			APISecretFingerprint: testAPIFingerprint,
-		}, nil
-	}), 0, nil)
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 0, nil)
+
+	bare := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
+	publishTestSupport(t, reg, "fixture", nodegroup.Support{Group: "/g", Version: 1, Entries: []nodegroup.Entry{{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}}, DefaultContext: &nodegroup.DefaultContext{TemplateID: bare}})
+	reads := countTestGroupReads(reg)
+	_ = reads
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"envd_access_token\":\"e2b-only\"}"}}`)

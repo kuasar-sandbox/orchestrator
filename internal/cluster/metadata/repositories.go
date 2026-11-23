@@ -56,6 +56,8 @@ type RouteRepository interface {
 	DeleteRouteAndOwnership(context.Context, RouteKey, Version, string, NodeSandboxRef) error
 	ApplyRouteDelete(context.Context, Registration, Version, NodeSandboxRef, *SandboxRecord) error
 	CommitIntentAndOwnership(context.Context, Version, SandboxRecord, NodeSandboxRef) (Version, error)
+	CommitGroupIntent(context.Context, Version, SandboxRecord, NodeSandboxRef, GroupAdmission) (Version, error)
+	RetireRejectedGroupIntent(context.Context, Registration, Version, NodeSandboxRef, *SandboxRecord) error
 	RollbackIntent(context.Context, RouteKey, Version, *SandboxRecord, bool) (Version, error)
 	ApplyRouteReport(context.Context, Registration, NodeSandboxRef, routesync.RouteEntry) (RouteReportResult, error)
 	ReadAndObserveRoute(context.Context, RouteKey) (Versioned[SandboxRecord], Invalidation, error)
@@ -67,6 +69,9 @@ type BuildRepository interface {
 	CompareAndPutBuild(context.Context, BuildKey, Version, BuildRecord) (Version, error)
 	DeleteBuild(context.Context, BuildKey, Version) error
 	CommitRegistrationIntent(context.Context, BuildRecord, NodeBuildRef) (Version, error)
+	CommitGroupRegistrationIntent(context.Context, BuildRecord, NodeBuildRef, GroupAdmission) (Version, error)
+	RetireRejectedGroupBuild(context.Context, Registration, Version, NodeBuildRef) error
+	AcceptGroupBuildRegistration(context.Context, Registration, BuildKey, string, *types.BuildTarget) (Versioned[BuildRecord], error)
 	AcceptBuildRegistration(context.Context, BuildKey, string, string, *types.BuildTarget) (Versioned[BuildRecord], error)
 	EnsureRegistrationOwnership(context.Context, BuildKey, string, string) error
 	RejectRegistrationIntent(context.Context, BuildKey, string, string) error

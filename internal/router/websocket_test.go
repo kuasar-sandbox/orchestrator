@@ -99,7 +99,7 @@ func TestClusterWebSocketUsesExistingConnectRelay(t *testing.T) {
 			route := routerTestRouteResolve(t, "stable-s1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
 			route.ForwardAccessToken = "forward-token"
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/route-link/route" {
+				if r.URL.Path == "/route-link/v2/data-route" {
 					resolves.Add(1)
 					_ = json.NewEncoder(w).Encode(route)
 				} else {

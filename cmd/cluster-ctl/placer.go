@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -21,10 +23,13 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-// runPlacer starts the standalone placer: it uses registry membership as the
-// bootstrap source, keeps node/group placement views synced, and answers registry
-// placement requests.
+// runPlacer maintains Node-owned Groups. "apply" runs the same input adapter
+// once with explicit conditional updates, without starting a background writer.
 func runPlacer(args []string, log *slog.Logger) error {
+	apply := len(args) > 0 && args[0] == "apply"
+	if apply {
+		args = args[1:]
+	}
 	fs := flag.NewFlagSet("placer", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/placer.yaml", "config file")
 	_ = fs.Parse(args)
@@ -32,6 +37,9 @@ func runPlacer(args []string, log *slog.Logger) error {
 	cfg, err := clustercfg.LoadPlacer(*cfgPath)
 	if err != nil {
 		return err
+	}
+	if len(cfg.ImportGroups) == 0 {
+		return fmt.Errorf("placer: at least one import_groups source is required")
 	}
 	// Validate local address syntax without binding or resolving a remote host.
 	if !strings.HasPrefix(cfg.Placer.Listen, "/") {
@@ -42,9 +50,6 @@ func runPlacer(args []string, log *slog.Logger) error {
 		if _, err := net.DefaultResolver.LookupPort(context.Background(), "tcp", port); err != nil {
 			return fmt.Errorf("placer listen: %w", err)
 		}
-	}
-	if len(cfg.ImportGroups) == 0 {
-		return fmt.Errorf("placer: standalone mode requires at least one import_groups source")
 	}
 	groupInputs, err := placer.NewConfiguredGroupInputs(cfg.ImportGroups)
 	if err != nil {
@@ -76,13 +81,18 @@ func runPlacer(args []string, log *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if apply {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+	}
 	regClient, err := clusterclient.NewRegistry(registryAddr, registryTLS)
 	if err != nil {
 		return err
 	}
 	eps, err := waitPlacerMembership(ctx, regClient, log, 2*time.Second, 200*time.Millisecond, 5*time.Second)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !apply {
 			return nil
 		}
 		return err
@@ -99,10 +109,36 @@ func runPlacer(args []string, log *slog.Logger) error {
 		return err
 	}
 	links := registryLinks(eps)
-	svc := placer.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, log)
+	svc := placer.NewRemoteLinksWithImports(links, groupInputs.Sources, cfg.Placement, log)
 	svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), activeLabel)
 	svc.SetPlacerLinkResolver(newPlacerLinkResolver(regClient))
 	svc.SetPlacerLinkRefresher(regClient.Refresh)
+	if apply {
+		svc.SetImportSourceOwnerSource(fmt.Sprintf("%s-apply-%d", cfg.Placer.ID, time.Now().UnixNano()), nil)
+		applyCtx := ctx
+		svc.StartNodeView(applyCtx)
+		go runPlacerRegistryLinks(applyCtx, regClient, svc, log)
+		poll := time.NewTicker(50 * time.Millisecond)
+		defer poll.Stop()
+		for !svc.Ready() {
+			select {
+			case <-applyCtx.Done():
+				return applyCtx.Err()
+			case <-poll.C:
+			}
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		var outputErr error
+		err := svc.Apply(applyCtx, func(result placer.ImportResult) {
+			if outputErr == nil {
+				outputErr = encoder.Encode(result)
+			}
+		})
+		if outputErr != nil {
+			return outputErr
+		}
+		return err
+	}
 	memberHub := membergroup.NewHub()
 	placerGroup, err := membergroup.New(membergroup.Options{
 		Label: cfg.Placer.MemberlistLabel, Name: cfg.Placer.ID, Hub: memberHub, Log: log,
@@ -137,7 +173,6 @@ func runPlacer(args []string, log *slog.Logger) error {
 	})
 	mux := http.NewServeMux()
 	memberHub.Mount(mux)
-	svc.ServePlacerLink(mux)
 	// Bind only after bootstrap succeeds; use the materials loaded before waiting.
 	ln, err := listenLink(cfg.Placer.Listen)
 	if err != nil {
@@ -157,7 +192,7 @@ func runPlacer(args []string, log *slog.Logger) error {
 	go runPlacerMemberMeta(ctx, placerGroup, svc, regClient, cfg.Placer.Advertise, log)
 	go svc.RegisterLoop(ctx, cfg.Placer.ID, cfg.Placer.Advertise, cfg.Placer.MemberlistLabel)
 	log.Info("cluster-ctl placer", "registry", registryAddr, "registry_members", len(links), "registry_tls", registryTLS != nil,
-		"group_sources", len(cfg.ImportGroups), "candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
+		"group_sources", len(cfg.ImportGroups),
 		"shuffle_rules", len(cfg.Placement.ShuffleSharding))
 	select {
 	case <-ctx.Done():

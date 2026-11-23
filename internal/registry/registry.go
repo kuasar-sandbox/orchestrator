@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/observebudget"
+	requestplacement "github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	nodestore "github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -45,7 +46,6 @@ var (
 )
 
 const lifecycleAckTimeout = 5 * time.Second
-const selectorPatchWriteConcurrency = 16
 
 // nodeConn is the registry's handle to one connected node's channel — it sends
 // commands toward the node. channel.go implements it over the wire; tests fake it.
@@ -54,48 +54,46 @@ type nodeConn interface {
 	send(*routesync.Command) error
 }
 
-// Placer suggests a node for a new sandbox: the placer suggests, the registry
-// commits by CAS.
-// PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
-// docs/cluster.md#groups-and-placement); TargetRuntimeDigest lets the placer prefer compatible
-// node runtimes when the caller knows the required runtime identity.
+// PlaceRequest supplies the constraints for Registry selection from published
+// Node Groups. Selection and intent commit retain the observed publication fence.
 type PlaceRequest struct {
-	Group               string
-	RouteKey            string
-	SandboxID           string
-	Config              map[string]string
-	Build               bool
-	BuildResources      *routesync.BuildResources
-	TargetRuntimeDigest string
-	ExcludeNodeIDs      []string
+	Migration            bool
+	PinnedTemplateID     string
+	PinnedTemplateSource string
+	PinnedGroupVersion   int64
+	PinnedNodeID         string
+	PinnedAuthRef        string
+	APIKey               string
+	TemplateID           *string
+	Constraints          requestplacement.Request
+	RequiredNodeID       string
+	Group                string
+	RouteKey             string
+	SandboxID            string
+	Build                bool
+	BuildResources       *routesync.BuildResources
+	TargetRuntimeDigest  string
+	ExcludeNodeIDs       []string
 }
 
-// Placement is a placer answer plus the group-derived material the registry must
-// place on node commands.
+// Placement is the Registry selection and its observed Group admission fence.
 type Placement struct {
+	GroupAdmission       *metadata.GroupAdmission
+	TemplateSource       string
 	NodeID               string
 	TemplateRef          string
 	TargetPort           int
-	Config               map[string]string
 	APISecretFingerprint string
-	ImageRepo            string
-	RegistryAuth         string
-}
-
-// Placer suggests a node and group-derived create/build material. Production
-// placement calls placer over placer_link; the builtin placer is the size-1/test
-// fallback and only fills NodeID.
-type Placer interface {
-	Place(ctx context.Context, req PlaceRequest) (*Placement, error)
 }
 
 // Registry owns the typed route, node and import-source services and accepts
 // node_link streams.
 type Registry struct {
-	stores      *Stores
-	placer      Placer
-	parkTimeout time.Duration
-	log         *slog.Logger
+	placementCandidates int
+	placementZoneMax    string
+	stores              *Stores
+	parkTimeout         time.Duration
+	log                 *slog.Logger
 
 	mu    sync.Mutex
 	nodes map[string]nodeConn // node_id -> channel
@@ -104,8 +102,8 @@ type Registry struct {
 	// lifetime so a delayed frame can never escape onto a newly allocated lock.
 	buildFrameFences map[string]*nodeBuildFrameFence
 	inflight         map[string]*reserveCall
-	reserveLeaders   chan struct{}                     // single-flight ReserveSandbox per (group,route_key)
-	acks             map[string]chan *routesync.CmdAck // cmd_id -> command acknowledgement waiter
+	reserveLeaders   chan struct{}           // single-flight ReserveSandbox per (group,route_key)
+	acks             map[string]*commandWait // cmd_id -> original connection and waiter
 
 	localNodeOwner     NodeOwner
 	nodeOwner          NodeOwner
@@ -115,13 +113,8 @@ type Registry struct {
 	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
 
 	placerMu         sync.Mutex
-	scaleReadyLabel  string
 	placerLabel      string
-	placerPeerSource PlacerPeerSource
 	placerSeedJoiner PlacerSeedJoiner
-	placerReplicas   int
-	minReadyPlacers  int
-	placerTimeout    time.Duration
 }
 
 type PlacerPeer struct {
@@ -129,8 +122,6 @@ type PlacerPeer struct {
 	Advertise  string
 	ReadyLabel string
 }
-
-type PlacerPeerSource func(readyLabel string) []PlacerPeer
 
 type PlacerSeedJoiner func(ctx context.Context, id, label, advertise string) error
 
@@ -190,11 +181,8 @@ type ReserveResult struct {
 	ExecSession *routesync.ExecSessionResult `json:"exec_session,omitempty"`
 }
 
-// New builds a Registry. Production callers set a placer_link placer explicitly.
-func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Logger) *Registry {
-	if placer == nil {
-		placer = noPlacer{}
-	}
+// New builds a Registry with Node Group selection and local Node ownership.
+func New(stores *Stores, parkTimeout time.Duration, log *slog.Logger) *Registry {
 	if parkTimeout <= 0 {
 		parkTimeout = 30 * time.Second
 	}
@@ -202,145 +190,21 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		log = slog.Default()
 	}
 	r := &Registry{
-		stores:           stores,
-		placer:           placer,
-		parkTimeout:      parkTimeout,
-		log:              log,
-		nodes:            make(map[string]nodeConn),
-		buildFrameFences: make(map[string]*nodeBuildFrameFence),
-		inflight:         make(map[string]*reserveCall),
-		reserveLeaders:   make(chan struct{}, observebudget.DefaultReserveLeaderLimit),
-		acks:             make(map[string]chan *routesync.CmdAck),
-		placerReplicas:   1,
-		minReadyPlacers:  1,
-		placerTimeout:    2 * time.Second,
+		placementCandidates: 2,
+		placementZoneMax:    "yellow",
+		stores:              stores,
+		parkTimeout:         parkTimeout,
+		log:                 log,
+		nodes:               make(map[string]nodeConn),
+		buildFrameFences:    make(map[string]*nodeBuildFrameFence),
+		inflight:            make(map[string]*reserveCall),
+		reserveLeaders:      make(chan struct{}, observebudget.DefaultReserveLeaderLimit),
+		acks:                make(map[string]*commandWait),
 	}
 	localOwner := newLocalNodeOwner(r)
 	r.localNodeOwner = localOwner
 	r.nodeOwner = localOwner
 	return r
-}
-
-// applySelectorPatch renews the placer-selected node credential-pair cache. The
-// placer owns selector/shuffle decisions; registry only writes the current key
-// lease into node_link for the explicit nodes in the patch. Old keys are not
-// actively deleted: node_link and node side TTLs expire entries that stop being
-// renewed.
-func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.SelectorPatch) error {
-	if err := r.checkSelectorPatchLease(ctx, p); err != nil {
-		return err
-	}
-	pair := clusterstate.NodeKeyPair{
-		APISecretFingerprint:   p.APISecretFingerprint,
-		APISecretType:          p.APISecretType,
-		APISecret:              p.APISecret,
-		APISecretRef:           p.APISecretRef,
-		ManifestKeyFingerprint: p.ManifestKeyFingerprint,
-		ManifestKeyType:        p.ManifestKeyType,
-		ManifestKey:            p.ManifestKey,
-		ManifestKeyRef:         p.ManifestKeyRef,
-	}
-	if selectorPatchPairEmpty(pair) {
-		return nil
-	}
-	var err error
-	pair, err = normalizeNodeKeyPair(pair)
-	if err != nil {
-		return err
-	}
-	if len(p.NodeIDs) == 0 {
-		return nil
-	}
-	pair.ExpiresUnix = time.Now().Add(keyLeaseTTL).Unix()
-	return r.putKeyPairTargets(ctx, p.NodeIDs, pair)
-}
-
-func selectorPatchPairEmpty(pair clusterstate.NodeKeyPair) bool {
-	return pair.APISecretFingerprint == "" && pair.APISecretType == "" && pair.APISecret == "" && pair.APISecretRef == "" &&
-		pair.ManifestKeyFingerprint == "" && pair.ManifestKeyType == "" && pair.ManifestKey == "" && pair.ManifestKeyRef == ""
-}
-
-func (r *Registry) putKeyPairTargets(ctx context.Context, nodeIDs []string, pair clusterstate.NodeKeyPair) error {
-	if r.nodeOwner == nil || len(nodeIDs) == 0 {
-		return nil
-	}
-	workers := len(nodeIDs)
-	if workers > selectorPatchWriteConcurrency {
-		workers = selectorPatchWriteConcurrency
-	}
-	workCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	jobs := make(chan string)
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-workCtx.Done():
-					return
-				case nodeID, ok := <-jobs:
-					if !ok {
-						return
-					}
-					err := r.nodeOwner.PutKeyPair(workCtx, nodeID, pair)
-					if err == nil || errors.Is(err, ErrNodeGone) {
-						continue
-					}
-					select {
-					case errCh <- err:
-						cancel()
-					default:
-					}
-					return
-				}
-			}
-		}()
-	}
-	seen := make(map[string]struct{}, len(nodeIDs))
-sendTargets:
-	for _, nodeID := range nodeIDs {
-		if nodeID == "" {
-			continue
-		}
-		if _, duplicate := seen[nodeID]; duplicate {
-			continue
-		}
-		seen[nodeID] = struct{}{}
-		select {
-		case jobs <- nodeID:
-		case <-workCtx.Done():
-			break sendTargets
-		}
-	}
-	close(jobs)
-	wg.Wait()
-	select {
-	case err := <-errCh:
-		return err
-	default:
-		return ctx.Err()
-	}
-}
-
-func (r *Registry) checkSelectorPatchLease(ctx context.Context, p *routesync.SelectorPatch) error {
-	if p == nil || p.ImportSourceID == "" || p.ImportOwnerID == "" || p.ImportRunID == "" || p.ImportTerm == 0 {
-		return errMissingImportSourceLease
-	}
-	if !r.stores.CheckPlacerLinkSourceLease(ctx, p.ImportSourceID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm) {
-		return errStaleImportSourceLease
-	}
-	return nil
-}
-
-// SetPlacerReadyLabel sets the registry membership label a placer must advertise
-// before it is used for Place requests.
-func (r *Registry) SetPlacerReadyLabel(label string) {
-	r.placerMu.Lock()
-	r.scaleReadyLabel = label
-	r.placerMu.Unlock()
 }
 
 func (r *Registry) SetPlacerMemberlistLabel(label string) {
@@ -353,12 +217,6 @@ func (r *Registry) placerMemberlistLabel() string {
 	r.placerMu.Lock()
 	defer r.placerMu.Unlock()
 	return r.placerLabel
-}
-
-func (r *Registry) SetPlacerPeerSource(source PlacerPeerSource) {
-	r.placerMu.Lock()
-	r.placerPeerSource = source
-	r.placerMu.Unlock()
 }
 
 func (r *Registry) SetPlacerSeedJoiner(joiner PlacerSeedJoiner) {
@@ -375,60 +233,6 @@ func (r *Registry) joinPlacerSeed(ctx context.Context, id, label, advertise stri
 		return nil
 	}
 	return joiner(ctx, id, label, advertise)
-}
-
-func (r *Registry) SetPlacerPolicy(replicaCount, minReady int, timeout time.Duration) {
-	if replicaCount <= 0 {
-		replicaCount = 1
-	}
-	if minReady <= 0 {
-		minReady = 1
-	}
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-	r.placerMu.Lock()
-	r.placerReplicas = replicaCount
-	r.minReadyPlacers = minReady
-	r.placerTimeout = timeout
-	r.placerMu.Unlock()
-}
-
-func (r *Registry) scalePolicy() (replicaCount, minReady int, timeout time.Duration) {
-	r.placerMu.Lock()
-	defer r.placerMu.Unlock()
-	return r.placerReplicas, r.minReadyPlacers, r.placerTimeout
-}
-
-func (r *Registry) readyPlacerPeers(time.Duration) []PlacerPeer {
-	r.placerMu.Lock()
-	source := r.placerPeerSource
-	readyLabel := r.scaleReadyLabel
-	r.placerMu.Unlock()
-	if source == nil {
-		return nil
-	}
-	src := source(readyLabel)
-	out := make([]PlacerPeer, 0, len(src))
-	for _, peer := range src {
-		if peer.ID == "" || peer.Advertise == "" {
-			continue
-		}
-		if readyLabel != "" && peer.ReadyLabel != "" && peer.ReadyLabel != readyLabel {
-			continue
-		}
-		out = append(out, peer)
-	}
-	return out
-}
-
-// SetPlacer wires the placer implementation.
-func (r *Registry) SetPlacer(p Placer) { r.placer = p }
-
-// SetNodeOwner replaces the local node-owner adapter. Reserve/build/key/orphan
-// flows stay the same; execution-state mutation moves behind this interface.
-func (r *Registry) SetNodeOwner(owner NodeOwner) {
-	r.nodeOwner = owner
 }
 
 func (r *Registry) SetRemoteNodeOwners(remotes map[string]NodeOwner) {
@@ -453,6 +257,10 @@ func (r *Registry) SetNodeLinkRelayPeers(peers map[string]NodeLinkRelayPeer) {
 	r.nodeLinkRelayMu.Unlock()
 }
 
+func (r *Registry) SetNodeOwner(owner NodeOwner) {
+	r.nodeOwner = owner
+}
+
 func (r *Registry) LocalNodeOwner() NodeOwner { return r.localNodeOwner }
 
 // Stores exposes the typed store layer used by registry route/node/build state.
@@ -461,6 +269,9 @@ func (r *Registry) Stores() *Stores { return r.stores }
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
 type createOptions struct {
+	apiKey         string
+	templateID     *string
+	constraints    requestplacement.Request
 	maxCheckpoints int
 	idleTimeout    *int64
 	workspaces     []workspace.Entry
@@ -539,10 +350,15 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 	}
 	defer releaseObservation()
 	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory, autoReset, opts); err != nil {
+		// A precise report can precede a delayed negative ACK. It remains the
+		// authoritative object fact and each caller still authenticates the result.
+		if res, live, readErr := r.reserveReadyResult(ctx, group, routeKey, r.reserveExpectedSandboxID(key)); readErr == nil && live {
+			r.finish(key, res, nil)
+			return res, nil
+		}
 		r.finish(key, nil, err)
-		if fence, ok := r.reserveRollbackFence(key); ok && !errors.Is(err, metadata.ErrUnknown) {
-			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
-			r.rollbackReserveAtFence(group, routeKey, fence, rec, found, dropCurrentRef)
+		if fence, ok := r.reserveRollbackFence(key); ok && !errors.Is(err, metadata.ErrUnknown) && !errors.Is(err, ErrReserveConflict) {
+			r.rollbackReserveAtFence(group, routeKey, fence, rec, found, false)
 		}
 		return waitCall(ctx, call)
 	}
@@ -717,6 +533,12 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 	if err != nil {
 		return fmt.Errorf("%w: invalid workspace declaration", errInvalidSandboxConfig)
 	}
+	requestJSON, err := json.Marshal(createConfig)
+	if err != nil {
+		return err
+	}
+	requestSum := sha256.Sum256(requestJSON)
+	requestDigest := hex.EncodeToString(requestSum[:])
 	workflowCredentials := cloneCreateCredentials(createCredentials)
 	workflowReplacement := replaceReady
 	sandboxID := "sb-" + newID()
@@ -783,9 +605,18 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			// The first committed RESERVED row freezes the create credential
 			// selection and TTL capture policy. A retry or competing Reserve must
 			// not adopt either value from its own request after that point.
-			if cur.WorkspacesDigest != workspaceDigest {
+			if cur.WorkspacesDigest != workspaceDigest || (cur.CreateRequestDigest != "" && cur.CreateRequestDigest != requestDigest) {
 				// Another request owns this reservation. Wait for its authoritative route.
 				return nil
+			}
+			if cur.GroupVersion > 0 {
+				source := "default"
+				if opts.templateID != nil {
+					source = "explicit"
+				}
+				if source != cur.TemplateSource || (opts.templateID != nil && *opts.templateID != cur.CreateTemplateID) {
+					return nil
+				}
 			}
 			binding = cur
 			autoPauseMemory = cur.AutoPauseMemory
@@ -806,10 +637,17 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 				selectedReplacement = nil
 			}
 		}
-		placement, perr := r.placer.Place(ctx, PlaceRequest{
-			Group: group, RouteKey: routeKey, SandboxID: sandboxID, Config: createConfig,
+		selectionRequest := PlaceRequest{
+			Group: group, RouteKey: routeKey, SandboxID: sandboxID,
+			APIKey: opts.apiKey, TemplateID: opts.templateID, Constraints: opts.constraints,
 			ExcludeNodeIDs: excluded.values(),
-		})
+		}
+		if binding != nil && binding.GroupVersion > 0 {
+			selectionRequest.PinnedTemplateID, selectionRequest.PinnedTemplateSource = binding.CreateTemplateID, binding.TemplateSource
+			selectionRequest.PinnedGroupVersion, selectionRequest.PinnedNodeID = binding.GroupVersion, binding.NodeID
+			selectionRequest.PinnedAuthRef = binding.APISecretFingerprint
+		}
+		placement, perr := r.selectGroupNode(ctx, selectionRequest)
 		if perr != nil {
 			if errors.Is(perr, ErrNoNode) && lastFailure != nil {
 				return lastFailure
@@ -832,10 +670,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if binding != nil && string(template.Profile) != binding.Profile {
 			return errors.New("registry: replacement profile mismatch")
 		}
-		config, err := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
-		}
+		config := cloneStringMap(createConfig)
 		if err := validateTrafficConfigForProfile(config, template.Profile); err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 		}
@@ -875,6 +710,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		}
 		quota := maxCheckpoints
 		cmd := &routesync.Command{
+			GroupAPIKey: opts.apiKey, ExpectedGroupVersion: placement.GroupAdmission.GroupVersion,
 			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID, MaxCheckpoints: &quota,
 			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config, Workspaces: opts.workspaces,
 			Cluster: &routesync.ClusterSandboxContext{
@@ -883,6 +719,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			APISecretFingerprint: placement.APISecretFingerprint,
 			AutoPauseMemory:      cloneOptionalBool(&autoPauseMemory), IdleTimeout: types.CloneIdleTimeout(idleTimeout),
 			AutoReset: cloneOptionalBool(&autoReset),
+		}
+		if placement.TemplateSource == "default" {
+			cmd.TemplateRef = ""
 		}
 		if err := workspace.CheckEnvelope(config, opts.workspaces); err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
@@ -895,6 +734,8 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			expect = curRev
 		}
 		reserved := &SandboxRecord{
+			CreateRequestDigest: requestDigest,
+			GroupVersion:        placement.GroupAdmission.GroupVersion, TemplateSource: placement.TemplateSource, CreateTemplateID: placement.TemplateRef,
 			Group: group, RouteKey: routeKey,
 			SandboxID: sandboxID, NodeSandboxID: nodeSandboxID,
 			SandboxGeneration: generation, NextSandboxGeneration: generation + 1,
@@ -907,7 +748,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			AutoReset: autoReset,
 		}
 		copyRouteCredentials(reserved, selectedReplacement)
-		reservedRev, ok, cerr := r.stores.commitSandboxIntent(ctx, reserved, expect)
+		reservedRev, ok, cerr := r.stores.commitGroupSandboxIntent(ctx, reserved, expect, *placement.GroupAdmission)
 		if cerr != nil {
 			if errors.Is(cerr, metadata.ErrOwnershipConflict) {
 				// The transaction definitely aborted. Keep the stable identity,
@@ -943,34 +784,32 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			excluded.add(nodeID)
 			continue
 		}
-		ack, err := r.nodeOwner.SendCommandAndWait(ctx, nodeID, cmd, lifecycleAckTimeout)
+		// This generation has a single sending path after its successful CAS.
+		// Recovery creates a new generation; it never re-delivers this identity.
+		ack, err := r.nodeOwner.SendCommandAndWait(withNodeRegistration(ctx, placement.GroupAdmission.Registration), nodeID, cmd, lifecycleAckTimeout)
 		if commandAckTimedOut(ctx, err) {
 			return nil // delivery is ambiguous; wait for the authoritative route event
 		}
 		if err != nil {
-			if !errors.Is(err, ErrNodeGone) {
-				return nil // delivery is ambiguous; keep RESERVED and wait for the route event
-			}
-			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
-				replaceReady, replaceReady != nil, true) {
-				return err
-			}
-			lastFailure = err
-			excluded.add(nodeID)
-			continue
-		}
+			return nil
+		} // Retain ambiguity even when an owner RPC loses its connection.
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			reason := ""
-			if ack != nil {
-				reason = ack.Reason
+			if ack != nil && ack.CmdID == cmd.CmdID && ack.ErrorCode == routesync.ErrorGroupVersionConflict {
+				var restore *SandboxRecord
+				if curFound {
+					restore = cur
+				}
+				err := r.stores.routes.RetireRejectedGroupIntent(ctx, placement.GroupAdmission.Registration, reservedRev, metadata.SandboxRef(*reserved), restore)
+				if err == nil {
+					return fmt.Errorf("%w: %s", ErrReserveConflict, routesync.ErrorGroupVersionConflict)
+				}
+				if !errors.Is(err, metadata.ErrConflict) {
+					return err
+				}
 			}
-			lastFailure = fmt.Errorf("registry: create rejected: %s", reason)
-			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
-				replaceReady, replaceReady != nil, true) {
-				return lastFailure
-			}
-			excluded.add(nodeID)
-			continue
+			// Generic 409/NotFound and stale rejection proofs cannot retire an
+			// intent. Await a report; timeout preserves its cleanup ownership.
+			return nil
 		}
 		return nil
 	}
@@ -1083,12 +922,30 @@ func copyRouteCredentials(dst, src *SandboxRecord) {
 // the caller's context/timeout ends.
 func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
 	ch := make(chan *routesync.CmdAck, 1)
+	waiter := &commandWait{conn: conn, result: ch}
 	r.mu.Lock()
-	r.acks[cmd.CmdID] = ch
+	if _, exists := r.acks[cmd.CmdID]; exists {
+		r.mu.Unlock()
+		return nil, metadata.ErrConflict
+	}
+	if r.nodes[conn.id()] != conn {
+		r.mu.Unlock()
+		return nil, ErrNodeGone
+	}
+	if expected, ok := ctx.Value(nodeRegistrationContextKey{}).(metadata.Registration); ok {
+		stream, valid := conn.(*nodeChannel)
+		if !valid || stream.registration != expected {
+			r.mu.Unlock()
+			return nil, metadata.ErrConflict
+		}
+	}
+	r.acks[cmd.CmdID] = waiter
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
-		delete(r.acks, cmd.CmdID)
+		if r.acks[cmd.CmdID] == waiter {
+			delete(r.acks, cmd.CmdID)
+		}
 		r.mu.Unlock()
 	}()
 	if err := conn.send(cmd); err != nil {
@@ -1106,16 +963,21 @@ func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesyn
 
 // ackCommand handles a node's CmdAck and wakes the matching SendCommandAndWait
 // waiter. Rejection/retry policy is handled by the command caller.
-func (r *Registry) ackCommand(ack *routesync.CmdAck) {
+type commandWait struct {
+	conn   nodeConn
+	result chan *routesync.CmdAck
+}
+
+func (r *Registry) ackNodeCommand(conn nodeConn, ack *routesync.CmdAck) {
 	if ack == nil {
 		return
 	}
 	r.mu.Lock()
-	ch, isWait := r.acks[ack.CmdID]
-	r.mu.Unlock()
-	if isWait {
+	defer r.mu.Unlock()
+	waiter, isWait := r.acks[ack.CmdID]
+	if isWait && waiter.conn == conn && r.nodes[conn.id()] == conn {
 		select {
-		case ch <- ack:
+		case waiter.result <- ack:
 		default:
 		}
 	}
@@ -1145,6 +1007,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		return nil
 	}
 	rec := &SandboxRecord{
+		GroupVersion: ref.GroupVersion, TemplateSource: ref.TemplateSource, CreateTemplateID: ref.CreateTemplateID,
 		InstanceID: e.InstanceID, StateVersion: e.PressureVersion,
 		Group: ref.Group, RouteKey: ref.RouteKey,
 		SandboxID: ref.SandboxID, NodeSandboxID: ref.NodeSandboxID,
@@ -1280,7 +1143,7 @@ func (r *Registry) applyLiveRoute(ctx context.Context, nodeID string, e *routesy
 }
 
 func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) error {
-	ref := metadata.NodeSandboxRef{Group: rec.Group, RouteKey: rec.RouteKey, SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID, SandboxGeneration: rec.SandboxGeneration, Profile: rec.Profile, APISecretFingerprint: rec.APISecretFingerprint}
+	ref := metadata.SandboxRef(*rec)
 	registration, err := nodeStreamRegistration(ctx, nodeID)
 	if err != nil {
 		return err
@@ -1410,6 +1273,17 @@ func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, exp
 			current.SandboxID != ref.SandboxID || current.SandboxGeneration != ref.SandboxGeneration ||
 			current.Profile != ref.Profile || current.APISecretFingerprint != ref.APISecretFingerprint {
 			continue
+		}
+		if ref.GroupVersion > 0 {
+			route, _, found, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
+			if err != nil {
+				return err
+			}
+			// Snapshot absence cannot close an ambiguous invocation: a worker
+			// on an older stream may still materialize this exact generation.
+			if !found || route.NodeID != nodeID || route.NodeSandboxID != ref.NodeSandboxID || route.InstanceID == "" {
+				continue
+			}
 		}
 		if err := r.applyDelete(ctx, nodeID, ref.NodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint); err != nil {
 			return err
@@ -1591,7 +1465,7 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 // DeleteSandboxRoute sends the authoritative delete command for an exact
 // group-scoped route. The caller supplies the stable public SandboxID so a
 // request for a deleted lineage cannot affect a route-key reuse.
-func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sandboxID string) (bool, error) {
+func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sandboxID string, apiKeys ...string) (bool, error) {
 	if group == "" || routeKey == "" || sandboxID == "" {
 		return false, nil
 	}
@@ -1601,6 +1475,13 @@ func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sand
 	}
 	if rec.SandboxID != sandboxID {
 		return false, nil
+	}
+	// HTTP always supplies the APIKey, including an empty value. Internal
+	// lifecycle callers already own the exact object and omit this envelope.
+	if len(apiKeys) > 0 {
+		if err := r.authenticateSandboxAPIKey(ctx, rec, apiKeys[0]); err != nil {
+			return false, err
+		}
 	}
 	if r.nodeOwner == nil || rec.NodeID == "" {
 		if rec.State == StateDead || rec.State == StateDeleting {
@@ -1615,8 +1496,9 @@ func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sand
 		if !errors.Is(err, ErrNodeGone) {
 			return false, err
 		}
-		err := r.stores.routes.DeleteRouteAndOwnership(ctx, metadata.RouteKey{Group: group, RouteKey: routeKey}, rev, rec.NodeID, metadata.SandboxRef(*rec))
-		return err == nil, err
+		// A disconnected Node may still hold the instance. Retire the logical
+		// route but retain exact ownership for its eventual targeted cleanup.
+		return r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
 	}
 	return true, nil
 }
@@ -1693,7 +1575,11 @@ func (r *Registry) removeNode(c nodeConn) {
 	r.mu.Unlock()
 	fence.mu.Unlock()
 	if removed {
-		r.scheduleNodeReap(c.id())
+		if channel, ok := c.(*nodeChannel); ok {
+			r.scheduleNodeReap(c.id(), channel.registration)
+		} else {
+			r.scheduleNodeReap(c.id())
+		}
 	}
 }
 
@@ -1883,7 +1769,7 @@ func (r *Registry) recoverExpiredNodes(ctx context.Context, deadAfter time.Durat
 	}
 }
 
-func (r *Registry) scheduleNodeReap(nodeID string) {
+func (r *Registry) scheduleNodeReap(nodeID string, expected ...metadata.Registration) {
 	r.mu.Lock()
 	ctx := r.reaperCtx
 	deadAfter := r.deadAfter
@@ -1894,6 +1780,16 @@ func (r *Registry) scheduleNodeReap(nodeID string) {
 	if deadAfter <= 0 {
 		deadAfter = 30 * time.Second
 	}
+	var registration metadata.Registration
+	if len(expected) > 0 {
+		registration = expected[0]
+	} else {
+		profile, err := r.stores.nodes.ReadNodeProfile(ctx, nodeID)
+		if err != nil || !profile.Exists {
+			return
+		}
+		registration = profile.Registration
+	}
 	go func() {
 		timer := time.NewTimer(deadAfter)
 		defer timer.Stop()
@@ -1901,14 +1797,14 @@ func (r *Registry) scheduleNodeReap(nodeID string) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			r.sweepNode(ctx, nodeID, deadAfter)
+			r.sweepNode(ctx, nodeID, deadAfter, registration)
 		}
 	}()
 }
 
 // sweepNode acquires a durable lifecycle claim before any cleanup. Reconnects
 // replace its fence; every bounded cleanup transaction rechecks that same claim.
-func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.Duration) {
+func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.Duration, expected ...metadata.Registration) {
 	if nodeID == "" {
 		return
 	}
@@ -1917,6 +1813,12 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	}
 	rec, found, err := r.stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found {
+		return
+	}
+	// A disconnect timer belongs to one registration, including the interval
+	// between a reconnect's registration commit and publishing its connection.
+	// BeginReap below also checks the profile version atomically.
+	if len(expected) > 0 && rec.Registration != expected[0] {
 		return
 	}
 	if rec.Reaping {
@@ -2002,6 +1904,15 @@ func (r *Registry) cleanupReap(ctx context.Context, claim metadata.ReapClaim) {
 			break
 		}
 		cursor = page.Next
+	}
+	for {
+		complete, err := r.stores.groups.CleanupGroupSupport(ctx, claim)
+		if err != nil {
+			return
+		}
+		if complete {
+			break
+		}
 	}
 	if _, err := r.stores.nodes.FinalizeReap(ctx, claim); err != nil {
 		r.log.Warn("registry: finalize reaping node", "node", claim.NodeID, "err", err)

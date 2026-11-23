@@ -45,13 +45,13 @@ func TestAuthRejectsBadKey(t *testing.T) {
 	var reserveHits, verifyHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits++
 			if r.URL.Query().Get("operation") != "create" || r.Header.Get(HeaderAPIKey) != "e2b_bad" {
 				t.Fatalf("create reserve query=%q api-key=%q", r.URL.RawQuery, r.Header.Get(HeaderAPIKey))
 			}
 			w.WriteHeader(http.StatusForbidden)
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			verifyHits++
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
@@ -95,10 +95,10 @@ func TestSandboxDeleteUsesRouteOwnerCommand(t *testing.T) {
 
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/delete":
+		case "/route-link/v2/delete":
 			deletePath, deleteQuery = r.URL.Path, r.URL.RawQuery
 			w.WriteHeader(http.StatusNoContent)
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -126,7 +126,7 @@ func TestSandboxDeleteUsesRouteOwnerCommand(t *testing.T) {
 	if nodeHits != 0 {
 		t.Fatalf("DELETE was forwarded to node %d time(s), want route_link command path only", nodeHits)
 	}
-	if deletePath != "/route-link/delete" || !strings.Contains(deleteQuery, "group=%2Fg") || !strings.Contains(deleteQuery, "route_key=rk") || !strings.Contains(deleteQuery, "sid=sb-1") {
+	if deletePath != "/route-link/v2/delete" || !strings.Contains(deleteQuery, "group=%2Fg") || !strings.Contains(deleteQuery, "route_key=rk") || !strings.Contains(deleteQuery, "sid=sb-1") {
 		t.Fatalf("route_link delete path=%q query=%q", deletePath, deleteQuery)
 	}
 }

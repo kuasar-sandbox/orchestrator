@@ -32,6 +32,11 @@ const (
 )
 
 type SandboxRecord struct {
+	ImportPending          bool                      `json:"import_pending,omitempty"`
+	CreateRequestDigest    string                    `json:"create_request_digest,omitempty"`
+	GroupVersion           int64                     `json:"group_version,omitempty"`
+	TemplateSource         string                    `json:"template_source,omitempty"`
+	CreateTemplateID       string                    `json:"create_template_id,omitempty"`
 	WorkspacesDigest       string                    `json:"workspaces_digest,omitempty"`
 	InstanceID             string                    `json:"instance_id,omitempty"`
 	StateVersion           uint64                    `json:"state_version,omitempty"`
@@ -69,6 +74,7 @@ type SandboxRecord struct {
 }
 
 type BuildRecord struct {
+	GroupVersion                  int64                     `json:"group_version,omitempty"`
 	Group                         string                    `json:"group"`
 	BuildID                       string                    `json:"build_id"`
 	NodeID                        string                    `json:"node_id"`
@@ -103,6 +109,9 @@ const (
 )
 
 type NodeSandboxRef struct {
+	GroupVersion         int64  `json:"group_version,omitempty"`
+	TemplateSource       string `json:"template_source,omitempty"`
+	CreateTemplateID     string `json:"create_template_id,omitempty"`
 	Group                string `json:"group"`
 	RouteKey             string `json:"route_key"`
 	SandboxID            string `json:"sandbox_id"`
@@ -113,9 +122,11 @@ type NodeSandboxRef struct {
 }
 
 type NodeBuildRef struct {
-	Group      string `json:"group"`
-	BuildID    string `json:"build_id"`
-	TemplateID string `json:"template_id"`
+	GroupVersion         int64  `json:"group_version,omitempty"`
+	APISecretFingerprint string `json:"api_secret_fingerprint,omitempty"`
+	Group                string `json:"group"`
+	BuildID              string `json:"build_id"`
+	TemplateID           string `json:"template_id"`
 }
 
 type NodeKeyPair struct {

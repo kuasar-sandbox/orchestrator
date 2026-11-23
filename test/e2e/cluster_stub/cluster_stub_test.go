@@ -26,12 +26,17 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/placer"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/router"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
 const (
@@ -74,11 +79,11 @@ func newHarness(t *testing.T) *harness {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	stores := newTestRegistryStores(t)
 
-	reg := registry.New(stores, nil, 5*time.Second, log)
-	httpPlacer := registry.NewHTTPPlacer(reg, 1, 2*time.Second)
-	reg.SetPlacer(httpPlacer)
+	reg := registry.New(stores, 5*time.Second, log)
+	if err := reg.SetPlacementPolicy(1, "yellow"); err != nil {
+		t.Fatal(err)
+	}
 	reg.SetPlacerMemberlistLabel("placer.default")
-	reg.SetPlacerReadyLabel("registry.1.test")
 
 	regHub := membergroup.NewHub()
 	mux := http.NewServeMux()
@@ -102,14 +107,6 @@ func newHarness(t *testing.T) *harness {
 		_, err := observer.Join(id)
 		return err
 	})
-	reg.SetPlacerPeerSource(func(label string) []registry.PlacerPeer {
-		metas := observer.ReadyPlacers(label)
-		out := make([]registry.PlacerPeer, 0, len(metas))
-		for _, meta := range metas {
-			out = append(out, registry.PlacerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
-		}
-		return out
-	})
 
 	groupDir := t.TempDir()
 	writeStubGroup(t, groupDir)
@@ -117,15 +114,14 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := placer.NewRemoteLinksWithGroups(
+	svc := placer.NewRemoteLinksWithImports(
 		[]placer.RegistryLink{{Name: "registry", BaseURL: "http://" + linkAddr, Client: http.DefaultClient}},
-		groupSource, []placer.ImportSource{{SourceID: "stub", Importer: groupSource}},
-		clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, log,
+		[]placer.ImportSource{{SourceID: "stub", Importer: groupSource}},
+		clustercfg.PlacementConfig{ImportRefresh: "50ms"}, log,
 	)
 	placerHub := membergroup.NewHub()
 	placerMux := http.NewServeMux()
 	placerHub.Mount(placerMux)
-	svc.ServePlacerLink(placerMux)
 	placerSrv := httptest.NewServer(placerMux)
 	placerGroup, err := membergroup.New(membergroup.Options{
 		Label: "placer.default", Name: "s1", Hub: placerHub, FastTimers: true,
@@ -159,7 +155,7 @@ func newHarness(t *testing.T) *harness {
 		strings.TrimPrefix(apiHTTP.URL, "http://"),
 		strings.TrimPrefix(dataHTTP.URL, "http://"),
 	)
-	waitForPlacement(t, ctx, httpPlacer, links.URL)
+	waitForPlacement(t, ctx, reg, links.URL)
 	rt := router.New(linkAddr, testDomain, time.Minute, nil, log)
 	rt.SetDataPlaneAuth("off")
 	routerSrv := httptest.NewServer(rt.Handler())
@@ -244,11 +240,16 @@ func writeStubGroup(t *testing.T, dir string) {
 	}
 }
 
-func waitForPlacement(t *testing.T, ctx context.Context, placer registry.Placer, linksURL string) {
+func waitForPlacement(t *testing.T, ctx context.Context, reg *registry.Registry, linksURL string) {
 	t.Helper()
+	raw, _ := hex.DecodeString(testAPISecret)
+	key, err := apikey.Mint(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var last error
 	for i := 0; i < 300; i++ {
-		if placement, err := placer.Place(ctx, registry.PlaceRequest{Group: testGroup, RouteKey: "probe"}); err == nil && placement.NodeID == "n1" {
+		if allowed, err := reg.VerifyGroupAPIKey(ctx, testGroup, key); err == nil && allowed {
 			return
 		} else {
 			last = err
@@ -308,12 +309,13 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	h := newHarness(t)
 	const routeKey = "u1:s1"
 
-	h.waitForNodeKeyCache(t, "n1")
+	keyPut := h.node.waitCommand(t, routesync.CmdGroupPut)
+	if keyPut.Group == nil || keyPut.Group.KeyPut == nil || keyPut.Group.KeyPut.APISecret != testAPISecret || keyPut.Group.KeyPut.ManifestKey != testMK {
+		t.Fatal("Group import omitted its atomic key pair")
+	}
 	h.node.sendHeartbeat(t)
-	keyPut := h.node.waitCommand(t, routesync.CmdKeyPut)
-	if keyPut.APISecretFingerprint != fullFingerprint(t, testAPISecret) || keyPut.APISecret != testAPISecret ||
-		keyPut.ManifestKeyFingerprint != fullFingerprint(t, testMK) || keyPut.ManifestKey != testMK {
-		t.Fatalf("key_put did not carry the complete credential pair: %+v", keyPut)
+	if h.node.countKind(routesync.CmdKeyPut) != 0 {
+		t.Fatal("Group import created an independent desired-key delivery")
 	}
 
 	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/sandboxes", nil)
@@ -349,7 +351,7 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != routeKey ||
 		create.Cluster.StableID != created.SandboxID ||
 		create.SID != registry.EncodeNodeSandboxID(created.SandboxID, 0) || create.Profile != "e2b" ||
-		create.TemplateRef != testTemplateRef || create.Config["from_group"] != "yes" {
+		create.TemplateRef != "" || create.Config["from_group"] != "" || create.GroupAPIKey != h.apiKey || create.ExpectedGroupVersion <= 0 {
 		t.Fatalf("create command = %+v", create)
 	}
 	if created.SandboxID == create.SID {
@@ -570,11 +572,13 @@ func (h *harness) doDataBySID(t *testing.T, sid, routeKey, accessToken string) *
 }
 
 type nodeStub struct {
-	t      *testing.T
-	ctx    context.Context
-	cancel context.CancelFunc
-	pw     *io.PipeWriter
-	resp   *http.Response
+	groupCore *orch.Orchestrator
+	groupDB   *store.Store
+	t         *testing.T
+	ctx       context.Context
+	cancel    context.CancelFunc
+	pw        *io.PipeWriter
+	resp      *http.Response
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
@@ -607,8 +611,20 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, apiEndpoint, d
 		respCh <- resp
 	}()
 	stub := &nodeStub{t: t, ctx: nctx, cancel: cancel, pw: pw, cmdCh: make(chan *routesync.Command, 64)}
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	stub.groupDB = db
+	stub.groupCore = orch.New(&config.Config{}, db, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	stub.write(t, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
-		NodeID: "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
+		GroupSupportVersion: routesync.GroupSupportVersion,
+		NodeID:              "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
 		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 4000, Memory: 4 << 30}},
 		BuildExecutionCapacity:    &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 4000, Memory: 4 << 30}},
 		APIEndpoint:               apiEndpoint,
@@ -633,6 +649,8 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, apiEndpoint, d
 	}
 	stub.write(t, &routesync.Msg{Type: routesync.TypeBuildSyncBegin})
 	stub.write(t, &routesync.Msg{Type: routesync.TypeBuildSyncEnd})
+	stub.write(t, &routesync.Msg{Type: routesync.TypeGroupBegin, Group: &routesync.GroupReport{SyncID: "initial", Sequence: 0}})
+	stub.write(t, &routesync.Msg{Type: routesync.TypeGroupEnd, Group: &routesync.GroupReport{SyncID: "initial", Sequence: 0}})
 	go stub.readLoop()
 	return stub
 }
@@ -647,14 +665,37 @@ func (n *nodeStub) readLoop() {
 			continue
 		}
 		cmd := *m.Cmd
+		wire := cmd
 		n.mu.Lock()
-		n.cmds = append(n.cmds, &cmd)
+		n.cmds = append(n.cmds, &wire)
 		n.mu.Unlock()
 		select {
-		case n.cmdCh <- &cmd:
+		case n.cmdCh <- &wire:
 		default:
 		}
 		ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
+		switch cmd.Kind {
+		case routesync.CmdGroupGet, routesync.CmdGroupList, routesync.CmdGroupPut, routesync.CmdGroupDelete:
+			ack = n.groupCore.HandleCommand(n.ctx, &cmd)
+			n.write(n.t, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack})
+			if cmd.Kind == routesync.CmdGroupPut && ack.Status == routesync.AckAccepted && ack.GroupResult.Version != *cmd.Group.ExpectedVersion {
+				support, err := n.groupDB.GroupSupport(n.ctx, cmd.Group.Group)
+				if err != nil {
+					n.t.Errorf("Group support: %v", err)
+					return
+				}
+				n.write(n.t, &routesync.Msg{Type: routesync.TypeGroupUpsert, Group: &routesync.GroupReport{Sequence: support.Version, Groups: []nodegroup.Support{support}}})
+			}
+			continue
+		}
+		if cmd.Kind == routesync.CmdCreate && cmd.TemplateRef == "" {
+			detail, _, err := n.groupDB.GroupAdmit(n.ctx, cmd.GroupAPIKey, cmd.Cluster.Group, cmd.ExpectedGroupVersion)
+			if err != nil || detail.Context.TemplateID == nil {
+				n.t.Errorf("Group input: %v", err)
+				return
+			}
+			cmd.TemplateRef = *detail.Context.TemplateID
+		}
 		if cmd.Kind == routesync.CmdBuildRegister {
 			_, options, err := buildcfg.Extract(cmd.Config)
 			if err != nil {

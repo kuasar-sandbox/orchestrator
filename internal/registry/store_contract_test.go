@@ -15,7 +15,7 @@ import (
 )
 
 func TestSandboxRouteRequiresValidProfile(t *testing.T) {
-	stores := newTestStores()
+	stores := newTestStores(t)
 	for _, profile := range []string{"", "other"} {
 		record := testSandboxIdentityRecord("/g", "rk", "sb", "n1", StateReady)
 		record.Profile = profile
@@ -27,21 +27,21 @@ func TestSandboxRouteRequiresValidProfile(t *testing.T) {
 
 func TestNodeSandboxRefsRequireValidProfile(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 	for _, profile := range []string{"", "unknown"} {
 		ref := testNodeSandboxRef("/g", "rk", "sb-"+profile, profile, testAPIFingerprint)
-		if err := stores.AddNodeSandboxRef(ctx, "n1", ref); err == nil {
+		if err := addTestSandboxRef(t, stores, ctx, "n1", ref); err == nil {
 			t.Fatalf("AddNodeSandboxRef accepted profile %q", profile)
 		}
 	}
 
 	e2b := testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)
-	if err := stores.AddNodeSandboxRef(ctx, "n1", e2b); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", e2b); err != nil {
 		t.Fatal(err)
 	}
 	bare := e2b
 	bare.Profile = "bare"
-	if err := stores.AddNodeSandboxRef(ctx, "n1", bare); !errors.Is(err, errNodeSandboxIDConflict) {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", bare); !errors.Is(err, errNodeSandboxIDConflict) {
 		t.Fatalf("profile rebind error=%v, want %v", err, errNodeSandboxIDConflict)
 	}
 }
@@ -58,7 +58,7 @@ func (p invalidSandboxPage) ListSandboxOwners(context.Context, string, metadata.
 func TestNodeSandboxSnapshotsRejectInvalidCredentialFingerprint(t *testing.T) {
 	for name, fingerprint := range map[string]string{"missing": "", "short": "abcd", "uppercase": strings.ToUpper(testAPIFingerprint)} {
 		t.Run(name, func(t *testing.T) {
-			stores := newTestStores()
+			stores := newTestStores(t)
 			seedTestNode(t, stores, "n1")
 			stores.ownership = invalidSandboxPage{OwnershipRepository: stores.ownership, ref: testNodeSandboxRef("/g", "rk", "sb", "e2b", fingerprint)}
 			if _, _, err := stores.GetNode(context.Background(), "n1"); err == nil {
@@ -70,12 +70,12 @@ func TestNodeSandboxSnapshotsRejectInvalidCredentialFingerprint(t *testing.T) {
 
 func TestTypedChildrenAssembleNodeView(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 	profile := &NodeRecord{NodeID: "n1", Labels: map[string]string{"pool": "p"}, Capacity: 10, APIEndpoint: "node-api", DataEndpoint: "node-data", LastHeartbeatUnix: time.Now().Unix(), LinkOwner: "r1"}
 	if err := stores.PutNode(ctx, profile); err != nil {
 		t.Fatal(err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: "/g", BuildID: "b1"}); err != nil {
@@ -100,12 +100,12 @@ func TestTypedChildrenAssembleNodeView(t *testing.T) {
 
 func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 	seedTestNode(t, stores, "n1")
 	sandboxRef := testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)
 	buildRef := metadata.NodeBuildRef{Group: "/g", BuildID: "build"}
 	pair := testNodeKeyPair(strings.Repeat("a", 64), strings.Repeat("b", 64), 100)
-	if err := stores.AddNodeSandboxRef(ctx, "n1", sandboxRef); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", sandboxRef); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeBuildRef(ctx, "n1", buildRef); err != nil {
@@ -128,7 +128,7 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	}
 	// A refresh before the reap claim invalidates every captured child stamp,
 	// even where the ownership identity itself remains exactly the same.
-	if err := stores.AddNodeSandboxRef(ctx, "n1", sandboxRef); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", sandboxRef); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeBuildRef(ctx, "n1", buildRef); err != nil {
@@ -163,7 +163,7 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 
 func TestProtectedRouteCredentialsStayInsideInternalStoreReads(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 	credentials := &sandboxcfg.Credentials{ServiceSecret: strings.Repeat("1", 64), EnvdAccessToken: "envd-private", TrafficAccessToken: "traffic-private"}
 	route := testE2BSandboxRecord("/g", "rk", "sb", "n1", StateReserved)
 	route.CreateCredentials = credentials
@@ -205,12 +205,12 @@ func TestProtectedRouteCredentialsStayInsideInternalStoreReads(t *testing.T) {
 
 func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 	n1Ref := testNodeSandboxRef("/g1", "rk1", "same", "e2b", testAPIFingerprint)
-	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", n1Ref); err != nil {
 		t.Fatal(err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n2", testNodeSandboxRef("/g2", "rk2", "same", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n2", testNodeSandboxRef("/g2", "rk2", "same", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -224,16 +224,16 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 			t.Fatalf("node %s ref=%+v found=%v err=%v", tc.node, ref, found, err)
 		}
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", n1Ref); err != nil {
 		t.Fatalf("idempotent same-node sandbox ref: %v", err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/other", "other", "same", "e2b", testAPIFingerprint)); !errors.Is(err, errNodeSandboxIDConflict) {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", testNodeSandboxRef("/other", "other", "same", "e2b", testAPIFingerprint)); !errors.Is(err, errNodeSandboxIDConflict) {
 		t.Fatalf("same-node ownership collision err=%v", err)
 	}
 	if ref, found, err := stores.GetNodeSandboxRef(ctx, "n1", n1Ref.NodeSandboxID); err != nil || !found || ref != n1Ref {
 		t.Fatalf("original sandbox ref=%+v found=%v err=%v", ref, found, err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b", Group: "/g"}); err == nil {
+	if err := addTestSandboxRef(t, stores, ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b", Group: "/g"}); err == nil {
 		t.Fatal("invalid sandbox ref was accepted")
 	}
 	if err := stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{BuildID: "b"}); err == nil {
@@ -243,11 +243,11 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 
 func TestTypedRouteAndBuildNamespacesAreSeparate(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 	if _, err := stores.PutSandbox(ctx, testSandboxIdentityRecord("/g", "rk", "sb", "n1", StateReady)); err != nil {
 		t.Fatalf("PutSandbox: %v", err)
 	}
-	if _, err := stores.putBuild(ctx, &BuildRecord{Group: "/g", BuildID: "b1", NodeID: "n1", State: BuildRegistered}); err != nil {
+	if _, err := stores.putBuild(ctx, &BuildRecord{Profile: "e2b", APISecretFingerprint: testAPIFingerprint, Group: "/g", BuildID: "b1", NodeID: "n1", State: BuildRegistered}); err != nil {
 		t.Fatalf("putBuild: %v", err)
 	}
 	route, _, found, err := stores.GetSandbox(ctx, "/g", "rk")
@@ -282,7 +282,7 @@ func TestTypedRouteAndBuildNamespacesAreSeparate(t *testing.T) {
 
 func TestClusterStoresPlacerLinkSourceCursorUsesLeaseFencing(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
 
 	rec, acquired, err := stores.AcquirePlacerLinkSourceLease(ctx, "source-a", "s1", "run-1", time.Second)
 	if err != nil || !acquired {

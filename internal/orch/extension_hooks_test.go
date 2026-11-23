@@ -455,7 +455,7 @@ func TestBuildRegisterHookReceivesRoutesOnlyAndCoreRetainsMMDSSecrets(t *testing
 func TestClusterBuildRegisterHookRunsOnceAndExactReplayUsesOriginalIdentity(t *testing.T) {
 	o := testOrch(t)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	command := clusterBuildRegisterCommand("extension-cluster-replay", fingerprint)
+	command := clusterBuildRegisterCommand(t, o, "extension-cluster-replay", fingerprint)
 	var calls atomic.Int32
 	o.SetExtensionHooks(nil, buildHookFunc(func(_ context.Context, operation *conductorextension.BuildOperation) error {
 		if calls.Add(1) != 1 {
@@ -512,7 +512,7 @@ func TestClusterSandboxHookOriginAndFixedRejectionACK(t *testing.T) {
 		origins = append(origins, operation.Origin)
 		return fmtRejected("private cluster policy")
 	}), nil)
-	command := clusterCreateCommand(fingerprint, "extension-cluster-create")
+	command := clusterCreateCommand(t, o, fingerprint, "extension-cluster-create")
 	ack := o.HandleCommand(context.Background(), command)
 	if ack.Status != routesync.AckRejected || ack.HTTPStatus != 403 || ack.Reason != conductorextension.ErrRejected.Error() {
 		t.Fatalf("cluster Create rejection ACK = %+v", ack)

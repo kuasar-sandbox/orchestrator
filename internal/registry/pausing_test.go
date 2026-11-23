@@ -28,10 +28,9 @@ func TestReservePausingPreservesOwner(t *testing.T) {
 					t.Fatal(err)
 				}
 				var placements, commands atomic.Int32
-				reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+				countTestGroupReads(reg).before = func() {
 					placements.Add(1)
-					return nil, ErrNoNode
-				}))
+				}
 				reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 					commands.Add(1)
 					if cmd.Kind != routesync.CmdConnect || cmd.SID != original.NodeSandboxID {
@@ -59,7 +58,7 @@ func TestReservePausingPreservesOwner(t *testing.T) {
 				if placementEntry {
 					// The initial Reserve read can become stale before the placement
 					// loop rereads the route; this entry must also preserve pausing.
-					err = reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false)
+					err = reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false, createOptions{apiKey: testAPIKeyValue()})
 				} else {
 					var result *ReserveResult
 					result, err = reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))

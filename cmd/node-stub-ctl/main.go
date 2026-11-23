@@ -36,9 +36,11 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
+	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
@@ -211,6 +213,7 @@ func runServe(args []string, log *slog.Logger) error {
 			BuildDelay:        *buildDelay,
 		}, svc)
 		svc.addNode(node)
+		defer node.closeGroups()
 		node.start(ctx)
 	}
 
@@ -750,6 +753,10 @@ type stubNodeOptions struct {
 }
 
 type stubNode struct {
+	groupMu  sync.Mutex
+	groups   *orch.Orchestrator
+	groupDB  *store.Store
+	groupDir string
 	stubNodeOptions
 	svc *service
 	log *slog.Logger
@@ -852,6 +859,8 @@ func (n *stubNode) restartLink() {
 }
 
 func (n *stubNode) rebootEmpty() {
+	n.crash()
+	n.closeGroups()
 	n.mu.Lock()
 	var old []routesync.RouteEntry
 	for _, sb := range n.sandboxes {
@@ -946,10 +955,15 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		return ack(cmd, routesync.AckRejected, "command contains non-canonical exec conditions")
 	}
 	switch cmd.Kind {
+	case routesync.CmdGroupGet, routesync.CmdGroupList, routesync.CmdGroupPut, routesync.CmdGroupDelete:
+		return n.handleGroup(ctx, cmd)
 	case routesync.CmdKeyPut:
 		pair, err := stubKeyPairFromCommand(cmd)
 		if err != nil {
 			return ack(cmd, routesync.AckRejected, err.Error())
+		}
+		if err := n.updateGroupPair(ctx, pair); err != nil {
+			return stubGroupError(cmd, err, false)
 		}
 		n.mu.Lock()
 		if existing, found := n.keyPairs[pair.APISecretFingerprint]; found && !sameStubKeyPair(existing, pair) {
@@ -963,12 +977,15 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		if !validStubFingerprint(cmd.APISecretFingerprint) {
 			return ack(cmd, routesync.AckRejected, "API secret fingerprint must be 64 lowercase hex characters")
 		}
+		if err := n.dropGroupPair(ctx, cmd.APISecretFingerprint); err != nil {
+			return stubGroupError(cmd, err, false)
+		}
 		n.mu.Lock()
 		delete(n.keyPairs, cmd.APISecretFingerprint)
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckAccepted, "")
 	case routesync.CmdCreate:
-		return n.handleCreate(cmd)
+		return n.groupCreate(ctx, cmd)
 	case routesync.CmdConnect:
 		return n.handleConnect(cmd)
 	case routesync.CmdExecSession:
@@ -976,7 +993,7 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	case routesync.CmdDelete:
 		return n.handleDelete(cmd)
 	case routesync.CmdBuildRegister:
-		return n.handleBuildRegisterContext(ctx, cmd)
+		return n.groupBuild(ctx, cmd)
 	default:
 		return ack(cmd, routesync.AckRejected, "unknown command kind")
 	}
@@ -1959,6 +1976,7 @@ func (s *stubSandbox) response() (int, string) {
 }
 
 type stubBuild struct {
+	GroupAPISecret           string                    `json:"-"`
 	BuildID                  string                    `json:"build_id"`
 	Profile                  string                    `json:"profile"`
 	APISecretFingerprint     string                    `json:"-"`

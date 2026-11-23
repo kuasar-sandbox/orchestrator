@@ -29,6 +29,7 @@ import (
 // Node is what the node-link client needs from the node's orchestrator: a route
 // source for the node's sandboxes and execution of registry commands.
 type Node interface {
+	routesync.GroupSource
 	routesync.Source
 	routesync.BuildSource
 	// HandleCommand executes a registry lifecycle / key command (create / connect
@@ -67,6 +68,7 @@ type Client struct {
 // node-link listener (a TCP or mTLS dial); heartbeat is the period between node
 // heartbeats (<=0 → 10s).
 func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, tlsConfig *tls.Config, log *slog.Logger) *Client {
+	identity.GroupSupportVersion = routesync.GroupSupportVersion
 	if heartbeat <= 0 {
 		heartbeat = 10 * time.Second
 	}
@@ -87,6 +89,7 @@ func NewWithEndpoint(endpoint string, dial func(ctx context.Context, endpoint st
 		log = slog.Default()
 	}
 	identity.AcceptRedirect = allowRedirect
+	identity.GroupSupportVersion = routesync.GroupSupportVersion
 	return &Client{
 		dialEndpoint: dial, endpoint: endpoint, allowRedirect: allowRedirect,
 		identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log,
@@ -185,6 +188,9 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	if redir := nodeLinkRedirectFromHello(hello); len(redir.targets) > 0 {
 		return redir
 	}
+	if hello.Hello.GroupSupportVersion != routesync.GroupSupportVersion {
+		return errors.New("node-link: Group support protocol version mismatch")
+	}
 	c.notifySession(endpoint)
 
 	// Stream the node's routes (to pw) while executing commands (from resp.Body),
@@ -198,6 +204,12 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	var hbMu sync.Mutex
 	var latestHeartbeat *routesync.Msg
 	go runNodeLinkOutbox(sctx, outbox, highOut, hbUpdate, &hbMu, &latestHeartbeat)
+	groupDone := make(chan error, 1)
+	go func() {
+		err := streamGroups(sctx, c.node, highOut)
+		groupDone <- err
+		cancel()
+	}()
 	onUp := func(uctx context.Context, m *routesync.Msg) {
 		if m.Type == routesync.TypeCommand && m.Cmd != nil {
 			if ack := c.node.HandleCommand(uctx, m.Cmd); ack != nil {
@@ -240,6 +252,11 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 		}
 	}()
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
+	select {
+	case err := <-groupDone:
+		return err
+	default:
+	}
 	return sctx.Err()
 }
 

@@ -37,15 +37,15 @@ func TestBuildRegisterMissingEndpointRecoversWithoutReregister(t *testing.T) {
 			defer data.Close()
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/verify-key":
+				case "/route-link/v2/verify-key":
 					w.WriteHeader(http.StatusOK)
-				case "/route-link/reserve-build":
+				case "/route-link/v2/reserve-build":
 					reserveCalls.Add(1)
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"build_id": buildID, "template_id": templateID, "node_id": "n1", "profile": "e2b",
 						"api_endpoint": "", "data_endpoint": strings.TrimPrefix(data.URL, "http://"),
 					})
-				case "/route-link/build":
+				case "/route-link/v2/build":
 					if r.URL.Query().Get("group") != "/g" || r.URL.Query().Get("build_id") != buildID {
 						t.Errorf("lookup changed accepted identity: %s", r.URL.RawQuery)
 					}
@@ -118,8 +118,8 @@ func TestBuildRegisterMissingEndpointRecoversWithoutReregister(t *testing.T) {
 					endpointAvailable.Store(true)
 				}
 			}
-			if reserveCalls.Load() != 1 || resolveCalls.Load() != 3 || apiHits.Load() != 2 || dataHits.Load() != 0 {
-				t.Errorf("calls reserve=%d resolve=%d api=%d data=%d; want 1/3/2/0", reserveCalls.Load(), resolveCalls.Load(), apiHits.Load(), dataHits.Load())
+			if reserveCalls.Load() != 1 || resolveCalls.Load() != 4 || apiHits.Load() != 2 || dataHits.Load() != 0 {
+				t.Errorf("calls reserve=%d resolve=%d api=%d data=%d; want 1/4/2/0", reserveCalls.Load(), resolveCalls.Load(), apiHits.Load(), dataHits.Load())
 			}
 		})
 	}

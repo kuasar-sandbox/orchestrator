@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
+	requestplacement "github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
@@ -23,13 +24,14 @@ import (
 // route_link paths. Routers dial this link for group-scoped route/build
 // operations and API-key verification.
 const (
-	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key=&operation=... -> ReserveResult
-	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
-	RouteLinkDeletePath       = "/route-link/delete"        // DELETE ?group=&route_key=&sid= -> node-link CmdDelete
-	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,profile,resources,metadata} -> BuildReserveResult
-	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
-	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox list
-	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
+	RouteLinkReservePath      = "/route-link/v2/reserve"
+	RouteLinkRoutePath        = "/route-link/v2/data-route"
+	RouteLinkControlRoutePath = "/route-link/v2/control-route"
+	RouteLinkDeletePath       = "/route-link/v2/delete"
+	RouteLinkReserveBuildPath = "/route-link/v2/reserve-build"
+	RouteLinkBuildPath        = "/route-link/v2/build"
+	RouteLinkListPath         = "/route-link/v2/list"
+	RouteLinkVerifyKeyPath    = "/route-link/v2/verify-key"
 	maxConnectReserveBody     = 64 << 10
 	maxCreateReserveBody      = 16 << 20
 )
@@ -65,13 +67,15 @@ type RouteResolve struct {
 // admits portable resource and traffic plus request-scoped restore, credentials, and
 // checkpoint namespaces into it.
 type SandboxReserveReq struct {
-	MaxCheckpoints  *int              `json:"max_checkpoints,omitempty"`
-	Workspaces      []workspace.Entry `json:"workspaces,omitempty"`
-	Config          map[string]string `json:"config,omitempty"`
-	IdleTimeout     *int64            `json:"idle_timeout,omitempty"`
-	AutoPauseMemory *bool             `json:"auto_pause_memory,omitempty"`
-	AutoReset       *bool             `json:"auto_reset,omitempty"`
-	Memory          *bool             `json:"memory,omitempty"`
+	TemplateID      *string                  `json:"templateID,omitempty"`
+	Placement       requestplacement.Request `json:"placement,omitempty,omitzero"`
+	MaxCheckpoints  *int                     `json:"max_checkpoints,omitempty"`
+	Workspaces      []workspace.Entry        `json:"workspaces,omitempty"`
+	Config          map[string]string        `json:"config,omitempty"`
+	IdleTimeout     *int64                   `json:"idle_timeout,omitempty"`
+	AutoPauseMemory *bool                    `json:"auto_pause_memory,omitempty"`
+	AutoReset       *bool                    `json:"auto_reset,omitempty"`
+	Memory          *bool                    `json:"memory,omitempty"`
 }
 
 // SandboxReserveExecSessionReq is the dedicated Router-to-Registry
@@ -86,6 +90,7 @@ type SandboxReserveExecSessionReq struct {
 func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkReservePath, r.serveReserve)
 	mux.HandleFunc(RouteLinkRoutePath, r.serveRoute)
+	mux.HandleFunc(RouteLinkControlRoutePath, r.serveControlRoute)
 	mux.HandleFunc(RouteLinkDeletePath, r.serveDelete)
 	mux.HandleFunc(RouteLinkReserveBuildPath, r.serveReserveBuild)
 	mux.HandleFunc(RouteLinkBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
@@ -98,8 +103,7 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 // ready placers. A 403 hides both a bad key and an unknown group.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	replicas, minReady, timeout := r.scalePolicy()
-	ok, err := r.VerifyAPIKeyWithMinReady(req.Context(), q.Get("group"), req.Header.Get("X-API-KEY"), replicas, minReady, timeout)
+	ok, err := r.VerifyGroupAPIKey(req.Context(), q.Get("group"), req.Header.Get("X-API-KEY"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable) // key provider unavailable → 503
 		return
@@ -127,25 +131,53 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "group is required", http.StatusBadRequest)
 		return
 	}
-	out := []ListItem{}
-	if err := r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
-		if s.State == StateReady || s.State == StatePausing || s.State == StatePaused {
-			out = append(out, ListItem{IdleTimeout: types.CloneIdleTimeout(s.IdleTimeout), SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
-		}
-		return nil
-	}); err != nil {
+	if err := r.authenticateCreate(req.Context(), group, req.Header.Get("X-API-KEY")); err != nil {
 		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
+	}
+	out := []ListItem{}
+	for cursor := metadata.Cursor(""); ; {
+		page, err := r.stores.routes.ListRoutes(req.Context(), group, cursor, 128)
+		if err != nil {
+			http.Error(w, err.Error(), routeLinkStatus(err))
+			return
+		}
+		for _, item := range page.Items {
+			s := &item.Value
+			if err := r.authenticateSandboxAPIKey(req.Context(), s, req.Header.Get("X-API-KEY")); err != nil {
+				if errors.Is(err, ErrReserveForbidden) {
+					continue
+				}
+				http.Error(w, err.Error(), routeLinkStatus(err))
+				return
+			}
+			if s.State == StateReady || s.State == StatePausing || s.State == StatePaused {
+				out = append(out, ListItem{IdleTimeout: types.CloneIdleTimeout(s.IdleTimeout), SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
+			}
+		}
+		if page.Next == "" {
+			break
+		}
+		cursor = page.Next
 	}
 	writeJSON(w, out)
 }
 
 func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
-	var br BuildReserveReq
-	if err := json.NewDecoder(req.Body).Decode(&br); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var br BuildReserveReq
+	if err := decodeOptionalReserveBody(req.Body, maxCreateReserveBody, &br); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errReserveBodyTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	br.APIKey = req.Header.Get("X-API-KEY")
 	if br.Group == "" {
 		br.Group = req.URL.Query().Get("group")
 	}
@@ -186,6 +218,19 @@ func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
 	}
 	if !found {
 		http.Error(w, "build not found", http.StatusNotFound)
+		return
+	}
+	current, exists, readErr := r.stores.GetBuildInGroup(req.Context(), q.Get("group"), res.BuildID)
+	if readErr != nil {
+		http.Error(w, "build lookup unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !exists || current.NodeID != res.NodeID || current.TemplateID != res.TemplateID {
+		http.Error(w, "build changed", http.StatusConflict)
+		return
+	}
+	if err := r.authenticateSandboxAPIKey(req.Context(), &SandboxRecord{Group: current.Group, APISecretFingerprint: current.APISecretFingerprint}, req.Header.Get("X-API-KEY")); err != nil {
+		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
 	writeJSON(w, res)
@@ -281,6 +326,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	res, err := r.ReserveSandbox(req.Context(), SandboxReserveRequest{
+		TemplateID: body.TemplateID, Constraints: body.Placement,
 		Operation:         operation,
 		Group:             group,
 		RouteKey:          routeKey,
@@ -302,7 +348,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
-	writeJSON(w, res)
+	writeReserveResponse(w, operation, res)
 }
 
 func decodeOptionalReserveBody(reader io.Reader, limit int64, out any) error {
@@ -348,7 +394,7 @@ func (r *Registry) serveRoute(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, rr)
+	writeJSON(w, dataRoute(*rr))
 }
 
 func (r *Registry) serveDelete(w http.ResponseWriter, req *http.Request) {
@@ -357,7 +403,7 @@ func (r *Registry) serveDelete(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	q := req.URL.Query()
-	deleted, err := r.DeleteSandboxRoute(req.Context(), q.Get("group"), q.Get("route_key"), q.Get("sid"))
+	deleted, err := r.DeleteSandboxRoute(req.Context(), q.Get("group"), q.Get("route_key"), q.Get("sid"), req.Header.Get("X-API-KEY"))
 	if err != nil {
 		http.Error(w, err.Error(), routeLinkStatus(err))
 		return

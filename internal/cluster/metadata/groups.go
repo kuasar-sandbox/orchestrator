@@ -5,6 +5,8 @@ import (
 	"errors"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 var ErrGroupResync = errors.New("Group support stream requires a complete snapshot")
@@ -46,6 +48,21 @@ type GroupSupportSelection struct {
 	Node        NodeSnapshot
 }
 
+// GroupAdmission is the selected support observation to compare atomically with
+// the intent write. Heartbeat profile and report cursor versions are excluded.
+type GroupAdmission struct {
+	Group               string
+	GroupVersion        int64
+	AuthRef             string
+	Registration        Registration
+	SupportVersion      Version
+	PublicationVersion  Version
+	Placement           placement.Request
+	ZoneAdmitMax        string
+	TargetRuntimeDigest string
+	BuildResources      *routesync.BuildResources
+}
+
 type GroupAuth struct {
 	Group     string `json:"group"`
 	AuthRef   string `json:"auth_ref"`
@@ -70,5 +87,6 @@ type GroupSupportRepository interface {
 	ReadGroupSupport(context.Context, string, string) (GroupSupportSelection, error)
 	ListGroupSupport(context.Context, string, Cursor, int) (Page[GroupSupportSelection], error)
 	ReadGroupAuth(context.Context, string, string) (Versioned[GroupAuth], error)
+	ListGroupAuth(context.Context, string, Cursor, int) (Page[Versioned[GroupAuth]], error)
 	CleanupGroupSupport(context.Context, ReapClaim) (bool, error)
 }

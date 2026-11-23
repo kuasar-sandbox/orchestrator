@@ -13,6 +13,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	requestplacement "github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -33,6 +34,8 @@ type BuildReserveResult struct {
 // BuildReserveReq is the router's build-register ask: the group + profile, the
 // canonical required Build resources, and portable template configuration.
 type BuildReserveReq struct {
+	APIKey     string                    `json:"-"`
+	Placement  requestplacement.Request  `json:"placement,omitempty,omitzero"`
 	Workspaces []workspace.Entry         `json:"workspaces,omitempty"`
 	Group      string                    `json:"group"`
 	BuildID    string                    `json:"build_id,omitempty"`
@@ -66,6 +69,48 @@ var errNodeBuildIDConflict = metadata.ErrOwnershipConflict
 // authoritative durable admission decision. The registry record pins ambiguous
 // delivery to the selected node; it is routing state, not an admission claim.
 func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*BuildReserveResult, error) {
+	if err := req.Placement.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrReserveBadRequest, err)
+	}
+	if req.BuildID != "" {
+		rec, found, err := r.stores.GetBuildInGroup(ctx, req.Group, req.BuildID)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			if err := r.authenticateSandboxAPIKey(ctx, &SandboxRecord{Group: rec.Group, APISecretFingerprint: rec.APISecretFingerprint}, req.APIKey); err != nil {
+				return nil, err
+			}
+			if err := r.validateExistingPlacement(ctx, &SandboxRecord{NodeID: rec.NodeID}, req.Placement); err != nil {
+				return nil, err
+			}
+		} else if err := r.authenticateCreate(ctx, req.Group, req.APIKey); err != nil {
+			return nil, err
+		}
+	} else if err := r.authenticateCreate(ctx, req.Group, req.APIKey); err != nil {
+		return nil, err
+	}
+	result, err := r.reserveBuild(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	current, found, err := r.stores.GetBuildInGroup(ctx, req.Group, result.BuildID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || current.NodeID != result.NodeID || current.TemplateID != result.TemplateID {
+		return nil, ErrReserveConflict
+	}
+	if err := r.authenticateSandboxAPIKey(ctx, &SandboxRecord{Group: current.Group, APISecretFingerprint: current.APISecretFingerprint}, req.APIKey); err != nil {
+		return nil, err
+	}
+	if err := r.validateExistingPlacement(ctx, &SandboxRecord{NodeID: current.NodeID}, req.Placement); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (r *Registry) reserveBuild(ctx context.Context, req BuildReserveReq) (*BuildReserveResult, error) {
 	if req.Group == "" {
 		return nil, fmt.Errorf("registry: group is required")
 	}
@@ -109,7 +154,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		return nil, err
 	}
 	req.Metadata = buildMetadata
-	attempt := buildRegistrationAttempt{MMDSSecrets: cloneStringMap(mmdsSecrets), Credentials: cloneBuildCredentials(credentials), Workspaces: req.Workspaces}
+	attempt := buildRegistrationAttempt{APIKey: req.APIKey, MMDSSecrets: cloneStringMap(mmdsSecrets), Credentials: cloneBuildCredentials(credentials), Workspaces: req.Workspaces}
 	resources := req.Resources
 	if resources == nil {
 		return nil, errors.New("registry: build resources are required")
@@ -152,6 +197,14 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			if err := r.refreshBuildRegistrationRef(ctx, rec); err != nil {
 				return nil, err
 			}
+			profile, found, err := r.stores.GetNodeProfile(ctx, rec.NodeID)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, ErrNodeGone
+			}
+			ctx = withNodeRegistration(ctx, profile.Registration)
 			ack, err := r.dispatchBuildRegistration(ctx, rec, attempt)
 			if err != nil {
 				return nil, fmt.Errorf("registry: build_register remains ambiguous on node %s: %w", rec.NodeID, err)
@@ -167,17 +220,8 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 				}
 				return r.buildReserveResult(ctx, registered), nil
 			}
-			if !definitiveBuildRegistrationRejection(ack) {
-				return nil, ambiguousBuildRegistrationError(rec.NodeID, ack)
-			}
-			if rec.State != BuildStarting {
-				return nil, fmt.Errorf("registry: build_register target recovery was rejected by node %s: %w", rec.NodeID, buildRegistrationRejectionError(ack))
-			}
-			if err := r.removeBuildRegistrationIntent(ctx, rec); err != nil {
-				return nil, err
-			}
-			lastFailure = buildRegistrationRejectionError(ack)
-			excluded.add(rec.NodeID)
+			// A replay rejection does not prove the earlier delivery failed.
+			return nil, ambiguousBuildRegistrationError(rec.NodeID, ack)
 		}
 	}
 
@@ -187,8 +231,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		placement, err := r.placer.Place(ctx, PlaceRequest{
-			Group: req.Group, RouteKey: "build", Build: true, Config: req.Metadata,
+		placement, err := r.selectGroupNode(ctx, PlaceRequest{
+			APIKey: req.APIKey, Constraints: req.Placement,
+			Group: req.Group, RouteKey: "build", Build: true,
 			BuildResources: resources,
 			ExcludeNodeIDs: excluded.values(),
 		})
@@ -235,7 +280,8 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		// pinned to this node. The node's durable registration transaction is the
 		// only authoritative admission decision.
 		rec := &BuildRecord{
-			Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile,
+			GroupVersion: placement.GroupAdmission.GroupVersion,
+			Group:        req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile,
 			APISecretFingerprint:          placement.APISecretFingerprint,
 			Resources:                     cloneBuildResources(resources),
 			RegistrationConfig:            cloneStringMap(req.Metadata),
@@ -243,12 +289,12 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			RegistrationSecure:            req.Secure,
 			RegistrationCredentialsDigest: credentialsDigest,
 			RegistrationMMDSValuesDigest:  mmdsDigest,
-			RegistrationImageRepo:         placement.ImageRepo,
-			RegistrationRegistryAuth:      placement.RegistryAuth,
 			State:                         BuildStarting, TemplateID: templateID,
 			RegistrationWorkspacesDigest: workspaceDigest,
 		}
-		if _, err := r.stores.builds.CommitRegistrationIntent(ctx, metadata.BuildRecord(*rec), metadata.NodeBuildRef(ref)); err != nil {
+		ref = metadata.BuildRef(metadata.BuildRecord(*rec))
+		version, err := r.stores.builds.CommitGroupRegistrationIntent(ctx, metadata.BuildRecord(*rec), metadata.NodeBuildRef(ref), *placement.GroupAdmission)
+		if err != nil {
 			if errors.Is(err, metadata.ErrOwnershipConflict) {
 				lastFailure = err
 				excluded.add(id)
@@ -256,7 +302,8 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			}
 			return nil, err
 		}
-		ack, err := r.dispatchBuildRegistration(ctx, rec, attempt)
+		dispatchCtx := withNodeRegistration(ctx, placement.GroupAdmission.Registration)
+		ack, err := r.dispatchBuildRegistration(dispatchCtx, rec, attempt)
 		if err != nil {
 			// Once the intent is durable, timeout, reset, disconnect, and ACK loss
 			// are all ambiguous. Keep the binding so only this node/BuildID can be
@@ -264,21 +311,22 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return nil, fmt.Errorf("registry: build_register ambiguous on node %s: %w", id, err)
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			if !definitiveBuildRegistrationRejection(ack) {
-				return nil, ambiguousBuildRegistrationError(id, ack)
+			if ack != nil && ack.ErrorCode == routesync.ErrorGroupVersionConflict {
+				err := r.stores.builds.RetireRejectedGroupBuild(ctx, placement.GroupAdmission.Registration, version, metadata.NodeBuildRef(ref))
+				if err == nil {
+					return nil, fmt.Errorf("%w: %s", ErrReserveConflict, routesync.ErrorGroupVersionConflict)
+				}
+				if !errors.Is(err, metadata.ErrConflict) {
+					return nil, err
+				}
 			}
-			if err := r.removeBuildRegistrationIntent(ctx, rec); err != nil {
-				return nil, err
-			}
-			lastFailure = buildRegistrationRejectionError(ack)
-			excluded.add(id)
-			continue
+			return nil, ambiguousBuildRegistrationError(id, ack)
 		}
 		target, err := acceptedBuildRegistrationTarget(ack)
 		if err != nil {
 			return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", id, err)
 		}
-		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, rec.TemplateID, target)
+		registered, err := r.markBuildRegistrationAccepted(dispatchCtx, rec.Group, rec.BuildID, rec.NodeID, rec.TemplateID, target)
 		if err != nil {
 			return nil, err
 		}
@@ -316,6 +364,7 @@ func sameBuildRegistrationDefinition(rec *BuildRecord, profile types.Profile, re
 // buildRegistrationAttempt contains only this caller's replay material. Durable
 // BuildRecord stores the corresponding digests and never serializes this envelope.
 type buildRegistrationAttempt struct {
+	APIKey      string
 	MMDSSecrets map[string]string
 	Credentials *sandboxcfg.Credentials
 	Workspaces  []workspace.Entry
@@ -344,6 +393,7 @@ func (r *Registry) dispatchBuildRegistration(ctx context.Context, rec *BuildReco
 		return nil, errors.New("workspace registration replay values are unavailable or changed")
 	}
 	cmd := &routesync.Command{
+		GroupAPIKey: attempt.APIKey, ExpectedGroupVersion: rec.GroupVersion,
 		CmdID: newID(), Kind: routesync.CmdBuildRegister,
 		BuildID: rec.BuildID, TemplateRef: rec.TemplateID, Profile: string(rec.Profile),
 		BuildResources: cloneBuildResources(rec.Resources), Config: cloneStringMap(rec.RegistrationConfig),
@@ -458,25 +508,6 @@ func buildRegistrationMMDSDigest(values map[string]string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func definitiveBuildRegistrationRejection(ack *routesync.CmdAck) bool {
-	return ack != nil && ack.Status == routesync.AckRejected &&
-		(ack.HTTPStatus == http.StatusBadRequest || ack.HTTPStatus == http.StatusConflict ||
-			ack.HTTPStatus == http.StatusTooManyRequests)
-}
-
-func buildRegistrationRejectionError(ack *routesync.CmdAck) error {
-	reason := ""
-	status := 0
-	if ack != nil {
-		reason = ack.Reason
-		status = ack.HTTPStatus
-	}
-	if reason == "" {
-		reason = http.StatusText(status)
-	}
-	return &nodeCommandRejection{status: status, reason: reason}
-}
-
 func ambiguousBuildRegistrationError(nodeID string, ack *routesync.CmdAck) error {
 	if ack == nil {
 		return fmt.Errorf("registry: build_register ambiguous on node %s: missing acknowledgement", nodeID)
@@ -490,12 +521,14 @@ func (r *Registry) refreshBuildRegistrationRef(ctx context.Context, expected *Bu
 	return r.stores.builds.EnsureRegistrationOwnership(ctx, metadata.BuildKey{Group: expected.Group, BuildID: expected.BuildID}, expected.NodeID, expected.TemplateID)
 }
 
-func (r *Registry) removeBuildRegistrationIntent(ctx context.Context, expected *BuildRecord) error {
-	return r.stores.builds.RejectRegistrationIntent(ctx, metadata.BuildKey{Group: expected.Group, BuildID: expected.BuildID}, expected.NodeID, expected.TemplateID)
-}
-
 func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID, templateID string, target *types.BuildTarget) (*BuildRecord, error) {
-	accepted, err := r.stores.builds.AcceptBuildRegistration(ctx, metadata.BuildKey{Group: group, BuildID: buildID}, nodeID, templateID, target)
+	var accepted metadata.Versioned[metadata.BuildRecord]
+	var err error
+	if reg, ok := ctx.Value(nodeRegistrationContextKey{}).(metadata.Registration); ok {
+		accepted, err = r.stores.builds.AcceptGroupBuildRegistration(ctx, reg, metadata.BuildKey{Group: group, BuildID: buildID}, templateID, target)
+	} else {
+		accepted, err = r.stores.builds.AcceptBuildRegistration(ctx, metadata.BuildKey{Group: group, BuildID: buildID}, nodeID, templateID, target)
+	}
 	if err != nil {
 		return nil, err
 	}

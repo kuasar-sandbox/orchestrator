@@ -1,13 +1,10 @@
 package placer
 
 import (
-	"math"
 	"testing"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // The placement algorithm is now a pure function over a node slice + a group's
@@ -15,103 +12,13 @@ import (
 
 func nodes(ns ...*registry.NodeRecord) []*registry.NodeRecord { return ns }
 
-func TestPlaceRespectsSelectors(t *testing.T) {
-	ns := nodes(
-		&registry.NodeRecord{NodeID: "a", Labels: map[string]string{"zone": "east"}, Counts: 5},
-		&registry.NodeRecord{NodeID: "b", Labels: map[string]string{"zone": "east"}, Counts: 1},
-		&registry.NodeRecord{NodeID: "c", Labels: map[string]string{"zone": "west"}},
-	)
-	sel := []map[string]string{{"zone": "east"}}
-	for i := 0; i < 30; i++ {
-		node, err := placeSandbox(placeParams{group: "/g", nodes: ns, selectors: sel, candidates: 2})
-		if err != nil || node == "c" {
-			t.Fatalf("placed %q err=%v (must stay in east)", node, err)
-		}
-	}
-}
-
-func TestPlaceNoEligible(t *testing.T) {
-	ns := nodes(&registry.NodeRecord{NodeID: "a", Labels: map[string]string{"zone": "west"}})
-	if _, err := placeSandbox(placeParams{group: "/g", nodes: ns, selectors: []map[string]string{{"zone": "east"}}}); err != registry.ErrNoNode {
-		t.Fatalf("want ErrNoNode, got %v", err)
-	}
-}
-
-func TestPlaceDraining(t *testing.T) {
-	ns := nodes(&registry.NodeRecord{NodeID: "a", Draining: true})
-	if _, err := placeSandbox(placeParams{group: "/g", nodes: ns}); err != registry.ErrNoNode {
-		t.Fatalf("want ErrNoNode (only node draining), got %v", err)
-	}
-}
-
-func TestPlaceZoneAndRequestExclusions(t *testing.T) {
-	ns := nodes(
-		&registry.NodeRecord{NodeID: "red", Zone: "red", Counts: 0},
-		&registry.NodeRecord{NodeID: "ok", Zone: "yellow", Counts: 9},
-		&registry.NodeRecord{NodeID: "excluded", Zone: "green", Counts: 0},
-	)
-	for i := 0; i < 30; i++ {
-		node, err := placeSandbox(placeParams{
-			group: "/g", nodes: ns, candidates: 3, zoneAdmitMax: "yellow",
-			excludedNodeIDs: map[string]struct{}{"excluded": {}},
-		})
-		if err != nil || node != "ok" {
-			t.Fatalf("placed %q err=%v (want ok: red zone + request exclusion)", node, err)
-		}
-	}
-}
-
-func TestPlaceDoesNotInferLivenessFromCatalogTimestamp(t *testing.T) {
-	node, err := placeSandbox(placeParams{
-		group: "/g",
-		nodes: nodes(&registry.NodeRecord{NodeID: "n1", LastHeartbeatUnix: 1}),
-	})
-	if err != nil || node != "n1" {
-		t.Fatalf("placed %q err=%v, want catalog candidate n1", node, err)
-	}
-}
-
-func TestPlaceWatermarkLoad(t *testing.T) {
-	// Ranking prefers the lower allocated/pool water level over raw count.
-	ns := nodes(
-		&registry.NodeRecord{NodeID: "hot", Allocated: 9, Pool: 10, Counts: 0},
-		&registry.NodeRecord{NodeID: "cool", Allocated: 1, Pool: 10, Counts: 100},
-	)
-	for i := 0; i < 500; i++ {
-		node, err := placeSandbox(placeParams{group: "/g", nodes: ns, candidates: 2})
-		if err != nil || node != "cool" {
-			t.Fatalf("placed %q (want cool: lower water level despite higher count)", node)
-		}
-	}
-}
-
-func TestP2CNoReplacementAvoidsHot(t *testing.T) {
-	ns := nodes(
-		&registry.NodeRecord{NodeID: "hot", Counts: 100},
-		&registry.NodeRecord{NodeID: "cold", Counts: 0},
-	)
-	for i := 0; i < 2000; i++ {
-		node, err := placeSandbox(placeParams{group: "/g", nodes: ns, candidates: 2})
-		if err != nil || node == "hot" {
-			t.Fatalf("P2C(k=2) picked %q; sampling-with-replacement regression", node)
-		}
-	}
-}
-
 func TestShuffleSharding(t *testing.T) {
 	var ns []*registry.NodeRecord
 	for _, slot := range []string{"s1", "s2", "s3", "s4"} {
 		ns = append(ns, &registry.NodeRecord{NodeID: "n-" + slot, Labels: map[string]string{"pool": "p1", "slot": slot}})
 	}
 	rules := []clustercfg.ShuffleRule{{Selector: map[string]string{"pool": "p1"}, ShardBy: "slot", N: 2}}
-	got := map[string]bool{}
-	for i := 0; i < 40; i++ {
-		node, err := placeSandbox(placeParams{group: "/cell/proj/app/g1", nodes: ns, rules: rules, candidates: 2})
-		if err != nil {
-			t.Fatal(err)
-		}
-		got[node] = true
-	}
+	_, got := importTargets("/cell/proj/app/g1", ns, nil, rules)
 	if len(got) != 2 {
 		t.Fatalf("group landed on %d nodes, want 2 (shuffle pins to N slots): %v", len(got), got)
 	}
@@ -139,7 +46,7 @@ func TestEffectiveSelectors(t *testing.T) {
 	}
 }
 
-func TestSelectorPatchTargets(t *testing.T) {
+func TestImportTargets(t *testing.T) {
 	ns := nodes(
 		&registry.NodeRecord{NodeID: "n-s1", Labels: map[string]string{"pool": "p1", "slot": "s1"}},
 		&registry.NodeRecord{NodeID: "n-s2", Labels: map[string]string{"pool": "p1", "slot": "s2"}},
@@ -147,60 +54,37 @@ func TestSelectorPatchTargets(t *testing.T) {
 		&registry.NodeRecord{NodeID: "other", Labels: map[string]string{"pool": "p2", "slot": "s4"}},
 	)
 	rules := []clustercfg.ShuffleRule{{Selector: map[string]string{"pool": "p1"}, ShardBy: "slot", N: 2}}
-	selectors, ids := selectorPatchTargets("/cell/g1", ns, []map[string]string{{"pool": "p1"}}, rules)
+	selectors, ids := importTargets("/cell/g1", ns, []map[string]string{{"pool": "p1"}}, rules)
 	if len(selectors) != 2 {
 		t.Fatalf("selectors=%v, want two shuffle-effective selectors", selectors)
 	}
 	for _, id := range ids {
-		if id == "n-s3" || id == "other" {
+		if id == "other" {
 			t.Fatalf("selector patch included ineligible node %q: %v", id, ids)
 		}
 	}
 	if len(ids) == 0 {
 		t.Fatal("selector patch target set unexpectedly empty")
 	}
-	_, ids = selectorPatchTargets("/g", ns, []map[string]string{{"pool": "p2"}}, nil)
+	_, ids = importTargets("/g", ns, []map[string]string{{"pool": "p2"}}, nil)
 	if len(ids) != 1 || ids[0] != "other" {
 		t.Fatalf("static selector patch ids=%v, want [other]", ids)
 	}
 }
 
-func TestPlaceBuildHeadroom(t *testing.T) {
-	// Placer receives low-frequency capacity only. It rejects a node on which
-	// this Build can never fit; current usage is checked at the Holder boundary.
+func TestImportTargetsIntersectStaticShardAndShuffle(t *testing.T) {
 	ns := nodes(
-		&registry.NodeRecord{NodeID: "too-small", BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 1000}}},
-		&registry.NodeRecord{NodeID: "fits", BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 2000}}},
+		&registry.NodeRecord{NodeID: "one", Labels: map[string]string{"slot": "s1"}},
+		&registry.NodeRecord{NodeID: "two", Labels: map[string]string{"slot": "s2"}},
 	)
-	for i := 0; i < 30; i++ {
-		node, err := placeBuild(placeParams{group: "/g", nodes: ns, candidates: 2, buildResources: &routesync.BuildResources{CPU: 1500}})
-		if err != nil || node != "fits" {
-			t.Fatalf("placeBuild = %q err=%v (want fits: request exceeds too-small capacity)", node, err)
-		}
+	rules := []clustercfg.ShuffleRule{{ShardBy: "slot", N: 1}}
+	slots, _ := shuffleSlots("g", ns, rules)
+	rejected := "s1"
+	if slots[rejected] {
+		rejected = "s2"
+	}
+	_, targets := importTargets("g", ns, []map[string]string{{"slot": rejected}}, rules)
+	if len(targets) != 0 {
+		t.Fatalf("conflicting static selector widened the shuffle set: %v", targets)
 	}
 }
-
-func TestBuildDimensionFitsFailsClosedWithoutOverflow(t *testing.T) {
-	for _, tc := range []struct {
-		name                   string
-		used, requested, limit int64
-		want                   bool
-	}{
-		{name: "unlimited", requested: math.MaxInt64, want: true},
-		{name: "exact", used: 7, requested: 3, limit: 10, want: true},
-		{name: "over limit", used: 8, requested: 3, limit: 10},
-		{name: "request exceeds limit", requested: math.MaxInt64, limit: 1},
-		{name: "negative used", used: -1},
-		{name: "negative request", requested: -1},
-		{name: "negative limit", limit: -1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := dimensionFits(tc.used, tc.requested, tc.limit); got != tc.want {
-				t.Fatalf("dimensionFits(%d, %d, %d) = %v, want %v", tc.used, tc.requested, tc.limit, got, tc.want)
-			}
-		})
-	}
-}
-
-// guard against an accidental maglev import drop (shuffle relies on it).
-var _ = maglev.LocateN

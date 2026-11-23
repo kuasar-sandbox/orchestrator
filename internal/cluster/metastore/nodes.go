@@ -232,13 +232,16 @@ func (s *Store) CleanupSandbox(ctx context.Context, claim metadata.ReapClaim, re
 				if !mayReapReserved {
 					return false, nil
 				}
-				clearRecord(m.tr, key)
+				if err := s.clearRoute(m, metadata.RouteKey{Group: ref.Value.Group, RouteKey: ref.Value.RouteKey}); err != nil {
+					return false, err
+				}
 			case metadata.StateReady, metadata.StatePaused, metadata.StatePausing:
-				clearRecord(m.tr, key)
+				if err := s.clearRoute(m, metadata.RouteKey{Group: ref.Value.Group, RouteKey: ref.Value.RouteKey}); err != nil {
+					return false, err
+				}
 			}
 		}
-		clearRecord(m.tr, s.sandboxOwnerKey(claim.NodeID, ref.Value.NodeSandboxID))
-		return true, nil
+		return s.clearMatchingSandbox(m, claim.NodeID, ref.Value)
 	})
 	return err
 }
@@ -274,8 +277,7 @@ func (s *Store) CleanupBuild(ctx context.Context, claim metadata.ReapClaim, ref 
 			return false, err
 		}
 		if !current.Exists || current.Value.NodeID != claim.NodeID || current.Value.Group != ref.Value.Group || current.Value.BuildID != ref.Value.BuildID || (ref.Value.TemplateID != "" && current.Value.TemplateID != ref.Value.TemplateID) {
-			clearRecord(m.tr, s.buildOwnerKey(claim.NodeID, ref.Value.BuildID))
-			return true, nil
+			return s.clearMatchingBuild(m, claim.NodeID, ref.Value)
 		}
 		switch current.Value.State {
 		case metadata.BuildStarting, metadata.BuildRegistered, metadata.BuildWaiting, metadata.BuildBuilding:

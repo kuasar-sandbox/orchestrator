@@ -6,6 +6,7 @@
 package clustercfg
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -99,12 +100,9 @@ type FoundationDBConfig struct {
 	Prefix      string `yaml:"prefix"`
 }
 
-// PlacerLinkConfig configures placer discovery/placement over the unified member listener.
+// PlacerLinkConfig configures importer discovery over the unified member listener.
 type PlacerLinkConfig struct {
-	PlacerReplicaCount int    `yaml:"placer_replica_count"`
-	MinReadyPlacers    int    `yaml:"min_ready_placers"`
-	PlacerLabel        string `yaml:"placer_label"`
-	PlaceTimeout       string `yaml:"place_timeout"`
+	PlacerLabel string `yaml:"placer_label"`
 }
 
 // RegistryDialConfig is how a consumer reaches the registry bootstrap endpoint.
@@ -133,14 +131,17 @@ type RouterCache struct {
 	IdleTimeout string `yaml:"idle_timeout"` // route resolution idle age; default 2m
 }
 
-// PlacementConfig groups the placer's placement policy.
+// PlacementConfig controls Group import distribution and source coordination.
 type PlacementConfig struct {
-	Candidates             int           `yaml:"candidates"`                // P2C sample size; default 2
-	ZoneAdmitMax           string        `yaml:"zone_admit_max"`            // exclude nodes hotter than this; default yellow
 	ImportSourceOwnerCount int           `yaml:"import_source_owner_count"` // placer candidates that may race for one source lease
 	ImportSourceLeaseTTL   string        `yaml:"import_source_lease_ttl"`   // registry-side source lease TTL
-	SelectorPatchRefresh   string        `yaml:"selector_patch_refresh_interval"`
+	ImportRefresh          string        `yaml:"import_refresh_interval"`
 	ShuffleSharding        []ShuffleRule `yaml:"shuffle_sharding"` // empty = static nodeSelectors only
+}
+
+type RegistryPlacementConfig struct {
+	Candidates   int    `yaml:"candidates"`
+	ZoneAdmitMax string `yaml:"zone_admit_max"`
 }
 
 type GroupSourceConfig struct {
@@ -243,16 +244,13 @@ func (c *RouteLinkConfig) ParkDur() time.Duration {
 	d, _ := time.ParseDuration(c.ParkTimeout)
 	return d
 }
-func (c *PlacerLinkConfig) PlaceDur() time.Duration {
-	d, _ := time.ParseDuration(c.PlaceTimeout)
-	return d
-}
+
 func (c *PlacementConfig) ImportSourceLeaseTTLDur() time.Duration {
 	d, _ := time.ParseDuration(c.ImportSourceLeaseTTL)
 	return d
 }
-func (c *PlacementConfig) SelectorPatchRefreshDur() time.Duration {
-	d, _ := time.ParseDuration(c.SelectorPatchRefresh)
+func (c *PlacementConfig) ImportRefreshDur() time.Duration {
+	d, _ := time.ParseDuration(c.ImportRefresh)
 	return d
 }
 func (m MembershipConfig) ReloadReadyTimeoutDur() time.Duration {
@@ -388,19 +386,21 @@ func validateDurations(m map[string]string) error {
 // listener for node_link, route_link, placer_link, and member RPC. node_link.listen
 // may split long-lived node streams onto another listener.
 type RegistryConfig struct {
-	Storage      StorageConfig      `yaml:"storage"`
-	Member       MemberConfig       `yaml:"member"`
-	Membership   MembershipConfig   `yaml:"membership"`
-	NodeLink     NodeLinkConfig     `yaml:"node_link"`
-	RouteLink    RouteLinkConfig    `yaml:"route_link"`
-	FoundationDB FoundationDBConfig `yaml:"foundationdb"`
-	PlacerLink   PlacerLinkConfig   `yaml:"placer_link"`
+	Placement    RegistryPlacementConfig `yaml:"placement"`
+	Storage      StorageConfig           `yaml:"storage"`
+	Member       MemberConfig            `yaml:"member"`
+	Membership   MembershipConfig        `yaml:"membership"`
+	NodeLink     NodeLinkConfig          `yaml:"node_link"`
+	RouteLink    RouteLinkConfig         `yaml:"route_link"`
+	FoundationDB FoundationDBConfig      `yaml:"foundationdb"`
+	PlacerLink   PlacerLinkConfig        `yaml:"placer_link"`
 }
 
 // DefaultRegistry returns the registry config with all non-required fields set.
 func DefaultRegistry() RegistryConfig {
 	return RegistryConfig{
-		Member: MemberConfig{ID: "registry", Listen: ":7700"},
+		Placement: RegistryPlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow"},
+		Member:    MemberConfig{ID: "registry", Listen: ":7700"},
 		Membership: MembershipConfig{
 			Active: 1, ReloadReadyTimeout: "10s",
 			Versions: []MembershipVersion{{
@@ -413,7 +413,7 @@ func DefaultRegistry() RegistryConfig {
 		RouteLink:    RouteLinkConfig{ParkTimeout: "30s"},
 		Storage:      StorageConfig{Backend: "fdb", Namespace: "kuasar-sandbox/cluster/records-v2/", SQLitePath: "/var/lib/cluster-ctl/metadata.sqlite", PostgresDSNEnv: "CLUSTER_STORAGE_POSTGRES_DSN"},
 		FoundationDB: FoundationDBConfig{ClusterFile: "/etc/foundationdb/fdb.cluster", Prefix: "kuasar-sandbox/cluster/"},
-		PlacerLink:   PlacerLinkConfig{PlacerReplicaCount: 3, MinReadyPlacers: 1, PlacerLabel: "placer.default", PlaceTimeout: "2s"},
+		PlacerLink:   PlacerLinkConfig{PlacerLabel: "placer.default"},
 	}
 }
 
@@ -428,7 +428,9 @@ func LoadRegistry(path string) (*RegistryConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("clustercfg: read %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &c); err != nil {
+		decoder := yaml.NewDecoder(bytes.NewReader(raw))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&c); err != nil {
 			return nil, fmt.Errorf("clustercfg: parse %s: %w", path, err)
 		}
 		c.applyDefaults()
@@ -443,6 +445,12 @@ func LoadRegistry(path string) (*RegistryConfig, error) {
 // defaulted struct overwrites whole sub-structs that appear, zeroing siblings).
 func (c *RegistryConfig) applyDefaults() {
 	d := DefaultRegistry()
+	if c.Placement.Candidates == 0 {
+		c.Placement.Candidates = d.Placement.Candidates
+	}
+	if c.Placement.ZoneAdmitMax == "" {
+		c.Placement.ZoneAdmitMax = d.Placement.ZoneAdmitMax
+	}
 	if c.Member.ID == "" {
 		c.Member.ID = d.Member.ID
 	}
@@ -500,22 +508,21 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.Storage.Namespace == "" {
 		c.Storage.Namespace = c.FoundationDB.Prefix + "records-v2/"
 	}
-	if c.PlacerLink.PlacerReplicaCount == 0 {
-		c.PlacerLink.PlacerReplicaCount = d.PlacerLink.PlacerReplicaCount
-	}
-	if c.PlacerLink.MinReadyPlacers == 0 {
-		c.PlacerLink.MinReadyPlacers = d.PlacerLink.MinReadyPlacers
-	}
 	if c.PlacerLink.PlacerLabel == "" {
 		c.PlacerLink.PlacerLabel = d.PlacerLink.PlacerLabel
-	}
-	if c.PlacerLink.PlaceTimeout == "" {
-		c.PlacerLink.PlaceTimeout = d.PlacerLink.PlaceTimeout
 	}
 }
 
 // Validate checks required fields and that durations / enums parse.
 func (c *RegistryConfig) Validate() error {
+	if c.Placement.Candidates < 1 || c.Placement.Candidates > 64 {
+		return fmt.Errorf("clustercfg: placement.candidates must be 1..64")
+	}
+	switch c.Placement.ZoneAdmitMax {
+	case "green", "yellow", "red", "critical":
+	default:
+		return fmt.Errorf("clustercfg: invalid placement.zone_admit_max")
+	}
 	if c.Member.ID == "" {
 		return fmt.Errorf("clustercfg: member.id is required")
 	}
@@ -631,15 +638,6 @@ func (c *RegistryConfig) Validate() error {
 	default:
 		return fmt.Errorf("clustercfg: storage.backend must be fdb, sqlite or postgres")
 	}
-	if c.PlacerLink.PlacerReplicaCount <= 0 {
-		return fmt.Errorf("clustercfg: placer_link.placer_replica_count must be positive")
-	}
-	if c.PlacerLink.MinReadyPlacers <= 0 {
-		return fmt.Errorf("clustercfg: placer_link.min_ready_placers must be positive")
-	}
-	if c.PlacerLink.MinReadyPlacers > c.PlacerLink.PlacerReplicaCount {
-		return fmt.Errorf("clustercfg: placer_link.min_ready_placers must not exceed placer_replica_count")
-	}
 	if c.PlacerLink.PlacerLabel == "" {
 		return fmt.Errorf("clustercfg: placer_link.placer_label is required")
 	}
@@ -648,7 +646,6 @@ func (c *RegistryConfig) Validate() error {
 		"node_link.heartbeat_interval":    c.NodeLink.HeartbeatInterval,
 		"node_link.node_dead_after":       c.NodeLink.NodeDeadAfter,
 		"route_link.park_timeout":         c.RouteLink.ParkTimeout,
-		"placer_link.place_timeout":       c.PlacerLink.PlaceTimeout,
 	})
 }
 
@@ -857,8 +854,7 @@ func DefaultPlacer() PlacerConfig {
 		Registry:     RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		ImportGroups: nil,
 		Placement: PlacementConfig{
-			Candidates: 2, ZoneAdmitMax: "yellow",
-			ImportSourceOwnerCount: 3, ImportSourceLeaseTTL: "15s", SelectorPatchRefresh: "1m",
+			ImportSourceOwnerCount: 3, ImportSourceLeaseTTL: "15s", ImportRefresh: "1m",
 		},
 	}
 }
@@ -871,7 +867,9 @@ func LoadPlacer(path string) (*PlacerConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("clustercfg: read %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &c); err != nil {
+		decoder := yaml.NewDecoder(bytes.NewReader(raw))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&c); err != nil {
 			return nil, fmt.Errorf("clustercfg: parse %s: %w", path, err)
 		}
 		c.applyDefaults()
@@ -899,20 +897,14 @@ func (c *PlacerConfig) applyDefaults() {
 	if c.Registry.Bootstrap == "" {
 		c.Registry.Bootstrap = d.Registry.Bootstrap
 	}
-	if c.Placement.Candidates == 0 {
-		c.Placement.Candidates = d.Placement.Candidates
-	}
-	if c.Placement.ZoneAdmitMax == "" {
-		c.Placement.ZoneAdmitMax = d.Placement.ZoneAdmitMax
-	}
 	if c.Placement.ImportSourceOwnerCount == 0 {
 		c.Placement.ImportSourceOwnerCount = d.Placement.ImportSourceOwnerCount
 	}
 	if c.Placement.ImportSourceLeaseTTL == "" {
 		c.Placement.ImportSourceLeaseTTL = d.Placement.ImportSourceLeaseTTL
 	}
-	if c.Placement.SelectorPatchRefresh == "" {
-		c.Placement.SelectorPatchRefresh = d.Placement.SelectorPatchRefresh
+	if c.Placement.ImportRefresh == "" {
+		c.Placement.ImportRefresh = d.Placement.ImportRefresh
 	}
 }
 
@@ -931,14 +923,6 @@ func (c *PlacerConfig) Validate() error {
 	}
 	if c.Placer.MemberlistLabel == "" {
 		return fmt.Errorf("clustercfg: placer.memberlist_label is required")
-	}
-	switch c.Placement.ZoneAdmitMax {
-	case "", "green", "yellow", "red":
-	default:
-		return fmt.Errorf("clustercfg: placement.zone_admit_max %q invalid (green|yellow|red)", c.Placement.ZoneAdmitMax)
-	}
-	if c.Placement.Candidates < 0 {
-		return fmt.Errorf("clustercfg: placement.candidates %d invalid (must be >= 0)", c.Placement.Candidates)
 	}
 	if c.Placement.ImportSourceOwnerCount <= 0 {
 		return fmt.Errorf("clustercfg: placement.import_source_owner_count must be positive")
@@ -962,7 +946,7 @@ func (c *PlacerConfig) Validate() error {
 		}
 	}
 	return validateDurations(map[string]string{
-		"placement.import_source_lease_ttl":         c.Placement.ImportSourceLeaseTTL,
-		"placement.selector_patch_refresh_interval": c.Placement.SelectorPatchRefresh,
+		"placement.import_source_lease_ttl": c.Placement.ImportSourceLeaseTTL,
+		"placement.import_refresh_interval": c.Placement.ImportRefresh,
 	})
 }

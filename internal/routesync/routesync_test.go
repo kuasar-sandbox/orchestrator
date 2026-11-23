@@ -204,7 +204,7 @@ func TestRouteSyncRejectsVersion6BeforeBusinessFrames(t *testing.T) {
 		if _, err := routesync.ReadRegister(r.Body); err != nil {
 			return
 		}
-		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: 6}})
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion, Version: 6}})
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{
 			SandboxID: "must-not-apply", State: routesync.StateRunning,
 		}})

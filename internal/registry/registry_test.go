@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"io"
 	"log/slog"
 	"net"
@@ -33,7 +35,7 @@ import (
 
 func testRegWithBox(t *testing.T) *Registry {
 	t.Helper()
-	return New(newTestStores(), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(newTestStores(t), 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
@@ -55,7 +57,8 @@ func testE2BRoute(sandboxID, state string) routesync.RouteEntry {
 	}
 	return routesync.RouteEntry{
 		SandboxID: nodeSandboxID, Profile: "e2b", State: state,
-		StableID: sandboxID, APISecret: testAPISecret,
+		TemplateID: testTemplateRef,
+		StableID:   sandboxID, APISecret: testAPISecret,
 		APISecretFingerprint: testAPIFingerprint, ManifestKeyFingerprint: fullFingerprint(testMK),
 		ServiceSecret: serviceSecret, EnvdAccessToken: testEnvdAccessToken,
 		TrafficAccessToken: testTrafficAccessToken, ForwardAccessToken: forwardAccessToken,
@@ -94,7 +97,8 @@ func testSandboxIdentityRecord(group, routeKey, sandboxID, nodeID string, state 
 func testRouteFromRecord(record *SandboxRecord, sid, state string) routesync.RouteEntry {
 	return routesync.RouteEntry{
 		SandboxID: sid, Profile: record.Profile, State: state,
-		StableID: record.StableID, APISecret: record.APISecret,
+		TemplateID: record.TemplateID,
+		StableID:   record.StableID, APISecret: record.APISecret,
 		APISecretFingerprint:   record.APISecretFingerprint,
 		ManifestKeyFingerprint: record.ManifestKeyFingerprint,
 		ServiceSecret:          record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
@@ -108,63 +112,6 @@ func updateHeartbeatAndRefreshKeyPairs(reg *Registry, ctx context.Context, nodeI
 	rec, found, err := reg.getNodeForLinkUpdate(ctx, nodeID)
 	if err == nil && found {
 		reg.refreshNodeKeyPairs(ctx, rec)
-	}
-}
-
-type placementFunc func(context.Context, PlaceRequest) (*Placement, error)
-
-func (f placementFunc) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
-	placement, err := f(ctx, req)
-	if err == nil && placement != nil && !req.Build && placement.TemplateRef == "" {
-		placement.TemplateRef = testTemplateRef
-	}
-	return placement, err
-}
-
-func placementWithToken(nodeID string) Placer {
-	return placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
-		return &Placement{
-			NodeID: nodeID, TemplateRef: testTemplateRef, Config: mergeConfig(map[string]string{"a": "1"}, req.Config),
-			APISecretFingerprint: fullFingerprint(testAPISecret), ImageRepo: "repo", RegistryAuth: "auth-json",
-		}, nil
-	})
-}
-
-func TestSelectorPatchRefreshesNodeLinkKeyCache(t *testing.T) {
-	ctx := context.Background()
-	reg := testRegWithBox(t)
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
-	var cmds []*routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
-		cmds = append(cmds, c)
-		reg.ackCommand(&routesync.CmdAck{CmdID: c.CmdID, Status: routesync.AckAccepted})
-	}})
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
-		t.Fatalf("push selector patch: %v", err)
-	}
-
-	if len(cmds) != 0 {
-		t.Fatalf("selector patch should only update node_link cache, got commands %+v", cmds)
-	}
-	updateHeartbeatAndRefreshKeyPairs(reg, ctx, "n1", &routesync.Heartbeat{})
-	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut ||
-		cmds[0].APISecretFingerprint != fullFingerprint(testAPISecret) || cmds[0].APISecret != testAPISecret ||
-		cmds[0].ManifestKeyFingerprint != fullFingerprint(testMK) || cmds[0].ManifestKey != testMK {
-		t.Fatalf("expected heartbeat key_put with the group key, got %+v", cmds)
-	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found || len(node.KeyPairs) != 1 {
-		t.Fatalf("node key state found=%v err=%v node=%+v", found, err, node)
-	}
-	if node.KeyPairs[0].AckedExpiresUnix != cmds[0].ExpiresUnix || node.KeyPairs[0].AckedExpiresUnix <= time.Now().Unix() {
-		t.Fatalf("acknowledged key lease not persisted in node_link: key=%+v cmd=%+v", node.KeyPairs[0], cmds[0])
-	}
-
-	cmds = nil
-	updateHeartbeatAndRefreshKeyPairs(reg, ctx, "n1", &routesync.Heartbeat{})
-	if len(cmds) != 0 {
-		t.Fatalf("heartbeat resent manifest key before stored TTL expired: %+v", cmds)
 	}
 }
 
@@ -447,7 +394,7 @@ func TestManifestKeyAckWaitDoesNotDelayHeartbeatState(t *testing.T) {
 	}
 	keyStarted := make(chan struct{})
 	var once sync.Once
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) {
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) {
 		once.Do(func() { close(keyStarted) })
 	}})
 	heartbeats := make(chan *routesync.Heartbeat, 2)
@@ -513,201 +460,6 @@ func TestDeleteSandboxRouteSendsNodeLinkCommand(t *testing.T) {
 	}
 }
 
-func TestSelectorPatchRetriesFailedManifestKeyCacheWrite(t *testing.T) {
-	ctx := context.Background()
-	reg := testRegWithBox(t)
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}}); err != nil {
-		t.Fatal(err)
-	}
-	owner := &flakyKeyPairOwner{remoteLifecycleOwner: remoteLifecycleOwner{reg: reg}}
-	reg.SetNodeOwner(owner)
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err == nil {
-		t.Fatal("first selector patch should fail when node_link cache write fails")
-	}
-	if owner.putCalls != 1 {
-		t.Fatalf("first patch put calls=%d, want 1", owner.putCalls)
-	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("node found=%v err=%v", found, err)
-	}
-	if len(node.KeyPairs) != 0 {
-		t.Fatalf("failed key cache write was persisted: %+v", node.KeyPairs)
-	}
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
-		t.Fatalf("second selector patch should retry successfully: %v", err)
-	}
-	if owner.putCalls != 2 {
-		t.Fatalf("second patch put calls=%d, want retry after failed cache write", owner.putCalls)
-	}
-	node, found, err = reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found || len(node.KeyPairs) != 1 {
-		t.Fatalf("retry did not persist key cache found=%v err=%v node=%+v", found, err, node)
-	}
-}
-
-func TestSelectorPatchWritesManifestKeyTargetsConcurrently(t *testing.T) {
-	reg := testRegWithBox(t)
-	owner := &concurrentKeyPairOwner{want: 4, ready: make(chan struct{})}
-	owner.reg = reg
-	reg.SetNodeOwner(owner)
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1", "n2", "n3", "n4"}, testMK); err != nil {
-		t.Fatalf("selector patch fan-out: %v", err)
-	}
-	owner.mu.Lock()
-	started := owner.started
-	owner.mu.Unlock()
-	if started != 4 {
-		t.Fatalf("manifest key writes started=%d, want 4", started)
-	}
-}
-
-func TestKeyDropOnLeave(t *testing.T) {
-	ctx := context.Background()
-	reg := testRegWithBox(t)
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
-	var cmds []*routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
-		cmds = append(cmds, c)
-		reg.ackCommand(&routesync.CmdAck{CmdID: c.CmdID, Status: routesync.AckAccepted})
-	}})
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
-		t.Fatalf("push selector patch: %v", err)
-	}
-	updateHeartbeatAndRefreshKeyPairs(reg, ctx, "n1", &routesync.Heartbeat{})
-	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
-		t.Fatalf("empty selector patch: %v", err)
-	}
-	cmds = nil
-
-	if len(cmds) != 0 {
-		t.Fatalf("empty patch should not push key_drop; node TTL handles expiry, got %+v", cmds)
-	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("node found=%v err=%v", found, err)
-	}
-	if len(node.KeyPairs) != 1 {
-		t.Fatalf("node_link key cache should remain until TTL expiry: %+v", node.KeyPairs)
-	}
-}
-
-func TestSelectorPatchWritesOnlySelectedNodeKeyCache(t *testing.T) {
-	ctx := context.Background()
-	reg := testRegWithBox(t)
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n2", Labels: map[string]string{"zone": "west"}})
-	cmds := map[string][]*routesync.Command{}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds["n1"] = append(cmds["n1"], c) }})
-	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(c *routesync.Command) { cmds["n2"] = append(cmds["n2"], c) }})
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n2"}, testMK); err != nil {
-		t.Fatalf("push selector patch: %v", err)
-	}
-
-	if len(cmds["n1"]) != 0 {
-		t.Fatalf("selector-matching n1 got commands despite selector patch targeting n2: %+v", cmds["n1"])
-	}
-	if len(cmds["n2"]) != 0 {
-		t.Fatalf("selector patch should not push n2 commands immediately: %+v", cmds["n2"])
-	}
-	n2, found, err := reg.stores.GetNode(ctx, "n2")
-	if err != nil || !found || len(n2.KeyPairs) != 1 {
-		t.Fatalf("n2 node_link cache=%+v found=%v err=%v", n2, found, err)
-	}
-
-	cmds = map[string][]*routesync.Command{}
-	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
-		t.Fatalf("empty selector patch: %v", err)
-	}
-	if len(cmds["n2"]) != 0 {
-		t.Fatalf("empty selector patch should not push key_drop, commands=%+v", cmds["n2"])
-	}
-	n2, _, _ = reg.stores.GetNode(ctx, "n2")
-	if len(n2.KeyPairs) != 1 {
-		t.Fatalf("empty selector patch should leave n2 cache until TTL expiry: %+v", n2.KeyPairs)
-	}
-}
-
-func TestSelectorPatchDoesNotDropRemovedTargetAndRotatesKey(t *testing.T) {
-	ctx := context.Background()
-	reg := testRegWithBox(t)
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
-	var cmds []*routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
-		t.Fatalf("push selector patch: %v", err)
-	}
-	if len(cmds) != 0 {
-		t.Fatalf("initial patch commands=%+v, want none", cmds)
-	}
-
-	cmds = nil
-	if err := pushSelectorPatchPair(reg, "/g", []string{"n1"},
-		"1111111111111111111111111111111111111111111111111111111111111111",
-		"2222222222222222222222222222222222222222222222222222222222222222"); err != nil {
-		t.Fatalf("rotate selector patch key: %v", err)
-	}
-	if len(cmds) != 0 {
-		t.Fatalf("rotated key patch commands=%+v, want none", cmds)
-	}
-	node, _, _ := reg.stores.GetNode(ctx, "n1")
-	if len(node.KeyPairs) != 2 {
-		t.Fatalf("rotated key cache=%+v, want old and new keys until TTL expiry", node.KeyPairs)
-	}
-
-	cmds = nil
-	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
-		t.Fatalf("empty selector patch: %v", err)
-	}
-	if len(cmds) != 0 {
-		t.Fatalf("removed selector patch target commands=%+v, want none", cmds)
-	}
-	node, _, _ = reg.stores.GetNode(ctx, "n1")
-	if len(node.KeyPairs) != 2 {
-		t.Fatalf("removed selector patch target cache=%+v, want unchanged until TTL expiry", node.KeyPairs)
-	}
-}
-
-func TestSelectorPatchCachesKeysInNodeLink(t *testing.T) {
-	ctx := context.Background()
-	reg := testRegWithBox(t)
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
-	reg.addNode(&fakeConn{nodeID: "n1"})
-
-	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
-		t.Fatalf("push selector patch: %v", err)
-	}
-
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("node found=%v err=%v", found, err)
-	}
-	if len(node.KeyPairs) != 1 || node.KeyPairs[0].APISecretFingerprint != fullFingerprint(testAPISecret) ||
-		node.KeyPairs[0].APISecret != testAPISecret || node.KeyPairs[0].ManifestKey != testMK {
-		t.Fatalf("node_link key-pair cache=%+v", node.KeyPairs)
-	}
-
-	registered := &routesync.NodeRegister{NodeID: "n1", Capacity: 10, DataEndpoint: "10.0.0.1:8443"}
-	if _, err := reg.updateNodeRegister(ctx, registered); err != nil {
-		t.Fatalf("updateNodeRegister: %v", err)
-	}
-	node, found, err = reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("node after register found=%v err=%v", found, err)
-	}
-	if len(node.KeyPairs) != 1 || node.KeyPairs[0].APISecretFingerprint != fullFingerprint(testAPISecret) {
-		t.Fatalf("register cleared node_link key-pair cache: %+v", node.KeyPairs)
-	}
-}
-
 func TestManifestKeyTTLExpiresNodeLinkCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
@@ -736,52 +488,11 @@ func TestManifestKeyTTLExpiresNodeLinkCache(t *testing.T) {
 	}
 }
 
-func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
-	reg := testReg(t)
-	ctx := context.Background()
-	resp, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{
-		SourceID: "source-a", OwnerID: "s1", RunID: "run-1", TTLMillis: 1000,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease := resp.Lease
-	if lease.Term == 0 {
-		t.Fatalf("lease term was not assigned: %+v", lease)
-	}
-	missing := selectorPatchForTest("/g", []string{"n1"}, testNodeKeyPair(testAPISecret, testMK, 0))
-	if err := reg.applySelectorPatch(ctx, missing); !errors.Is(err, errMissingImportSourceLease) {
-		t.Fatalf("missing source lease patch err=%v, want errMissingImportSourceLease", err)
-	}
-	stale := selectorPatchForTest("/g", []string{"n1"}, testNodeKeyPair(testAPISecret, testMK, 0))
-	stale.ImportSourceID, stale.ImportOwnerID, stale.ImportRunID, stale.ImportTerm = "source-a", "s2", "run-2", lease.Term
-	if err := reg.applySelectorPatch(ctx, stale); !errors.Is(err, errStaleImportSourceLease) {
-		t.Fatalf("stale source owner patch err=%v, want errStaleImportSourceLease", err)
-	}
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
-	if node, found, err := reg.stores.GetNode(ctx, "n1"); err != nil || !found || len(node.KeyPairs) != 0 {
-		t.Fatalf("stale patch changed node_link key cache: node=%+v found=%v err=%v", node, found, err)
-	}
-	pair := testNodeKeyPair(testAPISecret, testMK, 0)
-	good := selectorPatchForTest("/g", []string{"n1"}, pair)
-	good.ImportSourceID, good.ImportOwnerID, good.ImportRunID, good.ImportTerm = "source-a", lease.OwnerID, lease.RunID, lease.Term
-	if err := reg.applySelectorPatch(ctx, good); err != nil {
-		t.Fatalf("current source owner patch was rejected: %v", err)
-	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found || len(node.KeyPairs) != 1 ||
-		node.KeyPairs[0].APISecretFingerprint != pair.APISecretFingerprint || node.KeyPairs[0].ManifestKey != testMK {
-		t.Fatalf("current patch not applied to node_link: node=%+v found=%v err=%v", node, found, err)
-	}
-}
-
 func testReg(t *testing.T) *Registry {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := New(newTestStores(), nil, 5*time.Second, log)
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 5*time.Second, log)
+
 	return reg
 }
 
@@ -802,62 +513,6 @@ func testAPIKeyValue() string {
 		panic(err)
 	}
 	return apiKey
-}
-
-func enableTestCreateAuth(t *testing.T, reg *Registry) {
-	t.Helper()
-	secret, err := hex.DecodeString(testAPISecret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		parsed, parseErr := apikey.Parse(req.Header.Get("X-API-KEY"))
-		if parseErr != nil || !apikey.Verify(parsed, secret) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(server.Close)
-	reg.SetPlacerPeerSource(func(string) []PlacerPeer {
-		return []PlacerPeer{{ID: "test-placer", Advertise: server.URL}}
-	})
-}
-
-func pushSelectorPatch(reg *Registry, group string, nodes []string, manifestKey string) error {
-	if manifestKey == "" {
-		return pushSelectorPatchPair(reg, group, nodes, "", "")
-	}
-	return pushSelectorPatchPair(reg, group, nodes, testAPISecret, manifestKey)
-}
-
-func pushSelectorPatchPair(reg *Registry, group string, nodes []string, apiSecret, manifestKey string) error {
-	ctx := context.Background()
-	resp, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{
-		SourceID: "test-source", OwnerID: "test-placer", RunID: "test-run", TTLMillis: 1000,
-	})
-	if err != nil {
-		return err
-	}
-	patch := &routesync.SelectorPatch{Group: group, NodeIDs: nodes}
-	if apiSecret != "" || manifestKey != "" {
-		patch = selectorPatchForTest(group, nodes, testNodeKeyPair(apiSecret, manifestKey, 0))
-	}
-	patch.ImportSourceID = resp.Lease.SourceID
-	patch.ImportOwnerID = resp.Lease.OwnerID
-	patch.ImportRunID = resp.Lease.RunID
-	patch.ImportTerm = resp.Lease.Term
-	return reg.applySelectorPatch(ctx, patch)
-}
-
-func selectorPatchForTest(group string, nodes []string, pair clusterstate.NodeKeyPair) *routesync.SelectorPatch {
-	return &routesync.SelectorPatch{
-		Group: group, NodeIDs: nodes,
-		APISecretFingerprint: pair.APISecretFingerprint, APISecretType: pair.APISecretType,
-		APISecret: pair.APISecret, APISecretRef: pair.APISecretRef,
-		ManifestKeyFingerprint: pair.ManifestKeyFingerprint, ManifestKeyType: pair.ManifestKeyType,
-		ManifestKey: pair.ManifestKey, ManifestKeyRef: pair.ManifestKeyRef,
-	}
 }
 
 // fakeConn implements nodeConn; its onCmd hook lets a test simulate the node
@@ -1031,7 +686,6 @@ func (o *remoteLifecycleOwner) SendCommandAndWait(ctx context.Context, nodeID st
 func TestReserveSandboxCreateFlow(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1053,7 +707,8 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
-	reg.addNode(conn)
+	publishTestGroups(t, reg, "n1", "/c/p/a/g1")
+	attachTestNode(t, reg, conn)
 
 	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/c/p/a/g1", "u1:s1", nil))
 	if err != nil {
@@ -1087,7 +742,6 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1115,7 +769,8 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 		route.IdleTimeout = new(int64(5)) // effective create hook policy
 		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
-	reg.addNode(conn)
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, conn)
 
 	request := testCreateReserve("/g", "auto-pause-false", nil)
 	value := false
@@ -1137,7 +792,6 @@ func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalseAndAutoReset(t *testi
 func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1145,7 +799,8 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	commandSeen := make(chan *routesync.Command, 1)
 	releaseReady := make(chan struct{})
 	var once sync.Once
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
@@ -1213,22 +868,24 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 	ctx := context.Background()
 	cluster := newTestStoreCluster(t, []string{"a", "b", "c"}, 3, 1, 1, 1)
 	nodeID := "node-remote"
-	waiter := New(cluster["a"], placementWithToken(nodeID), 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	reporter := New(cluster["b"], nil, 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, waiter)
+	waiter := New(cluster["a"], 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reporter := New(cluster["b"], 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	owner := &remoteRouteWriteOwner{
 		node: &NodeRecord{NodeID: nodeID, DataEndpoint: "127.0.0.1:12345"},
 		onCreate: func(cmd *routesync.Command) {
 			go func() {
 				time.Sleep(20 * time.Millisecond)
 				route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-				route.TemplateID = cmd.TemplateRef
+				if cmd.TemplateRef != "" {
+					route.TemplateID = cmd.TemplateRef
+				}
 				testApplyRoute(reporter, context.Background(), nodeID, &route)
 			}()
 		},
 	}
 	waiter.SetNodeOwner(owner)
-	seedTestNode(t, waiter.stores, nodeID)
+	publishTestGroups(t, waiter, nodeID, "/g")
 
 	res, err := waiter.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
@@ -1246,7 +903,6 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1260,7 +916,8 @@ func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go testApplyRoute(reg, context.Background(), "n1", &route)
 	}
-	reg.addNode(conn)
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, conn)
 
 	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "u1:s1", nil))
 	if err != nil {
@@ -1326,178 +983,38 @@ func TestMaterializedRouteReadsRejectCorruptCredentials(t *testing.T) {
 	}
 }
 
-func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
-	ctx := context.Background()
+func TestReserveSandboxSendsRequestInputAndGroupRevision(t *testing.T) {
 	reg := testReg(t)
-	basePlacer := placementWithToken("n1")
-	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
-		placement, err := basePlacer.Place(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		placement.Config[sandboxcfg.NsRestore] = `{"prefetch":"memory"}`
-		placement.Config[sandboxcfg.NsCheckpoint] = `{"merge_ref":true}`
-		placement.Config[sandboxcfg.NsTraffic] = `{"max_inflight":{"total":20,"forward":8}}`
-		return placement, nil
-	}))
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
-	var got *routesync.Command
-	conn := &fakeConn{nodeID: "n1"}
-	conn.onCmd = func(cmd *routesync.Command) {
-		if cmd.Kind != routesync.CmdCreate {
-			return
-		}
-		cp := *cmd
-		got = &cp
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		go testApplyRoute(reg, context.Background(), "n1", &route)
-	}
-	reg.addNode(conn)
-
-	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{"b": "2"})); err != nil {
-		t.Fatal(err)
-	}
-	if got == nil {
-		t.Fatal("create command not sent")
-	}
-	if got.TemplateRef != testTemplateRef || got.Config["a"] != "1" || got.Config["b"] != "2" {
-		t.Fatalf("create command did not use placement config: %+v", got)
-	}
-	if got.Config[sandboxcfg.NsTraffic] != `{"max_inflight":{"total":20,"forward":8}}` {
-		t.Fatalf("create command lost placement traffic config: %+v", got.Config)
-	}
-	if got.Profile != "e2b" || got.Cluster == nil || got.Cluster.Group != "/g" || got.Cluster.RouteKey != "rk" ||
-		got.Cluster.StableID == got.SID || got.SID != EncodeNodeSandboxID(got.Cluster.StableID, 0) {
-		t.Fatalf("create command identity context=%+v, want StableID and g0 node ID", got)
-	}
-	if _, ok := got.Config[clusterstate.ObjectMetadataKey]; ok {
-		t.Fatalf("cluster identity leaked into create metadata: %+v", got.Config)
-	}
-	if _, ok := got.Config[sandboxcfg.NsRestore]; ok {
-		t.Fatalf("placement restore leaked without an explicit create value: %+v", got.Config)
-	}
-	if _, ok := got.Config[sandboxcfg.NsCheckpoint]; ok {
-		t.Fatalf("placement checkpoint policy leaked without an explicit create value: %+v", got.Config)
-	}
-	if got.APISecretFingerprint != fullFingerprint(testAPISecret) {
-		t.Fatalf("key fingerprint=%q, want provider key fp", got.APISecretFingerprint)
-	}
-
-	for _, mode := range []string{"off", "memory"} {
-		got = nil
-		if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk-"+mode, map[string]string{
-			sandboxcfg.NsRestore: `{"prefetch":"` + mode + `"}`,
-		})); err != nil {
-			t.Fatal(err)
-		}
-		if got == nil || got.Config[sandboxcfg.NsRestore] != `{"prefetch":"`+mode+`"}` {
-			t.Fatalf("explicit create restore %q did not reach command: %+v", mode, got)
-		}
-	}
-
-	got = nil
-	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk-checkpoint", map[string]string{
-		sandboxcfg.NsCheckpoint: ` { "merge_ref" : false, "drop_caches" : null } `,
-	})); err != nil {
-		t.Fatal(err)
-	}
-	if got == nil || got.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
-		t.Fatalf("explicit Create checkpoint policy did not reach command canonically: %+v", got)
-	}
-
-	got = nil
-	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk-traffic", map[string]string{
-		sandboxcfg.NsTraffic: ` { "max_inflight" : { "forward" : 0, "exec" : 2 } } `,
-	})); err != nil {
-		t.Fatal(err)
-	}
-	if got == nil || got.Config[sandboxcfg.NsTraffic] != `{"max_inflight":{"total":20,"forward":0,"exec":2}}` {
-		t.Fatalf("explicit Create traffic patch did not leaf-merge into command: %+v", got)
-	}
-}
-
-func TestReserveSandboxLeafMergesPlacementAndRequestResources(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	basePlacer := placementWithToken("n1")
-	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
-		placement, err := basePlacer.Place(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		placement.Config[sandboxcfg.NsResource] = `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":0.5}}`
-		return placement, nil
-	}))
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
+	publishTestGroups(t, reg, "n1", "/g")
 	var command *routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
-		copy := *cmd
-		copy.Config = cloneStringMap(cmd.Config)
-		command = &copy
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		command = cmd
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		go testApplyRoute(reg, context.Background(), "n1", &route)
+		testApplyRoute(reg, t.Context(), "n1", &route)
 	}})
-
-	_, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "resource-leaves", map[string]string{
-		sandboxcfg.NsResource: `{"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`,
-	}))
+	config := map[string]string{"request": "only", sandboxcfg.NsCheckpoint: `{"merge_ref":false}`}
+	result, err := reg.ReserveSandbox(t.Context(), testCreateReserve("/g", "rk", config))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if command == nil {
-		t.Fatal("create command not sent")
+	if command == nil || command.TemplateRef != "" || command.ExpectedGroupVersion != 1 || command.GroupAPIKey == "" || command.Config["request"] != "only" || command.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+		t.Fatalf("lost request/Group input: %+v", command)
 	}
-	patch, err := sandboxcfg.ParseResourcePatch(command.Config[sandboxcfg.NsResource])
-	if err != nil {
-		t.Fatal(err)
+	if command.APISecretFingerprint != testAPIFingerprint || command.ImageRepo != "" || command.RegistryAuth != "" || command.Cluster == nil || command.Cluster.StableID != result.Route.SandboxID || command.SID != EncodeNodeSandboxID(result.Route.SandboxID, 0) {
+		t.Fatal("command lost identity or exposed private Group input")
 	}
-	if patch.Capacity == nil || patch.Capacity.CPU == nil || *patch.Capacity.CPU != 4 ||
-		patch.Capacity.Memory == nil || *patch.Capacity.Memory != "8GiB" ||
-		patch.Allocatable == nil || patch.Allocatable.CPU == nil || *patch.Allocatable.CPU != 0.5 ||
-		patch.Allocatable.Memory == nil || *patch.Allocatable.Memory != "512MiB" ||
-		patch.Startup == nil || patch.Startup.Memory == nil || *patch.Startup.Memory != "1GiB" {
-		t.Fatalf("merged resource patch = %+v", patch)
-	}
-}
-
-func TestReserveSandboxDoesNotHideInvalidPlacementResourceWithRequest(t *testing.T) {
-	reg := testReg(t)
-	commands := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		return &Placement{
-			NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint,
-			Config: map[string]string{sandboxcfg.NsResource: `{"control":{}}`},
-		}, nil
-	}))
-	if err := putTestNode(reg.stores, context.Background(), &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { commands++ }})
-
-	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "invalid-placement-resource", map[string]string{
-		sandboxcfg.NsResource: `{"capacity":{"cpu":8,"memory":"16GiB"},"allocatable":{"memory":"1GiB"}}`,
-	}))
-	if !errors.Is(err, errInvalidSandboxConfig) || !strings.Contains(err.Error(), "node-managed") {
-		t.Fatalf("ReserveSandbox error = %v", err)
-	}
-	if commands != 0 {
-		t.Fatalf("invalid lower-priority resource sent %d commands", commands)
+	if _, found := command.Config[clusterstate.ObjectMetadataKey]; found {
+		t.Fatal("private identity leaked into metadata")
 	}
 }
 
 func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 	placements := 0
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	countTestGroupReads(reg).before = func() {
 		placements++
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}))
+	}
 
 	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
@@ -1533,20 +1050,17 @@ func TestReserveSandboxRejectsInvalidCredentialsBeforeReadyFastPath(t *testing.T
 	}
 }
 
-func TestReserveSandboxRejectsInvalidPlacementTemplate(t *testing.T) {
+func TestReserveSandboxRejectsInvalidExplicitTemplateBeforeMutation(t *testing.T) {
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		return &Placement{
-			NodeID: "n1", TemplateRef: "e2b-snp-invalid", APISecretFingerprint: testAPIFingerprint,
-		}, nil
-	}))
-
-	if _, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk", nil)); err == nil ||
-		!strings.Contains(err.Error(), "invalid placement template") {
-		t.Fatalf("ReserveSandbox error=%v, want invalid placement template", err)
+	publishTestGroups(t, reg, "n1", "/g")
+	request := testCreateReserve("/g", "rk", nil)
+	invalid := "e2b-snp-invalid"
+	request.TemplateID = &invalid
+	if _, err := reg.ReserveSandbox(t.Context(), request); !errors.Is(err, ErrReserveBadRequest) {
+		t.Fatalf("invalid template accepted: %v", err)
 	}
-	if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
-		t.Fatalf("invalid template wrote route: found=%v err=%v", found, err)
+	if _, _, found, err := reg.stores.GetSandbox(t.Context(), "/g", "rk"); err != nil || found {
+		t.Fatalf("invalid template wrote intent: %v %v", found, err)
 	}
 }
 
@@ -1555,6 +1069,9 @@ func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
 	call := &reserveCall{done: make(chan struct{}), result: result}
 	close(call.done)
 	reg := testReg(t)
+	if _, err := reg.stores.PutSandbox(t.Context(), testE2BSandboxRecord("/g", "rk", "s1", "n1", StateReserved)); err != nil {
+		t.Fatal(err)
+	}
 	reg.inflight[flightKey("/g", "rk")] = call
 
 	got, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk", map[string]string{
@@ -1567,11 +1084,12 @@ func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
 
 func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 	ctx := context.Background()
-	reg := New(newTestStores(), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
+	publishTestGroups(t, reg, "n-remote", "/g")
 	owner := &remoteLifecycleOwner{reg: reg}
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": owner})
 
@@ -1586,11 +1104,8 @@ func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 
 func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 	ctx := context.Background()
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		t.Fatal("ready route should not call placer")
-		return nil, nil
-	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1610,11 +1125,8 @@ func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 func TestReserveSandboxDoesNotReplaceReadyRouteOnRuntimeError(t *testing.T) {
 	ctx := context.Background()
 	placements := 0
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		return &Placement{NodeID: "replacement", APISecretFingerprint: testAPIFingerprint}, nil
-	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-ready", "n1", StateReady)); err != nil {
 		t.Fatal(err)
 	}
@@ -1646,6 +1158,7 @@ func TestSendAndWaitAck(t *testing.T) {
 	conn := &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}}
+	reg.addNode(conn)
 	ack, err := reg.sendAndWait(context.Background(), conn, &routesync.Command{CmdID: "c1", Kind: routesync.CmdKeyPut}, 2*time.Second)
 	if err != nil {
 		t.Fatalf("sendAndWait: %v", err)
@@ -1687,12 +1200,12 @@ func TestCreateRejectFastFails(t *testing.T) {
 func TestCreateRejectRestoresPreexistingRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
 	orig := testE2BSandboxRecord("/g", "rk", "sb-existing", "n-gone", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
 	}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind == routesync.CmdCreate {
 			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "reject"})
 		}
@@ -1711,7 +1224,7 @@ func TestDeadReportRetainsManagementUntilFinalDelete(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-dead", "n1", StateReady))
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-dead", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-dead", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1745,7 +1258,7 @@ func TestStartingReportPreservesRegistryRouteState(t *testing.T) {
 				t.Fatal(err)
 			}
 			ref := testNodeSandboxRef("/g", "rk", sid, "e2b", testAPIFingerprint)
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+			if err := addTestSandboxRef(t, reg.stores, ctx, "n1", ref); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1771,7 +1284,7 @@ func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-new", "n1", StateReady)); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1796,7 +1309,7 @@ func TestStaleLiveReportRetainsOwnershipUntilFinalDelete(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-new", "n1", StateReady)); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	var deletes int
@@ -1834,7 +1347,7 @@ func TestRouteReportProfileMustMatchOwnership(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-profile", "n1", StateReserved)); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-profile", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-profile", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	var deletes int
@@ -1907,7 +1420,7 @@ func TestReservedRouteWithMaterializedCredentialsRejectsRebinding(t *testing.T) 
 	if _, err := reg.stores.PutSandbox(ctx, current); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-resume", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "sb-resume", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	var deletes int
@@ -1966,7 +1479,7 @@ func TestRouteEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 		if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
 			t.Fatal(err)
 		}
-		if err := reg.stores.AddNodeSandboxRef(ctx, tc.node, testNodeSandboxRef(tc.group, tc.routeKey, "same-sandbox", "e2b", testAPIFingerprint)); err != nil {
+		if err := addTestSandboxRef(t, reg.stores, ctx, tc.node, testNodeSandboxRef(tc.group, tc.routeKey, "same-sandbox", "e2b", testAPIFingerprint)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1990,23 +1503,23 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	var firstSID string
-	placeCalls := 0
-	basePlacer := placementWithToken("n1")
-	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
-		placeCalls++
-		if placeCalls == 1 {
-			firstSID = req.SandboxID
-			if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/existing", "rk-existing", firstSID, "n1", StateReady)); err != nil {
-				return nil, err
-			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/existing", "rk-existing", firstSID, "e2b", testAPIFingerprint)); err != nil {
-				return nil, err
-			}
+	publishTestGroups(t, reg, "n1", "/new")
+	commits := 0
+	reg.stores.routes = &testGroupCommit{RouteRepository: reg.stores.routes, before: func(record metadata.SandboxRecord) {
+		commits++
+		if commits != 1 {
+			return
 		}
-		return basePlacer.Place(ctx, req)
-	}))
+		firstSID = record.SandboxID
+		if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/existing", "rk-existing", firstSID, "n1", StateReady)); err != nil {
+			t.Fatal(err)
+		}
+		if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/existing", "rk-existing", firstSID, "e2b", testAPIFingerprint)); err != nil {
+			t.Fatal(err)
+		}
+	}}
 	var createSIDs []string
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
@@ -2023,8 +1536,8 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReserveSandbox: %v", err)
 	}
-	if placeCalls != 2 || firstSID == "" || res.Route.SandboxID != firstSID || res.Route.NodeSandboxID == EncodeNodeSandboxID(firstSID, 0) {
-		t.Fatalf("placeCalls=%d firstSID=%q result=%+v", placeCalls, firstSID, res)
+	if commits != 2 || firstSID == "" || res.Route.SandboxID != firstSID || res.Route.NodeSandboxID == EncodeNodeSandboxID(firstSID, 0) {
+		t.Fatalf("commits=%d firstSID=%q result=%+v", commits, firstSID, res)
 	}
 	if len(createSIDs) != 1 || createSIDs[0] != res.Route.NodeSandboxID {
 		t.Fatalf("create commands=%v result=%+v", createSIDs, res)
@@ -2039,13 +1552,13 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 
 func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
-	reg := New(newTestStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
-	reg.SetPlacer(placementWithToken("n1"))
+	reg := New(newTestStores(t), 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
 	var sid string
 	var deletes int
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		switch cmd.Kind {
 		case routesync.CmdCreate:
 			sid = cmd.SID
@@ -2105,7 +1618,7 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 	}
 	ref := testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)
 	ref.SandboxGeneration, ref.NodeSandboxID = 1, reserved.NodeSandboxID
-	if err := reg.stores.AddNodeSandboxRef(ctx, "new", ref); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "new", ref); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2142,7 +1655,7 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	}
 	ref := testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)
 	ref.SandboxGeneration, ref.NodeSandboxID = 1, reserved.NodeSandboxID
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", ref); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2176,7 +1689,7 @@ func TestRollbackReserveRestoresOriginalCredentialBinding(t *testing.T) {
 	}
 	ref := testNodeSandboxRef("/g", "rk", reserved.SandboxID, "e2b", reserved.APISecretFingerprint)
 	ref.SandboxGeneration, ref.NodeSandboxID = 1, reserved.NodeSandboxID
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", ref); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2203,7 +1716,7 @@ func TestRollbackReserveRevisionFencesConcurrentWinner(t *testing.T) {
 			if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "candidate", testNodeSandboxRef("/g", "rk", reserved.SandboxID, "e2b", testAPIFingerprint)); err != nil {
+			if err := addTestSandboxRef(t, reg.stores, ctx, "candidate", testNodeSandboxRef("/g", "rk", reserved.SandboxID, "e2b", testAPIFingerprint)); err != nil {
 				t.Fatal(err)
 			}
 			observed, rev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -2257,17 +1770,11 @@ func TestReserveFinishIsSingleAssignment(t *testing.T) {
 	}
 }
 
-func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
+func TestReadyReplacementTransportFailureRetainsBothOwners(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	placements := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		if placements == 1 {
-			return &Placement{NodeID: "candidate", APISecretFingerprint: testAPIFingerprint}, nil
-		}
-		return nil, ErrNoNode
-	}))
+	reg.parkTimeout = 40 * time.Millisecond
+
 	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
@@ -2277,31 +1784,24 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
-	reg.addNode(&fakeConn{nodeID: "candidate", err: ErrNodeGone})
+	publishTestGroups(t, reg, "candidate", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "candidate", err: ErrNodeGone})
 
-	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, ErrNodeGone) {
-		t.Fatalf("ReserveSandbox err=%v, want ErrNodeGone", err)
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); err == nil {
+		t.Fatal("lost delivery unexpectedly succeeded")
 	}
-	if placements != 2 {
-		t.Fatalf("placements=%d, want failed candidate followed by no-node result", placements)
+	stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || stored.SandboxID != orig.SandboxID {
+		t.Fatal("stable identity lost")
 	}
-	restored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found || restored.SandboxID != "sb-old" || restored.NodeSandboxID != orig.NodeSandboxID || restored.SandboxGeneration != 0 || restored.NextSandboxGeneration != 2 || restored.NodeID != "old" || restored.State != StateReady {
-		t.Fatalf("restored route=%+v found=%v err=%v", restored, found, err)
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "candidate", EncodeNodeSandboxID(orig.SandboxID, 1)); err != nil || !found || ref.SandboxID != orig.SandboxID {
+		t.Fatalf("ambiguous delivery lost ownership: %v %v", found, err)
 	}
-	oldNode, found, err := reg.stores.GetNode(ctx, "old")
-	if err != nil || !found || len(oldNode.Sandboxes) != 1 || oldNode.Sandboxes[0].SandboxID != "sb-old" {
-		t.Fatalf("restored old node=%+v found=%v err=%v", oldNode, found, err)
-	}
-	candidate, found, err := reg.stores.GetNode(ctx, "candidate")
-	if err != nil || !found || len(candidate.Sandboxes) != 0 {
-		t.Fatalf("failed candidate=%+v found=%v err=%v", candidate, found, err)
-	}
-	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "old", orig.NodeSandboxID); err != nil || !found || ref.RouteKey != "rk" {
-		t.Fatalf("failed replacement did not restore old owner ref: ref=%+v found=%v err=%v", ref, found, err)
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "old", orig.NodeSandboxID); err != nil || !found {
+		t.Fatal("original ownership lost")
 	}
 }
 
@@ -2309,7 +1809,6 @@ func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.parkTimeout = 100 * time.Millisecond
-	reg.SetPlacer(placementWithToken("new"))
 	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
@@ -2319,12 +1818,13 @@ func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "old", testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	deleted := make(chan struct{})
 	var replacementSID string
-	reg.addNode(&fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "new", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
@@ -2361,9 +1861,8 @@ func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
 func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		return &Placement{NodeID: "candidate", APISecretFingerprint: strings.Repeat("b", 64)}, nil
-	}))
+	otherKey, entry := registryGroupEntry(t)
+	publishTestSupport(t, reg, "candidate", nodegroup.Support{Group: "/g", Version: 1, Entries: []nodegroup.Entry{entry}, DefaultContext: &nodegroup.DefaultContext{TemplateID: testTemplateRef}})
 	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
@@ -2371,11 +1870,11 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "old"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false); err == nil ||
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false, createOptions{apiKey: otherKey}); err == nil ||
 		!strings.Contains(err.Error(), "credential binding mismatch") {
 		t.Fatalf("placeAndCreate error = %v; want binding mismatch", err)
 	}
@@ -2392,12 +1891,8 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 func TestReadyReplacementRejectsProfileChange(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		return &Placement{
-			NodeID: "candidate", TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
-			APISecretFingerprint: testAPIFingerprint,
-		}, nil
-	}))
+	support := nodegroup.Support{Group: "/g", Version: 1, Entries: []nodegroup.Entry{{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}}, DefaultContext: &nodegroup.DefaultContext{TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String()}}
+	publishTestSupport(t, reg, "candidate", support)
 	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
@@ -2405,11 +1900,11 @@ func TestReadyReplacementRejectsProfileChange(t *testing.T) {
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "old"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false); err == nil ||
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false, createOptions{apiKey: testAPIKeyValue()}); err == nil ||
 		!strings.Contains(err.Error(), "replacement profile mismatch") {
 		t.Fatalf("placeAndCreate error = %v; want profile mismatch", err)
 	}
@@ -2431,22 +1926,18 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "new"}); err != nil {
 		t.Fatal(err)
 	}
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		return &Placement{
-			NodeID: "new", TemplateRef: testTemplateRef,
-			APISecretFingerprint: original.APISecretFingerprint,
-		}, nil
-	}))
+
 	var command *routesync.Command
 	var reserved *SandboxRecord
-	reg.addNode(&fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "new", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
 		copy := *cmd
 		copy.Config = cloneStringMap(cmd.Config)
 		command = &copy
 		reserved, _, _, _ = reg.stores.GetSandbox(ctx, "/g", "rk")
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := routesync.RouteEntry{
-			SandboxID: cmd.SID, Profile: original.Profile, State: routesync.StateRunning,
+			TemplateID: testTemplateRef, SandboxID: cmd.SID, Profile: original.Profile, State: routesync.StateRunning,
 			StableID: original.StableID, APISecret: original.APISecret,
 			APISecretFingerprint:   original.APISecretFingerprint,
 			ManifestKeyFingerprint: original.ManifestKeyFingerprint,
@@ -2498,7 +1989,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	}
 }
 
-func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
+func TestMaterializedReservedRejectionPreservesCredentialBinding(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "stable-auth-sid", "old", StateReserved)
@@ -2512,23 +2003,17 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, Counts: int(nodeID[1] - '1')}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	placements := 0
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		placements++
-		nodeID := "n1"
-		if placements == 2 {
-			nodeID = "n2"
-		}
-		return &Placement{NodeID: nodeID, TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
-	}))
+	publishTestGroups(t, reg, "n1", "/g")
+	publishTestGroups(t, reg, "n2", "/g")
+	reads := countTestGroupReads(reg)
 	var commands []*routesync.Command
 	for _, nodeID := range []string{"n1", "n2"} {
 		nodeID := nodeID
-		reg.addNode(&fakeConn{nodeID: nodeID, onCmd: func(cmd *routesync.Command) {
+		attachTestNode(t, reg, &fakeConn{nodeID: nodeID, onCmd: func(cmd *routesync.Command) {
 			copy := *cmd
 			copy.Config = cloneStringMap(cmd.Config)
 			commands = append(commands, &copy)
@@ -2543,11 +2028,11 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	newOverride := &sandboxcfg.Credentials{
 		ServiceSecret: strings.Repeat("4", 64), EnvdAccessToken: "new-envd", TrafficAccessToken: "new-traffic",
 	}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, newOverride, nil, true, false, createOptions{maxCheckpoints: 29}); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, newOverride, nil, true, false, createOptions{apiKey: testAPIKeyValue(), maxCheckpoints: 29}); err != nil {
 		t.Fatal(err)
 	}
-	if placements != 2 || len(commands) != 2 {
-		t.Fatalf("placements=%d commands=%d, want two attempts", placements, len(commands))
+	if reads.calls != 1 || len(commands) != 1 {
+		t.Fatalf("reads.calls=%d commands=%d, want one ambiguous attempt", reads.calls, len(commands))
 	}
 	for _, cmd := range commands {
 		if cmd.Cluster == nil || cmd.Cluster.StableID != original.StableID ||
@@ -2571,12 +2056,12 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		}
 	}
 	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found || reserved.State != StateReserved || reserved.NodeID != "n2" ||
+	if err != nil || !found || reserved.State != StateReserved || reserved.NodeID != "n1" ||
 		reserved.AutoPauseMemory || reserved.MaxCheckpoints != 17 || !sameRouteCredentials(reserved, original) {
 		t.Fatal("replacement retry did not persist the original credential binding")
 	}
 	route := testRouteFromRecord(original, reserved.NodeSandboxID, routesync.StateRunning)
-	testApplyRoute(reg, ctx, "n2", &route)
+	testApplyRoute(reg, ctx, "n1", &route)
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || ready.State != StateReady || ready.CreateCredentials != nil || ready.MaxCheckpoints != 17 ||
 		!sameRouteCredentials(ready, original) {
@@ -2595,52 +2080,24 @@ func TestMaterializedReservedRetryRejectsBindingChange(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	for _, nodeID := range []string{"n1", "n2"} {
-		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	placements := 0
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		placements++
-		fingerprint := testAPIFingerprint
-		if placements == 2 {
-			fingerprint = strings.Repeat("b", 64)
-		}
-		return &Placement{
-			NodeID: fmt.Sprintf("n%d", placements), TemplateRef: testTemplateRef,
-			APISecretFingerprint: fingerprint,
-		}, nil
-	}))
-	commands := 0
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
-		commands++
-		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected})
-	}})
-	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) { commands++ }})
-
-	err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false)
+	otherKey, entry := registryGroupEntry(t)
+	publishTestSupport(t, reg, "candidate", nodegroup.Support{Group: "/g", Version: 1, Entries: []nodegroup.Entry{entry}, DefaultContext: &nodegroup.DefaultContext{TemplateID: testTemplateRef}})
+	err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false, createOptions{apiKey: otherKey})
 	if err == nil || !strings.Contains(err.Error(), "credential binding mismatch") {
-		t.Fatalf("placeAndCreate error=%v, want credential binding mismatch", err)
+		t.Fatalf("binding change: %v", err)
 	}
-	if placements != 2 || commands != 1 {
-		t.Fatalf("placements=%d commands=%d, binding change reached a node", placements, commands)
+	stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || stored.NodeID != original.NodeID || stored.NodeSandboxID != original.NodeSandboxID || !sameRouteCredentials(stored, original) {
+		t.Fatal("binding change mutated original reservation")
 	}
 }
 
 func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
-			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
-		}
-		return &Placement{
-			NodeID: "candidate", TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
-			APISecretFingerprint: testAPIFingerprint,
-		}, nil
-	}))
-	err := reg.placeAndCreate(ctx, "/g", "rk", nil, &sandboxcfg.Credentials{EnvdAccessToken: "envd"}, nil, true, false)
+	support := nodegroup.Support{Group: "/g", Version: 1, Entries: []nodegroup.Entry{{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}}, DefaultContext: &nodegroup.DefaultContext{TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String()}}
+	publishTestSupport(t, reg, "candidate", support)
+	err := reg.placeAndCreate(ctx, "/g", "rk", nil, &sandboxcfg.Credentials{EnvdAccessToken: "envd"}, nil, true, false, createOptions{apiKey: testAPIKeyValue()})
 	if err == nil || !strings.Contains(err.Error(), "not valid for bare") {
 		t.Fatalf("placeAndCreate error = %v", err)
 	}
@@ -2652,19 +2109,11 @@ func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T)
 func TestCreateRejectsProfileInvalidTrafficBeforeRouteMutation(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		return &Placement{
-			NodeID: "candidate",
-			TemplateRef: types.TemplateID{
-				Profile: types.ProfileBare, Kind: types.KindImg,
-				Ref: "manifest://" + strings.Repeat("b", 64),
-			}.String(),
-			APISecretFingerprint: testAPIFingerprint,
-		}, nil
-	}))
+	support := nodegroup.Support{Group: "/g", Version: 1, Entries: []nodegroup.Entry{{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}}, DefaultContext: &nodegroup.DefaultContext{TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String()}}
+	publishTestSupport(t, reg, "candidate", support)
 	err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{
 		sandboxcfg.NsTraffic: `{"max_inflight":{"e2b:envd":0}}`,
-	}, nil, nil, true, false)
+	}, nil, nil, true, false, createOptions{apiKey: testAPIKeyValue()})
 	if !errors.Is(err, errInvalidSandboxConfig) || !strings.Contains(err.Error(), "not applicable to bare") {
 		t.Fatalf("placeAndCreate error = %v", err)
 	}
@@ -2715,10 +2164,9 @@ func TestNormalizeSandboxReserveConfigSeparatesCreateCredentials(t *testing.T) {
 func TestReserveSandboxRejectsInvalidCheckpointBeforePlacement(t *testing.T) {
 	placements := 0
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	countTestGroupReads(reg).before = func() {
 		placements++
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}))
+	}
 
 	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk-checkpoint-invalid", map[string]string{
 		sandboxcfg.NsCheckpoint: `{"merge_ref":"false"}`,
@@ -2737,14 +2185,13 @@ func TestReserveSandboxRejectsInvalidCheckpointBeforePlacement(t *testing.T) {
 func TestPlaceAndCreateRejectsUnseparatedCredentials(t *testing.T) {
 	placements := 0
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	countTestGroupReads(reg).before = func() {
 		placements++
-		return nil, ErrNoNode
-	}))
+	}
 	const privateValue = "must-not-appear"
 	err := reg.placeAndCreate(context.Background(), "/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: `{"envd_access_token":"` + privateValue + `"}`,
-	}, nil, nil, true, false)
+	}, nil, nil, true, false, createOptions{apiKey: testAPIKeyValue()})
 	if err == nil || strings.Contains(err.Error(), privateValue) {
 		t.Fatalf("unseparated credentials error=%q", err)
 	}
@@ -2792,27 +2239,20 @@ func TestCreateCredentialsPersistWithReservedAndClearOnReady(t *testing.T) {
 		EnvdAccessToken:    "envd-private",
 		TrafficAccessToken: "traffic-private",
 	}
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
-			t.Fatalf("credentials reached placer config: %+v", req.Config)
-		}
-		return &Placement{
-			NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint,
-			Config: map[string]string{sandboxcfg.NsCredentials: `{"envd_access_token":"placement-fallback"}`},
-		}, nil
-	}))
+
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var command *routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		copy := *cmd
 		copy.Config = cloneStringMap(cmd.Config)
 		command = &copy
 		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}})
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{"ordinary": "value"}, credentials, nil, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{"ordinary": "value"}, credentials, nil, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
 		t.Fatal(err)
 	}
 	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -2853,35 +2293,28 @@ func TestCreateCredentialsCASRetryUsesCommittedWinner(t *testing.T) {
 	reg := testReg(t)
 	winner := &sandboxcfg.Credentials{EnvdAccessToken: "winner-envd"}
 	later := &sandboxcfg.Credentials{EnvdAccessToken: "later-envd"}
-	placements := 0
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		placements++
-		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
-			t.Fatalf("credentials reached placement attempt %d: %+v", placements, req.Config)
-		}
-		if placements == 1 {
+	publishTestGroups(t, reg, "n1", "/g")
+	reads := countTestGroupReads(reg)
+	reads.before = func() {
+		if reads.calls == 1 {
 			winnerRecord := testSandboxIdentityRecord("/g", "rk", "sb-winner", "winner-node", StateReserved)
 			winnerRecord.CreateCredentials = cloneCreateCredentials(winner)
 			if _, err := reg.stores.PutSandbox(ctx, winnerRecord); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return &Placement{NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
-	}))
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
 	}
 	var commandConfig map[string]string
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		commandConfig = cloneStringMap(cmd.Config)
 		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}})
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
 		t.Fatal(err)
 	}
-	if placements != 2 {
-		t.Fatalf("placement attempts=%d, want CAS retry", placements)
+	if reads.calls != 2 {
+		t.Fatalf("placement attempts=%d, want CAS retry", reads.calls)
 	}
 	if commandConfig[sandboxcfg.NsCredentials] != `{"envd_access_token":"winner-envd"}` {
 		t.Fatalf("CAS retry adopted later credentials: %+v", commandConfig)
@@ -2902,31 +2335,27 @@ func TestCreateCredentialsCASRetryDropsRolledBackWinner(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, otherCandidate); err != nil {
 		t.Fatal(err)
 	}
-	placements := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		if placements == 1 {
+	publishTestGroups(t, reg, "n1", "/g")
+	reads := countTestGroupReads(reg)
+	reads.before = func() {
+		if reads.calls == 1 {
 			if _, err := reg.stores.PutSandbox(ctx, rolledBackState); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return &Placement{NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
-	}))
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
 	}
 	var commandConfig map[string]string
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		commandConfig = cloneStringMap(cmd.Config)
 		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}})
 
 	requestCredentials := &sandboxcfg.Credentials{EnvdAccessToken: "request-winner"}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, requestCredentials, nil, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, requestCredentials, nil, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
 		t.Fatal(err)
 	}
-	if placements != 2 {
-		t.Fatalf("placement attempts=%d, want CAS retry", placements)
+	if reads.calls != 2 {
+		t.Fatalf("placement attempts=%d, want CAS retry", reads.calls)
 	}
 	if commandConfig[sandboxcfg.NsCredentials] != `{"envd_access_token":"request-winner"}` {
 		t.Fatalf("CAS retry retained rolled-back credentials: %+v", commandConfig)
@@ -2943,18 +2372,18 @@ func TestReservedWithoutCreateCredentialsRejectsLaterFallback(t *testing.T) {
 	if _, err := reg.stores.PutSandbox(ctx, testSandboxIdentityRecord("/g", "rk", "sb-winner", "winner-node", StateReserved)); err != nil {
 		t.Fatal(err)
 	}
-	reg.SetPlacer(placementWithToken("n1"))
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	var commandConfig map[string]string
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		commandConfig = cloneStringMap(cmd.Config)
 		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}})
 
 	later := &sandboxcfg.Credentials{EnvdAccessToken: "later-envd"}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, found := commandConfig[sandboxcfg.NsCredentials]; found {
@@ -3013,24 +2442,23 @@ func TestReadyReplacementCASRetryPreservesConcurrentCredentialBinding(t *testing
 	}
 	reg.addNode(&fakeConn{nodeID: "candidate"})
 	currentFingerprint := strings.Repeat("b", 64)
-	placements := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		if placements == 1 {
+	publishTestGroups(t, reg, "candidate", "/g")
+	reads := countTestGroupReads(reg)
+	reads.before = func() {
+		if reads.calls == 1 {
 			concurrent := *orig
 			concurrent.APISecretFingerprint = currentFingerprint
 			if _, err := reg.stores.PutSandbox(ctx, &concurrent); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return &Placement{NodeID: "candidate", APISecretFingerprint: testAPIFingerprint}, nil
-	}))
+	}
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
 		t.Fatal(err)
 	}
-	if placements != 1 {
-		t.Fatalf("placements=%d, want one stale placement attempt", placements)
+	if reads.calls != 1 {
+		t.Fatalf("reads.calls=%d, want one stale placement attempt", reads.calls)
 	}
 	route, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || route.APISecretFingerprint != currentFingerprint || route.State != StateReady {
@@ -3041,7 +2469,6 @@ func TestReadyReplacementCASRetryPreservesConcurrentCredentialBinding(t *testing
 func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("new"))
 	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
 		t.Fatal(err)
@@ -3051,17 +2478,18 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "old", testNodeSandboxRef("/g", "rk", "sb-old", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	var replacementSID string
-	reg.addNode(&fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "new", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind == routesync.CmdCreate {
 			replacementSID = cmd.SID
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		}
 	}})
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
 		t.Fatalf("placeAndCreate: %v", err)
 	}
 	reserved, reservedRev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -3131,10 +2559,10 @@ func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 			}
 			currentRef := testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", testAPIFingerprint)
 			currentRef.SandboxGeneration, currentRef.NodeSandboxID = 1, current.NodeSandboxID
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", currentRef); err != nil {
+			if err := addTestSandboxRef(t, reg.stores, ctx, "n1", currentRef); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", testAPIFingerprint)); err != nil {
+			if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", testAPIFingerprint)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -3166,7 +2594,7 @@ func TestLateRouteEventsDoNotCrossCredentialBinding(t *testing.T) {
 			if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", oldFingerprint)); err != nil {
+			if err := addTestSandboxRef(t, reg.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", oldFingerprint)); err != nil {
 				t.Fatal(err)
 			}
 			current := testSandboxIdentityRecord("/g", "rk", "same-sandbox", "n1", StateReady)
@@ -3194,80 +2622,72 @@ func TestLateRouteEventsDoNotCrossCredentialBinding(t *testing.T) {
 	}
 }
 
-func TestReplaceOnRejectSucceeds(t *testing.T) {
+func TestGenericCreateRejectionRetainsOwnerAndAcceptsLateRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	const credentialsJSON = `{"envd_access_token":"same-on-every-attempt"}`
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		for _, nodeID := range req.ExcludeNodeIDs {
-			if nodeID == "n1" {
-				return &Placement{NodeID: "n2", APISecretFingerprint: testAPIFingerprint}, nil
-			}
+	for _, id := range []string{"n1", "n2"} {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: id, Counts: int(id[1] - '1')}); err != nil {
+			t.Fatal(err)
 		}
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}))
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"})
-	putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n2"})
-	creates := 0
-	var createCredentials []string
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
-		if cmd.Kind != routesync.CmdCreate {
-			return
-		}
-		creates++
-		createCredentials = append(createCredentials, cmd.Config[sandboxcfg.NsCredentials])
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "transient"})
-	}})
-	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
-		if cmd.Kind != routesync.CmdCreate {
-			return
-		}
-		creates++
-		createCredentials = append(createCredentials, cmd.Config[sandboxcfg.NsCredentials])
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
-		route.SandboxID = cmd.SID
-		go testApplyRoute(reg, context.Background(), "n2", &route)
-	}})
-
-	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
-		sandboxcfg.NsCredentials: credentialsJSON,
-	}))
-	if err != nil {
-		t.Fatalf("reserve should succeed after excluding the rejected node: %v", err)
+		publishTestGroups(t, reg, id, "/g")
 	}
-	if res.Route.NodeID != "n2" || creates != 2 {
-		t.Fatalf("expected n1 reject then n2 success; got %d creates, res=%+v", creates, res)
+	var commands []*routesync.Command
+	for _, id := range []string{"n1", "n2"} {
+		attachTestNode(t, reg, &fakeConn{nodeID: id, onCmd: func(cmd *routesync.Command) {
+			commands = append(commands, cmd)
+			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, HTTPStatus: 409, Reason: "ambiguous rejection"})
+		}})
 	}
-	if len(createCredentials) != 2 || createCredentials[0] != credentialsJSON || createCredentials[1] != credentialsJSON {
-		t.Fatalf("re-place changed create credentials: %v", createCredentials)
+	credentials := &sandboxcfg.Credentials{EnvdAccessToken: "original"}
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, credentials, nil, true, false, createOptions{apiKey: testAPIKeyValue()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("ordinary rejection retried: %d", len(commands))
+	}
+	stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || stored.State != StateReserved || stored.NodeID != "n1" || stored.CreateCredentials == nil || *stored.CreateCredentials != *credentials {
+		t.Fatal("ambiguous intent changed")
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", stored.NodeSandboxID); err != nil || !found {
+		t.Fatal("ordinary rejection dropped owner")
+	}
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found || len(node.Sandboxes) != 1 {
+		t.Fatal("missing ambiguous owner")
+	}
+	if err := reg.applyNodeFullSnapshot(testNodeSession(ctx, reg.stores, "n1"), "n1", node.Sandboxes, map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", stored.NodeSandboxID); err != nil || !found {
+		t.Fatal("snapshot absence retired ambiguous invocation")
+	}
+	route := testE2BRoute(stored.SandboxID, routesync.StateRunning)
+	route.SandboxID = stored.NodeSandboxID
+	testApplyRoute(reg, ctx, "n1", &route)
+	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || ready.State != StateReady || ready.NodeSandboxID != stored.NodeSandboxID {
+		t.Fatal("late authoritative fact was lost")
 	}
 }
 
 func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	var sawExclusion bool
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		for _, nodeID := range req.ExcludeNodeIDs {
-			if nodeID == "stale" {
-				sawExclusion = true
-				return &Placement{NodeID: "live", APISecretFingerprint: testAPIFingerprint}, nil
-			}
-		}
-		return &Placement{NodeID: "stale", APISecretFingerprint: testAPIFingerprint}, nil
-	}))
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "stale"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "live"}); err != nil {
+	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "live", Counts: 1}); err != nil {
 		t.Fatal(err)
 	}
 	original := testE2BSandboxRecord("/g", "rk", "sb-stale", "stale", StateReady)
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
-	reg.addNode(&fakeConn{nodeID: "live", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "stale", "/g")
+	publishTestGroups(t, reg, "live", "/g")
+	reads := countTestGroupReads(reg)
+	attachTestNode(t, reg, &fakeConn{nodeID: "live", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
@@ -3280,19 +2700,16 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReserveSandbox: %v", err)
 	}
-	if res.Route.NodeID != "live" || !sawExclusion {
-		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
+	if res.Route.NodeID != "live" || reads.calls != 2 {
+		t.Fatalf("result=%+v saw stale exclusion=%v", res, reads.calls)
 	}
 }
 
 func TestReserveSandboxDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 	ctx := context.Background()
-	placements := 0
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	publishTestGroups(t, reg, "n1", "/g")
+	reads := countTestGroupReads(reg)
 	checkErr := errors.New("node owner temporarily unavailable")
 	owner := &remoteRouteWriteOwner{
 		node: &NodeRecord{NodeID: "n1"}, connectedErr: checkErr,
@@ -3302,19 +2719,16 @@ func TestReserveSandboxDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, checkErr) {
 		t.Fatalf("ReserveSandbox err=%v, want connection check error", err)
 	}
-	if placements != 1 || owner.commands != 0 {
-		t.Fatalf("connection check error retried/executed: placements=%d commands=%d", placements, owner.commands)
+	if reads.calls != 1 || owner.commands != 0 {
+		t.Fatalf("connection check error retried/executed: reads.calls=%d commands=%d", reads.calls, owner.commands)
 	}
 }
 
 func TestReserveSandboxDoesNotRePlaceAfterCreateAckTimeout(t *testing.T) {
 	ctx := context.Background()
-	placements := 0
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	publishTestGroups(t, reg, "n1", "/g")
+	reads := countTestGroupReads(reg)
 	seedTestNode(t, reg.stores, "n1")
 	owner := &remoteRouteWriteOwner{
 		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
@@ -3325,19 +2739,16 @@ func TestReserveSandboxDoesNotRePlaceAfterCreateAckTimeout(t *testing.T) {
 	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ReserveSandbox err=%v, want park timeout", err)
 	}
-	if placements != 1 || owner.commands != 1 {
-		t.Fatalf("ambiguous create was retried: placements=%d commands=%d", placements, owner.commands)
+	if reads.calls != 1 || owner.commands != 1 {
+		t.Fatalf("ambiguous create was retried: reads.calls=%d commands=%d", reads.calls, owner.commands)
 	}
 }
 
 func TestReserveSandboxParksAfterAmbiguousCommandError(t *testing.T) {
 	ctx := context.Background()
-	placements := 0
-	reg := New(newTestStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
-	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(newTestStores(t), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	publishTestGroups(t, reg, "n1", "/g")
+	reads := countTestGroupReads(reg)
 	seedTestNode(t, reg.stores, "n1")
 	owner := &remoteRouteWriteOwner{
 		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
@@ -3348,8 +2759,8 @@ func TestReserveSandboxParksAfterAmbiguousCommandError(t *testing.T) {
 	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ReserveSandbox err=%v, want park timeout after ambiguous delivery", err)
 	}
-	if placements != 1 || owner.commands != 1 {
-		t.Fatalf("ambiguous create was retried: placements=%d commands=%d", placements, owner.commands)
+	if reads.calls != 1 || owner.commands != 1 {
+		t.Fatalf("ambiguous create was retried: reads.calls=%d commands=%d", reads.calls, owner.commands)
 	}
 }
 
@@ -3491,41 +2902,6 @@ func TestNodeListWatchTokenResetsAcrossRegistryRestart(t *testing.T) {
 	}
 }
 
-func TestSelectorPatchHTTPRejectsMissingImportSourceLease(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
-	mux := http.NewServeMux()
-	reg.ServePlacerLink(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	body, err := json.Marshal(&routesync.SelectorPatch{
-		Group: "/g", NodeIDs: []string{"n1"},
-		APISecretFingerprint: "missing", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-missing",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := http.Post(srv.URL+PlacerLinkSelectorPatchPath, "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status=%d, want 400", resp.StatusCode)
-	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("node found=%v err=%v", found, err)
-	}
-	if len(node.KeyPairs) != 0 {
-		t.Fatalf("missing lease patch changed key cache: %+v", node.KeyPairs)
-	}
-}
-
 func TestNodeListWatchIgnoresHeartbeatWatermarks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -3588,7 +2964,7 @@ func TestNodeLinkResumeTokenReturnedOnReconnect(t *testing.T) {
 		}
 		errc := make(chan error, 1)
 		go func() {
-			errc <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{NodeID: "n1"}})
+			errc <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1"}})
 		}()
 		resp, err := tr.RoundTrip(req)
 		if err != nil {
@@ -3713,13 +3089,13 @@ func TestNodeFullSnapshotKeepsAssignmentAddedAfterBaseline(t *testing.T) {
 	reg := testReg(t)
 	baseline := testNodeSandboxRef("/old", "rk", "same-sandbox", "e2b", testAPIFingerprint)
 	current := testNodeSandboxRef("/new", "rk", "same-sandbox", "e2b", testAPIFingerprint)
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", baseline); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", baseline); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.RemoveNodeSandboxRef(ctx, "n1", baseline.NodeSandboxID); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", current); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", current); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.stores.PutSandbox(ctx, testSandboxIdentityRecord(current.Group, current.RouteKey, current.SandboxID, "n1", StateReserved)); err != nil {
@@ -3743,13 +3119,13 @@ func TestNodeFullSnapshotKeepsReboundCredentialIdentity(t *testing.T) {
 	baseline := testNodeSandboxRef("/g", "rk", "same-sandbox", "e2b", testAPIFingerprint)
 	current := baseline
 	current.APISecretFingerprint = strings.Repeat("b", 64)
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", baseline); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", baseline); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.RemoveNodeSandboxRef(ctx, "n1", baseline.NodeSandboxID); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", current); err != nil {
+	if err := addTestSandboxRef(t, reg.stores, ctx, "n1", current); err != nil {
 		t.Fatal(err)
 	}
 	currentRoute := testSandboxIdentityRecord(current.Group, current.RouteKey, current.SandboxID, "n1", StateReserved)
@@ -3888,6 +3264,7 @@ func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
 		{Group: "/g", BuildID: "terminal", NodeID: "dead", State: BuildReady},
 		{Group: "/g", BuildID: "moved", NodeID: "other", State: BuildBuilding},
 	} {
+		build.Profile, build.APISecretFingerprint = types.ProfileE2B, testAPIFingerprint
 		if err := reg.stores.PutBuild(ctx, build); err != nil {
 			t.Fatal(err)
 		}
@@ -3916,49 +3293,5 @@ func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
 		if ref, found, err := reg.stores.GetNodeBuildRef(ctx, "dead", buildID); err != nil || found {
 			t.Fatalf("stale ref %s=%+v found=%v err=%v", buildID, ref, found, err)
 		}
-	}
-}
-
-func TestHTTPPlacerHonorsMinReadyPlacers(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.SetPlacerPeerSource(func(string) []PlacerPeer {
-		return []PlacerPeer{{ID: "s1", Advertise: "http://127.0.0.1:1"}}
-	})
-	placer := NewHTTPPlacerWithMinReady(reg, 1, 2, 100*time.Millisecond)
-	if _, err := placer.Place(ctx, PlaceRequest{Group: "/g", RouteKey: "rk"}); err != ErrNoNode {
-		t.Fatalf("Place with one ready placer and min_ready=2 err=%v, want ErrNoNode", err)
-	}
-	if _, err := reg.VerifyAPIKeyWithMinReady(ctx, "/g", "key", 1, 2, 100*time.Millisecond); err != ErrNoNode {
-		t.Fatalf("VerifyAPIKey with one ready placer and min_ready=2 err=%v, want ErrNoNode", err)
-	}
-}
-
-func TestHTTPPlacerPreservesInvalidSandboxConfig(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(routesync.PlaceResult{
-			Error: "resource leaves conflict", InvalidConfig: true,
-		})
-	}))
-	defer server.Close()
-	placer := &HTTPPlacer{timeout: time.Second, client: server.Client()}
-	_, err := placer.placeOne(context.Background(), PlacerPeer{Advertise: server.URL}, PlaceRequest{Group: "/g"})
-	if !errors.Is(err, errInvalidSandboxConfig) {
-		t.Fatalf("placeOne error = %v, want invalid sandbox config", err)
-	}
-}
-
-func TestReadyPlacerPeersUseMemberlistSource(t *testing.T) {
-	reg := testReg(t)
-	reg.SetPlacerReadyLabel("registry.1.test")
-	reg.SetPlacerPeerSource(func(label string) []PlacerPeer {
-		if label != "registry.1.test" {
-			t.Fatalf("ready label passed to source = %q", label)
-		}
-		return []PlacerPeer{{ID: "s1", Advertise: "http://placer-1", ReadyLabel: label}}
-	})
-	peers := reg.readyPlacerPeers(time.Minute)
-	if len(peers) != 1 || peers[0].ID != "s1" || peers[0].Advertise != "http://placer-1" {
-		t.Fatalf("ready placer peers=%+v", peers)
 	}
 }

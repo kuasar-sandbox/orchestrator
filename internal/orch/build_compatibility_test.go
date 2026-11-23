@@ -57,7 +57,7 @@ func TestBareAutoRejectsSandboxOptionsBeforeRegistrationAdmission(t *testing.T) 
 	t.Run("cluster", func(t *testing.T) {
 		o := testOrch(t)
 		_, _, fingerprint := allowlistedBuildIdentity(t, o)
-		cmd := clusterBuildRegisterCommand("bare-auto-env", fingerprint)
+		cmd := clusterBuildRegisterCommand(t, o, "bare-auto-env", fingerprint)
 		cmd.Profile = "bare"
 		cmd.BuildEnv = map[string]string{"APP_MODE": "production"}
 		if err := o.registerClusterBuild(context.Background(), cmd); !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "envVars") {
@@ -161,7 +161,7 @@ func TestLegacyBuildSecurePreservesReplayWithoutConstrainingTarget(t *testing.T)
 						return nil
 					}))
 				}
-				cmd := clusterBuildRegisterCommand("legacy-secure-"+target.name, fingerprint)
+				cmd := clusterBuildRegisterCommand(t, o, "legacy-secure-"+target.name, fingerprint)
 				cmd.Config[buildcfg.NsBuilder] = target.json
 				cmd.BuildSecure = true
 				if err := o.registerClusterBuild(ctx, cmd); err != nil {

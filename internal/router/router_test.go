@@ -330,7 +330,7 @@ func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
 			{MemberID: "r2", BaseURL: "http://r2", Client: second},
 		}, nil
 	})}
-	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/v2/test", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestRouteLinkHTTPFailsOverOnConflict(t *testing.T) {
 			{MemberID: "r2", BaseURL: "http://r2", Client: second},
 		}, nil
 	})}
-	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/v2/test", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func TestRouteLinkHTTPRefreshesMembershipAndRetries(t *testing.T) {
 	reg := &refreshingRouteRegistry{old: oldClient, new: newClient}
 	rt := &Router{routeRegistry: reg}
 
-	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/v2/test", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 		Config map[string]string `json:"config"`
 	}
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path != "/route-link/reserve" || req.URL.Query().Get("operation") != "create" ||
+		if req.URL.Path != "/route-link/v2/reserve" || req.URL.Query().Get("operation") != "create" ||
 			req.URL.Query().Get("group") != "/g" || req.URL.Query().Get("route_key") != "rk" {
 			t.Fatalf("reserve request path=%q query=%q", req.URL.Path, req.URL.RawQuery)
 		}
@@ -500,7 +500,7 @@ func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				query := req.URL.Query()
-				if req.URL.Path != "/route-link/reserve" || query.Get("operation") != tc.operation ||
+				if req.URL.Path != "/route-link/v2/reserve" || query.Get("operation") != tc.operation ||
 					query.Get("group") != "/g" || query.Get("route_key") != "rk" || query.Get("sid") != "s1" {
 					t.Fatalf("reserve path=%q query=%q", req.URL.Path, req.URL.RawQuery)
 				}
@@ -634,9 +634,9 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 func TestHandleListPropagatesRouteLinkStatus(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
-		case "/route-link/list":
+		case "/route-link/v2/list":
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -683,9 +683,9 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 	node2Host := strings.TrimPrefix(node2.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			switch r.URL.Query().Get("sid") {
 			case "sb-1":
 				_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk1", node1Host, types.ProfileE2B))
@@ -753,11 +753,11 @@ func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/verify-key" {
+		if r.URL.Path == "/route-link/v2/verify-key" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		if r.URL.Path != "/route-link/route" || r.URL.Query().Get("sid") != "sb-1" {
+		if r.URL.Path != "/route-link/v2/control-route" || r.URL.Query().Get("sid") != "sb-1" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -824,9 +824,9 @@ func TestControlForwardsTrafficStatsWithStableSIDRewrite(t *testing.T) {
 	route.State = "paused"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(route)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -1019,7 +1019,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/reserve-build":
+		case "/route-link/v2/reserve-build":
 			// The registry assigns the build/template ids + places it (docs/cluster.md#cluster-build); the
 			// router synthesizes the e2b register response and routes follow-ups.
 			var body map[string]any
@@ -1063,7 +1063,12 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 				BuildID: "b1", TemplateID: "t1", NodeID: "n1", APIEndpoint: nodeHost, Profile: types.ProfileE2B,
 				Target: &types.BuildTarget{Kind: types.BuildTargetImage},
 			})
-		case "/route-link/verify-key":
+		case "/route-link/v2/build":
+			if r.URL.Query().Get("group") != "/g" || r.Header.Get(HeaderAPIKey) != "e2b_test" {
+				t.Error("Build follow-up lost its object credentials")
+			}
+			_ = json.NewEncoder(w).Encode(buildReserveResult{BuildID: "b1", TemplateID: "t1", NodeID: "n1", APIEndpoint: nodeHost, Profile: types.ProfileE2B})
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -1253,9 +1258,9 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 func TestBuildRegisterPropagatesNodeResourceRejection(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			w.WriteHeader(http.StatusOK)
-		case "/route-link/reserve-build":
+		case "/route-link/v2/reserve-build":
 			http.Error(w, "allocatable.memory exceeds capacity.memory", http.StatusBadRequest)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -1282,7 +1287,7 @@ func TestBuildRegisterPropagatesNodeResourceRejection(t *testing.T) {
 	}
 }
 
-func TestBuildCacheIsGroupScoped(t *testing.T) {
+func TestBuildFollowupReauthorizesGroupDespiteCachedEndpoint(t *testing.T) {
 	var hits [2]int
 	nodes := make([]*httptest.Server, 2)
 	for i := range nodes {
@@ -1294,7 +1299,12 @@ func TestBuildCacheIsGroupScoped(t *testing.T) {
 		defer nodes[i].Close()
 	}
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/verify-key" {
+		if r.URL.Path == "/route-link/v2/build" && r.Header.Get(HeaderAPIKey) == "e2b_test" {
+			idx := map[string]int{"/g1": 0, "/g2": 1}[r.URL.Query().Get("group")]
+			_ = json.NewEncoder(w).Encode(buildReserveResult{BuildID: "b1", TemplateID: "t1", APIEndpoint: strings.TrimPrefix(nodes[idx].URL, "http://"), Profile: types.ProfileE2B})
+			return
+		}
+		if r.URL.Path == "/route-link/v2/verify-key" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}

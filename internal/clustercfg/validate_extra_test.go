@@ -3,7 +3,7 @@ package clustercfg
 import "testing"
 
 // TestValidateRejectsBadValues exercises each role's Validate over the bad values it
-// owns (durations/membership → registry, zones/candidates → placer, auth → router).
+// owns (durations/membership → registry, zones/candidates → registry, auth → router).
 func TestValidateRejectsBadValues(t *testing.T) {
 	t.Run("registry bad duration", func(t *testing.T) {
 		c := DefaultRegistry()
@@ -19,15 +19,15 @@ func TestValidateRejectsBadValues(t *testing.T) {
 			t.Error("Validate accepted a member.id outside active membership")
 		}
 	})
-	t.Run("placer bad zone_admit_max", func(t *testing.T) {
-		c := DefaultPlacer()
+	t.Run("registry bad zone_admit_max", func(t *testing.T) {
+		c := DefaultRegistry()
 		c.Placement.ZoneAdmitMax = "purple"
 		if err := c.Validate(); err == nil {
 			t.Error("Validate accepted a bad zone_admit_max")
 		}
 	})
-	t.Run("placer negative candidates", func(t *testing.T) {
-		c := DefaultPlacer()
+	t.Run("registry negative candidates", func(t *testing.T) {
+		c := DefaultRegistry()
 		c.Placement.Candidates = -1
 		if err := c.Validate(); err == nil {
 			t.Error("Validate accepted a negative placement.candidates")

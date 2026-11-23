@@ -39,10 +39,11 @@ type NodeLinkRelayPeer struct {
 // nodeChannel is the registry's per-node node_link handle: it writes commands to
 // the node on the h2c response body (serialized). It implements nodeConn.
 type nodeChannel struct {
-	nodeID string
-	mu     sync.Mutex
-	w      io.Writer
-	flush  func()
+	registration metadata.Registration
+	nodeID       string
+	mu           sync.Mutex
+	w            io.Writer
+	flush        func()
 }
 
 // nodeBuildFrameFence is the process-local active-session authority for Build
@@ -313,6 +314,9 @@ func (r *Registry) ServeNodeLinkRelay(w http.ResponseWriter, req *http.Request) 
 }
 
 func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush func(), body io.Reader, nr *routesync.NodeRegister) error {
+	if nr.GroupSupportVersion != routesync.GroupSupportVersion {
+		return errors.New("node-link: Group support protocol version mismatch")
+	}
 	registered, err := r.updateNodeRegister(ctx, nr)
 	if err != nil {
 		// Register may already have committed its profile and directory before
@@ -324,7 +328,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	}
 
 	ctx = withNodeRegistration(ctx, registered.Registration)
-	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flush}
+	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flush, registration: registered.Registration}
 
 	// Write Hello BEFORE exposing the node_link. After addNode, heartbeat
 	// maintenance may send key refresh commands on this same h2 stream under
@@ -332,8 +336,8 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	resumeFrom := registered.ResumeToken
 	fullExpected := append([]clusterstate.NodeSandboxRef(nil), registered.Sandboxes...)
 	buildExpected := append([]clusterstate.NodeBuildRef(nil), registered.Builds...)
-	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom}}); err != nil {
-		r.scheduleNodeReap(nr.NodeID)
+	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom, GroupSupportVersion: routesync.GroupSupportVersion}}); err != nil {
+		r.scheduleNodeReap(nr.NodeID, registered.Registration)
 		return nil
 	}
 	flush()
@@ -351,6 +355,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	buildCollecting := false
 	buildSynced := false
 	var buildSeen map[string]struct{}
+	groupStream := groupReportStream{}
 	for {
 		m, err := routesync.ReadMsg(body)
 		if err != nil {
@@ -360,6 +365,10 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 			return nil
 		}
 		switch m.Type {
+		case routesync.TypeGroupBegin, routesync.TypeGroupBatch, routesync.TypeGroupEnd, routesync.TypeGroupUpsert, routesync.TypeGroupDelete:
+			if err := groupStream.apply(ctx, r.stores.groups, registered.Registration, m); err != nil {
+				return fmt.Errorf("node-link: Group report: %w", err)
+			}
 		case routesync.TypeUpsert:
 			if m.Route != nil {
 				if collectingFull && m.Route.SandboxID != "" {
@@ -379,7 +388,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 			}
 		case routesync.TypeCmdAck:
 			// Command receipt wakes the matching node-owner SendCommandAndWait.
-			r.ackCommand(m.Ack)
+			r.ackNodeCommand(conn, m.Ack)
 		case routesync.TypeBuildSyncBegin, routesync.TypeBuildUpsert, routesync.TypeBuildDelete, routesync.TypeBuildSyncEnd:
 			err := r.withActiveNodeBuildFrame(conn, func() error {
 				switch m.Type {

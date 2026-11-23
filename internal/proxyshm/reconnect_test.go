@@ -72,7 +72,7 @@ func TestReconnectAfterOfflineDeleteAndReset(t *testing.T) {
 					if _, err := routesync.ReadRegister(r.Body); err != nil {
 						return
 					}
-					frames := []*routesync.Msg{{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}}
+					frames := []*routesync.Msg{{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion, Version: routesync.Version}}}
 					for i := range rows {
 						frames = append(frames, &routesync.Msg{Type: routesync.TypeUpsert, Route: &rows[i]})
 					}

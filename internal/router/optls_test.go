@@ -20,7 +20,7 @@ import (
 // covered by clustercfg.TestMTLSHandshake).
 func TestRouteLinkClientTLS(t *testing.T) {
 	routeLink := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/route" {
+		if r.URL.Path == "/route-link/v2/data-route" {
 			_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", "10.0.0.1:1", types.ProfileE2B))
 			return
 		}

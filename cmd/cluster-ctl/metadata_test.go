@@ -8,7 +8,7 @@ import (
 
 func newTestRegistryStores(t testing.TB) *registry.Stores {
 	t.Helper()
-	store, err := registry.NewStores(metadatastore.New().Repositories(), metadatastore.Owners{ID: "registry"})
+	store, err := registry.NewStores(metadatastore.New(t).Repositories(), metadatastore.Owners{ID: "registry"})
 	if err != nil {
 		t.Fatal(err)
 	}

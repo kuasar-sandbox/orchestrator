@@ -35,7 +35,7 @@ func TestCheckpointQuotaDirectAndClusterCreate(t *testing.T) {
 				var sid string
 				if cluster {
 					_, _, fingerprint := allowlistedBuildIdentity(t, o)
-					cmd := clusterCreateCommand(fingerprint, "checkpoint-quota")
+					cmd := clusterCreateCommand(t, o, fingerprint, "checkpoint-quota")
 					cmd.MaxCheckpoints = quota
 					ack := o.HandleCommand(ctx, cmd)
 					if (ack.Status == routesync.AckAccepted) != valid {

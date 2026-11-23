@@ -14,9 +14,9 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 	ctx := context.Background()
 	r := testReg(t)
 	seedTestNode(t, r.stores, "n1")
-	r.SetPlacer(placementWithToken("n1"))
+	publishTestGroups(t, r, "n1", "/g")
 	r.SetNodeOwner(&recordingNodeOwner{runtime: map[string]*NodeRecord{"n1": {NodeID: "n1", APIEndpoint: "node-api:7443"}}})
-	res, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+	res, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestBuildTransientResolutionSurvivesResultAndRejectsStaleEvents(t *testing.
 	if _, ok, err := r.stores.GetBuildInGroup(ctx, "/g", res.BuildID); err != nil || ok {
 		t.Fatal("late upsert resurrected projection")
 	}
-	replacement, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: res.BuildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+	replacement, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: res.BuildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +93,7 @@ func TestBuildTransientResolutionStartingAndUnavailableAreErrors(t *testing.T) {
 		{Group: "/starting", BuildID: "starting", NodeID: "n1", State: BuildStarting, TemplateID: "transient-starting"},
 		{Group: "/offline", BuildID: "offline", NodeID: "n1", State: BuildReady, TemplateID: "transient-offline", RegistrationTargetSet: true},
 	} {
+		rec.Profile, rec.APISecretFingerprint = types.ProfileE2B, testAPIFingerprint
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
 			t.Fatal(err)
 		}

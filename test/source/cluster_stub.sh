@@ -12,6 +12,7 @@ DOMAIN="${DOMAIN:-cluster.stub.local}"
 GROUP="${GROUP:-/e2e/stub/group}"
 NODES="${NODES:-4}"
 SCALERS="${SCALERS:-1}"
+CLUSTER_STUB_BACKEND="${CLUSTER_STUB_BACKEND:-foundationdb}"
 
 step() {
     echo "==> $*" >&2
@@ -41,21 +42,39 @@ fail() {
 build_cluster_stub_binaries() {
     command -v go >/dev/null 2>&1 || fail "go not on PATH"
     mkdir -p "$BIN"
-    (cd "$ROOT" && python3 scripts/cluster-native.py build --arch "$(uname -m)" --output "$BIN" --go "$(command -v go)" -- -trimpath)
+    if [ "$CLUSTER_STUB_BACKEND" = foundationdb ]; then
+        (cd "$ROOT" && python3 scripts/cluster-native.py build --arch "$(uname -m)" --output "$BIN" --go "$(command -v go)" -- -trimpath)
+    else
+        (cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -o "$BIN/cluster-ctl-pure" ./cmd/cluster-ctl)
+        CLUSTER_CTL="$BIN/cluster-ctl-pure"
+    fi
     (cd "$ROOT" && go build -trimpath -o "$NODE_STUB_CTL" ./cmd/node-stub-ctl)
     (cd "$ROOT" && go build -trimpath -o "$E2B_KEY_CTL" ./cmd/e2b-key-ctl)
 }
 
-# All Registry processes in a case share one real FDB database. The fixture owns
-# the disposable SSD process; no system database is required or modified.
-if [ -z "${FDB_CLUSTER_FILE:-}" ]; then
+# Each case uses a private metadata namespace in the selected real backend.
+# SQLite runs the supported single-Registry topology only. PostgreSQL's DSN is
+# passed through the environment and is never printed or written into YAML.
+case "$CLUSTER_STUB_BACKEND" in
+foundationdb) ;;
+postgres)
+    [ -n "${STORAGE_TEST_POSTGRES_DSN:-}" ] || fail "STORAGE_TEST_POSTGRES_DSN is required"
+    ;;
+sqlite) ;;
+*) fail "unknown CLUSTER_STUB_BACKEND" ;;
+esac
+if [ "$CLUSTER_STUB_BACKEND" = foundationdb ] && [ -z "${FDB_CLUSTER_FILE:-}" ]; then
     exec python3 "$ROOT/scripts/with-test-fdb.py" -- bash "$0"
 fi
-[ -f "$FDB_CLUSTER_FILE" ] || fail "FDB_CLUSTER_FILE is not a readable test cluster file"
+if [ "$CLUSTER_STUB_BACKEND" = foundationdb ]; then
+    [ -f "$FDB_CLUSTER_FILE" ] || fail "FDB_CLUSTER_FILE is not a readable test cluster file"
+fi
 
 if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
     build_cluster_stub_binaries
-    for spec in registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-placer-ha:3:2 registry-joint:4:1; do
+    cases="registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-placer-ha:3:2 registry-joint:4:1"
+    if [ "$CLUSTER_STUB_BACKEND" = sqlite ]; then cases="registry-n1:1:1"; fi
+    for spec in $cases; do
         CLUSTER_STUB_CASE="${spec%%:*}"
         rest="${spec#*:}"
         REGISTRIES="${rest%%:*}"
@@ -74,6 +93,9 @@ build_cluster_stub_binaries
 [ -x "$E2B_KEY_CTL" ] || fail "missing e2b-key-ctl at $E2B_KEY_CTL"
 REGISTRIES="${REGISTRIES:-1}"
 SCALERS="${SCALERS:-1}"
+if [ "$CLUSTER_STUB_BACKEND" = sqlite ] && [ "$REGISTRIES" != 1 ]; then
+    fail "SQLite supports only a single Registry"
+fi
 if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ] && [ -z "$NODES_EXPLICIT" ]; then
     NODES=10
 fi
@@ -236,6 +258,7 @@ alloc_port DATA_PORT node-stub-data
 MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
 API_SECRET="$("$E2B_KEY_CTL" derive-api-secret "$MANIFEST_KEY")"
 API_KEY="$("$E2B_KEY_CTL" gen-apikey "$API_SECRET")"
+export E2B_API_KEY="$API_KEY"
 
 OWNER_COUNT="$REGISTRIES"
 ROUTE_OWNER_COUNT="$OWNER_COUNT"
@@ -283,15 +306,36 @@ if [ "${#NEXT_IDS[@]}" -gt 0 ]; then
 $NEXT_MEMBERS_YAML"
 fi
 
+case "$CLUSTER_STUB_BACKEND" in
+foundationdb)
+    STORAGE_YAML="foundationdb:
+  cluster_file: \"$FDB_CLUSTER_FILE\"
+  prefix: \"cluster-stub/${WORK##*/}/\""
+    ;;
+postgres)
+    STORAGE_YAML="storage:
+  backend: postgres
+  postgres_dsn_env: STORAGE_TEST_POSTGRES_DSN
+  namespace: \"cluster-stub/${WORK##*/}/\""
+    ;;
+sqlite)
+    STORAGE_YAML="storage:
+  backend: sqlite
+  sqlite_path: \"$WORK/registry.db\"
+  namespace: \"cluster-stub/${WORK##*/}/\""
+    ;;
+esac
+
 for i in $(seq 1 "$REGISTRIES"); do
     port="${CONTROL_PORTS[$((i-1))]}"
     cat >"$WORK/registry-$i.yaml" <<EOF
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
-foundationdb:
-  cluster_file: "$FDB_CLUSTER_FILE"
-  prefix: "cluster-stub/${WORK##*/}/"
+$STORAGE_YAML
+placement:
+  candidates: 2
+  zone_admit_max: "yellow"
 membership:
   active: 1
 ${NEXT_LINE}  versions:
@@ -337,9 +381,7 @@ import_groups:
     source_type: file
     path: "$WORK/groups"
 placement:
-  candidates: 2
-  zone_admit_max: "yellow"
-  selector_patch_refresh_interval: "2s"
+  import_refresh_interval: "2s"
 EOF
 done
 
@@ -750,8 +792,8 @@ fi
 
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     step "checking joint route visibility from next-only registry"
-    curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
-        "http://127.0.0.1:${CONTROL_PORTS[3]}/route-link/list" >"$WORK/joint-routes.json"
+    curl -sS --noproxy '*' -H "X-API-KEY: $API_KEY" --get --data-urlencode "group=$GROUP" \
+        "http://127.0.0.1:${CONTROL_PORTS[3]}/route-link/v2/list" >"$WORK/joint-routes.json"
     python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the ready route"
 import json, sys
 routes = json.load(open(sys.argv[1]))
@@ -765,9 +807,10 @@ PY
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
-foundationdb:
-  cluster_file: "$FDB_CLUSTER_FILE"
-  prefix: "cluster-stub/${WORK##*/}/"
+$STORAGE_YAML
+placement:
+  candidates: 2
+  zone_admit_max: "yellow"
 membership:
   active: 2
   old_grace: 1
@@ -933,12 +976,13 @@ if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     ROUTE_LIST_PORT="${CONTROL_PORTS[3]}"
 fi
 python3 - "$ROUTE_LIST_PORT" "$GROUP" "$SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
-import json, sys, time, urllib.parse, urllib.request
+import json, os, sys, time, urllib.parse, urllib.request
 port, group, sid, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-url = "http://127.0.0.1:%s/route-link/list?%s" % (port, urllib.parse.urlencode({"group": group}))
+url = "http://127.0.0.1:%s/route-link/v2/list?%s" % (port, urllib.parse.urlencode({"group": group}))
 last = None
 for _ in range(100):
-    with urllib.request.urlopen(url, timeout=2) as resp:
+    req = urllib.request.Request(url, headers={"X-API-KEY": os.environ["E2B_API_KEY"]})
+    with urllib.request.urlopen(req, timeout=2) as resp:
         last = json.load(resp)
     with open(out, "w") as f:
         json.dump(last, f)
