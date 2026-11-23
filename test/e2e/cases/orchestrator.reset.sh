@@ -66,7 +66,13 @@ for i, arg in enumerate(childargs):
 # readiness pipe. Popen otherwise closes that inherited runtime prerequisite.
 cgroup = value('--cgroup-path')
 assert cgroup.startswith('fd='), cgroup
-child = subprocess.Popen([binary, *childargs], pass_fds=(writefd, int(cgroup[3:])))
+# The real node task can also carry a sealed, digest-bound config
+# provenance FD. This fault-injection wrapper must forward that FD unchanged;
+# otherwise sandbox-ctl exits before its first readiness event.
+pass_fds = [writefd, int(cgroup[3:])]
+if '_SANDBOX_CONFIG_PROVENANCE_FD' in os.environ:
+    pass_fds.append(int(os.environ['_SANDBOX_CONFIG_PROVENANCE_FD']))
+child = subprocess.Popen([binary, *childargs], pass_fds=tuple(pass_fds))
 os.close(writefd)
 with os.fdopen(readfd,'rb') as events:
     assert events.readline()==b'control_ready\n'
