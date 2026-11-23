@@ -51,7 +51,7 @@ REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"s
 code=$(req POST /v3/templates "$AK" '{"profile":"bare","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"}}')
 [ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "bare auto env registration = $code (want 400)"; }
 REQ_RESOURCE_HEADER='{"allocatable":{"memory":"512GiB"}}'
-code=$(req POST /v3/templates "$AK" '{"name":"e2e-auto-options","profile":"e2b","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"},"secure":true}')
+code=$(req POST /v3/templates "$AK" '{"name":"e2e-auto-options","profile":"e2b","envVars":{"IGNORED_AUTO_ENV":"not-an-image-default"}}')
 unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B9 registration = $code (want 202)"; }
 B9_TID=$(json_field "$WORK/resp.body" templateID)

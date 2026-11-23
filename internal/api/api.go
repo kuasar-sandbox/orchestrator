@@ -123,12 +123,12 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 		}
 		meta[item.metaKey] = h.Get(item.header)
 	}
-	bodyPolicy := sandboxcfg.SnapshotPolicy{}
+	bodyPolicy := sandboxcfg.CreateCheckpointPolicy{}
 	bodyPresent := false
 	if raw, ok := meta[sandboxcfg.NsCheckpoint]; ok {
 		bodyPresent = true
 		var err error
-		bodyPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(raw)
+		bodyPolicy, err = sandboxcfg.ParseCreateCheckpointPolicyJSON(raw)
 		if err != nil {
 			return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
 		}
@@ -139,17 +139,17 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 	}
 	policy := bodyPolicy
 	if headerPresent {
-		headerPolicy, err := sandboxcfg.ParseSnapshotPolicyJSON(h.Get(checkpointHeader))
+		headerPolicy, err := sandboxcfg.ParseCreateCheckpointPolicyJSON(h.Get(checkpointHeader))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", checkpointHeader, err)
 		}
-		policy = sandboxcfg.OverlaySnapshotPolicy(bodyPolicy, headerPolicy)
+		policy = sandboxcfg.OverlayCreateCheckpointPolicy(bodyPolicy, headerPolicy)
 	}
 	if policy.Empty() {
 		delete(meta, sandboxcfg.NsCheckpoint)
 		return meta, nil
 	}
-	canonical, err := sandboxcfg.MarshalSnapshotPolicyJSON(policy)
+	canonical, err := sandboxcfg.MarshalCreateCheckpointPolicyJSON(policy)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +162,18 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 
 func mergeBuildConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
 	var err error
+	// Build accepts capture policy only. Validate both original layers before
+	// Create normalization can erase an explicitly null quota field.
+	if raw, present := meta[sandboxcfg.NsCheckpoint]; present {
+		if _, err := sandboxcfg.ParseSnapshotPolicyJSON(raw); err != nil {
+			return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
+		}
+	}
+	if _, present := h[http.CanonicalHeaderKey(checkpointHeader)]; present {
+		if _, err := sandboxcfg.ParseSnapshotPolicyJSON(h.Get(checkpointHeader)); err != nil {
+			return nil, fmt.Errorf("%s: %w", checkpointHeader, err)
+		}
+	}
 	// Build registration accepts the same Create configuration headers. The
 	// core applies target-specific instance/portable validation after target
 	// resolution; restore is always rejected there.
@@ -321,7 +333,6 @@ type RegisterSpec struct {
 	Resources  types.BuildResources
 	Metadata   map[string]string
 	EnvVars    map[string]string
-	Secure     bool
 	Builder    types.BuildOptions
 	MMDSHeader *string
 }
@@ -350,7 +361,7 @@ type BuildLogEntry struct {
 type CreateReq struct {
 	Workspaces      []workspace.Entry `json:"-"`
 	AutoReset       bool              `json:"autoReset,omitempty"`
-	MaxCheckpoints  *int              `json:"max_checkpoints,omitempty"`
+	MaxCheckpoints  *int              `json:"-"` // accepted internal Create policy; public input uses checkpoint metadata
 	TemplateID      string            `json:"templateID"`
 	TimeoutSec      int               `json:"timeout"`
 	Metadata        map[string]string `json:"metadata"`
@@ -365,13 +376,12 @@ type CreateReq struct {
 // PauseRequest carries the E2B capture selector and action-scoped Snapshot-only
 // policy. A nil Memory value has the E2B default true.
 type PauseRequest struct {
-	NoWaitForPreviousMemorySave bool       `json:"noWaitForPreviousMemorySave,omitempty"`
-	Checkpoint                  bool       `json:"checkpoint,omitempty"`
-	IfIdle                      bool       `json:"ifIdle,omitempty"`
-	IfIdleSince                 *time.Time `json:"ifIdleSince,omitempty"`
-	Memory                      *bool      `json:"memory,omitempty"`
-	CheckpointMergeRef          *bool      `json:"checkpoint_merge_ref,omitempty"`
-	CheckpointDropCaches        *bool      `json:"checkpoint_drop_caches,omitempty"`
+	Checkpoint           bool       `json:"checkpoint,omitempty"`
+	IfIdle               bool       `json:"ifIdle,omitempty"`
+	IfIdleSince          *time.Time `json:"ifIdleSince,omitempty"`
+	Memory               *bool      `json:"memory,omitempty"`
+	CheckpointMergeRef   *bool      `json:"checkpoint_merge_ref,omitempty"`
+	CheckpointDropCaches *bool      `json:"checkpoint_drop_caches,omitempty"`
 }
 
 // ImportOptions selects the durable state kept by a newly imported target.
@@ -570,7 +580,10 @@ func apiKeyFrom(ctx context.Context) string {
 // --- handlers ---
 
 func (a *API) create(w http.ResponseWriter, r *http.Request) {
-	var req CreateReq
+	var body struct {
+		CreateReq
+		RemovedMaxCheckpoints json.RawMessage `json:"max_checkpoints"`
+	}
 	if r.ContentLength > maxCreateRequestBytes {
 		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
@@ -587,10 +600,15 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '{' || strictjson.DecodeAllowUnknown(trimmed, &req) != nil {
+	if len(trimmed) == 0 || trimmed[0] != '{' || strictjson.DecodeAllowUnknown(trimmed, &body) != nil {
 		writeErr(w, 400, "bad body")
 		return
 	}
+	if len(body.RemovedMaxCheckpoints) != 0 {
+		writeErr(w, http.StatusBadRequest, "max_checkpoints must be set in X-Kuasar-Sandbox-Checkpoint or metadata[kuasar-sandbox.checkpoint]")
+		return
+	}
+	req := body.CreateReq
 	req.APIKey = apiKeyFrom(r.Context())
 	req.MMDSHeader, err = singleOptionalHeader(r.Header, mmdsHeader)
 	if err != nil {
@@ -846,7 +864,6 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 	}
 	checkpointID, err := a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), sandboxcfg.CaptureRequest{
 		Kind: kind, SnapshotPolicy: override, Checkpoint: req.Checkpoint, IfIdle: req.IfIdle, IfIdleSince: req.IfIdleSince,
-		NoWaitForPreviousMemorySave: req.NoWaitForPreviousMemorySave,
 	})
 	switch {
 	case errors.Is(err, ErrPreviousMemorySavePending), errors.Is(err, ErrPauseRunChanged):
@@ -990,12 +1007,16 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		MemoryMBSn      json.RawMessage   `json:"memory_mb"`
 		Metadata        map[string]string `json:"metadata"`
 		EnvVars         map[string]string `json:"envVars"`
-		Secure          bool              `json:"secure"`
+		RemovedSecure   json.RawMessage   `json:"secure"`
 		Cancel          json.RawMessage   `json:"cancel"`
 		AutoPauseMemory json.RawMessage   `json:"autoPauseMemory"`
 	}
 	if err := decodeBuildRequest(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
+		return
+	}
+	if len(body.RemovedSecure) != 0 {
+		writeErr(w, http.StatusBadRequest, "secure is not a supported Build option")
 		return
 	}
 	query, err := url.ParseQuery(r.URL.RawQuery)
@@ -1064,7 +1085,7 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
 		Name: body.Name, Tags: body.Tags, Profile: profile, Resources: resources,
-		Metadata: meta, EnvVars: body.EnvVars, Secure: body.Secure,
+		Metadata: meta, EnvVars: body.EnvVars,
 		Builder: builderOpts, MMDSHeader: mmdsValue, Workspaces: workspaces,
 	})
 	if err != nil {

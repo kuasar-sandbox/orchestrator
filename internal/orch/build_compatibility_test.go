@@ -13,8 +13,10 @@ import (
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -74,7 +76,7 @@ func TestAutoTriggerValidatesKnownTargetBeforeQueueing(t *testing.T) {
 			o := testOrch(t)
 			key, _, _ := allowlistedBuildIdentity(t, o)
 			ctx := context.Background()
-			b, err := o.RegisterBuild(ctx, key, api.RegisterSpec{Profile: types.ProfileE2B, Resources: testBuildResources(), EnvVars: map[string]string{"APP_MODE": "production"}, Secure: true})
+			b, err := o.RegisterBuild(ctx, key, api.RegisterSpec{Profile: types.ProfileE2B, Resources: testBuildResources(), EnvVars: map[string]string{"APP_MODE": "production"}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -124,10 +126,70 @@ func TestAutoTriggerValidatesKnownTargetBeforeQueueing(t *testing.T) {
 					t.Fatalf("retry with supported target: %v", err)
 				}
 			}
-			if !reflect.DeepEqual(stored.Env, b.Env) || stored.Builder.Target != nil || !stored.Secure {
+			if !reflect.DeepEqual(stored.Env, b.Env) || stored.Builder.Target != nil || stored.Secure != b.Secure {
 				t.Fatalf("registration was rewritten: %+v", stored)
 			}
 		})
+	}
+}
+
+// A Registry may have persisted an older secure=true intent before the node
+// accepts it. Keep its immutable identity, including through a registration
+// Hook, without treating that obsolete flag as an instance configuration.
+func TestLegacyBuildSecurePreservesReplayWithoutConstrainingTarget(t *testing.T) {
+	for _, target := range []struct {
+		name string
+		json string
+	}{
+		{"image", `{"target":{"kind":"image"}}`},
+		{"sandbox", `{"target":{"kind":"sandbox","memory":false}}`},
+	} {
+		for _, withHook := range []bool{false, true} {
+			name := target.name
+			if withHook {
+				name += "/hook"
+			}
+			t.Run(name, func(t *testing.T) {
+				o := testOrch(t)
+				ctx := context.Background()
+				_, _, fingerprint := allowlistedBuildIdentity(t, o)
+				hookCalls := 0
+				if withHook {
+					o.SetExtensionHooks(nil, buildHookFunc(func(_ context.Context, operation *conductorextension.BuildOperation) error {
+						hookCalls++
+						operation.Register.Names = []string{"legacy-hook"}
+						return nil
+					}))
+				}
+				cmd := clusterBuildRegisterCommand("legacy-secure-"+target.name, fingerprint)
+				cmd.Config[buildcfg.NsBuilder] = target.json
+				cmd.BuildSecure = true
+				if err := o.registerClusterBuild(ctx, cmd); err != nil {
+					t.Fatalf("legacy in-flight registration: %v", err)
+				}
+				stored, err := o.st.GetBuild(ctx, cmd.BuildID)
+				if err != nil || stored == nil || !stored.Secure {
+					t.Fatalf("legacy registration state = %+v, %v", stored, err)
+				}
+				if err := validateKnownBuildTargetConfig(stored); err != nil {
+					t.Fatalf("legacy secure constrained target: %v", err)
+				}
+				if buildHasInstanceConfig(stored) {
+					t.Fatal("legacy secure requested instance configuration")
+				}
+				if err := o.registerClusterBuild(ctx, cmd); err != nil {
+					t.Fatalf("exact legacy replay: %v", err)
+				}
+				if withHook && hookCalls != 1 {
+					t.Fatalf("registration Hook calls = %d, want 1", hookCalls)
+				}
+				changed := *cmd
+				changed.BuildSecure = false
+				if err := o.registerClusterBuild(ctx, &changed); !errors.Is(err, store.ErrBuildRegistrationConflict) {
+					t.Fatalf("changed legacy identity replay = %v", err)
+				}
+			})
+		}
 	}
 }
 

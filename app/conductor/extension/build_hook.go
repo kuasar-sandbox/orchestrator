@@ -42,7 +42,6 @@ type BuildRegisterRequest struct {
 	Resources  BuildResources
 	Metadata   map[string]string
 	Env        map[string]string
-	Secure     bool
 	Builder    BuildOptions
 }
 

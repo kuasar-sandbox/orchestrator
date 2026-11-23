@@ -58,12 +58,14 @@ MOUNT_ID=$(findmnt -rn -M "$CHECKPOINT_ROOT" -o ID)
 [ -n "$MOUNT_ID" ] || fail 'mount identity missing'
 printf '%s\t%s\n' "$MOUNT_ID" "$CHECKPOINT_ROOT" >"$CASE_OUT/mount-identity.txt"
 
-# Quota is node management policy, not an artifact/template setting.
-code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"max_checkpoints\":0}")
+# Quota is per-instance node policy carried by the checkpoint extension.
+REQ_CHECKPOINT_HEADER='{"max_checkpoints":0}'
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\"}")
 [ "$code" = 400 ] || fail "zero quota accepted: $code"
 REQ_RESOURCE_HEADER='{"capacity":{"cpu":1,"memory":"512MiB"},"allocatable":{"cpu":1,"memory":"512MiB"}}'
-create_guest "{\"templateID\":\"$TEMPLATE\",\"timeout\":1200,\"max_checkpoints\":2}"
-unset REQ_RESOURCE_HEADER
+REQ_CHECKPOINT_HEADER='{"max_checkpoints":2}'
+create_guest "{\"templateID\":\"$TEMPLATE\",\"timeout\":1200}"
+unset REQ_RESOURCE_HEADER REQ_CHECKPOINT_HEADER
 wait_sandbox_state "$SID" running 1200 || fail 'cold create did not run'
 checkpoint_guest /bin/true
 checkpoint_guest /bin/sh -c 'cat > /home/user/holder-memory.py <<'"'"'PY'"'"'
@@ -209,7 +211,7 @@ json.dump(report,open(out,'w'),indent=2)
 PY
 }
 named_pause() { # label; leaves exact selected ID in NAMED_ID
-    code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":true,"checkpoint":true,"noWaitForPreviousMemorySave":true}')
+    code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":true,"checkpoint":true}')
     [ "$code" = 200 ] || { cat "$WORK/resp.body"; fail "named pause $1=$code"; }
     cp "$WORK/resp.body" "$CASE_OUT/pause-$1.json"
     NAMED_ID=$(json_field "$WORK/resp.body" checkpointID)

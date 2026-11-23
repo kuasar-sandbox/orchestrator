@@ -506,11 +506,11 @@ The public [Sandbox request types and enums](../app/conductor/extension/sandbox_
 | `SandboxResumeRequest` | `RequestedDeadlineUnix *int64`, where nil uses core resume-deadline policy; immutable `Mode ResumeMode` (`auto`/`memory`/`cold`) and `Trigger ResumeTrigger` (`connect`/`wake`/`route`/`exec`/`exec-session`) |
 | `SandboxDeleteRequest` | `Reason string` is diagnostic; editing it does not alter cleanup behavior |
 
-Direct Create may change the template within its immutable profile. Canonical cluster Create must retain its template and cluster metadata and leave top-level `MMDS` nil; it does not acquire direct-Create override authority.
+Direct Create may change the template within its immutable profile. Canonical cluster Create must retain its template and cluster metadata and leave top-level `MMDS` nil; it does not acquire direct-Create override authority. Create resolves `checkpoint.max_checkpoints` into core-owned quota before the Hook; the Hook's checkpoint metadata retains only `merge_ref`/`drop_caches` defaults and cannot reintroduce the quota.
 
 Build `register` runs after caller identity and IDs are resolved, but before the
 registration capacity transaction. It may change `Names`, `Aliases`, `Profile`,
-`Resources`, `Metadata` (including the routes-only MMDS declaration), `Env`, `Secure` and
+`Resources`, `Metadata` (including the routes-only MMDS declaration), `Env` and
 supported `Builder` options; `BuildID` and `TemplateID` remain core-owned. There is no mutable request `kind`: terminal `BuildKind` (`img`/`sbx`/`snp`) is derived only on success, and remains empty before then. Raw MMDS secret values,
 registry credentials, and pull tokens are not copied into the operation. The
 core rebinds retained initial MMDS values to the final route declaration and
@@ -518,7 +518,7 @@ resolves registry credentials only after the Hook. A canonical cluster
 BuildRegister runs the Hook only for new ownership. Exact replay of an existing
 durable `BuildID` verifies the original tenant-keyed request identity and
 credential fingerprints without invoking the mutable Hook again, so policy
-changes cannot break an ACK-lost replay.
+changes cannot break an ACK-lost replay. `Secure` is no longer a Build Hook input; historical internal secure values are retained only for registration state and replay identity.
 
 `Register.Resources` is the sole registration execution vector (`CPU` in milli-CPU, `Memory`/`Storage` in bytes). The Hook must leave `Builder.Resources` nil; reintroducing that duplicate authority is rejected. Mutable Builder controls are `Target *BuildTarget {Kind BuildTargetKind; Memory bool}`, `Referer *BuildRefererOptions {Enabled, Writeback *bool}`, and `Registry *BuildRegistryOptions` whose `TLS *BuildRegistryTLSOptions` contains `CABundlePEM string` and `InsecureSkipVerify bool`. Target kinds are `image` and `sandbox`; nil means auto resolution from final effective start/ready commands under the [Build target contract](node-build.md#request-scoped-builder-input), not from arbitrary configuration presence.
 

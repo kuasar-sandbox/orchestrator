@@ -255,7 +255,9 @@ type Build struct {
 	// post-Build Create never treats this retained copy as template authority.
 	Metadata map[string]string
 	Env      map[string]string
-	Secure   bool
+	// Secure is retained only for historical registrations and exact replay.
+	// It does not configure Build execution or constrain the output target.
+	Secure bool
 	// Registration-time instance credentials are encrypted at rest and used only
 	// by a memory target's Phase C. They never enter portable E/S configuration.
 	ServiceSecret      string

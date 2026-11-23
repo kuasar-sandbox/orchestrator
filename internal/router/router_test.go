@@ -607,7 +607,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil, false, nil, nil, nil)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1141,9 +1141,53 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 		t.Fatalf("autoPauseMemory status=%d reserveProfiles=%v", autoPauseResp.StatusCode, reserveProfiles)
 	}
 
+	// Removed public fields must not silently reach registration admission.
+	for _, name := range []string{"secure", "Secure", "SECURE"} {
+		for _, value := range []string{"true", "false", "null"} {
+			removedReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"`+name+`":`+value+`}`))
+			removedReq.Host = "api.test.local"
+			removedReq.Header.Set(HeaderGroup, "/g")
+			removedReq.Header.Set(HeaderAPIKey, "e2b_test")
+			removedResp, err := http.DefaultClient.Do(removedReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			removedResp.Body.Close()
+			if removedResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+				t.Fatalf("removed %s=%s status=%d reserveProfiles=%v", name, value, removedResp.StatusCode, reserveProfiles)
+			}
+		}
+	}
+	for _, value := range []string{"1", "null"} {
+		for _, source := range []string{"header", "metadata", "metadata with header"} {
+			body, header := `{}`, `{"max_checkpoints":`+value+`}`
+			if source != "header" {
+				body, header = checkpointQuotaBody(header), ""
+				if source == "metadata with header" {
+					header = `{"merge_ref":false}`
+				}
+			}
+			quotaReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(body))
+			quotaReq.Host = "api.test.local"
+			quotaReq.Header.Set(HeaderGroup, "/g")
+			quotaReq.Header.Set(HeaderAPIKey, "e2b_test")
+			if header != "" {
+				quotaReq.Header.Set(HeaderCheckpoint, header)
+			}
+			quotaResp, err := http.DefaultClient.Do(quotaReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			quotaResp.Body.Close()
+			if quotaResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+				t.Fatalf("Build quota %s=%s status=%d reserveProfiles=%v", source, value, quotaResp.StatusCode, reserveProfiles)
+			}
+		}
+	}
+
 	// register a build via the router (control plane: Host api.<domain> + group).
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(
-		`{"cpuCount":4,"memoryMB":8192,"envVars":{"REGISTERED":"yes"},"secure":true,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}","kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/token\",\"type\":\"secret\",\"secret\":\"token\"}],\"secrets\":{\"token\":\"body-value\"}}"}}`,
+		`{"cpuCount":4,"memoryMB":8192,"envVars":{"REGISTERED":"yes"},"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}","kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/token\",\"type\":\"secret\",\"secret\":\"token\"}],\"secrets\":{\"token\":\"body-value\"}}"}}`,
 	))
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
@@ -1179,7 +1223,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 		t.Fatalf("cluster build resources = %+v", reserveBuildResources)
 	}
 	if reserveNetwork != `{"hostname":"built"}` || reserveEnv["REGISTERED"] != "yes" ||
-		!reserveSecure || reserveCredentials.EnvdAccessToken != "registered-envd" {
+		reserveSecure || reserveCredentials.EnvdAccessToken != "registered-envd" {
 		t.Fatalf("cluster Create config network=%q env=%v secure=%t credentials=%+v",
 			reserveNetwork, reserveEnv, reserveSecure, reserveCredentials)
 	}

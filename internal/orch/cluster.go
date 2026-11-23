@@ -299,7 +299,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		if err := o.validateBuildOptions(builderOpts, false); err != nil {
 			return err
 		}
-		if err := validateRegistrationTargetConfig(builderOpts.Target, profile, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
+		if err := validateRegistrationTargetConfig(builderOpts.Target, profile, meta, cmd.BuildEnv, mmdsDoc, credentials); err != nil {
 			return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 		}
 	}
@@ -318,7 +318,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		ClusterGroup:              location.Group,
 		Metadata:                  meta,
 		Env:                       cloneStringMap(cmd.BuildEnv),
-		Secure:                    cmd.BuildSecure,
+		Secure:                    cmd.BuildSecure, // Preserve legacy in-flight registration state.
 		ServiceSecret:             credentials.ServiceSecret,
 		EnvdAccessToken:           credentials.EnvdAccessToken,
 		TrafficAccessToken:        credentials.TrafficAccessToken,
@@ -358,6 +358,8 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		modified.RegistrationImageRepo = b.RegistrationImageRepo
 		modified.RegistrationRegistryAuth = b.RegistrationRegistryAuth
 		modified.RegistrationRequestDigest = b.RegistrationRequestDigest
+		// Secure is legacy registration state, no longer a mutable Hook input.
+		modified.Secure = b.Secure
 		modified.ClusterGroup = b.ClusterGroup
 		modified.CreatedUnix = b.CreatedUnix
 		b = modified

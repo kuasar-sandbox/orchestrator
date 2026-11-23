@@ -22,8 +22,6 @@ type CaptureRequest struct {
 	Checkpoint  bool
 	IfIdle      bool
 	IfIdleSince *time.Time
-	// Waiting happens before accepting a pause and never changes its state.
-	NoWaitForPreviousMemorySave bool
 	// IdleSinceBootNS is an internal same-host anchor, never decoded from JSON.
 	IdleSinceBootNS int64
 	Kind            types.CaptureKind
@@ -74,19 +72,29 @@ func OverlaySnapshotPolicy(base, higher SnapshotPolicy) SnapshotPolicy {
 // representation. The top level must be exactly one object containing only
 // merge_ref and drop_caches, whose values may be true, false, or null.
 func ParseSnapshotPolicyJSON(raw string) (SnapshotPolicy, error) {
+	object, err := parseCheckpointPolicyObject(raw)
+	if err != nil {
+		return SnapshotPolicy{}, err
+	}
+	return parseSnapshotPolicyFields(object)
+}
+
+func parseCheckpointPolicyObject(raw string) (map[string]json.RawMessage, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed[0] != '{' {
-		return SnapshotPolicy{}, fmt.Errorf("checkpoint policy must be a JSON object")
+		return nil, fmt.Errorf("checkpoint policy must be a JSON object")
 	}
-
 	if err := strictjson.RejectDuplicateKeys([]byte(trimmed)); err != nil {
-		return SnapshotPolicy{}, fmt.Errorf("invalid checkpoint policy: %w", err)
+		return nil, fmt.Errorf("invalid checkpoint policy: %w", err)
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
-		return SnapshotPolicy{}, fmt.Errorf("invalid checkpoint policy: %w", err)
+		return nil, fmt.Errorf("invalid checkpoint policy: %w", err)
 	}
+	return object, nil
+}
 
+func parseSnapshotPolicyFields(object map[string]json.RawMessage) (SnapshotPolicy, error) {
 	var policy SnapshotPolicy
 	for field, value := range object {
 		var target **bool
