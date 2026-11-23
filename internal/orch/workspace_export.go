@@ -1,15 +1,15 @@
 package orch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -97,11 +97,16 @@ func (o *Orchestrator) callWorkspaceStorage(ctx context.Context, key string, req
 	if err != nil {
 		return result, err
 	}
-	cmd := exec.CommandContext(ctx, o.executables.OrchestratorCtl(), "workspace-storage")
+	cmd := helperexec.CommandContext(ctx, o.executables.OrchestratorCtl(), "workspace-storage")
 	cmd.Env = append(os.Environ(), manifest.CustomerKeyEnv+"="+key)
 	inheritSourceOperation(ctx, cmd)
 	output := &snapshotCheckOutput{limit: rtconfig.MaxPortableConfigBytes}
-	if err := runSnapshotRuntimeHelper(ctx, cmd, raw, output, io.Discard); err != nil || output.truncated {
+	stderr := &snapshotCheckOutput{limit: 4 << 10}
+	cmd.Stdin = bytes.NewReader(raw)
+	cmd.Stdout = output
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil || output.truncated || ctx.Err() != nil {
+		o.log.Warn("workspace storage helper result unavailable", "err", err, "context_err", ctx.Err(), "stderr", stderr.String(), "output_truncated", output.truncated)
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}

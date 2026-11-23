@@ -434,26 +434,29 @@ func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemo
 	return createSandboxPoliciesWithQuota(w, r, autoPauseMemory, idleTimeout, nil, autoReset...)
 }
 func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, idleTimeout **int64, maxCheckpoints **int, autoReset ...**bool) (map[string]string, error) {
+	if maxCheckpoints != nil {
+		*maxCheckpoints = nil
+	}
 	if _, present := r.Header[http.CanonicalHeaderKey(HeaderIdentity)]; present {
 		return nil, fmt.Errorf("%s / %s is only supported by direct conductor Create", HeaderIdentity, sandboxcfg.NsIdentity)
 	}
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
 	checkpointRaw, checkpointHeader := createHeaderValue(r.Header, HeaderCheckpoint)
-	checkpointHeaderPolicy := sandboxcfg.SnapshotPolicy{}
+	checkpointHeaderPolicy := sandboxcfg.CreateCheckpointPolicy{}
 	if checkpointHeader {
 		var err error
-		checkpointHeaderPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(checkpointRaw)
+		checkpointHeaderPolicy, err = sandboxcfg.ParseCreateCheckpointPolicyJSON(checkpointRaw)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", HeaderCheckpoint, err)
 		}
 	}
 	var body struct {
-		MaxCheckpoints  *int              `json:"max_checkpoints,omitempty"`
-		Metadata        map[string]string `json:"metadata"`
-		AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
-		IdleTimeout     *int64            `json:"idleTimeout,omitempty"`
-		AutoReset       *bool             `json:"autoReset,omitempty"`
+		RemovedMaxCheckpoints json.RawMessage   `json:"max_checkpoints"`
+		Metadata              map[string]string `json:"metadata"`
+		AutoPauseMemory       *bool             `json:"autoPauseMemory,omitempty"`
+		IdleTimeout           *int64            `json:"idleTimeout,omitempty"`
+		AutoReset             *bool             `json:"autoReset,omitempty"`
 	}
 	if r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
@@ -480,11 +483,8 @@ func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, auto
 	if idleTimeout != nil {
 		*idleTimeout = types.CloneIdleTimeout(body.IdleTimeout)
 	}
-	if _, err := types.ResolveMaxCheckpoints(body.MaxCheckpoints); err != nil {
-		return nil, err
-	}
-	if maxCheckpoints != nil {
-		*maxCheckpoints = body.MaxCheckpoints
+	if len(body.RemovedMaxCheckpoints) != 0 {
+		return nil, fmt.Errorf("max_checkpoints must be set in %s or metadata[%s]", HeaderCheckpoint, sandboxcfg.NsCheckpoint)
 	}
 	if _, present := body.Metadata[sandboxcfg.NsIdentity]; present {
 		return nil, fmt.Errorf("%s is only supported by direct conductor Create", sandboxcfg.NsIdentity)
@@ -542,19 +542,19 @@ func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, auto
 		selected[sandboxcfg.NsCredentials] = credentialsRaw
 	}
 	if checkpointHeader {
-		bodyPolicy := sandboxcfg.SnapshotPolicy{}
+		bodyPolicy := sandboxcfg.CreateCheckpointPolicy{}
 		if raw, ok := selected[sandboxcfg.NsCheckpoint]; ok {
 			var err error
-			bodyPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(raw)
+			bodyPolicy, err = sandboxcfg.ParseCreateCheckpointPolicyJSON(raw)
 			if err != nil {
 				return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
 			}
 		}
-		policy := sandboxcfg.OverlaySnapshotPolicy(bodyPolicy, checkpointHeaderPolicy)
+		policy := sandboxcfg.OverlayCreateCheckpointPolicy(bodyPolicy, checkpointHeaderPolicy)
 		if policy.Empty() {
 			delete(selected, sandboxcfg.NsCheckpoint)
 		} else {
-			canonical, err := sandboxcfg.MarshalSnapshotPolicyJSON(policy)
+			canonical, err := sandboxcfg.MarshalCreateCheckpointPolicyJSON(policy)
 			if err != nil {
 				return nil, err
 			}
@@ -568,9 +568,12 @@ func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, auto
 	if err != nil {
 		return nil, err
 	}
-	selected, err = sandboxcfg.NormalizeCheckpointMetadata(selected)
+	checkpointPolicy, selected, err := sandboxcfg.ExtractCreateCheckpointPolicy(selected)
 	if err != nil {
 		return nil, err
+	}
+	if maxCheckpoints != nil {
+		*maxCheckpoints = checkpointPolicy.MaxCheckpoints
 	}
 	credentials, cleaned, err := sandboxcfg.ExtractCredentials(selected)
 	if err != nil {
@@ -762,7 +765,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		MemoryMBSn      json.RawMessage   `json:"memory_mb"`
 		Metadata        map[string]string `json:"metadata"`
 		EnvVars         map[string]string `json:"envVars"`
-		Secure          bool              `json:"secure"`
+		RemovedSecure   json.RawMessage   `json:"secure"`
 		AutoPauseMemory json.RawMessage   `json:"autoPauseMemory"`
 		Cancel          json.RawMessage   `json:"cancel"`
 	}
@@ -777,6 +780,10 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := strictjson.DecodeAllowUnknown(rawBody, &body); err != nil {
 		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.RemovedSecure) != 0 {
+		http.Error(w, "secure is not a supported Build option", http.StatusBadRequest)
 		return
 	}
 	query, err := url.ParseQuery(r.URL.RawQuery)
@@ -900,7 +907,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		credentialEnvelope = &credentials
 	}
 	res, err := rt.routeLinkReserveBuild(
-		r.Context(), group, profile, resources, metadata, body.EnvVars, body.Secure,
+		r.Context(), group, profile, resources, metadata, body.EnvVars,
 		credentialEnvelope, mmdsSecrets, entries,
 	)
 	if err != nil {
@@ -2129,7 +2136,7 @@ func (rt *Router) routeLinkReserve(
 	return &res, nil
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, secure bool, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string, entries []workspace.Entry) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string, entries []workspace.Entry) (*buildReserveResult, error) {
 	var wireResources *routesync.BuildResources
 	if resources != nil {
 		wireResources = &routesync.BuildResources{
@@ -2139,7 +2146,7 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 	reqBody, _ := json.Marshal(registry.BuildReserveReq{
 		Group: group, BuildID: "bld-" + randomHexID(), TemplateID: "transient-" + randomHexID(),
 		Profile: profile, Resources: wireResources,
-		Metadata: metadata, Env: env, Secure: secure, Credentials: credentials, MMDSSecrets: mmdsSecrets, Workspaces: entries,
+		Metadata: metadata, Env: env, Credentials: credentials, MMDSSecrets: mmdsSecrets, Workspaces: entries,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {

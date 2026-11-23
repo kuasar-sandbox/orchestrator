@@ -21,10 +21,24 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	maxCheckpoints, err := types.ResolveMaxCheckpoints(req.MaxCheckpoints)
+	checkpointPolicy, metadata, err := sandboxcfg.ExtractCreateCheckpointPolicy(req.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	quota := req.MaxCheckpoints
+	if checkpointPolicy.MaxCheckpoints != nil {
+		if quota != nil && *quota != *checkpointPolicy.MaxCheckpoints {
+			return nil, fmt.Errorf("%w: conflicting max_checkpoints values in checkpoint metadata and internal Create request", api.ErrBadRequest)
+		}
+		quota = checkpointPolicy.MaxCheckpoints
+	}
+	maxCheckpoints, err := types.ResolveMaxCheckpoints(quota)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	// Quota becomes core-owned typed state here. Only snapshot defaults
+	// remain available to the Hook and subsequent Pause policy resolution.
+	req.Metadata = metadata
 
 	admissionStarted := time.Now()
 	if req.TimeoutSec <= 0 {

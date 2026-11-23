@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -111,7 +112,7 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 	if inspect {
 		args = append(args, "--list-versions")
 	}
-	cmd := exec.CommandContext(ctx, o.executables.OrchestratorCtl(), args...)
+	cmd := helperexec.CommandContext(ctx, o.executables.OrchestratorCtl(), args...)
 	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var stderr, stdout bytes.Buffer

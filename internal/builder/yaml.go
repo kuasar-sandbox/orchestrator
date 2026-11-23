@@ -3,7 +3,6 @@ package builder
 import (
 	"bytes"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -11,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -320,7 +320,7 @@ func (p *buildPipeline) templateReference(raw string) (string, error) {
 // tenant registry creds) layered over the unit environment — every host
 // invocation gets it, since any of them may resolve manifest:// refs.
 func (p *buildPipeline) hostCmdEnv(env map[string]string, bin string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(p.ctx, bin, args...)
+	cmd := helperexec.CommandContext(p.ctx, bin, args...)
 	cmd.Env = authoritativeProcessEnv(env)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

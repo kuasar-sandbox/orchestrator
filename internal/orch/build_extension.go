@@ -26,7 +26,6 @@ type normalizedBuildRegistration struct {
 	resources   types.BuildResources
 	metadata    map[string]string
 	env         map[string]string
-	secure      bool
 	builder     types.BuildOptions
 	mmds        sandboxcfg.MMDSDocument
 	credentials sandboxcfg.Credentials
@@ -46,7 +45,6 @@ func buildRegisterRequest(spec api.RegisterSpec, templateID string) *conductorex
 		Resources:  cloneBuildResources(spec.Resources),
 		Metadata:   cloneStringMap(spec.Metadata),
 		Env:        cloneStringMap(spec.EnvVars),
-		Secure:     spec.Secure,
 		Builder:    publicBuildOptions(builder),
 	}
 }
@@ -60,7 +58,6 @@ func buildRegisterRequestFromBuild(build *types.Build) *conductorextension.Build
 		Resources:  cloneBuildResources(build.Resources),
 		Metadata:   cloneStringMap(build.Metadata),
 		Env:        cloneStringMap(build.Env),
-		Secure:     build.Secure,
 		Builder:    publicBuildOptions(build.Builder),
 	}
 }
@@ -71,7 +68,7 @@ func buildRegisterRequestFromCandidate(candidate *normalizedBuildRegistration) *
 		Profile:    candidate.profile,
 		Names:      candidate.names, Aliases: candidate.aliases,
 		Resources: candidate.resources,
-		Metadata:  candidate.metadata, Env: candidate.env, Secure: candidate.secure,
+		Metadata:  candidate.metadata, Env: candidate.env,
 		Builder: candidate.builder,
 	}
 	return buildRegisterRequestFromBuild(build)
@@ -163,7 +160,7 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err := o.validateBuildOptions(builder, false); err != nil {
 		return nil, err
 	}
-	if err := validateRegistrationTargetConfig(builder.Target, profile, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
+	if err := validateRegistrationTargetConfig(builder.Target, profile, metadata, request.Env, mmdsDoc, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	return &normalizedBuildRegistration{
@@ -171,12 +168,12 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 		profile:    profile,
 		names:      append([]string(nil), request.Names...), aliases: append([]string(nil), request.Aliases...),
 		resources: resources, metadata: metadata,
-		env: cloneStringMap(request.Env), secure: request.Secure, builder: builder,
+		env: cloneStringMap(request.Env), builder: builder,
 		mmds: mmdsDoc, credentials: credentials,
 	}, nil
 }
 
-func validateRegistrationTargetConfig(target *types.BuildTarget, profile types.Profile, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
+func validateRegistrationTargetConfig(target *types.BuildTarget, profile types.Profile, metadata, env map[string]string, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
 	if raw, ok := metadata[workspace.Namespace]; ok {
 		entries, err := workspace.Parse(raw)
 		if err != nil {
@@ -190,14 +187,14 @@ func validateRegistrationTargetConfig(target *types.BuildTarget, profile types.P
 		resolved := types.ResolveBuildTarget(nil, "", "")
 		target = &resolved
 	}
-	return validateBuildTargetConfig(target, metadata, env, secure, mmds, credentials)
+	return validateBuildTargetConfig(target, metadata, env, mmds, credentials)
 }
 
-func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
+func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[string]string, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
 	if target == nil {
 		return nil
 	}
-	instanceOnly := secure || credentials != (sandboxcfg.Credentials{}) ||
+	instanceOnly := credentials != (sandboxcfg.Credentials{}) ||
 		mmds.RoutesPresent || mmds.SecretsPresent || metadata[sandboxcfg.NsTraffic] != "" ||
 		metadata[sandboxcfg.NsCheckpoint] != ""
 	switch {
@@ -218,10 +215,10 @@ func validateBuildTargetConfig(target *types.BuildTarget, metadata, env map[stri
 			return fmt.Errorf("image target cannot carry envVars; select builder.target kind=sandbox (memory=false is sufficient for envVars)")
 		}
 		if instanceOnly {
-			return fmt.Errorf("image target cannot carry secure, credentials, or MMDS instance configuration; select builder.target kind=sandbox,memory=true")
+			return fmt.Errorf("image target cannot carry credentials or MMDS instance configuration; select builder.target kind=sandbox,memory=true")
 		}
 	case target.Kind == types.BuildTargetSandbox && !target.Memory && instanceOnly:
-		return fmt.Errorf("sandbox target with memory=false cannot carry traffic, credentials, MMDS, secure, or checkpoint configuration")
+		return fmt.Errorf("sandbox target with memory=false cannot carry traffic, credentials, MMDS, or checkpoint configuration")
 	}
 	return nil
 }
@@ -239,7 +236,7 @@ func validateKnownBuildTargetConfig(build *types.Build) error {
 		resolved := types.ResolveBuildTarget(nil, build.StartCmd, build.ReadyCmd)
 		target = &resolved
 	}
-	return validateBuildTargetConfig(target, build.Metadata, build.Env, build.Secure,
+	return validateBuildTargetConfig(target, build.Metadata, build.Env,
 		sandboxcfg.MMDSDocument{RoutesPresent: build.Metadata[sandboxcfg.NsMMDS] != ""},
 		sandboxcfg.Credentials{ServiceSecret: build.ServiceSecret, EnvdAccessToken: build.EnvdAccessToken, TrafficAccessToken: build.TrafficAccessToken})
 }
@@ -292,7 +289,7 @@ func registeredBuildFromCandidate(buildID string, pair store.KeyPair, candidate 
 		Status:  types.BuildRegistered, FromImage: fromImage,
 		Names: candidate.names, Aliases: candidate.aliases,
 		Resources: candidate.resources,
-		Metadata:  candidate.metadata, Env: candidate.env, Secure: candidate.secure,
+		Metadata:  candidate.metadata, Env: candidate.env,
 		ServiceSecret:      candidate.credentials.ServiceSecret,
 		EnvdAccessToken:    candidate.credentials.EnvdAccessToken,
 		TrafficAccessToken: candidate.credentials.TrafficAccessToken,
@@ -331,7 +328,7 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		Resources            *routesync.BuildResources
 		Config               map[string]string
 		Env                  map[string]string
-		Secure               bool
+		Secure               bool // Retain the legacy field in the exact request identity.
 		Credentials          *sandboxcfg.Credentials
 		WorkspaceDigest      string `json:",omitempty"`
 		MMDSSecrets          map[string]string

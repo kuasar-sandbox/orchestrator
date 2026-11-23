@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -1371,9 +1373,8 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	precondition := sandboxPrecondition(sandbox)
 	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Pause = &conductorextension.SandboxPauseRequest{
-		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
-		CaptureKind:                 conductorextension.CaptureKind(request.Kind),
-		Checkpoint:                  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
+		CaptureKind: conductorextension.CaptureKind(request.Kind),
+		Checkpoint:  request.Checkpoint, IfIdle: request.IfIdle, IfIdleSince: cloneTime(request.IfIdleSince),
 		CheckpointMergeRef: cloneBool(request.SnapshotPolicy.MergeRef), CheckpointDropCaches: cloneBool(request.SnapshotPolicy.DropCaches),
 	}
 	operationID := operation.ID
@@ -1389,7 +1390,7 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	if candidate == nil {
 		return "", fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
 	}
-	if candidate.NoWaitForPreviousMemorySave != request.NoWaitForPreviousMemorySave || types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
+	if types.CaptureKind(candidate.CaptureKind) != request.Kind || candidate.Checkpoint != request.Checkpoint || candidate.IfIdle != request.IfIdle || !equalTime(candidate.IfIdleSince, request.IfIdleSince) {
 		return "", fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
@@ -1408,9 +1409,8 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	}
 	defer unlock()
 	finalRequest := sandboxcfg.CaptureRequest{
-		NoWaitForPreviousMemorySave: request.NoWaitForPreviousMemorySave,
-		Kind:                        types.CaptureKind(candidate.CaptureKind),
-		Checkpoint:                  candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
+		Kind:       types.CaptureKind(candidate.CaptureKind),
+		Checkpoint: candidate.Checkpoint, IfIdle: candidate.IfIdle, IfIdleSince: cloneTime(candidate.IfIdleSince),
 		SnapshotPolicy: sandboxcfg.SnapshotPolicy{
 			MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
 		},
@@ -1458,7 +1458,7 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	default:
 		return api.ErrNotFound
 	}
-	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox, NoWaitForPreviousMemorySave: true}
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
 	if current.AutoPauseMemory {
 		request.Kind = types.CaptureSnapshot
 		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, sandboxcfg.SnapshotPolicy{})
@@ -3311,7 +3311,7 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 		if request.Kind == types.CaptureSnapshot {
 			args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
 		}
-		cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+		cmd := helperexec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 		cmd.Env, err = retirementCommandEnvironment(permit)
 		if err != nil {
 			return types.ResumeSource{}, err
@@ -3408,13 +3408,30 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 		}
 	}
 	args = append(args, root)
-	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	cmd := helperexec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return artifact.PublishReport{}, fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+		publishErr := fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+		if ctx.Err() != nil {
+			// Preemption returns the public 409 instead of publishErr. Preserve
+			// the child diagnostic, including any cleanup failure, in the log.
+			var exit *exec.ExitError
+			signaled := false
+			if errors.As(err, &exit) {
+				status, ok := exit.Sys().(syscall.WaitStatus)
+				// Signal() returns -1 on normal exit; use the termination kind.
+				signaled = ok && status.Signaled()
+			}
+			if signaled {
+				o.log.Warn("publisher killed during cancellation; files may remain", "sid", sb.ID, "err", publishErr)
+			} else {
+				o.log.Info("publisher exited after cancellation", "sid", sb.ID, "err", publishErr)
+			}
+		}
+		return artifact.PublishReport{}, publishErr
 	}
 	report, err := artifact.DecodePublishReport(out.Bytes(), artifactRole(source.Kind))
 	if err != nil {

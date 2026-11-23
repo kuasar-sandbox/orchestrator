@@ -369,15 +369,13 @@ func TestDeadHolderDoesNotGateSuccessorPauseAndStillNeedsReleaseProof(t *testing
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	for _, noWait := range []bool{false, true} {
-		_, unlock, admitted, err := f.o.lockPauseAdmission(ctx, f.sb.ID, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, NoWaitForPreviousMemorySave: noWait}, nil)
-		if err != nil {
-			t.Fatalf("old holder blocked successor capture: %v", err)
-		}
-		unlock()
-		if admitted.RunID != f.sb.RunID || admitted.State != types.StateRunning {
-			t.Fatal("wrong running generation")
-		}
+	_, unlock, admitted, err := f.o.lockPauseAdmission(ctx, f.sb.ID, sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, nil)
+	if err != nil {
+		t.Fatalf("old holder blocked successor capture: %v", err)
+	}
+	unlock()
+	if admitted.RunID != f.sb.RunID || admitted.State != types.StateRunning {
+		t.Fatal("wrong running generation")
 	}
 	if err := f.o.reconcileRetiredRun(ctx, m); err == nil {
 		t.Fatal("live reader released old producer ownership")

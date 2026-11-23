@@ -531,7 +531,8 @@ operation 是独立可变副本，精确有一个 request 字段非 nil。`ID`�
 | `SandboxDeleteRequest` | `Reason string` 仅诊断,修改不改变 cleanup 行为 |
 
 直连 Create 可在不可变 profile 内更改模板;canonical cluster Create 必须保留模板及 cluster metadata,
-并让顶层 `MMDS` 保持 nil,不因此取得直连 Create 的覆盖权限。
+并让顶层 `MMDS` 保持 nil,不因此取得直连 Create 的覆盖权限。Create 在 Hook 前把
+`checkpoint.max_checkpoints` 解析为 core-owned 配额；Hook 的 checkpoint metadata 仅保留 `merge_ref`/`drop_caches` 缺省，不能重新加入配额。
 
 Sandbox 操作准入位置如下：
 
@@ -540,7 +541,7 @@ Sandbox 操作准入位置如下：
 - `resume`：仅用于 API Connect、Proxy Wake、native exec 和 canonical cluster command 共用的真实 paused → starting 准入。running/starting 的幂等 join 不调用 Hook。Hook 可改请求 deadline；`Mode` 和 `Trigger` 可观察但由 core 持有。
 - `delete`：仅普通显式 API Delete 或 canonical cluster Delete，可拒绝该请求。失败 create/resume 的回滚、对账、shutdown、恢复和其他强制 cleanup 不调用 Hook，不能被扩展可用性阻止。
 
-Build `register` 在解析调用方身份与 ID 后、registration capacity 事务前运行。可以改 `Names`、`Aliases`、`Profile`、`Resources`、`Metadata`(含 routes-only MMDS 声明)、`Env`、`Secure` 和受支持的 `Builder` options;`BuildID`、`TemplateID` 保持 core-owned。不存在可变请求 `kind`:终态 `BuildKind`(`img`/`sbx`/`snp`) 只在成功时推导,此前为空。原始 MMDS secret、registry credentials 和 pull token 不复制到 operation。Core 在 Hook 后把保留的初始 MMDS 值重新绑定到最终 routes 声明，再解析 registry 凭据。Canonical cluster BuildRegister 仅在新 ownership 时调用 Hook。对已持久 BuildID 的精确重放验证原始 tenant-keyed 请求身份和凭据指纹，不重复调用可变 Hook，因此后续策略变化不会破坏丢失 ACK 后的重放。
+Build `register` 在解析调用方身份与 ID 后、registration capacity 事务前运行。可以改 `Names`、`Aliases`、`Profile`、`Resources`、`Metadata`(含 routes-only MMDS 声明)、`Env` 和受支持的 `Builder` options;`BuildID`、`TemplateID` 保持 core-owned。不存在可变请求 `kind`:终态 `BuildKind`(`img`/`sbx`/`snp`) 只在成功时推导,此前为空。原始 MMDS secret、registry credentials 和 pull token 不复制到 operation。Core 在 Hook 后把保留的初始 MMDS 值重新绑定到最终 routes 声明，再解析 registry 凭据。Canonical cluster BuildRegister 仅在新 ownership 时调用 Hook。对已持久 BuildID 的精确重放验证原始 tenant-keyed 请求身份和凭据指纹，不重复调用可变 Hook，因此后续策略变化不会破坏丢失 ACK 后的重放。`Secure` 不再是 Build Hook 输入；内部历史 secure 值只保留作注册状态和重放身份。
 
 `Register.Resources` 是注册执行向量的唯一权威(`CPU` 为 milli-CPU,`Memory`/`Storage` 为 bytes)。
 Hook 必须让 `Builder.Resources` 保持 nil;重新引入重复权威会被拒绝。

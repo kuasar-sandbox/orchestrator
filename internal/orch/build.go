@@ -395,7 +395,7 @@ func buildHasInstanceConfig(build *types.Build) bool {
 	if build == nil {
 		return false
 	}
-	return build.Secure || build.ServiceSecret != "" || build.EnvdAccessToken != "" ||
+	return build.ServiceSecret != "" || build.EnvdAccessToken != "" ||
 		build.TrafficAccessToken != "" || build.Metadata[sandboxcfg.NsTraffic] != "" ||
 		build.Metadata[sandboxcfg.NsMMDS] != "" ||
 		build.Metadata[sandboxcfg.NsCheckpoint] != ""

@@ -32,7 +32,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?, max_checkpoints?}` + 可选 `X-Kuasar-Sandbox-*` Header;`max_checkpoints` 缺省为 1，显式值必须为正整数；`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, idleTimeout?, autoPauseMemory?, autoReset?}` + 可选 `X-Kuasar-Sandbox-*` Header；`checkpoint.max_checkpoints` 经 checkpoint Header/metadata 命名空间设置，缺省为 1，显式值必须为正整数（[Checkpoint policy 输入](#request-checkpoint)）；顶层 `max_checkpoints` 返回 400；`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata`、autoReset，以及可选 deadAt/executionResult/autoResetError（[终止、Reset 与数据保留](#reset-and-retention)） |
 | usage stats | `GET /sandboxes/{id}/stats/usage` | 共用原生 current/saved/history Reader; 无损整数和 coverage, 在线 owner/离线锁, 不 Wake 或采样 |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读最终资源规格和宿主 VMM counter,附可观测的节点 reservation;sparse JSON,不访问 guest |
@@ -380,8 +380,8 @@ checkpoint，也不设置资源恢复责任。running 实例若仍有 `ResourceO
 是 Snapshot S,不继承 `autoPauseMemory`。因此 `Create(autoPauseMemory=false) + Pause({})` 保存 S,
 而同一 Sandbox TTL 到期保存 E。`checkpoint_merge_ref` 和 `checkpoint_drop_caches` 只属于
 `SnapshotPolicy`;若 `memory=false` 同时携任一字段（即使值为 `null`）,API 在 guest freeze、capture 或 lifecycle
-副作用前返回 400。Pause Header 中显式提供 `merge_ref`/`drop_caches` 也受此限制。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
-`merge_ref`、`drop_caches`,不接受 `memory`。
+副作用前返回 400。Pause Header 中显式提供 `merge_ref`/`drop_caches` 也受此限制。Pause 与 Build 的 checkpoint 输入仍只接受
+`merge_ref`、`drop_caches`；配额 `max_checkpoints` 仅供 Create，`memory` 始终不是 checkpoint 命名空间字段。
 
 ### Checkpoint 内存保存
 
@@ -438,8 +438,8 @@ producer 未发布 `FileReady` 即退出时，已有 RAM 读者继续占有原�
 之后才清除；保留 BaseDir 和原 ResumeSource。
 
 同一 SID 可以同时存在多个 holder，新的暂停不等待旧 RAM 释放，Bundle 与 tarstream
-行为一致。`noWaitForPreviousMemorySave` 与 `NoWaitForPreviousMemorySave` 保留为
-兼容输入，不再触发前轮等待或 pending 冲突。恢复从权威节点库存接管该 SID 所有未
+行为一致。已移除的 Pause 输入 `noWaitForPreviousMemorySave`（含
+`NoWaitForPreviousMemorySave`）返回 HTTP 400，即使值为 false 或 null。恢复从权威节点库存接管该 SID 所有未
 结清额度，与所选 checkpoint 或分支无关：Q = B + ΣRi。每份 Ri 按准确 capture 只计
 一次并留在原 SourcePool，新 B/cache 由目标池准入。ReservationMemory、balloon、
 StateSync、Guest Capacity 和 startup 仍只表示本代 B，下一轮也只把 B 转为新 Ri。
@@ -497,8 +497,10 @@ paused/source 事务；物理 RAM 已释放但文件未发布时，将准确 pau
 runner fencing 和终止清理流程收敛，不仅凭进程存活重新发布 running。
 
 `checkpoint=true` 保存一个长期保留的不可变 E 或 S/E 对, 与 paused/source 在同一事务提交,
-返回 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. 默认 Pause 仍返回 204. Sandbox 选项
-`max_checkpoints` 缺省为 1，接受正整数。Direct/cluster Create、Reserve 重试及
+返回 HTTP 200 `{"checkpointID":"<UUID-v7>"}`. 默认 Pause 仍返回 204. Create 选项
+`checkpoint.max_checkpoints` 缺省为 1，接受正整数，经 `X-Kuasar-Sandbox-Checkpoint`
+或 `metadata["kuasar-sandbox.checkpoint"]` 设置（[Checkpoint policy 输入](#request-checkpoint)）；
+旧的顶层 body 字段返回 400。Direct/cluster Create、Reserve 重试及
 replacement 保留已受理的策略；它不写入 S/E 或 migration token。命名 Pause 在冻结前
 检查名额，并在 paused/source/holder 提交事务中再次核验，达到上限返回 409。
 普通 Pause 不占此配额, 也不覆盖保留来源. 正在导出的 checkpoint 仍占配额.
@@ -943,6 +945,17 @@ publisher、capture CLI 和 `checkpoint-cleanup` 继承其描述符，因此 con
 发出取消不代表已经完成。正常执行结束、确认运行实例失联及显式删除共同使用受来源保护的
 资源收尾，保留的 dead 历史与执行结果继续保持原有业务含义。
 
+支持协作取消的直接辅助子进程（发布、workspace-storage、构建宿主工具、capture/reset
+及 checkpoint 检查/清理）共用退出策略：先 SIGTERM，5 秒内部宽限后仍未退出则
+SIGKILL，并始终等待真实子进程退出。沿用调用方 operation context 和现有提交协议；
+5 秒是兜底默认值，不是实测清理保证。短准入检查保持独立预算；proxy worker、guest
+exec 和 VM/service runner 保持各自生命周期协议。
+
+取消发布时向 `sandbox-ctl publish` 发送 SIGTERM，让它在退出前清理临时物化目录和
+当前未完成的目标文件；子进程退出前继续保留 export/source 保护。共同 helper 策略的 5 秒宽限后仍未退出则
+强杀，因此强制终止仍可能留下文件。已提交的共享产物不回滚。请求取消和 conductor
+lifecycle 关闭也使用相同的发布取消路径。
+
 Export 的 publish 阶段不持有长 lifecycle lock。结果校验通过后，在 per-SID lifecycle lock
 内检查完整原始 S/E 对、源实例和导出 attempt。Resume 先成功 `BeginResume` 时，KMT
 export 被取消并返回 409；template publish 可 detached 完成并返回 TemplateID，但不清理
@@ -1067,7 +1080,7 @@ JSON 对象字符串)注入,零 SDK/API 改动。这些独立的 typed 租户 sc
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
-| `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
+| `checkpoint` | host-only Create 输入：`merge_ref`/`drop_caches` 为 `true`/`false`/`null`，设置 Pause 缺省；`max_checkpoints` 设置保留配额（正整数/null，缺省 1）。配额提取为 Sandbox typed state，metadata 只保留快照缺省；均不进入 runtime YAML 或 snapshot.cfg |
 | `workspace` | 可移植的数据盘名称与挂载拓扑，创建时的盘源选择走私有通道。参见 [Workspace 存储](#workspace-存储)。 |
 | `mmds` | portable exact `routes` + request-scoped initial `secrets`;持久化前拆分,metadata 最终只保留 routes |
 
@@ -1096,20 +1109,27 @@ metadata。orchestrator 不判断本地/远程、单层/多层或底层 Prefetch
 
 ### Checkpoint policy 输入
 
-Checkpoint policy 也支持 metadata 与 Create header 两个入口:
+Create 的 checkpoint policy 支持以下两种等价的 Header 或 metadata 输入：
 
 ```http
-X-Kuasar-Sandbox-Checkpoint: {"merge_ref":false,"drop_caches":null}
+X-Kuasar-Sandbox-Checkpoint: {"merge_ref":true,"drop_caches":false,"max_checkpoints":3}
 ```
 
 ```json
-{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}
+{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false,\"max_checkpoints\":3}"}}
 ```
 
-两处共用严格 JSON object 解析:只允许 `merge_ref`、`drop_caches`,每个值只允许
-`true`、`false`、`null`;unknown、错误类型、第二个 value 或尾随内容均返回 400。
-Header 按字段覆盖 metadata;`null`/缺失表示不覆盖,而不是清除低层值。合并后全为
-`null`/缺失则删除整个 namespace。该 namespace 不从 source template 继承；Build 的 checkpoint 输入见 [请求级 Builder 输入](node-build_zh.md#request-scoped-builder-input)。`local` 与 `bundle` 使用完全相同的 policy 解析、覆盖和副作用边界。
+| 字段 | 允许值 | 适用范围 |
+|---|---|---|
+| `merge_ref` | `true`、`false` 或 `null` | Create 设置 Sandbox 快照缺省；Pause/Build 可提供 capture policy |
+| `drop_caches` | `true`、`false` 或 `null` | Create 设置 Sandbox 快照缺省；Pause/Build 可提供 capture policy |
+| `max_checkpoints` | 正整数或 `null` | 仅 Create 的保留 checkpoint 配额；合并后未指定时取 1 |
+
+两处均须为严格 JSON object。未知或重复字段、错误类型、非正配额、第二个 value 或尾随内容均返回 400；合法 Header 不能遮蔽非法 metadata。Header 按字段覆盖 metadata，`null`/缺失继承低层值。旧的 Create 顶层 body 字段 `max_checkpoints` 返回 400，包括值为 false 或 null 的情况。
+
+Create 在准入前把合并后的配额提取为 Sandbox typed state。checkpoint metadata 只保留 `merge_ref`/`drop_caches`；两者均为 null/缺失时删除该 namespace，即使请求提供了配额。该策略不从 source template 继承，配额不写入 E/S 制品或 migration token。
+
+Pause 与 Build 的 checkpoint 输入仍只接受 `merge_ref`/`drop_caches`；其中出现 `max_checkpoints` 即返回 400，包括 null。`memory` 不是 checkpoint 命名空间字段。Build capture 规则见 [请求级 Builder 输入](node-build_zh.md#request-scoped-builder-input)。`local` 与 `bundle` 使用完全相同的 policy 解析、覆盖和副作用边界。
 
 <a id="configuration-rendering"></a>
 
@@ -1151,10 +1171,11 @@ Header 按字段覆盖 metadata;`null`/缺失表示不覆盖,而不是清除低�
   除 host restore/checkpoint 策略外，其余配置在 cold launch 生效或已冻入 memory；network 还用于
   host 侧重建连接，因而保留 portable 网络声明。
 - **host policy 不随快照或模板**:`kuasar-sandbox.restore` 与
-  `kuasar-sandbox.checkpoint` 只由 create 请求写入 sandbox metadata。image cold boot
-  不把它们渲染进运行 YAML;snp create、pause 后 resume 和 migration import 在存在
-  restore ref 时重新渲染 restore policy;checkpoint 始终只由 host Pause 路径读取,
-  不进入 `SANDBOX_CONFIG`/`snapshot.cfg`。connect/resume 不提供临时覆盖。
+  `kuasar-sandbox.checkpoint` 来自本次 Create 请求。checkpoint 配额提取为 Sandbox typed state，
+  其 metadata 只保留快照缺省。image cold boot 不把这些策略渲染进运行 YAML；snp create、
+  pause 后 resume 和 migration import 在存在 restore ref 时重新渲染 restore policy。
+  host Pause 读取快照缺省；它与配额均不进入 `SANDBOX_CONFIG`/`snapshot.cfg`。
+  connect/resume 不提供临时覆盖。
 - **持久化**:`sandboxes.metadata_json` 是 Sandbox launch 配置；`builds.metadata_json` /
   `builds.builder_json` 是 retention-bounded Build 执行记录。后两者不会成为另一份模板权威。
 
