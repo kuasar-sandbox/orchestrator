@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Public HTTP product-process benchmark; only sandbox execution is simulated."""
-import concurrent.futures,http.client,json,os,pathlib,statistics,time
+import concurrent.futures,http.client,json,os,pathlib,statistics,subprocess,time,urllib.request
 
 PORT=int(os.environ['CLUSTER_BENCH_PORT'])
 GROUP=os.environ['CLUSTER_BENCH_GROUP']
@@ -10,6 +10,16 @@ PIDS=[int(x) for x in os.environ['CLUSTER_BENCH_PIDS'].split()]
 COUNT=int(os.environ.get('CLUSTER_BENCH_COUNT','200'))
 OUTPUT=pathlib.Path(os.environ['CLUSTER_BENCH_OUTPUT'])
 RESULT={'backend':os.environ['CLUSTER_BENCH_BACKEND'],'nodes':int(os.environ['CLUSTER_BENCH_NODES']),'product_processes':len(PIDS),'vm_execution':'stub','samples':COUNT,'quantile_method':'sorted order statistic at floor((n-1)*p)','clock_ticks_per_second':os.sysconf('SC_CLK_TCK'),'phases':{}}
+
+def database_counters():
+    # Optional externally supplied CLI argv, against this fixture's isolated
+    # database. These are server-wide sampled counters, not per-request counts.
+    command=os.environ.get('CLUSTER_BENCH_FDB_STATUS_COMMAND')
+    if not command:return None
+    time.sleep(5)  # Outside measured phases; allow the server sample to refresh.
+    result=subprocess.run(json.loads(command),check=True,capture_output=True,text=True,timeout=15)
+    status=json.loads(result.stdout)
+    return {name:value['counter'] for name,value in status['cluster']['workload']['transactions'].items() if 'counter' in value}
 
 def usage():
     out={}
@@ -55,6 +65,7 @@ def measure(name,fn,count,workers=1):
     OUTPUT.write_text(json.dumps(RESULT,indent=2))
     print(json.dumps({'phase':name,**{k:v for k,v in RESULT['phases'][name].items() if not k.startswith('processes') and k != 'latencies_ms'}}),flush=True)
 
+RESULT['database_counters_before']=database_counters()
 status,raw,_=request('POST','/sandboxes','benchmark/existing',{})
 assert status==201,status
 existing=json.loads(raw);sid=existing['sandboxID'];token=existing['envdAccessToken']
@@ -68,6 +79,25 @@ def create(i,prefix):
     return result
 measure('first_create_serial',lambda i:create(i,'benchmark/serial/'),COUNT)
 measure('first_create_concurrent',lambda i:create(i,'benchmark/concurrent/'),COUNT,8)
+admin=os.environ.get('CLUSTER_BENCH_ADMIN')
+identifiers={sid for _,sid in created}
+def pending_instances():
+    with urllib.request.urlopen(admin+'/v1/nodes',timeout=5) as response:nodes=json.load(response)
+    return sum(s.get('cluster',{}).get('stable_id') in identifiers for node in nodes for s in node.get('sandboxes',[]))
+if admin and pending_instances()!=len(identifiers):raise RuntimeError('cleanup observation cannot account for every created instance')
 measure('delete',lambda i:request('DELETE','/sandboxes/'+created[i][1],created[i][0]),len(created),8)
 RESULT['post_delete_processes']=usage()
+if admin:
+    start=time.perf_counter();observations=[]
+    while True:
+        pending=pending_instances()
+        observations.append({'elapsed_ms':1000*(time.perf_counter()-start),'pending_local_instances':pending})
+        if pending==0 or time.perf_counter()-start>=10:break
+        time.sleep(.05)
+    RESULT['cleanup']={'scope':'only the instances created by the two measured Create phases; Node execution is simulated','created':len(identifiers),'observations':observations}
+    if pending:raise RuntimeError('benchmark-created instances remain after Delete')
+RESULT['database_counters_after']=database_counters()
+if RESULT['database_counters_before'] is not None:
+    RESULT['database_counter_delta']={key:value-RESULT['database_counters_before'][key] for key,value in RESULT['database_counters_after'].items()}
+    RESULT['database_counter_scope']='isolated FDB server sampled totals; includes background work and status requests; not per-API transaction/conflict attribution'
 OUTPUT.write_text(json.dumps(RESULT,indent=2))

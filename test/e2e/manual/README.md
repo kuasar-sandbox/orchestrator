@@ -72,3 +72,11 @@ statistic. Historical acceptance samples preceded raw-latency retention; their
 recorded quantiles must not be presented as recomputed nearest-rank estimates.
 Group CRUD/renewal and directory costs, including Go allocation counts, are
 separately measured by BenchmarkNodeGroup and BenchmarkGroupDirectory.
+
+The driver also observes only its own created instances through the stub's
+administrative endpoint before and after Delete. This reports ordinary simulated
+execution cleanup, not unresolved ownership under arbitrary failures. Optional
+`CLUSTER_BENCH_FDB_STATUS_COMMAND` is a JSON argv array for the prepared FDB CLI
+`status json` command against the isolated database. Sampling waits occur outside
+measured phases. Its cumulative server counters include background work and
+status requests; they must not be presented as exact per-API conflict counts.

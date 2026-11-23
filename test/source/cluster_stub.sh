@@ -1060,6 +1060,7 @@ if [ -n "${CLUSTER_BENCH_OUTPUT:-}" ]; then
     export CLUSTER_BENCH_KEY="$API_KEY" CLUSTER_BENCH_DOMAIN="$DOMAIN"
     export CLUSTER_BENCH_PIDS="${PIDS[*]}" CLUSTER_BENCH_BACKEND="$CLUSTER_STUB_BACKEND"
     export CLUSTER_BENCH_NODES="$NODES"
+    export CLUSTER_BENCH_ADMIN="$ADMIN"
     python3 "$ROOT/test/e2e/lib/cluster_benchmark.py"
 fi
 
