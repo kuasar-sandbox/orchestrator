@@ -175,46 +175,46 @@
     "transformation": "byte-identical"
   },
   "product-counters-after-1795474562.json": {
-    "bytes": 91928,
+    "bytes": 55944,
     "original_sha256": "7c9a807213e4f083714de65628396e3746be1012e5ac379120b28740d53fb18c",
     "original_task_path": "evidence/product-counters-after-1795474562.json",
-    "published_sha256": "7c9a807213e4f083714de65628396e3746be1012e5ac379120b28740d53fb18c",
-    "transformation": "byte-identical"
+    "published_sha256": "5de3d3249325531febbee298e79e7e9e04b554762dad5730f1fff15b96036545",
+    "transformation": "wrap raw latency arrays at 16 values per line; JSON values unchanged"
   },
   "product-counters-after-1795474672.json": {
-    "bytes": 95292,
+    "bytes": 59308,
     "original_sha256": "189b0f3c327dbe2faa6ba872a2691041a678f4bcefd55b2ffc5735597838bf37",
     "original_task_path": "evidence/product-counters-after-1795474672.json",
-    "published_sha256": "189b0f3c327dbe2faa6ba872a2691041a678f4bcefd55b2ffc5735597838bf37",
-    "transformation": "byte-identical"
+    "published_sha256": "01071d014f739875239fccea52654d7ae6bdbeaf93016651e2752700f6844e84",
+    "transformation": "wrap raw latency arrays at 16 values per line; JSON values unchanged"
   },
   "product-counters-after-1795474774.json": {
-    "bytes": 91504,
+    "bytes": 55520,
     "original_sha256": "d2d71f79b87fbbaed0607e752cf8f91678978e3af800fb0f6bedd7aa8373f265",
     "original_task_path": "evidence/product-counters-after-1795474774.json",
-    "published_sha256": "d2d71f79b87fbbaed0607e752cf8f91678978e3af800fb0f6bedd7aa8373f265",
-    "transformation": "byte-identical"
+    "published_sha256": "73f305ecf3ce58eeceeedf3373f1840f0902d7a0b8038312df14c7dea2340b88",
+    "transformation": "wrap raw latency arrays at 16 values per line; JSON values unchanged"
   },
   "product-counters-before-1795474511.json": {
-    "bytes": 96290,
+    "bytes": 60306,
     "original_sha256": "e00e5a112a9c73beb8f5d861bba2021e57306db6702b64af6963796aaaadd3ec",
     "original_task_path": "evidence/product-counters-before-1795474511.json",
-    "published_sha256": "e00e5a112a9c73beb8f5d861bba2021e57306db6702b64af6963796aaaadd3ec",
-    "transformation": "byte-identical"
+    "published_sha256": "39a35fe154bf4be6e2ee551eb07f7862cbdb1310957b0383ce01e1760f997467",
+    "transformation": "wrap raw latency arrays at 16 values per line; JSON values unchanged"
   },
   "product-counters-before-1795474617.json": {
-    "bytes": 93892,
+    "bytes": 57908,
     "original_sha256": "bd625bdc52d71be350dedd722a51a36ffba68966fc432d8bb41a60ef55c58170",
     "original_task_path": "evidence/product-counters-before-1795474617.json",
-    "published_sha256": "bd625bdc52d71be350dedd722a51a36ffba68966fc432d8bb41a60ef55c58170",
-    "transformation": "byte-identical"
+    "published_sha256": "d6fe88c169f3c6dca4ecf5d6501b72792ff7e8f895787310a851563bf40167b0",
+    "transformation": "wrap raw latency arrays at 16 values per line; JSON values unchanged"
   },
   "product-counters-before-1795474728.json": {
-    "bytes": 90809,
+    "bytes": 54825,
     "original_sha256": "e1a1c078cefc65de9d69a7b62379b94a67936dfe4eb6f029910808092174ae1e",
     "original_task_path": "evidence/product-counters-before-1795474728.json",
-    "published_sha256": "e1a1c078cefc65de9d69a7b62379b94a67936dfe4eb6f029910808092174ae1e",
-    "transformation": "byte-identical"
+    "published_sha256": "be1f3ea52458fac51ea7041f92bee49ed1e4b0a6103ad90f140fb2866a76cb56",
+    "transformation": "wrap raw latency arrays at 16 values per line; JSON values unchanged"
   },
   "product-counters-summary.json": {
     "bytes": 5291,
