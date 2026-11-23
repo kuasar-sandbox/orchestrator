@@ -35,11 +35,21 @@ systemd_state() {
         systemctl show sandbox-init.service -p InvocationID --value
         for f in /proc/[0-9]*/comm; do
             if test "$(cat "$f" 2>/dev/null)" = envd; then
+                pid=${f#/proc/}; pid=${pid%/comm}
+                stat=$(cat "${f%/comm}/stat")
+                stat=${stat##*) }
+                set -- $stat
+                printf "ENVD_IDENTITY=%s:%s\n" "$pid" "${20}"
                 tr "\000" " " <"${f%/comm}/cmdline"
                 echo
             fi
         done
     ' >"$1"
+    sed -n '1p' "$1" >"${1%.out}.invocation.out"
+    grep -Eq '^[0-9a-f]{32}$' "${1%.out}.invocation.out" || fail "invalid executor InvocationID"
+    sed -n 's/^ENVD_IDENTITY=//p' "$1" >"${1%.out}.envd-identity.out"
+    [ "$(wc -l <"${1%.out}.envd-identity.out")" = 1 ] || fail "expected one envd process"
+    grep -Eq '^[1-9][0-9]*:[0-9]+$' "${1%.out}.envd-identity.out" || fail "invalid envd PID/starttime"
     grep -q -- '-cgroup-root[= ]/run/sandbox-init/cgroup' "$1" || fail "envd delegation root"
 }
 systemd_delete() {
@@ -72,6 +82,7 @@ sleep 6
 resume_checkpoint_guest 0
 systemd_health
 systemd_state "$WORK/systemd-s-resume.out"
+cmp "$WORK/systemd-before.envd-identity.out" "$WORK/systemd-s-resume.envd-identity.out"
 cmp "$WORK/systemd-before.out" "$WORK/systemd-s-resume.out"
 checkpoint_guest /bin/cat /run/systemd-api-token >"$WORK/systemd-s-token.out"
 cmp "$WORK/systemd-token.out" "$WORK/systemd-s-token.out"
@@ -80,12 +91,12 @@ cmp "$WORK/systemd-token.out" "$WORK/systemd-s-token.out"
 pause_checkpoint_guest sandbox 0
 E2B_API_KEY="$AK" timeout -k 5s 300 "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --to-template --json --socket "$WORK/node-ctl.socket" \
-    >"$WORK/systemd-export.json" 2>"$WORK/systemd-export.log"
-SYSTEMD_TEMPLATE=$(json_field "$WORK/systemd-export.json" result)
+    >"$CASE_OUT/systemd-export.json" 2>"$WORK/systemd-export.log"
+SYSTEMD_TEMPLATE=$(json_field "$CASE_OUT/systemd-export.json" result)
 resume_checkpoint_guest 0
 systemd_health
 systemd_state "$WORK/systemd-e-resume.out"
-if cmp -s "$WORK/systemd-before.out" "$WORK/systemd-e-resume.out"; then
+if cmp -s "$WORK/systemd-before.invocation.out" "$WORK/systemd-e-resume.invocation.out"; then
     fail "E cold resume retained the old executor invocation"
 fi
 checkpoint_guest /bin/test ! -e /run/systemd-api-token
@@ -105,10 +116,11 @@ EOF
     systemctl daemon-reload
     systemctl start systemd-api-stop.service
 '
-DELETED_SID=$SID
+DELETED_RUN_ID=$(sandbox_run_id "$SID")
+[ -n "$DELETED_RUN_ID" ] || fail "missing current run before Delete"
 systemd_delete
-journalctl --no-pager -o cat "KUASAR_SANDBOX_ID=$DELETED_SID" >"$WORK/systemd-delete.journal"
-grep -q SYSTEMD_API_STOP "$WORK/systemd-delete.journal" || fail "Delete omitted Guest stop hook"
+wait_unit_journal_contains "${RUNNER_PREFIX}${DELETED_RUN_ID}.service" \
+    SYSTEMD_API_STOP "$WORK/systemd-delete.journal" || fail "Delete omitted Guest stop hook"
 
 create_guest "{\"templateID\":\"$SYSTEMD_TEMPLATE\",\"timeout\":600}"
 systemd_health
