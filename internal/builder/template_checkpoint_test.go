@@ -21,7 +21,7 @@ func TestTemplateSnapshotArgsCarryCheckpointModeAndPolicy(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := []string{
-				"snapshot", "--path-id", "c", "--output", "/work/build", "--mode", tc.want, "--run-root", "/run/sandbox",
+				"snapshot", "--json", "--path-id", "c", "--output", "/work/build", "--mode", tc.want, "--run-root", "/run/sandbox",
 			}
 			if tc.policy.MergeRef != nil {
 				want = append(want, "--merge-ref=false")

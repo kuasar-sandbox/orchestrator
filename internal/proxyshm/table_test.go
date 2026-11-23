@@ -19,19 +19,20 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestPressureProjectionBumpsRecordLayout(t *testing.T) {
-	if schema != 9 {
-		t.Fatalf("schema = %d, want schema 9", schema)
+func TestRuntimeTemplateRecordLayout(t *testing.T) {
+	if schema != 10 {
+		t.Fatalf("schema = %d, want schema 10", schema)
 	}
-	if got := unsafe.Offsetof(mmapRecord{}.StableID); got != 1219 {
-		t.Fatalf("StableID offset = %d, want 1219", got)
+	if got := unsafe.Offsetof(mmapRecord{}.StableID); got != 1667 {
+		t.Fatalf("StableID offset = %d, want 1667", got)
 	}
-	if got := unsafe.Offsetof(mmapRecord{}.APISecret); got != 1347 {
-		t.Fatalf("APISecret offset = %d, want 1347", got)
+	if got := unsafe.Offsetof(mmapRecord{}.APISecret); got != 1795 {
+		t.Fatalf("APISecret offset = %d, want 1795", got)
 	}
-	if got := unsafe.Sizeof(mmapRecord{}); got != 2664 {
-		t.Fatalf("mmapRecord size = %d, want 2664", got)
+	if got := unsafe.Sizeof(mmapRecord{}); got != 3112 {
+		t.Fatalf("mmapRecord size = %d, want 3112", got)
 	}
+	t.Logf("record bytes=%d, default capacity=%d, added mapping bytes=%d", recordSize, defaultCapacity, (recordSize-2664)*defaultCapacity)
 }
 
 func TestTableSharedLookupAndDelete(t *testing.T) {
@@ -423,13 +424,17 @@ func TestTableSupportsPortableTemplateID(t *testing.T) {
 	defer tbl.Close()
 
 	templateID := types.TemplateID{
-		Profile: types.ProfileE2B,
+		Profile: types.ProfileBare,
 		Kind:    types.KindSnp,
 		Ref: "file://" + strings.Repeat("a", 64) + ".snapshot@location:" +
-			"019fb713-6fd5-71f0-b9bc-4a2a20147e53",
+			strings.Repeat("l", types.MaxPortableBaseRefBytes-len("file://")-64-len(".snapshot@location:")) +
+			"@runtime:" + strings.Repeat("r", 255-len(".bundle")) + ".bundle:digest:" + strings.Repeat("b", 64),
 	}.String()
-	if len(templateID) <= 128 {
-		t.Fatalf("portable template ID length = %d, want >128", len(templateID))
+	if len(templateID) != types.MaxTemplateIDBytes {
+		t.Fatalf("portable template ID length = %d, want %d", len(templateID), types.MaxTemplateIDBytes)
+	}
+	if _, err := types.ParseTemplateID(templateID); err != nil {
+		t.Fatal(err)
 	}
 	entry := routesync.RouteEntry{
 		SandboxID: "s1", State: routesync.StateRunning, TemplateID: templateID,
