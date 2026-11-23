@@ -1,0 +1,424 @@
+{
+  "backend": "FoundationDB 7.3.77",
+  "nodes": 4,
+  "vm_execution": "stub",
+  "samples": 200,
+  "phases": {
+    "ensure_existing": {
+      "n": 1000,
+      "concurrency": 1,
+      "rps": 100.88639352331109,
+      "wall_s": 9.912139438000004,
+      "p50_ms": 9.348109,
+      "p95_ms": 13.881103,
+      "p99_ms": 19.128604,
+      "mean_ms": 9.823993087,
+      "status_counts": {
+        "201": 1000
+      },
+      "processes_before": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 73340,
+          "peak_rss_kib": 73340,
+          "cpu_ticks": 40
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 52512,
+          "peak_rss_kib": 52800,
+          "cpu_ticks": 13
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 23848,
+          "peak_rss_kib": 23848,
+          "cpu_ticks": 5
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 52872,
+          "peak_rss_kib": 53024,
+          "cpu_ticks": 7
+        }
+      },
+      "processes_after": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 75348,
+          "peak_rss_kib": 75580,
+          "cpu_ticks": 723
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53716,
+          "peak_rss_kib": 54224,
+          "cpu_ticks": 64
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 23904,
+          "peak_rss_kib": 23904,
+          "cpu_ticks": 8
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 54592,
+          "peak_rss_kib": 55248,
+          "cpu_ticks": 249
+        }
+      }
+    },
+    "control_get": {
+      "n": 1000,
+      "concurrency": 1,
+      "rps": 1306.4051290280577,
+      "wall_s": 0.7654593339999991,
+      "p50_ms": 0.6774,
+      "p95_ms": 0.9236,
+      "p99_ms": 1.165,
+      "mean_ms": 0.709277928,
+      "status_counts": {
+        "200": 1000
+      },
+      "processes_before": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 75348,
+          "peak_rss_kib": 75580,
+          "cpu_ticks": 723
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53716,
+          "peak_rss_kib": 54224,
+          "cpu_ticks": 64
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 23904,
+          "peak_rss_kib": 23904,
+          "cpu_ticks": 8
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 54592,
+          "peak_rss_kib": 55248,
+          "cpu_ticks": 249
+        }
+      },
+      "processes_after": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 75364,
+          "peak_rss_kib": 75580,
+          "cpu_ticks": 727
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53136,
+          "peak_rss_kib": 54224,
+          "cpu_ticks": 65
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 26332,
+          "peak_rss_kib": 26332,
+          "cpu_ticks": 33
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 53728,
+          "peak_rss_kib": 55248,
+          "cpu_ticks": 313
+        }
+      }
+    },
+    "data_cached": {
+      "n": 2000,
+      "concurrency": 1,
+      "rps": 1018.5547864251436,
+      "wall_s": 1.9635664440000014,
+      "p50_ms": 0.886001,
+      "p95_ms": 1.1869,
+      "p99_ms": 1.523,
+      "mean_ms": 0.925754813,
+      "status_counts": {
+        "204": 2000
+      },
+      "processes_before": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 75364,
+          "peak_rss_kib": 75580,
+          "cpu_ticks": 727
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53136,
+          "peak_rss_kib": 54224,
+          "cpu_ticks": 65
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 26332,
+          "peak_rss_kib": 26332,
+          "cpu_ticks": 33
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 53728,
+          "peak_rss_kib": 55248,
+          "cpu_ticks": 313
+        }
+      },
+      "processes_after": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 74424,
+          "peak_rss_kib": 75580,
+          "cpu_ticks": 739
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53380,
+          "peak_rss_kib": 54224,
+          "cpu_ticks": 67
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 28164,
+          "peak_rss_kib": 28164,
+          "cpu_ticks": 123
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 53784,
+          "peak_rss_kib": 55248,
+          "cpu_ticks": 476
+        }
+      }
+    },
+    "first_create_serial": {
+      "n": 200,
+      "concurrency": 1,
+      "rps": 14.968374324770268,
+      "wall_s": 13.361504440000004,
+      "p50_ms": 59.692298,
+      "p95_ms": 91.868197,
+      "p99_ms": 176.65535,
+      "mean_ms": 66.684289625,
+      "status_counts": {
+        "201": 200
+      },
+      "processes_before": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 74424,
+          "peak_rss_kib": 75580,
+          "cpu_ticks": 739
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53380,
+          "peak_rss_kib": 54224,
+          "cpu_ticks": 67
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 28164,
+          "peak_rss_kib": 28164,
+          "cpu_ticks": 123
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 53784,
+          "peak_rss_kib": 55248,
+          "cpu_ticks": 476
+        }
+      },
+      "processes_after": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 75724,
+          "peak_rss_kib": 76368,
+          "cpu_ticks": 1284
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 55108,
+          "peak_rss_kib": 55108,
+          "cpu_ticks": 108
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 28532,
+          "peak_rss_kib": 28532,
+          "cpu_ticks": 148
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 54752,
+          "peak_rss_kib": 55884,
+          "cpu_ticks": 529
+        }
+      }
+    },
+    "first_create_concurrent": {
+      "n": 200,
+      "concurrency": 8,
+      "rps": 93.93940845872616,
+      "wall_s": 2.129031928999993,
+      "p50_ms": 79.000497,
+      "p95_ms": 116.683196,
+      "p99_ms": 129.328096,
+      "mean_ms": 83.74484719,
+      "status_counts": {
+        "201": 200
+      },
+      "processes_before": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 75724,
+          "peak_rss_kib": 76368,
+          "cpu_ticks": 1284
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 55108,
+          "peak_rss_kib": 55108,
+          "cpu_ticks": 108
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 28532,
+          "peak_rss_kib": 28532,
+          "cpu_ticks": 148
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 54752,
+          "peak_rss_kib": 55884,
+          "cpu_ticks": 529
+        }
+      },
+      "processes_after": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 77424,
+          "peak_rss_kib": 79412,
+          "cpu_ticks": 1608
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53116,
+          "peak_rss_kib": 54980,
+          "cpu_ticks": 137
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 29140,
+          "peak_rss_kib": 29140,
+          "cpu_ticks": 166
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 56824,
+          "peak_rss_kib": 57084,
+          "cpu_ticks": 587
+        }
+      }
+    },
+    "delete": {
+      "n": 400,
+      "concurrency": 8,
+      "rps": 732.6147113187901,
+      "wall_s": 0.5459895820000042,
+      "p50_ms": 10.0707,
+      "p95_ms": 15.5141,
+      "p99_ms": 18.444399,
+      "mean_ms": 10.3926469025,
+      "status_counts": {
+        "204": 400
+      },
+      "processes_before": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 77436,
+          "peak_rss_kib": 79412,
+          "cpu_ticks": 1609
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53116,
+          "peak_rss_kib": 54980,
+          "cpu_ticks": 137
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 29140,
+          "peak_rss_kib": 29140,
+          "cpu_ticks": 166
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 56824,
+          "peak_rss_kib": 57084,
+          "cpu_ticks": 587
+        }
+      },
+      "processes_after": {
+        "1452": {
+          "name": "ld.so",
+          "rss_kib": 83188,
+          "peak_rss_kib": 83188,
+          "cpu_ticks": 1672
+        },
+        "1470": {
+          "name": "ld.so",
+          "rss_kib": 53308,
+          "peak_rss_kib": 54980,
+          "cpu_ticks": 137
+        },
+        "1487": {
+          "name": "node-stub-ctl",
+          "rss_kib": 30100,
+          "peak_rss_kib": 30100,
+          "cpu_ticks": 179
+        },
+        "1500": {
+          "name": "ld.so",
+          "rss_kib": 58332,
+          "peak_rss_kib": 61092,
+          "cpu_ticks": 693
+        }
+      }
+    }
+  },
+  "post_delete_processes": {
+    "1452": {
+      "name": "ld.so",
+      "rss_kib": 83188,
+      "peak_rss_kib": 83188,
+      "cpu_ticks": 1672
+    },
+    "1470": {
+      "name": "ld.so",
+      "rss_kib": 53308,
+      "peak_rss_kib": 54980,
+      "cpu_ticks": 137
+    },
+    "1487": {
+      "name": "node-stub-ctl",
+      "rss_kib": 30100,
+      "peak_rss_kib": 30100,
+      "cpu_ticks": 179
+    },
+    "1500": {
+      "name": "ld.so",
+      "rss_kib": 58332,
+      "peak_rss_kib": 61092,
+      "cpu_ticks": 693
+    }
+  }
+}

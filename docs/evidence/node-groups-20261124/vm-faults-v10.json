@@ -1,0 +1,96 @@
+[
+  {
+    "case": "F03",
+    "public_status": 201,
+    "node": {
+      "id": "sb-b4453f5a71bd297e58a8ca5f347c4712-g0",
+      "stable_id": "sb-b4453f5a71bd297e58a8ca5f347c4712",
+      "run_id": "sr-01a20a63-cd17-7024-933d-cfd69d199658",
+      "state": "running"
+    },
+    "create_deliveries": 1,
+    "fault_observed": "drop"
+  },
+  {
+    "case": "F04",
+    "public_status": 201,
+    "node": {
+      "id": "sb-fc2c4fd2de66841cf62f0ee4ccf148aa-g0",
+      "stable_id": "sb-fc2c4fd2de66841cf62f0ee4ccf148aa",
+      "run_id": "sr-01a20a63-e1f2-7c2d-aac4-3708a33ef27e",
+      "state": "running"
+    },
+    "create_deliveries": 1,
+    "fault_observed": "forward-late-error"
+  },
+  {
+    "case": "F08-after-Node-acceptance",
+    "node": {
+      "id": "sb-e0ebd8160fb60e1acf5dd4e5da866a74-g0",
+      "stable_id": "sb-e0ebd8160fb60e1acf5dd4e5da866a74",
+      "run_id": "sr-01a20a63-e4a1-75d8-ab21-77f2abc8e719",
+      "state": "running"
+    },
+    "create_deliveries": 1,
+    "registry_signal": "SIGKILL",
+    "full_snapshot_recovered": true
+  },
+  {
+    "case": "F02-after-socket-before-Node-acceptance",
+    "registry_signal": "SIGKILL",
+    "interrupted_status": "connection-lost",
+    "committed_node_sid": "sb-fd43dc663cfd3f1ea65e727ee1ad1611-g0",
+    "recovered_node": {
+      "id": "sb-fd43dc663cfd3f1ea65e727ee1ad1611-g1",
+      "stable_id": "sb-fd43dc663cfd3f1ea65e727ee1ad1611",
+      "run_id": "sr-01a20a63-ea68-7637-b15d-f063cf8e19b5",
+      "state": "running"
+    },
+    "forwarded_create_deliveries": 1
+  },
+  {
+    "case": "F06",
+    "rejected_node_sid": "sb-48e4be4a01c69a46410b7f4dab05fbed-g0",
+    "public_status": 409,
+    "replacement": {
+      "id": "sb-375e3bcea02be4381f43a9183af42468-g0",
+      "stable_id": "sb-375e3bcea02be4381f43a9183af42468",
+      "run_id": "sr-01a20a63-f126-7aee-b3bc-4dfb1724fb21",
+      "state": "running"
+    }
+  },
+  {
+    "case": "F07-generic-conflict",
+    "registry_status": 503,
+    "negative_node_query": 404,
+    "retained_node_sid_while_waiting": "sb-7c271859523f1f87c6253d81276a9e7d-g0",
+    "retained_state_while_waiting": "reserved"
+  },
+  {
+    "case": "F12-concurrent-callers",
+    "valid_statuses": [
+      201,
+      201
+    ],
+    "bad_mac_status": 403,
+    "incompatible_placement_status": 409,
+    "node": {
+      "id": "sb-3aa639ef9d4a112f52acfeb5a7b6e9b0-g0",
+      "stable_id": "sb-3aa639ef9d4a112f52acfeb5a7b6e9b0",
+      "run_id": "sr-01a20a64-223e-709f-bfe0-1d00449f3e8d",
+      "state": "running"
+    },
+    "create_deliveries": 1
+  },
+  {
+    "case": "F11-after-acceptance",
+    "node": {
+      "id": "sb-375e3bcea02be4381f43a9183af42468-g0",
+      "stable_id": "sb-375e3bcea02be4381f43a9183af42468",
+      "run_id": "sr-01a20a63-f126-7aee-b3bc-4dfb1724fb21",
+      "state": "running"
+    },
+    "tombstone_version": 4,
+    "new_create_status": 403
+  }
+]

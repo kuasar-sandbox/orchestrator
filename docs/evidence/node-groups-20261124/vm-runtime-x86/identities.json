@@ -1,0 +1,10 @@
+{
+  "products/bin/sandbox-ctl": "89241ea4c99f13cb842a6772b8811744e086167043e946d33a3168cccd107d2e",
+  "products/sandbox-ctl-candidate": "ce61276bbebb6cf7698dbaaee1d0913c28567d8499875bb9f10b59aaf52f8b22",
+  "products/sandbox-ctl-legacy": "ffc91df1aef53252042ef1114ddd128289e45d94a7821624e991592291d0eb15",
+  "products/bin/cloud-hypervisor": "6f8d2fb5d9ca53bc7fcaedbbdfb297381811a3af3e0642ecbd90a63235308852",
+  "products/bin/vmlinux": "fcd48c32d2e027aa100471308c80ebb75eb9f7c7cb7cbdd5f8a8329efca4198f",
+  "products/runtime-v1.bundle": "0bbbfc2044c9345e82d4f7606d924fe643db259b75b35df2c0e887be654ac7f0",
+  "products/runtime-v2.bundle": "f5cedf4d0de9197af08c9caf929fe419bad50613f45cb80fe5fbcd9efbcdc5f9",
+  "fixtures/root.img": "87a4a34b85debd35a4269224b88805c4ce95ed922ab742e23dce58c9200a51b0"
+}

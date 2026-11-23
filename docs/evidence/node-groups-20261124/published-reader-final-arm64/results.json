@@ -1,0 +1,42 @@
+[
+  {
+    "format": "local",
+    "producer": "old",
+    "annotated": false,
+    "reader": "v0.2.0-preview.20261124.1",
+    "host_default": "runtime-v2.bundle",
+    "captured_runtime": "runtime-v1.bundle",
+    "guest_marker_preserved": true,
+    "restore_ms": 44.61919888854027
+  },
+  {
+    "format": "local",
+    "producer": "writer",
+    "annotated": true,
+    "reader": "v0.2.0-preview.20261124.1",
+    "host_default": "runtime-v2.bundle",
+    "captured_runtime": "runtime-v1.bundle",
+    "guest_marker_preserved": true,
+    "restore_ms": 43.16192492842674
+  },
+  {
+    "format": "bundle",
+    "producer": "old",
+    "annotated": false,
+    "reader": "v0.2.0-preview.20261124.1",
+    "host_default": "runtime-v2.bundle",
+    "captured_runtime": "runtime-v1.bundle",
+    "guest_marker_preserved": true,
+    "restore_ms": 69.03729494661093
+  },
+  {
+    "format": "bundle",
+    "producer": "writer",
+    "annotated": true,
+    "reader": "v0.2.0-preview.20261124.1",
+    "host_default": "runtime-v2.bundle",
+    "captured_runtime": "runtime-v1.bundle",
+    "guest_marker_preserved": true,
+    "restore_ms": 65.84402127191424
+  }
+]

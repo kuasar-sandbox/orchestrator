@@ -1,0 +1,562 @@
+[
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 111.25719826668501,
+    "capture_ms": 52.15429374948144,
+    "restore_ms": 41.622660122811794
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 109.4718761742115,
+    "capture_ms": 56.35784612968564,
+    "restore_ms": 43.268054723739624
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 108.75383391976357,
+    "capture_ms": 56.97045102715492,
+    "restore_ms": 42.669289745390415
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 106.04996886104345,
+    "capture_ms": 59.24300104379654,
+    "restore_ms": 41.30198201164603
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 110.7019754126668,
+    "capture_ms": 58.5596221499145,
+    "restore_ms": 42.93848481029272
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 111.33543215692043,
+    "capture_ms": 58.20121103897691,
+    "restore_ms": 40.80710280686617
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 109.14772702381015,
+    "capture_ms": 57.226134929805994,
+    "restore_ms": 43.61454397439957
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 110.11451203376055,
+    "capture_ms": 57.76579724624753,
+    "restore_ms": 44.66591402888298
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 107.82100027427077,
+    "capture_ms": 61.21734529733658,
+    "restore_ms": 42.028022930026054
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 106.56475787982345,
+    "capture_ms": 57.913694996386766,
+    "restore_ms": 44.1289939917624
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 109.19997887685895,
+    "capture_ms": 52.7035160921514,
+    "restore_ms": 45.68462306633592
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 116.32451880723238,
+    "capture_ms": 57.87227209657431,
+    "restore_ms": 44.55738887190819
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 115.20065413787961,
+    "capture_ms": 58.7765141390264,
+    "restore_ms": 45.24201713502407
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 113.89443930238485,
+    "capture_ms": 57.569845113903284,
+    "restore_ms": 42.5009997561574
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 111.2459572032094,
+    "capture_ms": 60.13274239376187,
+    "restore_ms": 42.568034026771784
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 116.55214196071029,
+    "capture_ms": 58.43809526413679,
+    "restore_ms": 42.624027002602816
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 120.37925142794847,
+    "capture_ms": 58.371060993522406,
+    "restore_ms": 45.29349086806178
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 109.81440497562289,
+    "capture_ms": 57.6928430236876,
+    "restore_ms": 41.302830912172794
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 117.14615626260638,
+    "capture_ms": 58.96768486127257,
+    "restore_ms": 42.75456489995122
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 108.95050503313541,
+    "capture_ms": 58.89069102704525,
+    "restore_ms": 43.6516460031271
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 112.19310108572245,
+    "capture_ms": 61.357193160802126,
+    "restore_ms": 41.90042521804571
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 110.83406303077936,
+    "capture_ms": 59.21392980962992,
+    "restore_ms": 41.098969988524914
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 116.58293288201094,
+    "capture_ms": 57.68877174705267,
+    "restore_ms": 44.013616628944874
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 109.19912904500961,
+    "capture_ms": 56.299012154340744,
+    "restore_ms": 41.74551693722606
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 107.55755519494414,
+    "capture_ms": 59.80724282562733,
+    "restore_ms": 42.83621860668063
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 107.82055091112852,
+    "capture_ms": 58.021921664476395,
+    "restore_ms": 44.06950017437339
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 116.75799312070012,
+    "capture_ms": 58.50337911397219,
+    "restore_ms": 42.750834953039885
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 118.82189195603132,
+    "capture_ms": 58.44213534146547,
+    "restore_ms": 44.58566987887025
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 111.55823478475213,
+    "capture_ms": 58.70014987885952,
+    "restore_ms": 44.72868796437979
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 107.80603997409344,
+    "capture_ms": 59.0349193662405,
+    "restore_ms": 45.17125431448221
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 112.99899686127901,
+    "capture_ms": 59.88533794879913,
+    "restore_ms": 42.87065099924803
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 110.26927130296826,
+    "capture_ms": 57.503821793943644,
+    "restore_ms": 44.23290025442839
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 115.1781533844769,
+    "capture_ms": 58.65832697600126,
+    "restore_ms": 42.07644611597061
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 112.97987680882215,
+    "capture_ms": 57.82316019758582,
+    "restore_ms": 45.65477091819048
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 105.85212800651789,
+    "capture_ms": 57.127390056848526,
+    "restore_ms": 46.115506906062365
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 107.1646730415523,
+    "capture_ms": 58.43429500237107,
+    "restore_ms": 43.72054012492299
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 108.51381998509169,
+    "capture_ms": 60.66700303927064,
+    "restore_ms": 42.01368195936084
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 119.60092699155211,
+    "capture_ms": 57.48872086405754,
+    "restore_ms": 42.67765022814274
+  },
+  {
+    "mode": "local",
+    "version": "new",
+    "boot_ms": 105.40533205494285,
+    "capture_ms": 55.91370025649667,
+    "restore_ms": 40.577619802206755
+  },
+  {
+    "mode": "local",
+    "version": "old",
+    "boot_ms": 110.4354108683765,
+    "capture_ms": 56.77899997681379,
+    "restore_ms": 46.64908768609166
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 111.76495719701052,
+    "capture_ms": 77.48325914144516,
+    "restore_ms": 61.814329121261835
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 113.80754504352808,
+    "capture_ms": 77.38923281431198,
+    "restore_ms": 63.210899010300636
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 110.03802763298154,
+    "capture_ms": 77.9917468316853,
+    "restore_ms": 62.38308222964406
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 109.5675709657371,
+    "capture_ms": 75.27055079117417,
+    "restore_ms": 62.7914359793067
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 113.11939498409629,
+    "capture_ms": 77.31578918173909,
+    "restore_ms": 64.25434909760952
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 110.57538772001863,
+    "capture_ms": 75.9073980152607,
+    "restore_ms": 65.23902527987957
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 110.68572476506233,
+    "capture_ms": 75.7380579598248,
+    "restore_ms": 62.23347317427397
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 111.3487328402698,
+    "capture_ms": 73.79841711372137,
+    "restore_ms": 63.27938288450241
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 105.54782999679446,
+    "capture_ms": 75.00385586172342,
+    "restore_ms": 64.33513388037682
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 112.26770607754588,
+    "capture_ms": 73.77673638984561,
+    "restore_ms": 63.73089924454689
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 110.38904776796699,
+    "capture_ms": 76.74876600503922,
+    "restore_ms": 66.22456200420856
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 111.12608015537262,
+    "capture_ms": 78.00024887546897,
+    "restore_ms": 61.82478880509734
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 107.62995993718505,
+    "capture_ms": 73.123037815094,
+    "restore_ms": 64.22188691794872
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 111.03166406974196,
+    "capture_ms": 82.60566322132945,
+    "restore_ms": 63.00123734399676
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 106.9456902332604,
+    "capture_ms": 74.74830187857151,
+    "restore_ms": 65.02996291965246
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 105.3859400562942,
+    "capture_ms": 79.68736486509442,
+    "restore_ms": 63.632183242589235
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 110.30171159654856,
+    "capture_ms": 74.79844521731138,
+    "restore_ms": 61.695911921560764
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 110.5184149928391,
+    "capture_ms": 76.73037610948086,
+    "restore_ms": 62.11675703525543
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 105.65643571317196,
+    "capture_ms": 79.07988037914038,
+    "restore_ms": 63.61836288124323
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 112.72580176591873,
+    "capture_ms": 78.02955992519855,
+    "restore_ms": 62.32763919979334
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 111.93682719022036,
+    "capture_ms": 78.89661006629467,
+    "restore_ms": 64.54886589199305
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 106.20308807119727,
+    "capture_ms": 73.11259815469384,
+    "restore_ms": 62.54118075594306
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 111.02297436445951,
+    "capture_ms": 77.09244638681412,
+    "restore_ms": 65.34966174513102
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 106.99292318895459,
+    "capture_ms": 80.69010218605399,
+    "restore_ms": 64.39226679503918
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 106.80712200701237,
+    "capture_ms": 74.29592497646809,
+    "restore_ms": 65.57084480300546
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 107.7285148203373,
+    "capture_ms": 78.64277483895421,
+    "restore_ms": 64.46649134159088
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 114.78383978828788,
+    "capture_ms": 77.30852905660868,
+    "restore_ms": 62.91168229654431
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 107.9656882211566,
+    "capture_ms": 72.79064925387502,
+    "restore_ms": 63.768791034817696
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 108.28478680923581,
+    "capture_ms": 77.31529884040356,
+    "restore_ms": 65.17902296036482
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 110.58421898633242,
+    "capture_ms": 80.6928831152618,
+    "restore_ms": 62.70711123943329
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 123.23108594864607,
+    "capture_ms": 79.03527794405818,
+    "restore_ms": 63.75967990607023
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 109.98923517763615,
+    "capture_ms": 85.62922710552812,
+    "restore_ms": 65.622896887362
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 114.94703916832805,
+    "capture_ms": 71.730918250978,
+    "restore_ms": 65.99644897505641
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 111.11462861299515,
+    "capture_ms": 78.05056078359485,
+    "restore_ms": 64.40683826804161
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 106.05515912175179,
+    "capture_ms": 82.03646028414369,
+    "restore_ms": 65.56328386068344
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 107.69882285967469,
+    "capture_ms": 73.52115074172616,
+    "restore_ms": 64.87955478951335
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 111.84793198481202,
+    "capture_ms": 78.30027583986521,
+    "restore_ms": 63.73079912737012
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 113.5580400004983,
+    "capture_ms": 75.62572229653597,
+    "restore_ms": 65.94632612541318
+  },
+  {
+    "mode": "bundle",
+    "version": "new",
+    "boot_ms": 108.65961806848645,
+    "capture_ms": 77.13727885857224,
+    "restore_ms": 63.94073134288192
+  },
+  {
+    "mode": "bundle",
+    "version": "old",
+    "boot_ms": 108.66924934089184,
+    "capture_ms": 77.43349485099316,
+    "restore_ms": 64.7558169439435
+  }
+]

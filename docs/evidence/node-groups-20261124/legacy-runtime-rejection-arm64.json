@@ -1,0 +1,14 @@
+{
+  "case": "C02-actual-restore-boundary",
+  "reader_sha256": "3832fc253276b2e3fd63369fb999d5980f6c08160650279ee8c9f9b26ba2aba2",
+  "legacy_annotation_absent": true,
+  "configured_runtime": "runtime-v2.bundle",
+  "captured_runtime": "runtime-v1.bundle",
+  "required_fallback_absent": true,
+  "result": {
+    "rejected": true,
+    "exit": 1,
+    "elapsed_ms": 56.83548795059323,
+    "error_tail": "restore exited before readiness\nno compatible runtime bundle for file://runtime-v1.bundle@digest:fb53e4abceeb104b13df4658b075525b89c5dfe4cbb0074f4b9d21327254fbf6: boot.runtime primary /home/chenxiaohui/work/cluster-refactor-20261123-vm/legacy-runtime-rejection/products/runtime-v2.bundle: identity mismatch: portable file://runtime-v1.bundle@digest:fb53e4abceeb104b13df4658b075525b89c5dfe4cbb0074f4b9d21327254fbf6, host file://runtime-v2.bundle@digest:9492c8131285fbfafc674b3e2fc38b8a8c532150c321b56c09713b8137ee2cc3\nboot.runtime fallback /home/chenxiaohui/work/cluster-refactor-20261123-vm/legacy-runtime-rejection/products/runtime-v1.bundle: boot.runtime identity: open /home/chenxiaohui/work/cluster-refactor-20261123-vm/legacy-runtime-rejection/products/runtime-v1.bundle: no such file or directory\n"
+  }
+}

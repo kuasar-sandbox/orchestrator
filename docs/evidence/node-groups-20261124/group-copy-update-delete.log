@@ -1,0 +1,8 @@
+=== RUN   TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate
+=== RUN   TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate/update
+=== RUN   TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate/delete
+--- PASS: TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate (0.86s)
+    --- PASS: TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate/update (0.44s)
+    --- PASS: TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate/delete (0.42s)
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/orch	1.908s

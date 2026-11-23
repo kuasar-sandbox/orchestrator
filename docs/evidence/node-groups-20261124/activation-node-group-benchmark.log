@@ -1,0 +1,21 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/store
+cpu: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
+BenchmarkNodeGroup/Get-4         	     200	     56000 ns/op	    7086 B/op	     100 allocs/op
+BenchmarkNodeGroup/Get-4         	     200	     72612 ns/op	    6643 B/op	      99 allocs/op
+BenchmarkNodeGroup/Get-4         	     200	     51328 ns/op	    6646 B/op	      99 allocs/op
+BenchmarkNodeGroup/Update-4      	     200	   6972544 ns/op	   11319 B/op	     185 allocs/op
+BenchmarkNodeGroup/Update-4      	     200	   6993434 ns/op	   11291 B/op	     185 allocs/op
+BenchmarkNodeGroup/Update-4      	     200	   6925003 ns/op	   11312 B/op	     185 allocs/op
+BenchmarkNodeGroup/DeleteRecreate-4         	     200	  17196394 ns/op	   17569 B/op	     313 allocs/op
+BenchmarkNodeGroup/DeleteRecreate-4         	     200	  13814302 ns/op	   17535 B/op	     312 allocs/op
+BenchmarkNodeGroup/DeleteRecreate-4         	     200	  13694410 ns/op	   17561 B/op	     312 allocs/op
+BenchmarkNodeGroup/Renew-4                  	     200	   7113261 ns/op	   14533 B/op	     237 allocs/op
+BenchmarkNodeGroup/Renew-4                  	     200	   8187362 ns/op	   14539 B/op	     237 allocs/op
+BenchmarkNodeGroup/Renew-4                  	     200	   6815921 ns/op	   14539 B/op	     237 allocs/op
+BenchmarkNodeGroup/Snapshot128-4            	     200	   1159205 ns/op	  604519 B/op	    7324 allocs/op
+BenchmarkNodeGroup/Snapshot128-4            	     200	   1132006 ns/op	  604517 B/op	    7324 allocs/op
+BenchmarkNodeGroup/Snapshot128-4            	     200	   1111268 ns/op	  604523 B/op	    7324 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/store	25.042s
