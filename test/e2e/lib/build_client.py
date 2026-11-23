@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 
-from placer_readiness import wait_for_placer
+from group_readiness import wait_for_group
 
 
 def command(*args):
@@ -38,9 +38,8 @@ def configure():
     parser.add_argument("--timeout-only", type=int, default=0, metavar="SECONDS")
     parser.add_argument("--restart-request")
     parser.add_argument("--restart-ready")
-    parser.add_argument("--placer-url")
+    parser.add_argument("--node-url")
     parser.add_argument("--registry-url", action="append", default=[])
-    parser.add_argument("--expected-node")
     args = parser.parse_args()
     key = os.environ["BUILD_ACTION_API_KEY"]
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -85,12 +84,11 @@ def row(build_id):
 
 
 def register(label, target=None):
-    if args.post_restart and args.placer_url:
-        # Watch failover can invalidate a previously ready view between
-        # Build actions. Recheck before each new registration, not the write.
-        assert args.expected_node, "--placer-url requires --expected-node"
-        wait_for_placer(args.placer_url, args.group, args.expected_node,
-                        registry_urls=args.registry_url, api_key=key)
+    if args.post_restart and args.node_url:
+        # Recheck the imported Node Group and shared authentication after
+        # reconnect, before each new registration. Do not retry the write.
+        wait_for_group(args.node_url, args.group,
+                       registry_urls=args.registry_url, api_key=key)
     value, _ = require("POST", "/v3/templates", 202,
                        {"name": "issue372-" + label, "cpuCount": args.cpu, "memoryMB": 6144},
                        header=json.dumps({"target": target}) if target else None)

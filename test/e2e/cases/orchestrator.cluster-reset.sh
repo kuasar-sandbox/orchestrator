@@ -21,9 +21,9 @@ start_cluster_control_plane
 NODE_ID=real-reset-node
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
-PLACER_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/placer_readiness.py" \
-    --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID" \
-    --route-key "$ROUTE_KEY" --registry-url "http://127.0.0.1:$CONTROL_PORT"
+GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
+    --node-url "http://127.0.0.1:$NODE_PORT" --group "$GROUP" \
+    --registry-url "http://127.0.0.1:$CONTROL_PORT"
 
 field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$WORK/router-resp.body" "$1"; }
 node_run() {

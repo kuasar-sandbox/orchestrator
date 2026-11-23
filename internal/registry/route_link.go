@@ -98,14 +98,14 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkVerifyKeyPath, r.serveVerifyKey)
 }
 
-// serveVerifyKey verifies an api key through the placer-owned group provider
-// view. Registry route owners do not consult the group provider; they only fail over across
-// ready placers. A 403 hides both a bad key and an unknown group.
+// serveVerifyKey checks the full APIKey against retained Group authentication
+// roots. A 403 hides both a bad key and an unknown group. This is not a placement
+// or capacity probe; existing objects can retain roots after support disappears.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	ok, err := r.VerifyGroupAPIKey(req.Context(), q.Get("group"), req.Header.Get("X-API-KEY"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable) // key provider unavailable → 503
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	if !ok {

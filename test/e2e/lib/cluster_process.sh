@@ -259,9 +259,9 @@ node_link:
   node_dead_after: "5s"
 route_link:
   park_timeout: "180s"
-placer_link:
-  min_ready_placers: 1
-  place_timeout: "5s"
+placement:
+  candidates: 2
+  zone_admit_max: "yellow"
 EOF
     done
 }
@@ -282,11 +282,8 @@ import_groups:
     source_type: file
     path: "$WORK/g"
 placement:
-  candidates: 2
-  zone_admit_max: "yellow"
-  node_dead_after: "5s"
   import_source_lease_ttl: "10s"
-  selector_patch_refresh_interval: "1s"
+  import_refresh_interval: "1s"
 EOF
     cat > "$WORK/router.yaml" <<EOF
 domain: "$DOMAIN"
