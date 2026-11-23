@@ -933,6 +933,8 @@ Create 和 Build 共用既有 `kuasar-sandbox.launch` metadata 对象。E2B 在�
 
 新的产品 envd 插件取得最终镜像的完整默认环境，再叠加来源和请求覆盖。tenant task 读取与实际启动相同的不可变镜像身份，fresh image 路径同样执行；镜像环境不回传 Conductor。PATH 来自默认值时，非 off 模式在前面加入 `/run/sandbox-runtime/systemd/bin`，保留镜像 PATH 的全部目录；仅实际 runtime 模式在该目录投影工具，provided 下目录不存在时由普通 PATH 查找跳过。显式 PATH（包括空值）保持不变。已保存 E 的插件 PATH 继续具有权威性；只有该插件携带可信默认 PATH 来源标记时，模式覆盖才调整平台前缀。Host 在 artifact 和任务到 CLI 的内部交接中保留来源，不从字符串相等推断；旧 E 插件无标记时保持 PATH 不变。其他插件保留各自独立的环境。
 
+包括 `off` 模式在内的新 E2B 冷定义，其 primary stdout/stderr 继续经既有应用 MUX 进入 `sandbox` journal 输出；envd 作为普通 plugin，其自身进程的 stdout/stderr 沿 Guest console 进入 `console` 输出。已有 E/S 保留 envd primary 时，继续使用原有应用输出路径。参见[日志身份与输出目标](observability_zh.md#journal-ownership-and-output-targets)。
+
 Runtime readiness 或 placeholder 的 `app_started` 不代表 E2B Running。当前 run 必须在既有 launch context 中成功完成 `POST /init`；取消、期限耗尽或 run 已失效都不能发布 Running。零启动超时保留现有无上限语义；Guest service 就绪不要求任意用户 unit 全部健康。
 
 活动实例的普通删除在接纳时记录精确 run，先请求有界 Host/Guest 正常关机，再执行 runner fence 和资源回收。原有物理清理超时在关机阶段之后开始。重复删除复用 Host 已受理的期限；paused、冻结捕获、已经退出以及无新标记的旧 deleting 行保留原有销毁清理，不为 Shutdown 解冻。没有新增 Launch 配置或第二份 grace。

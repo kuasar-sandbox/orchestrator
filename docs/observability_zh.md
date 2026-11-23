@@ -294,7 +294,7 @@ Build phase target 携 `KUASAR_BUILD_ID`、`KUASAR_RUN_ID`。字段不从环境�
 | `sandbox-ctl` | runner/Build phase 的 `--log-to` | runtime component 诊断 | 仅宿主排障 |
 | `sandbox` | runner 的 `--stdout-to`/`--stderr-to` | 沙箱 app stdio | 仅宿主排障 |
 | `build` | Build phase/run-builder | app stdio、里程碑、envd RUN 回放与 flatten 进度 | SDK 与宿主;完整读取/分页/失败语义见 [按目标执行与发布](node-build_zh.md#execution-and-publication) |
-| `console` | runner/Build phase 的 `--console` | guest 内核 dmesg | 仅宿主;不进入 SDK Build 流 |
+| `console` | runner/Build phase 的 `--console` | Guest 内核、init 及普通 plugin 的 console 输出 | 仅宿主;不进入 SDK Build 流 |
 
 所有这些 native stream 直写 journal,不经临时日志文件。run-builder 里程碑与 envd RUN 回放使用
 pure-Go `go-systemd/journal`。`--log-to` 不替换原始进程 stderr;早期 CLI、CH stderr、panic 与
