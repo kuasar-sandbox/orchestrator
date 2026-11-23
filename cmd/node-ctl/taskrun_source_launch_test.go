@@ -51,10 +51,17 @@ func TestLaunchTaskProjectsPreparedSourceBeforeSpawnWithoutReread(t *testing.T) 
 				completePrepare: func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error) {
 					return &configsock.LaunchSpec{Exec: "/sandbox-ctl", Args: []string{"run", "--config", path}, SourceLaunch: &configsock.SourceLaunchProjection{Profile: types.ProfileE2B, ConfigPath: path}}, nil
 				},
-				startChild: func(_ string, argv, _ []string, _, _ *os.File) error {
+				startChild: func(_ string, argv, _ []string, _, _ *os.File, provenance []byte) error {
 					starts++
 					host, presence, err := rtconfig.LoadMergedWithPresence([]string{path})
 					if err != nil {
+						t.Fatal(err)
+					}
+					raw, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := rtconfig.ApplyConfigProvenance(raw, host, provenance); err != nil {
 						t.Fatal(err)
 					}
 					if !presence.Has("launch.systemd") || host.Launch.Systemd != "provided" || host.Launch.Exec != source.Launch.Exec || host.Launch.Placeholder || len(host.Launch.Plugin) != 0 || host.Launch.Env["SOURCE"] != "task-local" || host.Launch.Env["INSTANCE"] != "yes" {

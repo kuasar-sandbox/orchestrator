@@ -48,7 +48,7 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	return p.startSandboxYAML(phase, b, connect, "", false)
 }
 
-func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect []string, from string, replaceBoot bool) (*phaseSandbox, error) {
+func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect []string, from string, replaceBoot bool, provenance ...[]byte) (*phaseSandbox, error) {
 	s := p.spec
 	sid := phaseSandboxID(phase, s.BuildID)
 	phaseRunDir := p.phaseRunDir(phase)
@@ -72,7 +72,21 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 	// Component/app/console logs use explicit targets. Original process stderr
 	// remains available for early CLI errors, CH stderr and journal fallback.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := sandboxproc.Start(cmd, p.vmmCgroup, readyW); err != nil {
+	var envelope []byte
+	if len(provenance) > 0 {
+		envelope = provenance[0]
+	}
+	provenanceFD, err := sandboxproc.AttachConfigProvenance(cmd, envelope)
+	if err != nil {
+		_ = readyR.Close()
+		_ = readyW.Close()
+		return nil, err
+	}
+	startErr := sandboxproc.Start(cmd, p.vmmCgroup, readyW)
+	if provenanceFD != nil {
+		_ = provenanceFD.Close()
+	}
+	if err := startErr; err != nil {
 		_ = readyR.Close()
 		return nil, fmt.Errorf("spawn sandbox-ctl: %w", err)
 	}

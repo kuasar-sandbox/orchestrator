@@ -108,7 +108,7 @@ func TestPreparedSourceProjectionPreservesTopologyAndPresence(t *testing.T) {
 				source.Launch.Exec = envdExec
 				if layout == "plugin" {
 					source.Launch.Exec, source.Launch.Args, source.Launch.Placeholder = "", nil, true
-					source.Launch.Plugin = []rtconfig.PluginConfig{{Exec: envdExec, Args: []string{"-port", "49983", "-cgroup-root=" + systemdCgroupRoot}, User: "0:0", Restart: "always"}, {Exec: "/other", Args: []string{"unchanged"}}}
+					source.Launch.Plugin = []rtconfig.PortablePluginConfig{{Exec: envdExec, Args: []string{"-port", "49983", "-cgroup-root=" + systemdCgroupRoot}, User: "0:0", Restart: "always"}, {Exec: "/other", Args: []string{"unchanged"}}}
 				} else if layout == "unknown" {
 					source.Launch.Exec = "/custom/product"
 				}
@@ -141,12 +141,12 @@ func TestPreparedSourceProjectionPreservesTopologyAndPresence(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				host, presence, err := rtconfig.LoadConfigBytesWithPresence(projected)
+				host, presence, err := rtconfig.LoadConfigBytesWithPresence(projected.Config)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if !presence.Has("launch.systemd") || presence.Has("boot.root.base") {
-					t.Fatalf("projection lost host-only ownership:\n%s", projected)
+					t.Fatalf("projection lost host-only ownership:\n%s", projected.Config)
 				}
 				launch := host.Launch
 				if launch.Exec != source.Launch.Exec || launch.Placeholder != source.Launch.Placeholder || launch.CgroupControl || launch.PIDNamespace != "shared" || launch.Env["ARTIFACT"] != "yes" || launch.Env["INSTANCE"] != "yes" {
@@ -163,7 +163,7 @@ func TestPreparedSourceProjectionPreservesTopologyAndPresence(t *testing.T) {
 					gotArgs, _ := yaml.Marshal(launch.Args)
 					wantArgs, _ := yaml.Marshal(source.Launch.Args)
 					gotPlugins, _ := yaml.Marshal(launch.Plugin)
-					expectedPlugins := append([]rtconfig.PluginConfig(nil), source.Launch.Plugin...)
+					expectedPlugins := append([]rtconfig.PortablePluginConfig(nil), source.Launch.Plugin...)
 					if layout == "plugin" {
 						expectedPlugins[0].Env = mergeStr(expectedPlugins[0].Env, p.EnvVars)
 					}
@@ -172,7 +172,7 @@ func TestPreparedSourceProjectionPreservesTopologyAndPresence(t *testing.T) {
 						t.Fatal("no-override create rewrote layout")
 					}
 				} else if layout == "plugin" {
-					if !strings.HasSuffix(launch.Plugin[0].Args[2], "="+envdCgroupRoot(mode)) || !reflect.DeepEqual(launch.Plugin[1], source.Launch.Plugin[1]) {
+					if !strings.HasSuffix(launch.Plugin[0].Args[2], "="+envdCgroupRoot(mode)) || launch.Plugin[1].Exec != source.Launch.Plugin[1].Exec || !reflect.DeepEqual(launch.Plugin[1].Args, source.Launch.Plugin[1].Args) {
 						t.Fatalf("plugin rewrite: %+v", launch.Plugin)
 					}
 				} else if launch.Args[3] != envdCgroupRoot(mode) {
@@ -262,17 +262,20 @@ func TestSourceDefaultPATHKeepsProvenanceAcrossHostProjection(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				raw, err = ProjectSourceLaunch(raw, types.ProfileE2B, source)
+				projected, err := ProjectSourceLaunch(raw, types.ProfileE2B, source)
 				if err != nil {
 					t.Fatal(err)
 				}
-				host, presence, err := rtconfig.LoadConfigBytesWithPresence(raw)
+				host, presence, err := rtconfig.LoadConfigBytesWithPresence(projected.Config)
 				if err != nil {
+					t.Fatal(err)
+				}
+				if err := rtconfig.ApplyConfigProvenance(projected.Config, host, projected.Provenance); err != nil {
 					t.Fatal(err)
 				}
 				wantDefault := defaultPath && explicit == "inherit"
-				if presence.Has("launch.env.PATH") == wantDefault {
-					t.Fatalf("host overlay lost PATH origin:\n%s", raw)
+				if !presence.Has("launch.env.PATH") || host.Launch.PersistentSystemdPathDefault() != wantDefault {
+					t.Fatalf("host overlay lost concrete PATH or trusted origin:\n%s", projected.Config)
 				}
 				runtime, c0, err := rtconfig.ApplyFromRules(source, host, presence, rtconfig.ApplyFromOptions{})
 				if err != nil {

@@ -54,15 +54,25 @@ func TestImageFastPathProjectsProductEnvironmentBeforeSpawn(t *testing.T) {
 					}
 					return &taskartifact.ImageEnvironment{ImageRef: identity, Env: map[string]string{"PATH": "/image/custom/bin:/usr/bin", "IMAGE": "yes", "WIN": "image"}}, nil
 				},
-				startChild: func(string, []string, []string, *os.File, *os.File) error {
+				startChild: func(_ string, _, _ []string, _, _ *os.File, provenance []byte) error {
 					starts++
-					host, err := rtconfig.LoadMerged([]string{path})
+					raw, err := os.ReadFile(path)
 					if err != nil {
+						t.Fatal(err)
+					}
+					host, err := rtconfig.LoadConfigBytes(raw)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := rtconfig.ApplyConfigProvenance(raw, host, provenance); err != nil {
 						t.Fatal(err)
 					}
 					env := host.Launch.Plugin[0].Env
 					if env["IMAGE"] != "yes" || env["WIN"] != "request" || env["PATH"] != "/run/sandbox-runtime/systemd/bin:/image/custom/bin:/usr/bin" {
 						t.Fatalf("wrong env: %#v", env)
+					}
+					if !host.Launch.PersistentSystemdPathDefault() || !host.Launch.Plugin[0].PersistentSystemdPathDefault() {
+						t.Fatal("fresh image lost trusted PATH provenance at child handoff")
 					}
 					return spawned
 				},

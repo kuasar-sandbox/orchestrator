@@ -184,7 +184,7 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 		Launch: rtconfig.PortableLaunchConfig{
 			Env: map[string]string{"OLD": "value"}, Restart: "always",
 			Placeholder: true, PIDNamespace: "private",
-			Plugin: []rtconfig.PluginConfig{{Exec: "/old/plugin"}},
+			Plugin: []rtconfig.PortablePluginConfig{{Exec: "/old/plugin"}},
 			User:   "1000:1000", StopSignal: "SIGINT", StopGracePeriod: "30s",
 		},
 		Mounts:   []rtconfig.MountConfig{{Target: "/old", Type: "tmpfs"}},

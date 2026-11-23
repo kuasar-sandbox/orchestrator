@@ -931,7 +931,7 @@ Create 和 Build 共用既有 `kuasar-sandbox.launch` metadata 对象。E2B 在�
 
 省略表示继承来源，显式 `off` 可以覆盖来源。没有来源的新定义默认 off。Build 先合并完整来源，再生成供顶层 E 和内存 C0 共用的最终 Launch。从 E 新建时，tenant task 保留已经准备好的完整来源到最终投影，保持来源的进程布局。显式改变模式时，只对已识别的 envd-primary 或 placeholder/envd-plugin 布局更新产品拥有的 cgroup 根；未知或歧义布局要求新建冷定义。暂停 E 的冷恢复使用持久来源，不重放历史创建 metadata。S 恢复已经捕获的状态，拒绝任何新模式覆盖，包括 off。
 
-新的产品 envd 插件取得最终镜像的完整默认环境，再叠加来源和请求覆盖。tenant task 读取与实际启动相同的不可变镜像身份，fresh image 路径同样执行；镜像环境不回传 Conductor。PATH 来自默认值时，非 off 模式在前面加入 `/run/sandbox-runtime/systemd/bin`，保留镜像 PATH 的全部目录；仅实际 runtime 模式在该目录投影工具，provided 下目录不存在时由普通 PATH 查找跳过。显式 PATH（包括空值）保持不变。已保存 E 的插件 PATH 继续具有权威性；只有来源记录默认 PATH 标记、插件 PATH 又精确等于该默认值或平台前缀加默认值时，模式覆盖才调整平台前缀。其他插件保留各自独立的环境。
+新的产品 envd 插件取得最终镜像的完整默认环境，再叠加来源和请求覆盖。tenant task 读取与实际启动相同的不可变镜像身份，fresh image 路径同样执行；镜像环境不回传 Conductor。PATH 来自默认值时，非 off 模式在前面加入 `/run/sandbox-runtime/systemd/bin`，保留镜像 PATH 的全部目录；仅实际 runtime 模式在该目录投影工具，provided 下目录不存在时由普通 PATH 查找跳过。显式 PATH（包括空值）保持不变。已保存 E 的插件 PATH 继续具有权威性；只有该插件携带可信默认 PATH 来源标记时，模式覆盖才调整平台前缀。Host 在 artifact 和任务到 CLI 的内部交接中保留来源，不从字符串相等推断；旧 E 插件无标记时保持 PATH 不变。其他插件保留各自独立的环境。
 
 Runtime readiness 或 placeholder 的 `app_started` 不代表 E2B Running。当前 run 必须在既有 launch context 中成功完成 `POST /init`；取消、期限耗尽或 run 已失效都不能发布 Running。零启动超时保留现有无上限语义；Guest service 就绪不要求任意用户 unit 全部健康。
 

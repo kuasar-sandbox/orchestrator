@@ -145,10 +145,22 @@ func ProjectNewE2BEnvironment(launch *rtconfig.LaunchConfig, imageEnv map[string
 	if defaultPath {
 		launch.Plugin[0].Env["PATH"] = envdDefaultPath(launch.EffectiveSystemd(), launch.Env["PATH"])
 	}
+	launch.Plugin[0].SetSystemdPathDefault(defaultPath)
 	return nil
 }
 
 func envdDefaultPath(mode, path string) string {
+	// Provenance is established before this product-owned transformation.
+	// Remove only our exact directory component; retain every image directory
+	// and empty component, including a custom OCI default PATH.
+	parts := strings.Split(path, ":")
+	kept := parts[:0]
+	for _, part := range parts {
+		if part != systemdToolsPath {
+			kept = append(kept, part)
+		}
+	}
+	path = strings.Join(kept, ":")
 	if mode != "off" && mode != "" {
 		// Only runtime projects this directory. In provided mode an absent
 		// directory is skipped by normal PATH search; image directories remain.
@@ -157,10 +169,18 @@ func envdDefaultPath(mode, path string) string {
 	return path
 }
 
+// LaunchProjection binds trusted PATH provenance to the exact ordinary host
+// document consumed by sandbox-ctl. The provenance is handed off privately;
+// its internal keys never become tenant-settable Launch fields.
+type LaunchProjection struct {
+	Config     []byte
+	Provenance []byte
+}
+
 // ProjectImageLaunch finishes a fresh image E2B launch inside the tenant task.
 // The immutable ref is checked against the actual rendered boot config before
 // any environment is published; no image metadata crosses the conductor.
-func ProjectImageLaunch(raw []byte, imageRef string, imageEnv map[string]string) ([]byte, error) {
+func ProjectImageLaunch(raw []byte, imageRef string, imageEnv map[string]string) (*LaunchProjection, error) {
 	host, _, err := rtconfig.LoadConfigBytesWithPresence(raw)
 	if err != nil {
 		return nil, err
@@ -171,7 +191,7 @@ func ProjectImageLaunch(raw []byte, imageRef string, imageEnv map[string]string)
 	if err := ProjectNewE2BEnvironment(&host.Launch, imageEnv); err != nil {
 		return nil, err
 	}
-	return replaceLaunchDocument(raw, host.Launch)
+	return MarshalLaunchProjection(raw, host.Launch)
 }
 
 func completeLaunchMap(launch rtconfig.LaunchConfig) map[string]any {
@@ -233,7 +253,7 @@ func (s SandboxSpec) launchOverlay(env map[string]string) map[string]any {
 // ProjectSourceLaunch retains the authenticated source's full process layout.
 // The result remains a host/instance document, not an immutable boot definition.
 // Call only for a fresh E create, after task-local preparation and before spawn.
-func ProjectSourceLaunch(raw []byte, profile types.Profile, source *rtconfig.PortableSandboxConfig) ([]byte, error) {
+func ProjectSourceLaunch(raw []byte, profile types.Profile, source *rtconfig.PortableSandboxConfig) (*LaunchProjection, error) {
 	if source == nil {
 		return nil, fmt.Errorf("sandboxcfg: source launch projection requires the prepared Sandbox config")
 	}
@@ -262,12 +282,12 @@ func ProjectSourceLaunch(raw []byte, profile types.Profile, source *rtconfig.Por
 		}
 	}
 	if profile == types.ProfileE2B {
-		projectSourceEnvdEnvironment(&merged.Launch, source, requestEnv, presence.Has("launch.systemd"))
+		projectSourceEnvdEnvironment(&merged.Launch, requestEnv, presence.Has("launch.systemd"))
 	}
-	return replaceLaunchDocument(raw, merged.Launch)
+	return MarshalLaunchProjection(raw, merged.Launch)
 }
 
-func projectSourceEnvdEnvironment(launch *rtconfig.LaunchConfig, source *rtconfig.PortableSandboxConfig, request map[string]string, modeOverride bool) {
+func projectSourceEnvdEnvironment(launch *rtconfig.LaunchConfig, request map[string]string, modeOverride bool) {
 	// Old envd-as-primary already receives the merged Launch.Env. Only the
 	// recognized product plugin receives instance overrides. Other plugins and
 	// unknown saved layouts remain authoritative.
@@ -284,26 +304,46 @@ func projectSourceEnvdEnvironment(launch *rtconfig.LaunchConfig, source *rtconfi
 		return
 	}
 	plugin := &launch.Plugin[index]
+	defaultPath := plugin.PersistentSystemdPathDefault()
 	plugin.Env = mergeStr(plugin.Env, request)
-	if _, explicit := request["PATH"]; explicit || !modeOverride || !source.Launch.SystemdPathDefault {
+	if _, explicit := request["PATH"]; explicit {
+		plugin.SetSystemdPathDefault(false)
 		return
 	}
-	base, present := source.Launch.Env["PATH"]
-	if !present {
-		base = defaultExecPath
+	if defaultPath && modeOverride {
+		path, present := plugin.Env["PATH"]
+		if !present {
+			path = defaultExecPath
+		}
+		if plugin.Env == nil {
+			plugin.Env = make(map[string]string)
+		}
+		plugin.Env["PATH"] = envdDefaultPath(launch.EffectiveSystemd(), path)
 	}
-	if path, exists := plugin.Env["PATH"]; exists && (path == base || path == systemdToolsPath+":"+base) {
-		plugin.Env["PATH"] = envdDefaultPath(launch.EffectiveSystemd(), base)
-	}
+	plugin.SetSystemdPathDefault(defaultPath)
 }
 
-func replaceLaunchDocument(raw []byte, launch rtconfig.LaunchConfig) ([]byte, error) {
+// MarshalLaunchProjection preserves a fully merged trusted Launch across the
+// private task-to-CLI boundary; ordinary YAML still contains no internal fields.
+func MarshalLaunchProjection(raw []byte, launch rtconfig.LaunchConfig) (*LaunchProjection, error) {
 	var document map[string]any
 	if err := yaml.Unmarshal(raw, &document); err != nil {
 		return nil, err
 	}
 	document["launch"] = completeLaunchMap(launch)
-	return yaml.Marshal(document)
+	// Unlike a plain tenant overlay, this task projection has a digest-bound
+	// private provenance envelope. Keep the concrete default PATH so the child
+	// does not need to reread or infer the selected OCI image's environment.
+	document["launch"].(map[string]any)["env"] = mergeStr(nil, launch.Env)
+	encoded, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, err
+	}
+	provenance, err := rtconfig.MarshalConfigProvenance(encoded, launch)
+	if err != nil {
+		return nil, err
+	}
+	return &LaunchProjection{Config: encoded, Provenance: provenance}, nil
 }
 
 func projectExistingEnvdRoot(launch *rtconfig.LaunchConfig) error {
@@ -372,34 +412,37 @@ func projectExistingEnvdRoot(launch *rtconfig.LaunchConfig) error {
 	return nil
 }
 
-func ProjectSourceLaunchFile(path string, profile types.Profile, source *rtconfig.PortableSandboxConfig) error {
-	return projectLaunchFile(path, func(raw []byte) ([]byte, error) { return ProjectSourceLaunch(raw, profile, source) })
+func ProjectSourceLaunchFile(path string, profile types.Profile, source *rtconfig.PortableSandboxConfig) ([]byte, error) {
+	return projectLaunchFile(path, func(raw []byte) (*LaunchProjection, error) { return ProjectSourceLaunch(raw, profile, source) })
 }
 
-func ProjectImageLaunchFile(path, imageRef string, imageEnv map[string]string) error {
-	return projectLaunchFile(path, func(raw []byte) ([]byte, error) { return ProjectImageLaunch(raw, imageRef, imageEnv) })
+func ProjectImageLaunchFile(path, imageRef string, imageEnv map[string]string) ([]byte, error) {
+	return projectLaunchFile(path, func(raw []byte) (*LaunchProjection, error) { return ProjectImageLaunch(raw, imageRef, imageEnv) })
 }
 
-func projectLaunchFile(path string, project func([]byte) ([]byte, error)) error {
+func projectLaunchFile(path string, project func([]byte) (*LaunchProjection, error)) ([]byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	raw, err = project(raw)
+	projection, err := project(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".source-launch-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(raw); err != nil {
+	if _, err := tmp.Write(projection.Config); err != nil {
 		_ = tmp.Close()
-		return err
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return nil, err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return nil, err
+	}
+	return projection.Provenance, nil
 }

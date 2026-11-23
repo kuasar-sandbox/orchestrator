@@ -51,6 +51,20 @@ func TestE2BEnvironmentUsesSameFinalImageForBuildAndFreshCreate(t *testing.T) {
 				}
 			}
 			check(phaseC.Launch)
+			memory, _, _, err := p.templateBoot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			memoryConfig, err := rtconfig.LoadConfigBytes(memory.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rtconfig.ApplyConfigProvenance(memory.Config, memoryConfig, memory.Provenance); err != nil {
+				t.Fatal(err)
+			}
+			if !memoryConfig.Launch.PersistentSystemdPathDefault() || !memoryConfig.Launch.Plugin[0].PersistentSystemdPathDefault() {
+				t.Fatal("memory template boot lost trusted PATH provenance")
+			}
 			image, err := p.openCurrentImage()
 			if err != nil {
 				t.Fatal(err)
@@ -61,18 +75,28 @@ func TestE2BEnvironmentUsesSameFinalImageForBuildAndFreshCreate(t *testing.T) {
 				t.Fatal(err)
 			}
 			check(cfg.Launch)
-			if portable.Launch.Plugin[0].Env["IMAGE"] != "yes" || !portable.Launch.SystemdPathDefault {
+			if portable.Launch.Plugin[0].Env["IMAGE"] != "yes" || !portable.Launch.SystemdPathDefault || !portable.Launch.Plugin[0].SystemdPathDefault {
 				t.Fatal("top-level E lost product environment or default PATH origin")
 			}
 			// The image fast path applies the same defaults to the ordinary
 			// rendered host document and checks the immutable boot identity.
-			fresh, err := sandboxcfg.ProjectImageLaunch(document, ref, environment.Env)
+			freshDocument, err := sandboxcfg.MarshalBuildColdConfig(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
-			created, err := rtconfig.LoadConfigBytes(fresh)
+			fresh, err := sandboxcfg.ProjectImageLaunch(freshDocument, ref, environment.Env)
 			if err != nil {
 				t.Fatal(err)
+			}
+			created, err := rtconfig.LoadConfigBytes(fresh.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rtconfig.ApplyConfigProvenance(fresh.Config, created, fresh.Provenance); err != nil {
+				t.Fatal(err)
+			}
+			if !created.Launch.Plugin[0].PersistentSystemdPathDefault() {
+				t.Fatal("fresh image lost trusted plugin PATH source")
 			}
 			check(created.Launch)
 			ctx, cancel := context.WithCancel(context.Background())

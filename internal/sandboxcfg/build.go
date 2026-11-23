@@ -92,6 +92,10 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	// of exposing a tenant-settable spelling in the intermediate host document.
 	sourceDefaults := *p.Source
 	sourceDefaults.Launch.SystemdPathDefault = false
+	sourceDefaults.Launch.Plugin = append([]rtconfig.PortablePluginConfig(nil), p.Source.Launch.Plugin...)
+	for i := range sourceDefaults.Launch.Plugin {
+		sourceDefaults.Launch.Plugin[i].SystemdPathDefault = false
+	}
 	raw, err := yaml.Marshal(&sourceDefaults)
 	if err != nil {
 		return nil, fmt.Errorf("sandboxcfg: encode source defaults: %w", err)
@@ -99,6 +103,9 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	var merged rtconfig.SandboxConfig
 	if err := yaml.Unmarshal(raw, &merged); err != nil {
 		return nil, fmt.Errorf("sandboxcfg: decode source defaults: %w", err)
+	}
+	for i := range merged.Launch.Plugin {
+		merged.Launch.Plugin[i].SetSystemdPathDefault(p.Source.Launch.Plugin[i].SystemdPathDefault)
 	}
 	merged.Resources = projected.Resources
 	merged.Network = projected.Network
