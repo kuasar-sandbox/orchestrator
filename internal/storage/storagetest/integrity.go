@@ -64,5 +64,9 @@ func runIntegrity(t *testing.T, factory Factory) {
 		if !errors.Is(err, storage.ErrInvalid) {
 			t.Fatalf("corrupt chunk accepted: %v", err)
 		}
+		err = s.Read(t.Context(), func(tx *record.Tx) error { _, err := tx.GetMany([]record.Key{key}); return err })
+		if !errors.Is(err, storage.ErrInvalid) {
+			t.Fatalf("batch accepted corrupt chunk: %v", err)
+		}
 	})
 }
