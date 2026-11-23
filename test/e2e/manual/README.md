@@ -23,11 +23,20 @@ bash test/e2e/manual/cluster-migration.sh
 ```
 
 The failure script exercises lost Create ACK, running report before generic
-error ACK, Registry SIGKILL after Node acceptance with all results withheld,
-initial Group version conflict, and existing-object authorization after Group
-deletion. It checks Node rows, exact local identity, actual VM execution, public
+error ACK, Registry SIGKILL both before and after Node acceptance, initial
+Group version conflict, generic rejection with a negative Node query, concurrent
+callers with different credentials/Placement, and existing-object authorization
+after Group deletion. It checks Node rows, exact local identity, actual VM execution, public
 credentials and Create delivery counts. The relay stores only frame types,
 command/Sandbox IDs and states; it excludes command bodies and credentials.
+
+The generic-rejection case observes one Registry decision directly because the
+public Router can retry a temporary response after logical-slot retirement.
+It does not classify that later invocation as a second delivery of the old
+execution identity. Native Registry tests separately check retained ownership
+and authentication after timeout on SQLite, PostgreSQL and FoundationDB.
+They also inject rollback/Unknown at physical transaction boundaries and
+replay old ACK/report frames across two real HTTP/2 NodeLink streams.
 
 The migration script exports a real annotated Snapshot, makes the target Group
 default refer to an unavailable runtime, and passes only the opaque KMT to

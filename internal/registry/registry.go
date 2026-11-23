@@ -144,9 +144,9 @@ type reserveCall struct {
 	finishOnce sync.Once
 	result     *ReserveResult
 	err        error
-	// re-Place context (docs/cluster.md#route-link): a rejected create re-places once on another node
-	// before failing the Reserve. orig is the pre-reserve record to restore on
-	// timeout/reject while the row is still RESERVED.
+	// orig is the pre-reserve record to restore when the exact reserved
+	// revision times out or fails. Ambiguous deliveries retain their ownership
+	// and authentication references for later convergence and cleanup.
 	group, routeKey   string
 	expectedSandboxID string
 	orig              *SandboxRecord
@@ -172,9 +172,9 @@ func (f reserveRollbackFence) matches(rec *SandboxRecord, revision metadata.Vers
 		rec.NodeSandboxID == f.NodeSandboxID && rec.SandboxGeneration == f.SandboxGeneration
 }
 
-// ReserveResult is the operation result returned to a trusted router. Route is
-// always the complete authoritative forwarding record; operation-specific
-// results are present only after their matching node command is accepted.
+// ReserveResult is the internal result used to construct the appropriate
+// RouteLink control/data projection. Operation-specific results are present
+// only after their matching Node command is accepted.
 type ReserveResult struct {
 	Route       RouteResolve                 `json:"route"`
 	Connect     *routesync.ConnectResult     `json:"connect,omitempty"`

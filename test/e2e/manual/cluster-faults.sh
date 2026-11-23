@@ -15,6 +15,8 @@ make_ext4_templates
 build_template_with_standalone_node
 write_group_record
 write_registry_configs 1
+# Keep the ambiguity timeout observable within this manual acceptance run.
+sed -i 's/park_timeout: "180s"/park_timeout: "12s"/' "$WORK/registry-1.yaml"
 write_placer_router_configs
 start_cluster_control_plane
 RELAY_PORT="$(free_port)"
@@ -32,4 +34,5 @@ GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" --node
 export FAULT_WORK="$WORK" FAULT_OUT="$CASE_OUT" FAULT_GROUP="$GROUP" FAULT_DOMAIN="$DOMAIN" FAULT_API_KEY="$CLUSTER_API_KEY"
 export FAULT_ROUTER="http://127.0.0.1:$ROUTER_PORT" FAULT_NODE="http://127.0.0.1:$NODE_PORT" FAULT_SANDBOX_CTL="$BIN/sandbox-ctl"
 export FAULT_REGISTRY_PID="${REGISTRY_PIDS[0]}" FAULT_CLUSTER_CTL="$BIN/run-cluster-ctl"
+export FAULT_REGISTRY="http://127.0.0.1:$CONTROL_PORT"
 python3 "$SCRIPT_DIR/cluster_faults.py"

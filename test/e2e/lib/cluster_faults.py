@@ -2,6 +2,7 @@
 """Real Node/SQLite/VM checks through the test-only NodeLink ordering relay."""
 import concurrent.futures
 import atexit
+import http.client
 import json
 import os
 import pathlib
@@ -24,18 +25,20 @@ def main():
     node = os.environ["FAULT_NODE"]
     mode_path = work / "fault-mode"
     receipts = []
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
     def mode(value):
         temporary = mode_path.with_suffix(".next")
         temporary.write_text(value + "\n")
         temporary.replace(mode_path)
 
-    def request(base, method, path, route="", body=None):
+    def request(base, method, path, route="", body=None, extra_headers=None):
         headers = {"Host": host, "X-API-KEY": api_key,
                    "X-Kuasar-Sandbox-Group": group}
         if route:
             headers["X-Kuasar-Route-Key"] = route
+        if extra_headers:
+            headers.update(extra_headers)
         data = None if body is None else json.dumps(body).encode()
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -187,6 +190,51 @@ def main():
     record({"case": "F08-after-Node-acceptance", "node": local, "create_deliveries": 1, "registry_signal": "SIGKILL", "full_snapshot_recovered": True})
     delete(recovered, route)
 
+    # The intent is committed and bytes have reached the relay, but the actual
+    # Node has not received this command. Kill the owner, discard that dead
+    # stream, and recover the same logical slot with a fresh local generation.
+    route = "fault/F02"
+    start = len(events())
+    mode("pause-create")
+    reserve_path = "/route-link/v2/reserve?" + urllib.parse.urlencode({"group": group, "route_key": route, "operation": "create"})
+    pending = pool.submit(request, os.environ["FAULT_REGISTRY"], "POST", reserve_path, route, {})
+    command = until(lambda: next((e for e in events()[start:] if e["action"] == "create-received"), None), "no committed pre-acceptance command")
+    stable = command["sid"].rsplit("-g", 1)[0]
+    assert row(stable) is None, "held command reached the actual Node"
+    projection_path = "/route-link/v2/data-route?" + urllib.parse.urlencode({"group": group, "route_key": route, "sid": stable})
+    code, before_restart = request(os.environ["FAULT_REGISTRY"], "GET", projection_path)
+    assert code == 200 and before_restart["node_sandbox_id"] == command["sid"], "intent was not committed before owner failure"
+    restarted.kill()
+    restarted.wait(timeout=10)
+    mode("disconnect")
+    until(lambda: any(e["action"] == "session-closed" for e in events()[start:]), "old paused NodeLink did not close")
+    assert not any(e["action"] == "forward-down" and e.get("sid") == command["sid"] for e in events()[start:]), "old command escaped the closed stream"
+    try:
+        failed_status, _ = pending.result(timeout=20)
+        assert failed_status >= 500, "dead owner returned success"
+    except (http.client.RemoteDisconnected, urllib.error.URLError, ConnectionError):
+        failed_status = "connection-lost"
+    mode("normal")
+    with (work / "registry-restarted-before-acceptance.log").open("w") as log:
+        restarted = subprocess.Popen([os.environ["FAULT_CLUSTER_CTL"], "registry", "--config", str(config)], stdout=log, stderr=subprocess.STDOUT)
+    def intent_reopened():
+        try:
+            code, current = request(os.environ["FAULT_REGISTRY"], "GET", projection_path)
+            return code == 200 and current["node_sandbox_id"] == command["sid"]
+        except (urllib.error.URLError, ConnectionError):
+            return False
+    until(intent_reopened, "fresh Registry lost the committed logical slot")
+    until(lambda: any(e["type"] == "group_end" for e in events()[start:]), "Node did not republish Group after pre-acceptance restart")
+    status, recovered = request(router, "POST", "/sandboxes", route, {})
+    assert status == 201 and recovered["sandboxID"] == stable, "pre-acceptance restart rebound the logical identity"
+    local = assert_live(recovered, route)
+    assert local["id"] != command["sid"], "ambiguous local execution identity was reused"
+    create_ids = {e["command"] for e in events()[start:] if e["action"] == "create-received"}
+    sent = [e for e in events()[start:] if e["action"] == "forward-down" and e.get("command") in create_ids]
+    assert len(sent) == 1 and sent[0]["sid"] == local["id"], "pre-acceptance recovery redelivered the old execution"
+    record({"case": "F02-after-socket-before-Node-acceptance", "registry_signal": "SIGKILL", "interrupted_status": failed_status, "committed_node_sid": command["sid"], "recovered_node": local, "forwarded_create_deliveries": 1})
+    delete(recovered, route)
+
     route = "fault/F06"
     start = len(events())
     mode("pause-create")
@@ -210,6 +258,62 @@ def main():
     local = assert_live(created, route)
     assert local["id"] != command["sid"], "retired execution identity was reused"
     record({"case": "F06", "rejected_node_sid": command["sid"], "public_status": 409, "replacement": local})
+
+    # The same actual initial Node rejection, without its structured proof,
+    # must not be generalized into permission to retire the pending identity.
+    ambiguous_route = "fault/F07"
+    start = len(events())
+    mode("pause-create")
+    # Observe one Registry decision directly. The public Router may retry a
+    # temporary response after the old logical slot is retired; that is a
+    # separate invocation and must not hide this decision's unknown outcome.
+    reserve_path = "/route-link/v2/reserve?" + urllib.parse.urlencode({"group": group, "route_key": ambiguous_route, "operation": "create"})
+    pending = pool.submit(request, os.environ["FAULT_REGISTRY"], "POST", reserve_path, ambiguous_route, {})
+    ambiguous = until(lambda: next((e for e in events()[start:] if e["action"] == "create-received"), None), "no ambiguous delivery")
+    status, detail = request(node, "GET", group_path)
+    assert status == 200
+    revised = dict(detail["context"])
+    revised["metadata"] = {"fault-window": "unstructured-rejection"}
+    status, _ = request(node, "PUT", group_path, body={"expected_version": detail["version"], "context": revised})
+    assert status == 200
+    mode("generic-group-rejection")
+    until(lambda: any(e["action"] == "strip-proof" for e in events()[start:]), "generic-only rejection was not injected")
+    ambiguous_sid = ambiguous["sid"].rsplit("-g", 1)[0]
+    projection_path = "/route-link/v2/data-route?" + urllib.parse.urlencode({"group": group, "route_key": ambiguous_route, "sid": ambiguous_sid})
+    code, retained = request(os.environ["FAULT_REGISTRY"], "GET", projection_path)
+    assert code == 200 and retained["node_sandbox_id"] == ambiguous["sid"], "generic conflict retired its pending identity"
+    code, _ = request(node, "GET", "/sandboxes/" + ambiguous["sid"])
+    assert code == 404, "the rejected delivery unexpectedly materialized"
+    assert not pending.done(), "negative Node query released the pending caller"
+    status, _ = pending.result(timeout=50)
+    assert status == 503, "ambiguous Create did not end as a temporary failure: " + str(status)
+    record({"case": "F07-generic-conflict", "registry_status": status, "negative_node_query": 404, "retained_node_sid_while_waiting": retained["node_sandbox_id"], "retained_state_while_waiting": retained["state"]})
+    mode("normal")
+
+    # Shared work never shares permission. While a real Create is held before
+    # Node admission, a second valid waiter may join, but neither a bad MAC nor
+    # incompatible Placement may receive the first caller's result.
+    waiter_route = "fault/F12"
+    start = len(events())
+    mode("pause-create")
+    first = pool.submit(request, router, "POST", "/sandboxes", waiter_route, {})
+    until(lambda: any(e["action"] == "create-received" for e in events()[start:]), "no held waiter Create")
+    second = pool.submit(request, router, "POST", "/sandboxes", waiter_route, {})
+    invalid_key = api_key[:-1] + ("1" if api_key[-1] == "0" else "0")
+    code, _ = request(router, "POST", "/sandboxes", waiter_route, {}, {"X-API-KEY": invalid_key})
+    assert code == 403, "shared wait authenticated an invalid MAC"
+    code, _ = request(router, "POST", "/sandboxes", waiter_route, {}, {"X-Kuasar-Sandbox-Placement": json.dumps({"node_selectors": [{"fixture-impossible": "true"}]})})
+    assert code == 409, "shared wait ignored caller Placement"
+    assert not first.done() and not second.done(), "held valid waiter unexpectedly finished"
+    mode("normal")
+    first_status, first_object = first.result(timeout=50)
+    second_status, second_object = second.result(timeout=50)
+    assert first_status == second_status == 201 and first_object["sandboxID"] == second_object["sandboxID"], "valid waiters did not share the exact object"
+    waiter_local = assert_live(first_object, waiter_route)
+    commands = [e for e in events()[start:] if e["action"] == "create-received"]
+    assert len(commands) == 1, "concurrent waiters dispatched another execution"
+    record({"case": "F12-concurrent-callers", "valid_statuses": [first_status, second_status], "bad_mac_status": 403, "incompatible_placement_status": 409, "node": waiter_local, "create_deliveries": 1})
+    delete(first_object, waiter_route)
 
     # Delete is later than copied/accepted input; retained object authorization
     # must survive, and the importer must not revive this explicit tombstone.

@@ -66,7 +66,7 @@ func (r *relay) mode() (string, error) {
 	}
 	mode := strings.TrimSpace(string(raw))
 	switch mode {
-	case "normal", "drop-create-ack", "drop-create-results", "error-after-ready", "pause-create", "disconnect":
+	case "normal", "drop-create-ack", "drop-create-results", "error-after-ready", "pause-create", "generic-group-rejection", "disconnect":
 		return mode, nil
 	default:
 		return "", fmt.Errorf("invalid fixture mode")
@@ -79,6 +79,7 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.NotFound(w, req)
 		return
 	}
+	defer r.record("session-closed", &routesync.Msg{Type: "session"})
 	ctx, cancel := context.WithCancel(req.Context())
 	defer cancel()
 	reader, writer := io.Pipe()
@@ -108,6 +109,10 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				sid = creates[msg.Ack.CmdID]
 			}
 			mu.Unlock()
+			if sid != "" && mode == "generic-group-rejection" && msg.Ack.ErrorCode == routesync.ErrorGroupVersionConflict {
+				msg.Ack.ErrorCode, msg.Ack.Reason = "", "fixture generic conflict"
+				r.record("strip-proof", msg)
+			}
 			if sid != "" && (mode == "drop-create-ack" || mode == "drop-create-results") {
 				r.record("drop", msg)
 				continue

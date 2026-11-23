@@ -111,31 +111,43 @@ func TestGroupCreateDefaultAndExplicitInputs(t *testing.T) {
 }
 
 func TestGroupCreateKeepsCopiedInputsAcrossConcurrentUpdate(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Sandbox.TimeoutSec = 60
-	gate := make(chan struct{})
-	defer close(gate)
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{startGate: gate})
-	_, _, fp := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(t, o, fp, "group-hook-race")
-	o.SetExtensionHooks(sandboxHookFunc(func(ctx context.Context, _ *conductorextension.SandboxOperation) error {
-		_, err := o.GroupPut(ctx, cmd.GroupAPIKey, cmd.Cluster.Group, nodegroup.PutRequest{
-			ExpectedVersion: cmd.ExpectedGroupVersion, Context: nodegroup.Context{TargetPort: 8080},
+	for _, change := range []string{"update", "delete"} {
+		t.Run(change, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Sandbox.TimeoutSec = 60
+			gate := make(chan struct{})
+			defer close(gate)
+			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{startGate: gate})
+			_, _, fp := allowlistedBuildIdentity(t, o)
+			cmd := clusterCreateCommand(t, o, fp, "group-hook-race")
+			o.SetExtensionHooks(sandboxHookFunc(func(ctx context.Context, _ *conductorextension.SandboxOperation) error {
+				if change == "delete" {
+					_, err := o.GroupDelete(ctx, cmd.GroupAPIKey, cmd.Cluster.Group, cmd.ExpectedGroupVersion)
+					return err
+				}
+				_, err := o.GroupPut(ctx, cmd.GroupAPIKey, cmd.Cluster.Group, nodegroup.PutRequest{
+					ExpectedVersion: cmd.ExpectedGroupVersion, Context: nodegroup.Context{TargetPort: 8080},
+				})
+				return err
+			}), nil)
+			ack := o.HandleCommand(ctx, cmd)
+			if ack.Status != routesync.AckAccepted {
+				t.Fatalf("copied Group inputs were revoked during core admission: %+v", ack)
+			}
+			if sb, err := o.st.Get(ctx, cmd.SID); err != nil || sb == nil || sb.TemplateID != cmd.TemplateRef {
+				t.Fatalf("copied Group input did not reach durable acceptance: %v %v", sb, err)
+			}
+			next := *cmd
+			next.SID = "group-hook-next"
+			ack = o.HandleCommand(ctx, &next)
+			wantStatus, wantCode := http.StatusConflict, routesync.ErrorGroupVersionConflict
+			if change == "delete" {
+				wantStatus, wantCode = http.StatusNotFound, ""
+			}
+			if ack.Status != routesync.AckRejected || ack.HTTPStatus != wantStatus || ack.ErrorCode != wantCode {
+				t.Fatalf("new invocation reused stale revision: %+v", ack)
+			}
 		})
-		return err
-	}), nil)
-	ack := o.HandleCommand(ctx, cmd)
-	if ack.Status != routesync.AckAccepted {
-		t.Fatalf("copied Group inputs were revoked during core admission: %+v", ack)
-	}
-	if sb, err := o.st.Get(ctx, cmd.SID); err != nil || sb == nil || sb.TemplateID != cmd.TemplateRef {
-		t.Fatalf("copied Group input did not reach durable acceptance: %v %v", sb, err)
-	}
-	next := *cmd
-	next.SID = "group-hook-next"
-	ack = o.HandleCommand(ctx, &next)
-	if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusConflict || ack.ErrorCode != routesync.ErrorGroupVersionConflict {
-		t.Fatalf("new invocation reused stale revision: %+v", ack)
 	}
 }
 
