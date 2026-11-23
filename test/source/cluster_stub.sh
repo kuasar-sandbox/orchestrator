@@ -1053,4 +1053,14 @@ for _ in range(100):
 raise SystemExit("route list still contains the rebooted sandbox")
 PY
 
+# Optional measurement on the same verified product-process fixture.
+if [ -n "${CLUSTER_BENCH_OUTPUT:-}" ]; then
+    [ "$CLUSTER_STUB_CASE" = registry-n1 ] || fail "benchmark requires CLUSTER_STUB_CASE=registry-n1"
+    export CLUSTER_BENCH_PORT="$ROUTER_PORT" CLUSTER_BENCH_GROUP="$GROUP"
+    export CLUSTER_BENCH_KEY="$API_KEY" CLUSTER_BENCH_DOMAIN="$DOMAIN"
+    export CLUSTER_BENCH_PIDS="${PIDS[*]}" CLUSTER_BENCH_BACKEND="$CLUSTER_STUB_BACKEND"
+    export CLUSTER_BENCH_NODES="$NODES"
+    python3 "$ROOT/test/e2e/lib/cluster_benchmark.py"
+fi
+
 echo "PASS source/cluster-stub"

@@ -49,3 +49,26 @@ Keep the JSON receipts, complete command/source/binary identities, and logs.
 Record failures and the exact injection boundary. These cases do not by
 themselves establish every F01–F12/C01–C12 case, physical exactly-once execution,
 multi-host availability, or production performance.
+
+## Product-process measurements
+
+The optional benchmark uses the regular cluster-stub acceptance fixture. Four
+logical Nodes share one execution-stub process; Registry, Router and Placer are
+real processes. The storage server is separate. This does not measure VM startup
+or multi-host HA. With the normal native binaries and isolated FDB helper:
+
+```sh
+CLUSTER_STUB_CASE=registry-n1 NODES=4 SCALERS=1 \
+  CLUSTER_BENCH_COUNT=200 CLUSTER_BENCH_OUTPUT=/your/evidence/candidate.json \
+  bash test/source/cluster_stub.sh
+```
+
+Use the same driver and optional hook on the baseline, match dependencies and
+hardware, and alternate three before/after pairs without concurrent load. The
+JSON records request latencies, throughput, status counts and product-process
+CPU/RSS. CPU ticks require the recorded clock frequency; RSS excludes FDB and
+can double-count shared pages. Quantiles use the documented empirical order
+statistic. Historical acceptance samples preceded raw-latency retention; their
+recorded quantiles must not be presented as recomputed nearest-rank estimates.
+Group CRUD/renewal and directory costs, including Go allocation counts, are
+separately measured by BenchmarkNodeGroup and BenchmarkGroupDirectory.
