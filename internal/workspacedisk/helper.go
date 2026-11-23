@@ -37,11 +37,21 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var req Request
 	if len(raw) > rtconfig.MaxPortableConfigBytes || strictjson.Decode(raw, &req) != nil {
 		return errors.New("invalid workspace operation")
 	}
 	result, err := execute(ctx, req, os.Getenv(manifest.CustomerKeyEnv))
+	if ctx.Err() != nil {
+		// execute has unwound its owned resources. Keep cancellation and any
+		// cleanup diagnostic visible to the parent, rather than report success.
+		// Cancellation takes precedence even if commit just completed; committed
+		// content-addressed artifacts remain available and are not rolled back.
+		return errors.Join(ctx.Err(), err)
+	}
 	if err != nil {
 		result = Result{Error: "storage"}
 		switch {

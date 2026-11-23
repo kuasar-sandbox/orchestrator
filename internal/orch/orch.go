@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -3287,7 +3289,7 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 		if request.Kind == types.CaptureSnapshot {
 			args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
 		}
-		cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+		cmd := helperexec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 		cmd.Env, err = retirementCommandEnvironment(permit)
 		if err != nil {
 			return types.ResumeSource{}, err
@@ -3384,13 +3386,30 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 		}
 	}
 	args = append(args, root)
-	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	cmd := helperexec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return artifact.PublishReport{}, fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+		publishErr := fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+		if ctx.Err() != nil {
+			// Preemption returns the public 409 instead of publishErr. Preserve
+			// the child diagnostic, including any cleanup failure, in the log.
+			var exit *exec.ExitError
+			signaled := false
+			if errors.As(err, &exit) {
+				status, ok := exit.Sys().(syscall.WaitStatus)
+				// Signal() returns -1 on normal exit; use the termination kind.
+				signaled = ok && status.Signaled()
+			}
+			if signaled {
+				o.log.Warn("publisher killed during cancellation; files may remain", "sid", sb.ID, "err", publishErr)
+			} else {
+				o.log.Info("publisher exited after cancellation", "sid", sb.ID, "err", publishErr)
+			}
+		}
+		return artifact.PublishReport{}, publishErr
 	}
 	report, err := artifact.DecodePublishReport(out.Bytes(), artifactRole(source.Kind))
 	if err != nil {

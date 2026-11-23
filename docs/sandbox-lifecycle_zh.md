@@ -943,6 +943,17 @@ publisher、capture CLI 和 `checkpoint-cleanup` 继承其描述符，因此 con
 发出取消不代表已经完成。正常执行结束、确认运行实例失联及显式删除共同使用受来源保护的
 资源收尾，保留的 dead 历史与执行结果继续保持原有业务含义。
 
+支持协作取消的直接辅助子进程（发布、workspace-storage、构建宿主工具、capture/reset
+及 checkpoint 检查/清理）共用退出策略：先 SIGTERM，5 秒内部宽限后仍未退出则
+SIGKILL，并始终等待真实子进程退出。沿用调用方 operation context 和现有提交协议；
+5 秒是兜底默认值，不是实测清理保证。短准入检查保持独立预算；proxy worker、guest
+exec 和 VM/service runner 保持各自生命周期协议。
+
+取消发布时向 `sandbox-ctl publish` 发送 SIGTERM，让它在退出前清理临时物化目录和
+当前未完成的目标文件；子进程退出前继续保留 export/source 保护。共同 helper 策略的 5 秒宽限后仍未退出则
+强杀，因此强制终止仍可能留下文件。已提交的共享产物不回滚。请求取消和 conductor
+lifecycle 关闭也使用相同的发布取消路径。
+
 Export 的 publish 阶段不持有长 lifecycle lock。结果校验通过后，在 per-SID lifecycle lock
 内检查完整原始 S/E 对、源实例和导出 attempt。Resume 先成功 `BeginResume` 时，KMT
 export 被取消并返回 409；template publish 可 detached 完成并返回 TemplateID，但不清理
