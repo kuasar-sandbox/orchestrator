@@ -1,10 +1,10 @@
 # Group support repository foundation
 
 This is the shared metadata foundation for [proposal
-#570](https://github.com/kuasar-sandbox/orchestrator/issues/570). It adds a typed
-repository on the existing record/short-transaction layer. No storage driver
-understands Group business semantics. Existing NodeLink/report/request paths do
-not yet call this repository.
+#570](https://github.com/kuasar-sandbox/orchestrator/issues/570). The typed
+repository uses the existing record/short-transaction layer. No storage driver
+understands Group business semantics. Normal Node reports publish support here;
+Registry request admission reads the completed directory.
 
 Each full report has an original registration, a synchronization ID, a consistent
 Node sequence and a record count. Batches have offsets and are checked for
@@ -27,8 +27,8 @@ an object reference does not write a shared authentication counter. Removing
 the last reference uses a bounded serializable prefix check in the same
 transaction; concurrent references conflict with reclamation. Removing support
 therefore preserves authentication retained by an existing sandbox or Build.
-The complete activation unit will bind object references to existing lifecycle
-transactions; this foundation does not partially modify those paths.
+Sandbox/Build route and ownership changes retain or release these object
+references inside their existing lifecycle transactions.
 
 Report batches are limited to 128 rows, 128 authentication entries and 256 KiB
 of encoded payload. Cleanup also bounds total authentication work per
@@ -41,5 +41,6 @@ Validation uses the same repository contract on real SQLite, PostgreSQL 16.15
 and FoundationDB 7.3.77, with Go race instrumentation. Cases cover incomplete
 snapshots, stable publication, ordered deltas, reconnect/reap races, unknown
 commits, retained object authentication and bounded cleanup. Existing repository
-conformance also runs on all three backends. End-to-end Create/Build/Router and
-performance acceptance remain part of the activation unit.
+conformance also runs on all three backends. End-to-end Create/Build/Router,
+failure and performance results are recorded in the
+[activation acceptance report](node-group-runtime-acceptance.md).
