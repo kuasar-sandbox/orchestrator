@@ -27,6 +27,13 @@
     "published_sha256": "e30c60755705a4b49b5b8676bd8b8bb8eadea5af4c3f73d1c2a90500e80d3a76",
     "transformation": "byte-identical"
   },
+  "activation-native-retry-fault.log": {
+    "bytes": 13537,
+    "original_sha256": "6afe3118439b9d74bd5dc881589abba1240f284a6ecc223d7ed07d73bb7250eb",
+    "original_task_path": "evidence/activation-native-retry-fault.log",
+    "published_sha256": "6afe3118439b9d74bd5dc881589abba1240f284a6ecc223d7ed07d73bb7250eb",
+    "transformation": "byte-identical"
+  },
   "activation-node-group-benchmark.log": {
     "bytes": 1697,
     "original_sha256": "0b695d926efa665e0171f54997c55267d5a5d15369c292d9a3a1ebd6c3d45c62",
@@ -82,6 +89,20 @@
     "original_task_path": "evidence/migration-cache-fix.patch",
     "published_sha256": "e29213f6084be626351e0db8affb62385ce508468a2c49ab553c390b8c3a9ef2",
     "transformation": "JSON-encode the original patch without changing its content"
+  },
+  "native-arm64-databases/native-arm-databases.log": {
+    "bytes": 619,
+    "original_sha256": "5bdcbf03e3b10f08c946c0c3a38b5d769eb17c379391000b71f88c2c40b7b42c",
+    "original_task_path": "native-arm64-databases/native-arm-databases.log",
+    "published_sha256": "5bdcbf03e3b10f08c946c0c3a38b5d769eb17c379391000b71f88c2c40b7b42c",
+    "transformation": "byte-identical"
+  },
+  "native-arm64-databases/validation-receipt.json": {
+    "bytes": 1497,
+    "original_sha256": "b4c68880fc77fc0b87b3f1bcf066519fe7db363e44e2b3a4c765c4fd3f6a3913",
+    "original_task_path": "native-arm64-databases/validation-receipt.json",
+    "published_sha256": "b4c68880fc77fc0b87b3f1bcf066519fe7db363e44e2b3a4c765c4fd3f6a3913",
+    "transformation": "byte-identical"
   },
   "native-arm64-final-carriers/binaries.sha256": {
     "bytes": 251,

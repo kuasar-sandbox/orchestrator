@@ -48,7 +48,7 @@ before either proposal is closed.
 | Node Group foundation, #572 | `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a` | includes reviewed cursor escaping fix; full Store race and native ARM regression passed; final main CI pending |
 | Shared support repository, #573 | `75f38bb1c863939eaeec7da8c029e2ced9c85e37` | final main rebase/CI pending |
 | Snapshot producer, sandboxer #474 | `ecfd3ea66efb1968d6435f344e555decd2e873ca` | same tree as tested `5bd60b2`; waits for actual Orchestrator reader delivery |
-| Cluster activation, #574 | production changes through `85d1ce7`; failure/carrier tests through `3710d73` | final main rebase/CI/release pending |
+| Cluster activation, #574 | production changes through `85d1ce7`; failure/carrier tests through `1c6ff22` | final main rebase/CI/release pending |
 
 Sandboxer SDK `v0.2.0-preview.20261124.1` resolved to
 `h1:lp8cYCRnPyyyNbzd7V7aRYS9OT3aLI/hN3UiQgVlNIE=`;
@@ -74,7 +74,7 @@ that these manual runs used the final published cluster binary.
 ## Functional and failure evidence
 
 Native transaction and connection tests execute real SQLite, PostgreSQL 16.15
-and FoundationDB 7.3.77 under the Go race detector. The child-process commit
+and FoundationDB 7.3.77 under the Go race detector on x86_64 and aarch64. The child-process commit
 experiment kills an actual Registry test process after its native commit and
 before returning to command dispatch. Its Node execution after recovery is
 represented by report/ACK fixtures. The manual VM suite complements this with
@@ -113,11 +113,25 @@ that all earlier deliveries had no effects.
 | C09 | Publication/rewrite tests preserve the same Snapshot declaration; member selection, physical carriers, internal parents and content keys exclude it. The review-found rewrite loss was fixed before #473 merge. |
 | C10 | Actual old-to-new and new-to-new restore pass on x86_64/aarch64. A genuinely old reader rejects new annotated refs. An intermediate reader accepted tarstream but rejected annotated Bundle, demonstrating why the complete reader was required. |
 | C11 | Actual module resolution and published binary tests precede producer enablement; source merge alone is insufficient. Orchestrator reader release remains a producer gate until its receipt is attached. |
-| C12 | Base/suffix/ref/TemplateID limits 256/336/592/799 bytes; native x86/ARM parser and actual mmap read/write pass. Build capture JSON, publication, route/Token and persistence suites preserve the reference. A 592-byte ref / 799-byte template also traversed selection, framed NodeLink command/report, actual native DB commit/readback, RouteLink response and mmap on all three x86 backends and ARM SQLite. Encrypted KMT and maximum runtime basename in Build capture JSON passed on x86 and ARM; ARM PG/FDB are not claimed by this focused pure-Go run. |
+| C12 | Base/suffix/ref/TemplateID limits 256/336/592/799 bytes; native x86/ARM parser and actual mmap read/write pass. Build capture JSON, publication, route/Token and persistence suites preserve the reference. A 592-byte ref / 799-byte template also traversed selection, framed NodeLink command/report, actual native DB commit/readback, RouteLink response and mmap on all three backends on both architectures. Encrypted KMT and maximum runtime basename in Build capture JSON passed separately on x86 and ARM. |
 
 The full activation Go race suite passed (Node package 662.134 s). Follow-up
 Registry race passed in 58.381 s; the native commit/stream/waiter suite passed
-after later additions. Source checks include Go vet and 359 Python helper tests.
+after later additions. Full ARM native race coverage also passed at `1c6ff22`
+([receipt](evidence/node-groups-20261124/native-arm64-databases/validation-receipt.json),
+[log](evidence/node-groups-20261124/native-arm64-databases/native-arm-databases.log)):
+FDB driver 1.332 s, metadata 10.254 s, SQL engine 4.014 s, Registry 28.985 s,
+cluster command 4.903 s and HTTP cluster stub 3.174 s. All 3,259 archived source
+files were verified before execution. This uses real native PG/FDB/SQLite and
+simulated Node execution where the test calls for it, not an ARM VM cluster.
+An initial ARM dependency setup lacked the verified workspace sums and could not
+reach the public checksum service. After copying the original sums, a later run
+exposed a test injector that consumed its commit fault on a definite database
+retry, plus an overlong Unix-socket temporary path. The injector now deliberately
+rolls back one real transaction before losing the successful commit reply; x86
+and ARM regressions passed. The final runner uses a short temporary path. Failed
+attempts remain in the local archive and are not counted as passing.
+Source checks include Go vet and 359 Python helper tests.
 The real cluster lifecycle run covered Build, Group import, Create, exec, cold
 Wake, WebSocket/envd, stats, List/Delete and retained Build status after Router
 restart. Separate real recovery/reset runs covered owner failover, conductor
