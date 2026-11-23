@@ -132,7 +132,7 @@ func (p *buildPipeline) importYAML() (map[string]any, error) {
 				"diff_template": template,
 			},
 		},
-		"launch": map[string]any{"placeholder": true},
+		"launch": map[string]any{"systemd": "off", "placeholder": true},
 	}
 	files := p.dnsFiles()
 	tlsFiles, err := p.flattenConfigFiles()
@@ -175,6 +175,7 @@ func (p *buildPipeline) stepsYAML(plan []workspace.Prepared) (map[string]any, er
 		"network":   p.networkDoc(),
 		"boot":      boot,
 		"launch": map[string]any{
+			"systemd":        "off", // temporary build tool, independent of the final definition
 			"exec":           "/opt/sandbox-runtime/bin/envd",
 			"args":           []string{"-isnotfc", "-port", "49983"},
 			"user":           "0:0",
@@ -236,7 +237,8 @@ func (p *buildPipeline) sourceStepsYAML() (map[string]any, error) {
 			"root": root,
 		},
 		"launch": map[string]any{
-			"exec": "/opt/sandbox-runtime/bin/envd", "args": []string{"-isnotfc", "-port", "49983"},
+			"systemd": "off", // temporary build tool, independent of the final definition
+			"exec":    "/opt/sandbox-runtime/bin/envd", "args": []string{"-isnotfc", "-port", "49983"},
 			"env": map[string]string{}, "ephemeral_env": map[string]string{}, "workdir": "", "plugin": []any{},
 			"user": "0:0", "restart": "always", "cgroup_control": true,
 			"placeholder": false, "pid_namespace": "shared", "stop_signal": "", "stop_grace_period": "", "start_timeout": "",

@@ -288,7 +288,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
-	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec.Launch); err != nil {
+	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
 	if existing == nil {

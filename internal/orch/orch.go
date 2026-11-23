@@ -173,6 +173,7 @@ type Orchestrator struct {
 	resourceControllerSocketIdentity string
 	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (artifact.PublishReport, error)
 	captureStateReader               func(context.Context, string, ctl.CaptureStateQuery) (ctl.CaptureState, error)
+	shutdownSandbox                  func(context.Context, string, ctl.ShutdownTarget) error
 	removeSandboxRunDir              func(string) error
 	removeSandboxBaseDir             func(string) error
 	resetMu                          sync.Mutex
@@ -759,9 +760,15 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 			return launchFailed("envd", err)
 		}
 	}
+	if err := launchCtx.Err(); err != nil {
+		return launchFailed("ready", err)
+	}
 	unlock = o.lifecycle.Lock(sb.ID)
 	defer unlock()
-	changed, err = o.st.CommitStartingRunning(ctx, sb.ID, sb.RunID)
+	if err := launchCtx.Err(); err != nil {
+		return launchFailed("commit", err)
+	}
+	changed, err = o.st.CommitStartingRunning(launchCtx, sb.ID, sb.RunID)
 	if err != nil {
 		return launchFailed("commit", fmt.Errorf("orch: commit launch %s: %w", sb.ID, err))
 	}
@@ -2478,6 +2485,9 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		Workdir:   sb.RunDir,
 		Env:       sandboxTaskEnv(sb),
 	}
+	if deadline := attempt.Deadline(); !deadline.IsZero() {
+		response.AbsoluteDeadlineUnixNano = deadline.UnixNano()
+	}
 	source := sandboxcfg.SourceForLaunch(sb, tmpl)
 	if source.Empty() {
 		locations, err := o.imageRefLocations(tmpl.Ref, sb.WorkspacePlan)
@@ -2488,6 +2498,12 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 			return nil, false, err
 		}
 		response.Final = o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)
+		if projection := response.Final.ImageLaunch; projection != nil && projection.ManifestConfig != "" {
+			projection.ManifestConfig, err = filepath.Abs(projection.ManifestConfig)
+			if err != nil {
+				return nil, false, fmt.Errorf("orch: absolute image manifest config: %w", err)
+			}
+		}
 		return response, true, nil
 	}
 	var deadlineUnixNano int64
@@ -2641,11 +2657,19 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 	for _, c := range p.ConnectSpecs() {
 		args = append(args, "--connect", c)
 	}
-	return &configsock.LaunchSpec{
+	result := &configsock.LaunchSpec{
 		Exec:    o.executables.SandboxCtl(),
 		Args:    args,
 		Workdir: sb.RunDir,
 	}
+	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindSbx && sb.LaunchMode == types.LaunchCold {
+		result.SourceLaunch = &configsock.SourceLaunchProjection{Profile: tmpl.Profile, ConfigPath: o.sandboxConfigPath(sb)}
+	}
+	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindImg && sb.LaunchMode == types.LaunchImage && tmpl.Profile == types.ProfileE2B {
+		result.ImageLaunch = &configsock.ImageLaunchProjection{ConfigPath: o.sandboxConfigPath(sb), ImageRef: tmpl.Ref,
+			ManifestConfig: o.cfg.ManifestConfig, RefLocations: locations}
+	}
+	return result
 }
 
 // --- reaper / reconcile ---

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
@@ -262,8 +264,16 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 		}
 	}
 	requests := make(chan string, 4)
+	allowInit := make(chan struct{})
+	var releaseInit sync.Once
+	t.Cleanup(func() { releaseInit.Do(func() { close(allowInit) }) })
 	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Method + " " + r.URL.Path
+		select {
+		case <-allowInit:
+		case <-r.Context().Done():
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
@@ -280,6 +290,15 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("envd /init was not attempted after runtime readiness")
 	}
+	starting, err := o.st.Get(ctx, sb.ID)
+	if err != nil || starting == nil || starting.State != types.StateStarting {
+		t.Fatalf("placeholder runtime readiness published Running before /init: %+v, %v", starting, err)
+	}
+	launch, err := rtconfig.Load(o.sandboxConfigPath(sb))
+	if err != nil || !launch.Launch.Placeholder || len(launch.Launch.Plugin) != 1 {
+		t.Fatalf("expected placeholder plus envd plugin: %+v, %v", launch, err)
+	}
+	releaseInit.Do(func() { close(allowInit) })
 	select {
 	case err := <-done:
 		if err != nil {

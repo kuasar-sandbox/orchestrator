@@ -196,7 +196,7 @@ func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			cfg, err := p.buildColdConfig()
+			cfg, err := p.buildColdConfig(nil)
 			if err != nil {
 				t.Fatal(err)
 			}

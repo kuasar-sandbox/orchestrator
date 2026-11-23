@@ -22,9 +22,11 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
@@ -65,14 +67,15 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 }
 
 type taskLaunchOps struct {
-	fetchBootstrap  func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error)
-	prepareArtifact func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error)
-	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
-	setenv          func(string, string) error
-	chdir           func(string) error
-	captureIdentity func(*configsock.SandboxTaskSpec)
-	startChild      func(string, []string, []string, *os.File, *os.File) error
-	log             *slog.Logger
+	fetchBootstrap   func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error)
+	prepareArtifact  func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error)
+	imageEnvironment func(context.Context, configsock.ImageLaunchProjection) (*taskartifact.ImageEnvironment, error)
+	completePrepare  func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
+	setenv           func(string, string) error
+	chdir            func(string) error
+	captureIdentity  func(*configsock.SandboxTaskSpec)
+	startChild       func(string, []string, []string, *os.File, *os.File) error
+	log              *slog.Logger
 }
 
 func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, ops taskLaunchOps) error {
@@ -110,24 +113,26 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 
 	taskCtx := ctx
 	cancelDeadline := func() {}
-	if bootstrap.Prepare != nil {
-		rawDeadline := bootstrap.Prepare.AbsoluteDeadlineUnixNano
-		if rawDeadline < 0 {
-			return fmt.Errorf("sandbox task bootstrap launch deadline must not be negative")
+	rawDeadline := bootstrap.AbsoluteDeadlineUnixNano
+	if rawDeadline < 0 || bootstrap.Prepare != nil && bootstrap.Prepare.AbsoluteDeadlineUnixNano < 0 {
+		return fmt.Errorf("sandbox task bootstrap launch deadline must not be negative")
+	}
+	if bootstrap.Prepare != nil && (rawDeadline == 0 || bootstrap.Prepare.AbsoluteDeadlineUnixNano > 0 && bootstrap.Prepare.AbsoluteDeadlineUnixNano < rawDeadline) {
+		rawDeadline = bootstrap.Prepare.AbsoluteDeadlineUnixNano
+	}
+	if rawDeadline > 0 {
+		deadline := time.Unix(0, rawDeadline)
+		if !deadline.After(time.Now()) {
+			return fmt.Errorf("sandbox task bootstrap launch deadline has expired")
 		}
-		if rawDeadline > 0 {
-			deadline := time.Unix(0, rawDeadline)
-			if !deadline.After(time.Now()) {
-				return fmt.Errorf("sandbox task bootstrap launch deadline has expired")
-			}
-			taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
-		}
+		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
 	}
 	defer cancelDeadline()
 
 	spec := bootstrap.Final
 	locations := map[string]string{}
 	var preparedSource types.ResumeSource
+	var sourceConfig *rtconfig.PortableSandboxConfig
 	if bootstrap.Prepare != nil {
 		result, err := ops.prepareArtifact(taskCtx, *bootstrap.Prepare)
 		if err != nil {
@@ -137,6 +142,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 		}
 		locations = result.RefLocationURIs
 		preparedSource = result.PreparedSource
+		sourceConfig = result.SourceSandboxConfig
 		ops.log.Info("sandbox task artifact prepared", "sid", sandboxID, "run_id", runID,
 			"task_artifact_prepare_duration", result.PrepareDuration,
 			"task_artifact_config_read_duration", result.ConfigReadDuration,
@@ -164,6 +170,41 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if arg, ok := launchSpecArtifactArg(spec.Args); ok {
 		return fmt.Errorf("launch spec must not set task-owned artifact argument %q", arg)
 	}
+	if projection := spec.SourceLaunch; projection != nil {
+		if preparedSource.Kind != types.ResumeSourceSandbox {
+			return fmt.Errorf("source launch projection requires a prepared Sandbox E")
+		}
+		if err := taskCtx.Err(); err != nil {
+			return err
+		}
+		if err := sandboxcfg.ProjectSourceLaunchFile(projection.ConfigPath, projection.Profile, sourceConfig); err != nil {
+			return fmt.Errorf("project prepared source launch: %w", err)
+		}
+	}
+	if projection := spec.ImageLaunch; projection != nil {
+		if spec.SourceLaunch != nil || !preparedSource.Empty() || bootstrap.Prepare != nil {
+			return fmt.Errorf("image launch projection requires a fresh image task")
+		}
+		load := ops.imageEnvironment
+		if load == nil {
+			load = taskartifact.LoadImageEnvironment
+		}
+		image, err := load(taskCtx, *projection)
+		if err != nil {
+			return fmt.Errorf("read final image environment: %w", err)
+		}
+		if image == nil || image.ImageRef != projection.ImageRef {
+			return fmt.Errorf("final image environment identity mismatch")
+		}
+		if err := taskCtx.Err(); err != nil {
+			return err
+		}
+		if err := sandboxcfg.ProjectImageLaunchFile(projection.ConfigPath, image.ImageRef, image.Env); err != nil {
+			return fmt.Errorf("project final image environment: %w", err)
+		}
+		ops.log.Info("sandbox product environment projected", "sid", sandboxID, "run_id", runID,
+			"image_ref", image.ImageRef, "image_config_sha256", image.ConfigSHA256)
+	}
 	workdir := spec.Workdir
 	if workdir == "" {
 		workdir = bootstrap.Workdir
@@ -188,6 +229,9 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
+	if err := taskCtx.Err(); err != nil {
+		return err
+	}
 	// Preparation cancellation must not become the runtime lifetime. The
 	// sole spawn boundary derives child FD numbers and owns readiness Close.
 	cancelDeadline()

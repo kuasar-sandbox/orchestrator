@@ -366,7 +366,14 @@ func (p *buildPipeline) allowsImportRefererManifestWriteback() bool {
 }
 
 func (p *buildPipeline) sandboxAssembly(image *sandboxfile.FlattenedImage) (*rtconfig.SandboxConfig, *rtconfig.PortableSandboxConfig, error) {
-	cfg, err := p.buildColdConfig()
+	var env map[string]string
+	if p.profile == types.ProfileE2B {
+		if err := p.rememberImageEnvironment(image.ImageConfig); err != nil {
+			return nil, nil, err
+		}
+		env = p.imageEnv
+	}
+	cfg, err := p.buildColdConfig(env)
 	if err != nil {
 		return nil, nil, err
 	}

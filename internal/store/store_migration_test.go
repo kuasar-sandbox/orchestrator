@@ -48,6 +48,7 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		`DROP INDEX idx_builds_terminal_retention`,
 		`ALTER TABLE sandboxes DROP COLUMN dead_unix`,
 		`ALTER TABLE sandboxes DROP COLUMN idle_timeout`,
+		`ALTER TABLE sandboxes DROP COLUMN delete_shutdown_run_id`,
 		`ALTER TABLE builds DROP COLUMN finished_unix`,
 	} {
 		if _, err := db.ExecContext(context.Background(), statement); err != nil {

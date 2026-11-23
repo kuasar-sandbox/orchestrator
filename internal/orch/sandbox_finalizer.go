@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 // acceptSandboxDeleteLocked commits the only durable delete acceptance point.
@@ -587,13 +588,28 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 		return err
 	}
 
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	cleanupCtx, release, err := o.trySourceOperation(cleanupCtx, sb)
+	// The accepted active generation gets the Host owner's single bounded
+	// shutdown action before any runner fence. The physical cleanup timeout
+	// starts afterwards and cannot truncate a larger Guest stop grace.
+	stopCtx, release, err := o.trySourceOperation(context.WithoutCancel(ctx), sb)
 	if err != nil {
 		return err
 	}
 	defer release()
+	if sb.DeleteShutdownRunID != "" && sb.DeleteShutdownRunID == sb.RunID && sb.ExecutionResult == nil {
+		shutdown := o.shutdownSandbox
+		if shutdown == nil {
+			shutdown = ctl.Shutdown
+		}
+		if err := shutdown(stopCtx, filepath.Join(sb.RunDir, "ctl.sock"), ctl.ShutdownTarget{SandboxID: sb.ID, RunID: sb.RunID}); err != nil {
+			// Lost/old owners and already retired runs still require the exact
+			// unit and resource fences below. An accepted Host action retains
+			// its own deadline; retrying this finalizer cannot restart grace.
+			o.log.Warn("normal sandbox shutdown incomplete; fencing runner", "sid", sb.ID, "run_id", sb.RunID, "err", err)
+		}
+	}
+	cleanupCtx, cancel := context.WithTimeout(stopCtx, 30*time.Second)
+	defer cancel()
 	if err := o.cleanupSandboxTerminalOwnership(cleanupCtx, sb); err != nil {
 		return err
 	}

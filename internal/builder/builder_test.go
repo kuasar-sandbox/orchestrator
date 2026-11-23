@@ -428,7 +428,11 @@ func TestNetworkDocTapFDSocket(t *testing.T) {
 
 func decodeBuildColdConfig(t *testing.T, p *buildPipeline) *rtconfig.SandboxConfig {
 	t.Helper()
-	document, err := p.buildColdConfigYAML()
+	projected, err := p.buildColdConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := sandboxcfg.MarshalBuildColdConfig(projected)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,6 +487,9 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 	}
 
 	stepsLaunch := mustStepsYAML(t, p, nil)["launch"].(map[string]any)
+	if stepsLaunch["systemd"] != "off" {
+		t.Fatal("temporary builder inherited final systemd policy")
+	}
 	if got := stepsLaunch["cgroup_control"]; got != true {
 		t.Fatalf("steps launch.cgroup_control = %#v, want true", got)
 	}
@@ -494,13 +501,13 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 	if !template.Launch.CgroupControl {
 		t.Fatalf("template launch.cgroup_control = false, want true")
 	}
-	if got := template.Launch.Args; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983"}) {
+	if got := template.Launch.Plugin[0].Args; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983", "-cgroup-root", "/sys/fs/cgroup"}) {
 		t.Fatalf("template envd args = %#v", got)
 	}
 
 	p.spec.MMDSEnabled = true
 	template = decodeBuildColdConfig(t, p)
-	if !template.Launch.CgroupControl || !reflect.DeepEqual(template.Launch.Args, []string{"-port", "49983"}) {
+	if !template.Launch.CgroupControl || !reflect.DeepEqual(template.Launch.Plugin[0].Args, []string{"-port", "49983", "-cgroup-root", "/sys/fs/cgroup"}) {
 		t.Fatalf("MMDS template launch = %#v", template.Launch)
 	}
 }
@@ -608,6 +615,9 @@ func TestSourceStepsYAMLClearsPersistentActions(t *testing.T) {
 		}
 	}
 	launch := doc["launch"].(map[string]any)
+	if launch["systemd"] != "off" {
+		t.Fatal("source materialization inherited systemd")
+	}
 	if env, ok := launch["env"].(map[string]string); !ok || len(env) != 0 {
 		t.Fatalf("source steps launch.env = %#v", launch["env"])
 	}

@@ -289,7 +289,7 @@ func TestBuildLaunchCgroupControl(t *testing.T) {
 	if !e2bConfig.Launch.CgroupControl {
 		t.Fatal("e2b launch.cgroup_control = false, want true")
 	}
-	if got := strings.Join(e2bConfig.Launch.Args, " "); got != "-isnotfc -port 49983" {
+	if got := strings.Join(e2bConfig.Launch.Plugin[0].Args, " "); got != "-isnotfc -port 49983 -cgroup-root /sys/fs/cgroup" {
 		t.Fatalf("e2b envd args = %q", got)
 	}
 	e2b.MMDSEnabled = true
@@ -297,7 +297,7 @@ func TestBuildLaunchCgroupControl(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !e2bConfig.Launch.CgroupControl || strings.Join(e2bConfig.Launch.Args, " ") != "-port 49983" {
+	if !e2bConfig.Launch.CgroupControl || strings.Join(e2bConfig.Launch.Plugin[0].Args, " ") != "-port 49983 -cgroup-root /sys/fs/cgroup" {
 		t.Fatalf("MMDS e2b launch = %+v", e2bConfig.Launch)
 	}
 

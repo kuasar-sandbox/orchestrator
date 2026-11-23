@@ -380,16 +380,17 @@ type Sandbox struct {
 	// it is never copied to a new sandbox, template or migration token.
 	HoldValue *int64 `json:"-"`
 
-	MaxCheckpoints int    // positive sandbox-local named checkpoint quota; default 1
-	InstanceID     string // immutable parent incarnation; never a timestamp
-	AutoReset      bool
-	DeadRunID      string // confirmed ended run; retained through cleanup and dead
-	DeadToken      string // unique terminal instance, independent of deadAt precision
-	ResetID        string // durable logical operation; partial outputs belong to parent
-	ResetState     string // empty, pending, failed, or succeeded
-	ResetAutomatic bool
-	ResetError     string
-	AutoResetError string
+	MaxCheckpoints      int    // positive sandbox-local named checkpoint quota; default 1
+	InstanceID          string // immutable parent incarnation; never a timestamp
+	AutoReset           bool
+	DeleteShutdownRunID string // exact active run accepted for normal delete; empty for frozen/legacy cleanup
+	DeadRunID           string // confirmed ended run; retained through cleanup and dead
+	DeadToken           string // unique terminal instance, independent of deadAt precision
+	ResetID             string // durable logical operation; partial outputs belong to parent
+	ResetState          string // empty, pending, failed, or succeeded
+	ResetAutomatic      bool
+	ResetError          string
+	AutoResetError      string
 
 	PauseReason           string
 	ResourceObligation    bool

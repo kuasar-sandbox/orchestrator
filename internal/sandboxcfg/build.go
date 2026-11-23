@@ -22,6 +22,7 @@ const (
 type BuildColdParams struct {
 	Profile          types.Profile
 	ImageRef         string
+	ImageEnv         map[string]string // defaults from the exact final image, read in the tenant task
 	Source           *rtconfig.PortableSandboxConfig
 	Kernel           string
 	Runtime          string
@@ -67,6 +68,11 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		return nil, err
 	}
 	if p.Source == nil {
+		if p.Profile == types.ProfileE2B {
+			if err := ProjectNewE2BEnvironment(&projected.Launch, p.ImageEnv); err != nil {
+				return nil, err
+			}
+		}
 		projected.Metadata = setBuildCommands(projected.Metadata, p.StartCmd, p.ReadyCmd)
 		return projected, nil
 	}
@@ -81,7 +87,12 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	// Portable and runtime schemas intentionally share field spellings for
 	// non-host state. A YAML round trip is preferable to a second manual field
 	// allowlist and is followed by overwriting every host/boot-owned field.
-	raw, err := yaml.Marshal(p.Source)
+	// PATH origin is trusted artifact metadata, deliberately rejected by the
+	// ordinary Launch decoder. Carry it through the typed setter below instead
+	// of exposing a tenant-settable spelling in the intermediate host document.
+	sourceDefaults := *p.Source
+	sourceDefaults.Launch.SystemdPathDefault = false
+	raw, err := yaml.Marshal(&sourceDefaults)
 	if err != nil {
 		return nil, fmt.Errorf("sandboxcfg: encode source defaults: %w", err)
 	}
@@ -111,11 +122,25 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	merged.EphemeralFiles = projected.EphemeralFiles
 
 	if p.Profile == types.ProfileE2B {
-		launch := projected.Launch
-		launch.Env = mergeStr(merged.Launch.Env, projected.Launch.Env)
-		merged.Launch = launch
+		mode := merged.Launch.EffectiveSystemd()
+		if p.Spec.HasSystemdOverride() {
+			mode = p.Spec.Launch.Systemd
+		}
+		merged.Launch = newE2BLaunch(mode, mergeStr(merged.Launch.Env, p.EnvVars), p.MMDSEnabled)
 	} else {
 		mergeBareBuildLaunch(&merged.Launch, p.Spec.Launch, p.Spec.LaunchCgroupControl, p.EnvVars)
+	}
+	_, requestPath := p.EnvVars["PATH"]
+	if p.Spec.Launch != nil {
+		_, launchPath := p.Spec.Launch.Env["PATH"]
+		requestPath = requestPath || launchPath
+	}
+	defaultPath := p.Source.Launch.SystemdPathDefault && !requestPath
+	merged.Launch.SetSystemdPathDefault(defaultPath)
+	if p.Profile == types.ProfileE2B {
+		if err := ProjectNewE2BEnvironment(&merged.Launch, p.ImageEnv); err != nil {
+			return nil, err
+		}
 	}
 	if p.NamespacePresent[NsMounts] {
 		merged.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)
@@ -157,6 +182,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		merged.Metadata[NsNetwork] = string(network)
 	}
 	merged.Metadata = setBuildCommands(merged.Metadata, p.StartCmd, p.ReadyCmd)
+	merged.Launch.Systemd = merged.Launch.EffectiveSystemd()
 	return &merged, nil
 }
 
@@ -164,6 +190,22 @@ func mergeBareBuildLaunch(dst *rtconfig.LaunchConfig, override *rtconfig.LaunchC
 	dst.Env = mergeStr(dst.Env, env)
 	if override == nil {
 		return
+	}
+	if override.Systemd != "" {
+		dst.Systemd = override.Systemd
+	}
+	if override.Placeholder {
+		dst.Placeholder = true
+		dst.Exec, dst.Args = "", nil
+	}
+	if override.PIDNamespace != "" {
+		dst.PIDNamespace = override.PIDNamespace
+	}
+	if override.StopGracePeriod != "" {
+		dst.StopGracePeriod = override.StopGracePeriod
+	}
+	if override.StartTimeout != "" {
+		dst.StartTimeout = override.StartTimeout
 	}
 	if override.Exec != "" {
 		dst.Exec = override.Exec
@@ -229,15 +271,7 @@ func MarshalBuildColdConfig(cfg *rtconfig.SandboxConfig) ([]byte, error) {
 	// complete persistent launch surface so false/empty values clear source-E
 	// defaults instead of disappearing through omitempty. Direct top-level E
 	// assembly reads the same projection, keeping both target paths equivalent.
-	document["launch"] = map[string]any{
-		"exec": cfg.Launch.Exec, "args": cfg.Launch.Args, "env": cfg.Launch.Env,
-		"ephemeral_env": cfg.Launch.EphemeralEnv, "workdir": cfg.Launch.Workdir,
-		"restart": cfg.Launch.Restart, "cgroup_control": cfg.Launch.CgroupControl,
-		"placeholder": cfg.Launch.Placeholder, "pid_namespace": cfg.Launch.PIDNamespace,
-		"plugin": cfg.Launch.Plugin, "user": cfg.Launch.User,
-		"stop_signal": cfg.Launch.StopSignal, "stop_grace_period": cfg.Launch.StopGracePeriod,
-		"start_timeout": cfg.Launch.StartTimeout,
-	}
+	document["launch"] = completeLaunchMap(cfg.Launch)
 	// DeflateOnOOM is the sole optional portable resource leaf. An explicit null
 	// clears a source value when the shared projection has no settled value,
 	// while sandboxer's host policy fields remain untouched.

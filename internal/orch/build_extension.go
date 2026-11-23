@@ -157,7 +157,7 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec.Launch); err != nil {
+	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builder, false); err != nil {
