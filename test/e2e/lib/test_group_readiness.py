@@ -99,6 +99,10 @@ class GroupReadinessTest(unittest.TestCase):
 
             def do_GET(self):
                 requests.append((self.path, self.headers.get("X-API-KEY")))
+                if self.path.startswith("/groups?") and self.headers.get("Host") != "api.fixture.local":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 self.send_response(503 if len(requests) == 1 else 200)
                 self.end_headers()
                 if self.path.startswith("/groups?"):
@@ -112,6 +116,7 @@ class GroupReadinessTest(unittest.TestCase):
                 result = subprocess.run([
                     sys.executable, str(Path(__file__).with_name("group_readiness.py")),
                     "--node-url", url, "--registry-url", url, "--group", "/group", "--timeout", "2",
+                    "--node-host", "api.fixture.local",
                 ], env={**os.environ, "GROUP_API_KEY": "fixture-only"},
                     capture_output=True, text=True, timeout=5)
             finally:
@@ -132,7 +137,7 @@ class GroupReadinessTest(unittest.TestCase):
         gate = Mock(wraps=functools.partial(wait_for_group, timeout=0.2, opener=opener,
                                           monotonic=clock.monotonic, sleep=clock.sleep))
         write = Mock(return_value=({"templateID": "transient-test", "buildID": "build-test"}, {}))
-        scope = {"args": SimpleNamespace(node_url="http://node", group="/group", cpu=2,
+        scope = {"args": SimpleNamespace(node_url="http://node", host="api.fixture.local", group="/group", cpu=2,
                                          post_restart=True, registry_url=["http://registry"]),
                  "wait_for_group": gate, "require": write, "json": json, "key": "fixture-only"}
         exec(compile(ast.Module(body=[register], type_ignores=[]), str(path), "exec"), scope)

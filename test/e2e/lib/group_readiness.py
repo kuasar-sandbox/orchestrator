@@ -11,7 +11,7 @@ import urllib.request
 
 
 def wait_for_group(node_url, group, timeout=60, *, require_template=False,
-                   registry_urls=(), api_key=None, opener=None,
+                   registry_urls=(), api_key=None, node_host=None, opener=None,
                    monotonic=time.monotonic, sleep=time.sleep):
     """Read existing state only. Admission and capacity are checked by the write."""
     if not registry_urls or not api_key:
@@ -29,9 +29,12 @@ def wait_for_group(node_url, group, timeout=60, *, require_template=False,
                 with opener.open(request, timeout=min(2, max(0.1, timeout))) as response:
                     if response.status != 200:
                         raise urllib.error.URLError(f"Registry authentication HTTP {response.status}")
+            headers = {"X-API-KEY": api_key}
+            if node_host:
+                headers["Host"] = node_host
             request = urllib.request.Request(
                 node_url.rstrip("/") + "/groups?" + query,
-                headers={"X-API-KEY": api_key}, method="GET")
+                headers=headers, method="GET")
             with opener.open(request, timeout=min(2, max(0.1, timeout))) as response:
                 if response.status != 200:
                     raise urllib.error.URLError(f"Node Group HTTP {response.status}")
@@ -57,13 +60,14 @@ def wait_for_group(node_url, group, timeout=60, *, require_template=False,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--node-url", required=True)
+    parser.add_argument("--node-host", required=True)
     parser.add_argument("--group", required=True)
     parser.add_argument("--registry-url", action="append", required=True)
     parser.add_argument("--timeout", type=float, default=60)
     args = parser.parse_args()
     value = wait_for_group(args.node_url, args.group, args.timeout,
                            require_template=True, registry_urls=args.registry_url,
-                           api_key=os.environ["GROUP_API_KEY"])
+                           api_key=os.environ["GROUP_API_KEY"], node_host=args.node_host)
     print("==> Group import ready: " + json.dumps(value), flush=True)
 
 

@@ -52,7 +52,7 @@ wait_redirect_group() {
         registry_args+=(--registry-url "http://127.0.0.1:$port")
     done
     GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
-        --node-url "http://127.0.0.1:$NODE_PORT" --group "$GROUP" "${registry_args[@]}"
+        --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" "${registry_args[@]}"
 }
 
 stop_redirect_process() {

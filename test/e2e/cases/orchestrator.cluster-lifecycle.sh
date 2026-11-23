@@ -144,7 +144,7 @@ NODE_ID=real-node-1
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
 GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
-    --node-url "http://127.0.0.1:$NODE_PORT" --group "$GROUP" \
+    --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" \
     --registry-url "http://127.0.0.1:$CONTROL_PORT"
 run_cluster_flow
 # Prove Build ownership routing through the group, then recover retained status
