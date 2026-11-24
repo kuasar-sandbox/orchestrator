@@ -39,6 +39,7 @@ def configure():
     parser.add_argument("--restart-request")
     parser.add_argument("--restart-ready")
     parser.add_argument("--node-url")
+    parser.add_argument("--node-id")
     parser.add_argument("--registry-url", action="append", default=[])
     args = parser.parse_args()
     key = os.environ["BUILD_ACTION_API_KEY"]
@@ -88,7 +89,7 @@ def register(label, target=None):
         # Recheck the imported Node Group and shared authentication after
         # reconnect, before each new registration. Do not retry the write.
         wait_for_group(args.node_url, args.group,
-                       registry_urls=args.registry_url, api_key=key, node_host=args.host)
+                       registry_urls=args.registry_url, api_key=key, node_host=args.host, node_id=args.node_id)
     value, _ = require("POST", "/v3/templates", 202,
                        {"name": "issue372-" + label, "cpuCount": args.cpu, "memoryMB": 6144},
                        header=json.dumps({"target": target}) if target else None)

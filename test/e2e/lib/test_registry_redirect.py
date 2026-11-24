@@ -82,7 +82,8 @@ router_req() {
         record list; echo '[]' > "$WORK/router-resp.body"; echo 200
     fi
 }
-wait_node_sandbox_finalized() { record finalized; }
+node_sandbox_id() { record local-id; [ "$1" = exact-sid ] || exit 18; echo exact-sid-g7; }
+wait_node_sandbox_finalized() { [ "$1" = exact-sid-g7 ] || exit 18; record finalized; }
 ''' + function("retry_data_by_sid") + '\n' + (source or function("run_redirect_recovery")) + '\n' + function("run_redirect_flow") + '\nrun_redirect_flow\n'
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                                     timeout=5, env={**os.environ, "SEQUENCE": str(log), "FAILURE": failure,
@@ -93,7 +94,7 @@ wait_node_sandbox_finalized() { record finalized; }
         status, calls = self.recovery()
         self.assertEqual(status, 0)
         self.assertEqual(calls, ["restart", "node-link", "group", "create", "request", "traffic",
-                                 "delete", "list", "finalized"])
+                                 "local-id", "delete", "list", "finalized"])
 
     def test_each_failed_gate_blocks_the_post_restart_request(self):
         for gate in ("restart", "node-link", "group"):
@@ -116,7 +117,7 @@ wait_node_sandbox_finalized() { record finalized; }
         self.assertEqual(status, 0)
         self.assertEqual(calls, ["restart", "node-link", "group", "create",
                                  "request", "request", "request", "traffic",
-                                 "delete", "list", "finalized"])
+                                 "local-id", "delete", "list", "finalized"])
 
     def test_data_readiness_exhausts_existing_bound_without_repeating_create(self):
         status, calls = self.recovery("http")

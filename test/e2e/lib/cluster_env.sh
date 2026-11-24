@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Process, configuration and request primitives for real cluster cases.
+umask 077
 SCRIPT_DIR="${E2E_LIB:?E2E_LIB must point to prepared helpers}/orchestrator"
 . "$SCRIPT_DIR/proxy.sh"
 . "$SCRIPT_DIR/build_fixture_units.sh"
@@ -9,40 +10,22 @@ SWITCH="${SWITCH:-c${BASHPID}}"
 : "${ORCHESTRATOR_BASE_IMAGE:?ORCHESTRATOR_BASE_IMAGE must name the prepared base image}"
 E2E_IMAGE="$ORCHESTRATOR_BASE_IMAGE"
 : "${ZOT_BIN:?ZOT_BIN must point to the prepared registry binary}"
-: "${FDB_SERVER_TEST_BIN:?FDB_SERVER_TEST_BIN must point to the prepared FoundationDB server}"
-: "${FDB_CLI_TEST_BIN:?FDB_CLI_TEST_BIN must point to the prepared FoundationDB CLI}"
+CLUSTER_STORAGE_BACKEND="${CLUSTER_STORAGE_BACKEND:-foundationdb}"
+CLUSTER_USE_PLACER="${CLUSTER_USE_PLACER:-1}"
 SW_NETNS="${SW_NETNS:-e2ec_${BASHPID}}"
 
 step() { echo "==> $*" >&2; }
+# The shared Proxy helper may print its complete log on startup failure. Keep
+# those bytes private for cluster fixtures, consistent with the failure hook.
+collect_proxy_log() { printf 'Cluster Proxy did not become ready; private log retained until cleanup.\n' >&2; }
 
 fail() {
-    echo "==> FAIL: $*" >&2
-    if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
-        for f in "$WORK"/*.body "$WORK"/*.json "$WORK"/*.out; do
-            [ -f "$f" ] || continue
-            echo "---- $f ----" >&2
-            sed -n '1,220p' "$f" >&2 || true
-        done
-        for f in "$WORK"/*.log; do
-            [ -f "$f" ] || continue
-            echo "---- $f ----" >&2
-            sed -n '1,260p' "$f" >&2 || true
-        done
-        echo "---- sandbox systemd units ----" >&2
-        systemctl list-units 'sandbox-builder@*.service' 'sandbox-runner@*.service' --all --no-pager >&2 2>/dev/null || true
-        while IFS= read -r unit; do
-            [ -n "$unit" ] || continue
-            echo "---- journal $unit ----" >&2
-            journalctl -u "$unit" --no-pager -n 100 2>/dev/null | sed 's/^/  unit| /' >&2 || true
-        done < <(systemctl list-units 'sandbox-builder@*.service' 'sandbox-runner@*.service' --all --no-legend --no-pager 2>/dev/null | awk '{print $1}')
-        if [ -d "$WORK/cr/sandboxes" ]; then
-            while IFS= read -r sid; do
-                [ -n "$sid" ] || continue
-                echo "---- journal sandbox $sid ----" >&2
-                journalctl KUASAR_SANDBOX_ID="$sid" --no-pager -n 100 2>/dev/null | sed 's/^/  sandbox| /' >&2 || true
-            done < <(find "$WORK/cr/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
-        fi
-    fi
+    # Callers may hold HTTP bodies or live capabilities in their arguments.
+    # Only the fixed failure location is public; the platform collector emits
+    # a closed-vocabulary summary from this fixture's private observations.
+    export CLUSTER_FAILURE_SOURCE="${BASH_SOURCE[1]##*/}" CLUSTER_FAILURE_LINE="${BASH_LINENO[0]}"
+    printf 'FAIL: cluster fixture at %s:%s (private response details withheld)\n' \
+        "${BASH_SOURCE[1]##*/}" "${BASH_LINENO[0]}" >&2
     exit 1
 }
 
@@ -56,7 +39,6 @@ command -v python3 >/dev/null 2>&1 || fail "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || fail "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || fail "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || fail "prepared registry is missing: $ZOT_BIN"
-[ -x "$FDB_SERVER_TEST_BIN" ] && [ -x "$FDB_CLI_TEST_BIN" ] || fail "prepared FoundationDB helpers are missing"
 [ -x "$(dirname "$BIN")/lib/cluster-ctl/ld.so" ] || fail "prepared cluster native runtime is missing"
 command -v ip >/dev/null 2>&1 || fail "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || fail "systemd not PID1"
@@ -89,11 +71,16 @@ SW_STARTED=""
 NETNS_CREATED=""
 CLUSTER_EXEC_PID=""
 CLUSTER_FDB_PID=""
+TEST_POSTGRES_CONTAINER=""
+TEST_POSTGRES_NETWORK=""
 
 cleanup() {
+    local result=$?
     set +e
     rm -f "$WORK/create.credentials"
+    if declare -F cluster_extra_cleanup >/dev/null; then cluster_extra_cleanup; fi
     stop_build_fixture_units "$WORK" 2>/dev/null
+    stop_test_postgres 2>/dev/null || { [ "$result" != 0 ] || result=1; }
     [ -n "$CLUSTER_EXEC_PID" ] && kill "$CLUSTER_EXEC_PID" 2>/dev/null
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
         p="${PIDS[$i]}"
@@ -106,13 +93,13 @@ cleanup() {
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
     mkdir -p "$CASE_OUT/runtime"
-    cp "$WORK"/*.log "$CASE_OUT/runtime/" 2>/dev/null || true
-    [ ! -d "$WORK/fdb/logs" ] || cp -a "$WORK/fdb/logs" "$CASE_OUT/runtime/fdb-logs"
-    [ ! -f "$WORK/build-actions.json" ] || cp "$WORK/build-actions.json" "$CASE_OUT/runtime/"
+    # Raw logs/config/response bodies remain private; never upload capabilities.
     [ -n "${E2E_KEEP:-}" ] && step "kept runtime directory: $WORK" || rm -rf "$WORK"
+    exit "$result"
 }
 trap cleanup EXIT
 
 
 . "$SCRIPT_DIR/cluster_http.sh"
 . "$SCRIPT_DIR/cluster_process.sh"
+. "$SCRIPT_DIR/postgres_fixture.sh"

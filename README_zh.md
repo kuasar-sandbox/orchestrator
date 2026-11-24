@@ -28,7 +28,7 @@
 | [访问与代理](docs/node-proxy_zh.md) | SDK 访问、凭据、exec、转发、MMDS、流量准入与 routesync |
 | [资源与准入](docs/node-resource_zh.md) | capacity/startup 策略、reservation、节点压力、恢复与资源协议 |
 | [观测](docs/observability_zh.md) | Journal 输出、native stats、无损 usage、OTLP metrics 与历史查询 |
-| [集群控制](docs/cluster_zh.md) | 公共入口、Group、角色配置、复制所有权、路由与恢复 |
+| [集群控制](docs/cluster_zh.md) | 公共入口、Group、角色配置、执行所有权、路由与恢复 |
 | [应用扩展](docs/extensions_zh.md) | 静态 App bootstrap、公共 Go 契约、对象源、Hook 与 wrapper |
 
 <a id="responsibilities"></a>
@@ -60,7 +60,7 @@
 - **Router**:集群级 E2B 兼容控制面与数据面统一入口,按稳定沙箱身份路由。
 - **Placer**:可选的 Node Group 导入、条件维护与凭据续期。Registry 从节点已发布的支持中选点，Node 负责执行和资源准入。
 
-控制面保留稳定的外部 Sandbox 身份,实际 node-local 实例可在恢复/迁移时改变。
+控制面保留稳定的外部 Sandbox 身份,实际 node-local 实例可在恢复/迁移时改变。首次配置从[一个 SQLite Registry、一个 Router 和两个 Node](docs/cluster_zh.md#minimum-cluster)开始；直接 Group 维护不需要 Placer。
 
 <a id="security-and-multi-tenancy"></a>
 
@@ -90,6 +90,8 @@
 | `run-cluster-ctl registry` | 启动 Registry |
 | `run-cluster-ctl router` | 启动集群控制与数据统一入口 |
 | `run-cluster-ctl placer` | 启动 Group 导入维护 |
+| `run-cluster-ctl status ...` | 只读检查已认证 Group/Node 的发布与模板资格，无生命周期副作用 |
+| `node-ctl group apply ...` | 经本地业务 API 条件维护 Node Group；根凭据安装独立进行 |
 | `e2b-key-ctl ...` | 生成和派生租户凭据 |
 
 move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkpoint 的物理清理可能
@@ -141,6 +143,7 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 # 可选集群角色,各使用独立服务/终端。
 run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 run-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
+# 仅在需要 Group 导入/续期时启用：
 run-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 
 # 独立模式开发,替换 host 与 canonical template 占位符。

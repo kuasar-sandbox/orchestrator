@@ -1,4 +1,5 @@
 import base64, json, os, pathlib, signal, sqlite3, time, urllib.error, urllib.parse, urllib.request
+from group_readiness import wait_for_group
 work=pathlib.Path(os.environ['MIGRATION_WORK']);out=pathlib.Path(os.environ['MIGRATION_OUT'])
 sid=os.environ['MIGRATION_SID'];group=os.environ['MIGRATION_GROUP'];route=os.environ['MIGRATION_ROUTE']
 host='api.'+os.environ['MIGRATION_DOMAIN'];key=os.environ['MIGRATION_API_KEY']
@@ -30,12 +31,18 @@ status,detail=request(node,'GET',path);assert status==200
 wrong=exported['snapshotRef'].split('@runtime:')[0]+'@runtime:unavailable.bundle:digest:'+'0'*64
 template='e2b-snp-'+base64.urlsafe_b64encode(wrong.encode()).decode().rstrip('=')
 context=dict(detail['context']);context['templateID']=template
-status,changed=request(node,'PUT',path,{'expected_version':detail['version'],'context':context});assert status==200,(status,changed)
-time.sleep(1)
+status,changed=request(node,'PUT',path,{'expected_version':detail['version'],'context':context});assert status==200,'target Group update status='+str(status)
+wait_for_group(node,group,registry_urls=[os.environ['MIGRATION_REGISTRY']],api_key=key,
+               node_host=host,node_id=os.environ['MIGRATION_NODE_ID'])
 pid=int(os.environ['MIGRATION_SOURCE_PID'])
 assert str(work/'cluster-node.yaml').encode() in pathlib.Path('/proc/'+str(pid)+'/cmdline').read_bytes(), 'unexpected source PID'
 os.kill(pid,signal.SIGKILL)
-time.sleep(1)
+for _ in range(200):
+ try:
+  if pathlib.Path('/proc/'+str(pid)+'/stat').read_text().rsplit(') ',1)[1].split()[0]=='Z':break
+ except FileNotFoundError:break
+ time.sleep(.05)
+else:raise AssertionError('source conductor did not exit')
 status,connected=request(router,'POST','/sandboxes/'+sid+'/connect',{}, {'X-Kuasar-Migration-Token':exported['result']})
 assert status in (200,201),('migration Connect',status)
 assert connected['sandboxID']==sid

@@ -22,7 +22,7 @@ NODE_ID=real-reset-node
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
 GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
-    --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" \
+    --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --node-id "$NODE_ID" --group "$GROUP" \
     --registry-url "http://127.0.0.1:$CONTROL_PORT"
 
 field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$WORK/router-resp.body" "$1"; }

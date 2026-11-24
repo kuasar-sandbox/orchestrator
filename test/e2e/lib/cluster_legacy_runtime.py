@@ -9,6 +9,9 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
+
+from runtime_variant import identity
 
 
 def main():
@@ -26,6 +29,18 @@ def main():
         "X-Kuasar-Route-Key": os.environ["LEGACY_TEST_ROUTE"],
         "Content-Type": "application/json",
     }
+    # Prove the product's startup inventory reader accepted the valid variant.
+    # A malformed bundle would be omitted and cannot satisfy this query.
+    _, _, _, _, digest = identity(work / "incompatible-runtime/runtime-v2.bundle")
+    annotated = reference + "@runtime:runtime-v2.bundle:digest:" + digest
+    diagnostic_template = "e2b-snp-" + base64.urlsafe_b64encode(annotated.encode()).decode().rstrip("=")
+    query = urllib.parse.urlencode({"group": os.environ["LEGACY_TEST_GROUP"],
+        "node_id": os.environ["LEGACY_TEST_NODE_ID"], "template_id": diagnostic_template})
+    status_request = urllib.request.Request(os.environ["LEGACY_TEST_REGISTRY"] +
+        "/route-link/v2/group-status?" + query, headers={"X-API-Key": os.environ["LEGACY_TEST_API_KEY"]})
+    with urllib.request.urlopen(status_request, timeout=10) as response:
+        observed = json.load(response)
+    assert observed.get("published") and observed.get("runtime_match") is True, "product inventory rejected the valid runtime variant"
     start = time.time()
     request = urllib.request.Request(
         os.environ["LEGACY_TEST_ROUTER"] + "/sandboxes",
@@ -79,6 +94,8 @@ def main():
         "case": "C02-public-cluster-legacy-runtime",
         "public_status": status,
         "legacy_reference_unannotated": True,
+        "capture_provenance": "current real VM capture; external runtime annotation omitted",
+        "variant_inventory_verified": True,
         "explicit_template": True,
         "selected_node": "legacy-incompatible-node",
         "node_runtime_rejected": True,

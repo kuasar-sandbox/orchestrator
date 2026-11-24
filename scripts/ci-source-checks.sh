@@ -22,7 +22,17 @@ REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
 bash test/source/resource_pool_units.sh
 bash test/source/journal_contract.sh
 bash test/source/capture_cli.sh
+bash test/source/cluster_fixture_configs.sh
 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+CLUSTER_STUB_BACKEND=sqlite REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+# Provision real PostgreSQL explicitly: these backend contracts must never
+# silently skip because the DSN was absent from the required source gate.
+bash scripts/with-test-postgres.sh -- bash -euc '
+    test -n "$STORAGE_TEST_POSTGRES_DSN"
+    CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m \
+        ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry
+    CLUSTER_STUB_BACKEND=postgres REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+'
 bash test/source/builder_state.sh
 bash test/source/telemetry_backends.sh
 # Helper/source regressions stay in this compiler-capable gate, not in the

@@ -1,9 +1,10 @@
 // Command cluster-ctl is the kuasar-sandbox cluster control plane (cluster.md).
 //
-//	cluster-ctl registry  --config <registry.yaml>   # state cluster + node_link hub
+//	cluster-ctl registry  --config <registry.yaml>   # metadata authority + node_link hub
 //	cluster-ctl router    --config <router.yaml>     # e2b-compatible unified ingress
-//	cluster-ctl placer    --config <placer.yaml>     # placement scheduler
+//	cluster-ctl placer    --config <placer.yaml>     # optional Group importer
 //	cluster-ctl config <registry|router|placer> [--template|--config <f>|--resolve]  # config diagnose / generate
+//	cluster-ctl status --registry <URL> --group <group> --node-id <node> # read published Group support
 //	cluster-ctl version
 //
 // One binary, three roles as independent processes.
@@ -32,6 +33,8 @@ func main() {
 		err = runPlacer(os.Args[2:], log)
 	case "config":
 		err = configCmd(os.Args[2:])
+	case "status":
+		err = statusCmd(os.Args[2:], os.Stdout)
 	case "version", "-v", "--version":
 		fmt.Println("cluster-ctl", version)
 	default:
@@ -44,6 +47,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|placer|config|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|placer|config|status|version} [flags]")
 	os.Exit(2)
 }

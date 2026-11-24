@@ -32,6 +32,7 @@ const (
 	RouteLinkBuildPath        = "/route-link/v2/build"
 	RouteLinkListPath         = "/route-link/v2/list"
 	RouteLinkVerifyKeyPath    = "/route-link/v2/verify-key"
+	RouteLinkGroupStatusPath  = "/route-link/v2/group-status"
 	maxConnectReserveBody     = 64 << 10
 	maxCreateReserveBody      = 16 << 20
 )
@@ -96,6 +97,7 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
 	mux.HandleFunc(RouteLinkListPath, r.serveList)
 	mux.HandleFunc(RouteLinkVerifyKeyPath, r.serveVerifyKey)
+	mux.HandleFunc(RouteLinkGroupStatusPath, r.serveGroupStatus)
 }
 
 // serveVerifyKey checks the full APIKey against retained Group authentication

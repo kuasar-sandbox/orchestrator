@@ -30,7 +30,7 @@ The eight maintained topics below contain both operational usage and the complet
 | [Access and proxy](docs/node-proxy.md) | SDK access, credentials, exec, forwarding, MMDS, traffic admission and routesync |
 | [Resources and admission](docs/node-resource.md) | Capacity/startup policy, reservation, node pressure, recovery and resource protocols |
 | [Observability](docs/observability.md) | Journal output, native stats, lossless usage, OTLP metrics and history queries |
-| [Cluster control](docs/cluster.md) | Public ingress, Groups, role configuration, replicated ownership, routing and recovery |
+| [Cluster control](docs/cluster.md) | Public ingress, Groups, role configuration, execution ownership, routing and recovery |
 | [Application extensions](docs/extensions.md) | Static App bootstrap, public Go contracts, object sources, hooks and wrappers |
 
 <a id="responsibilities"></a>
@@ -62,7 +62,7 @@ A standalone deployment exposes an E2B-compatible API that can be used by the un
 - **Router** — the cluster-wide E2B-compatible unified control- and data-plane ingress and stable-sandbox routing layer;
 - **Placer** — optional import and conditional maintenance of Node-owned Groups and credential leases. Registry selects Nodes from published support; Nodes own execution and resource admission.
 
-The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration.
+The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration. Start with [one SQLite Registry, one Router and two Nodes](docs/cluster.md#minimum-cluster); direct Group maintenance needs no Placer.
 
 <a id="security-and-multi-tenancy"></a>
 
@@ -91,6 +91,8 @@ For security architecture and deployment trust boundaries, see the [project syst
 | `run-cluster-ctl registry` | Start a Registry process |
 | `run-cluster-ctl router` | Start the unified cluster control- and data-plane ingress |
 | `run-cluster-ctl placer` | Start Group import maintenance |
+| `run-cluster-ctl status ...` | Read one authenticated Group/Node publication and template eligibility without lifecycle effects |
+| `node-ctl group apply ...` | Conditionally maintain a Node Group through its local business API; root installation is separate |
 | `e2b-key-ctl ...` | Generate and derive tenant credentials |
 
 A successful move export accepts source deletion durably; RunDir, BaseDir and
@@ -139,6 +141,7 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 # Optional cluster roles, each in its own service/terminal.
 run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 run-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
+# Optional Group import/renewal only:
 run-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 
 # Standalone development; replace host and the canonical template placeholder.

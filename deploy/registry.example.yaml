@@ -1,10 +1,11 @@
 # Registry config — run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml.
 # Validate with `run-cluster-ctl config registry --config registry.yaml`.
+# Protected private HTTP example; enable listener mTLS and https:// advertise together.
 
 member:
   id: registry-1
   listen: ":7700"
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS; then use https:// advertise
 
 membership:
   active: 1
@@ -14,7 +15,7 @@ membership:
   versions:
     - version: 1
       members:
-        - { id: registry-1, advertise: "https://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
+        - { id: registry-1, advertise: "http://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
   owners:
     route_link: 1
     node_link: 1
@@ -29,8 +30,17 @@ node_link:
 route_link:
   park_timeout: 30s
 
-# All Registry members use the same external database and isolated key prefix.
-foundationdb:
+# Select exactly one backend; the product default remains fdb.
+# SQLite supports one Registry process and a persistent local file.
+# PostgreSQL/FDB peers share one database and namespace.
+storage:
+  backend: fdb                      # fdb | sqlite | postgres
+  namespace: kuasar-sandbox/cluster/records-v2/
+  # sqlite_path: /var/lib/cluster-ctl/metadata.sqlite
+  # postgres_dsn_env: CLUSTER_STORAGE_POSTGRES_DSN
+# For PostgreSQL, put the DSN in the Registry service's protected EnvironmentFile,
+# not in this YAML. See docs/cluster-storage.md for all three deployment paths.
+foundationdb:                       # used only with backend: fdb
   cluster_file: /etc/foundationdb/fdb.cluster
   prefix: kuasar-sandbox/cluster/
 

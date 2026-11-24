@@ -52,7 +52,7 @@ wait_redirect_group() {
         registry_args+=(--registry-url "http://127.0.0.1:$port")
     done
     GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
-        --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" "${registry_args[@]}"
+        --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --node-id "$NODE_ID" --group "$GROUP" "${registry_args[@]}"
 }
 
 stop_redirect_process() {
@@ -78,13 +78,13 @@ restart_redirect_owner() {
     [ "$REDIRECT_CONNECTIONS" -gt 0 ] || fail "redirected node never connected to $REDIRECT_OWNER"
     step "restarting actual redirect owner=$REDIRECT_OWNER pid=${REGISTRY_PIDS[$index]} endpoint=$REDIRECT_ENDPOINT"
     stop_redirect_process "${REGISTRY_PIDS[$index]}" "$REDIRECT_OWNER"
-    "$BIN/run-cluster-ctl" registry --config "$WORK/$REDIRECT_OWNER.yaml" > >(tee -a "$WORK/$REDIRECT_OWNER.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" registry --config "$WORK/$REDIRECT_OWNER.yaml" >>"$WORK/$REDIRECT_OWNER.log" 2>&1 &
     REGISTRY_PIDS[$index]=$!
     PIDS+=("$!")
     wait_port "${CONTROL_PORTS[$index]}" "$REDIRECT_OWNER-restarted"
 
     stop_redirect_process "$ROUTER_PID" router
-    "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" > >(tee -a "$WORK/router.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" >>"$WORK/router.log" 2>&1 &
     ROUTER_PID=$!
     PIDS+=("$!")
     wait_port "$ROUTER_PORT" router-restarted
@@ -117,7 +117,7 @@ run_redirect_flow() {
     run_redirect_recovery
     step "creating one sandbox through the recovered redirected registry topology"
     code="$(create_sandbox "$create_response")"
-    [ "$code" = "201" ] || { [ -s "$create_response" ] && cat "$create_response" >&2; fail "redirect create returned $code"; }
+    [ "$code" = "201" ] || { fail "redirect create returned $code"; }
     assert_no_default_exec_token "$create_response" || fail "redirect create exposed a default exec token"
     IFS=$'\t' read -r sid envd_token forward_token < <(sandbox_route "$create_response") \
         || fail "redirect create returned an invalid e2b response"
@@ -129,8 +129,10 @@ run_redirect_flow() {
     step "PASS: post-restart redirected topology placed a real sandbox and routed envd health ($code)"
     unset envd_token
 
+    local node_sid
+    node_sid="$(node_sandbox_id "$sid")" || fail "missing exact Node identity before Delete"
     code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
-    [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "redirect delete returned $code"; }
+    [ "$code" = "204" ] || { fail "redirect delete returned $code"; }
     for _ in $(seq 1 80); do
         code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"
         if [ "$code" = "200" ] && python3 - "$WORK/router-resp.body" "$sid" <<'PY_DELETE'
@@ -140,7 +142,7 @@ sid = sys.argv[2]
 raise SystemExit(0 if all(row.get("sandboxID") != sid for row in rows) else 1)
 PY_DELETE
         then
-            wait_node_sandbox_finalized "$sid" || fail "redirect delete returned before node-local finalization"
+            wait_node_sandbox_finalized "$node_sid" || fail "redirect delete returned before node-local finalization"
             step "PASS: redirected topology delete reached node-local finalization"
             return 0
         fi

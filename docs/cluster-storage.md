@@ -1,18 +1,33 @@
+[English](cluster-storage.md) | [简体中文](cluster-storage_zh.md)
+
 # Cluster metadata storage
 
 Registry uses one shared metadata implementation on SQLite, PostgreSQL or
-FoundationDB. This storage stage preserves the existing Registry/Router/Placer
-business protocols. Node-owned Group context, Group support reporting and the
-revised create/accept/close protocol are a separate upper-layer change.
+FoundationDB, including execution ownership and completed Node Group support.
+Node owns private Group context; Registry authenticates and selects from published
+support. Router and the optional Placer use Registry protocols and do not open
+the database. Start with the [minimum two-node cluster](cluster.md#minimum-cluster).
 
 ## Configuration and deployment
+
+Choose a backend before first startup:
+
+| Backend | Deployment | Required durable input |
+|---|---|---|
+| SQLite | One Registry serving multiple compute Nodes | Private persistent local database file; do not share it between Registry processes or use a network filesystem |
+| PostgreSQL | One or more Registry peers | One database, the same namespace, and a service environment variable containing the DSN |
+| FoundationDB (default) | One or more Registry peers | Reachable database, readable cluster file, and the same namespace |
+
+Generate the full role configuration with `run-cluster-ctl config registry
+--template`; choose the backend in that file. For example, the storage portion of
+a **single-Registry** setup is:
 
 ```yaml
 storage:
   backend: sqlite                 # fdb (default), sqlite, postgres
   namespace: example/records-v2/   # identical for Registry peers
   sqlite_path: /var/lib/cluster-ctl/metadata.sqlite
-  postgres_dsn_env: CLUSTER_STORAGE_POSTGRES_DSN
+  # postgres_dsn_env: CLUSTER_STORAGE_POSTGRES_DSN  # used only with backend: postgres
 foundationdb:
   cluster_file: /etc/foundationdb/fdb.cluster
   prefix: example/                # legacy namespace base, if namespace omitted
@@ -21,8 +36,24 @@ foundationdb:
 Only the selected backend is opened. PostgreSQL credentials come from the named
 environment variable, not YAML or the membership API. For example, set
 `CLUSTER_STORAGE_POSTGRES_DSN` to the deployment's PostgreSQL connection string
-and select `backend: postgres`. All peers must reach the same database and
-namespace. Backend, namespace and connection changes require restart.
+and select `backend: postgres`. For the shipped systemd unit, create a root-owned
+mode-0600 `/etc/cluster-ctl/storage.env` containing
+`CLUSTER_STORAGE_POSTGRES_DSN=postgresql://...` with the actual database, user,
+password and TLS requirements. Add a service drop-in:
+
+```ini
+# /etc/systemd/system/cluster-registry.service.d/storage.conf
+[Service]
+EnvironmentFile=/etc/cluster-ctl/storage.env
+```
+
+Run `systemctl daemon-reload` and start/restart this Registry through its normal
+maintenance procedure. An `export` in an operator's shell does not configure an
+already managed systemd service. Do not print the DSN in diagnostics or pass it
+as a command-line argument. All peers must reach the same database and namespace.
+Backend, namespace and connection changes require restart. A membership
+`https://` advertisement requires the matching listener certificate/key and peer
+trust; it does not enable TLS by itself.
 
 SQLite requires a persistent local file and a single Registry member in every
 configured membership version. It uses WAL, `synchronous=FULL` and immediate
@@ -118,18 +149,36 @@ When `storage.namespace` is omitted, it defaults to
 
 There is no automatic in-place conversion of the prior experimental FDB schema.
 Do not point the new codec at old record bytes or treat an empty new namespace
-as a migrated database. Retain old snapshots/evidence separately; any deployment
-holding old data needs an explicit export/import and cache-history cutover.
-The PR's existing native release layout is unchanged.
+as a migrated database. There is no supported execution-state export/import API
+and no tool that rebuilds Registry ownership from Node databases, route events,
+Group definitions or portable snapshots. Do not fabricate old SID/Node/ready rows.
+
+For disposable pre-release state, stop new admission, finish or explicitly remove
+test-owned work through the old version, stop the old roles and retain any needed
+evidence. Start the new release with a fresh Registry database/namespace and
+fresh Node state, reinstall roots and Groups, then create new Sandboxes from
+compatible retained canonical artifacts. This is a rebuild with new execution
+identities, not an in-place migration or same-ID recovery. Keep old data isolated
+until its retention decision has been made; do not delete unrelated state.
+
+For a same-schema database restore, stop all Registry/Router/Placer processes
+that could write or cache that history and preserve the corresponding Node
+ownership evidence. Restore a database-consistent backup by that backend's
+native procedure, including SQLite WAL consistency. A database backup alone
+cannot roll running Nodes back to that point in time. Keep admission closed
+until ownership reconciliation is demonstrated; a new empty namespace does not
+repair mismatches. Node DB/encryption keys, tenant roots, canonical artifacts and
+their complete dependencies are separate backup inputs. The [recovery contract](cluster.md#registry-state-ownership-and-disaster-recovery-boundaries)
+defines the current limit; loss of required ownership state cannot promise
+identity-preserving recovery.
 
 ## Validation and future metadata extensions
 
 `storagetest` runs the same transaction, record, ABA, retry, unknown-outcome,
-observation and representative repository tests on real backends. The extension
-example adds Group/Node indices, registration guards, selection competition and
-bounded cleanup above the engine. It is an isolation proof, not the production
-Group protocol. Snapshot latch/cursor, immutable auth references and accepted
-result binding belong in shared metadata; they do not require Group/Create
+observation and representative repository tests on real backends. The production
+Group-support repository also tests registration guards, completed publication,
+selection competition, retained object authentication and bounded cleanup. These
+business contracts remain above the engine; they do not require Group/Create
 methods in a driver. `MaxCheckpoints` remains part of current business regression.
 
 ```sh

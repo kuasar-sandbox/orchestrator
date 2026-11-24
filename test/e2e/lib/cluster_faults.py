@@ -14,6 +14,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from group_readiness import wait_for_group
+
 
 def main():
     work = pathlib.Path(os.environ["FAULT_WORK"])
@@ -179,6 +181,8 @@ def main():
     assert status != 201, "interrupted Create unexpectedly completed without a delivered fact"
     until(lambda: any(e["type"] == "node_register" for e in events()[start:]), "actual Node did not reconnect")
     until(lambda: request(router, "GET", "/sandboxes/" + stable, route)[0] == 200, "reconnected full snapshot did not converge")
+    wait_for_group(node, group, registry_urls=[os.environ["FAULT_REGISTRY"]],
+                   api_key=api_key, node_host=host, node_id=os.environ["FAULT_NODE_ID"])
     status, recovered = request(router, "POST", "/sandboxes", route, {})
     assert status == 201 and recovered["sandboxID"] == stable, "owner restart rebound the logical object"
     local = assert_live(recovered, route)
@@ -225,6 +229,8 @@ def main():
             return False
     until(intent_reopened, "fresh Registry lost the committed logical slot")
     until(lambda: any(e["type"] == "group_end" for e in events()[start:]), "Node did not republish Group after pre-acceptance restart")
+    wait_for_group(node, group, registry_urls=[os.environ["FAULT_REGISTRY"]],
+                   api_key=api_key, node_host=host, node_id=os.environ["FAULT_NODE_ID"])
     status, recovered = request(router, "POST", "/sandboxes", route, {})
     assert status == 201 and recovered["sandboxID"] == stable, "pre-acceptance restart rebound the logical identity"
     local = assert_live(recovered, route)
@@ -252,7 +258,8 @@ def main():
     with sqlite3.connect(work / "cl/node-ctl.db") as db:
         assert db.execute("select count(*) from sandboxes where id=?", (command["sid"],)).fetchone()[0] == 0, "rejected delivery created a Node row"
     assert not (work / "cr/sandboxes" / command["sid"]).exists(), "rejected delivery created a RunDir"
-    time.sleep(1)  # Allow the already committed Group report to publish; no write retry.
+    wait_for_group(node, group, registry_urls=[os.environ["FAULT_REGISTRY"]],
+                   api_key=api_key, node_host=host, node_id=os.environ["FAULT_NODE_ID"])
     status, created = request(router, "POST", "/sandboxes", route, {})
     assert status == 201, "fresh request after exact rejection failed: " + str(status)
     local = assert_live(created, route)

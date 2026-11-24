@@ -1011,7 +1011,7 @@ for n in nodes:
     for s in n.get("sandboxes", []):
         location = s.get("cluster", {})
         if location.get("route_key") == "user1/session1":
-            open(sys.argv[2], "w").write("NODE=%s\nSID=%s\n" % (shlex.quote(n["node_id"]), shlex.quote(s["sid"])))
+            open(sys.argv[2], "w").write("NODE=%s\nSID=%s\nSTABLE_SID=%s\n" % (shlex.quote(n["node_id"]), shlex.quote(s["sid"]), shlex.quote(location["stable_id"])))
             sys.exit(0)
 raise SystemExit("sandbox not found")
 PY
@@ -1036,7 +1036,7 @@ if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
 elif [ "$CLUSTER_STUB_CASE" = registry-owner-failover ]; then
     ROUTE_LIST_PORT="${CONTROL_PORTS[1]}"
 fi
-python3 - "$ROUTE_LIST_PORT" "$GROUP" "$SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
+python3 - "$ROUTE_LIST_PORT" "$GROUP" "$STABLE_SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
 import json, os, sys, time, urllib.parse, urllib.request
 port, group, sid, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 url = "http://127.0.0.1:%s/route-link/v2/list?%s" % (port, urllib.parse.urlencode({"group": group}))

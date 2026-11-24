@@ -8,13 +8,13 @@ This contract follows cluster capabilities and state ownership across Registry, 
 
 `cluster-ctl` is the cluster control plane for large deployments, with three independent roles:
 
-- `registry`: a reliable, stateful cluster that maintains execution state for nodes, routes and placer imports.
+- `registry`: maintains durable execution ownership, authenticates requests, selects Nodes and owns node connections.
 - `router`: a unified e2b-compatible entry point that locates the route owner by sandbox group and forwards the hot path directly to the node.
-- `placer`: imports complete Group records and maintains conditional Node updates from the `node_list` view.
+- `placer` (optional): imports complete Group records and maintains conditional Node updates from the `node_list` view.
 
 Registry accesses durable execution metadata through typed repositories backed by SQLite, PostgreSQL or FoundationDB 7.3.77. SQLite is limited to one Registry; shared deployments use PostgreSQL or FoundationDB. Transactions and storage recovery belong to the selected database; Registry retains lifecycle rules, node connection ownership and command dispatch. Router and Placer use the same business protocols without importing a database client.
 
-**Read by task:** [Public ingress](#client-access) · [Groups and placement](#groups-and-placement) · [Configure roles](#configuration) · [State ownership](#membership-and-state) · [Link protocols](#protocols) · [Failure and recovery](#failure-and-recovery)
+**Read by task:** [First cluster](#minimum-cluster) · [Public ingress](#client-access) · [Groups and placement](#groups-and-placement) · [Configure roles](#configuration) · [State ownership](#membership-and-state) · [Link protocols](#protocols) · [Failure and recovery](#failure-and-recovery)
 
 <a id="roles-and-topology"></a>
 
@@ -66,6 +66,204 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 | Placer | Consumes `node_list` WATCH_LIST; imports complete Group records and applies conditional Node maintenance |
 | Node | Runs sandboxes/builds; reports full inventories and events through node_link; receives create/connect/exec_session/delete/build/key commands |
 
+<a id="minimum-cluster"></a>
+
+## First cluster: one SQLite Registry, one Router, two Nodes
+
+This path uses direct Node Group maintenance; it needs no Placer or FDB service.
+One Registry limits control-plane availability, not the number of compute Nodes.
+Use an isolated test deployment before opening production admission.
+
+### 1. Install matching inputs and prepare the two Nodes
+
+Select one aggregate release through the main project's [installation guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/installation.md).
+Install its complete native archives, including the `run-cluster-ctl` launcher
+and private libraries, on the control host. Prepare two native Nodes using the
+[deployment guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md)
+or the [node-infra cluster example](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#cluster-attachment).
+Both Nodes need usable KVM, their own persistent Node DB/encryption key and
+Conductor/Proxy/Connector setup, compatible runtime/kernel inputs, and access to
+the same artifact store or named file locations. A local path on node-a alone
+is not a portable template. Configure real Runner/Builder budgets and the
+Builder diff template before the Build below.
+
+Use the addresses below as a mapping to replace with your own DNS and interfaces:
+
+| Role | Private address | Configuration |
+|---|---|---|
+| Registry | `registry-1.example:7700` | `/etc/cluster-ctl/registry.yaml` |
+| Router | Public `api.sandboxes.example.com` and `*.sandboxes.example.com` | `/etc/cluster-ctl/router.yaml` |
+| node-a | `node-a.example:3000` API, `node-a.example:3001` data | Node-specific Conductor and Proxy files |
+| node-b | `node-b.example:3000` API, `node-b.example:3001` data | Separate Node identity, state and keys |
+
+Provision a private CA and per-role client/server certificates for Registry
+links. Public Router ingress needs a trusted certificate covering the API and
+sandbox hosts. Router-to-Node API/data listeners remain distinct private
+plaintext endpoints; restrict their network access to trusted infrastructure.
+
+### 2. Configure and start Registry and Router
+
+The following complete single-member Registry input selects SQLite explicitly:
+
+```yaml
+member:
+  id: registry-1
+  listen: ':7700'
+  tls: {cert: /etc/cluster-ctl/tls/registry.pem, key: /etc/cluster-ctl/tls/registry.key, ca: /etc/cluster-ctl/tls/ca.pem}
+membership:
+  active: 1
+  versions:
+    - version: 1
+      members:
+        - {id: registry-1, advertise: 'https://registry-1.example:7700', node_advertise: 'registry-1.example:7700'}
+  owners: {route_link: 1, node_link: 1, placer_link: 1, node_list: 1}
+storage:
+  backend: sqlite
+  namespace: first-cluster/records-v2/
+  sqlite_path: /var/lib/cluster-ctl/metadata.sqlite
+```
+
+Create `/var/lib/cluster-ctl` with access limited to the Registry service user
+and persist it across restarts. Do not run a second Registry against that file.
+The Router input is:
+
+```yaml
+domain: sandboxes.example.com
+registry:
+  bootstrap: registry-1.example:7700
+  tls: {cert: /etc/cluster-ctl/tls/router-client.pem, key: /etc/cluster-ctl/tls/router-client.key, ca: /etc/cluster-ctl/tls/ca.pem}
+ingress:
+  listen: ':443'
+  tls: {cert: /etc/cluster-ctl/tls/public.pem, key: /etc/cluster-ctl/tls/public.key}
+auth:
+  data_plane: enforce
+```
+
+Validate both files with `run-cluster-ctl config ROLE --config FILE`. Install the
+shipped `cluster-registry.service` and `cluster-router.service`, then run
+`systemctl daemon-reload` and `systemctl start cluster-registry cluster-router`.
+These units expect installed binaries in `/usr/bin`; match the unit to your
+installation prefix. For another supervisor, use the identical role commands.
+A listening Router is not yet proof that a Node can accept work.
+
+### 3. Attach both Nodes and create a Group
+
+Add the following to node-a's Conductor configuration; use `node-b`, its addresses/certificates and `labels.node: node-b` on the other Node. Set the Proxy's `data_listen` to
+`node-a.example:3001` (the local interface address may be used for binding).
+
+```yaml
+api:
+  domain: sandboxes.example.com
+  listen: ':3000'
+cluster:
+  node_id: node-a
+  node_link:
+    endpoint: registry-1.example:7700
+    tls: {cert: /etc/node-ctl/tls/node.pem, key: /etc/node-ctl/tls/node.key, ca: /etc/node-ctl/tls/ca.pem}
+  api_endpoint: node-a.example:3000
+  data_endpoint: node-a.example:3001
+  labels: {pool: first-cluster, node: node-a}
+```
+
+Validate through `node-ctl config conductor --config FILE` and `node-ctl config
+proxy --config FILE`, then start each Node's Conductor and Proxy using the
+selected deployment's normal service units. A node-infra instance uses its
+native overlay paths and `node-conductor.service` instead of `node-ctl.service`.
+
+Generate one tenant pair in a trusted administrative shell, retain it through
+your normal secret storage, and make that same pair available to both Nodes'
+local administrators. Do not generate a different pair on each Node.
+
+```sh
+export MANIFEST_KEY=$(e2b-key-ctl gen-key)
+export API_SECRET=$(e2b-key-ctl derive-api-secret)
+export E2B_API_KEY=$(e2b-key-ctl gen-apikey)
+```
+
+On **each Node**, with those values available and the local admin socket:
+
+```sh
+umask 077
+node-ctl manifest-key add --socket /run/sandbox/node-ctl.socket --label first-cluster
+cat >first-cluster.json <<'JSON'
+{"group":"first-cluster","expected_version":0,"context":{"target_port":49983}}
+JSON
+node-ctl group apply --socket /run/sandbox/node-ctl.socket -f first-cluster.json
+```
+
+Retain each apply result's `version`. Zero means create-only; if the Group already
+exists, read it and make an explicit CAS update instead of retrying zero.
+`group apply` does not install roots. The local admin socket handles the root
+installation; `E2B_API_KEY` authenticates the business Group operation. Give
+application clients only the API key, never either root or the Node encryption key.
+
+### 4. Verify publication, build a real template, then set the default
+
+From a trusted control host, inspect **each Node** through Registry:
+
+```sh
+run-cluster-ctl status --registry https://registry-1.example:7700 \
+  --ca /etc/cluster-ctl/tls/ca.pem \
+  --cert /etc/cluster-ctl/tls/operator.pem --key /etc/cluster-ctl/tls/operator.key \
+  --group first-cluster --node-id node-a
+```
+
+Require `storage_readable:true`, `published:true`, the same `group_version` as
+the local apply result, and a nonempty current `registration` with Node ID,
+link owner and fence. Repeat for node-b. Until a default exists,
+`default_template_missing` is expected for default Create; it does not block a
+Build. A successful `/verify-key` call alone cannot prove this publication.
+After reconnect or an update, repeat this comparison with the current local
+revision and registration; do not mask incomplete publication with Create retries.
+
+Set `E2B_API_URL=https://api.sandboxes.example.com`,
+`E2B_DOMAIN=sandboxes.example.com`, `KUASAR_GROUP=first-cluster`, and
+`BUILD_KIND=sbx` in the SDK/Build client environment. Prepare `APP_IMAGE` pinned
+by digest with the [first application recipe](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/templates.md#first-application),
+then execute the complete [Build HTTP recipe](node-build.md#client-workflow).
+With `KUASAR_GROUP` set, that recipe sends the Group header on registration,
+trigger and status calls through Router. Wait for this exact Build's `ready`
+result and export its canonical `e2b-sbx-...` TemplateID as `TEMPLATE_ID` in both
+Node admin sessions and the SDK client; a
+transient ID or an illustrative string is not a runnable template.
+
+On each Node, replace the Group file's context with that canonical template,
+retaining `target_port:49983`, and set `expected_version` to that Node's observed
+revision. For example, when its revision is 1:
+
+```sh
+python3 - <<'PY_GROUP'
+import json, os
+with open('first-cluster.json', 'w') as f:
+    json.dump({'group': 'first-cluster', 'expected_version': 1,
+               'context': {'templateID': os.environ['TEMPLATE_ID'], 'target_port': 49983}}, f)
+PY_GROUP
+node-ctl group apply --socket /run/sandbox/node-ctl.socket -f first-cluster.json
+```
+
+Check publication again against each new returned revision. Now require
+`eligible:true`; inspect the fixed reason if it is false. This read-only result
+is a point-in-time observation, not a capacity reservation. Node admission still
+checks real resources and artifacts on the actual request.
+
+### 5. Exercise the SDK and retain recovery inputs
+
+Run the [client acceptance recipe](#client-onboarding) below with the same
+Group/API key and canonical TemplateID. It covers Create, exec, files, pause,
+connect and delete through Router. Run it once with `KUASAR_NODE=node-a` and once with `KUASAR_NODE=node-b` to
+exercise both Nodes. The optional Placement header uses the explicit `node`
+label configured above; Node ID does not automatically become a label.
+
+Keep Registry metadata, each Node's own DB/encryption key, tenant roots, Group
+inputs and the artifact closure according to their respective retention rules.
+For a shared control plane, replace SQLite with one supported PostgreSQL/FDB
+backend and configure multiple Registry members as described in
+[metadata storage](cluster-storage.md). Changing the backend does not migrate
+execution state; follow its explicit rebuild/restore boundary before switching.
+Add [Placer](#placer-configuration) only
+when source import and automatic credential renewal are needed. Neither step is
+required to operate this initial two-Node cluster.
+
 <a id="client-access"></a>
 
 ## Public ingress and identity
@@ -78,16 +276,16 @@ The standalone `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` extension
 
 ### Minimal cluster client acceptance
 
-Start from the existing [Registry](cluster.md), [Placer configuration and file provider](#placer-configuration) and [deployment order](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md).
-This is a one-group acceptance path, not an HA reference configuration.
+Complete the [first-cluster setup](#minimum-cluster), or use an existing Group
+maintained directly on Nodes or by the optional Placer. This is a one-group
+acceptance path, not an HA reference configuration.
 
 1. Register eligible nodes with matching runtime/kernel/artifact access and the
    intended selector labels. Ensure node-link full sync and completed GroupSupport publication for
-   this group. Reuse the provider JSON schema, replacing illustrative `tmpl-1`
-   with an actually published canonical `e2b-img/sbx/snp-...` ID from an exact
-   ready Build. Configure its ManifestKey/APISecret under the existing protected
-   provider contract; give clients only an API key signed by that APISecret.
-2. For this SDK command/file test, use the provider's example `target_port=49983`.
+   this group. Use an actually published canonical `e2b-img/sbx/snp-...` ID from
+   an exact ready Build. Install the root pair through the Node admin socket or
+   trusted importer contract; give clients only an API key signed by its APISecret.
+2. For this SDK command/file test, use the Group example `target_port=49983`.
    That constraint deliberately limits data to envd. To test an arbitrary user
    application port as well, use a group without a fixed port constraint or one
    configured for that port; do not assume 49983 represents every service.
@@ -97,13 +295,13 @@ This is a one-group acceptance path, not an HA reference configuration.
    listeners, respectively Conductor and Proxy; protect them with private network
    access controls. Public HTTPS does not encrypt that hop. Do not advertise a
    TLS-only node listener as a plaintext endpoint.
-4. Set `KUASAR_GROUP` to the exact provider group, `TEMPLATE_ID` to its usable
+4. Set `KUASAR_GROUP` to the exact Group name, `TEMPLATE_ID` to its usable
    template, and reuse API URL/key/domain/CA settings. With the project's pinned
    **e2b==2.25.1**, pass the same Group and caller-chosen route key on Create and
    every later control/data operation:
 
 ```python
-import os, uuid
+import json, os, uuid
 from e2b import Sandbox
 
 if not __debug__:
@@ -113,6 +311,9 @@ headers = {
     "X-Kuasar-Sandbox-Group": os.environ["KUASAR_GROUP"],
     "X-Kuasar-Route-Key": str(uuid.uuid4()),
 }
+if os.environ.get("KUASAR_NODE"):
+    headers["X-Kuasar-Sandbox-Placement"] = json.dumps({
+        "node_selectors": [{"node": os.environ["KUASAR_NODE"]}]})
 options = dict(api_url=os.environ["E2B_API_URL"],
                api_key=os.environ["E2B_API_KEY"],
                domain=os.environ["E2B_DOMAIN"], headers=headers)
@@ -150,10 +351,10 @@ and data requests. Inspect
 node endpoint selection to prove control and data use their distinct listeners.
 
 Success means real create, command/file roundtrip, pause/resume and kill; Registry
-stub tests alone do not prove this VM path. On NoNode, check group import, selector,
+stub tests alone do not prove this VM path. On NoNode, check current Group publication, selector,
 node health/capacity and artifact access; on control success/data failure, check
 header propagation, target_port, DNS/TLS and the Proxy internal endpoint. Stop on
-identity mismatch. Kill only test-owned instances; removing a provider file is
+identity mismatch. Kill only test-owned instances; removing an input file is
 not instance cleanup or immediate revocation of credentials already bound to rows.
 Retain shared templates/keys until the retention policy permits deletion.
 
@@ -379,6 +580,56 @@ Registry scans bounded pages of normally published Group support, verifies the c
 
 Valid unannotated legacy SNP templates remain usable. An annotated SNP additionally requires the same Node's runtime label to match both bundle basename and declared digest. Invalid annotations fail without stripping metadata or falling back. Selection performs no artifact I/O and does not infer identity from a host's default runtime. For an opaque migration token, the destination Node decrypts and validates the actual restored template; Registry does not substitute the Group default or historical initial template as its runtime requirement.
 
+### Runtime inventory and selection diagnostics
+
+Conductor builds its reserved runtime labels **once at startup** by inspecting
+regular entries/symlinks ending in `.bundle` in the lexical parent directory of
+`sandbox.boot.runtime`. For `/opt/boot/current.bundle` pointing into a versioned
+release directory, the inventory is `/opt/boot`, not the symlink target's parent.
+Each usable entry must have a valid basename and Bundle-declared digest. Invalid
+entries are omitted with a diagnostic; manually configured labels under
+`kuasar-sandbox.boot/` are discarded and cannot manufacture support.
+
+Install each retained runtime under the exact basename declared by the snapshots
+that need it, in that inventory directory, and keep referenced bytes immutable.
+New files are not watched or downloaded. Through the normal node maintenance
+procedure, restart Conductor to rescan and wait for the new registration/full
+support publication. Updating only a label, the primary symlink target, or the
+Group's template does not rescan an already running process. Keep older bundles
+while retained snapshots need them; a compatible configured primary runtime is
+not sufficient evidence that every captured basename is advertised.
+A Node can advertise only one digest for a given basename. If old and new
+snapshots captured the same basename with different contents, keep separate
+compatible Node pools; use distinct immutable basenames for future captures.
+Renaming a reference or editing its annotation does not make it compatible.
+
+`run-cluster-ctl status --registry URL --group GROUP --node-id NODE` reads one
+authenticated Group/Node pair using `E2B_API_KEY`; use `--ca`, `--cert` and `--key`
+for the deployment's Registry TLS. Add `--template-id TEMPLATE_ID` to inspect an
+explicit canonical template instead of the Group default. It makes no lifecycle
+write and exposes no private Group context, root, fingerprint or token. Only a
+completed publication tied to the same live registration and the authenticated
+root exposes its revision and registration. An old object's retained key can
+still manage that object without proving current Group support.
+
+| Observation | Operator action |
+|---|---|
+| `published:false`, `support_unavailable` | Compare the local Group revision, correct API key, NodeLink registration and completion of full support publication; a listening process or key verification alone is insufficient |
+| `node_unavailable` | Check NodeLink owner/reconnect and heartbeat evidence; do not retry a possibly executed Create on another Node |
+| `draining` / `zone_rejected` | Inspect native Node drain/resource pressure; preserve its admission decision |
+| `default_template_missing` | Build/publish and conditionally set a Group default, or inspect an explicit template |
+| `runtime_unavailable` | Check exact basename/digest, inventory directory and completed publication after the maintenance restart |
+| `eligible:true`, actual admission fails | Inspect the final Node's resource, artifact/network and request-selector requirements; status reserves no capacity |
+| Placer conflict / key expiry | Inspect per-target results from the explicit `placer apply`, its source-lease logs and local `manifest-key list` expiry; resolve the observed revision instead of silently overwriting a manual Group edit |
+
+Exit zero means the authenticated observation succeeded. Inspect `published`,
+`group_version` and `eligible` separately. `storage_readable:true` covers this
+metadata/auth read only; it does not certify database HA or future writes.
+`eligible` checks this Node's default/explicit-template Create prerequisites
+without request selectors. `registration.fence` is an opaque comparison token,
+not a time or credential. Use per-object status and the native resource tools to
+investigate actual work; do not dump private Group reads into shared logs.
+
 ### Acceptance, recovery and delivery order
 
 An intent owns a stable logical ID and an exact Node-local generation. Timeout, lost ACK, generic 400/409/429, NotFound and absence from a report do not prove nonexecution. Cleanup responsibility remains until authoritative object facts or existing reclamation rules resolve it. Late failure cannot regress a newer fact. Only the structured `GroupVersionConflict` produced at initial Node admission, before input copy or core effects, can retire that exact fresh delivery through the atomic intent/registration guard. The client receives the conflict; Registry does not hide it by an implicit retry. No persistent command execution journal or exactly-once promise is introduced.
@@ -451,6 +702,10 @@ node_link:
 route_link:
   park_timeout: 30s
 
+storage:
+  backend: fdb                 # fdb | postgres; this example has three Registry members
+  namespace: kuasar-sandbox/cluster/records-v2/
+  # postgres_dsn_env: CLUSTER_STORAGE_POSTGRES_DSN
 foundationdb:
   cluster_file: /etc/foundationdb/fdb.cluster
   prefix: "kuasar-sandbox/cluster/"
@@ -500,7 +755,7 @@ When FDB is selected, Registry needs a readable cluster file and the same storag
 
 Release validation retains source revision, selected dependency and Go module checks. Only cluster-ctl is admitted as CGO=1 with the `fdb` tag; the other payloads and trusted archive validator remain CGO=0. Native library names, bytes, loader, licenses and provenance are checked against a fixed allowlist. Validation never executes foreign-architecture payloads or downloads dependencies. `make test-release` includes native linkage/launcher and negative packaging fixtures; it uses the matching host architecture.
 
-Prepared product cluster cases receive the fixed `fdbserver-test` and `fdbcli-test` helpers through [the declared helper inventory](../release/helper-inputs.json). The source-build stage verifies the official package hashes and the executables' compatibility with the product runtime. Each case starts its own single-SSD database, connection file and prefix, writes that same configuration into its Registry instances, and cleans up its own processes. The prepared runtime uses the delivered launcher/libraries and helpers without compiling, fetching dependencies or selecting a machine's default database. This isolated fixture tests deployment wiring; it does not claim production database redundancy.
+FDB-backed prepared cluster cases receive the fixed `fdbserver-test` and `fdbcli-test` helpers through [the declared helper inventory](../release/helper-inputs.json). The source-build stage verifies the official package hashes and executable/runtime compatibility; each FDB case owns its isolated single-SSD database, connection file and namespace. SQLite cases own a persistent local test file; PostgreSQL cases use the digest-pinned PostgreSQL image prepared with the test inputs. The prepared runtime uses delivered products/helpers without compiling, downloading dependencies or selecting a machine's default database. Each fixture cleans only its own resources. These isolated fixtures test deployment wiring, not production database redundancy.
 
 <a id="router-command"></a>
 
@@ -616,7 +871,7 @@ These fields belong to Conductor configuration. Shared loading, path and environ
 | `cluster.node_link.endpoint` | Empty | Registry node-link address ([Cluster integration (node-link)](#node-attachment)); empty means standalone |
 | `cluster.node_link.tls` | Empty | Node-link mTLS cert/key/CA; production requires it ([Cluster integration (node-link)](#node-attachment) and cluster.md) |
 | `cluster.node_id` | Required in cluster mode | Unique node registration identity |
-| `cluster.labels` | Empty | zone/pool/slot/node labels matched by Placer nodeSelectors |
+| `cluster.labels` | Empty | zone/pool/slot/node labels matched by request Placement and optional importer nodeSelectors |
 | `cluster.api_endpoint` | Required in cluster mode | Explicit advertised conductor host:port; never inferred from api.listen |
 | `cluster.data_endpoint` | Required in cluster mode | Explicit advertised Proxy host:port; never inferred from its bind listener |
 
@@ -624,7 +879,7 @@ These fields belong to Conductor configuration. Shared loading, path and environ
 
 ### Cluster integration (node-link)
 
-With cluster.node_link.endpoint ([Configuration](node.md#conductor-configuration)), `node-ctl conductor serve` dials Registry to join the cluster orchestrated by `cluster-ctl registry/router/placer`. Node-link reuses routesync's framed JSON over h2c engine (node-proxy.md [routesync and shared route views](node-proxy.md#route-synchronization)), with reversed roles: node owns local routes/builds; Registry subscribes and sends commands.
+With cluster.node_link.endpoint ([Configuration](node.md#conductor-configuration)), `node-ctl conductor serve` dials Registry to join the cluster served by Registry/Router, with an optional Placer importer. Node-link reuses routesync's framed JSON over h2c engine (node-proxy.md [routesync and shared route views](node-proxy.md#route-synchronization)), with reversed roles: node owns local routes/builds; Registry subscribes and sends commands.
 
 This section defines node behavior. [cluster.md](cluster.md) defines Registry ownership selection, redirect/relay, typed metadata transactions and membership changes.
 
@@ -658,7 +913,7 @@ These are Registry consistency and role-membership contracts, not additional pub
 
 #### Versioned membership
 
-Registry membership comes from an operator-distributed configuration file. Each version has the stable label `registry.<version>.<sha256(sort(member_ids))>`. This is service membership; FoundationDB maintains its own database topology.
+Registry membership comes from an operator-distributed configuration file. Each version has the stable label `registry.<version>.<sha256(sort(member_ids))>`. This is service membership; PostgreSQL/FoundationDB maintain their own database topology, and SQLite permits one Registry.
 
 | View | Business use |
 |---|---|
@@ -739,7 +994,7 @@ The repository stays one Go module. Only the native FDB driver and its command a
 
 #### Business owners and storage placement
 
-`membership.owners.route_link/node_link/placer_link/node_list` selects Registry service candidates and node connection affinity. `LocateN` and the placer Maglev selection remain business routing mechanisms. They do not select FoundationDB storage replicas or define a database replication factor. `ConnectionOwners` exposes only the local member ID and ordered candidates for a NodeID; it has no storage API.
+`membership.owners.route_link/node_link/placer_link/node_list` selects Registry service candidates and node connection affinity. `LocateN` and the placer Maglev selection remain business routing mechanisms. They do not select database storage replicas or define a database replication factor. `ConnectionOwners` exposes only the local member ID and ordered candidates for a NodeID; it has no storage API.
 
 A Registry may read or change an authorized record through the shared database without fetching a peer's local copy. The selected `link_owner` remains the process holding the node's stream, and node commands still reach it through node-owner RPC. Registry selects Nodes directly from published Group support.
 
@@ -1069,7 +1324,7 @@ kuasar-sandbox.cluster is not tenant configuration. Cluster Build group uses a s
 
 ### node_list
 
-Node_list is the low-frequency projection produced by typed Node transactions and read through `NodeDirectory`. It is physically partitioned into 256 fixed buckets in FoundationDB, independent of Registry service membership. The business routing key `node_list` still chooses service candidates for HTTP WATCH_LIST.
+Node_list is the low-frequency projection produced by typed Node transactions and read through `NodeDirectory`. Its shared repository uses 256 fixed buckets on every storage backend, independent of Registry service membership. The business routing key `node_list` still chooses service candidates for HTTP WATCH_LIST.
 
 <a id="placer-node-list"></a>
 
@@ -1116,7 +1371,7 @@ RouteLink v2 uses distinct ControlRoute and DataRoute payloads. Control calls ar
 | `envd_access_token` | Data-plane token for the e2b envd port |
 | `traffic_access_token` | Token used by external gateways and e2b data-plane components; not consumed by the cluster platform layer |
 | `forward_access_token` | Data-plane token for other bare/e2b forwarding targets |
-| `target_port` | Mandatory data-plane port returned by group/provider; if zero, the request must explicitly specify a port |
+| `target_port` | Mandatory data-plane port in Group support; if zero, the request must explicitly specify a port |
 | `updated_at` | Used by timeout/reconciliation |
 
 State machine:
@@ -1363,13 +1618,13 @@ Build placement continues to use registration headroom and the selected node's d
 
 The node is the authority for sandbox/build execution state. Sandbox/build records in `route_link`, reverse ownership in `node_link`, and admission-related projections derive from node facts for routing, queries or scheduling; operator files cannot create or transfer them. A terminal Build remains a projection of one node execution. Its produced template/manifest is durably reusable; the BuildRecord is not.
 
-FoundationDB database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. The explicit recovery/bootstrap protocol is not implemented; [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) is a historical proposal closed as not planned, not an available recovery procedure; manually writing execution rows must not bypass that limitation.
+The selected backend's consistent database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. The explicit recovery/bootstrap protocol is not implemented; [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) is a historical proposal closed as not planned, not an available recovery procedure; manually writing execution rows must not bypass that limitation.
 
 The historical proposal [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33), closed as not planned, described an **unbound durable route** with a migration token as the disaster-recovery object for a portable paused sandbox, not SandboxRecord. It would contain no old SID/NodeID/admission and use fresh placement, target-node snapshot validation and a new identity before READY established the runtime route. This recovery-only workflow is not implemented or available through normal route_link APIs.
 
 Manifest Bundle does not change migration-token/KMT wire format: the existing source fields identify E-only or an exact S/E pair, including Bundle refs. Import retaining S reads only S and paired E metadata in a tenant helper for runtime admission. Target-node task-local launch preflight reads the root Bundle's contiguous metadata prefix, gathers the selected launch's located sources from flat `bundle/refs`, and deterministically derives the mapping using `checkpoint.remote.ref_location_parent`. Same-directory siblings need no mapping; cold selection does not require the memory-only closure. The shared conductor does not open or recursively scan referenced Bundles. Export/promote still delegates to sandboxer, publishing the root Bundle and its unlocated siblings unchanged while retaining the addresses of externally located dependencies.
 
-Sandbox-group configuration, placement hints, APISecret and ManifestKey remain the placer/provider's responsibility for persistence and disaster recovery. The current protocol has no operator runtime-import fallback for complete Registry execution-state loss; #33/#34 are historical proposals, not implementation commitments. It must be reported as unrecoverable through the current protocol, instead of constructing route/build ownership that could conflict with nodes.
+Group inputs and tenant roots must be retained by their administration/import source. Node databases own applied Group context and bound object credentials; the optional Placer is not a substitute for Node or Registry backup. The current protocol has no operator runtime-import fallback for complete Registry execution-state loss; #33/#34 are historical proposals, not implementation commitments. It must be reported as unrecoverable through the current protocol, instead of constructing route/build ownership that could conflict with nodes.
 
 <a id="registry-reliability"></a>
 
@@ -1383,8 +1638,8 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 | Conductor process restart | Reconciles durable rows against systemd units: adopts live sandboxes/builders, retries deleting/paused cleanup, resumes already accepted interrupted restores, and cleans/fails missing fresh executions. This is not whole-host reboot |
 | Node host reboot | Running processes are gone. If node SQLite/artifacts survive, reconciliation still processes paused rows, accepted interrupted restores, cleanup owners and retained Builds. Missing executions converge through node reports/exact route cleanup; no blanket durable-row deletion or automatic recreation of every old sandbox |
 | One Registry member fails | With a shared PostgreSQL/FDB backend, other service candidates still access durable metadata; a single SQLite Registry must restart. Nodes whose stream owner failed reconnect; registration fences reject stale overlapping sessions |
-| FoundationDB is unavailable or cannot commit | Metadata operations fail or return an explicit unknown commit outcome; Registry does not fall back to local writes |
-| FoundationDB metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; the application recovery/bootstrap protocol remains unavailable (#34 is historical) |
+| The selected database is unavailable or cannot commit | Metadata operations fail or return an explicit unknown commit outcome; Registry does not fall back to local writes |
+| Registry metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; the application recovery/bootstrap protocol remains unavailable (#34 is historical) |
 | Membership change | Changes service candidates and node-link affinity; all views keep using the same database and prefix |
 | Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. Provider data and portable templates/manifests remain reusable, but do not restore lost Registry execution ownership. Migration-token route recovery (#33) is a historical, unimplemented proposal, not an execution-row import or an available fallback |
 
@@ -1413,23 +1668,32 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 
 Source stub integration runs with `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh`
 or the required `make test-source` gate. It uses the selected source workspace
-and starts real control-plane processes plus an isolated FoundationDB test fixture without a MicroVM. Prepared product
+and starts real control-plane processes without a MicroVM. The default uses an isolated FDB fixture; `CLUSTER_STUB_BACKEND=sqlite|postgres` selects the other real backends. The required source gate runs the supported topology matrix and explicitly provisions PostgreSQL before its transaction/repository contracts, so a missing DSN cannot silently drop that backend. Prepared product
 E2E uses the [shared public runner and focused cases](../CONTRIBUTING.md#node-validation).
 `test/source/cluster_stub.sh` covers N=1 and multi-member Registry, joint/old_grace membership cutover, group import, key distribution, explicit create/Reserve, stable-SandboxID CmdConnect, SandboxID↔NodeSandboxID translation, control/build reaching the API listener, data/exec reaching the Data listener, ExecSession Reserve/CmdExecSession issuance, `service=exec` KAT rejection/two-hop validation and the second-hop buffered tunnel, route cache, BuildRegister, orphan-route cleanup, reconnect full-sync convergence after a lost Build Delete, and emptied-node convergence. The stub's `reboot-empty` deliberately empties simulated state; it is not proof that real conductor startup deletes durable SQLite rows.
 
-The independent `orchestrator.cluster-lifecycle.sh` owns the real lifecycle,
-Build cancellation/reclamation and Router restart contracts.
-`orchestrator.cluster-recovery.sh` derives the exact Registry owner from the actual node-link redirect and confirms
-that the node used it. It restarts that owner and Router, requires a new node-link
-connection, then uses the existing bounded placer probe to require the expected
-node. The recovered topology and empty Router cache must then serve one real
-Create, pass the existing bounded read-only guest `/health` readiness probe, and
-complete normal Delete with node-local finalization. This exercises actual
-post-restart placement after node-link recovery. Failed recovery readiness blocks
-Create; failed Create is not retried. Guest readiness retains its existing bound
-and permits no repeated mutating operation. Syntax,
-ShellCheck and the placer/recovery gate regressions precede the required real KVM
-owner run; stub or helper results do not replace that run.
+The maintained prepared-product cases cover complementary paths:
+
+| Case | Real path |
+|---|---|
+| `orchestrator.cluster-lifecycle.sh` | FDB + Placer lifecycle/Build, Router restart and retained status |
+| `orchestrator.cluster-lifecycle-sqlite.sh` | One SQLite Registry + two Nodes; no Placer; direct root/Group apply, CRUD/CAS/tombstone/recreation, Registry restart and VM lifecycle |
+| `orchestrator.cluster-lifecycle-postgres.sh` | Three PostgreSQL-backed Registries + two Nodes with the same direct Group and VM acceptance |
+| `orchestrator.cluster-recovery.sh` | Three FDB Registries; actual redirected NodeLink owner restart, fresh publication, then one real Create/data/Delete |
+| `orchestrator.cluster-reset.sh` | Retained dead ownership, Reset/Wake and exact parent deletion |
+| `orchestrator.cluster-faults.sh` | Delivered NodeLink fault relay; ambiguous ACK and initial Group-version conflict behavior with real execution |
+| `orchestrator.cluster-migration.sh` | Real VM migration/KMT and late-source cleanup |
+| `orchestrator.cluster-legacy-runtime.sh` | A real current capture with an unannotated reference, plus a different valid runtime identity; runtime selection and final Node rejection. This is reference compatibility, not old-producer provenance. |
+
+Readiness compares the Node's committed Group revision with completed Registry
+support for that exact current registration. Key verification alone cannot open
+the gate. The owner-recovery case confirms the actual redirected owner before
+restarting it; recovery readiness must succeed before its one Create. Read-only
+guest health polling does not authorize replaying a mutating operation. Final
+cleanup follows Registry's stable identity to the actual node-local generation.
+Syntax/helper/source gates do not replace the required native KVM run. Prepared
+inputs must include the PostgreSQL image and fault relay for cases that declare
+them; missing helpers are failures, not a reason to silently skip coverage.
 
 <a id="router-reliability"></a>
 
@@ -1496,6 +1760,6 @@ Node views and source pages are bounded. Import visits static targets rather tha
 
 ### Placer references
 
-- [cluster.md](cluster.md) — Registry membership, typed FoundationDB metadata, node_link, route_link and placer_link design.
+- [cluster.md](cluster.md) — Registry membership, typed shared metadata, node_link, route_link and placer_link design.
 - [cluster.md](#client-access) — router Reserve consumption, route cache, and data-plane forwarding.
 - [node.md](node.md) — node-side node-link registration, heartbeats, command execution, and key TTL.
