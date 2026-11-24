@@ -134,6 +134,8 @@ print(base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4)).decode())
 PY
 ) || fail "W template id did not decode to a portable ref"
 PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
+# Runtime scheduling metadata does not change the Manifest lookup key.
+PORTABLE_W_KEY="${PORTABLE_W_KEY%%@runtime:*}"
 [[ "$PORTABLE_W_REF" == manifest://* && "$PORTABLE_W_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "published W ref is not manifest://<64hex>: $PORTABLE_W_REF"
 # After paused cleanup, keep-source publication must preserve the resume pair
@@ -159,7 +161,7 @@ if len(refs) != len(parent_refs) + 1:
 invalid_refs = [ref for ref in refs if re.fullmatch(r"manifest://[0-9a-f]{64}", ref) is None]
 if invalid_refs:
     raise SystemExit(f"portable W has non-manifest memory refs: {invalid_refs!r}")
-if refs[0] == sys.argv[3]:
+if refs[0] == sys.argv[3].split("@runtime:", 1)[0]:
     raise SystemExit("portable W self and B memory lower collapsed to one ref")
 if refs[1:] != parent_refs:
     raise SystemExit(f"portable W changed the external suffix: {refs[1:]!r}, want {parent_refs!r}")
@@ -375,7 +377,8 @@ def located_key(ref):
     if not match:
         raise SystemExit(f"not a canonical published Bundle selector: {ref!r}")
     return match[1]
-root, history = located_key(sys.argv[4]), located_key(refs[0])
+# The full root has already been opened by sandbox-ctl info above.
+root, history = located_key(sys.argv[4].split("@runtime:", 1)[0]), located_key(refs[0])
 if root == history:
     raise SystemExit("B memory graph references its own root")
 if root in sys.argv[5:] or history in sys.argv[5:]:
@@ -453,7 +456,8 @@ def located_key(ref):
     if not match:
         raise SystemExit(f"not a canonical published Bundle selector: {ref!r}")
     return match[1]
-root, history = located_key(sys.argv[4]), located_key(refs[0])
+# The full root has already been opened by sandbox-ctl info above.
+root, history = located_key(sys.argv[4].split("@runtime:", 1)[0]), located_key(refs[0])
 if history == root or history in sys.argv[5:] or root in sys.argv[5:]:
     raise SystemExit(f"history did not receive a new immutable identity: {refs[0]}")
 for key in (root, history):
@@ -478,7 +482,7 @@ case "$BUNDLE_TOKEN" in kmt1.*) ;; *) fail "bundle export returned a non-KMT res
     || fail "Bundle keep-source export rewrote the S/E pair"
 [ -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "bundle keep-source export removed the retained checkpoint"
 BUNDLE_REMOTE_REF=$(json_field "$WORK/bundle-publish.json" snapshotRef)
-[[ "$BUNDLE_REMOTE_REF" == manifest://* && "$BUNDLE_REMOTE_REF" != "manifest://$BUNDLE_ROOT_KEY" ]] \
+[[ "$BUNDLE_REMOTE_REF" == manifest://* && "${BUNDLE_REMOTE_REF%%@runtime:*}" != "manifest://$BUNDLE_ROOT_KEY" ]] \
     || fail "Bundle publication did not return a new portable Snapshot identity"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
@@ -490,7 +494,7 @@ current, first = (json.load(open(path)) for path in sys.argv[1:3])
 refs, suffix = current.get("FromRefs") or [], first.get("FromRefs") or []
 assert len(refs) == 1 + len(suffix) and refs[1:] == suffix, (refs, suffix)
 assert all(isinstance(ref, str) and re.fullmatch(r"manifest://[0-9a-f]{64}", ref) for ref in refs), refs
-assert refs[0] != sys.argv[3] and refs[0].removeprefix("manifest://") not in sys.argv[4:], refs
+assert refs[0] != sys.argv[3].split("@runtime:", 1)[0] and refs[0].removeprefix("manifest://") not in sys.argv[4:], refs
 PY_BUNDLE_STORE
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_LOCAL_RESUME_$RANDOM"
 wait_sandbox_state "$SID" running 20 || fail "retained Bundle C did not resume from its local checkpoint"
