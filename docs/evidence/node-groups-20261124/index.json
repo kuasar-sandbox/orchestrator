@@ -1,4 +1,18 @@
 {
+  "activation-config-examples-after.log": {
+    "bytes": 138,
+    "original_sha256": "c5e74e2298a3ea0ebf57a2828f1f66ca3046d86e2f14a6dec3cf30cb27910186",
+    "original_task_path": "evidence/activation-config-examples-after.log",
+    "published_sha256": "c5e74e2298a3ea0ebf57a2828f1f66ca3046d86e2f14a6dec3cf30cb27910186",
+    "transformation": "byte-identical"
+  },
+  "activation-config-examples-before.log": {
+    "bytes": 2500,
+    "original_sha256": "50deae3aae31a8dd0467be78dcbce45050e2f883804cdfff6243efe6d0c99777",
+    "original_task_path": "evidence/activation-config-examples-before.log",
+    "published_sha256": "50deae3aae31a8dd0467be78dcbce45050e2f883804cdfff6243efe6d0c99777",
+    "transformation": "byte-identical"
+  },
   "activation-directory-benchmark.log": {
     "bytes": 32664,
     "original_sha256": "483acefaa221a45873cc5268e545b03da8fa980ef83c2c002e49152a2904ebe9",
@@ -39,6 +53,13 @@
     "original_sha256": "0b695d926efa665e0171f54997c55267d5a5d15369c292d9a3a1ebd6c3d45c62",
     "original_task_path": "evidence/activation-node-group-benchmark.log",
     "published_sha256": "0b695d926efa665e0171f54997c55267d5a5d15369c292d9a3a1ebd6c3d45c62",
+    "transformation": "byte-identical"
+  },
+  "activation-rebased-store-groups.log": {
+    "bytes": 66,
+    "original_sha256": "cf32663d1b8b57e00ea852a792d18c4d1cbe438a7377a423aba213a7adebfcd8",
+    "original_task_path": "evidence/activation-rebased-store-groups.log",
+    "published_sha256": "cf32663d1b8b57e00ea852a792d18c4d1cbe438a7377a423aba213a7adebfcd8",
     "transformation": "byte-identical"
   },
   "group-copy-update-delete.log": {
@@ -151,6 +172,20 @@
     "original_sha256": "5e5b5946d43f1d97a73bc9c09e9b1b5d92c895d6a50d083ff223e049463bcce6",
     "original_task_path": "native-arm64-group-cursor/source-identity.txt",
     "published_sha256": "5e5b5946d43f1d97a73bc9c09e9b1b5d92c895d6a50d083ff223e049463bcce6",
+    "transformation": "byte-identical"
+  },
+  "orchestrator-reader-delivery.json": {
+    "bytes": 1671,
+    "original_sha256": "1f8499f825c93ef8a6c3b725ae6096bbad532108417731ddd483fc27660f9663",
+    "original_task_path": "orchestrator-reader-20261124.2/binary-receipt.json",
+    "published_sha256": "1f8499f825c93ef8a6c3b725ae6096bbad532108417731ddd483fc27660f9663",
+    "transformation": "byte-identical"
+  },
+  "orchestrator-reader-sdk.json": {
+    "bytes": 565,
+    "original_sha256": "e9bfaa4794bf3a783d29923da0b44127995954b74722c8317dda692538e94e21",
+    "original_task_path": "evidence/orchestrator-reader-sdk.json",
+    "published_sha256": "e9bfaa4794bf3a783d29923da0b44127995954b74722c8317dda692538e94e21",
     "transformation": "byte-identical"
   },
   "product-benchmark-final-after-1795467036.json": {

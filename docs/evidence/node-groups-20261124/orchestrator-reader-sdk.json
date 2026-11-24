@@ -1,0 +1,21 @@
+{
+  "module": {
+    "Path": "github.com/kuasar-sandbox/orchestrator",
+    "Version": "v0.2.0-preview.20261124.2",
+    "Sum": "h1:ZVRwyJcpepw6waSfO0JS4JVaulN9P2HEsUJK6qLTZd0=",
+    "GoModSum": "h1:VAo49sI1UTeyyV0UcQURfwap6056q8jPmTDXZERgzkk="
+  },
+  "release_run": 45296417785,
+  "source": "d9626893d02b7754dcd1542bc021146c24a58371",
+  "platform_selection": "a724fe8a3dcf6f3418523b11b4402ecf8721829e",
+  "vcs_modified": false,
+  "inspected_binaries": [
+    "node-ctl",
+    "cluster-ctl",
+    "e2b-key-ctl"
+  ],
+  "architectures": [
+    "x86_64",
+    "aarch64"
+  ]
+}

@@ -44,11 +44,11 @@ before either proposal is closed.
 |---|---|---|
 | Shared Ref reader, accelerator #238 | merged `127afc27958d2721beb4b36c135ee1b1fce86390` | SDK `v0.2.0-preview.20261124`; official run `45201145110` passed |
 | Sandboxer reader, #473 | head `d2c67d40d7db27801550c6055d41fb9dad349f7d`; merged `347b3fe657b66f69b0a86ce2c428bdb484471663` | exact-head run `45262391782` passed; component release `45271271036` passed |
-| Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` passed; actual reader release pending |
+| Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` and component release `45296417785` passed; actual SDK and both-architecture tools verified as `v0.2.0-preview.20261124.2` |
 | Node Group foundation, #572 | head `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a`; merged `d9626893d02b7754dcd1542bc021146c24a58371` | exact-head run `45287872172` passed (24 successful jobs; four inapplicable jobs skipped); tested merge tree equals the final main tree, including the cursor escaping fix |
 | Shared support repository, #573 | `80c6e0114248c214bed4a3a94a86b8697d7edd2b` | rebased onto merged #572 with an unchanged support patch; official run `45295630484` pending |
-| Snapshot producer, sandboxer #474 | `ecfd3ea66efb1968d6435f344e555decd2e873ca` | same tree as tested `5bd60b2`; waits for actual Orchestrator reader delivery |
-| Cluster activation, #574 | production changes through `85d1ce7`; failure/carrier tests through `1c6ff22` | final main rebase/CI/release pending |
+| Snapshot producer, sandboxer #474 | `ecfd3ea66efb1968d6435f344e555decd2e873ca` | same tree as tested `5bd60b2`; actual reader delivery gate satisfied, exact-head run `45298653710` pending |
+| Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | final main rebase/CI/release pending |
 
 Sandboxer SDK `v0.2.0-preview.20261124.1` resolved to
 `h1:lp8cYCRnPyyyNbzd7V7aRYS9OT3aLI/hN3UiQgVlNIE=`;
@@ -64,6 +64,15 @@ inapplicable jobs skipped). The [CI receipt](evidence/node-groups-20261124/reade
 records every job. It selects the Sandboxer reader
 but predates Orchestrator #571; it does not satisfy the remaining Orchestrator
 consumer gate.
+
+Orchestrator `v0.2.0-preview.20261124.2` subsequently delivered #571 from clean
+source `d9626893d02b7754dcd1542bc021146c24a58371`. Its actual public module sums
+and default platform selection are retained in the [SDK receipt](evidence/node-groups-20261124/orchestrator-reader-sdk.json).
+Both release archives matched published sizes/digests; `node-ctl`, `cluster-ctl`
+and `e2b-key-ctl` on both architectures report that clean source in their build
+information. [Binary hashes](evidence/node-groups-20261124/orchestrator-reader-delivery.json)
+identify the downloaded consumers. The producer became Ready only after these
+receipts were obtained. The final writer/activation aggregate is still pending.
 
 Both published readers restored snapshots from the updated producer on their
 native KVM hosts. The updated producer hashes are
@@ -119,7 +128,7 @@ that all earlier deliveries had no effects.
 | C08 | Old source output need not acquire invented metadata; a new capture gains its actual runtime. Actual opaque-token migration succeeds with an incompatible target default. |
 | C09 | Publication/rewrite tests preserve the same Snapshot declaration; member selection, physical carriers, internal parents and content keys exclude it. The review-found rewrite loss was fixed before #473 merge. |
 | C10 | Actual old-to-new and new-to-new restore pass on x86_64/aarch64. A genuinely old reader rejects new annotated refs. An intermediate reader accepted tarstream but rejected annotated Bundle, demonstrating why the complete reader was required. |
-| C11 | Actual module resolution and published binary tests precede producer enablement; source merge alone is insufficient. Orchestrator reader release remains a producer gate until its receipt is attached. |
+| C11 | Actual module resolution and published binary tests precede producer enablement; source merge alone is insufficient. Actual Orchestrator reader SDK, both-architecture tool hashes and candidate default selection are now recorded; producer enablement followed those receipts. |
 | C12 | Base/suffix/ref/TemplateID limits 256/336/592/799 bytes; native x86/ARM parser and actual mmap read/write pass. Build capture JSON, publication, route/Token and persistence suites preserve the reference. A 592-byte ref / 799-byte template also traversed selection, framed NodeLink command/report, actual native DB commit/readback, RouteLink response and mmap on all three backends on both architectures. Encrypted KMT and maximum runtime basename in Build capture JSON passed separately on x86 and ARM. |
 
 The full activation Go race suite passed (Node package 662.134 s). Follow-up
