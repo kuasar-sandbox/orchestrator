@@ -63,6 +63,9 @@ func validateRetainedReceipt(r *retainedAccount) error {
 		if err := e.Capture.Validate(); err != nil {
 			return err
 		}
+		if e.VMM != nil && e.VMM.Cgroup.Path != e.Source.CgroupPath {
+			return fmt.Errorf("retained VMM cgroup differs from source")
+		}
 		key := fmt.Sprintf("%s:%d", e.Capture.MemoryID, e.Capture.Epoch)
 		if keys[e.Capture] || paths[e.Capture.CapturePath] || ids[key] {
 			return fmt.Errorf("duplicate retained capture")
@@ -248,6 +251,9 @@ func validateRetentionProof(r *retainedCapture, proof *memorycheckpoint.CaptureR
 	if proof.Producer != r.Producer || proof.CheckpointID != r.CheckpointID || proof.Holder != r.Holder {
 		return fmt.Errorf("capture producer or holder identity changed")
 	}
+	if (proof.VMM == nil) != (r.VMM == nil) || proof.VMM != nil && (*proof.VMM != *r.VMM || proof.VMM.Cgroup.Path != r.Source.CgroupPath) {
+		return fmt.Errorf("capture VMM source identity changed")
+	}
 	return nil
 }
 
@@ -297,7 +303,7 @@ func retentionProcessStartTime(pid int) (uint64, error) {
 
 // Recover every capture before scanning any ordinary lease/process/cgroup.
 // Settled entries remain zero-charge identity evidence until SID retirement.
-func (i *Inventory) recoverRetained(state *State, controlPIDs map[int]bool) error {
+func (i *Inventory) recoverRetained(state *State, controlPIDs map[int]bool, retiredVMMs ...map[string]memorycheckpoint.VMMIdentity) error {
 	dir := retentionDir(i.ControllerSocket)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -335,6 +341,9 @@ func (i *Inventory) recoverRetained(state *State, controlPIDs map[int]bool) erro
 					} else if proof.Committed && proof.RuntimeRetired && e.Stage == retentionPrepared {
 						e.Stage, r.Stage, r.Handoff = retentionHeld, retentionHolding, nil
 						r.Revision++
+					}
+					if len(retiredVMMs) > 0 && proof.VMM != nil && e.Stage == retentionHeld && proof.Committed && proof.RuntimeRetired && !proof.RAMReleased {
+						retiredVMMs[0][e.Source.CgroupPath] = *proof.VMM
 					}
 				} else if i.Logf != nil {
 					i.Logf("retaining uncertain checkpoint memory sid=%s memory=%s: %v", r.SandboxID, e.Memory.MemoryID, err)

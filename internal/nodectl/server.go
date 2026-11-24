@@ -910,6 +910,9 @@ func featureResponse(features []string, coordinated ...bool) []string {
 	var out []string
 	if resource.HasFeature(features, resource.FeatureRetainedMemoryV2) {
 		out = append(out, resource.FeatureRetainedMemoryV2)
+		if resource.HasFeature(features, resource.FeatureDeferredVMMExit) {
+			out = append(out, resource.FeatureDeferredVMMExit)
+		}
 	}
 	if resource.HasFeature(features, resource.FeatureRetainedMemoryV1) {
 		out = append(out, resource.FeatureRetainedMemoryV1)

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"slices"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
@@ -122,6 +123,15 @@ func (s *Server) handleRetained(peerPID int, req *Message, token string) *Messag
 			if proof.Holder.PID != peerPID || proof.Holder.StartTime != start {
 				return bad(fmt.Errorf("capture holder does not own source reservation"))
 			}
+			if proof.VMM != nil {
+				if !resource.HasFeature(active.ClientFeatures, resource.FeatureDeferredVMMExit) || proof.VMM.Cgroup.Path != active.CgroupPath {
+					return bad(fmt.Errorf("deferred VMM does not own the source reservation"))
+				}
+				vmm, err := memorycheckpoint.IdentifyVMM(proof.VMM.PID, active.CgroupPath)
+				if err != nil || vmm != *proof.VMM {
+					return bad(fmt.Errorf("deferred VMM source identity not proven: %v", err))
+				}
+			}
 			if r == nil {
 				r = &retainedAccount{Version: 2, SandboxID: req.SandboxID, ID: NewToken(), Revision: 1, Stage: retentionActive,
 					OwnerLease: lease, OwnerFile: file, OwnerToken: token}
@@ -136,7 +146,7 @@ func (s *Server) handleRetained(peerPID int, req *Message, token string) *Messag
 				}
 				r.Revision++
 			}
-			e = &retainedCapture{Capture: *req.Retention, Producer: proof.Producer, CheckpointID: proof.CheckpointID, Holder: proof.Holder,
+			e = &retainedCapture{Capture: *req.Retention, Producer: proof.Producer, CheckpointID: proof.CheckpointID, Holder: proof.Holder, VMM: proof.VMM,
 				Memory: resource.RetainedMemory{MemoryID: req.Retention.MemoryID, Epoch: req.Retention.Epoch, SourcePool: s.State.SandboxPool(req.SandboxID), Bytes: active.ReservationMemory},
 				Stage:  retentionPrepared, Source: active, SourceStartTime: start, SourceFile: file}
 			r.Captures = append(r.Captures, e)
