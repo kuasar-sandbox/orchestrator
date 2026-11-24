@@ -35,4 +35,5 @@ export FAULT_WORK="$WORK" FAULT_OUT="$CASE_OUT" FAULT_GROUP="$GROUP" FAULT_DOMAI
 export FAULT_ROUTER="http://127.0.0.1:$ROUTER_PORT" FAULT_NODE="http://127.0.0.1:$NODE_PORT" FAULT_SANDBOX_CTL="$BIN/sandbox-ctl"
 export FAULT_REGISTRY_PID="${REGISTRY_PIDS[0]}" FAULT_CLUSTER_CTL="$BIN/run-cluster-ctl"
 export FAULT_REGISTRY="http://127.0.0.1:$CONTROL_PORT" FAULT_NODE_ID="$NODE_ID"
-python3 "$SCRIPT_DIR/cluster_faults.py" >"$WORK/cluster-faults.log" 2>&1
+# Only fixed diagnostics/PASS reach stdout; exception details remain private.
+python3 "$SCRIPT_DIR/cluster_faults.py" 2>"$WORK/cluster-faults.log"

@@ -82,5 +82,6 @@ export LEGACY_TEST_WORK="$WORK" LEGACY_TEST_OUT="$CASE_OUT" LEGACY_TEST_GROUP="$
 export LEGACY_TEST_API_KEY="$CLUSTER_API_KEY" LEGACY_TEST_TEMPLATE="$TEMPLATE_REF" LEGACY_TEST_ROUTE=legacy/runtime-incompatible
 export LEGACY_TEST_ROUTER="http://127.0.0.1:$ROUTER_PORT" LEGACY_TEST_HOST="api.$DOMAIN"
 export LEGACY_TEST_REGISTRY="http://127.0.0.1:$CONTROL_PORT" LEGACY_TEST_NODE_ID="$NODE_ID"
-python3 "$SCRIPT_DIR/cluster_legacy_runtime.py" >"$WORK/cluster-legacy-runtime.log" 2>&1
+# Only fixed failure diagnostics reach stdout; the receipt and traceback stay private.
+python3 "$SCRIPT_DIR/cluster_legacy_runtime.py" 2>"$WORK/cluster-legacy-runtime.log"
 echo 'PASS: actual unannotated SNP reached Node runtime validation and rejected an incompatible valid bundle'

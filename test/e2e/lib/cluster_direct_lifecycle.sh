@@ -33,7 +33,7 @@ BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/cluster_direct_buil
     --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
     --source "$GUEST_REF" --evidence "$WORK/build-actions.json" \
     --node-url "http://127.0.0.1:$NODE_PORT" --node-id "$NODE_ID" "${registry_args[@]}" \
-    >"$WORK/cluster-build.log" 2>&1 || fail "direct empty Group Build"
+    2>"$WORK/cluster-build.log" || fail "direct empty Group Build"
 TEMPLATE_REF=$(json_field "$WORK/build-actions.json" canonical)
 PRIMARY_WORK=$WORK
 PRIMARY_PORT=$NODE_PORT
