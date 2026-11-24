@@ -32,6 +32,8 @@ def main():
     build.require("POST", f"/v2/templates/{tid}/builds/{bid}", 202,
                   {"fromImage": args.source, "steps": [{"type": "RUN", "args": ["echo DIRECT_ROUTED_BUILD"]}]})
     ready = build.wait_for("empty-Group routed Build completes", lambda: build.check_terminal(tid, bid, "ready"), 300)
+    build.wait_for("routed Build RUN reached the guest", lambda: "DIRECT_ROUTED_BUILD" in build.command(
+        "journalctl", "KUASAR_BUILD_ID=" + bid, "--no-pager", "--output=cat").splitlines(), 30)
     canonical = ready["templateID"]
     assert canonical.startswith("e2b-img-"), "routed Build did not return a canonical image"
     stored = build.row(bid)
