@@ -85,7 +85,7 @@ if memory_refs != parent_refs:
     raise SystemExit(f"working-set external suffix={memory_refs!r}, want {parent_refs!r}")
 descriptor = memory_descriptor(sys.argv[6])
 parent_ref = json.loads(sys.argv[3])[2]
-expected_parent = "file://" + os.path.join(os.path.dirname(sys.argv[6]), parent_ref.removeprefix("file://"))
+expected_parent = "file://" + os.path.join(os.path.dirname(sys.argv[6]), parent_ref.split("@runtime:", 1)[0].removeprefix("file://"))
 assert descriptor.get("parents") == [expected_parent], (descriptor, expected_parent)
 assert descriptor.get("working_set") is True, descriptor
 parent_path = expected_parent.removeprefix("file://").split("@", 1)[0]
@@ -345,8 +345,8 @@ import json, sys
 current, first = (json.load(open(path)) for path in sys.argv[1:3])
 assert (current.get("FromRefs") or []) == (first.get("FromRefs") or []), (current, first)
 before, after = (json.loads(raw) for raw in sys.argv[3:5])
-assert after[2] == "file://" + sys.argv[5] + ".bundle@manifest:" + sys.argv[5], after
-assert before[2] != after[2] and before[3] != after[3], (before, after)
+assert after[2].split("@runtime:", 1)[0] == "file://" + sys.argv[5] + ".bundle@manifest:" + sys.argv[5], after
+assert before[2].split("@runtime:", 1)[0] != after[2].split("@runtime:", 1)[0] and before[3] != after[3], (before, after)
 PY_BUNDLE_LOCAL_B
 [ -e "$BUNDLE_TARGET" ] || fail "local Bundle B lost necessary A memory carrier"
 
@@ -433,8 +433,8 @@ import json, sys
 current, first = (json.load(open(path)) for path in sys.argv[1:3])
 assert (current.get("FromRefs") or []) == (first.get("FromRefs") or []), (current, first)
 before, after = (json.loads(raw) for raw in sys.argv[3:5])
-assert after[2] == "file://" + sys.argv[5] + ".bundle@manifest:" + sys.argv[5], after
-assert before[2] != after[2] and before[3] != after[3], (before, after)
+assert after[2].split("@runtime:", 1)[0] == "file://" + sys.argv[5] + ".bundle@manifest:" + sys.argv[5], after
+assert before[2].split("@runtime:", 1)[0] != after[2].split("@runtime:", 1)[0] and before[3] != after[3], (before, after)
 PY_BUNDLE_LOCAL_C
 [ -e "$BUNDLE_B_TARGET" ] && [ -e "$BUNDLE_TARGET" ] \
     || fail "local Bundle C lost necessary A/B memory carriers"

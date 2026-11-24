@@ -80,6 +80,26 @@ class SnapshotBundleGraph(unittest.TestCase):
                                     text=True, capture_output=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
 
+    def test_local_bundle_capture_has_a_new_carrier_with_or_without_runtime_metadata(self):
+        annotation = "@runtime:runtime.bundle:digest:" + "1" * 64
+        for marker in ("PY_BUNDLE_LOCAL_B", "PY_BUNDLE_LOCAL_C"):
+            parser = shipped_assertion(marker)
+            with tempfile.TemporaryDirectory() as directory:
+                cfg = Path(directory) / "config.json"
+                cfg.write_text('{"FromRefs":[]}')
+                for suffix in ("", annotation):
+                    before = ["paused", "snapshot", "file://" + A + ".bundle@manifest:" + A, "old-E", ""]
+                    after = ["paused", "snapshot", "file://" + B + ".bundle@manifest:" + B + suffix, "new-E", ""]
+                    def run():
+                        return subprocess.run([sys.executable, "-", str(cfg), str(cfg),
+                                               json.dumps(before), json.dumps(after), B],
+                                              input=parser, text=True, capture_output=True, timeout=5)
+                    result = run()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # Changing only scheduling metadata cannot stand in for a new S.
+                    before[2] = "file://" + B + ".bundle@manifest:" + B
+                    self.assertNotEqual(run().returncode, 0)
+
     def test_runtime_declaration_does_not_change_root_or_history_identity(self):
         annotation = "@runtime:sandbox-runtime.bundle:digest:" + "1" * 64
         for parser in (PARSER, shipped_assertion("PY_BUNDLE")):
