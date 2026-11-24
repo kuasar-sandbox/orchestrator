@@ -36,6 +36,7 @@ foundationdb:
 
 placer_link:
   placer_label: placer.default
-  placer_replica_count: 3
-  min_ready_placers: 1
-  place_timeout: 2s
+
+placement:
+  candidates: 2                       # Registry P2C sample size
+  zone_admit_max: yellow               # exclude nodes hotter than this (green|yellow|red)

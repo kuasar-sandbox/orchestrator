@@ -12,7 +12,7 @@
 - `router`:e2b 兼容统一入口,按 sandbox-group 定位 route owner,热路径直转 node。
 - `placer`: 从 `node_list` 选择静态导入目标，维护完整 Group 记录和有条件 Node 更新。
 
-Registry 通过类型化 repository 访问 FoundationDB 7.3.77 持久执行元数据。事务、复制与存储恢复由 FoundationDB 负责；Registry 保留生命周期规则、node 连接归属与命令下发。Router 和 Placer 继续使用业务协议，不引入数据库 client。
+Registry 通过类型化 repository 访问 SQLite、PostgreSQL 或 FoundationDB 7.3.77 持久执行元数据。SQLite 仅支持单 Registry，共享部署使用 PostgreSQL 或 FoundationDB。事务与存储恢复由所选数据库负责；Registry 保留生命周期规则、node 连接归属与命令下发。Router 和 Placer 继续使用业务协议，不引入数据库 client。
 
 **阅读路径：** [公共入口](#client-access) · [Group 与放置](#groups-and-placement) · [角色配置](#configuration) · [状态所有权](#membership-and-state) · [Link 协议](#protocols) · [故障与恢复](#failure-and-recovery)
 
@@ -32,7 +32,7 @@ flowchart TD
   registry <-->|"node_link commands and state"| node
   placer["Placer and Group source"] -->|"Conditional Group imports"| registry
   registry -->|"node_list WATCH_LIST"| placer
-  registry -->|"Typed metadata transactions"| fdb["FoundationDB"]
+  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
 ```
 
 稳态数据面不经过 registry.只有显式 create/connect/exec-session,以及数据面 target 缺失或
@@ -52,7 +52,7 @@ typed stale fallback 路径需要 registry:
 
 1. **group 是业务分片键**:所有 cluster 北向请求必须携带 `X-Kuasar-Sandbox-Group` 或等价 group
    身份。当前不支持无 group 的 cluster 数据面入口。
-2. **持久元数据由 FoundationDB 保存**：Registry 进程故障不会擦除元数据。数据库可用性由独立的 FoundationDB 冗余和故障域决定，不取决于 Registry owner 数。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
+2. **持久元数据由所选数据库保存**：Registry 进程故障不会擦除元数据。数据库可用性由其配置的冗余和故障域决定，不取决于 Registry owner 数。SQLite 只支持单 Registry；共享 PostgreSQL/FDB 可使用多个成员。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
 3. **操作保持类型化范围**：Route/Build 使用 group 与记录身份，node 操作使用 NodeID，低频目录按 bucket 有界分页。不能把无关局部列表拼成权威事实。
 4. **原子性对应业务不变量**：耦合的 intent/ownership、生命周期 fence 与投影通过类型化事务提交，Registry 成员不维护彼此的元数据副本。
 5. **成员健康不参与分片计算**:成员表来自版本化配置;`LocateN` 输入只使用 membership members。
@@ -840,7 +840,7 @@ Registry 通过一份共享仓储实现，将执行元数据持久化到 SQLite�
 
 | 层次 | 目标 | 对调用方的最小接口 |
 |---|---|---|
-| Router / Placer | 鉴权转发，或基于已校验目录提出 placement | 既有 route_link / placer_link / node_list HTTP 契约 |
+| Router / Placer | 鉴权转发，或向已校验的静态目标条件导入 Group | 既有 route_link / placer_link / node_list HTTP 契约 |
 | Registry 业务服务 | 校验生命周期与归属、下发命令、处理节点报告 | Route、Build、Node、Ownership、KeyPair、Directory、ImportSource 类型化能力 |
 | `internal/cluster/metadata` | 定义中立记录、完整版本、领域结果与有界列表 | `Versioned[T]`、`Version`、领域 repository 方法、`Invalidation`、`ObservationAdmission` |
 | `internal/cluster/metastore` | 共享业务仓储实现 | 原子的生命周期、索引和归属操作 |
@@ -1596,6 +1596,7 @@ Resolve,不会隐式创建 sandbox。
 - node proxy 在 CONNECT 握手阶段返回带 `X-Kuasar-Proxy-Error: not_found|unauthorized` 的 404/401。
 - node data_endpoint 连接失败。
 - route TTL 或 idle timeout 到期。
+- 成功的 Create、Connect 或 exec-session 响应确认了另一个 Node/本地实例，且修订不早于缓存 route。此时淘汰旧数据目标；控制响应不填充数据缓存。
 
 握手成功后的 HTTP 401/403/404 是沙箱内应用或 envd 的响应,不淘汰 route。带上述 typed error 的
 握手失败会淘汰旧 target,以同一请求 credential 调用 `ReserveData` 复验并取得 fresh route,然后只
@@ -1606,14 +1607,14 @@ Resolve,不会隐式创建 sandbox。
 ### Build
 
 Build 记录由 group-scoped `BuildRepository` 访问。node 拥有 durable registration/execution
-claim 和 usage；node-link owner 持有当前连接与 profile 投影供 Registry 检查。
+claim 和 usage；node-link owner 持有当前连接与 profile 投影供 Registry 检查。首次注册在复制输入前核对所选 Group 修订；已有持久 Build 优先解析，之后的 Group 变化不会改写其原始输入。
 
 ```text
 router build register
   │ stable build_id/template_id + explicit profile
   ▼
-route owner ReserveBuild → PlaceBuild
-  │ placer filters configured capacity and suggests a node
+route owner ReserveBuild
+  │ Registry selects one Node from published Group/auth support, Placement and capacity
   ▼
 node owner: live connection + current registration usage check
   │
@@ -1639,7 +1640,7 @@ control HTTP 只缓存并拨该地址.结果不保留旧 `DataEndpoint` alias,Bu
 显式存在。`builder.target` 通过 `X-Kuasar-Sandbox-Builder` 请求头或 `metadata["kuasar-sandbox.builder"]` 提供，注册后不可更改：Image、top-level
 Sandbox E、memory Sandbox 三种 target 均随 canonical builder JSON、Registry replay identity、
 `build_register` 和节点 Build row 传递；构建声明或从来源模板继承 workspace 时，须在注册时显式指定 Sandbox 目标。无 workspace 的构建可以省略目标，由 worker 根据最终生效的 start/ready 命令自动选择。
-route owner 将 profile、target/config identity 与 placement 返回的 `APISecretFingerprint` 持久化进
+route owner 将 profile、target/config identity 与 所选 Group entry 的 `APISecretFingerprint` 持久化进
 BuildRecord,并随 `build_register` 下发,节点按该完整指纹从同一凭据对写入本地 build,同时将
 profile 写入 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bare build 可选择三种 target，
 但仍不接受 e2b 专属的 start/ready 命令。
@@ -1653,7 +1654,7 @@ header/metadata 归一化，也传递 `envVars`。Registry 的 durable BuildReco
 对 instance-only 输入的拒绝、restore 的无条件拒绝、target 与输出 ref 的一致性由 Router、Registry、
 节点和 worker 各自 fail closed，不能靠某一跳的过滤作为信任边界。
 
-Placer 筛选低频配置容量；Registry 验证 node 当前连接和 registration usage headroom，先持久化
+Registry 筛选已发布的 Group/auth 支持、请求 Placement 与配置容量，验证 node 当前连接和 registration usage headroom，先持久化
 immutable `BuildStarting` dispatch intent 与 `(node_id,build_id)` owner ref，再下发 `build_register`。
 Node 的 durable registration transaction 是唯一权威准入决定；Registry 没有 `AdmitBuild` lease
 或终态 `ReleaseBuild` RPC。明确余量不足或 definitive admission rejection 可在 exact intent cleanup

@@ -151,7 +151,7 @@ type GroupSourceConfig struct {
 }
 
 // PlacerProcessConfig is the standalone placer's own control plane. The same
-// advertise address is used for placer API calls and placer memberlist HTTP
+// advertise address is used for importer memberlist HTTP
 // transport.
 type PlacerProcessConfig struct {
 	ID              string `yaml:"id"`
@@ -834,17 +834,17 @@ func (c *RouterConfig) RouteIdleDur() time.Duration {
 }
 
 // ===========================================================================
-// placer.yaml — placement scheduler (docs/cluster.md#placer-configuration).
+// placer.yaml — optional Group importer (docs/cluster.md#placer-configuration).
 // ===========================================================================
 
 // PlacerConfig is the standalone placer's config. It discovers registry
-// membership through the bootstrap endpoint, pushes itself to placer_link, and
-// answers placement calls from registry route owners.
+// membership through the bootstrap endpoint, registers its memberlist seed, and
+// maintains Group definitions through conditional Node commands.
 type PlacerConfig struct {
 	Placer       PlacerProcessConfig `yaml:"placer"`
 	Registry     RegistryDialConfig  `yaml:"registry"` // upstream: registry bootstrap/membership
 	ImportGroups []GroupSourceConfig `yaml:"import_groups,omitempty"`
-	Placement    PlacementConfig     `yaml:"placement"` // placement policy
+	Placement    PlacementConfig     `yaml:"placement"` // static import targets and lease policy
 }
 
 // DefaultPlacer returns the placer config with all non-required fields set.

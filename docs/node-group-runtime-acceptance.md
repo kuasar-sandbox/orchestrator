@@ -139,6 +139,14 @@ rolls back one real transaction before losing the successful commit reply; x86
 and ARM regressions passed. The final runner uses a short temporary path. Failed
 attempts remain in the local archive and are not counted as passing.
 Source checks include Go vet and 359 Python helper tests.
+A final operator-entry audit found that generated and shipped Registry/Placer
+configs still contained retired placement fields. The CLI also retained an older
+`node_list` setting no longer accepted by the Registry schema. These inputs were
+rejected by the actual configuration command before the fix. Generated and
+shipped examples now round-trip through that command for all three roles; the
+configuration/reload race regressions pass. The matching English and Chinese
+operator docs describe Registry selection and optional Group import. This fixes
+the delivery surface without adding fallback parsing for obsolete settings.
 The real cluster lifecycle run covered Build, Group import, Create, exec, cold
 Wake, WebSocket/envd, stats, List/Delete and retained Build status after Router
 restart. Separate real recovery/reset runs covered owner failover, conductor

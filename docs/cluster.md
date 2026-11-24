@@ -12,7 +12,7 @@ This contract follows cluster capabilities and state ownership across Registry, 
 - `router`: a unified e2b-compatible entry point that locates the route owner by sandbox group and forwards the hot path directly to the node.
 - `placer`: imports complete Group records and maintains conditional Node updates from the `node_list` view.
 
-Registry accesses durable execution metadata through typed repositories backed by FoundationDB 7.3.77. Transaction, replication and recovery belong to FoundationDB; Registry retains lifecycle rules, node connection ownership and command dispatch. Router and Placer use the same business protocols without importing a database client.
+Registry accesses durable execution metadata through typed repositories backed by SQLite, PostgreSQL or FoundationDB 7.3.77. SQLite is limited to one Registry; shared deployments use PostgreSQL or FoundationDB. Transactions and storage recovery belong to the selected database; Registry retains lifecycle rules, node connection ownership and command dispatch. Router and Placer use the same business protocols without importing a database client.
 
 **Read by task:** [Public ingress](#client-access) · [Groups and placement](#groups-and-placement) · [Configure roles](#configuration) · [State ownership](#membership-and-state) · [Link protocols](#protocols) · [Failure and recovery](#failure-and-recovery)
 
@@ -32,7 +32,7 @@ flowchart TD
   registry <-->|"node_link commands and state"| node
   placer["Placer and Group source"] -->|"Conditional Group imports"| registry
   registry -->|"node_list WATCH_LIST"| placer
-  registry -->|"Typed metadata transactions"| fdb["FoundationDB"]
+  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
 ```
 
 The steady-state data plane bypasses Registry. Explicit create/connect/exec-session operations and data requests with a missing target or typed stale fallback require Registry:
@@ -47,7 +47,7 @@ The steady-state data plane bypasses Registry. Explicit create/connect/exec-sess
 ### Design principles
 
 1. **Group is the business shard key**: every northbound cluster request must include `X-Kuasar-Sandbox-Group` or equivalent group identity. A cluster data-plane entry without a group is currently unsupported.
-2. **Durable metadata belongs to FoundationDB**: Registry process failure does not erase metadata. Database availability depends on the external FoundationDB redundancy and failure domains, not Registry owner count. Losing all metadata still does not authorize reconstructing execution ownership from incomplete reports.
+2. **The selected database owns durable metadata**: Registry process failure does not erase metadata. Database availability depends on its configured redundancy and failure domains, not Registry owner count. SQLite supports one Registry; shared PostgreSQL/FDB deployments can use multiple members. Losing all metadata still does not authorize reconstructing execution ownership from incomplete reports.
 3. **Operations stay within typed scopes**: Route/Build operations use a group and record identity, node operations use NodeID, and the low-frequency directory uses bounded bucket pages. Unrelated partial lists cannot be merged into authority.
 4. **Atomicity follows business invariants**: coupled intent/ownership, lifecycle fences and projections commit through typed transactions. Registry members do not maintain replicas of each other's metadata.
 5. **Member health does not determine sharding**: the member list comes from versioned configuration; `LocateN` takes only membership members as input. Memberlist detects health and propagates metadata.
@@ -887,7 +887,7 @@ A node may connect to any Registry member. The receiving member obtains its orde
 | Is not a candidate and the node supports redirect | Returns the configured candidate endpoints; the node reconnects |
 | Is not a candidate and no usable redirect is available | Relays sequentially to candidates until an owner accepts |
 
-The profile's `link_owner` identifies the Registry process actually holding the h2 stream. Route-owner create/connect/delete/build/key commands reach that process through node-owner RPC. There is one durable metadata copy from the application's perspective, accessed through FoundationDB; accepting a stream does not start peer metadata replication.
+The profile's `link_owner` identifies the Registry process actually holding the h2 stream. Route-owner create/connect/delete/build/key commands reach that process through node-owner RPC. There is one durable metadata store from the application's perspective, accessed through the selected backend; accepting a stream does not start peer metadata replication.
 
 During `old_grace`, an old member may remain `link_owner` and receive forwarded commands. After disconnect, the node reconnects using current candidates. The immutable registration fence prevents an overlapping old session from adopting a new profile or erasing its ownership.
 
@@ -1303,6 +1303,7 @@ Evict a cached route when:
 - The node proxy returns 404/401 during the CONNECT handshake with `X-Kuasar-Proxy-Error: not_found|unauthorized`.
 - Connecting to node data_endpoint fails.
 - Route TTL or cache idle timeout expires.
+- A successful Create, Connect or exec-session response identifies another Node/local instance at a revision at least as new as the cached route. This invalidates the old data target; the control response does not populate the data cache.
 
 After a successful handshake, HTTP 401/403/404 comes from the sandbox application or envd and does not evict the route. A handshake failure with the typed errors above evicts the old target, calls `ReserveData` with the same request credential to revalidate and obtain a fresh route, then retries once. Ordinary connection failure only evicts the cache; subsequent requests Resolve again. No router route subscription is maintained for this purpose.
 
@@ -1310,14 +1311,14 @@ After a successful handshake, HTTP 401/403/404 comes from the sandbox applicatio
 
 ### Build
 
-Build records are accessed through the group-scoped `BuildRepository`. The node owns durable registration/execution claims and usage; its node-link owner holds the current connectivity/profile projection for Registry checks.
+Build records are accessed through the group-scoped `BuildRepository`. The node owns durable registration/execution claims and usage; its node-link owner holds the current connectivity/profile projection for Registry checks. First registration checks the selected Group revision before copying its inputs. An existing durable Build is resolved first, so later Group changes do not rewrite its original inputs.
 
 ```text
 router build register
   │ stable build_id/template_id + explicit profile
   ▼
-route owner ReserveBuild → PlaceBuild
-  │ placer filters configured capacity and suggests a node
+route owner ReserveBuild
+  │ Registry selects one Node from published Group/auth support, Placement and capacity
   ▼
 node owner: live connection + current registration usage check
   │
@@ -1338,11 +1339,11 @@ node TTL deletes history; BuildDelete removes projection/ref
 
 `ReserveBuild` returns the current node's `APIEndpoint`. Router caches and dials only that address for later build status/trigger/files/log control HTTP. The result retains no old `DataEndpoint` alias, and BuildRecord does not copy endpoints.
 
-Northbound `/v3/templates` resolves omitted profile to `e2b` according to that endpoint's semantics. Internally, profile must be explicit. `builder.target`, supplied through the `X-Kuasar-Sandbox-Builder` header or `metadata["kuasar-sandbox.builder"]`, is immutable after registration: Image, top-level Sandbox E and memory Sandbox targets travel with canonical builder JSON, Registry replay identity, `build_register` and the node Build row. Builds that declare a workspace or inherit one from the source template require an explicit Sandbox target at registration. For builds without workspaces, the worker resolves an omitted target from effective start/ready commands. The route owner persists profile, target/config identity and placement's `APISecretFingerprint` into BuildRecord and passes them through `build_register`. The node uses the full fingerprint to copy the same credential pair into the local Build and writes profile into BuildSpec. Missing/invalid values are rejected, never silently rewritten. Bare builds can choose all three targets but still cannot use e2b-only start/ready commands.
+Northbound `/v3/templates` resolves omitted profile to `e2b` according to that endpoint's semantics. Internally, profile must be explicit. `builder.target`, supplied through the `X-Kuasar-Sandbox-Builder` header or `metadata["kuasar-sandbox.builder"]`, is immutable after registration: Image, top-level Sandbox E and memory Sandbox targets travel with canonical builder JSON, Registry replay identity, `build_register` and the node Build row. Builds that declare a workspace or inherit one from the source template require an explicit Sandbox target at registration. For builds without workspaces, the worker resolves an omitted target from effective start/ready commands. The route owner persists profile, target/config identity and the selected Group entry's `APISecretFingerprint` into BuildRecord and passes them through `build_register`. The node uses the full fingerprint to copy the same credential pair into the local Build and writes profile into BuildSpec. Missing/invalid values are rejected, never silently rewritten. Bare builds can choose all three targets but still cannot use e2b-only start/ready commands.
 
 Build Register and ordinary Create share strict header/metadata normalization for resource/network/launch/init/mounts/files/metadata, and also pass `envVars`. Registry's durable BuildRecord retains non-secret config/env plus irreversible digests of credentials/MMDS values. Public Build Register `secure` is rejected with HTTP 400, including false/null. Historical secure values remain in internal dispatch, durable state and registration replay identity so older in-flight intents can complete; they do not affect execution or target validation. Raw credentials and initial MMDS values live only in the current dispatch envelope; after validation, the node encrypts them into task-local Build state. Router, Registry, node and worker must each fail closed on instance-only inputs for explicit Image/top-level Sandbox E, unconditional rejection of restore, and target/output-ref mismatches. Filtering by one hop does not replace another hop's trust boundary.
 
-Placer filters low-frequency configured capacity. Registry validates the node's live connection and current registration-usage headroom, then persists immutable `BuildStarting` dispatch intent and the `(node_id,build_id)` ownership ref before `build_register`. The node's durable registration transaction is the sole authoritative admission decision; Registry has no `AdmitBuild` lease or terminal `ReleaseBuild` RPC. Insufficient known headroom or a definitive admission rejection permits exclusion/reselection after exact intent cleanup. Timeout, reset, disconnect, ACK loss or an invalid/uncertain acceptance leaves the operation bound to the selected node and BuildID. A retry must replay the identical stored definition and credential/MMDS digests to that same target; it cannot silently move an ambiguous registration to another node. Equal build_id values on different nodes remain distinct node-local bindings.
+Registry filters published Group/auth support, request Placement and configured capacity. It validates the node's live connection and current registration-usage headroom, then persists immutable `BuildStarting` dispatch intent and the `(node_id,build_id)` ownership ref before `build_register`. The node's durable registration transaction is the sole authoritative admission decision; Registry has no `AdmitBuild` lease or terminal `ReleaseBuild` RPC. Insufficient known headroom or a definitive admission rejection permits exclusion/reselection after exact intent cleanup. Timeout, reset, disconnect, ACK loss or an invalid/uncertain acceptance leaves the operation bound to the selected node and BuildID. A retry must replay the identical stored definition and credential/MMDS digests to that same target; it cannot silently move an ambiguous registration to another node. Equal build_id values on different nodes remain distinct node-local bindings.
 
 BuildUpsert/Delete carries only a node-local projection. The nodelink owner obtains group from the immutable `(node_id,build_id)` ref. Terminal Upsert updates the query projection; durable node heartbeat reports claim usage. Cancel/delete intent commit immediately releases registration usage. After exact execution-owner cleanup, terminal commit releases execution ownership. Explicit deletion, including persisted delete intent after cleanup, or node TTL removes the retained row and sends BuildDelete with immutable transient TemplateID, allowing Registry to remove only the matching projection/ref. See the [durable usage query](../internal/store/build_admission.go) and [registration transaction](../internal/store/mmds_route_secret_values.go). Northbound queries and Router caches always include group. Every node Build durable transition and its corresponding live publication is serialized under an unconditional per-Build fence, independent of conductor Extension enablement, so waiting cannot arrive after building/terminal and overwrite Registry's projection.
 
@@ -1381,7 +1382,7 @@ Sandbox-group configuration, placement hints, APISecret and ManifestKey remain t
 | node_link disconnect | Node owner immediately rejects new submissions to that node; route owner excludes/reselects it. Once the disconnected node's last heartbeat is older than node_dead_after, revision-fenced reaping claims the stale profile and cleans its directory and eligible execution projections. Dead/deleting Sandbox management rows and their exact ownership remain; in-flight reservations are not swept. Reconnection reports full/incremental state |
 | Conductor process restart | Reconciles durable rows against systemd units: adopts live sandboxes/builders, retries deleting/paused cleanup, resumes already accepted interrupted restores, and cleans/fails missing fresh executions. This is not whole-host reboot |
 | Node host reboot | Running processes are gone. If node SQLite/artifacts survive, reconciliation still processes paused rows, accepted interrupted restores, cleanup owners and retained Builds. Missing executions converge through node reports/exact route cleanup; no blanket durable-row deletion or automatic recreation of every old sandbox |
-| One Registry member fails | Other service candidates still access durable metadata in FoundationDB. Nodes whose stream owner failed reconnect; registration fences reject stale overlapping sessions |
+| One Registry member fails | With a shared PostgreSQL/FDB backend, other service candidates still access durable metadata; a single SQLite Registry must restart. Nodes whose stream owner failed reconnect; registration fences reject stale overlapping sessions |
 | FoundationDB is unavailable or cannot commit | Metadata operations fail or return an explicit unknown commit outcome; Registry does not fall back to local writes |
 | FoundationDB metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; the application recovery/bootstrap protocol remains unavailable (#34 is historical) |
 | Membership change | Changes service candidates and node-link affinity; all views keep using the same database and prefix |

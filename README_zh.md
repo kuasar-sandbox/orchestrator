@@ -56,9 +56,9 @@
 
 `cluster-ctl` 运行三个独立角色:
 
-- **Registry**:复制的集群状态与节点通道枢纽。
+- **Registry**:持久集群元数据、Node 选点与节点通道枢纽。
 - **Router**:集群级 E2B 兼容控制面与数据面统一入口,按稳定沙箱身份路由。
-- **Placer**:sandbox-group provider/importer，以及创建、恢复和迁移的节点放置建议。生命周期提交与执行由 Registry 和 Node 负责。
+- **Placer**:可选的 Node Group 导入、条件维护与凭据续期。Registry 从节点已发布的支持中选点，Node 负责执行和资源准入。
 
 控制面保留稳定的外部 Sandbox 身份,实际 node-local 实例可在恢复/迁移时改变。
 
@@ -89,7 +89,7 @@
 | `node-ctl export-sandbox` / `import-sandbox` | 跨节点移动 portable Sandbox 状态 |
 | `run-cluster-ctl registry` | 启动 Registry |
 | `run-cluster-ctl router` | 启动集群控制与数据统一入口 |
-| `run-cluster-ctl placer` | 启动放置服务 |
+| `run-cluster-ctl placer` | 启动 Group 导入维护 |
 | `e2b-key-ctl ...` | 生成和派生租户凭据 |
 
 move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkpoint 的物理清理可能
@@ -109,7 +109,7 @@ move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkp
 
 ## 部署概览
 
-独立节点运行 Conductor 与 Proxy；按需独立启动 Telemetry。Telemetry 复用 Plugin Plane，不加入 Create/Resume barrier，其故障不改变 Sandbox lifecycle。示例配置显式启用 embedded Prometheus TSDB；本地存储必须通过 `local.enabled` 选择，未配置的 query backend 默认 `none`，写入与查询独立装配。完整选择见[观测](docs/observability_zh.md#telemetry)。集群另加 Registry、Router、Placer，并使用独立 FoundationDB 数据库。完整安装 native runtime bundle，通过 `run-cluster-ctl` 启动集群角色；Registry peer 使用相同 cluster file 和 prefix。配置样例与 systemd unit 位于 `deploy/`，详见[原生构建与运行包](docs/cluster_zh.md#native-build-and-runtime)。
+独立节点运行 Conductor 与 Proxy；按需独立启动 Telemetry。Telemetry 复用 Plugin Plane，不加入 Create/Resume barrier，其故障不改变 Sandbox lifecycle。示例配置显式启用 embedded Prometheus TSDB；本地存储必须通过 `local.enabled` 选择，未配置的 query backend 默认 `none`，写入与查询独立装配。完整选择见[观测](docs/observability_zh.md#telemetry)。集群另加 Registry、Router，以及可选的 Placer 导入维护。Registry 按配置使用 SQLite、PostgreSQL 或 FoundationDB；SQLite 仅支持单 Registry。完整安装 native runtime bundle，通过 `run-cluster-ctl` 启动集群角色；Registry peer 使用相同数据库和元数据 namespace。配置样例与 systemd unit 位于 `deploy/`，详见[原生构建与运行包](docs/cluster_zh.md#native-build-and-runtime)。
 
 面向用户的发布件安装流程见项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)。生产部署应使用持久存储、生产 TLS、受保护凭据、明确网络策略及基于实际 workload 验证的容量设置。
 
