@@ -292,11 +292,12 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	}
 	starting, err := o.st.Get(ctx, sb.ID)
 	if err != nil || starting == nil || starting.State != types.StateStarting {
-		t.Fatalf("placeholder runtime readiness published Running before /init: %+v, %v", starting, err)
+		t.Fatalf("runtime readiness published Running before E2B /init: %+v, %v", starting, err)
 	}
 	launch, err := rtconfig.Load(o.sandboxConfigPath(sb))
-	if err != nil || !launch.Launch.Placeholder || len(launch.Launch.Plugin) != 1 {
-		t.Fatalf("expected placeholder plus envd plugin: %+v, %v", launch, err)
+	if err != nil || launch.Launch.Placeholder || len(launch.Launch.Plugin) != 0 ||
+		launch.Launch.Exec != "/opt/sandbox-runtime/bin/envd" {
+		t.Fatalf("expected the original envd primary: %+v, %v", launch, err)
 	}
 	releaseInit.Do(func() { close(allowInit) })
 	select {
