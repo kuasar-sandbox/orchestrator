@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memorycheckpoint"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
@@ -56,7 +57,8 @@ func (i *Inventory) Recover(state *State) error {
 		return fmt.Errorf("lease inventory mkdir: %w", err)
 	}
 	controlPIDs := make(map[int]bool)
-	if err := i.recoverRetained(state, controlPIDs); err != nil {
+	retiredVMMs := make(map[string]memorycheckpoint.VMMIdentity)
+	if err := i.recoverRetained(state, controlPIDs, retiredVMMs); err != nil {
 		return err
 	}
 	if err := i.scanLeases(state, controlPIDs); err != nil {
@@ -65,7 +67,7 @@ func (i *Inventory) Recover(state *State) error {
 	if err := i.scanManaged(state, controlPIDs); err != nil {
 		return err
 	}
-	if err := i.scanCgroups(state, controlPIDs); err != nil {
+	if err := i.scanCgroups(state, controlPIDs, retiredVMMs); err != nil {
 		return err
 	}
 	snapshot := state.ResourceSnapshot()
@@ -337,7 +339,7 @@ func (i *Inventory) vmmCgroup(pid int) string {
 	return managedVMMCgroup(pid)
 }
 
-func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
+func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool, retiredVMMs ...map[string]memorycheckpoint.VMMIdentity) error {
 	seen := make(map[string]bool)
 	for _, root := range i.CgroupScanPaths {
 		root = filepath.Clean(root)
@@ -374,6 +376,20 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 			}
 			if !populated || state.HasCgroup(path) {
 				return nil
+			}
+			// An old VMM can still be exiting after logical retirement. Only
+			// the original identity and the exact charged source cgroup may
+			// suppress the orphan charge; a foreign consumer never matches.
+			if len(retiredVMMs) > 0 {
+				if vmm, ok := retiredVMMs[0][path]; ok {
+					covered, err := vmm.CoversCgroup(path)
+					if covered && err == nil {
+						return nil
+					}
+					if err != nil && i.Logf != nil {
+						i.Logf("retired VMM inventory uncertain: %v", err)
+					}
+				}
 			}
 			// Full retained inventory has registered every exact live holder
 			// PID. A historical cgroup pathname alone cannot suppress a new,

@@ -385,7 +385,7 @@ func (o *Orchestrator) prepareCheckpointRetirement(ctx context.Context, sb *type
 	if err := os.MkdirAll(filepath.Join(sb.BaseDir, "checkpoint"), 0700); err != nil {
 		return nil, err
 	}
-	permit := ctl.HostRetirementPermit{Version: 1, SandboxID: sb.ID, InstanceID: sb.InstanceID, RunID: sb.RunID, CheckpointID: checkpointID, OperationID: checkpointID}
+	permit := ctl.HostRetirementPermit{Version: 1, SandboxID: sb.ID, InstanceID: sb.InstanceID, RunID: sb.RunID, CheckpointID: checkpointID, OperationID: checkpointID, DeferVMMExit: true}
 	_, err := o.mutateRetirement(ctx, sb.RunID, func(m *store.RunPoolOwnership) error {
 		if m.Kind != runKindSandbox || (m.TaskID != "" && m.TaskID != sb.ID) {
 			return errors.New("runner retirement owner mismatch")

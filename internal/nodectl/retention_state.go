@@ -39,6 +39,7 @@ type retainedCapture struct {
 	Producer        memorycheckpoint.RunIdentity    `json:"producer"`
 	CheckpointID    string                          `json:"checkpoint_id"`
 	Holder          memorycheckpoint.HolderIdentity `json:"holder"`
+	VMM             *memorycheckpoint.VMMIdentity   `json:"vmm,omitempty"`
 	Memory          resource.RetainedMemory         `json:"memory"`
 	Stage           string                          `json:"stage"`
 	Source          Reservation                     `json:"source"`
@@ -63,6 +64,10 @@ type retainedHandoff struct {
 func cloneCapture(r *retainedCapture) *retainedCapture {
 	out := *r
 	out.Source = cloneReservation(&r.Source)
+	if r.VMM != nil {
+		v := *r.VMM
+		out.VMM = &v
+	}
 	return &out
 }
 
