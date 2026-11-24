@@ -46,9 +46,14 @@ before either proposal is closed.
 | Sandboxer reader, #473 | head `d2c67d40d7db27801550c6055d41fb9dad349f7d`; merged `347b3fe657b66f69b0a86ce2c428bdb484471663` | exact-head run `45262391782` passed; component release `45271271036` passed |
 | Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` and component release `45296417785` passed; actual SDK and both-architecture tools verified as `v0.2.0-preview.20261124.2` |
 | Node Group foundation, #572 | head `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a`; merged `d9626893d02b7754dcd1542bc021146c24a58371` | exact-head run `45287872172` passed (24 successful jobs; four inapplicable jobs skipped); tested merge tree equals the final main tree, including the cursor escaping fix |
-| Shared support repository, #573 | `80c6e0114248c214bed4a3a94a86b8697d7edd2b` | rebased onto merged #572 with an unchanged support patch; official run `45295630484` pending |
+| Shared support repository, #573 | head `80c6e0114248c214bed4a3a94a86b8697d7edd2b`; merged `caa007de10fcf156e239af7c820f952d9945c2f6` | official run `45295630484`, attempt 2, passed (24 successful jobs; four inapplicable skips). Initial ARM input-download HTTP 503 was retried without source changes; tested and merged trees match |
 | Snapshot producer, sandboxer #474 | `54d24f759e539217bbbeae6ae21bc1e42c923e4c` | production implementation unchanged from tested `5bd60b2`; UFFD and dirty-memory evidence fixtures account for runtime declarations. Actual reader delivery gate satisfied; exact-head run `45306961103` pending |
-| Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | final main rebase/CI/release pending |
+| Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | rebased onto actual merged #573 with identical full tree and all 22 patches unchanged; official CI/release pending |
+
+The [support CI receipt](evidence/node-groups-20261124/group-support-ci-receipt.json)
+records all jobs and the tested/merged tree identity. The activation main rebase
+preserved the complete pre-rebase tree; its [range comparison](evidence/node-groups-20261124/activation-final-main-range-diff.txt)
+shows all twenty-two patches unchanged.
 
 Sandboxer SDK `v0.2.0-preview.20261124.1` resolved to
 `h1:lp8cYCRnPyyyNbzd7V7aRYS9OT3aLI/hN3UiQgVlNIE=`;

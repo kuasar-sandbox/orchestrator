@@ -27,6 +27,20 @@
     "published_sha256": "51d230bf926b1a0292af5efe1dfbff0d329341baca928be2c386683d69c34818",
     "transformation": "byte-identical"
   },
+  "activation-final-main-range-diff.txt": {
+    "bytes": 2059,
+    "original_sha256": "16e1706fcf92a760f3bcf458a3d13a30402b9ef7ac462ec401b7fe1124106748",
+    "original_task_path": "evidence/activation-final-main-range-diff.txt",
+    "published_sha256": "16e1706fcf92a760f3bcf458a3d13a30402b9ef7ac462ec401b7fe1124106748",
+    "transformation": "byte-identical"
+  },
+  "activation-final-main-rebase.json": {
+    "bytes": 284,
+    "original_sha256": "416f31173cb43a4812571ea5ba1187cca00cf39ed59ce777755514a23a9ba1ea",
+    "original_task_path": "evidence/activation-final-main-rebase.json",
+    "published_sha256": "416f31173cb43a4812571ea5ba1187cca00cf39ed59ce777755514a23a9ba1ea",
+    "transformation": "byte-identical"
+  },
   "activation-final-token-builder.log": {
     "bytes": 143,
     "original_sha256": "e9488010cf5e36fba275a4e6ce6136d4a8e15a053cc5654b0a83021f432b5436",
@@ -81,6 +95,13 @@
     "original_sha256": "e50a5b8f70b32942adfe7e287c28155f876621903469eba0875df888efbe92dc",
     "original_task_path": "evidence/group-foundation-ci-receipt.json",
     "published_sha256": "e50a5b8f70b32942adfe7e287c28155f876621903469eba0875df888efbe92dc",
+    "transformation": "byte-identical"
+  },
+  "group-support-ci-receipt.json": {
+    "bytes": 4929,
+    "original_sha256": "048c7c398d142b74cc2d6867001cfbb0441f3beb272123a56f0df538420fb01f",
+    "original_task_path": "evidence/group-support-ci-receipt.json",
+    "published_sha256": "048c7c398d142b74cc2d6867001cfbb0441f3beb272123a56f0df538420fb01f",
     "transformation": "byte-identical"
   },
   "host-unit-receipt-after.json": {
