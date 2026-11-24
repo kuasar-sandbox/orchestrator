@@ -305,7 +305,7 @@ Conductor constructs independent journald targets for runtime component diagnost
 | `sandbox-ctl` | Runner/Build phase `--log-to` | Runtime component diagnostics | Host only |
 | `sandbox` | Runner `--stdout-to`/`--stderr-to` | Sandbox app stdio | Host only |
 | `build` | Build phases/run-builder | App stdio, milestones, envd RUN replay and flatten progress | SDK and host; complete reading/pagination/failure rules in [Target-aware execution and publication](node-build.md#execution-and-publication) |
-| `console` | Runner/Build phase `--console` | Guest kernel dmesg | Host only; excluded from SDK Build logs |
+| `console` | Runner/Build phase `--console` | Console output from the Guest kernel, init and ordinary plugins | Host only; excluded from SDK Build logs |
 
 Native streams write directly to journal without temporary log files. Run-builder milestones and envd RUN replay use pure-Go `go-systemd/journal`. `--log-to` does not replace original process stderr: early CLI output, CH stderr, panics and failed-send fallback retain their existing sinks. Builder units set `LogRateLimitIntervalSec=0`; runners keep default rate limits. Neither policy guarantees lossless storage under journal/storage failure, exactly-once durability or nonblocking sends.
 

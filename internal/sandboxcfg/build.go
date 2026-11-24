@@ -78,9 +78,8 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		return nil, fmt.Errorf("sandboxcfg: build source E data disks are not supported")
 	}
 
-	// Portable and runtime schemas intentionally share field spellings for
-	// non-host state. A YAML round trip is preferable to a second manual field
-	// allowlist and is followed by overwriting every host/boot-owned field.
+	// Portable and runtime schemas share the persistent non-boot fields.
+	// The source is already authoritative for its Env and primary layout.
 	raw, err := yaml.Marshal(p.Source)
 	if err != nil {
 		return nil, fmt.Errorf("sandboxcfg: encode source defaults: %w", err)
@@ -111,9 +110,11 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	merged.EphemeralFiles = projected.EphemeralFiles
 
 	if p.Profile == types.ProfileE2B {
-		launch := projected.Launch
-		launch.Env = mergeStr(merged.Launch.Env, projected.Launch.Env)
-		merged.Launch = launch
+		mode := merged.Launch.EffectiveSystemd()
+		if p.Spec.HasSystemdOverride() {
+			mode = p.Spec.Launch.Systemd
+		}
+		merged.Launch = newE2BLaunch(mode, mergeStr(merged.Launch.Env, p.EnvVars), p.MMDSEnabled)
 	} else {
 		mergeBareBuildLaunch(&merged.Launch, p.Spec.Launch, p.Spec.LaunchCgroupControl, p.EnvVars)
 	}
@@ -157,6 +158,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		merged.Metadata[NsNetwork] = string(network)
 	}
 	merged.Metadata = setBuildCommands(merged.Metadata, p.StartCmd, p.ReadyCmd)
+	merged.Launch.Systemd = merged.Launch.EffectiveSystemd()
 	return &merged, nil
 }
 
@@ -164,6 +166,22 @@ func mergeBareBuildLaunch(dst *rtconfig.LaunchConfig, override *rtconfig.LaunchC
 	dst.Env = mergeStr(dst.Env, env)
 	if override == nil {
 		return
+	}
+	if override.Systemd != "" {
+		dst.Systemd = override.Systemd
+	}
+	if override.Placeholder {
+		dst.Placeholder = true
+		dst.Exec, dst.Args = "", nil
+	}
+	if override.PIDNamespace != "" {
+		dst.PIDNamespace = override.PIDNamespace
+	}
+	if override.StopGracePeriod != "" {
+		dst.StopGracePeriod = override.StopGracePeriod
+	}
+	if override.StartTimeout != "" {
+		dst.StartTimeout = override.StartTimeout
 	}
 	if override.Exec != "" {
 		dst.Exec = override.Exec
@@ -229,15 +247,7 @@ func MarshalBuildColdConfig(cfg *rtconfig.SandboxConfig) ([]byte, error) {
 	// complete persistent launch surface so false/empty values clear source-E
 	// defaults instead of disappearing through omitempty. Direct top-level E
 	// assembly reads the same projection, keeping both target paths equivalent.
-	document["launch"] = map[string]any{
-		"exec": cfg.Launch.Exec, "args": cfg.Launch.Args, "env": cfg.Launch.Env,
-		"ephemeral_env": cfg.Launch.EphemeralEnv, "workdir": cfg.Launch.Workdir,
-		"restart": cfg.Launch.Restart, "cgroup_control": cfg.Launch.CgroupControl,
-		"placeholder": cfg.Launch.Placeholder, "pid_namespace": cfg.Launch.PIDNamespace,
-		"plugin": cfg.Launch.Plugin, "user": cfg.Launch.User,
-		"stop_signal": cfg.Launch.StopSignal, "stop_grace_period": cfg.Launch.StopGracePeriod,
-		"start_timeout": cfg.Launch.StartTimeout,
-	}
+	document["launch"] = completeLaunchMap(cfg.Launch)
 	// DeflateOnOOM is the sole optional portable resource leaf. An explicit null
 	// clears a source value when the shared projection has no settled value,
 	// while sandboxer's host policy fields remain untouched.

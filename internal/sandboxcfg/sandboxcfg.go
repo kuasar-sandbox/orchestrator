@@ -81,7 +81,8 @@ type SandboxSpec struct {
 	Traffic       TrafficPatch
 	Network       NetworkSpec
 	Restore       RestoreSpec
-	Launch        *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
+	Launch        *rtconfig.LaunchConfig // e2b permits only the systemd key
+	LaunchKeys    map[string]bool        `json:"launch_keys,omitempty"`
 	// LaunchCgroupControl preserves whether the boolean was explicitly present.
 	// LaunchConfig alone cannot distinguish an omitted value from false when a
 	// source Sandbox contributes lower-priority launch defaults.
@@ -133,19 +134,12 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 			return s, err
 		}
 	}
-	if raw := strings.TrimSpace(meta[NsLaunch]); raw != "" {
-		var l rtconfig.LaunchConfig
-		if err := yaml.Unmarshal([]byte(raw), &l); err != nil {
-			return s, fmt.Errorf("sandboxcfg: metadata[%q] is not valid JSON: %w", NsLaunch, err)
+	if raw, present := meta[NsLaunch]; present {
+		var err error
+		s.Launch, s.LaunchKeys, s.LaunchCgroupControl, err = parseLaunch(raw)
+		if err != nil {
+			return s, err
 		}
-		var presence struct {
-			CgroupControl *bool `yaml:"cgroup_control"`
-		}
-		if err := yaml.Unmarshal([]byte(raw), &presence); err != nil {
-			return s, fmt.Errorf("sandboxcfg: metadata[%q] is not valid JSON: %w", NsLaunch, err)
-		}
-		s.Launch = &l
-		s.LaunchCgroupControl = presence.CgroupControl
 	}
 	if err := dec(NsInit, &s.Init); err != nil {
 		return s, err
@@ -431,7 +425,7 @@ type SandboxHostConfig struct {
 	Boot           hostBootConfig           `yaml:"boot"`
 	Restore        rtconfig.RestoreConfig   `yaml:"restore,omitempty"`
 	Timeouts       rtconfig.TimeoutsConfig  `yaml:"timeouts,omitempty"`
-	Launch         *rtconfig.LaunchConfig   `yaml:"launch,omitempty"`
+	Launch         map[string]any           `yaml:"launch,omitempty"`
 	Mounts         []rtconfig.MountConfig   `yaml:"mounts,omitempty"`
 	Files          []rtconfig.FileConfig    `yaml:"files,omitempty"`
 	EphemeralFiles []rtconfig.FileConfig    `yaml:"ephemeral_files,omitempty"`
@@ -580,11 +574,10 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 	// Cold boot still selects the target kernel/runtime and derives a new C0.
 	freshTemplateCreate := p.Sandbox.ResumeSource.Empty() && p.Template.Kind == types.KindSbx
 	if freshTemplateCreate {
-		launchContainer := &rtconfig.SandboxConfig{}
-		if err := p.buildLaunch(launchContainer); err != nil {
+		if err := ValidateLaunchForProfile(p.Template.Profile, p.Spec); err != nil {
 			return nil, err
 		}
-		c.Launch = &launchContainer.Launch
+		c.Launch = p.Spec.launchOverlay(p.EnvVars)
 		c.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)
 		c.Files = append([]rtconfig.FileConfig(nil), p.Spec.Files...)
 		c.Init = append([]rtconfig.InitConfig(nil), p.Spec.Init...)
@@ -604,6 +597,9 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 func (p Params) BuildSnapshotHostConfig() (*SnapshotHostConfig, error) {
 	if p.Sandbox == nil || p.Sandbox.LaunchMode != types.LaunchMemory {
 		return nil, fmt.Errorf("sandboxcfg: Snapshot host config requires memory launch mode")
+	}
+	if p.Sandbox.ResumeSource.Empty() && p.Spec.HasSystemdOverride() {
+		return nil, fmt.Errorf("sandboxcfg: Snapshot restore cannot override launch.systemd")
 	}
 	usage, err := p.runtimeUsage()
 	if err != nil {
@@ -714,66 +710,25 @@ func (p Params) buildRuntimeNetwork() rtconfig.NetworkConfig {
 	return network
 }
 
-// buildLaunch fills launch. e2b is envd-owned (a tenant launch override is rejected);
-// bare uses the image entrypoint by default, overlaid by the tenant launch spec.
+// buildLaunch defines a new cold workload. Existing E/S layouts are handled by
+// source projection and never pass through this definition builder.
 func (p Params) buildLaunch(c *rtconfig.SandboxConfig) error {
-	if err := ValidateLaunchForProfile(p.Template.Profile, p.Spec.Launch); err != nil {
+	if err := ValidateLaunchForProfile(p.Template.Profile, p.Spec); err != nil {
 		return err
 	}
+	mode := "off"
+	if p.Spec.Launch != nil && p.Spec.Launch.Systemd != "" {
+		mode = p.Spec.Launch.Systemd
+	}
 	if p.Template.Profile == types.ProfileE2B {
-		// FC mode (drop -isnotfc) when MMDS is enabled so envd polls the metadata
-		// service for the access-token hash and accepts re-keying at /init.
-		args := []string{"-isnotfc", "-port", "49983"}
-		if p.MMDSEnabled {
-			args = []string{"-port", "49983"}
-		}
-		// envd must run as root (it setuids into the image user per exec); shares
-		// sandbox-init's PID namespace so PID 1 reaps the workload's orphans.
-		c.Launch = rtconfig.LaunchConfig{
-			Exec: "/opt/sandbox-runtime/bin/envd", Args: args, Env: p.EnvVars,
-			Restart: "always", User: "0:0", PIDNamespace: "shared", CgroupControl: true,
-		}
+		c.Launch = newE2BLaunch(mode, p.EnvVars, p.MMDSEnabled)
 		return nil
 	}
-	// bare: empty exec -> sandbox-init runs the flattened image's entrypoint.
-	c.Launch = rtconfig.LaunchConfig{Env: p.EnvVars, Restart: "always"}
-	if s := p.Spec.Launch; s != nil {
-		if s.Exec != "" {
-			c.Launch.Exec = s.Exec
-		}
-		if len(s.Args) > 0 {
-			c.Launch.Args = s.Args
-		}
-		if s.Workdir != "" {
-			c.Launch.Workdir = s.Workdir
-		}
-		if s.Restart != "" {
-			c.Launch.Restart = s.Restart
-		}
-		if s.User != "" {
-			c.Launch.User = s.User
-		}
-		if s.StopSignal != "" {
-			c.Launch.StopSignal = s.StopSignal
-		}
-		c.Launch.CgroupControl = s.CgroupControl
-		if len(s.Plugin) > 0 {
-			c.Launch.Plugin = s.Plugin
-		}
-		c.Launch.Env = mergeStr(p.EnvVars, s.Env) // tenant launch env overrides create env
-	}
-	return nil
-}
-
-// ValidateLaunchForProfile applies the same profile ownership rule at request
-// normalization and at final rendering. e2b's launch is platform-owned by
-// envd; bare is the only profile that accepts a tenant launch override.
-func ValidateLaunchForProfile(profile types.Profile, launch *rtconfig.LaunchConfig) error {
-	if !profile.Valid() {
-		return fmt.Errorf("sandboxcfg: unknown profile %q", profile)
-	}
-	if profile == types.ProfileE2B && launch != nil {
-		return fmt.Errorf("sandboxcfg: launch override is not allowed for the e2b profile (envd owns launch)")
+	c.Launch = rtconfig.LaunchConfig{Systemd: mode, Restart: "always"}
+	mergeBareBuildLaunch(&c.Launch, p.Spec.Launch, p.Spec.LaunchCgroupControl, p.EnvVars)
+	// Programmatic image callers predate the explicit-presence carrier.
+	if p.Spec.Launch != nil && p.Spec.LaunchCgroupControl == nil && p.Spec.Launch.CgroupControl {
+		c.Launch.CgroupControl = true
 	}
 	return nil
 }

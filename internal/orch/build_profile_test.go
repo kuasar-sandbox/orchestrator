@@ -172,7 +172,7 @@ func TestBuildRegisterRejectsE2BLaunchOverrideBeforePersistence(t *testing.T) {
 				Kind: types.BuildTargetSandbox, Memory: true,
 			}},
 		})
-		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "envd owns launch") {
+		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "e2b launch only permits systemd") {
 			t.Fatalf("RegisterBuild launch error = %v, want e2b ownership rejection", err)
 		}
 		usage, usageErr := o.st.BuildUsage(ctx)
@@ -187,7 +187,7 @@ func TestBuildRegisterRejectsE2BLaunchOverrideBeforePersistence(t *testing.T) {
 		cmd := clusterBuildRegisterCommand(t, o, "build-e2b-launch", fingerprint)
 		cmd.Config[sandboxcfg.NsLaunch] = "{\"exec\":\"/tenant\"}"
 		err := o.registerClusterBuild(ctx, cmd)
-		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "envd owns launch") {
+		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "e2b launch only permits systemd") {
 			t.Fatalf("registerClusterBuild launch error = %v, want e2b ownership rejection", err)
 		}
 		stored, getErr := o.st.GetBuild(ctx, cmd.BuildID)

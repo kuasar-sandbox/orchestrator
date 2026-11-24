@@ -119,19 +119,64 @@ exec_through_cluster_connect() {
     local diagnostics="$WORK/native-exec.client.log"
     local attempt status guest_command
 
-    # The pinned envd is quiet on successful requests. Write test data into its
-    # actual guest stdio pipes so the managed run, not this exec client's file
-    # destinations, exercises the application journal targets. Shared guest PID
-    # namespace and the root test capability allow this without changing envd
-    # verbosity or production launch policy. The outer timeout bounds all I/O.
+    # Exercise the managed primary's actual app pipes, independently of this
+    # exec client's destinations. New E2B definitions have a placeholder primary
+    # and an envd plugin; existing definitions can retain an envd primary.
+    # Shared guest PID namespace and the root test capability expose /proc.
+    # The outer timeout bounds the single scan and all I/O.
     guest_command="$(cat <<'SH'
-primary=
+placeholder=
+envd=
+envd_count=0
+envd_pipe_count=0
+newline='
+'
 for executable in /proc/[0-9]*/exe; do
-    case "$(readlink "$executable" 2>/dev/null)" in
-        */envd) primary=${executable%/exe}; break ;;
-    esac
+    process=${executable%/exe}
+    if [ "$executable" -ef /opt/sandbox-runtime/bin/sandbox-init ]; then
+        # These are NUL-delimited argv fields 1, 2, 3 and 6. Replace embedded
+        # newlines first so argument contents cannot change field positions.
+        arguments=$(LC_ALL=C tr '\000\012' '\012\001' 2>/dev/null <"$process/cmdline") || {
+            echo 'journal probe: cannot read runtime process identity' >&2; exit 48;
+        }
+        identity=$(printf '%s\n' "$arguments" | LC_ALL=C sed -n '2,4p;7p') || {
+            echo 'journal probe: cannot parse runtime process identity' >&2; exit 48;
+        }
+        case "$identity" in
+            "exec-child${newline}"[01]"${newline}1${newline}-")
+                [ -z "$placeholder" ] || {
+                    echo 'journal probe: multiple placeholder primaries' >&2; exit 48;
+                }
+                placeholder=$process
+                ;;
+            "exec-child${newline}"[01]"${newline}0${newline}"*) ;;
+            "exec-child${newline}"*)
+                echo 'journal probe: unsupported exec-child identity' >&2; exit 48;
+                ;;
+        esac
+    else
+        case "$(readlink "$executable" 2>/dev/null)" in
+            */envd)
+                envd=$process
+                envd_count=$((envd_count + 1))
+                if [ -p "$process/fd/1" ] && [ -p "$process/fd/2" ]; then
+                    envd_pipe_count=$((envd_pipe_count + 1))
+                fi
+                ;;
+        esac
+    fi
 done
-[ -n "$primary" ] || { echo 'journal probe: envd not found' >&2; exit 48; }
+if [ -n "$placeholder" ]; then
+    [ "$envd_pipe_count" -eq 0 ] || {
+        echo 'journal probe: ambiguous primary layout' >&2; exit 48;
+    }
+    primary=$placeholder
+else
+    [ "$envd_count" -eq 1 ] || {
+        echo 'journal probe: expected one legacy envd primary' >&2; exit 48;
+    }
+    primary=$envd
+fi
 [ -p "$primary/fd/1" ] && [ -p "$primary/fd/2" ] || {
     echo 'journal probe: primary stdio is not pipe-backed' >&2; exit 48;
 }
@@ -170,8 +215,8 @@ SH
         [ "$attempt" = "$retries" ] || sleep 0.5
     done
     sed 's/^/  client| /' "$diagnostics" >&2
-    sed 's/^/  stdout| /' "$output" 2>/dev/null >&2
-    sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2
+    sed 's/^/  stdout| /' "$output" >&2 2>/dev/null
+    sed 's/^/  stderr| /' "$error_output" >&2 2>/dev/null
     fail "native exec did not complete after $retries attempt(s), last exit=$status"
 }
 

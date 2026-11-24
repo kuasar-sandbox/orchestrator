@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   reset_automatic      INTEGER NOT NULL DEFAULT 0,
   reset_error          TEXT NOT NULL DEFAULT '',
   auto_reset_error     TEXT NOT NULL DEFAULT '',
+  delete_shutdown_run_id TEXT NOT NULL DEFAULT '',
   pause_reason TEXT NOT NULL DEFAULT '',
   resource_obligation INTEGER NOT NULL DEFAULT 0,
   pressure_version INTEGER NOT NULL DEFAULT 0,
@@ -308,7 +309,7 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	for _, name := range []string{"instance_id", "dead_run_id", "dead_token", "reset_id", "reset_state", "reset_error", "auto_reset_error"} {
+	for _, name := range []string{"instance_id", "dead_run_id", "dead_token", "reset_id", "reset_state", "reset_error", "auto_reset_error", "delete_shutdown_run_id"} {
 		if err := ensureColumn(ctx, db, "sandboxes", name, "TEXT NOT NULL DEFAULT ''"); err != nil {
 			db.Close()
 			return nil, err
@@ -630,8 +631,8 @@ const sandboxInsertSQL = `
 	  resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,
 	  sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
-	  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,workspace_plan_enc)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,workspace_plan_enc,delete_shutdown_run_id)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -646,7 +647,7 @@ ON CONFLICT(id) DO UPDATE SET
   sandbox_result_json=excluded.sandbox_result_json,
  pause_reason=excluded.pause_reason, resource_obligation=excluded.resource_obligation, pressure_version=excluded.pressure_version, running_since_ns=excluded.running_since_ns, pressure_since_ns=excluded.pressure_since_ns,
  dead_run_id=excluded.dead_run_id,dead_token=excluded.dead_token,reset_id=excluded.reset_id,reset_state=excluded.reset_state,
- reset_automatic=excluded.reset_automatic,reset_error=excluded.reset_error,auto_reset_error=excluded.auto_reset_error
+ reset_automatic=excluded.reset_automatic,reset_error=excluded.reset_error,auto_reset_error=excluded.auto_reset_error,delete_shutdown_run_id=excluded.delete_shutdown_run_id
  WHERE sandboxes.instance_id=excluded.instance_id`
 
 const sandboxInsertOnlySQL = sandboxInsertSQL + `
@@ -749,7 +750,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
 		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix, resultRunID, resultJSON,
 		sb.PauseReason, sb.ResourceObligation, sb.PressureVersion, sb.RunningSinceUnixNano, sb.PressureSinceUnixNano,
-		sb.InstanceID, sb.AutoReset, sb.DeadRunID, sb.DeadToken, sb.ResetID, sb.ResetState, sb.ResetAutomatic, sb.ResetError, sb.AutoResetError, planEnc,
+		sb.InstanceID, sb.AutoReset, sb.DeadRunID, sb.DeadToken, sb.ResetID, sb.ResetState, sb.ResetAutomatic, sb.ResetError, sb.AutoResetError, planEnc, sb.DeleteShutdownRunID,
 	}, nil
 }
 
@@ -1350,8 +1351,8 @@ func (s *Store) ClearPausedRunDir(ctx context.Context, id, expectedRunDir, expec
 }
 
 // BeginSandboxDelete is the durable acceptance fence for an explicit delete.
-// It changes only lifecycle state (and clears the no-longer-actionable launch
-// mode), preserving every exact runner, network, and path identity needed by a
+// It records normal shutdown only for an active running generation, then clears
+// the no-longer-actionable launch mode, preserving every identity needed by a
 // retrying node-local finalizer. The complete ownership tuple is part of the
 // CAS so a stale API or node-link command cannot delete a newer incarnation.
 func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool, error) {
@@ -1359,7 +1360,12 @@ func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool
 		return false, errors.New("store: begin sandbox delete requires a sandbox")
 	}
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes SET resource_obligation=0, pause_reason='', pressure_version=pressure_version+CASE WHEN state='deleting' THEN 0 ELSE 1 END, state=?, launch_mode='', dead_unix=0
+		UPDATE sandboxes SET
+           delete_shutdown_run_id=CASE
+             WHEN state='deleting' THEN delete_shutdown_run_id
+             WHEN state='running' AND sandbox_result_run_id='' THEN run_id
+             ELSE '' END,
+           resource_obligation=0, pause_reason='', pressure_version=pressure_version+CASE WHEN state='deleting' THEN 0 ELSE 1 END, state=?, launch_mode='', dead_unix=0
 		 WHERE id=? AND state=? AND launch_mode=?
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
@@ -1518,7 +1524,7 @@ var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,sta
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,resume_sandbox_ref,auto_pause_memory,idle_timeout,max_checkpoints,launch_mode,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix,sandbox_result_run_id,sandbox_result_json,pause_reason,resource_obligation,pressure_version,running_since_ns,pressure_since_ns,
-  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,hold_value,workspace_plan_enc`
+  instance_id,auto_reset,dead_run_id,dead_token,reset_id,reset_state,reset_automatic,reset_error,auto_reset_error,hold_value,workspace_plan_enc,delete_shutdown_run_id`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
@@ -1534,7 +1540,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&resumeSourceKind, &sb.ResumeSource.Ref, &sb.ResumeSource.SandboxRef, &autoPauseMemory, &sb.IdleTimeout, &sb.MaxCheckpoints, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix, &sandboxResultRunID, &sandboxResultJSON, &sb.PauseReason, &sb.ResourceObligation, &sb.PressureVersion, &sb.RunningSinceUnixNano, &sb.PressureSinceUnixNano,
-		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError, &sb.HoldValue, &planEnc); err != nil {
+		&sb.InstanceID, &sb.AutoReset, &sb.DeadRunID, &sb.DeadToken, &sb.ResetID, &sb.ResetState, &sb.ResetAutomatic, &sb.ResetError, &sb.AutoResetError, &sb.HoldValue, &planEnc, &sb.DeleteShutdownRunID); err != nil {
 		return nil, err
 	}
 	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)

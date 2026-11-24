@@ -72,7 +72,8 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 	// Component/app/console logs use explicit targets. Original process stderr
 	// remains available for early CLI errors, CH stderr and journal fallback.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := sandboxproc.Start(cmd, p.vmmCgroup, readyW); err != nil {
+	startErr := sandboxproc.Start(cmd, p.vmmCgroup, readyW)
+	if err := startErr; err != nil {
 		_ = readyR.Close()
 		return nil, fmt.Errorf("spawn sandbox-ctl: %w", err)
 	}

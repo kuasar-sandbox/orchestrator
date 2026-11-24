@@ -428,7 +428,11 @@ func TestNetworkDocTapFDSocket(t *testing.T) {
 
 func decodeBuildColdConfig(t *testing.T, p *buildPipeline) *rtconfig.SandboxConfig {
 	t.Helper()
-	document, err := p.buildColdConfigYAML()
+	projected, err := p.buildColdConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := sandboxcfg.MarshalBuildColdConfig(projected)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,6 +487,9 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 	}
 
 	stepsLaunch := mustStepsYAML(t, p, nil)["launch"].(map[string]any)
+	if stepsLaunch["systemd"] != "off" {
+		t.Fatal("temporary builder inherited final systemd policy")
+	}
 	if got := stepsLaunch["cgroup_control"]; got != true {
 		t.Fatalf("steps launch.cgroup_control = %#v, want true", got)
 	}
@@ -608,6 +615,9 @@ func TestSourceStepsYAMLClearsPersistentActions(t *testing.T) {
 		}
 	}
 	launch := doc["launch"].(map[string]any)
+	if launch["systemd"] != "off" {
+		t.Fatal("source materialization inherited systemd")
+	}
 	if env, ok := launch["env"].(map[string]string); !ok || len(env) != 0 {
 		t.Fatalf("source steps launch.env = %#v", launch["env"])
 	}
