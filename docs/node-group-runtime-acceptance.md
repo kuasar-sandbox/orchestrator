@@ -45,8 +45,8 @@ before either proposal is closed.
 | Shared Ref reader, accelerator #238 | merged `127afc27958d2721beb4b36c135ee1b1fce86390` | SDK `v0.2.0-preview.20261124`; official run `45201145110` passed |
 | Sandboxer reader, #473 | head `d2c67d40d7db27801550c6055d41fb9dad349f7d`; merged `347b3fe657b66f69b0a86ce2c428bdb484471663` | exact-head run `45262391782` passed; component release `45271271036` passed |
 | Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` passed; actual reader release pending |
-| Node Group foundation, #572 | `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a` | includes reviewed cursor escaping fix; full Store race and native ARM regression passed; final main CI pending |
-| Shared support repository, #573 | `75f38bb1c863939eaeec7da8c029e2ced9c85e37` | final main rebase/CI pending |
+| Node Group foundation, #572 | head `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a`; merged `d9626893d02b7754dcd1542bc021146c24a58371` | exact-head run `45287872172` passed (24 successful jobs; four inapplicable jobs skipped); tested merge tree equals the final main tree, including the cursor escaping fix |
+| Shared support repository, #573 | `80c6e0114248c214bed4a3a94a86b8697d7edd2b` | rebased onto merged #572 with an unchanged support patch; official run `45295630484` pending |
 | Snapshot producer, sandboxer #474 | `ecfd3ea66efb1968d6435f344e555decd2e873ca` | same tree as tested `5bd60b2`; waits for actual Orchestrator reader delivery |
 | Cluster activation, #574 | production changes through `85d1ce7`; failure/carrier tests through `1c6ff22` | final main rebase/CI/release pending |
 
@@ -57,6 +57,13 @@ Published `sandbox-ctl` SHA-256:
 
 - x86_64: `7c72ee57e8776b5d0e0c96f177b7d2b9cde4357ac3b04ce31fd8fe7011bced99`.
 - aarch64: `3832fc253276b2e3fd63369fb999d5980f6c08160650279ee8c9f9b26ba2aba2`.
+
+Aggregate `release-v0.2.0-preview.20261124.1` passed run `45274512568`,
+including both native published-download checks (47 successful jobs and four
+inapplicable jobs skipped). The [CI receipt](evidence/node-groups-20261124/reader-aggregate-receipt.json)
+records every job. It selects the Sandboxer reader
+but predates Orchestrator #571; it does not satisfy the remaining Orchestrator
+consumer gate.
 
 Both published readers restored snapshots from the updated producer on their
 native KVM hosts. The updated producer hashes are

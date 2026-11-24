@@ -55,6 +55,13 @@
     "published_sha256": "0307a636268e16e8c8908deff335f31be9209f59047122492ca3c7656f0fbe0d",
     "transformation": "byte-identical"
   },
+  "group-foundation-ci-receipt.json": {
+    "bytes": 6739,
+    "original_sha256": "e50a5b8f70b32942adfe7e287c28155f876621903469eba0875df888efbe92dc",
+    "original_task_path": "evidence/group-foundation-ci-receipt.json",
+    "published_sha256": "e50a5b8f70b32942adfe7e287c28155f876621903469eba0875df888efbe92dc",
+    "transformation": "byte-identical"
+  },
   "host-unit-receipt-after.json": {
     "bytes": 1614,
     "original_sha256": "677b13afc42bd4c38f4c35754c5c7e5a55f02763eed7fc063175e77c985a263d",
@@ -270,6 +277,13 @@
     "original_sha256": "d5bd34da55629f8bf9676088ba4cf012d660ae38b50c3bfa498c970d2ba8ccb2",
     "original_task_path": "evidence/published-reader-final-x86/reader-final-writer-20261124.1/evidence/results.json",
     "published_sha256": "d5bd34da55629f8bf9676088ba4cf012d660ae38b50c3bfa498c970d2ba8ccb2",
+    "transformation": "byte-identical"
+  },
+  "reader-aggregate-receipt.json": {
+    "bytes": 12077,
+    "original_sha256": "9befe2cef27da93a4b1b1b51c0043e30f7e44f3602ff340c9eb7d64ecf630f68",
+    "original_task_path": "evidence/reader-aggregate-receipt.json",
+    "published_sha256": "9befe2cef27da93a4b1b1b51c0043e30f7e44f3602ff340c9eb7d64ecf630f68",
     "transformation": "byte-identical"
   },
   "remote-slice-reuse-fixture.patch.json": {
