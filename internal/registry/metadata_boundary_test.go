@@ -19,16 +19,16 @@ import (
 
 func registryWithTypedFixture(t *testing.T) (*Registry, *metadatastore.Store) {
 	t.Helper()
-	db := metadatastore.New()
+	db := metadatastore.New(t)
 	stores, err := NewStores(db.Repositories(), metadatastore.Owners{ID: "registry"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg := New(stores, placementWithToken("n1"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	enableTestCreateAuth(t, reg)
+	reg := New(stores, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", APIEndpoint: "node-api", DataEndpoint: "node-data", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
+	publishTestGroups(t, reg, "n1", "/g")
 	return reg, db
 }
 
@@ -36,6 +36,18 @@ type unknownRouteRepository struct {
 	metadata.RouteRepository
 	intentUnknown, reportUnknown, deleteUnknown bool
 	intents, reports, deletes                   int
+}
+
+func (f *unknownRouteRepository) CommitGroupIntent(ctx context.Context, expected metadata.Version, record metadata.SandboxRecord, ref metadata.NodeSandboxRef, admission metadata.GroupAdmission) (metadata.Version, error) {
+	f.intents++
+	v, err := f.RouteRepository.CommitGroupIntent(ctx, expected, record, ref, admission)
+	if err != nil {
+		return v, err
+	}
+	if f.intentUnknown {
+		return metadata.Version{}, &metadata.Unknown{Cause: errors.New("reply lost after commit")}
+	}
+	return v, nil
 }
 
 func (f *unknownRouteRepository) CommitIntentAndOwnership(ctx context.Context, expected metadata.Version, record metadata.SandboxRecord, ref metadata.NodeSandboxRef) (metadata.Version, error) {
@@ -75,6 +87,29 @@ type unknownBuildRepository struct {
 	metadata.BuildRepository
 	intentUnknown, ackUnknown bool
 	intents, acks             int
+}
+
+func (f *unknownBuildRepository) CommitGroupRegistrationIntent(ctx context.Context, b metadata.BuildRecord, ref metadata.NodeBuildRef, admission metadata.GroupAdmission) (metadata.Version, error) {
+	f.intents++
+	v, err := f.BuildRepository.CommitGroupRegistrationIntent(ctx, b, ref, admission)
+	if err != nil {
+		return v, err
+	}
+	if f.intentUnknown {
+		return metadata.Version{}, &metadata.Unknown{Cause: errors.New("intent reply lost")}
+	}
+	return v, nil
+}
+func (f *unknownBuildRepository) AcceptGroupBuildRegistration(ctx context.Context, reg metadata.Registration, key metadata.BuildKey, template string, target *types.BuildTarget) (metadata.Versioned[metadata.BuildRecord], error) {
+	f.acks++
+	v, err := f.BuildRepository.AcceptGroupBuildRegistration(ctx, reg, key, template, target)
+	if err != nil {
+		return v, err
+	}
+	if f.ackUnknown {
+		return metadata.Versioned[metadata.BuildRecord]{}, &metadata.Unknown{Cause: errors.New("ACK commit reply lost")}
+	}
+	return v, nil
 }
 
 func (f *unknownBuildRepository) CommitRegistrationIntent(ctx context.Context, b metadata.BuildRecord, ref metadata.NodeBuildRef) (metadata.Version, error) {
@@ -272,7 +307,7 @@ func TestBuildIntentAndAcceptedUnknownDoNotReplay(t *testing.T) {
 			reg.SetNodeOwner(owner)
 			faults := &unknownBuildRepository{BuildRepository: reg.stores.builds, intentUnknown: stage == "intent", ackUnknown: stage == "ack"}
 			reg.stores.builds = faults
-			req := BuildReserveReq{Group: "/g", BuildID: "b-unknown", TemplateID: "transient-unknown", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
+			req := BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "b-unknown", TemplateID: "transient-unknown", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
 			_, err := reg.ReserveBuild(context.Background(), req)
 			if !errors.Is(err, metadata.ErrUnknown) {
 				t.Fatalf("reserve error=%v", err)
@@ -296,10 +331,9 @@ func TestBuildIntentAndAcceptedUnknownDoNotReplay(t *testing.T) {
 				t.Fatalf("owner lost: %+v %v %v", ref, found, err)
 			}
 			faults.intentUnknown, faults.ackUnknown = false, false
-			reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+			countTestGroupReads(reg).before = func() {
 				t.Fatal("recovery re-placed an immutable Build intent")
-				return nil, ErrNoNode
-			}))
+			}
 			recovered, err := reg.ReserveBuild(context.Background(), req)
 			if err != nil || recovered == nil || recovered.NodeID != record.NodeID || recovered.BuildID != record.BuildID || recovered.TemplateID != record.TemplateID {
 				t.Fatalf("next request did not recover immutable Build: %+v %v", recovered, err)
@@ -329,7 +363,7 @@ func TestObservationCapacityRejectedBeforePlacementAndMutation(t *testing.T) {
 	owner := &recordingNodeOwner{}
 	reg.SetNodeOwner(owner)
 	placed := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) { placed++; return nil, ErrNoNode }))
+	countTestGroupReads(reg).before = func() { placed++ }
 	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "capacity", nil))
 	if !errors.Is(err, metadata.ErrCapacity) {
 		t.Fatalf("reserve error=%v", err)
@@ -360,7 +394,7 @@ func TestSingleFlightJoinersShareObservationReservation(t *testing.T) {
 	defer cancel()
 	command := make(chan *routesync.Command, 1)
 	var count atomic.Int32
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind == routesync.CmdCreate {
 			count.Add(1)
 			command <- cmd
@@ -379,7 +413,7 @@ func TestSingleFlightJoinersShareObservationReservation(t *testing.T) {
 	go func() {
 		// The reserved-row path reaches Done only after joining waitCall. This
 		// makes the shared-capacity assertion independent of goroutine timing.
-		_, err := reg.reserveCreate(waiterCtx, "/g", "shared", nil, false, false)
+		_, err := reg.reserveCreate(waiterCtx, "/g", "shared", nil, false, false, createOptions{apiKey: testAPIKeyValue()})
 		result <- err
 	}()
 	select {
@@ -418,12 +452,12 @@ func TestSingleFlightJoinersShareObservationReservation(t *testing.T) {
 func TestNewRegistrationRejectsOriginalStreamHeartbeat(t *testing.T) {
 	reg, _ := registryWithTypedFixture(t)
 	ctx := context.Background()
-	old, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "old"})
+	old, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "old"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldCtx := withNodeRegistration(ctx, old.Registration)
-	fresh, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "new"})
+	fresh, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "new"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +482,7 @@ func TestCrossRegistryRegistrationFencesEveryOldStreamProjection(t *testing.T) {
 	old, db := registryWithTypedFixture(t)
 	oldOwner := &recordingNodeOwner{}
 	old.SetNodeOwner(oldOwner)
-	registered, err := old.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "old-api"})
+	registered, err := old.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "old-api"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +494,7 @@ func TestCrossRegistryRegistrationFencesEveryOldStreamProjection(t *testing.T) {
 	}
 	routeRef := metadata.SandboxRef(*route)
 	buildKey := metadata.BuildKey{Group: "/g", BuildID: "build-stream-fence"}
-	build := metadata.BuildRecord{Group: buildKey.Group, BuildID: buildKey.BuildID, NodeID: "n1", TemplateID: "transient-stream-fence", Profile: types.ProfileE2B, State: metadata.BuildStarting}
+	build := metadata.BuildRecord{APISecretFingerprint: testAPIFingerprint, Group: buildKey.Group, BuildID: buildKey.BuildID, NodeID: "n1", TemplateID: "transient-stream-fence", Profile: types.ProfileE2B, State: metadata.BuildStarting}
 	buildRef := metadata.NodeBuildRef{Group: build.Group, BuildID: build.BuildID, TemplateID: build.TemplateID}
 	if _, err := old.stores.builds.CommitRegistrationIntent(ctx, build, buildRef); err != nil {
 		t.Fatal(err)
@@ -472,9 +506,9 @@ func TestCrossRegistryRegistrationFencesEveryOldStreamProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh := New(stores, nil, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fresh := New(stores, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	fresh.SetNodeOwner(&recordingNodeOwner{})
-	reconnected, err := fresh.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "new-api", DataEndpoint: "new-data"})
+	reconnected, err := fresh.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "new-api", DataEndpoint: "new-data"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +676,7 @@ func TestRuntimeProfileWriterDoesNotRetryIntoReconnectGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	intercept := &interceptProfileUpdate{NodeRepository: reg.stores.nodes, before: func() {
-		if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "new-generation"}); err != nil {
+		if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "new-generation"}); err != nil {
 			t.Fatal(err)
 		}
 	}}
@@ -692,15 +726,16 @@ func TestFailedNodeHelloSchedulesCleanupAndPreservesReconnect(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			reg.reaperCtx, reg.deadAfter = ctx, 20*time.Millisecond
-			if err := reg.serveNodeLinkLocal(ctx, failedNodeHello{}, func() {}, strings.NewReader(""), &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "failed-hello"}); err != nil {
+			if err := reg.serveNodeLinkLocal(ctx, failedNodeHello{}, func() {}, strings.NewReader(""), &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "failed-hello"}); err != nil {
 				t.Fatal(err)
 			}
 			if reconnect {
-				next, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "reconnected"})
+				next, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "reconnected"})
 				if err != nil {
 					t.Fatal(err)
 				}
-				reg.addNode(&fakeConn{nodeID: "n1"})
+				// Do not publish the connection yet: the old timer must not claim
+				// the new registration in the Hello-to-addNode interval.
 				<-time.After(2 * reg.deadAfter)
 				got, found, err := reg.stores.GetNodeProfile(ctx, "n1")
 				if err != nil || !found || got.Registration != next.Registration || got.Reaping {
@@ -758,7 +793,7 @@ func TestReapClaimHidesDirectoryAndReconnectFencesCleanup(t *testing.T) {
 	if err != nil || !reaping.Exists || !reaping.Reaping {
 		t.Fatalf("reap marker lost: %+v %v", reaping, err)
 	}
-	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "reconnected"}); err != nil {
+	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "reconnected"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.nodes.CleanupSandbox(ctx, claim, owner, rev, true); !errors.Is(err, metadata.ErrConflict) {
@@ -787,7 +822,7 @@ func TestReaperResumesDurableClaimAfterRegistryRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restarted := New(stores, nil, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	restarted := New(stores, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reapCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan struct{})
@@ -837,7 +872,7 @@ func TestLeaderCapacityRejectedBeforePlacementAndObservation(t *testing.T) {
 	owner := &recordingNodeOwner{}
 	reg.SetNodeOwner(owner)
 	placed := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) { placed++; return nil, ErrNoNode }))
+	countTestGroupReads(reg).before = func() { placed++ }
 	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "leader-capacity", nil))
 	if !errors.Is(err, metadata.ErrCapacity) {
 		t.Fatalf("reserve error=%v", err)

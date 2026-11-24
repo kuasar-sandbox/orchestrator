@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,9 +39,8 @@ var (
 
 const scaleLinkFailureRetries = 2
 
-// Service is the standalone placer placement engine. It keeps node_list/group
-// views synced, computes placement over the local view, and returns suggestions
-// that the registry commits through route/node owner state.
+// Service imports complete Group definitions onto statically selected Nodes.
+// Per-request placement and authorization are owned by Registry and Node.
 type Service struct {
 	linksMu     sync.RWMutex
 	links       []RegistryLink
@@ -54,8 +52,7 @@ type Service struct {
 	cfg clustercfg.PlacementConfig
 	log *slog.Logger
 
-	nodes    *nodeView
-	provider clusterstate.SandboxGroupProvider
+	nodes *nodeView
 
 	sourceMu           sync.RWMutex
 	runID              string
@@ -63,10 +60,12 @@ type Service struct {
 	sourceOwnerID      string
 	sourcePeerSource   func() []string
 	sourceLeaseTTL     time.Duration
-	selectorPatchEvery time.Duration
+	importEvery        time.Duration
 	scaleLinkResolver  func(context.Context, string) ([]RegistryLink, error)
 	scaleLinkRefresher func(context.Context) error
 	nodeChanges        chan struct{}
+	importMu           sync.Mutex
+	importStates       map[importTarget]*importState
 }
 
 type RegistryLink struct {
@@ -82,15 +81,12 @@ func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementC
 }
 
 func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, log *slog.Logger) *Service {
-	return NewRemoteLinksWithGroups(links, emptyGroupProvider{}, nil, cfg, log)
+	return NewRemoteLinksWithImports(links, nil, cfg, log)
 }
 
-func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.SandboxGroupProvider, sources []ImportSource, cfg clustercfg.PlacementConfig, log *slog.Logger) *Service {
+func NewRemoteLinksWithImports(links []RegistryLink, sources []ImportSource, cfg clustercfg.PlacementConfig, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
-	}
-	if cfg.Candidates <= 0 {
-		cfg.Candidates = 2
 	}
 	if cfg.ImportSourceOwnerCount <= 0 {
 		cfg.ImportSourceOwnerCount = 3
@@ -99,26 +95,22 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 	if sourceLeaseTTL <= 0 {
 		sourceLeaseTTL = 15 * time.Second
 	}
-	selectorPatchEvery := cfg.SelectorPatchRefreshDur()
-	if selectorPatchEvery <= 0 {
-		selectorPatchEvery = time.Minute
+	importEvery := cfg.ImportRefreshDur()
+	if importEvery <= 0 {
+		importEvery = time.Minute
 	}
 	links = normalizeRegistryLinks(links)
-	if provider == nil {
-		provider = emptyGroupProvider{}
-	}
 	runID := newRunID()
 	return &Service{
 		links: links, watchLinks: links,
 		cfg: cfg, log: log,
-		nodes:              newNodeView(1),
-		provider:           provider,
-		runID:              runID,
-		importSources:      normalizeImportSources(sources),
-		sourceOwnerID:      "local",
-		sourceLeaseTTL:     sourceLeaseTTL,
-		selectorPatchEvery: selectorPatchEvery,
-		nodeChanges:        make(chan struct{}, 1),
+		nodes:          newNodeView(1),
+		runID:          runID,
+		importSources:  normalizeImportSources(sources),
+		sourceOwnerID:  "local",
+		sourceLeaseTTL: sourceLeaseTTL,
+		importEvery:    importEvery,
+		nodeChanges:    make(chan struct{}, 1),
 	}
 }
 
@@ -211,10 +203,7 @@ func minReadyLinks(n int) int {
 	}
 }
 
-// Start launches the node_list watch loop and selector patch reconcile.
-// sandbox-group data is imported into the placer/provider side, not watched from
-// registry. node_list is low-frequency catalog data; hot load/budget is validated
-// by registry/node owner on the cold placement path.
+// Start watches the Node catalog and runs conditional background imports.
 func (s *Service) Start(ctx context.Context) {
 	startReconcile := false
 	s.linksMu.Lock()
@@ -227,7 +216,7 @@ func (s *Service) Start(ctx context.Context) {
 	}
 	s.linksMu.Unlock()
 	if startReconcile {
-		go s.reconcileSelectorPatches(ctx)
+		go s.reconcileGroups(ctx)
 	}
 }
 
@@ -311,68 +300,6 @@ func (s *Service) startWatchLinkLocked(ctx context.Context) {
 	go s.watchNodeList(wctx)
 }
 
-func (s *Service) ServePlacerLink(mux *http.ServeMux) {
-	mux.HandleFunc(registry.PlacerLinkPlacePath, s.servePlace)
-	mux.HandleFunc(registry.PlacerLinkVerifyKeyPath, s.serveVerifyKey)
-}
-
-func (s *Service) servePlace(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var in routesync.PlaceReq
-	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.answer(req.Context(), &in))
-}
-
-func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	group := req.URL.Query().Get("group")
-	apiSecret, apiSecretFound, err := s.provider.GetAPISecret(req.Context(), group)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	credentialFound := apiSecretFound
-	var manifestKey clusterstate.Secret
-	if apiSecret.Value == "" {
-		var manifestKeyFound bool
-		manifestKey, manifestKeyFound, err = s.provider.GetKey(req.Context(), group)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		credentialFound = credentialFound || manifestKeyFound
-	}
-	apiSecret, err = materializeAPISecret(manifestKey, apiSecret)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	if !credentialFound {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	apiSecretValue, err := inlineSecret("api_secret", apiSecret)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	if apiSecretValue == "" || !verifyAPIKey(apiSecretValue, req.Header.Get("X-API-KEY")) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
 func (s *Service) RegisterLoop(ctx context.Context, id, advertise, memberlistLabel string) {
 	if id == "" || advertise == "" {
 		s.log.Warn("placer: registration disabled; member id/advertise missing")
@@ -412,116 +339,6 @@ func (s *Service) ReadyForLabel(label string) bool {
 // answer computes a placement for a reverse request over the local view. It
 // requires a complete node_list snapshot, then resolves only the requested group;
 // there is no global "all groups imported" readiness gate.
-func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesync.PlaceResult {
-	res := &routesync.PlaceResult{ReqID: req.ReqID}
-	if !s.nodes.ready() {
-		res.NoNode = true
-		return res
-	}
-	g, ok, err := s.groupForPlace(ctx, req.Group)
-	if err != nil {
-		res.Error = err.Error()
-		return res
-	}
-	if !ok {
-		res.NoNode = true
-		return res
-	}
-	apiFP, _, _, _, _, _, _, _, err := credentialPairPatch(req.Group, g.manifestKey, g.apiSecret)
-	if err != nil {
-		res.Error = err.Error()
-		return res
-	}
-	var sandboxConfig map[string]string
-	if !req.Build {
-		sandboxConfig, err = mergeConfig(g.group.Config, req.Config)
-		if err != nil {
-			res.Error = fmt.Sprintf("placer: group %q sandbox config: %v", req.Group, err)
-			res.InvalidConfig = true
-			return res
-		}
-	}
-	p := placeParams{
-		group: req.Group, nodes: s.nodes.values(), selectors: g.hint.NodeSelectors,
-		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
-		zoneAdmitMax: s.cfg.ZoneAdmitMax, excludedNodeIDs: nodeIDSet(req.ExcludeNodeIDs),
-		targetRuntimeDigest: req.TargetRuntimeDigest,
-		buildResources:      req.BuildResources,
-	}
-	var node string
-	var placeErr error
-	if req.Build {
-		node, placeErr = placeBuild(p)
-	} else {
-		node, placeErr = placeSandbox(p)
-	}
-	if placeErr != nil || node == "" {
-		res.NoNode = true
-	} else {
-		res.NodeID = node
-		res.APISecretFingerprint = apiFP
-		if req.Build {
-			res.ImageRepo = g.group.ImageRepo
-			if g.group.RegistryAuth.Value != "" {
-				registryAuth, err := inlineSecret("registry_auth", g.group.RegistryAuth)
-				if err != nil {
-					res.Error = err.Error()
-					res.NodeID = ""
-					return res
-				}
-				res.RegistryAuth = registryAuth
-			}
-		} else {
-			res.TemplateRef = g.group.TemplateRef
-			res.TargetPort = g.group.TargetPort
-			res.Config = sandboxConfig
-		}
-	}
-	return res
-}
-
-type groupView struct {
-	group       clusterstate.SandboxGroup
-	hint        clusterstate.PlacementHint
-	manifestKey clusterstate.Secret
-	apiSecret   clusterstate.Secret
-}
-
-func (s *Service) groupForPlace(ctx context.Context, group string) (groupView, bool, error) {
-	g, found, err := s.provider.Get(ctx, group)
-	if err != nil || !found {
-		return groupView{}, false, err
-	}
-	hint, _, err := s.provider.GetPlacementHint(ctx, group)
-	if err != nil {
-		return groupView{}, false, err
-	}
-	manifestKey, _, err := s.provider.GetKey(ctx, group)
-	if err != nil {
-		return groupView{}, false, err
-	}
-	apiSecret, _, err := s.provider.GetAPISecret(ctx, group)
-	if err != nil {
-		return groupView{}, false, err
-	}
-	apiSecret, err = materializeAPISecret(manifestKey, apiSecret)
-	if err != nil {
-		return groupView{}, false, fmt.Errorf("placer: group %q: %w", group, err)
-	}
-	return groupView{group: g, hint: hint, manifestKey: manifestKey, apiSecret: apiSecret}, true, nil
-}
-
-type selectorPatchGroup struct {
-	group       string
-	hint        clusterstate.PlacementHint
-	manifestKey clusterstate.Secret
-	apiSecret   clusterstate.Secret
-}
-
-type selectorPatchState struct {
-	key    string
-	sentAt time.Time
-}
 
 type importLeaseToken struct {
 	sourceID string
@@ -532,45 +349,9 @@ type importLeaseToken struct {
 // selectors and credential-pair node set, then pushes them through placer_link. Only
 // the source lease winner runs Range for a source_id; unchanged patches are
 // refreshed so node_link credential-pair TTLs stay live.
-func (s *Service) reconcileSelectorPatches(ctx context.Context) {
-	last := map[string]selectorPatchState{} // group -> derived key + owner-set signature + last successful push
-	t := time.NewTicker(s.reconcileInterval())
-	defer t.Stop()
-	readyPoll := time.NewTicker(placerReadyPollInterval)
-	defer readyPoll.Stop()
-	wasReady := false
-	reconcileIfReady := func() {
-		ready := s.nodes.ready()
-		if ready && !wasReady {
-			s.reconcileImportSources(ctx, s.nodes.values(), last)
-		}
-		wasReady = ready
-	}
-	reconcileIfReady()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-readyPoll.C:
-			reconcileIfReady()
-		case <-s.nodeChanges:
-			if s.nodes.ready() {
-				wasReady = true
-				s.reconcileImportSources(ctx, s.nodes.values(), last)
-			}
-		case <-t.C:
-			ready := s.nodes.ready()
-			wasReady = ready
-			if !ready {
-				continue
-			}
-			s.reconcileImportSources(ctx, s.nodes.values(), last)
-		}
-	}
-}
 
 func (s *Service) reconcileInterval() time.Duration {
-	interval := s.selectorPatchEvery
+	interval := s.importEvery
 	if interval <= 0 {
 		interval = time.Minute
 	}
@@ -578,102 +359,6 @@ func (s *Service) reconcileInterval() time.Duration {
 		return time.Second
 	}
 	return interval
-}
-
-func (s *Service) reconcileImportSources(ctx context.Context, nodes []*registry.NodeRecord, last map[string]selectorPatchState) {
-	for _, source := range s.importSources {
-		if source.SourceID == "" || source.Importer == nil {
-			continue
-		}
-		if !s.isImportSourceCandidate(source.SourceID) {
-			continue
-		}
-		s.reconcileImportSource(ctx, source, nodes, last)
-	}
-}
-
-func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource, nodes []*registry.NodeRecord, last map[string]selectorPatchState) {
-	retries := 0
-	for {
-		lease, ok, err := s.acquireImportSourceLeaseToken(ctx, source.SourceID)
-		if err != nil {
-			if isPlacerShutdownError(ctx, err) {
-				return
-			}
-			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
-				continue
-			}
-			s.log.Warn("placer: import source lease", "source", source.SourceID, "err", err)
-			return
-		}
-		if !ok {
-			return
-		}
-		page, err := source.Importer.Range(ctx, lease.lease.Cursor, defaultGroupPageLimit)
-		if err != nil {
-			s.log.Warn("placer: group import", "source", source.SourceID, "cursor", lease.lease.Cursor, "err", err)
-			return
-		}
-		groups, err := s.selectorPatchGroupsForImportPage(ctx, page.Groups)
-		if err != nil {
-			s.log.Warn("placer: group import", "source", source.SourceID, "err", err)
-			return
-		}
-		if err := s.pushSelectorPatches(ctx, source.SourceID, nodes, groups, lease, last); err != nil {
-			if isPlacerShutdownError(ctx, err) {
-				return
-			}
-			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
-				continue
-			}
-			s.log.Warn("placer: selector patch", "source", source.SourceID, "err", err)
-			return
-		}
-		complete := page.NextCursor == ""
-		if err := s.checkpointImportSource(ctx, source.SourceID, lease, page.NextCursor, complete, ""); err != nil {
-			if isPlacerShutdownError(ctx, err) {
-				return
-			}
-			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
-				continue
-			}
-			s.log.Warn("placer: source cursor", "source", source.SourceID, "cursor", page.NextCursor, "err", err)
-			return
-		}
-		retries = 0
-		if complete {
-			return
-		}
-	}
-}
-
-func (s *Service) retryPlacerLinkFailure(ctx context.Context, sourceID string, err error, attempts *int) bool {
-	if isPlacerShutdownError(ctx, err) {
-		return false
-	}
-	if attempts == nil || *attempts >= scaleLinkFailureRetries {
-		return false
-	}
-	s.linksMu.RLock()
-	refresher := s.scaleLinkRefresher
-	s.linksMu.RUnlock()
-	if refresher == nil {
-		return false
-	}
-	*attempts++
-	if refreshErr := refresher(ctx); refreshErr != nil {
-		s.log.Warn("placer: refresh registry membership after placer_link failure", "source", sourceID, "err", refreshErr, "cause", err)
-	} else {
-		s.log.Warn("placer: retry placer_link operation after membership refresh", "source", sourceID, "attempt", *attempts, "err", err)
-	}
-	timer := time.NewTimer(scaleLinkRetryDelay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
 
 func isPlacerShutdownError(ctx context.Context, err error) bool {
@@ -688,29 +373,6 @@ func isPlacerShutdownError(ctx context.Context, err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "terminated signal received") || strings.Contains(msg, "context canceled")
-}
-
-func (s *Service) selectorPatchGroupsForImportPage(ctx context.Context, groups []string) ([]selectorPatchGroup, error) {
-	out := make([]selectorPatchGroup, 0, len(groups))
-	for _, group := range groups {
-		hint, found, err := s.provider.GetPlacementHint(ctx, group)
-		if err != nil {
-			return nil, err
-		}
-		if !found {
-			continue
-		}
-		key, _, err := s.provider.GetKey(ctx, group)
-		if err != nil {
-			return nil, err
-		}
-		apiSecret, _, err := s.provider.GetAPISecret(ctx, group)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, selectorPatchGroup{group: group, hint: hint, manifestKey: key, apiSecret: apiSecret})
-	}
-	return out, nil
 }
 
 func (s *Service) isImportSourceCandidate(sourceID string) bool {
@@ -851,54 +513,6 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 	return fmt.Errorf("placer: no registry link for source %s cursor checkpoint", sourceID)
 }
 
-func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, nodes []*registry.NodeRecord, groups []selectorPatchGroup, lease importLeaseToken, last map[string]selectorPatchState) error {
-	now := time.Now()
-	for _, g := range groups {
-		selectors, nodeIDs := selectorPatchTargets(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
-		apiFP, apiType, apiValue, apiRef,
-			manifestFP, manifestType, manifestValue, manifestRef, err := credentialPairPatch(g.group, g.manifestKey, g.apiSecret)
-		if err != nil {
-			s.log.Warn("placer: credential pair", "group", g.group, "err", err)
-			nodeIDs = nil
-			apiFP, apiType, apiValue, apiRef = "", "", "", ""
-			manifestFP, manifestType, manifestValue, manifestRef = "", "", "", ""
-		}
-		links := s.scaleLinkLinks(ctx, clusterstate.ImportSourceRoutingKey(sourceID))
-		linkSig := registryLinkSignature(links)
-		key := selectorPatchSignature(selectors, nodeIDs,
-			apiFP, apiType, apiValue, apiRef,
-			manifestFP, manifestType, manifestValue, manifestRef,
-			linkSig)
-		state := last[g.group]
-		if state.key == key && now.Sub(state.sentAt) < s.selectorPatchEvery {
-			continue
-		}
-		patch := &routesync.SelectorPatch{
-			Group: g.group, Selectors: selectors, NodeIDs: nodeIDs,
-			APISecretFingerprint: apiFP, APISecretType: apiType, APISecret: apiValue, APISecretRef: apiRef,
-			ManifestKeyFingerprint: manifestFP, ManifestKeyType: manifestType, ManifestKey: manifestValue, ManifestKeyRef: manifestRef,
-			ImportSourceID: lease.sourceID, ImportOwnerID: lease.lease.OwnerID, ImportRunID: lease.lease.RunID, ImportTerm: lease.lease.Term,
-		}
-		pushed := false
-		for _, link := range links {
-			if err := s.postJSON(ctx, link, registry.PlacerLinkSelectorPatchPath, patch); err != nil {
-				if isPlacerShutdownError(ctx, err) {
-					return err
-				}
-				s.log.Warn("placer: selector patch", "registry", link.Name, "source", sourceID, "group", g.group, "err", err)
-				continue
-			}
-			last[g.group] = selectorPatchState{key: key, sentAt: now}
-			pushed = true
-			break
-		}
-		if !pushed {
-			return fmt.Errorf("placer: selector patch failed for source %s group %s", sourceID, g.group)
-		}
-	}
-	return nil
-}
-
 func (s *Service) scaleLinkLinks(ctx context.Context, recordKey string) []RegistryLink {
 	s.linksMu.RLock()
 	resolver := s.scaleLinkResolver
@@ -920,55 +534,6 @@ func (s *Service) scaleLinkLinks(ctx context.Context, recordKey string) []Regist
 		return fallback
 	}
 	return links
-}
-
-func registryLinkSignature(links []RegistryLink) string {
-	ids := make([]string, 0, len(links))
-	for _, link := range links {
-		ids = append(ids, link.Name+"@"+link.BaseURL)
-	}
-	sort.Strings(ids)
-	return strings.Join(ids, ",")
-}
-
-func selectorPatchSignature(selectors []map[string]string, nodeIDs []string,
-	apiFP, apiType, apiValue, apiRef,
-	manifestFP, manifestType, manifestValue, manifestRef,
-	linkSig string,
-) string {
-	nodes := append([]string(nil), nodeIDs...)
-	sort.Strings(nodes)
-	return strings.Join([]string{
-		strings.Join(canonicalSelectorStrings(selectors), ";"),
-		strings.Join(nodes, ","),
-		apiFP,
-		apiType,
-		apiValue,
-		apiRef,
-		manifestFP,
-		manifestType,
-		manifestValue,
-		manifestRef,
-		linkSig,
-	}, "|")
-}
-
-func canonicalSelectorStrings(selectors []map[string]string) []string {
-	out := make([]string, 0, len(selectors))
-	for _, selector := range selectors {
-		keys := make([]string, 0, len(selector))
-		for key := range selector {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, key := range keys {
-			parts = append(parts, strconv.Quote(key)+"="+strconv.Quote(selector[key]))
-		}
-		out = append(out, strings.Join(parts, ","))
-	}
-	sort.Strings(out)
-	return out
 }
 
 func (s *Service) postJSON(ctx context.Context, link RegistryLink, path string, v any) error {
@@ -993,22 +558,6 @@ func (s *Service) postJSON(ctx context.Context, link RegistryLink, path string, 
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	return clusterclient.DrainResponse(resp.Body)
-}
-
-func selectorPatchTargets(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, []string) {
-	effective := selectors
-	if eff, ok := effectiveSelectors(group, nodes, selectors, rules); ok {
-		effective = eff
-	}
-	var nodeIDs []string
-	for _, n := range nodes {
-		if n.Draining || !matchSelectors(n.Labels, effective) {
-			continue
-		}
-		nodeIDs = append(nodeIDs, n.NodeID)
-	}
-	sort.Strings(nodeIDs)
-	return effective, nodeIDs
 }
 
 func (s *Service) watchNodeList(ctx context.Context) {

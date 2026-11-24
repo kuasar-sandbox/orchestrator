@@ -17,7 +17,7 @@ func TestCaptureSnapshotReferencePreservesActualResult(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(directory, file.name), nil, 0600); err != nil {
 			t.Fatal(err)
 		}
-		for _, annotation := range []string{"", "@runtime:captured-runtime.bundle:digest:" + strings.Repeat("b", 64)} {
+		for _, annotation := range []string{"", "@runtime:captured-runtime.bundle:digest:" + strings.Repeat("b", 64), "@runtime:" + strings.Repeat("r", manifest.MaxRuntimeBasenameBytes-len(".bundle")) + ".bundle:digest:" + strings.Repeat("b", 64)} {
 			ref := "file://" + file.name + "@" + file.scheme + ":" + strings.Repeat("a", 64) + annotation
 			output, err := json.Marshal(artifact.PublishReport{
 				SnapshotRef: ref, SandboxRef: "manifest://" + strings.Repeat("c", 64), RemovedRefs: []string{},

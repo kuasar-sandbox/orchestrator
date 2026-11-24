@@ -62,7 +62,10 @@ func runRegistry(args []string, log *slog.Logger) error {
 		return err
 	}
 
-	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), log)
+	reg := registry.New(stores, cfg.RouteLink.ParkDur(), log)
+	if err := reg.SetPlacementPolicy(cfg.Placement.Candidates, cfg.Placement.ZoneAdmitMax); err != nil {
+		return err
+	}
 	reg.SetRemoteNodeOwners(remoteNodeOwners)
 	nodeLinkRelayPeers, err := buildRegistryNodeLinkRelayPeers(cfg)
 	if err != nil {
@@ -71,12 +74,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	reg.SetNodeLinkRelayPeers(nodeLinkRelayPeers)
 	reg.SetPlacerMemberlistLabel(cfg.PlacerLink.PlacerLabel)
 	reg.SetPlacerSeedJoiner(placerObserver.JoinSeed)
-	reg.SetPlacerPeerSource(placerObserver.ReadyPlacers)
-	if active, ok := cfg.Membership.ActiveVersion(); ok {
-		reg.SetPlacerReadyLabel(active.Label)
-	}
-	reg.SetPlacerPolicy(cfg.PlacerLink.PlacerReplicaCount, cfg.PlacerLink.MinReadyPlacers, cfg.PlacerLink.PlaceDur())
-	reg.SetPlacer(registry.NewHTTPPlacerWithMinReady(reg, cfg.PlacerLink.PlacerReplicaCount, cfg.PlacerLink.MinReadyPlacers, cfg.PlacerLink.PlaceDur()))
 	cfgState := newRegistryRuntimeConfig(cfg, connectionOwners)
 
 	go runRegistryReload(ctx, *cfgPath, cfgState, reg, registryMembers, log)
@@ -214,7 +211,7 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if err := validateRegistryMembershipReload(old.Membership, next.Membership); err != nil {
 		return err
 	}
-	active, ok := next.Membership.ActiveVersion()
+	_, ok := next.Membership.ActiveVersion()
 	if !ok {
 		return fmt.Errorf("registry reload: active membership %d not found", next.Membership.Active)
 	}
@@ -239,10 +236,10 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 		return err
 	}
 	reg.SetNodeLinkRelayPeers(nodeLinkRelayPeers)
-	reg.SetPlacerReadyLabel(active.Label)
 	reg.SetPlacerMemberlistLabel(next.PlacerLink.PlacerLabel)
-	reg.SetPlacerPolicy(next.PlacerLink.PlacerReplicaCount, next.PlacerLink.MinReadyPlacers, next.PlacerLink.PlaceDur())
-	reg.SetPlacer(registry.NewHTTPPlacerWithMinReady(reg, next.PlacerLink.PlacerReplicaCount, next.PlacerLink.MinReadyPlacers, next.PlacerLink.PlaceDur()))
+	if err := reg.SetPlacementPolicy(next.Placement.Candidates, next.Placement.ZoneAdmitMax); err != nil {
+		return err
+	}
 	cfgState.set(next)
 	return nil
 }

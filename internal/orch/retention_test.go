@@ -142,7 +142,7 @@ func TestConcurrentTerminalBuildReapAndSameIDRegistrationStayOrdered(t *testing.
 		ctx := context.Background()
 		_, _, fingerprint := allowlistedBuildIdentity(t, o)
 		buildID := "retention-race-" + leftPad(iteration, 2)
-		cmd := clusterBuildRegisterCommand(buildID, fingerprint)
+		cmd := clusterBuildRegisterCommand(t, o, buildID, fingerprint)
 		if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 			t.Fatalf("iteration %d initial registration = %+v", iteration, ack)
 		}

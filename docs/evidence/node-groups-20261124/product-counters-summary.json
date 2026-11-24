@@ -1,0 +1,164 @@
+{
+  "scope": "Three alternating pairs; 4 product processes / 4 logical Node stubs; FDB server sampled totals include background/status traffic; not per-API attribution",
+  "count": 200,
+  "versions": {
+    "before": {
+      "runs": [
+        {
+          "file": "product-counters-before-1795474511.json",
+          "counters": {
+            "committed": 1775,
+            "conflicted": 0,
+            "rejected_for_queued_too_long": 0,
+            "started": 19645,
+            "started_batch_priority": 1,
+            "started_default_priority": 19540,
+            "started_immediate_priority": 104
+          },
+          "cleanup": {
+            "scope": "only the instances created by the two measured Create phases; Node execution is simulated",
+            "created": 400,
+            "observations": [
+              {
+                "elapsed_ms": 0.9951010000577298,
+                "pending_local_instances": 0
+              }
+            ]
+          }
+        },
+        {
+          "file": "product-counters-before-1795474617.json",
+          "counters": {
+            "committed": 1818,
+            "conflicted": 0,
+            "rejected_for_queued_too_long": 0,
+            "started": 20466,
+            "started_batch_priority": 1,
+            "started_default_priority": 20348,
+            "started_immediate_priority": 117
+          },
+          "cleanup": {
+            "scope": "only the instances created by the two measured Create phases; Node execution is simulated",
+            "created": 400,
+            "observations": [
+              {
+                "elapsed_ms": 1.8419040000026143,
+                "pending_local_instances": 0
+              }
+            ]
+          }
+        },
+        {
+          "file": "product-counters-before-1795474728.json",
+          "counters": {
+            "committed": 1724,
+            "conflicted": 0,
+            "rejected_for_queued_too_long": 0,
+            "started": 17936,
+            "started_batch_priority": 1,
+            "started_default_priority": 17845,
+            "started_immediate_priority": 90
+          },
+          "cleanup": {
+            "scope": "only the instances created by the two measured Create phases; Node execution is simulated",
+            "created": 400,
+            "observations": [
+              {
+                "elapsed_ms": 1.5820000000985601,
+                "pending_local_instances": 0
+              }
+            ]
+          }
+        }
+      ],
+      "median_counter_delta": {
+        "committed": 1775,
+        "conflicted": 0,
+        "rejected_for_queued_too_long": 0,
+        "started": 19645,
+        "started_batch_priority": 1,
+        "started_default_priority": 19540,
+        "started_immediate_priority": 104
+      }
+    },
+    "after": {
+      "runs": [
+        {
+          "file": "product-counters-after-1795474562.json",
+          "counters": {
+            "committed": 1559,
+            "conflicted": 18,
+            "rejected_for_queued_too_long": 0,
+            "started": 25191,
+            "started_batch_priority": 1,
+            "started_default_priority": 25073,
+            "started_immediate_priority": 117
+          },
+          "cleanup": {
+            "scope": "only the instances created by the two measured Create phases; Node execution is simulated",
+            "created": 400,
+            "observations": [
+              {
+                "elapsed_ms": 2.2632999999814274,
+                "pending_local_instances": 0
+              }
+            ]
+          }
+        },
+        {
+          "file": "product-counters-after-1795474672.json",
+          "counters": {
+            "committed": 1565,
+            "conflicted": 22,
+            "rejected_for_queued_too_long": 0,
+            "started": 25190,
+            "started_batch_priority": 1,
+            "started_default_priority": 25072,
+            "started_immediate_priority": 117
+          },
+          "cleanup": {
+            "scope": "only the instances created by the two measured Create phases; Node execution is simulated",
+            "created": 400,
+            "observations": [
+              {
+                "elapsed_ms": 1.641400000039539,
+                "pending_local_instances": 0
+              }
+            ]
+          }
+        },
+        {
+          "file": "product-counters-after-1795474774.json",
+          "counters": {
+            "committed": 1567,
+            "conflicted": 14,
+            "rejected_for_queued_too_long": 0,
+            "started": 24310,
+            "started_batch_priority": 1,
+            "started_default_priority": 24192,
+            "started_immediate_priority": 117
+          },
+          "cleanup": {
+            "scope": "only the instances created by the two measured Create phases; Node execution is simulated",
+            "created": 400,
+            "observations": [
+              {
+                "elapsed_ms": 1.600999999936903,
+                "pending_local_instances": 0
+              }
+            ]
+          }
+        }
+      ],
+      "median_counter_delta": {
+        "committed": 1565,
+        "conflicted": 18,
+        "rejected_for_queued_too_long": 0,
+        "started": 25190,
+        "started_batch_priority": 1,
+        "started_default_priority": 25072,
+        "started_immediate_priority": 117
+      }
+    }
+  }
+}

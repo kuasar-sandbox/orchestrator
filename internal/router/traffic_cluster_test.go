@@ -102,9 +102,9 @@ func TestClusterKnownTargetCountsOnlyFinalNodeWorker(t *testing.T) {
 	var reserveHits atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(route)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits.Add(1)
 			http.Error(w, "known target must not reserve", http.StatusInternalServerError)
 		default:

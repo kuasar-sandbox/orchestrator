@@ -26,22 +26,17 @@ func TestWorkspaceReserveBindsFirstSourceToReservation(t *testing.T) {
 	ctx := context.Background()
 	r := testReg(t)
 	meta, entries := workspaceInput(t, "kwt1.first")
-	r.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		if strings.Contains(req.Config[workspace.Namespace], "kwt1.") {
-			t.Fatal("private source reached placer")
-		}
-		return &Placement{NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint}, nil
-	}))
 	if err := putTestNode(r.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
+	publishTestGroups(t, r, "n1", "/g")
 	var commands []*routesync.Command
-	r.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
+	attachTestNode(t, r, &fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
 		commands = append(commands, c)
 		r.ackCommand(&routesync.CmdAck{CmdID: c.CmdID, Status: routesync.AckAccepted})
 	}})
 	place := func(key string, ws []workspace.Entry) error {
-		return r.placeAndCreate(ctx, "/g", key, meta, nil, nil, true, false, createOptions{workspaces: ws})
+		return r.placeAndCreate(ctx, "/g", key, meta, nil, nil, true, false, createOptions{apiKey: testAPIKeyValue(), workspaces: ws})
 	}
 	if err := place("r", entries); err != nil {
 		t.Fatal(err)
@@ -74,11 +69,11 @@ func TestWorkspaceBuildReplayIdentity(t *testing.T) {
 	ctx := context.Background()
 	r := testReg(t)
 	seedTestNode(t, r.stores, "n1")
-	r.SetPlacer(placementWithToken("n1"))
+	publishTestGroups(t, r, "n1", "/g")
 	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
 	r.SetNodeOwner(owner)
 	meta, entries := workspaceInput(t, "kwt1.private")
-	req := BuildReserveReq{Group: "/g", BuildID: "workspace-build", TemplateID: "transient-workspace", Profile: types.ProfileBare, Resources: testWireBuildResources(), Metadata: meta, Workspaces: entries}
+	req := BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "workspace-build", TemplateID: "transient-workspace", Profile: types.ProfileBare, Resources: testWireBuildResources(), Metadata: meta, Workspaces: entries}
 	if _, err := r.ReserveBuild(ctx, req); err == nil {
 		t.Fatal("expected lost acknowledgment")
 	}

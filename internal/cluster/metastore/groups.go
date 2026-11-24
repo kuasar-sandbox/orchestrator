@@ -370,18 +370,26 @@ func (s *Store) readGroupSelection(tr *records.Tx, group, node string) (metadata
 	if row.Value.Group != group || row.Value.Registration.NodeID != node {
 		return metadata.GroupSupportSelection{}, invalidRecord("Group candidate identity")
 	}
-	pub, err := readTyped[metadata.GroupPublication](tr, s.groupPublicationKey(node))
+	related, err := tr.GetMany([]records.Key{s.groupPublicationKey(node), s.profileKey(node), s.lifecycleKey(node)})
+	if err != nil {
+		return metadata.GroupSupportSelection{}, err
+	}
+	return groupSelection(row, related)
+}
+
+func groupSelection(row metadata.Versioned[metadata.GroupSupportRecord], related []records.Value) (metadata.GroupSupportSelection, error) {
+	pub, err := typed[metadata.GroupPublication](wrapRecord(related[0]))
 	if err != nil {
 		return metadata.GroupSupportSelection{}, err
 	}
 	if !pub.Exists || !pub.Value.Published || pub.Value.Registration != row.Value.Registration || pub.Value.SyncID != row.Value.SyncID {
 		return metadata.GroupSupportSelection{}, nil
 	}
-	profile, err := readTyped[metadata.NodeProfileRecord](tr, s.profileKey(node))
+	profile, err := typed[metadata.NodeProfileRecord](wrapRecord(related[1]))
 	if err != nil {
 		return metadata.GroupSupportSelection{}, err
 	}
-	life, err := readTyped[lifecycle](tr, s.lifecycleKey(node))
+	life, err := typed[lifecycle](wrapRecord(related[2]))
 	if err != nil {
 		return metadata.GroupSupportSelection{}, err
 	}
@@ -428,12 +436,29 @@ func (s *Store) ListGroupSupport(ctx context.Context, group string, cursor metad
 		if err != nil {
 			return err
 		}
-		for _, item := range page.Items {
+		// Keep the scanned rows and batch their dependent records inside this
+		// same snapshot. Per-candidate reads otherwise add four sequential
+		// database round trips for each Node in the bounded page.
+		rows := make([]metadata.Versioned[metadata.GroupSupportRecord], len(page.Items))
+		keys := make([]records.Key, 0, 3*len(page.Items))
+		for i, item := range page.Items {
 			row, err := typed[metadata.GroupSupportRecord](wrapRecord(item.Value))
 			if err != nil {
 				return err
 			}
-			selected, err := s.readGroupSelection(tr, group, row.Value.Registration.NodeID)
+			node := row.Value.Registration.NodeID
+			if !row.Exists || row.Value.Group != group || node == "" || !bytes.Equal(item.Key, s.groupSupportKey(group, node)) {
+				return invalidRecord("Group candidate identity")
+			}
+			rows[i] = row
+			keys = append(keys, s.groupPublicationKey(node), s.profileKey(node), s.lifecycleKey(node))
+		}
+		related, err := tr.GetMany(keys)
+		if err != nil {
+			return err
+		}
+		for i, row := range rows {
+			selected, err := groupSelection(row, related[3*i:3*i+3])
 			if err != nil {
 				return err
 			}

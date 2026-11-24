@@ -839,7 +839,7 @@ Public Config/App/extension contracts live in config and app/conductor, app/prox
 
 - [Node Proxy](node-proxy.md): independent forwarding, routing/routesync, authentication, MMDS and CONNECT; [Data-plane boundaries](#runtime-endpoints)'s sole data ingress, reached through Router in clusters.
 - [Node resources](node-resource.md): resource protocol, Sandbox policy and controller organization, embedded in serve at the sole resource_listen endpoint.
-- [Cluster](cluster.md): [node-link wire](cluster.md#node-link) and [node attachment](cluster.md#node-attachment), Registry and Reserve; [Router](cluster.md#client-access) data ingress and [Placer](cluster.md#groups-and-placement) placement/key distribution.
+- [Cluster](cluster.md): [node-link wire](cluster.md#node-link) and [node attachment](cluster.md#node-attachment), Registry and Reserve; [Router](cluster.md#client-access) data ingress and [Placer](cluster.md#groups-and-placement) conditional Group import and credential renewal.
 - [Sandbox lifecycle](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/runtime.md): SANDBOX_CONFIG modes, run/snapshot/restore/connect and cgroups.
 - [vSwitch operations](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch-operations.md): attach/detach/open-port; [vSwitch design](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md) owns floating IP and mgmt-service/MMDS VIP translation.
 - [Flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md): export, idempotent OCI Referrers and FLATTEN_REGISTRY_*.

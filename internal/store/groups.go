@@ -453,6 +453,30 @@ func (s *Store) GroupList(ctx context.Context, apiKey, cursor string, limit int)
 // GroupSnapshot is an internal consistent catalog boundary. Its sequence is
 // node-wide and unrelated to the shared engine's per-key revisions. No private
 // default configuration or manifest root is projected into GroupSupport.
+func (s *Store) GroupSupport(ctx context.Context, name string) (nodegroup.Support, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nodegroup.Support{}, err
+	}
+	defer tx.Rollback()
+	r, err := readGroup(ctx, tx, name)
+	if err != nil {
+		return nodegroup.Support{}, err
+	}
+	if !r.active {
+		return nodegroup.Support{}, nodegroup.ErrNotFound
+	}
+	pair, err := s.decryptVerifiedKeyPair(r.owner, r.apiEnc, r.manifestHash, r.manifestEnc)
+	if err != nil {
+		return nodegroup.Support{}, err
+	}
+	detail, err := s.groupDetail(r)
+	if err != nil {
+		return nodegroup.Support{}, err
+	}
+	return detail.Context.Support(r.name, r.revision, r.owner, pair.APISecret), nil
+}
+
 func (s *Store) GroupSnapshot(ctx context.Context) (int64, []nodegroup.Support, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

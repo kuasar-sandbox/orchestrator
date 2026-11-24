@@ -314,7 +314,7 @@ func TestClusterCreatePreservesOriginalCredentialInput(t *testing.T) {
 	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
 	o.vs = blocked
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "cluster-identity")
+	cmd := clusterCreateCommand(t, o, fingerprint, "cluster-identity")
 	cmd.Config = map[string]string{sandboxcfg.NsCredentials: `{"service_secret":"` + strings.Repeat("a", 64) + `"}`, "keep": "value"}
 	original := cloneStringMap(cmd.Config)
 	finalSecret := strings.Repeat("b", 64)
@@ -383,7 +383,7 @@ func TestIdentityInvalidAndWrongOriginRejectedBeforeEffects(t *testing.T) {
 		}
 	}
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "cluster-reject")
+	cmd := clusterCreateCommand(t, o, fingerprint, "cluster-reject")
 	cmd.Config = map[string]string{sandboxcfg.NsIdentity: `{}`}
 	if ack := o.HandleCommand(context.Background(), cmd); ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("cluster identity injection = %+v", ack)

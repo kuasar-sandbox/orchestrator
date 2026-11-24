@@ -2,6 +2,7 @@ package routesync
 
 import (
 	"encoding/json"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -27,59 +28,6 @@ const (
 // NodeLinkPath is the HTTP path node-ctl conductor serve dials to open its node_link
 // channel to the registry.
 const NodeLinkPath = "/node-link/session"
-
-// PlaceReq is a registry placement request to the placer.
-// TargetRuntimeDigest lets the placer require a matching guest runtime; empty
-// means no runtime constraint.
-type PlaceReq struct {
-	ReqID               string            `json:"req_id"`
-	Group               string            `json:"group"`
-	RouteKey            string            `json:"route_key"`
-	SandboxID           string            `json:"sandbox_id,omitempty"`
-	Config              map[string]string `json:"config,omitempty"`
-	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware; docs/cluster.md#placer-placement)
-	BuildResources      *BuildResources   `json:"build_resources,omitempty"`
-	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
-	ExcludeNodeIDs      []string          `json:"exclude_node_ids,omitempty"`
-}
-
-// PlaceResult is the placer's answer (NodeID set, or NoNode when nothing eligible).
-type PlaceResult struct {
-	ReqID                string            `json:"req_id"`
-	NodeID               string            `json:"node_id,omitempty"`
-	NoNode               bool              `json:"no_node,omitempty"`
-	Error                string            `json:"error,omitempty"`
-	InvalidConfig        bool              `json:"invalid_config,omitempty"`
-	TemplateRef          string            `json:"template_ref,omitempty"`
-	TargetPort           int               `json:"target_port,omitempty"`
-	Config               map[string]string `json:"config,omitempty"`
-	APISecretFingerprint string            `json:"api_secret_fingerprint,omitempty"`
-	ImageRepo            string            `json:"image_repo,omitempty"`
-	RegistryAuth         string            `json:"registry_auth,omitempty"`
-}
-
-// SelectorPatch is the placer's placement projection for a group. NodeIDs is the
-// explicit node set that should hold the group's API/manifest credential pair;
-// Selectors carries the shuffle-effective selector projection. The pair is one
-// atomic unit: both fingerprints and both typed secret carriers are present, or
-// all credential fields are absent.
-type SelectorPatch struct {
-	Group                  string              `json:"group"`
-	Selectors              []map[string]string `json:"selectors"`
-	NodeIDs                []string            `json:"node_ids,omitempty"`
-	APISecretFingerprint   string              `json:"api_secret_fingerprint,omitempty"`
-	APISecretType          string              `json:"api_secret_type,omitempty"`
-	APISecret              string              `json:"api_secret,omitempty"`
-	APISecretRef           string              `json:"api_secret_ref,omitempty"`
-	ManifestKeyFingerprint string              `json:"manifest_key_fingerprint,omitempty"`
-	ManifestKeyType        string              `json:"manifest_key_type,omitempty"`
-	ManifestKey            string              `json:"manifest_key,omitempty"`
-	ManifestKeyRef         string              `json:"manifest_key_ref,omitempty"`
-	ImportSourceID         string              `json:"import_source_id,omitempty"`
-	ImportOwnerID          string              `json:"import_owner_id,omitempty"`
-	ImportRunID            string              `json:"import_run_id,omitempty"`
-	ImportTerm             uint64              `json:"import_term,omitempty"`
-}
 
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
 // drives the node with. The node executes via its existing e2b lifecycle (the
@@ -149,6 +97,7 @@ const (
 // so the registry can place sandboxes (and later builds) on it and forward the
 // data plane to it (docs/cluster.md#node-link).
 type NodeRegister struct {
+	GroupSupportVersion       int                  `json:"group_support_version,omitempty"`
 	NodeID                    string               `json:"node_id"`
 	Labels                    map[string]string    `json:"labels,omitempty"`   // zone / pool / slot / node (nodeSelectors)
 	Capacity                  int                  `json:"capacity,omitempty"` // max sandboxes (headroom signal)
@@ -226,10 +175,13 @@ type Heartbeat struct {
 // only the current delivery with its Ack; retry semantics are operation-specific.
 // Fields are populated per Kind.
 type Command struct {
-	Workspaces []workspace.Entry `json:"workspaces,omitempty"`
-	CmdID      string            `json:"cmd_id"`
-	Kind       string            `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
-	SID        string            `json:"sid,omitempty"`
+	Group                *GroupCommand     `json:"group,omitempty"`
+	GroupAPIKey          string            `json:"group_api_key,omitempty"`
+	ExpectedGroupVersion int64             `json:"expected_group_version,omitempty"`
+	Workspaces           []workspace.Entry `json:"workspaces,omitempty"`
+	CmdID                string            `json:"cmd_id"`
+	Kind                 string            `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
+	SID                  string            `json:"sid,omitempty"`
 	// create and lifecycle credential binding
 	TemplateRef          string                 `json:"template_ref,omitempty"`           // canonical img/sbx/snp template ref
 	Profile              string                 `json:"profile,omitempty"`                // sandbox profile; also used by build_register
@@ -326,11 +278,16 @@ type BuildRegisterResult struct {
 // additionally return their synchronously prepared result; asynchronous resume
 // completion still arrives through the route stream.
 type CmdAck struct {
-	CmdID         string               `json:"cmd_id"`
-	Status        string               `json:"status"` // AckAccepted | AckRejected
-	Reason        string               `json:"reason,omitempty"`
-	HTTPStatus    int                  `json:"http_status,omitempty"`
-	Connect       *ConnectResult       `json:"connect,omitempty"`
-	ExecSession   *ExecSessionResult   `json:"exec_session,omitempty"`
-	BuildRegister *BuildRegisterResult `json:"build_register,omitempty"`
+	GroupResult         *nodegroup.Result    `json:"group_result,omitempty"`
+	GroupDetail         *nodegroup.Detail    `json:"group_detail,omitempty"`
+	GroupPage           *nodegroup.Page      `json:"group_page,omitempty"`
+	CurrentGroupVersion *int64               `json:"current_group_version,omitempty"`
+	ErrorCode           string               `json:"error_code,omitempty"`
+	CmdID               string               `json:"cmd_id"`
+	Status              string               `json:"status"` // AckAccepted | AckRejected
+	Reason              string               `json:"reason,omitempty"`
+	HTTPStatus          int                  `json:"http_status,omitempty"`
+	Connect             *ConnectResult       `json:"connect,omitempty"`
+	ExecSession         *ExecSessionResult   `json:"exec_session,omitempty"`
+	BuildRegister       *BuildRegisterResult `json:"build_register,omitempty"`
 }

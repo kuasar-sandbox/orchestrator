@@ -100,13 +100,11 @@ node_link:
   node_dead_after: 30s
 route_link:
   park_timeout: 30s
-node_list:
-  watch_retention: 10000
 placer_link:
   placer_label: placer.default          # placer memberlist label; not a configured placer list
-  placer_replica_count: 3
-  min_ready_placers: 1
-  place_timeout: 2s
+placement:
+  candidates: 2                      # Registry P2C sample size
+  zone_admit_max: yellow              # exclude nodes hotter than this (green|yellow|red)
 `
 
 const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (docs/cluster.md#router-configuration).
@@ -128,14 +126,14 @@ cache:
 `
 
 const placerConfigSkeleton = `# cluster-ctl placer config — cluster-ctl placer --config <this> (docs/cluster.md#placer-configuration).
-# Standalone placement scheduler; starts from registry membership, joins the
-# placer memberlist label, consumes node_list, and provides placement.
+# Optional Group importer; starts from registry membership, joins the
+# placer memberlist, consumes node_list, and maintains Node-owned Groups.
 placer:
   id: placer-1
   listen: ":7800"
   advertise: "https://placer-1.example:7800"
   memberlist_label: placer.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for placer Place API
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for importer memberlist
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
@@ -144,11 +142,9 @@ import_groups:                         # standalone placer requires at least one
     source_type: file
     path: /var/lib/kuasar/groups
 placement:
-  candidates: 2                      # P2C sample size
-  zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)
   import_source_owner_count: 3       # candidates that may race for each source lease
   import_source_lease_ttl: 15s       # registry-side source lease TTL
-  selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
+  import_refresh_interval: 1m       # reconcile Groups and renew unchanged bindings
   # shuffle_sharding:                # empty = static nodeSelectors only
   #   - selector: { pool: gpu }
   #     shard_by: zone

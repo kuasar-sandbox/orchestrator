@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"io"
 	"log/slog"
 	"net"
@@ -34,9 +35,9 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	cluster := newTestStoreCluster(t, []string{"ingress", "peer", "owner"}, 3, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
-	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
-	enableTestCreateAuth(t, ingress)
+	owner := New(cluster["owner"], 5*time.Second, log)
+	ingress := New(cluster["ingress"], 5*time.Second, log)
+
 	ingress.SetRemoteNodeOwners(map[string]NodeOwner{"owner": owner.LocalNodeOwner()})
 
 	ownerMux := http.NewServeMux()
@@ -54,6 +55,7 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 
 	waitNodeLinkRecord(t, ctx, owner.stores, nodeID, "owner")
 	waitNodeLinkProfile(t, ctx, ingress.stores, nodeID, "owner")
+	waitTestGroupSupport(t, ingress, nodeID, "/g")
 	if _, live := ingress.node(nodeID); live {
 		t.Fatal("ingress member unexpectedly holds the node_link stream")
 	}
@@ -82,9 +84,8 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 	cluster := newTestStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
-	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
-	enableTestCreateAuth(t, ingress)
+	owner := New(cluster["owner"], 5*time.Second, log)
+	ingress := New(cluster["ingress"], 5*time.Second, log)
 
 	ownerMux := http.NewServeMux()
 	ownerMux.HandleFunc(NodeLinkRelayPath, owner.ServeNodeLinkRelay)
@@ -121,7 +122,7 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 		}
 		respCh <- resp
 	}()
-	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
+	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion,
 		NodeID: nodeID, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443", AcceptRedirect: true,
 	}}); err != nil {
 		t.Fatal(err)
@@ -159,9 +160,8 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	cluster := newTestStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
-	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
-	enableTestCreateAuth(t, ingress)
+	owner := New(cluster["owner"], 5*time.Second, log)
+	ingress := New(cluster["ingress"], 5*time.Second, log)
 
 	ownerMux := http.NewServeMux()
 	ownerMux.HandleFunc(routesync.NodeLinkPath, owner.ServeNodeLink)
@@ -181,7 +181,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	defer ingressSrv.Close()
 
 	node := newRedirectNodeStub(nodeID)
-	client := nodelink.NewWithEndpoint(ingressSrv.Listener.Addr().String(), testNodeLinkDial, routesync.NodeRegister{
+	client := nodelink.NewWithEndpoint(ingressSrv.Listener.Addr().String(), testNodeLinkDial, routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion,
 		NodeID: nodeID, Capacity: 10, APIEndpoint: "127.0.0.1:18181", DataEndpoint: "127.0.0.1:19191",
 	}, node, 20*time.Millisecond, nil, log, true)
 	go client.Run(ctx)
@@ -192,6 +192,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 		t.Fatal("ingress member unexpectedly holds redirected node_link stream")
 	}
 	waitRegistryNodeLive(t, owner, nodeID)
+	waitTestGroupSupport(t, ingress, nodeID, "/g")
 
 	res, err := ingress.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
@@ -210,7 +211,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 
 func TestNodeLinkRedirectDoesNotFallbackToRelayEndpoint(t *testing.T) {
 	cluster := newTestStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
-	ingress := New(cluster["ingress"], nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ingress := New(cluster["ingress"], 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ingress.SetNodeLinkRelayPeers(map[string]NodeLinkRelayPeer{"owner": {
 		Endpoint: "http://owner-control.example.test",
 	}})
@@ -325,6 +326,13 @@ func (n *redirectNodeStub) Heartbeat() *routesync.Heartbeat {
 func (n *redirectNodeStub) RangeBuilds(context.Context, func(routesync.BuildEvent) error) error {
 	return nil
 }
+
+func (n *redirectNodeStub) GroupSnapshot(context.Context) (int64, []nodegroup.Support, error) {
+	return 1, []nodegroup.Support{{Group: "/g", Version: 1, Entries: []nodegroup.Entry{{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}}, DefaultContext: &nodegroup.DefaultContext{TemplateID: testTemplateRef}}}, nil
+}
+func (n *redirectNodeStub) SubscribeGroups() (<-chan routesync.GroupEvent, func()) {
+	return make(chan routesync.GroupEvent), func() {}
+}
 func (n *redirectNodeStub) SubscribeBuilds() (<-chan routesync.BuildEvent, func()) {
 	return make(chan routesync.BuildEvent), func() {}
 }
@@ -406,7 +414,7 @@ func startRelayNodeStub(t *testing.T, ctx context.Context, addr, nodeID string) 
 		}
 		respCh <- resp
 	}()
-	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
+	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion,
 		NodeID: nodeID, Capacity: 10, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443",
 	}}); err != nil {
 		t.Fatal(err)
@@ -425,6 +433,15 @@ func startRelayNodeStub(t *testing.T, ctx context.Context, addr, nodeID string) 
 	}
 	if hello.Type != routesync.TypeHello {
 		t.Fatalf("first response=%+v, want hello", hello)
+	}
+	for _, msg := range []*routesync.Msg{
+		{Type: routesync.TypeGroupBegin, Group: &routesync.GroupReport{SyncID: "test", Sequence: 1, Total: 1}},
+		{Type: routesync.TypeGroupBatch, Group: &routesync.GroupReport{SyncID: "test", Sequence: 1, Groups: []nodegroup.Support{{Group: "/g", Version: 1, Entries: []nodegroup.Entry{{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}}, DefaultContext: &nodegroup.DefaultContext{TemplateID: testTemplateRef}}}}},
+		{Type: routesync.TypeGroupEnd, Group: &routesync.GroupReport{SyncID: "test", Sequence: 1}},
+	} {
+		if err := routesync.WriteMsg(pw, msg); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeBuildSyncBegin}); err != nil {
 		t.Fatal(err)

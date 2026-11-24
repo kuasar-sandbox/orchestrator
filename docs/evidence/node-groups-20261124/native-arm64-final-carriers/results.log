@@ -1,0 +1,20 @@
+Warning: Permanently added '49.235.34.229' (ED25519) to the list of known hosts.
+Warning: Permanently added 'bms.ci-arm' (ED25519) to the list of known hosts.
+./builder.test: OK
+./migrationtoken.test: OK
+./registry.test: OK
+=== RUN   TestMaximumRuntimeReferenceSurvivesEncryptedToken
+--- PASS: TestMaximumRuntimeReferenceSurvivesEncryptedToken (0.00s)
+PASS
+=== RUN   TestCaptureSnapshotReferencePreservesActualResult
+--- PASS: TestCaptureSnapshotReferencePreservesActualResult (0.00s)
+PASS
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers/sqlite
+    native_template_carrier_test.go:119: C12: 592-byte reference / 799-byte template survived selection, framed NodeLink command/report, native commit/readback, RouteLink response and actual mmap
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers/postgres
+    native_intent_fault_test.go:35: set STORAGE_TEST_POSTGRES_DSN for real PostgreSQL Registry faults
+--- PASS: TestRegistryNativeMaximumRuntimeTemplateCarriers (0.01s)
+    --- PASS: TestRegistryNativeMaximumRuntimeTemplateCarriers/sqlite (0.01s)
+    --- SKIP: TestRegistryNativeMaximumRuntimeTemplateCarriers/postgres (0.00s)
+PASS

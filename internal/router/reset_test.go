@@ -36,10 +36,10 @@ func TestResetTerminalManagementUsesNodeAPI(t *testing.T) {
 				}))
 				defer node.Close()
 				control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path == "/route-link/verify-key" {
+					if r.URL.Path == "/route-link/v2/verify-key" {
 						return
 					}
-					if r.URL.Path != "/route-link/route" {
+					if r.URL.Path != "/route-link/v2/data-route" && r.URL.Path != "/route-link/v2/control-route" {
 						t.Errorf("management unexpectedly used %s", r.URL.Path)
 						w.WriteHeader(http.StatusBadRequest)
 						return

@@ -156,6 +156,55 @@ func (t *Tx) Get(key Key) (Value, error) {
 	return value, err
 }
 
+// GetMany preserves input order, duplicates, absent records and read-your-writes.
+// It batches envelope reads through the existing engine transaction; chunked
+// values still use the same integrity-checked decoder as Get.
+func (t *Tx) GetMany(keys []Key) ([]Value, error) {
+	out := make([]Value, len(keys))
+	if t.write != nil {
+		if err := t.loadBases(keys); err != nil {
+			return nil, err
+		}
+		for i, key := range keys {
+			var err error
+			out[i], err = t.Get(key)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	for start := 0; start < len(keys); start += 256 {
+		part := keys[start:min(start+256, len(keys))]
+		physicalKeys := make([][]byte, len(part))
+		for i, key := range part {
+			var err error
+			physicalKeys[i], err = physical(key)
+			if err != nil {
+				return nil, err
+			}
+		}
+		rows, err := t.read.GetMany(physicalKeys)
+		if err != nil {
+			return nil, err
+		}
+		for i, raw := range rows {
+			if !raw.Exists {
+				continue
+			}
+			value, actual, err := t.decode(physicalKeys[i], raw.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			if !bytes.Equal(actual, part[i]) {
+				return nil, invalid("logical key collision")
+			}
+			out[start+i] = value
+		}
+	}
+	return out, nil
+}
+
 func (t *Tx) Expect(key Key, expected Version) (Value, error) {
 	v, err := t.Get(key)
 	if err != nil {

@@ -41,16 +41,6 @@ func testFingerprint(secretHex string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-type testPlacer struct{}
-
-func (testPlacer) Place(ctx context.Context, req registry.PlaceRequest) (*registry.Placement, error) {
-	return &registry.Placement{
-		NodeID:               "n1",
-		TemplateRef:          "e2b-img-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh",
-		APISecretFingerprint: testFingerprint(testAPISecret),
-	}, nil
-}
-
 // fakeNode implements Node: it streams its routes and, on a create command,
 // "boots" the sandbox by adding a running route + emitting an upsert event — the
 // same path a real node takes (the registry's Reserve waits on that route).
@@ -156,6 +146,7 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	}
 	e := routesync.RouteEntry{
 		SandboxID:              cmd.SID,
+		TemplateID:             testNodeTemplate,
 		Profile:                cmd.Profile,
 		State:                  routesync.StateRunning,
 		StableID:               stableID,
@@ -193,7 +184,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(newTestRegistryStores(t), testPlacer{}, 5*time.Second, log)
+	reg := registry.New(newTestRegistryStores(t), 5*time.Second, log)
 	rawAPISecret, err := hex.DecodeString(testAPISecret)
 	if err != nil {
 		t.Fatal(err)
@@ -205,25 +196,14 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
-	mux.HandleFunc(registry.PlacerLinkVerifyKeyPath, func(w http.ResponseWriter, req *http.Request) {
-		parsed, parseErr := apikey.Parse(req.Header.Get("X-API-KEY"))
-		if parseErr != nil || !apikey.Verify(parsed, rawAPISecret) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	})
 	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer srv.Close()
-	reg.SetPlacerPeerSource(func(string) []registry.PlacerPeer {
-		return []registry.PlacerPeer{{ID: "test-placer", Advertise: srv.URL}}
-	})
 	addr := srv.Listener.Addr().String()
 
 	node := newFakeNode()
 	client := New(
 		func(ctx context.Context) (net.Conn, error) { return net.Dial("tcp", addr) },
-		routesync.NodeRegister{NodeID: "n1", APIEndpoint: "10.0.0.1:8442", DataEndpoint: "10.0.0.1:8443"},
+		routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "10.0.0.1:8442", DataEndpoint: "10.0.0.1:8443"},
 		node, 50*time.Millisecond, nil, log,
 	)
 	go client.Run(ctx)
@@ -280,7 +260,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, registry.ErrNodeGone) || time.Now().After(reserveDeadline) {
+		if !errors.Is(err, registry.ErrNodeGone) && !errors.Is(err, registry.ErrReserveForbidden) || time.Now().After(reserveDeadline) {
 			t.Fatalf("reserve over node-link: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -310,7 +290,7 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(newTestRegistryStores(t), testPlacer{}, 5*time.Second, log)
+	reg := registry.New(newTestRegistryStores(t), 5*time.Second, log)
 
 	ownerMux := http.NewServeMux()
 	ownerMux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
@@ -328,7 +308,7 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 			http.Error(w, "redirect not accepted", http.StatusConflict)
 			return
 		}
-		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion,
 			Version: routesync.Version,
 			Redirect: &routesync.NodeLinkRedirect{Targets: []routesync.NodeLinkTarget{{
 				MemberID: "owner", Endpoint: ownerSrv.URL,
@@ -347,7 +327,7 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 		func(ctx context.Context, endpoint string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 		},
-		routesync.NodeRegister{NodeID: "n1", APIEndpoint: "10.0.0.1:8442", DataEndpoint: "10.0.0.1:8443"},
+		routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "10.0.0.1:8442", DataEndpoint: "10.0.0.1:8443"},
 		node, 50*time.Millisecond, nil, log, true,
 	)
 	go client.Run(ctx)
@@ -372,7 +352,7 @@ func TestNodeLinkRejectsPreviousVersionBeforeCommands(t *testing.T) {
 			http.Error(w, "bad node register", http.StatusBadRequest)
 			return
 		}
-		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion,
 			Version: routesync.Version - 1,
 		}})
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: &routesync.Command{
@@ -391,7 +371,7 @@ func TestNodeLinkRejectsPreviousVersionBeforeCommands(t *testing.T) {
 		func(ctx context.Context, endpoint string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 		},
-		routesync.NodeRegister{NodeID: "n1"},
+		routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1"},
 		node,
 		time.Hour,
 		nil,
@@ -418,7 +398,7 @@ func TestNodeLinkRunsBuildFullSyncAfterEveryEstablishedSession(t *testing.T) {
 			http.Error(w, "bad node register", http.StatusBadRequest)
 			return
 		}
-		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion, Version: routesync.Version}}); err != nil {
 			return
 		}
 		w.(http.Flusher).Flush()
@@ -441,7 +421,7 @@ func TestNodeLinkRunsBuildFullSyncAfterEveryEstablishedSession(t *testing.T) {
 		func(ctx context.Context) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
 		},
-		routesync.NodeRegister{NodeID: "n1"}, node, time.Hour, nil,
+		routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1"}, node, time.Hour, nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	go client.Run(ctx)
@@ -473,7 +453,7 @@ func TestNodeLinkReconnectsAfterBuildFullSyncReadFailure(t *testing.T) {
 			http.Error(w, "bad node register", http.StatusBadRequest)
 			return
 		}
-		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion, Version: routesync.Version}}); err != nil {
 			return
 		}
 		w.(http.Flusher).Flush()
@@ -494,7 +474,7 @@ func TestNodeLinkReconnectsAfterBuildFullSyncReadFailure(t *testing.T) {
 		func(ctx context.Context) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
 		},
-		routesync.NodeRegister{NodeID: "n1"}, node, time.Hour, nil,
+		routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1"}, node, time.Hour, nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	go client.Run(ctx)

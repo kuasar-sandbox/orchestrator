@@ -1,9 +1,11 @@
 # Node Group internal foundation
 
-This change prepares the Node-owned Group resource described in [proposal
-#570](https://github.com/kuasar-sandbox/orchestrator/issues/570). Public HTTP/UDS
-handlers, NodeLink commands, support reporting, import and creation consumers are
-not mounted in this integration unit. It introduces no runtime feature switch.
+This document describes the local foundation of the Node-owned Group resource
+in [proposal #570](https://github.com/kuasar-sandbox/orchestrator/issues/570).
+HTTP/UDS and trusted NodeLink maintenance use this same transaction core;
+[cluster operations](cluster.md) describes reporting, import and request
+admission. The foundation was delivered before those consumers and introduces
+no runtime feature switch.
 
 `node_groups` stores each active name, revision, owner fingerprint, fixed
 API/manifest-root binding and the complete private context. Root material and
@@ -41,5 +43,6 @@ valid without one. Placement is a request field and is rejected in Group default
 The SQLite tests cover real transaction rollback after pair insertion, competing
 CAS writers, no-op renewal, expiry and binding failures, authenticated tombstone
 handling, owner-scoped pagination, encryption, and reading a committed result
-after closing/reopening the database without consuming its reply. End-to-end
-transport fault testing belongs to the complete cluster activation unit.
+after closing/reopening the database without consuming its reply. Native
+transaction, transport and real VM results are recorded in the
+[activation acceptance report](node-group-runtime-acceptance.md).

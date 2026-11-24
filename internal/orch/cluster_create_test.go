@@ -25,7 +25,7 @@ func TestClusterCreateRejectsInvalidResourcePatchBeforeSideEffects(t *testing.T)
 	vs := &resourcePreflightVS{}
 	o.vs = vs
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "invalid-resource")
+	cmd := clusterCreateCommand(t, o, fingerprint, "invalid-resource")
 	cmd.Config = map[string]string{
 		sandboxcfg.NsResource: `{"control":{}}`,
 	}
@@ -43,8 +43,10 @@ func TestClusterCreateRejectsInvalidResourcePatchBeforeSideEffects(t *testing.T)
 	}
 }
 
-func clusterCreateCommand(fingerprint, sid string) *routesync.Command {
+func clusterCreateCommand(t *testing.T, o *Orchestrator, fingerprint, sid string) *routesync.Command {
+	key, revision := clusterGroupFixture(t, o, fingerprint, "group-a")
 	return &routesync.Command{
+		GroupAPIKey: key, ExpectedGroupVersion: revision,
 		CmdID: "create-" + sid, Kind: routesync.CmdCreate, SID: sid,
 		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		Profile:     string(types.ProfileBare), APISecretFingerprint: fingerprint,
@@ -80,7 +82,7 @@ func TestClusterCreateAdmitsHoldFromFinalHookMetadata(t *testing.T) {
 				o.SetProxyRouteBarrierCoordinator(&fakeRouteBarrierCoordinator{barrier: b})
 			}
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
-			cmd := clusterCreateCommand(fingerprint, "cluster-hook-mmds")
+			cmd := clusterCreateCommand(t, o, fingerprint, "cluster-hook-mmds")
 			o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, op *conductorextension.SandboxOperation) error {
 				op.Create.Metadata = map[string]string{sandboxcfg.NsMMDS: tt.routes}
 				return nil
@@ -118,7 +120,7 @@ func TestClusterCreatePersistsAutoPauseMemoryDefaultAndValues(t *testing.T) {
 			lc := &countingLauncher{startGate: startGate}
 			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
-			cmd := clusterCreateCommand(fingerprint, test.sid)
+			cmd := clusterCreateCommand(t, o, fingerprint, test.sid)
 			cmd.AutoPauseMemory = test.value
 
 			ack := o.HandleCommand(ctx, cmd)
@@ -150,7 +152,7 @@ func TestClusterCreateAckFollowsDurableStartingAcceptance(t *testing.T) {
 	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
 	o.vs = blocked
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "stable-g0")
+	cmd := clusterCreateCommand(t, o, fingerprint, "stable-g0")
 	events, stopEvents := o.Subscribe()
 	defer stopEvents()
 
@@ -194,7 +196,7 @@ func TestClusterCreatePreAssignmentFailurePublishesDelete(t *testing.T) {
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	o.vs = failingCreateVS{err: errors.New("cluster attach failed")}
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "stable-g1")
+	cmd := clusterCreateCommand(t, o, fingerprint, "stable-g1")
 	events, stopEvents := o.Subscribe()
 	defer stopEvents()
 
@@ -247,7 +249,7 @@ func TestConcurrentClusterCreateHasOneLaunchOwner(t *testing.T) {
 		go func(i int) {
 			ready.Done()
 			<-release
-			cmd := clusterCreateCommand(fingerprint, "stable-g2")
+			cmd := clusterCreateCommand(t, o, fingerprint, "stable-g2")
 			cmd.CmdID = "concurrent-" + string(rune('a'+i))
 			results <- o.HandleCommand(ctx, cmd)
 		}(i)
@@ -283,7 +285,7 @@ func TestCreateClusterWrapperUsesAcceptedAttempt(t *testing.T) {
 	lc := &countingLauncher{started: started, startGate: startGate}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "stable-g3")
+	cmd := clusterCreateCommand(t, o, fingerprint, "stable-g3")
 	type result struct {
 		sb  *types.Sandbox
 		err error
@@ -323,7 +325,7 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	}
 	o.vs = vs
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	create := clusterCreateCommand(fingerprint, "stable-g4")
+	create := clusterCreateCommand(t, o, fingerprint, "stable-g4")
 	events, stopEvents := o.Subscribe()
 	defer stopEvents()
 	if ack := o.HandleCommand(ctx, create); ack.Status != routesync.AckAccepted {
@@ -427,14 +429,15 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 }
 
 func TestPrecheckClusterSnapshotPolicy(t *testing.T) {
-	newCommand := func(fingerprint, raw string) *routesync.Command {
+	newCommand := func(o *Orchestrator, fingerprint, raw string) *routesync.Command {
+		key, revision := clusterGroupFixture(t, o, fingerprint, "group-a")
 		return &routesync.Command{
 			SID:                  "stable-g0",
 			TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 			Profile:              string(types.ProfileBare),
-			APISecretFingerprint: fingerprint,
-			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
-			Config:               map[string]string{sandboxcfg.NsCheckpoint: raw},
+			APISecretFingerprint: fingerprint, GroupAPIKey: key, ExpectedGroupVersion: revision,
+			Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
+			Config:  map[string]string{sandboxcfg.NsCheckpoint: raw},
 		}
 	}
 
@@ -444,7 +447,7 @@ func TestPrecheckClusterSnapshotPolicy(t *testing.T) {
 			cfg.Checkpoint.Mode = mode
 			o := testOrchCfg(t, cfg)
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
-			cmd := newCommand(fingerprint, ` { "merge_ref" : false, "drop_caches" : null } `)
+			cmd := newCommand(o, fingerprint, ` { "merge_ref" : false, "drop_caches" : null } `)
 			_, _, normalized, err := o.precheckCluster(context.Background(), cmd)
 			if err != nil {
 				t.Fatalf("%s checkpoint policy rejected: %v", mode, err)
@@ -455,7 +458,7 @@ func TestPrecheckClusterSnapshotPolicy(t *testing.T) {
 			if cmd.Config[sandboxcfg.NsCheckpoint] != ` { "merge_ref" : false, "drop_caches" : null } ` {
 				t.Fatal("precheck modified original checkpoint input")
 			}
-			if _, _, _, err := o.precheckCluster(context.Background(), newCommand(fingerprint, `{"merge_ref":0}`)); err == nil {
+			if _, _, _, err := o.precheckCluster(context.Background(), newCommand(o, fingerprint, `{"merge_ref":0}`)); err == nil {
 				t.Fatal("malformed cluster checkpoint policy was accepted")
 			}
 		})
@@ -467,12 +470,13 @@ func TestPrecheckClusterRequiresConsistentProfileAndContext(t *testing.T) {
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	templateRef := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 	valid := func() *routesync.Command {
+		key, revision := clusterGroupFixture(t, o, fingerprint, "group-a")
 		return &routesync.Command{
 			SID:                  "stable-g0",
 			TemplateRef:          templateRef,
 			Profile:              string(types.ProfileBare),
-			APISecretFingerprint: fingerprint,
-			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
+			APISecretFingerprint: fingerprint, GroupAPIKey: key, ExpectedGroupVersion: revision,
+			Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 		}
 	}
 
@@ -531,7 +535,9 @@ func TestPrecheckClusterExtractsCredentials(t *testing.T) {
 	o := testOrch(t)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	secret := strings.Repeat("1", 64)
+	key, revision := clusterGroupFixture(t, o, fingerprint, "group-a")
 	cmd := &routesync.Command{
+		GroupAPIKey: key, ExpectedGroupVersion: revision,
 		SID: "stable-g0", TemplateRef: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), Profile: "e2b",
 		APISecretFingerprint: fingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
@@ -633,7 +639,7 @@ func TestIdlePolicyClusterCreateAndHook(t *testing.T) {
 		o, ctx := newAsyncConnectTestOrchestrator(t, &config.Config{}, &countingLauncher{startGate: gate})
 		defer close(gate)
 		_, _, fingerprint := allowlistedBuildIdentity(t, o)
-		cmd := clusterCreateCommand(fingerprint, "idle-policy")
+		cmd := clusterCreateCommand(t, o, fingerprint, "idle-policy")
 		cmd.IdleTimeout = policy
 		ack := o.HandleCommand(ctx, cmd)
 		if ack.Status != routesync.AckAccepted {
@@ -651,7 +657,7 @@ func TestIdlePolicyClusterHookOwnsEffectiveValue(t *testing.T) {
 	defer close(gate)
 	o, ctx := newAsyncConnectTestOrchestrator(t, &config.Config{}, &countingLauncher{startGate: gate})
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterCreateCommand(fingerprint, "idle-hook")
+	cmd := clusterCreateCommand(t, o, fingerprint, "idle-hook")
 	cmd.IdleTimeout = new(int64(0))
 	o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, operation *conductorextension.SandboxOperation) error {
 		if operation.Create.IdleTimeout == nil || *operation.Create.IdleTimeout != 0 {

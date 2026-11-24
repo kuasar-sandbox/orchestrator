@@ -49,7 +49,7 @@ func TestReaperRecoversDisconnectBeforeClaimAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restarted := New(stores, nil, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	restarted := New(stores, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reapCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { restarted.RunReaper(reapCtx, 30*time.Second); close(done) }()
@@ -291,7 +291,7 @@ func TestExpiredNodeRecoveryContinuesAcrossEmptyFilteredPage(t *testing.T) {
 	staleNodeProfile(t, reg, "zz")
 	for i := 0; i < 128; i++ {
 		if _, err := reg.stores.nodes.Register(ctx, metadata.Version{}, metadata.NodeProfileRecord{
-			NodeID: fmt.Sprintf("a%03d", i), LinkOwner: "registry", LastHeartbeatUnix: time.Now().Unix(),
+			NodeID: fmt.Sprintf("%c%c", 'a'+i/26, 'a'+i%26), LinkOwner: "registry", LastHeartbeatUnix: time.Now().Unix(),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -323,7 +323,7 @@ func TestExpiredNodeRecoveryRejectsCandidateChangedDuringConnectionProbe(t *test
 				if mode == "heartbeat" {
 					reg.updateHeartbeat(withNodeRegistration(ctx, old.Registration), "n1", &routesync.Heartbeat{Counts: 7})
 				} else {
-					if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", APIEndpoint: "new-session"}); err != nil {
+					if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{GroupSupportVersion: routesync.GroupSupportVersion, NodeID: "n1", APIEndpoint: "new-session"}); err != nil {
 						t.Fatal(err)
 					}
 				}

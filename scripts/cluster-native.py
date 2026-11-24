@@ -284,7 +284,7 @@ def main():
         env["CLUSTER_NATIVE_TEST_LIBRARY_PATH"] = str(library_path)
         subprocess.run([args.go, "test", "-tags=fdb", "-exec=" + executor, *flags, "./internal/fdbdriver",
                         "./internal/cluster/metastore", "./internal/storage/sqlengine",
-                        "./cmd/cluster-ctl", "./test/e2e/cluster_stub"], cwd=ROOT, env=env, check=True)
+                        "./internal/registry", "./cmd/cluster-ctl", "./test/e2e/cluster_stub"], cwd=ROOT, env=env, check=True)
         return
     check(args.output is not None, "build requires --output")
     output = args.output.resolve()

@@ -46,14 +46,13 @@ raise SystemExit(1)
 PY
 }
 
-wait_redirect_placer() {
+wait_redirect_group() {
     local port registry_args=()
     for port in "${CONTROL_PORTS[@]}"; do
         registry_args+=(--registry-url "http://127.0.0.1:$port")
     done
-    PLACER_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/placer_readiness.py" \
-        --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID" \
-        --route-key "$ROUTE_KEY" "${registry_args[@]}"
+    GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
+        --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" "${registry_args[@]}"
 }
 
 stop_redirect_process() {
@@ -110,7 +109,7 @@ wait_redirect_node_link() {
 run_redirect_recovery() {
     restart_redirect_owner || fail "redirect owner restart failed"
     wait_redirect_node_link || fail "redirected node-link recovery failed"
-    wait_redirect_placer || fail "placer did not converge to the redirected node"
+    wait_redirect_group || fail "Group import/authentication did not converge after redirect"
 }
 
 run_redirect_flow() {

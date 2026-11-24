@@ -1,0 +1,184 @@
+{
+  "repository": "kuasar-sandbox/orchestrator",
+  "pr": 573,
+  "head": "80c6e0114248c214bed4a3a94a86b8697d7edd2b",
+  "merged": "caa007de10fcf156e239af7c820f952d9945c2f6",
+  "tested_merge": "1a741529ff64cabb9a943b5a33ec29b7c750f0cf",
+  "tested_and_merged_tree": "10d2516b39a3cca5bfdf7b231bafc25fc0825128",
+  "run_id": 45295630484,
+  "run_attempt": 2,
+  "conclusion": "success",
+  "successful_jobs": 24,
+  "inapplicable_skips": 4,
+  "initial_failure": "Attempt 1 ARM build failed before compilation fetching a fixed native input (HTTP 503 Backend.max_conn reached). Source/x86 jobs passed. Failed jobs only were retried after completion.",
+  "jobs": [
+    {
+      "id": 138137294974,
+      "name": "ci / admission",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137295794,
+      "name": "ci / e2e / aarch64 / build",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137296082,
+      "name": "ci / e2e / resolve",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137296624,
+      "name": "ci / e2e / source-checks (B)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137296845,
+      "name": "ci / e2e / workbench-release (${{ matrix.arch }}, ${{ matrix.group }})",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138137296976,
+      "name": "ci / e2e / workbench-native",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138137297665,
+      "name": "ci / e2e / source-checks (A)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137298216,
+      "name": "ci / e2e / x86_64 / build",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137298813,
+      "name": "ci / e2e / x86_64 / prepare",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137299305,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--basic)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137299763,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--builder)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137299830,
+      "name": "ci / e2e / x86_64 / performance",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138137300749,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--telemetry)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137300780,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--orchestrator)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138137301819,
+      "name": "ci / e2e / x86_64 / result",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138141914484,
+      "name": "ci / e2e / aarch64 / prepare",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902488,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--builder)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902555,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--orchestrator)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902588,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--basic)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902700,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--telemetry)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902729,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--builder)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902745,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--basic)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902788,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--orchestrator)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143902824,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--telemetry)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138143904361,
+      "name": "ci / e2e / aarch64 / performance",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138164630276,
+      "name": "ci / e2e / aarch64 / result",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138164740692,
+      "name": "ci / e2e / results",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138164888312,
+      "name": "ci / finalize",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}

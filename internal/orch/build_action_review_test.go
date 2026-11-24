@@ -54,7 +54,7 @@ func TestPostTerminalDeleteFencesRegistrationReplay(t *testing.T) {
 	ctx := context.Background()
 	o := testOrch(t)
 	_, _, fp := allowlistedBuildIdentity(t, o)
-	cmd := clusterBuildRegisterCommand("review-late-replay", fp)
+	cmd := clusterBuildRegisterCommand(t, o, "review-late-replay", fp)
 	if err := o.registerClusterBuild(ctx, cmd); err != nil {
 		t.Fatal(err)
 	}

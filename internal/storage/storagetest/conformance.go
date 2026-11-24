@@ -239,6 +239,7 @@ func RunRecords(t *testing.T, factory Factory) {
 	runExtension(t, factory)
 	runProjectionContracts(t, factory)
 	runIntegrity(t, factory)
+	runRecordBatch(t, factory)
 	t.Run("record_delete_recreate_chunks_and_long_identity", func(t *testing.T) {
 		open := factory(t)
 		b := backend(t, open)

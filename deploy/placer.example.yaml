@@ -1,7 +1,7 @@
 # cluster-ctl placer config — run-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml.
-# Standalone placement scheduler (docs/cluster.md#placer-configuration): it starts from registry
-# membership, joins the placer memberlist label, consumes node_list, and provides
-# placement for registry callers.
+# Optional Group importer (docs/cluster.md#placer-configuration): it starts from registry
+# membership, joins the placer memberlist, consumes node_list, and maintains
+# Node-owned Group definitions and credential leases.
 # Validate with `cluster-ctl config placer --config placer.yaml`.
 
 placer:
@@ -9,7 +9,7 @@ placer:
   listen: ":7800"
   advertise: "https://placer-1.example:7800"
   memberlist_label: placer.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for placer Place API
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for importer memberlist
 
 registry:
   bootstrap: registry-1.example:7700
@@ -21,11 +21,9 @@ import_groups:
     path: /var/lib/kuasar/groups
 
 placement:
-  candidates: 2                       # P2C sample size
-  zone_admit_max: yellow              # exclude nodes hotter than this (green|yellow|red)
   import_source_owner_count: 3        # candidates that may race for each source lease
   import_source_lease_ttl: 15s        # registry-side source lease TTL
-  selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
+  import_refresh_interval: 1m        # reconcile Groups and renew unchanged bindings
   # shuffle_sharding: pin matching groups to n deterministic shards of the node set,
   # bucketed by a node label. Empty = static nodeSelectors only.
   # shuffle_sharding:

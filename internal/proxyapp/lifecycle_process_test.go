@@ -465,7 +465,7 @@ func serveFixtureRoutes(t *testing.T, socket string, metadata bool, options ...r
 		if len(options) != 0 && options[0].metadataService != "" {
 			policy.MMDS.Services = map[string]string{"local": "unix://" + options[0].metadataService}
 		}
-		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, Policy: policy, ProxyCapabilities: capabilities}}); err != nil {
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{GroupSupportVersion: routesync.GroupSupportVersion, Version: routesync.Version, Policy: policy, ProxyCapabilities: capabilities}}); err != nil {
 			return
 		}
 		if len(options) != 0 && options[0].route != nil {

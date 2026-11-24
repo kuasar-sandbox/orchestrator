@@ -9,7 +9,6 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // Node view watches are low-frequency control-plane streams for placer views.
@@ -18,11 +17,8 @@ import (
 const (
 	PlacerLinkNodeListWatchPath = "/placer-link/watch-node-list" // placer node_list WATCH_LIST
 	PlacerLinkRegisterPath      = "/placer-link/register"
-	PlacerLinkSelectorPatchPath = "/placer-link/selector-patch"
 	PlacerLinkImportSourcePath  = "/placer-link/import-source-lease"
 	PlacerLinkSourceCursorPath  = "/placer-link/import-source-cursor"
-	PlacerLinkPlacePath         = "/placer-link/place"
-	PlacerLinkVerifyKeyPath     = "/placer-link/verify-key"
 )
 
 // ViewEvent is one frame on a view watch ([4B LE len][ViewEvent]); Value is the
@@ -79,11 +75,11 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 }
 
 // ServePlacerLink mounts the placer-facing placer_link API: node_list WATCH_LIST,
-// placer registration, import source leases, and selector patches.
+// placer registration, import source leases, and conditional Node Group commands.
 func (r *Registry) ServePlacerLink(mux *http.ServeMux) {
 	mux.HandleFunc(PlacerLinkNodeListWatchPath, r.serveNodeListWatch)
 	mux.HandleFunc(PlacerLinkRegisterPath, r.servePlacerRegister)
-	mux.HandleFunc(PlacerLinkSelectorPatchPath, r.serveSelectorPatch)
+	mux.HandleFunc(PlacerLinkNodeGroupPath, r.serveNodeGroup)
 	mux.HandleFunc(PlacerLinkImportSourcePath, r.serveImportSourceLease)
 	mux.HandleFunc(PlacerLinkSourceCursorPath, r.serveImportSourceCursor)
 }
@@ -111,35 +107,6 @@ func (r *Registry) servePlacerRegister(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	if err := r.joinPlacerSeed(req.Context(), in.ID, label, in.Advertise); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (r *Registry) serveSelectorPatch(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var patch routesync.SelectorPatch
-	if err := json.NewDecoder(io.LimitReader(req.Body, 4<<20)).Decode(&patch); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if patch.Group == "" {
-		http.Error(w, "group is required", http.StatusBadRequest)
-		return
-	}
-	if err := r.applySelectorPatch(req.Context(), &patch); err != nil {
-		if errors.Is(err, errMissingImportSourceLease) {
-			http.Error(w, "import source lease fields are required", http.StatusBadRequest)
-			return
-		}
-		if errors.Is(err, errStaleImportSourceLease) {
-			http.Error(w, "stale import source lease", http.StatusConflict)
-			return
-		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}

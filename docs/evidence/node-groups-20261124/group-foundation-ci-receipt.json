@@ -1,0 +1,217 @@
+{
+  "schema": 1,
+  "repository": "kuasar-sandbox/orchestrator",
+  "workflow_run_id": 45287872172,
+  "url": "https://github.com/kuasar-sandbox/orchestrator/actions/runs/45287872172",
+  "head_sha": "187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a",
+  "run_attempt": 1,
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-11-23T23:20:00Z",
+  "updated_at": "2026-11-24T00:12:57Z",
+  "jobs": [
+    {
+      "id": 138088799229,
+      "name": "ci / admission",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:20:51Z",
+      "completed_at": "2026-11-23T23:21:03Z"
+    },
+    {
+      "id": 138089310170,
+      "name": "ci / e2e / resolve",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:21:06Z",
+      "completed_at": "2026-11-23T23:21:38Z"
+    },
+    {
+      "id": 138089604292,
+      "name": "ci / e2e / source-checks (A)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:21:41Z",
+      "completed_at": "2026-11-23T23:39:36Z"
+    },
+    {
+      "id": 138089604306,
+      "name": "ci / e2e / source-checks (B)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:21:42Z",
+      "completed_at": "2026-11-23T23:51:37Z"
+    },
+    {
+      "id": 138089604746,
+      "name": "ci / e2e / aarch64 / build",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:21:43Z",
+      "completed_at": "2026-11-23T23:31:47Z"
+    },
+    {
+      "id": 138089605197,
+      "name": "ci / e2e / x86_64 / build",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:21:42Z",
+      "completed_at": "2026-11-23T23:31:50Z"
+    },
+    {
+      "id": 138089607171,
+      "name": "ci / e2e / workbench-native",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T23:21:38Z",
+      "completed_at": "2026-11-23T23:21:38Z"
+    },
+    {
+      "id": 138089607181,
+      "name": "ci / e2e / workbench-release (${{ matrix.arch }}, ${{ matrix.group }})",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T23:21:38Z",
+      "completed_at": "2026-11-23T23:21:38Z"
+    },
+    {
+      "id": 138094624404,
+      "name": "ci / e2e / aarch64 / prepare",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:31:52Z",
+      "completed_at": "2026-11-23T23:36:08Z"
+    },
+    {
+      "id": 138094646885,
+      "name": "ci / e2e / x86_64 / prepare",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:31:53Z",
+      "completed_at": "2026-11-23T23:38:25Z"
+    },
+    {
+      "id": 138096784284,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--basic)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:13Z",
+      "completed_at": "2026-11-23T23:39:31Z"
+    },
+    {
+      "id": 138096784389,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--telemetry)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:13Z",
+      "completed_at": "2026-11-23T23:38:59Z"
+    },
+    {
+      "id": 138096784396,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--orchestrator)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:12Z",
+      "completed_at": "2026-11-24T00:11:55Z"
+    },
+    {
+      "id": 138096784432,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--telemetry)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:12Z",
+      "completed_at": "2026-11-23T23:52:34Z"
+    },
+    {
+      "id": 138096784454,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--orchestrator)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:13Z",
+      "completed_at": "2026-11-23T23:38:28Z"
+    },
+    {
+      "id": 138096784488,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--basic)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:13Z",
+      "completed_at": "2026-11-23T23:46:46Z"
+    },
+    {
+      "id": 138096784581,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--builder)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:13Z",
+      "completed_at": "2026-11-23T23:37:50Z"
+    },
+    {
+      "id": 138096784586,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--builder)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:36:12Z",
+      "completed_at": "2026-11-23T23:51:10Z"
+    },
+    {
+      "id": 138096787389,
+      "name": "ci / e2e / aarch64 / performance",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T23:36:08Z",
+      "completed_at": "2026-11-23T23:36:08Z"
+    },
+    {
+      "id": 138097889152,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--telemetry)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:38:28Z",
+      "completed_at": "2026-11-23T23:47:47Z"
+    },
+    {
+      "id": 138097889155,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--orchestrator)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:38:28Z",
+      "completed_at": "2026-11-24T00:05:49Z"
+    },
+    {
+      "id": 138097889195,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--builder)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:38:28Z",
+      "completed_at": "2026-11-23T23:47:59Z"
+    },
+    {
+      "id": 138097889233,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--basic)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:38:29Z",
+      "completed_at": "2026-11-23T23:46:47Z"
+    },
+    {
+      "id": 138097890702,
+      "name": "ci / e2e / x86_64 / performance",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T23:38:26Z",
+      "completed_at": "2026-11-23T23:38:25Z"
+    },
+    {
+      "id": 138110704640,
+      "name": "ci / e2e / x86_64 / result",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:05:52Z",
+      "completed_at": "2026-11-24T00:06:14Z"
+    },
+    {
+      "id": 138113613072,
+      "name": "ci / e2e / aarch64 / result",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:11:58Z",
+      "completed_at": "2026-11-24T00:12:13Z"
+    },
+    {
+      "id": 138113751554,
+      "name": "ci / e2e / results",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:12:15Z",
+      "completed_at": "2026-11-24T00:12:27Z"
+    },
+    {
+      "id": 138113864349,
+      "name": "ci / finalize",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:12:30Z",
+      "completed_at": "2026-11-24T00:12:56Z"
+    }
+  ],
+  "source_identity": {
+    "reviewed_head": "187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a",
+    "base": "a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0",
+    "tested_merge": "556a0cc202212245516ca5667078b94156cddab9",
+    "main_squash": "d9626893d02b7754dcd1542bc021146c24a58371",
+    "tested_and_merged_tree": "d4e7ff1027ec04c5ae3056e8da53575ba9d6f3fc"
+  }
+}

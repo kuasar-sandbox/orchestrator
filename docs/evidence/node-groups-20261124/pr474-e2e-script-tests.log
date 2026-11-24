@@ -1,0 +1,48 @@
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_dirty_memory.py
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.027s
+
+OK
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_path_id.py
+....
+----------------------------------------------------------------------
+Ran 4 tests in 0.356s
+
+OK
+PYTHONDONTWRITEBYTECODE=1 python3 test/source/cgroup_fork_probe_test.py
+..........
+----------------------------------------------------------------------
+Ran 10 tests in 0.864s
+
+OK
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.100s
+
+OK
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_upload_restore_tick.py
+..................
+----------------------------------------------------------------------
+Ran 18 tests in 14.806s
+
+OK
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_disks_restore.py
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.010s
+
+OK
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_encrypted_diff.py
+........
+----------------------------------------------------------------------
+Ran 8 tests in 2.108s
+
+OK
+BIN="/home/grayc/work/cluster-refactor-20261123/sandboxer-producer/bin/x86_64" PYTHONDONTWRITEBYTECODE=1 python3 test/source/usage_harness_test.py
+...............................................................................................................................................
+----------------------------------------------------------------------
+Ran 143 tests in 9.254s
+
+OK

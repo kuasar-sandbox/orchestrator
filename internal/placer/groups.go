@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,7 +15,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
 
 const defaultGroupPageLimit = 1024
@@ -26,15 +28,13 @@ type ImportSource struct {
 }
 
 type ConfiguredGroupInputs struct {
-	Provider clusterstate.SandboxGroupProvider
-	Sources  []ImportSource
+	Sources []ImportSource
 }
 
 func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (ConfiguredGroupInputs, error) {
 	if len(sources) == 0 {
-		return ConfiguredGroupInputs{Provider: emptyGroupProvider{}}, nil
+		return ConfiguredGroupInputs{}, nil
 	}
-	out := make([]*fileGroupSource, 0, len(sources))
 	imports := make([]ImportSource, 0, len(sources))
 	for _, cfg := range sources {
 		switch cfg.SourceType {
@@ -43,13 +43,12 @@ func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (Configure
 			if err != nil {
 				return ConfiguredGroupInputs{}, err
 			}
-			out = append(out, src)
 			imports = append(imports, ImportSource{SourceID: cfg.SourceID, Importer: src})
 		default:
 			return ConfiguredGroupInputs{}, fmt.Errorf("placer: unsupported group source type %q", cfg.SourceType)
 		}
 	}
-	return ConfiguredGroupInputs{Provider: multiGroupProvider{sources: out}, Sources: imports}, nil
+	return ConfiguredGroupInputs{Sources: imports}, nil
 }
 
 func NewFileGroupSource(sourceID, dir string) (*fileGroupSource, error) {
@@ -69,155 +68,15 @@ func NewFileGroupSource(sourceID, dir string) (*fileGroupSource, error) {
 	return &fileGroupSource{sourceID: sourceID, dir: dir}, nil
 }
 
-type emptyGroupProvider struct{}
-
-func (emptyGroupProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
-	return clusterstate.SandboxGroup{}, false, nil
-}
-
-func (emptyGroupProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
-	return clusterstate.PlacementHint{}, false, nil
-}
-
-func (emptyGroupProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{}, false, nil
-}
-
-func (emptyGroupProvider) GetAPISecret(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{}, false, nil
-}
-
-type multiGroupProvider struct {
-	sources []*fileGroupSource
-}
-
-func (m multiGroupProvider) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
-	var out clusterstate.SandboxGroup
-	foundOne := ""
-	for _, source := range m.sources {
-		g, found, err := source.Get(ctx, group)
-		if err != nil {
-			return clusterstate.SandboxGroup{}, false, err
-		}
-		if !found {
-			continue
-		}
-		if foundOne != "" {
-			return clusterstate.SandboxGroup{}, false, duplicateGroupError(group, foundOne, source.sourceID)
-		}
-		foundOne = source.sourceID
-		out = g
-	}
-	return out, foundOne != "", nil
-}
-
-func (m multiGroupProvider) GetPlacementHint(ctx context.Context, group string) (clusterstate.PlacementHint, bool, error) {
-	var out clusterstate.PlacementHint
-	foundOne := ""
-	for _, source := range m.sources {
-		hint, found, err := source.GetPlacementHint(ctx, group)
-		if err != nil {
-			return clusterstate.PlacementHint{}, false, err
-		}
-		if !found {
-			continue
-		}
-		if foundOne != "" {
-			return clusterstate.PlacementHint{}, false, duplicateGroupError(group, foundOne, source.sourceID)
-		}
-		foundOne = source.sourceID
-		out = hint
-	}
-	return out, foundOne != "", nil
-}
-
-func (m multiGroupProvider) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
-	var out clusterstate.Secret
-	foundOne := ""
-	for _, source := range m.sources {
-		key, found, err := source.GetKey(ctx, group)
-		if err != nil {
-			return clusterstate.Secret{}, false, err
-		}
-		if !found {
-			continue
-		}
-		if foundOne != "" {
-			return clusterstate.Secret{}, false, duplicateGroupError(group, foundOne, source.sourceID)
-		}
-		foundOne = source.sourceID
-		out = key
-	}
-	return out, foundOne != "", nil
-}
-
-func (m multiGroupProvider) GetAPISecret(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
-	var out clusterstate.Secret
-	foundOne := ""
-	for _, source := range m.sources {
-		key, found, err := source.GetAPISecret(ctx, group)
-		if err != nil {
-			return clusterstate.Secret{}, false, err
-		}
-		if !found {
-			continue
-		}
-		if foundOne != "" {
-			return clusterstate.Secret{}, false, duplicateGroupError(group, foundOne, source.sourceID)
-		}
-		foundOne = source.sourceID
-		out = key
-	}
-	return out, foundOne != "", nil
-}
-
-func duplicateGroupError(group, firstSource, secondSource string) error {
-	return fmt.Errorf("placer: group %q is defined by multiple sources (%s, %s)", group, firstSource, secondSource)
-}
-
 type fileGroupSource struct {
 	sourceID string
 	dir      string
 }
 
-func (s *fileGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
-	rec, found, err := s.find(ctx, group)
-	if err != nil || !found {
-		return clusterstate.SandboxGroup{}, false, err
-	}
-	return groupRecordToGroup(rec), true, nil
-}
-
-func (s *fileGroupSource) GetPlacementHint(ctx context.Context, group string) (clusterstate.PlacementHint, bool, error) {
-	rec, found, err := s.find(ctx, group)
-	if err != nil || !found {
-		return clusterstate.PlacementHint{}, false, err
-	}
-	return clusterstate.PlacementHint{NodeSelectors: cloneSelectors(rec.NodeSelectors), ShuffleLabels: cloneStringMap(rec.ShuffleLabels)}, true, nil
-}
-
-func (s *fileGroupSource) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
-	rec, found, err := s.find(ctx, group)
-	if err != nil || !found {
-		return clusterstate.Secret{}, false, err
-	}
-	key, err := normalizeManifestKey(rec.ManifestKey)
-	if err != nil {
-		return clusterstate.Secret{}, false, fmt.Errorf("placer: group %q: %w", group, err)
-	}
-	return key, true, nil
-}
-
-func (s *fileGroupSource) GetAPISecret(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
-	rec, found, err := s.find(ctx, group)
-	if err != nil || !found {
-		return clusterstate.Secret{}, false, err
-	}
-	apiSecret, err := materializeAPISecret(rec.ManifestKey, rec.APISecret)
-	if err != nil {
-		return clusterstate.Secret{}, false, fmt.Errorf("placer: group %q: %w", group, err)
-	}
-	return apiSecret, true, nil
+// Read returns one complete record. A maintenance operation must derive its
+// context, static target selection and credentials from this single read.
+func (s *fileGroupSource) Read(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return s.find(ctx, group)
 }
 
 func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
@@ -301,16 +160,30 @@ func (s *fileGroupSource) records(ctx context.Context) ([]clusterstate.SandboxGr
 }
 
 func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
-	raw, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return clusterstate.SandboxGroupRecord{}, err
 	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	if err != nil {
+		return clusterstate.SandboxGroupRecord{}, err
+	}
+	if len(raw) > 1<<20 {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: import record exceeds 1 MiB", path)
+	}
 	var rec clusterstate.SandboxGroupRecord
-	if err := json.Unmarshal(raw, &rec); err != nil {
+	if err := strictjson.DecodeAllowNull(raw, &rec); err != nil {
 		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if rec.Group == "" {
 		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: group is required", path)
+	}
+	if len(rec.ShuffleLabels) != 0 {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: shuffle_labels has no consumer; remove it", path)
+	}
+	if _, _, err := importContext(rec); err != nil {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	rec.Config, err = sandboxcfg.NormalizeResourceMetadata(rec.Config)
 	if err != nil {
@@ -321,6 +194,23 @@ func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
 		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: sandbox_config: %w", path, err)
 	}
 	return rec, nil
+}
+
+func importContext(rec clusterstate.SandboxGroupRecord) (nodegroup.Context, []byte, error) {
+	if err := nodegroup.ValidateName(rec.Group); err != nil {
+		return nodegroup.Context{}, nil, err
+	}
+	c := nodegroup.Context{
+		SandboxConfig: rec.Config, ImageRepo: rec.ImageRepo, TargetPort: rec.TargetPort,
+		ProjectID: rec.ProjectID, Metadata: rec.Metadata,
+	}
+	if rec.TemplateRef != "" {
+		c.TemplateID = &rec.TemplateRef
+	}
+	if !secretAbsent(rec.RegistryAuth) {
+		c.RegistryAuth = &rec.RegistryAuth
+	}
+	return nodegroup.Normalize(c)
 }
 
 func groupRecordActive(rec clusterstate.SandboxGroupRecord) bool {
@@ -336,18 +226,6 @@ func parseGroupCursor(cursor string) (int, error) {
 		return 0, fmt.Errorf("placer: invalid group cursor %q", cursor)
 	}
 	return start, nil
-}
-
-func groupRecordToGroup(rec clusterstate.SandboxGroupRecord) clusterstate.SandboxGroup {
-	return clusterstate.SandboxGroup{
-		Group:        rec.Group,
-		Config:       cloneStringMap(rec.Config),
-		ImageRepo:    rec.ImageRepo,
-		RegistryAuth: rec.RegistryAuth,
-		TemplateRef:  rec.TemplateRef,
-		TargetPort:   rec.TargetPort,
-		Metadata:     cloneStringMap(rec.Metadata),
-	}
 }
 
 func inlineSecret(kind string, s clusterstate.Secret) (string, error) {
@@ -465,76 +343,6 @@ func materializeAPISecret(manifestKey, apiSecret clusterstate.Secret) (clusterst
 	}, nil
 }
 
-func manifestKeyPatch(group string, key clusterstate.Secret) (fp, keyType, keyValue, keyRef string, err error) {
-	key, err = normalizeManifestKey(key)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
-	}
-	if key.Value == "" {
-		return "", "", "", "", nil
-	}
-	keyType = key.Type
-	switch keyType {
-	case clusterstate.SecretInline:
-		fp, err = manifestKeyFingerprint(key.Value)
-		if err != nil {
-			return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
-		}
-		return fp, keyType, key.Value, "", nil
-	case clusterstate.SecretRef:
-		return key.Fingerprint, keyType, "", key.Value, nil
-	default:
-		return "", "", "", "", fmt.Errorf("placer: group %q: unknown manifest_key type %q", group, keyType)
-	}
-}
-
-func apiSecretPatch(group string, apiSecret clusterstate.Secret) (fp, secretType, secretValue, secretRef string, err error) {
-	apiSecret, err = normalizeAPISecret(apiSecret)
-	if err != nil {
-		return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
-	}
-	if apiSecret.Value == "" {
-		return "", "", "", "", nil
-	}
-	secretType = apiSecret.Type
-	switch secretType {
-	case clusterstate.SecretInline:
-		fp, err = apiSecretFingerprint(apiSecret.Value)
-		if err != nil {
-			return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
-		}
-		return fp, secretType, apiSecret.Value, "", nil
-	case clusterstate.SecretRef:
-		return apiSecret.Fingerprint, secretType, "", apiSecret.Value, nil
-	default:
-		return "", "", "", "", fmt.Errorf("placer: group %q: unknown api_secret type %q", group, secretType)
-	}
-}
-
-func credentialPairPatch(group string, manifestKey, apiSecret clusterstate.Secret) (
-	apiFP, apiType, apiValue, apiRef,
-	manifestFP, manifestType, manifestValue, manifestRef string,
-	err error,
-) {
-	apiSecret, err = materializeAPISecret(manifestKey, apiSecret)
-	if err != nil {
-		return "", "", "", "", "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
-	}
-	manifestFP, manifestType, manifestValue, manifestRef, err = manifestKeyPatch(group, manifestKey)
-	if err != nil {
-		return "", "", "", "", "", "", "", "", err
-	}
-	apiFP, apiType, apiValue, apiRef, err = apiSecretPatch(group, apiSecret)
-	if err != nil {
-		return "", "", "", "", "", "", "", "", err
-	}
-	if (apiFP == "") != (manifestFP == "") {
-		return "", "", "", "", "", "", "", "", fmt.Errorf("placer: group %q: api_secret and manifest_key must be configured as one pair", group)
-	}
-	return apiFP, apiType, apiValue, apiRef,
-		manifestFP, manifestType, manifestValue, manifestRef, nil
-}
-
 func manifestKeyFingerprint(manifestKeyHex string) (string, error) {
 	raw, err := decodeRoot("manifest_key", manifestKeyHex)
 	if err != nil {
@@ -555,22 +363,6 @@ func apiSecretFingerprint(apiSecretHex string) (string, error) {
 func isLowerHex64(value string) bool {
 	_, err := decodeRoot("fingerprint", value)
 	return err == nil
-}
-
-func verifyAPIKey(apiSecretHex, encoded string) bool {
-	p, err := apikey.Parse(encoded)
-	if err != nil {
-		return false
-	}
-	raw, err := decodeRoot("api_secret", apiSecretHex)
-	if err != nil {
-		return false
-	}
-	return apikey.Verify(p, raw)
-}
-
-func mergeConfig(group, create map[string]string) (map[string]string, error) {
-	return sandboxcfg.MergeMetadata(group, create)
 }
 
 func cloneGroupRecord(in clusterstate.SandboxGroupRecord) clusterstate.SandboxGroupRecord {

@@ -9,6 +9,7 @@ import (
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -32,22 +33,63 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
 		return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("cluster create: group and route key are required")
 	}
-	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+	detail, pair, err := o.clusterCreateGroup(ctx, cmd)
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, err
 	}
-	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
+	templateRef, configuration := cmd.TemplateRef, cmd.Config
+	if templateRef == "" {
+		if detail.Context.TemplateID == nil {
+			return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("%w: Group has no default template", api.ErrBadRequest)
+		}
+		templateRef = *detail.Context.TemplateID
+		configuration, err = sandboxcfg.MergeCreateMetadata(detail.Context.SandboxConfig, cmd.Config)
+		if err != nil {
+			return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+	}
+	tmpl, err := types.ParseTemplateID(templateRef)
 	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
+		return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("cluster create: template %q: %w", templateRef, err)
 	}
 	if tmpl.Profile != profile {
 		return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("cluster create: profile %q does not match template profile %q", profile, tmpl.Profile)
 	}
-	normalized, err := o.normalizeSandboxCreateConfig(profile, cmd.Config)
+	normalized, err := o.normalizeSandboxCreateConfig(profile, configuration)
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxCreateConfig{}, fmt.Errorf("cluster create: %w", err)
 	}
 	return pair, tmpl, normalized, nil
+}
+
+// Consult accepted ownership before mutable Group state. A later Group deletion
+// or revision cannot turn a lost acceptance into nonexecution proof.
+func (o *Orchestrator) clusterCreateGroup(ctx context.Context, cmd *routesync.Command) (nodegroup.Detail, store.KeyPair, error) {
+	existing, err := o.st.Get(ctx, cmd.SID)
+	if err != nil {
+		return nodegroup.Detail{}, store.KeyPair{}, err
+	}
+	if existing != nil {
+		if !ownsSandbox(existing, cmd.GroupAPIKey) {
+			return nodegroup.Detail{}, store.KeyPair{}, nodegroup.ErrForbidden
+		}
+		if err := validateClusterSandboxCredentialBinding(existing, cmd.APISecretFingerprint); err != nil {
+			return nodegroup.Detail{}, store.KeyPair{}, err
+		}
+		if err := validateClusterSandboxContext(existing, cmd); err != nil {
+			return nodegroup.Detail{}, store.KeyPair{}, fmt.Errorf("%w: %v", api.ErrAlreadyExists, err)
+		}
+		return nodegroup.Detail{}, store.KeyPair{}, api.ErrAlreadyExists
+	}
+	return o.admitClusterGroup(ctx, cmd, cmd.Cluster.Group)
+}
+
+func (o *Orchestrator) admitClusterCreate(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, *launchAttempt, error) {
+	pair, tmpl, normalized, err := o.precheckCluster(ctx, cmd)
+	if err != nil {
+		return nil, nil, err
+	}
+	return o.acceptClusterCreate(ctx, cmd, pair, tmpl, normalized)
 }
 
 // acceptClusterCreate retains cluster-only Hook constraints, then uses the same
@@ -110,6 +152,8 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 	}
 	normalized.Workspaces = cmd.Workspaces
 	normalized.Metadata = clusterSandboxMetadata(normalized.Metadata)
+	// The adapter already copied an authenticated revision. Group changes after
+	// that boundary do not revoke this invocation or restart its core admission.
 	accepted, attempt, err := o.acceptSandboxCreate(ctx, sandboxCreateSpec{
 		ID: cmd.SID, StableID: cmd.Cluster.StableID, MaxCheckpoints: maxCheckpoints,
 		Cluster:  &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},

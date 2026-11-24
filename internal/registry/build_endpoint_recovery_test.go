@@ -48,7 +48,7 @@ func TestReserveBuildEndpointLossAfterACKPreservesAcceptedIdentity(t *testing.T)
 			ctx := context.Background()
 			reg := testReg(t)
 			seedTestNode(t, reg.stores, "n1")
-			reg.SetPlacer(placementWithToken("n1"))
+			publishTestGroups(t, reg, "n1", "/g")
 			target := &types.BuildTarget{Kind: types.BuildTargetSandbox}
 			owner := &endpointLossAfterACKOwner{
 				recordingNodeOwner: &recordingNodeOwner{
@@ -58,7 +58,7 @@ func TestReserveBuildEndpointLossAfterACKPreservesAcceptedIdentity(t *testing.T)
 				endpointErr: tc.err,
 			}
 			reg.SetNodeOwner(owner)
-			req := BuildReserveReq{Group: "/g", BuildID: "endpoint-recovery", TemplateID: "transient-endpoint-recovery", Profile: types.ProfileBare, Resources: testWireBuildResources()}
+			req := BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "endpoint-recovery", TemplateID: "transient-endpoint-recovery", Profile: types.ProfileBare, Resources: testWireBuildResources()}
 			registered, err := reg.ReserveBuild(ctx, req)
 			if err != nil || registered == nil {
 				t.Fatalf("accepted registration lost: result=%+v err=%v", registered, err)

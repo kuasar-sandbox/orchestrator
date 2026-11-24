@@ -250,14 +250,15 @@ type MMDSProxyPolicy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
-	Activity  *Activity   `json:"activity,omitempty"`
-	PauseAck  *PauseAck   `json:"pause_ack,omitempty"`
-	Type      string      `json:"type"`
-	Hello     *Hello      `json:"hello,omitempty"`      // hello (orchestrator -> subscriber)
-	Register  *Register   `json:"register,omitempty"`   // register (subscriber -> orchestrator, first up-frame)
-	Route     *RouteEntry `json:"route,omitempty"`      // upsert
-	SID       string      `json:"sid,omitempty"`        // delete | wake | command target
-	BarrierID string      `json:"barrier_id,omitempty"` // route_barrier | route_barrier_ack
+	Group     *GroupReport `json:"group_report,omitempty"`
+	Activity  *Activity    `json:"activity,omitempty"`
+	PauseAck  *PauseAck    `json:"pause_ack,omitempty"`
+	Type      string       `json:"type"`
+	Hello     *Hello       `json:"hello,omitempty"`      // hello (orchestrator -> subscriber)
+	Register  *Register    `json:"register,omitempty"`   // register (subscriber -> orchestrator, first up-frame)
+	Route     *RouteEntry  `json:"route,omitempty"`      // upsert
+	SID       string       `json:"sid,omitempty"`        // delete | wake | command target
+	BarrierID string       `json:"barrier_id,omitempty"` // route_barrier | route_barrier_ack
 	// Cluster node-link variants (docs/cluster.md#node-link): node_register / heartbeat / cmd_ack
 	// flow node -> registry; command flows registry -> node; rev stamps down events.
 	NodeReg  *NodeRegister `json:"node_register,omitempty"`
@@ -272,11 +273,12 @@ type Msg struct {
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.
 type Hello struct {
-	ProxyCapabilities []string          `json:"proxy_capabilities,omitempty"`
-	Version           int               `json:"version"`
-	Policy            Policy            `json:"policy,omitempty"`
-	ResumeFrom        string            `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
-	Redirect          *NodeLinkRedirect `json:"redirect,omitempty"`
+	GroupSupportVersion int               `json:"group_support_version,omitempty"`
+	ProxyCapabilities   []string          `json:"proxy_capabilities,omitempty"`
+	Version             int               `json:"version"`
+	Policy              Policy            `json:"policy,omitempty"`
+	ResumeFrom          string            `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
+	Redirect            *NodeLinkRedirect `json:"redirect,omitempty"`
 }
 
 // InplaceRestartV1 promises capability-based Proxy registration, all-participant

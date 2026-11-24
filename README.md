@@ -58,9 +58,9 @@ A standalone deployment exposes an E2B-compatible API that can be used by the un
 
 `cluster-ctl` runs three independent roles:
 
-- **Registry** — replicated cluster state and node-channel hub;
+- **Registry** — durable cluster metadata, Node selection and the node-channel hub;
 - **Router** — the cluster-wide E2B-compatible unified control- and data-plane ingress and stable-sandbox routing layer;
-- **Placer** — sandbox-group providers/importers and node-placement recommendations for creation, restore, and migration. Registry and nodes own lifecycle commits and execution.
+- **Placer** — optional import and conditional maintenance of Node-owned Groups and credential leases. Registry selects Nodes from published support; Nodes own execution and resource admission.
 
 The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration.
 
@@ -90,7 +90,7 @@ For security architecture and deployment trust boundaries, see the [project syst
 | `node-ctl export-sandbox` / `import-sandbox` | Move portable sandbox state across nodes |
 | `run-cluster-ctl registry` | Start a Registry process |
 | `run-cluster-ctl router` | Start the unified cluster control- and data-plane ingress |
-| `run-cluster-ctl placer` | Start the placement service |
+| `run-cluster-ctl placer` | Start Group import maintenance |
 | `e2b-key-ctl ...` | Generate and derive tenant credentials |
 
 A successful move export accepts source deletion durably; RunDir, BaseDir and
@@ -110,7 +110,7 @@ The repository also builds `node-stub-ctl`, an E2E helper that simulates node-li
 
 ## Deployment overview
 
-A standalone node runs Conductor and Proxy; start the independent Telemetry service when needed. Telemetry uses the Plugin Plane without joining Create/Resume barriers, and its failure does not change Sandbox lifecycle. The example configuration explicitly enables embedded Prometheus TSDB. Local storage requires `local.enabled`; an unconfigured query backend defaults to `none`, and writes and queries are assembled independently. See [observability](docs/observability.md#telemetry). A cluster adds Registry, Router and Placer, backed by an external FoundationDB database. Install the complete native runtime bundle and start cluster roles through `run-cluster-ctl`; Registry peers must use the same cluster file and prefix. Configuration examples and systemd units are under `deploy/`; see [native build and runtime](docs/cluster.md#native-build-and-runtime).
+A standalone node runs Conductor and Proxy; start the independent Telemetry service when needed. Telemetry uses the Plugin Plane without joining Create/Resume barriers, and its failure does not change Sandbox lifecycle. The example configuration explicitly enables embedded Prometheus TSDB. Local storage requires `local.enabled`; an unconfigured query backend defaults to `none`, and writes and queries are assembled independently. See [observability](docs/observability.md#telemetry). A cluster adds Registry and Router, with optional Placer import maintenance. Registry uses the configured SQLite, PostgreSQL or FoundationDB backend; SQLite supports one Registry. Install the complete native runtime bundle and start cluster roles through `run-cluster-ctl`; Registry peers must share the same database and metadata namespace. Configuration examples and systemd units are under `deploy/`; see [native build and runtime](docs/cluster.md#native-build-and-runtime).
 
 The release-based installation path is the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md). Production deployments should use durable storage, production TLS, protected credentials, an explicit network policy and capacity settings validated against their workloads.
 

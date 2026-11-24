@@ -66,7 +66,7 @@ func TestClusterWaitingProjectionPrecedesConcurrentBuildClaimWithoutExtension(t 
 	o.vs = failingCreateVS{err: errors.New("stop after execution claim")}
 	ctx := context.Background()
 	apiKey, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterBuildRegisterCommand("waiting-before-building", fingerprint)
+	cmd := clusterBuildRegisterCommand(t, o, "waiting-before-building", fingerprint)
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 		t.Fatalf("BuildRegister ack = %+v", ack)
 	}

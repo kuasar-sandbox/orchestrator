@@ -37,19 +37,39 @@ func ValidateSandbox(r SandboxRecord) error {
 	if r.Group == "" || r.RouteKey == "" || !types.Profile(r.Profile).Valid() || !ValidSandboxIdentity(r.SandboxID, r.NodeSandboxID, r.SandboxGeneration) || r.NextSandboxGeneration <= r.SandboxGeneration {
 		return invalid("invalid sandbox identity, profile or generation")
 	}
-	return nil
+	return validateCreateBinding(r.GroupVersion, r.TemplateSource, r.CreateTemplateID, r.Profile)
 }
 func ValidateSandboxRef(r NodeSandboxRef) error {
 	if r.Group == "" || r.RouteKey == "" || !types.Profile(r.Profile).Valid() || !ValidSandboxIdentity(r.SandboxID, r.NodeSandboxID, r.SandboxGeneration) || !ValidFingerprint(r.APISecretFingerprint) {
 		return invalid("invalid sandbox ownership")
 	}
+	return validateCreateBinding(r.GroupVersion, r.TemplateSource, r.CreateTemplateID, r.Profile)
+}
+func validateCreateBinding(revision int64, source, template, profile string) error {
+	if revision == 0 && source == "" && template == "" {
+		return nil
+	}
+	if revision <= 0 || (source != "default" && source != "explicit") {
+		return invalid("invalid Group create binding")
+	}
+	parsed, err := types.ParseTemplateID(template)
+	if err != nil || string(parsed.Profile) != profile {
+		return invalid("invalid selected create template")
+	}
 	return nil
 }
 func SandboxRef(r SandboxRecord) NodeSandboxRef {
-	return NodeSandboxRef{Group: r.Group, RouteKey: r.RouteKey, SandboxID: r.SandboxID, NodeSandboxID: r.NodeSandboxID, SandboxGeneration: r.SandboxGeneration, Profile: r.Profile, APISecretFingerprint: r.APISecretFingerprint}
+	return NodeSandboxRef{Group: r.Group, RouteKey: r.RouteKey, SandboxID: r.SandboxID, NodeSandboxID: r.NodeSandboxID, SandboxGeneration: r.SandboxGeneration, Profile: r.Profile, APISecretFingerprint: r.APISecretFingerprint, GroupVersion: r.GroupVersion, TemplateSource: r.TemplateSource, CreateTemplateID: r.CreateTemplateID}
+}
+func BuildRef(r BuildRecord) NodeBuildRef {
+	ref := NodeBuildRef{Group: r.Group, BuildID: r.BuildID, TemplateID: r.TemplateID}
+	if r.GroupVersion > 0 {
+		ref.GroupVersion, ref.APISecretFingerprint = r.GroupVersion, r.APISecretFingerprint
+	}
+	return ref
 }
 func ValidateBuild(r BuildRecord) error {
-	if r.Group == "" || r.BuildID == "" || r.NodeID == "" || !r.Profile.Valid() || !ValidFingerprint(r.APISecretFingerprint) {
+	if r.Group == "" || r.BuildID == "" || r.NodeID == "" || !r.Profile.Valid() || !ValidFingerprint(r.APISecretFingerprint) || r.GroupVersion < 0 {
 		return invalid("invalid build identity, profile or credentials")
 	}
 	return nil
@@ -178,7 +198,13 @@ func MergeRouteReport(current Versioned[SandboxRecord], nodeID string, ref NodeS
 	if cur.InstanceID != "" && event.PressureVersion == cur.StateVersion && (cur.State == StateDead || cur.State == StateDeleting) && state != cur.State {
 		return out, nil
 	}
+	if cur.GroupVersion > 0 && !cur.ImportPending && cur.InstanceID == "" && event.TemplateID != cur.CreateTemplateID {
+		out.Reason = "first materialization differs from selected template"
+		return out, nil
+	}
 	next := SandboxRecord{Group: ref.Group, RouteKey: ref.RouteKey, SandboxID: ref.SandboxID, NodeSandboxID: ref.NodeSandboxID, SandboxGeneration: ref.SandboxGeneration, NextSandboxGeneration: cur.NextSandboxGeneration, State: state, NodeID: nodeID, Profile: ref.Profile, APISecretFingerprint: ref.APISecretFingerprint, InstanceID: event.InstanceID, StateVersion: event.PressureVersion, ArtifactLocation: event.ArtifactLocation, TemplateID: event.TemplateID, ManifestKeyFingerprint: event.ManifestKeyFingerprint, StableID: event.StableID, APISecret: event.APISecret, ServiceSecret: event.ServiceSecret, EnvdAccessToken: event.EnvdAccessToken, TrafficAccessToken: event.TrafficAccessToken, ForwardAccessToken: event.ForwardAccessToken, LastActive: nowUnix, TargetPort: cur.TargetPort, MaxCheckpoints: cur.MaxCheckpoints, AutoPauseMemory: cur.AutoPauseMemory, AutoReset: cur.AutoReset, IdleTimeout: types.CloneIdleTimeout(event.IdleTimeout)}
+	next.GroupVersion, next.TemplateSource, next.CreateTemplateID = cur.GroupVersion, cur.TemplateSource, cur.CreateTemplateID
+	next.CreateRequestDigest, next.WorkspacesDigest = cur.CreateRequestDigest, cur.WorkspacesDigest
 	if next.TemplateID == "" {
 		next.TemplateID = cur.TemplateID
 	}

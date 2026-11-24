@@ -1,0 +1,83 @@
+{
+  "results": [
+    {
+      "mode": "local",
+      "old_boot": {
+        "ready_ms": 178.84498508647084,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "old_capture_ms": 213.0945660173893,
+      "old_to_new": {
+        "ready_ms": 261.0949859954417,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "new_capture_ms": 235.00549793243408,
+      "new_to_new": {
+        "ready_ms": 474.6122662909329,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "new_to_intermediate_reader": {
+        "ready_ms": 484.32842502370477,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "new_to_old": {
+        "rejected": true,
+        "exit": 2,
+        "elapsed_ms": 53.929935209453106,
+        "error_tail": "file ref: digest identity must be 64 lowercase hex characters\n"
+      },
+      "passed": true
+    },
+    {
+      "mode": "bundle",
+      "old_boot": {
+        "ready_ms": 162.96055866405368,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "old_capture_ms": 161.6778327152133,
+      "old_to_new": {
+        "ready_ms": 225.99452594295144,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "new_capture_ms": 556.9749539718032,
+      "new_to_new": {
+        "ready_ms": 332.99685921519995,
+        "events": [
+          "control_ready",
+          "ready"
+        ]
+      },
+      "new_to_intermediate_reader": {
+        "rejected": true,
+        "exit": 1,
+        "elapsed_ms": 55.0663941539824,
+        "error_tail": "restore exited before readiness\nopen snapshot: snapshot self ref: canonical Bundle source: manifest bundle: ref[0]: Bundle carrier ref \"file://6da49568572abd02044f311d85bd9b8fb2874ca34e9eeafc4d13b6b70ad44e89.bundle@runtime:runtime-v1.bundle:digest:0de8f58a15f115debb4caab66cd649d40c91a73736442bca3511541d50f4b73c\" must not contain a snapshot runtime declaration\n"
+      },
+      "new_to_old": {
+        "rejected": true,
+        "exit": 2,
+        "elapsed_ms": 53.76679776236415,
+        "error_tail": "file ref: manifest identity must be 64 lowercase hex characters\n"
+      },
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,224 @@
+{
+  "repository": "kuasar-sandbox/sandboxer",
+  "pr": 474,
+  "head": "54d24f759e539217bbbeae6ae21bc1e42c923e4c",
+  "merged": "2f6187eb26585215d57658382753c9ceaf38c2e3",
+  "tested_merge": "6eb2a124d7c84a3cd34450aed854fce2172bd4f5",
+  "tested_and_merged_tree": "4cc8b5863eee28358d733cbe14947c66d1ba3017",
+  "run_id": 45306961103,
+  "run_attempt": 1,
+  "conclusion": "success",
+  "successful_jobs": 30,
+  "inapplicable_skips": 3,
+  "previous_failures": [
+    {
+      "run_id": 45298653710,
+      "reason": "UFFD integration fixture used runtime without the required .bundle basename; corrected in f83dd87. Subsequent head superseded this run."
+    },
+    {
+      "run_id": 45301574190,
+      "reason": "Dirty-memory evidence incorrectly used the final qualifier as Snapshot content identity after runtime annotation emission; corrected in 54d24f7. Subsequent head superseded this run."
+    }
+  ],
+  "reader_gate": "Actual reader modules, both-architecture tools and default selection were verified before producer Ready/enablement. Final combined producer/activation release acceptance remains required.",
+  "jobs": [
+    {
+      "id": 138153037707,
+      "name": "ci / admission",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138153939476,
+      "name": "ci / e2e / resolve",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138154192763,
+      "name": "ci / e2e / source-checks (A)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138154193304,
+      "name": "ci / e2e / aarch64 / build",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138154193484,
+      "name": "ci / e2e / x86_64 / build",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138154194676,
+      "name": "ci / e2e / workbench-native",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138154195348,
+      "name": "ci / e2e / workbench-release (${{ matrix.arch }}, ${{ matrix.group }})",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138157972538,
+      "name": "ci / e2e / x86_64 / prepare",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138158062076,
+      "name": "ci / e2e / aarch64 / prepare",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692109,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--image)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692173,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--telemetry)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692222,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--snapshot)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692259,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--image)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692308,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--basic)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692314,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--basic)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692319,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--telemetry)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692336,
+      "name": "ci / e2e / aarch64 / e2e (hosted-arm--network)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692372,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--network)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692405,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--sandbox)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159692509,
+      "name": "ci / e2e / aarch64 / e2e (supplemental-arm--orchestrator)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138159693277,
+      "name": "ci / e2e / aarch64 / performance",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 138160797033,
+      "name": "ci / e2e / x86_64 / performance",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797611,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--network)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797620,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--snapshot)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797666,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--image)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797706,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--sandbox)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797724,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--orchestrator)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797728,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--basic)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138160797750,
+      "name": "ci / e2e / x86_64 / e2e (hosted-x86--telemetry)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138165723936,
+      "name": "ci / e2e / x86_64 / result",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138169495576,
+      "name": "ci / e2e / aarch64 / result",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138169685506,
+      "name": "ci / e2e / results",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 138169790137,
+      "name": "ci / finalize",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}

@@ -1,0 +1,372 @@
+{
+  "schema": 1,
+  "repository": "kuasar-sandbox/kuasar-sandbox",
+  "workflow_run_id": 45274512568,
+  "url": "https://github.com/kuasar-sandbox/kuasar-sandbox/actions/runs/45274512568",
+  "head_sha": "77408efbaa43fe2502d6c5e86c298612b1c75cb9",
+  "run_attempt": 1,
+  "status": "completed",
+  "conclusion": "success",
+  "created_at": "2026-11-23T21:55:18Z",
+  "updated_at": "2026-11-24T00:17:49Z",
+  "jobs": [
+    {
+      "id": 138042709302,
+      "name": "prepare",
+      "conclusion": "success",
+      "started_at": "2026-11-23T21:55:23Z",
+      "completed_at": "2026-11-23T21:56:04Z"
+    },
+    {
+      "id": 138043136394,
+      "name": "helper-build (x86_64, ubuntu-24.04)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T21:56:08Z",
+      "completed_at": "2026-11-23T21:59:38Z"
+    },
+    {
+      "id": 138043136459,
+      "name": "helper-build (aarch64, ubuntu-24.04-arm)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T21:56:09Z",
+      "completed_at": "2026-11-23T22:00:22Z"
+    },
+    {
+      "id": 138045589233,
+      "name": "node-infra-build (aarch64, ubuntu-24.04-arm)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:00:27Z",
+      "completed_at": "2026-11-23T22:02:44Z"
+    },
+    {
+      "id": 138045589289,
+      "name": "node-infra-build (x86_64, ubuntu-24.04)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:00:25Z",
+      "completed_at": "2026-11-23T22:05:13Z"
+    },
+    {
+      "id": 138045589292,
+      "name": "collect",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:00:25Z",
+      "completed_at": "2026-11-23T22:05:26Z"
+    },
+    {
+      "id": 138048572698,
+      "name": "workbench-build (x86_64, ubuntu-24.04)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:05:29Z",
+      "completed_at": "2026-11-23T22:13:46Z"
+    },
+    {
+      "id": 138048572869,
+      "name": "workbench-build (aarch64, ubuntu-24.04-arm)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:05:31Z",
+      "completed_at": "2026-11-23T22:12:17Z"
+    },
+    {
+      "id": 138053443267,
+      "name": "stage",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:13:48Z",
+      "completed_at": "2026-11-23T22:30:23Z"
+    },
+    {
+      "id": 138062741900,
+      "name": "release-asset-validation / resolve",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:30:26Z",
+      "completed_at": "2026-11-23T22:34:00Z"
+    },
+    {
+      "id": 138064749046,
+      "name": "release-asset-validation / workbench-release (x86_64, all)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:34:03Z",
+      "completed_at": "2026-11-23T23:49:31Z"
+    },
+    {
+      "id": 138064749364,
+      "name": "release-asset-validation / workbench-release (aarch64, all)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:34:06Z",
+      "completed_at": "2026-11-23T22:39:52Z"
+    },
+    {
+      "id": 138064749690,
+      "name": "release-asset-validation / aarch64 / build",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:34:06Z",
+      "completed_at": "2026-11-23T22:40:16Z"
+    },
+    {
+      "id": 138064749702,
+      "name": "release-asset-validation / x86_64 / build",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:34:03Z",
+      "completed_at": "2026-11-23T22:39:53Z"
+    },
+    {
+      "id": 138064752054,
+      "name": "release-asset-validation / workbench-native",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T22:34:01Z",
+      "completed_at": "2026-11-23T22:34:00Z"
+    },
+    {
+      "id": 138064752856,
+      "name": "release-asset-validation / source-checks (${{ matrix.group }})",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T22:34:01Z",
+      "completed_at": "2026-11-23T22:34:00Z"
+    },
+    {
+      "id": 138067942672,
+      "name": "release-asset-validation / x86_64 / prepare",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:39:56Z",
+      "completed_at": "2026-11-23T22:45:49Z"
+    },
+    {
+      "id": 138068154998,
+      "name": "release-asset-validation / aarch64 / prepare",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:40:22Z",
+      "completed_at": "2026-11-23T22:45:26Z"
+    },
+    {
+      "id": 138070884202,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--snapshot)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:30Z",
+      "completed_at": "2026-11-23T23:12:00Z"
+    },
+    {
+      "id": 138070884239,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--sandbox)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:30Z",
+      "completed_at": "2026-11-23T23:05:59Z"
+    },
+    {
+      "id": 138070884265,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--basic)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:30Z",
+      "completed_at": "2026-11-23T23:24:55Z"
+    },
+    {
+      "id": 138070884282,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--telemetry)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T23:07:34Z"
+    },
+    {
+      "id": 138070884283,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--network)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T23:00:50Z"
+    },
+    {
+      "id": 138070884338,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--orchestrator)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T23:29:03Z"
+    },
+    {
+      "id": 138070884356,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--image)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:48:27Z"
+    },
+    {
+      "id": 138070884395,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--storage)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:48:51Z"
+    },
+    {
+      "id": 138070884420,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--basic)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:50:17Z"
+    },
+    {
+      "id": 138070884423,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--telemetry)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:48:49Z"
+    },
+    {
+      "id": 138070884428,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--builder)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:49:27Z"
+    },
+    {
+      "id": 138070884481,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--orchestrator)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:48:46Z"
+    },
+    {
+      "id": 138070884596,
+      "name": "release-asset-validation / aarch64 / e2e (hosted-arm--network)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T22:48:59Z"
+    },
+    {
+      "id": 138070884605,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--image)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:31Z",
+      "completed_at": "2026-11-23T23:01:12Z"
+    },
+    {
+      "id": 138070884827,
+      "name": "release-asset-validation / aarch64 / e2e (supplemental-arm--builder)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:48:31Z",
+      "completed_at": "2026-11-23T23:05:46Z"
+    },
+    {
+      "id": 138070886492,
+      "name": "release-asset-validation / aarch64 / performance",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T22:45:26Z",
+      "completed_at": "2026-11-23T22:45:26Z"
+    },
+    {
+      "id": 138071097392,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--image)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:52Z",
+      "completed_at": "2026-11-23T22:50:02Z"
+    },
+    {
+      "id": 138071097409,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--network)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:53Z",
+      "completed_at": "2026-11-23T22:53:47Z"
+    },
+    {
+      "id": 138071097412,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--orchestrator)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:52Z",
+      "completed_at": "2026-11-23T23:12:26Z"
+    },
+    {
+      "id": 138071097575,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--builder)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:52Z",
+      "completed_at": "2026-11-23T22:54:14Z"
+    },
+    {
+      "id": 138071097724,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--basic)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:53Z",
+      "completed_at": "2026-11-23T23:13:04Z"
+    },
+    {
+      "id": 138071097759,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--storage)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:52Z",
+      "completed_at": "2026-11-23T22:49:03Z"
+    },
+    {
+      "id": 138071097783,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--snapshot)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:52Z",
+      "completed_at": "2026-11-23T22:55:05Z"
+    },
+    {
+      "id": 138071097825,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--telemetry)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:53Z",
+      "completed_at": "2026-11-23T22:58:38Z"
+    },
+    {
+      "id": 138071097982,
+      "name": "release-asset-validation / x86_64 / e2e (hosted-x86--sandbox)",
+      "conclusion": "success",
+      "started_at": "2026-11-23T22:45:52Z",
+      "completed_at": "2026-11-23T22:51:05Z"
+    },
+    {
+      "id": 138071100227,
+      "name": "release-asset-validation / x86_64 / performance",
+      "conclusion": "skipped",
+      "started_at": "2026-11-23T22:45:50Z",
+      "completed_at": "2026-11-23T22:45:49Z"
+    },
+    {
+      "id": 138085265035,
+      "name": "release-asset-validation / x86_64 / result",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:13:07Z",
+      "completed_at": "2026-11-23T23:13:17Z"
+    },
+    {
+      "id": 138093285187,
+      "name": "release-asset-validation / aarch64 / result",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:29:06Z",
+      "completed_at": "2026-11-23T23:30:24Z"
+    },
+    {
+      "id": 138103143357,
+      "name": "release-asset-validation / results",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:49:34Z",
+      "completed_at": "2026-11-23T23:49:45Z"
+    },
+    {
+      "id": 138103252028,
+      "name": "publish",
+      "conclusion": "success",
+      "started_at": "2026-11-23T23:49:48Z",
+      "completed_at": "2026-11-24T00:14:27Z"
+    },
+    {
+      "id": 138114822651,
+      "name": "published-download (ubuntu-24.04-arm)",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:14:32Z",
+      "completed_at": "2026-11-24T00:17:03Z"
+    },
+    {
+      "id": 138114822695,
+      "name": "published-download (ubuntu-24.04)",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:14:30Z",
+      "completed_at": "2026-11-24T00:17:27Z"
+    },
+    {
+      "id": 138116229453,
+      "name": "cleanup",
+      "conclusion": "success",
+      "started_at": "2026-11-24T00:17:30Z",
+      "completed_at": "2026-11-24T00:17:48Z"
+    }
+  ],
+  "scope": "Sandboxer reader aggregate; Orchestrator source predates #571 and does not satisfy that consumer gate."
+}

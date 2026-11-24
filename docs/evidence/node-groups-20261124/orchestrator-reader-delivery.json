@@ -1,0 +1,44 @@
+{
+  "source": "d9626893d02b7754dcd1542bc021146c24a58371",
+  "tag": "v0.2.0-preview.20261124.2",
+  "results": [
+    {
+      "arch": "aarch64",
+      "archive": "orchestrator-v0.2.0-preview.20261124.2-linux-aarch64.tar.gz",
+      "archive_sha256": "ebc504f59aadf3b911c0faa15165396b073475f27a1aefa7362a2e9e3d27f8fd",
+      "binaries": {
+        "node-ctl": {
+          "sha256": "28853b41ab44a4e12a1504f2c2534528aa254a85a967d82066b9ea66ec4fd610",
+          "buildinfo": "aarch64-node-ctl-buildinfo.txt"
+        },
+        "cluster-ctl": {
+          "sha256": "a8415736589766d50b95fbc852d186db805d0bf45ac7d3ad4e3db9624086fd1c",
+          "buildinfo": "aarch64-cluster-ctl-buildinfo.txt"
+        },
+        "e2b-key-ctl": {
+          "sha256": "671567adf551b5d57ac3986df415ed4088f86718fdaa83982b2a53b9840dcc53",
+          "buildinfo": "aarch64-e2b-key-ctl-buildinfo.txt"
+        }
+      }
+    },
+    {
+      "arch": "x86_64",
+      "archive": "orchestrator-v0.2.0-preview.20261124.2-linux-x86_64.tar.gz",
+      "archive_sha256": "6fc3e4caf1ba1e227e8ade93ce3f4d33beaa5b9c76bfcb9718e65cab99bdd914",
+      "binaries": {
+        "node-ctl": {
+          "sha256": "55ab4a5044e614683125d62c4108f0011551a8a5e005f7ad0f95561cd67b0752",
+          "buildinfo": "x86_64-node-ctl-buildinfo.txt"
+        },
+        "cluster-ctl": {
+          "sha256": "18bb9ebce7b6f22aa05ad145f7ee23f7c71af9cebcfa63f77028806955261287",
+          "buildinfo": "x86_64-cluster-ctl-buildinfo.txt"
+        },
+        "e2b-key-ctl": {
+          "sha256": "ea1d4e7ebdd3b778225e6581a48176c91713ef475598940cf70b5c448e6aa319",
+          "buildinfo": "x86_64-e2b-key-ctl-buildinfo.txt"
+        }
+      }
+    }
+  ]
+}

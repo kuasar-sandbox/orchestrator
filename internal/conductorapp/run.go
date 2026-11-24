@@ -157,6 +157,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 			}
 		}
 		capacity, registrationCapacity, executionCapacity, runtimeDigest := core.ClusterNodeInfo()
+		labels := orch.RuntimeLabels(cfg.Cluster.Labels, cfg.Sandbox.Boot.Runtime, func(path string, err error) {
+			logger.Warn("omit invalid local runtime from Node labels", "path", path, "err", err)
+		})
 		nodeClient := nodelink.NewWithEndpoint(
 			registryAddress,
 			func(dialCtx context.Context, endpoint string) (net.Conn, error) {
@@ -171,7 +174,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 				return (&net.Dialer{}).DialContext(dialCtx, "tcp", endpoint)
 			},
 			routesync.NodeRegister{
-				NodeID: nodeID, Labels: cfg.Cluster.Labels,
+				NodeID: nodeID, Labels: labels,
 				APIEndpoint: cfg.Cluster.APIEndpoint, DataEndpoint: cfg.Cluster.DataEndpoint,
 				Capacity: capacity, BuildRegistrationCapacity: registrationCapacity,
 				BuildExecutionCapacity: executionCapacity, RuntimeDigest: runtimeDigest,

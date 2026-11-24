@@ -1,0 +1,421 @@
+=== RUN   TestAddressMapLocateIgnoresOverlappingBackendVA
+--- PASS: TestAddressMapLocateIgnoresOverlappingBackendVA (0.00s)
+=== RUN   TestAddressMapLocateRejectsBackendOnlyVA
+--- PASS: TestAddressMapLocateRejectsBackendOnlyVA (0.00s)
+=== RUN   TestAddressMapCHRegionBounds
+--- PASS: TestAddressMapCHRegionBounds (0.00s)
+=== RUN   TestAddressMapRejectsInvalidRegistrationRanges
+--- PASS: TestAddressMapRejectsInvalidRegistrationRanges (0.00s)
+=== RUN   TestBackendMemoryGuardNativeRemoteGUP
+=== RUN   TestBackendMemoryGuardNativeRemoteGUP/guarded_false
+    backend_memory_guard_gup_linux_test.go:122: guarded=false remote_read=1/<nil> seek_data=4096/<nil> CH_COPY=0/file exists backend=00
+=== RUN   TestBackendMemoryGuardNativeRemoteGUP/guarded_true
+    backend_memory_guard_gup_linux_test.go:122: guarded=true remote_read=-1/bad address seek_data=-1/no such device or address CH_COPY=4096/<nil> backend=ff
+--- PASS: TestBackendMemoryGuardNativeRemoteGUP (2.05s)
+    --- PASS: TestBackendMemoryGuardNativeRemoteGUP/guarded_false (1.02s)
+    --- PASS: TestBackendMemoryGuardNativeRemoteGUP/guarded_true (1.03s)
+=== RUN   TestBackendMemoryGuardRemoteGUPChild
+--- PASS: TestBackendMemoryGuardRemoteGUPChild (0.00s)
+=== RUN   TestBackendMemoryGuardLegacySelection
+=== RUN   TestBackendMemoryGuardLegacySelection/modern
+=== RUN   TestBackendMemoryGuardLegacySelection/legacy
+=== RUN   TestBackendMemoryGuardLegacySelection/permission
+=== RUN   TestBackendMemoryGuardLegacySelection/access
+=== RUN   TestBackendMemoryGuardLegacySelection/unavailable
+=== RUN   TestBackendMemoryGuardLegacySelection/legacy-permission
+--- PASS: TestBackendMemoryGuardLegacySelection (0.00s)
+    --- PASS: TestBackendMemoryGuardLegacySelection/modern (0.00s)
+    --- PASS: TestBackendMemoryGuardLegacySelection/legacy (0.00s)
+    --- PASS: TestBackendMemoryGuardLegacySelection/permission (0.00s)
+    --- PASS: TestBackendMemoryGuardLegacySelection/access (0.00s)
+    --- PASS: TestBackendMemoryGuardLegacySelection/unavailable (0.00s)
+    --- PASS: TestBackendMemoryGuardLegacySelection/legacy-permission (0.00s)
+=== RUN   TestBackendMemoryGuardRejectsInvalidInput
+--- PASS: TestBackendMemoryGuardRejectsInvalidInput (0.00s)
+=== RUN   TestBackendMemoryGuardNativeFailureCleanup
+--- PASS: TestBackendMemoryGuardNativeFailureCleanup (0.00s)
+=== RUN   TestBackendMemoryGuardNativeReleaseAndReload
+--- PASS: TestBackendMemoryGuardNativeReleaseAndReload (0.20s)
+=== RUN   TestBackendMemoryGuardNativeUserReadSIGBUS
+    backend_memory_guard_sigbus_linux_test.go:30: [signal SIGBUS: bus error code=0x2 addr=0x721718c15000 pc=0xe6e092]
+    backend_memory_guard_sigbus_linux_test.go:30: read: production guard raised fatal SIGBUS at addr=0x721718c15000 (offset=0); child reaped
+--- PASS: TestBackendMemoryGuardNativeUserReadSIGBUS (0.03s)
+=== RUN   TestBackendMemoryGuardNativeUserWriteSIGBUS
+    backend_memory_guard_sigbus_linux_test.go:34: [signal SIGBUS: bus error code=0x2 addr=0x756b8a61d000 pc=0xe6e161]
+    backend_memory_guard_sigbus_linux_test.go:34: write: production guard raised fatal SIGBUS at addr=0x756b8a61d000 (offset=12288); child reaped
+--- PASS: TestBackendMemoryGuardNativeUserWriteSIGBUS (0.02s)
+=== RUN   TestBackendMemoryGuardSIGBUSChild
+--- PASS: TestBackendMemoryGuardSIGBUSChild (0.00s)
+=== RUN   TestRealMissingCleanFillRecordedWriteAndReleaseCapture
+--- PASS: TestRealMissingCleanFillRecordedWriteAndReleaseCapture (0.20s)
+=== RUN   TestRealMissingZeroAndTailDoNotInventDirtyWrites
+--- PASS: TestRealMissingZeroAndTailDoNotInventDirtyWrites (0.60s)
+=== RUN   TestRealMissingDuplicateFaultPreservesResidentWrite
+--- PASS: TestRealMissingDuplicateFaultPreservesResidentWrite (0.20s)
+=== RUN   TestCaptureIncludesKnownLoadedHoleAsZero
+--- PASS: TestCaptureIncludesKnownLoadedHoleAsZero (0.00s)
+=== RUN   TestMissingHandlerRejectsOtherFaultKindsWithoutFilling
+=== RUN   TestMissingHandlerRejectsOtherFaultKindsWithoutFilling/write-protect
+    fault.go:439: uffd: mandatory source read failed: uffd: unsupported pagefault flags 0x2
+=== RUN   TestMissingHandlerRejectsOtherFaultKindsWithoutFilling/minor
+    fault.go:439: uffd: mandatory source read failed: uffd: unsupported pagefault flags 0x4
+--- PASS: TestMissingHandlerRejectsOtherFaultKindsWithoutFilling (0.00s)
+    --- PASS: TestMissingHandlerRejectsOtherFaultKindsWithoutFilling/write-protect (0.00s)
+    --- PASS: TestMissingHandlerRejectsOtherFaultKindsWithoutFilling/minor (0.00s)
+=== RUN   TestChunkRunBufferedTail
+--- PASS: TestChunkRunBufferedTail (0.04s)
+=== RUN   TestChunkRunBusyReadsOnlyUrgentPage
+--- PASS: TestChunkRunBusyReadsOnlyUrgentPage (0.00s)
+=== RUN   TestChunkRunFillsWholeVisibleChunkAroundFault
+--- PASS: TestChunkRunFillsWholeVisibleChunkAroundFault (0.03s)
+=== RUN   TestChunkRunStopsAtStateAndCHRegionBoundaries
+=== RUN   TestChunkRunStopsAtStateAndCHRegionBoundaries/page_state
+=== RUN   TestChunkRunStopsAtStateAndCHRegionBoundaries/CH_region
+--- PASS: TestChunkRunStopsAtStateAndCHRegionBoundaries (0.02s)
+    --- PASS: TestChunkRunStopsAtStateAndCHRegionBoundaries/page_state (0.01s)
+    --- PASS: TestChunkRunStopsAtStateAndCHRegionBoundaries/CH_region (0.01s)
+=== RUN   TestChunkRunBidirectionalTailStopsAtBothBoundaries
+=== RUN   TestChunkRunBidirectionalTailStopsAtBothBoundaries/page_state
+=== RUN   TestChunkRunBidirectionalTailStopsAtBothBoundaries/CH_region
+--- PASS: TestChunkRunBidirectionalTailStopsAtBothBoundaries (0.03s)
+    --- PASS: TestChunkRunBidirectionalTailStopsAtBothBoundaries/page_state (0.01s)
+    --- PASS: TestChunkRunBidirectionalTailStopsAtBothBoundaries/CH_region (0.01s)
+=== RUN   TestChunkRunBidirectionalWindowRespectsLayeredVisibility
+--- PASS: TestChunkRunBidirectionalWindowRespectsLayeredVisibility (0.03s)
+=== RUN   TestChunkRunBidirectionalWindowPopulatesOnlyFullPages
+--- PASS: TestChunkRunBidirectionalWindowPopulatesOnlyFullPages (0.00s)
+=== RUN   TestChunkRunSuffixFailureAbandonsPrefix
+--- PASS: TestChunkRunSuffixFailureAbandonsPrefix (0.02s)
+=== RUN   TestChunkRunPrefixStateConflictKeepsAdjacentPages
+--- PASS: TestChunkRunPrefixStateConflictKeepsAdjacentPages (0.02s)
+=== RUN   TestOrdinaryDataFaultUsesOnePlusFifteenPages
+--- PASS: TestOrdinaryDataFaultUsesOnePlusFifteenPages (0.00s)
+=== RUN   TestZeroTailStopsAtStateBoundary
+--- PASS: TestZeroTailStopsAtStateBoundary (0.00s)
+=== RUN   TestZeroAndReleasedFaultsUseSerialZeroTail
+=== RUN   TestZeroAndReleasedFaultsUseSerialZeroTail/snapshot_zero
+=== RUN   TestZeroAndReleasedFaultsUseSerialZeroTail/released
+--- PASS: TestZeroAndReleasedFaultsUseSerialZeroTail (0.00s)
+    --- PASS: TestZeroAndReleasedFaultsUseSerialZeroTail/snapshot_zero (0.00s)
+    --- PASS: TestZeroAndReleasedFaultsUseSerialZeroTail/released (0.00s)
+=== RUN   TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages
+=== RUN   TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages/0
+=== RUN   TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages/1
+--- PASS: TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages (0.00s)
+    --- PASS: TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages/0 (0.00s)
+    --- PASS: TestResolvedHoleAndZeroRunsUseOnePlusFifteenPages/1 (0.00s)
+=== RUN   TestConcurrentFaultsKeepSingleTailReservation
+--- PASS: TestConcurrentFaultsKeepSingleTailReservation (0.00s)
+=== RUN   TestFaultQueueWaitDepthAndInflightMetrics
+--- PASS: TestFaultQueueWaitDepthAndInflightMetrics (0.00s)
+=== RUN   TestUrgentConflictConvergence
+=== RUN   TestUrgentConflictConvergence/EEXIST
+=== RUN   TestUrgentConflictConvergence/EAGAIN
+=== RUN   TestUrgentConflictConvergence/ENOENT
+--- PASS: TestUrgentConflictConvergence (0.00s)
+    --- PASS: TestUrgentConflictConvergence/EEXIST (0.00s)
+    --- PASS: TestUrgentConflictConvergence/EAGAIN (0.00s)
+    --- PASS: TestUrgentConflictConvergence/ENOENT (0.00s)
+=== RUN   TestStaleAbsentFaultConvergesWithoutError
+--- PASS: TestStaleAbsentFaultConvergesWithoutError (0.00s)
+=== RUN   TestTailNoCompletionLeavesNeighborAbsent
+--- PASS: TestTailNoCompletionLeavesNeighborAbsent (0.00s)
+=== RUN   TestZeroTailNoCompletionLeavesNeighborAbsent
+--- PASS: TestZeroTailNoCompletionLeavesNeighborAbsent (0.00s)
+=== RUN   TestDataTailCommitsPositivePartialPrefix
+--- PASS: TestDataTailCommitsPositivePartialPrefix (0.00s)
+=== RUN   TestZeroTailCommitsPositivePartialPrefix
+--- PASS: TestZeroTailCommitsPositivePartialPrefix (0.00s)
+=== RUN   TestFaultAndTailAddNoAllocationsAboveSource
+=== RUN   TestFaultAndTailAddNoAllocationsAboveSource/zero
+=== RUN   TestFaultAndTailAddNoAllocationsAboveSource/ordinary_data
+--- PASS: TestFaultAndTailAddNoAllocationsAboveSource (0.06s)
+    --- PASS: TestFaultAndTailAddNoAllocationsAboveSource/zero (0.00s)
+    --- PASS: TestFaultAndTailAddNoAllocationsAboveSource/ordinary_data (0.06s)
+=== RUN   TestBufferedChunkTailAddsNoAllocations
+--- PASS: TestBufferedChunkTailAddsNoAllocations (0.00s)
+=== RUN   TestUrgentRejectsInvalidIoctlCompletion
+=== RUN   TestUrgentRejectsInvalidIoctlCompletion/-1
+    fault.go:321: uffd: COPY(data urgent) va=0x40000000: uffd ioctl returned negative completion -1
+=== RUN   TestUrgentRejectsInvalidIoctlCompletion/1
+    fault.go:321: uffd: COPY(data urgent) va=0x40000000: uffd ioctl completion 1 is not page-aligned
+=== RUN   TestUrgentRejectsInvalidIoctlCompletion/8192
+    fault.go:321: uffd: COPY(data urgent) va=0x40000000: uffd ioctl completed 8192 bytes, requested 4096
+--- PASS: TestUrgentRejectsInvalidIoctlCompletion (0.00s)
+    --- PASS: TestUrgentRejectsInvalidIoctlCompletion/-1 (0.00s)
+    --- PASS: TestUrgentRejectsInvalidIoctlCompletion/1 (0.00s)
+    --- PASS: TestUrgentRejectsInvalidIoctlCompletion/8192 (0.00s)
+=== RUN   TestEventRemoveDiscardsTailBeforeInstallation
+    handler.go:719: uffd: EVENT_REMOVE backendVA miss off=0x1000 remaining=12288
+--- PASS: TestEventRemoveDiscardsTailBeforeInstallation (0.00s)
+=== RUN   TestUrgentWinsRunningTail
+--- PASS: TestUrgentWinsRunningTail (0.00s)
+=== RUN   TestFaultRunBoundStopsAtCHRegion
+=== RUN   TestFaultRunBoundStopsAtCHRegion/2
+=== RUN   TestFaultRunBoundStopsAtCHRegion/0
+=== RUN   TestFaultRunBoundStopsAtCHRegion/1
+--- PASS: TestFaultRunBoundStopsAtCHRegion (0.00s)
+    --- PASS: TestFaultRunBoundStopsAtCHRegion/2 (0.00s)
+    --- PASS: TestFaultRunBoundStopsAtCHRegion/0 (0.00s)
+    --- PASS: TestFaultRunBoundStopsAtCHRegion/1 (0.00s)
+=== RUN   TestCheckedCompletion
+=== RUN   TestCheckedCompletion/zero
+=== RUN   TestCheckedCompletion/full
+=== RUN   TestCheckedCompletion/partial_pages
+=== RUN   TestCheckedCompletion/negative
+=== RUN   TestCheckedCompletion/too_large
+=== RUN   TestCheckedCompletion/unaligned
+--- PASS: TestCheckedCompletion (0.00s)
+    --- PASS: TestCheckedCompletion/zero (0.00s)
+    --- PASS: TestCheckedCompletion/full (0.00s)
+    --- PASS: TestCheckedCompletion/partial_pages (0.00s)
+    --- PASS: TestCheckedCompletion/negative (0.00s)
+    --- PASS: TestCheckedCompletion/too_large (0.00s)
+    --- PASS: TestCheckedCompletion/unaligned (0.00s)
+=== RUN   TestWorkerCount
+=== RUN   TestWorkerCount/explicit_worker_count_wins
+=== RUN   TestWorkerCount/uses_runtime_cpu_count_when_unset
+=== RUN   TestWorkerCount/enforces_minimum_for_explicit_small_count
+--- PASS: TestWorkerCount (0.00s)
+    --- PASS: TestWorkerCount/explicit_worker_count_wins (0.00s)
+    --- PASS: TestWorkerCount/uses_runtime_cpu_count_when_unset (0.00s)
+    --- PASS: TestWorkerCount/enforces_minimum_for_explicit_small_count (0.00s)
+=== RUN   TestLatHist_Empty
+--- PASS: TestLatHist_Empty (0.00s)
+=== RUN   TestLatHist_CountSumMax
+--- PASS: TestLatHist_CountSumMax (0.00s)
+=== RUN   TestLatHist_Percentiles
+--- PASS: TestLatHist_Percentiles (0.00s)
+=== RUN   TestLatSnapshot_Sub_NewPeak
+--- PASS: TestLatSnapshot_Sub_NewPeak (0.00s)
+=== RUN   TestLatSnapshot_Sub_NoNewPeak
+--- PASS: TestLatSnapshot_Sub_NoNewPeak (0.00s)
+=== RUN   TestLatHist_Overflow
+--- PASS: TestLatHist_Overflow (0.00s)
+=== RUN   TestHandlerCloseJoinsReservedButNotEnqueuedTail
+--- PASS: TestHandlerCloseJoinsReservedButNotEnqueuedTail (0.00s)
+=== RUN   TestDeferredRunReadCanceledReleasesTail
+--- PASS: TestDeferredRunReadCanceledReleasesTail (0.00s)
+=== RUN   TestDeferredRunReadFailureIsBestEffort
+    fault.go:719: uffd: deferred tail read [4096,65536): injected deferred read failure
+--- PASS: TestDeferredRunReadFailureIsBestEffort (0.00s)
+=== RUN   TestChunkReservationReleasedOnEveryUrgentExit
+=== RUN   TestChunkReservationReleasedOnEveryUrgentExit/chunk_read_error
+    fault.go:439: uffd: mandatory source read failed: uffd: chunk window read [0,8192): chunk 0: not found
+=== RUN   TestChunkReservationReleasedOnEveryUrgentExit/single_page
+=== RUN   TestChunkReservationReleasedOnEveryUrgentExit/urgent_EEXIST
+--- PASS: TestChunkReservationReleasedOnEveryUrgentExit (0.00s)
+    --- PASS: TestChunkReservationReleasedOnEveryUrgentExit/chunk_read_error (0.00s)
+    --- PASS: TestChunkReservationReleasedOnEveryUrgentExit/single_page (0.00s)
+    --- PASS: TestChunkReservationReleasedOnEveryUrgentExit/urgent_EEXIST (0.00s)
+=== RUN   TestEnsureLoadedRangesAndLiveFastPath
+--- PASS: TestEnsureLoadedRangesAndLiveFastPath (0.20s)
+=== RUN   TestEnsureLoadedConfirmsCopyResult
+=== RUN   TestEnsureLoadedConfirmsCopyResult/full
+=== RUN   TestEnsureLoadedConfirmsCopyResult/exists
+=== RUN   TestEnsureLoadedConfirmsCopyResult/short
+=== RUN   TestEnsureLoadedConfirmsCopyResult/unaligned
+=== RUN   TestEnsureLoadedConfirmsCopyResult/negative
+=== RUN   TestEnsureLoadedConfirmsCopyResult/oversized
+=== RUN   TestEnsureLoadedConfirmsCopyResult/unmapped
+=== RUN   TestEnsureLoadedConfirmsCopyResult/invalid
+--- PASS: TestEnsureLoadedConfirmsCopyResult (1.62s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/full (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/exists (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/short (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/unaligned (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/negative (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/oversized (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/unmapped (0.20s)
+    --- PASS: TestEnsureLoadedConfirmsCopyResult/invalid (0.20s)
+=== RUN   TestEnsureLoadedEagainRetriesAndCancels
+=== RUN   TestEnsureLoadedEagainRetriesAndCancels/retry
+=== RUN   TestEnsureLoadedEagainRetriesAndCancels/cancel
+--- PASS: TestEnsureLoadedEagainRetriesAndCancels (0.40s)
+    --- PASS: TestEnsureLoadedEagainRetriesAndCancels/retry (0.20s)
+    --- PASS: TestEnsureLoadedEagainRetriesAndCancels/cancel (0.20s)
+=== RUN   TestEnsureLoadedCallerCancellationDoesNotStrandWorker
+--- PASS: TestEnsureLoadedCallerCancellationDoesNotStrandWorker (0.20s)
+=== RUN   TestEnsureLoadedPermanentSourceError
+--- PASS: TestEnsureLoadedPermanentSourceError (0.20s)
+=== RUN   TestEnsureLoadedReleaseAndCPUWinnerDuringRead
+=== RUN   TestEnsureLoadedReleaseAndCPUWinnerDuringRead/cpu-winner
+=== RUN   TestEnsureLoadedReleaseAndCPUWinnerDuringRead/remove
+--- PASS: TestEnsureLoadedReleaseAndCPUWinnerDuringRead (0.40s)
+    --- PASS: TestEnsureLoadedReleaseAndCPUWinnerDuringRead/cpu-winner (0.20s)
+    --- PASS: TestEnsureLoadedReleaseAndCPUWinnerDuringRead/remove (0.20s)
+=== RUN   TestEnsureLoadedRegistrationReadinessSplitAndUnmap
+--- PASS: TestEnsureLoadedRegistrationReadinessSplitAndUnmap (0.01s)
+=== RUN   TestAddUffdFailureRollsBackAndCloseRejectsAdmission
+--- PASS: TestAddUffdFailureRollsBackAndCloseRejectsAdmission (0.20s)
+=== RUN   TestCloseDrainsIoctlBeforeFDReuse
+--- PASS: TestCloseDrainsIoctlBeforeFDReuse (0.20s)
+=== RUN   TestConcurrentBackendLoadsShareWinningPage
+--- PASS: TestConcurrentBackendLoadsShareWinningPage (0.20s)
+=== RUN   TestCloseCancelsRegistrationWaitAndConcurrentAdoption
+--- PASS: TestCloseCancelsRegistrationWaitAndConcurrentAdoption (0.00s)
+=== RUN   TestUrgentReleaseDoesNotPublishStaleChunkTail
+--- PASS: TestUrgentReleaseDoesNotPublishStaleChunkTail (0.00s)
+=== RUN   TestMandatoryConflictReleasesWorkerForCPUFault
+--- PASS: TestMandatoryConflictReleasesWorkerForCPUFault (0.20s)
+=== RUN   TestReaderPublishesBatchReleaseBeforeBlockedFaultDispatch
+--- PASS: TestReaderPublishesBatchReleaseBeforeBlockedFaultDispatch (0.00s)
+=== RUN   TestPageTraceStrictSetting
+--- PASS: TestPageTraceStrictSetting (0.00s)
+=== RUN   TestPageTraceDisabledDoesNotRecordOrChangeLoad
+=== RUN   TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_""
+=== RUN   TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"invalid"
+=== RUN   TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"1"
+=== RUN   TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"4096"
+--- PASS: TestPageTraceDisabledDoesNotRecordOrChangeLoad (0.81s)
+    --- PASS: TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"" (0.20s)
+    --- PASS: TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"invalid" (0.20s)
+    --- PASS: TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"1" (0.20s)
+    --- PASS: TestPageTraceDisabledDoesNotRecordOrChangeLoad/setting_"4096" (0.20s)
+=== RUN   TestPageTraceCopyReleaseAndZero
+--- PASS: TestPageTraceCopyReleaseAndZero (0.01s)
+=== RUN   TestPageTraceEexistIsInputEvidenceAndFallbackIsVisible
+--- PASS: TestPageTraceEexistIsInputEvidenceAndFallbackIsVisible (0.00s)
+=== RUN   TestPageTraceNeighborSourceRunsDoNotConsumeTargetBudget
+--- PASS: TestPageTraceNeighborSourceRunsDoNotConsumeTargetBudget (0.00s)
+=== RUN   TestPageTraceBoundedConcurrentRecords
+--- PASS: TestPageTraceBoundedConcurrentRecords (0.00s)
+=== RUN   TestPageTracePreservesSignedCompletionAndError
+=== RUN   TestPageTracePreservesSignedCompletionAndError/kernel
+=== RUN   TestPageTracePreservesSignedCompletionAndError/other
+--- PASS: TestPageTracePreservesSignedCompletionAndError (0.00s)
+    --- PASS: TestPageTracePreservesSignedCompletionAndError/kernel (0.00s)
+    --- PASS: TestPageTracePreservesSignedCompletionAndError/other (0.00s)
+=== RUN   TestPageTraceSeedExistingFolio
+--- PASS: TestPageTraceSeedExistingFolio (0.00s)
+=== RUN   TestPageTraceCloseEmitsAfterWorkersAndUsers
+--- PASS: TestPageTraceCloseEmitsAfterWorkersAndUsers (0.20s)
+=== RUN   TestPageTraceRealMemfdBackingAndRegistration
+--- PASS: TestPageTraceRealMemfdBackingAndRegistration (0.21s)
+=== RUN   TestPageTraceAdoptionObservationJoinsClose
+--- PASS: TestPageTraceAdoptionObservationJoinsClose (0.00s)
+=== RUN   TestPageTraceReleaseKeepsKernelEvent
+=== RUN   TestPageTraceReleaseKeepsKernelEvent/remove
+=== RUN   TestPageTraceReleaseKeepsKernelEvent/unmap
+--- PASS: TestPageTraceReleaseKeepsKernelEvent (0.00s)
+    --- PASS: TestPageTraceReleaseKeepsKernelEvent/remove (0.00s)
+    --- PASS: TestPageTraceReleaseKeepsKernelEvent/unmap (0.00s)
+=== RUN   TestPageTraceMapsBoundedAndErrorsAreDiagnostic
+--- PASS: TestPageTraceMapsBoundedAndErrorsAreDiagnostic (0.25s)
+=== RUN   TestMixedSnapshotPageAndMetadataEOFClassification
+=== RUN   TestMixedSnapshotPageAndMetadataEOFClassification/short_EOF
+=== RUN   TestMixedSnapshotPageAndMetadataEOFClassification/short_unexpected_EOF
+=== RUN   TestMixedSnapshotPageAndMetadataEOFClassification/full_unexpected_EOF
+=== RUN   TestMixedSnapshotPageAndMetadataEOFClassification/full_EOF
+=== RUN   TestMixedSnapshotPageAndMetadataEOFClassification/retryable_EOF
+--- PASS: TestMixedSnapshotPageAndMetadataEOFClassification (0.02s)
+    --- PASS: TestMixedSnapshotPageAndMetadataEOFClassification/short_EOF (0.00s)
+    --- PASS: TestMixedSnapshotPageAndMetadataEOFClassification/short_unexpected_EOF (0.00s)
+    --- PASS: TestMixedSnapshotPageAndMetadataEOFClassification/full_unexpected_EOF (0.00s)
+    --- PASS: TestMixedSnapshotPageAndMetadataEOFClassification/full_EOF (0.00s)
+    --- PASS: TestMixedSnapshotPageAndMetadataEOFClassification/retryable_EOF (0.01s)
+=== RUN   TestRequiredChunkWindowRecoveryOwnsTailBuffer
+=== RUN   TestRequiredChunkWindowRecoveryOwnsTailBuffer/recover
+=== RUN   TestRequiredChunkWindowRecoveryOwnsTailBuffer/cancel
+--- PASS: TestRequiredChunkWindowRecoveryOwnsTailBuffer (0.06s)
+    --- PASS: TestRequiredChunkWindowRecoveryOwnsTailBuffer/recover (0.04s)
+    --- PASS: TestRequiredChunkWindowRecoveryOwnsTailBuffer/cancel (0.02s)
+=== RUN   TestRequiredFaultRetriesButTailRemainsBestEffort
+    fault.go:719: uffd: deferred tail read [4096,65536): io: read/write on closed pipe
+--- PASS: TestRequiredFaultRetriesButTailRemainsBestEffort (0.05s)
+=== RUN   TestRequiredFaultPermanentEOFDoesNotInstallOrWake
+    fault.go:439: uffd: mandatory source read failed: uffd: data urgent read off=0x0: EOF
+--- PASS: TestRequiredFaultPermanentEOFDoesNotInstallOrWake (0.00s)
+=== RUN   TestRealUffdRemoveDuringReadRecovery
+    handler.go:719: uffd: EVENT_REMOVE backendVA miss off=0x0 remaining=4096
+--- PASS: TestRealUffdRemoveDuringReadRecovery (0.01s)
+=== RUN   TestFullFaultQueueCancellationJoinsReaderAndWorkers
+--- PASS: TestFullFaultQueueCancellationJoinsReaderAndWorkers (0.00s)
+=== RUN   TestRealUffdUnmapWakesRecoveringKernelFault
+    read_recovery_test.go:432: isolated kernel-fault test:
+        === RUN   TestRealUffdUnmapWakesRecoveringKernelFault
+            handler.go:719: uffd: EVENT_REMOVE backendVA miss off=0x0 remaining=4096
+            fault.go:321: uffd: COPY(data urgent) va=0x77162eb12000: uffd: COPY registration lost
+        --- PASS: TestRealUffdUnmapWakesRecoveringKernelFault (0.01s)
+        PASS
+--- PASS: TestRealUffdUnmapWakesRecoveringKernelFault (1.05s)
+=== RUN   TestReleaseCaptureRestoreWithoutRefault
+=== RUN   TestReleaseCaptureRestoreWithoutRefault/capture_0_merge_false
+=== RUN   TestReleaseCaptureRestoreWithoutRefault/capture_1_merge_true
+=== RUN   TestReleaseCaptureRestoreWithoutRefault/capture_2_merge_false
+--- PASS: TestReleaseCaptureRestoreWithoutRefault (0.80s)
+    --- PASS: TestReleaseCaptureRestoreWithoutRefault/capture_0_merge_false (0.22s)
+    --- PASS: TestReleaseCaptureRestoreWithoutRefault/capture_1_merge_true (0.25s)
+    --- PASS: TestReleaseCaptureRestoreWithoutRefault/capture_2_merge_false (0.25s)
+=== RUN   TestCaptureMemoryLayoutLoadedHoleAndResidentReuse
+--- PASS: TestCaptureMemoryLayoutLoadedHoleAndResidentReuse (0.00s)
+=== RUN   TestRealMissingShmemReleaseDuringSourceRead
+=== RUN   TestRealMissingShmemReleaseDuringSourceRead/cpu_fault_false
+=== RUN   TestRealMissingShmemReleaseDuringSourceRead/cpu_fault_true
+--- PASS: TestRealMissingShmemReleaseDuringSourceRead (0.41s)
+    --- PASS: TestRealMissingShmemReleaseDuringSourceRead/cpu_fault_false (0.20s)
+    --- PASS: TestRealMissingShmemReleaseDuringSourceRead/cpu_fault_true (0.20s)
+=== RUN   TestRealMissingShmemReleaseDiscardsSpeculativeTail
+--- PASS: TestRealMissingShmemReleaseDiscardsSpeculativeTail (0.20s)
+=== RUN   TestRealMissingShmemEexistPreservesLiveCPUBytes
+--- PASS: TestRealMissingShmemEexistPreservesLiveCPUBytes (0.20s)
+=== RUN   TestStreamSnapshotSource_LayeredMultiPageChunks
+--- PASS: TestStreamSnapshotSource_LayeredMultiPageChunks (0.00s)
+=== RUN   TestStreamSnapshotSource_LayeredManifest
+--- PASS: TestStreamSnapshotSource_LayeredManifest (0.00s)
+=== RUN   TestZeroSourceRunContract
+--- PASS: TestZeroSourceRunContract (0.00s)
+=== RUN   TestStreamSnapshotSourcePreservesChunkRunWithoutPayloadIO
+--- PASS: TestStreamSnapshotSourcePreservesChunkRunWithoutPayloadIO (0.00s)
+=== RUN   TestSnapshotMemorySectionPreservesManifestChunkRun
+--- PASS: TestSnapshotMemorySectionPreservesManifestChunkRun (0.00s)
+=== RUN   TestStreamSnapshotSourceChunkWindowDoesNotExceedRAM
+--- PASS: TestStreamSnapshotSourceChunkWindowDoesNotExceedRAM (0.00s)
+=== RUN   TestStreamSnapshotSourceMergesFinalHoleAndZero
+--- PASS: TestStreamSnapshotSourceMergesFinalHoleAndZero (0.00s)
+=== RUN   TestStreamSnapshotSourcePageBoundarySafety
+=== RUN   TestStreamSnapshotSourcePageBoundarySafety/hole_to_data
+=== RUN   TestStreamSnapshotSourcePageBoundarySafety/data_to_hole
+--- PASS: TestStreamSnapshotSourcePageBoundarySafety (0.00s)
+    --- PASS: TestStreamSnapshotSourcePageBoundarySafety/hole_to_data (0.00s)
+    --- PASS: TestStreamSnapshotSourcePageBoundarySafety/data_to_hole (0.00s)
+=== RUN   TestStreamSnapshotSourceLayeredCapability
+--- PASS: TestStreamSnapshotSourceLayeredCapability (0.00s)
+=== RUN   TestStreamSnapshotSourceLayeredVisibilityClipsChunkRun
+--- PASS: TestStreamSnapshotSourceLayeredVisibilityClipsChunkRun (0.00s)
+=== RUN   TestStreamSnapshotSourcePlaintextAndEncryptedTar
+=== RUN   TestStreamSnapshotSourcePlaintextAndEncryptedTar/plaintext
+=== RUN   TestStreamSnapshotSourcePlaintextAndEncryptedTar/encrypted
+--- PASS: TestStreamSnapshotSourcePlaintextAndEncryptedTar (0.00s)
+    --- PASS: TestStreamSnapshotSourcePlaintextAndEncryptedTar/plaintext (0.00s)
+    --- PASS: TestStreamSnapshotSourcePlaintextAndEncryptedTar/encrypted (0.00s)
+=== RUN   TestStreamSnapshotSourceBounds
+--- PASS: TestStreamSnapshotSourceBounds (0.00s)
+=== RUN   TestPageStateRunBounds
+--- PASS: TestPageStateRunBounds (0.00s)
+=== RUN   TestNormalizeUffdCompletion
+=== RUN   TestNormalizeUffdCompletion/complete
+=== RUN   TestNormalizeUffdCompletion/partial
+=== RUN   TestNormalizeUffdCompletion/negative_field_and_errno
+=== RUN   TestNormalizeUffdCompletion/negative_field_only
+=== RUN   TestNormalizeUffdCompletion/syscall_errno_is_authoritative
+--- PASS: TestNormalizeUffdCompletion (0.00s)
+    --- PASS: TestNormalizeUffdCompletion/complete (0.00s)
+    --- PASS: TestNormalizeUffdCompletion/partial (0.00s)
+    --- PASS: TestNormalizeUffdCompletion/negative_field_and_errno (0.00s)
+    --- PASS: TestNormalizeUffdCompletion/negative_field_only (0.00s)
+    --- PASS: TestNormalizeUffdCompletion/syscall_errno_is_authoritative (0.00s)
+=== RUN   TestVAReportDiagnosticCallbackBeforeACK
+--- PASS: TestVAReportDiagnosticCallbackBeforeACK (0.00s)
+=== RUN   TestVAReportRollbackAndOffsetHandoff
+--- PASS: TestVAReportRollbackAndOffsetHandoff (0.20s)
+=== RUN   TestVAReportStopInterruptsIncompleteHandshake
+--- PASS: TestVAReportStopInterruptsIncompleteHandshake (0.00s)
+=== RUN   TestVAReportFragmentedFramePreservesFD
+=== RUN   TestVAReportFragmentedFramePreservesFD/prefix-fd
+=== RUN   TestVAReportFragmentedFramePreservesFD/body-fd
+--- PASS: TestVAReportFragmentedFramePreservesFD (0.02s)
+    --- PASS: TestVAReportFragmentedFramePreservesFD/prefix-fd (0.01s)
+    --- PASS: TestVAReportFragmentedFramePreservesFD/body-fd (0.01s)
+PASS
+ok  	github.com/kuasar-sandbox/sandboxer/pkg/uffd	13.045s

@@ -59,6 +59,9 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
+	groupMu      sync.Mutex // orders Group commits, snapshots and transient reports
+	groupSubs    map[uint64]chan routesync.GroupEvent
+	groupSubSeq  uint64
 	hostObserver *conductorHostObserver // wired during startup, before reconciliation
 	holdMu       sync.Mutex
 	holds        map[string]holdProjection

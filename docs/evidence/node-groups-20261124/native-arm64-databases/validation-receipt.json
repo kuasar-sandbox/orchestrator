@@ -1,0 +1,48 @@
+{
+  "architecture": "aarch64",
+  "race": true,
+  "verified_source_files": 3259,
+  "sources": {
+    "accelerator": {
+      "head": "d627cf8b16ca2d9ea39f29398d89ce8da87e1d06",
+      "tree": "ebba92d432bd17974cc2274116ac6dd82a08290e"
+    },
+    "connector": {
+      "head": "6b48c8f450dac707b708a08980a463c1d66ff847",
+      "tree": "904e541f1fddd838fd3a2349871e0cd53459df45"
+    },
+    "guest-runtime": {
+      "head": "656f9f8b5c75f0909dd4417a1b780eed5233685f",
+      "tree": "7c6eaf00acc23e45044fe24498d39a2f70a7fa7a"
+    },
+    "sandboxer": {
+      "head": "d2c67d40d7db27801550c6055d41fb9dad349f7d",
+      "tree": "0aa4f92b762d55add73f4087998c52c1fd83ce45"
+    },
+    "orchestrator": {
+      "head": "1c6ff222702927f87142b9fddd45bd05ea1f0df0",
+      "tree": "39aebefe3506ad08662f87dd5bcf3ed13165f372"
+    }
+  },
+  "go": "go version go1.26.8 linux/arm64",
+  "postgres_image": "sha256:be2f4eb4b9824567b746dcbee82ad8644c9920349d8e8f47153ddd70f98599a4",
+  "command": [
+    "python3",
+    "scripts/with-test-fdb.py",
+    "--",
+    "python3",
+    "scripts/cluster-native.py",
+    "test",
+    "--arch",
+    "aarch64",
+    "--",
+    "-race",
+    "-count=1",
+    "-timeout",
+    "10m"
+  ],
+  "setup_retry_reason": "Verified original workspace sums retained; native fault injection now survives definite transaction aborts; short TMPDIR avoids Unix socket path length limits. Prior failed logs are retained.",
+  "started_unix": 1795477675.8552907,
+  "exit_code": 0,
+  "finished_unix": 1795477716.7314706
+}
