@@ -29,7 +29,7 @@ def located(key):
 
 class SnapshotBundleGraph(unittest.TestCase):
     def validate(self, refs=None, suffix=None, members=None, extra_cfg=None,
-                 root_members=None, missing_history=False, parser=PARSER):
+                 root_members=None, missing_history=False, parser=PARSER, annotation=""):
         if refs is None:
             refs = [located(H), ref(BASE), ref(LOWER)]
         if suffix is None:
@@ -52,7 +52,7 @@ class SnapshotBundleGraph(unittest.TestCase):
                     for name in names:
                         archive.writestr(name, b"fixture")
             return subprocess.run(
-                [sys.executable, "-", str(current), str(parent), str(root), located(PUBLIC), A, B],
+                [sys.executable, "-", str(current), str(parent), str(root), located(PUBLIC) + annotation, A, B],
                 input=parser, text=True, capture_output=True, timeout=5)
 
     def assert_rejected(self, diagnostic, **kwargs):
@@ -63,6 +63,54 @@ class SnapshotBundleGraph(unittest.TestCase):
     def test_materialized_history_has_its_own_exact_carrier(self):
         result = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_manifest_prefetch_key_uses_the_carrier_identity(self):
+        source = CASE.read_text()
+        start = source.index('PORTABLE_W_KEY=')
+        end = source.index('# After paused cleanup', start)
+        script = ('set -euo pipefail; fail() { exit 1; }; PORTABLE_W_REF=$1;\n'
+                  + source[start:end] + '\nprintf "%s" "$PORTABLE_W_KEY"')
+        for suffix in ("", "@runtime:runtime.bundle:digest:" + "1" * 64):
+            result = subprocess.run(["bash", "-c", script, "fixture", ref(PUBLIC) + suffix],
+                                    text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, PUBLIC)
+        for invalid in ("manifest://" + "g" * 64, "manifest://" + PUBLIC + "/extra", located(PUBLIC)):
+            result = subprocess.run(["bash", "-c", script, "fixture", invalid],
+                                    text=True, capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_local_bundle_capture_has_a_new_carrier_with_or_without_runtime_metadata(self):
+        annotation = "@runtime:runtime.bundle:digest:" + "1" * 64
+        for marker in ("PY_BUNDLE_LOCAL_B", "PY_BUNDLE_LOCAL_C"):
+            parser = shipped_assertion(marker)
+            with tempfile.TemporaryDirectory() as directory:
+                cfg = Path(directory) / "config.json"
+                cfg.write_text('{"FromRefs":[]}')
+                for suffix in ("", annotation):
+                    before = ["paused", "snapshot", "file://" + A + ".bundle@manifest:" + A, "old-E", ""]
+                    after = ["paused", "snapshot", "file://" + B + ".bundle@manifest:" + B + suffix, "new-E", ""]
+                    def run():
+                        return subprocess.run([sys.executable, "-", str(cfg), str(cfg),
+                                               json.dumps(before), json.dumps(after), B],
+                                              input=parser, text=True, capture_output=True, timeout=5)
+                    result = run()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # Changing only scheduling metadata cannot stand in for a new S.
+                    before[2] = "file://" + B + ".bundle@manifest:" + B
+                    self.assertNotEqual(run().returncode, 0)
+
+    def test_runtime_declaration_does_not_change_root_or_history_identity(self):
+        annotation = "@runtime:sandbox-runtime.bundle:digest:" + "1" * 64
+        for parser in (PARSER, shipped_assertion("PY_BUNDLE")):
+            with self.subTest(parser=parser[:50]):
+                result = self.validate(parser=parser, annotation=annotation)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                result = self.validate(parser=parser, annotation=annotation,
+                                       refs=[located(PUBLIC), ref(BASE), ref(LOWER)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue("own root" in result.stderr or "new immutable identity" in result.stderr,
+                                result.stderr)
 
     def test_full_local_snapshot_cannot_impersonate_materialized_history(self):
         for key in (A, B):

@@ -4,6 +4,7 @@ persist_ref() {
 import base64
 import re
 import sys
+import unicodedata
 
 try:
     profile, kind, payload = sys.argv[1].split("-", 2)
@@ -13,12 +14,26 @@ try:
     if base64.urlsafe_b64encode(raw).decode().rstrip("=") != payload:
         raise ValueError
     ref = raw.decode()
-    manifest_ref = re.fullmatch(r"manifest://[0-9a-f]{64}", ref)
+    base = ref
+    if "@runtime" in ref:
+        base, marker, declaration = ref.partition("@runtime:")
+        name, separator, digest = declaration.rpartition(":digest:")
+        # Match manifest.RuntimeIdentity's public grammar, preserving the full
+        # ref below. Only storage path assertions use the unannotated base.
+        reserved = ("@runtime", "@digest:", "@hmac:", "@manifest:", "@location:", "@sha256:")
+        if (kind != "snp" or not marker or not separator or
+                not name.endswith(".bundle") or name == ".bundle" or
+                len(name.encode()) > 255 or "/" in name or "\\" in name or
+                any(unicodedata.category(c) == "Cc" for c in name) or
+                any(value in name for value in reserved) or
+                not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ValueError
+    manifest_ref = re.fullmatch(r"manifest://[0-9a-f]{64}", base)
     located_ref = re.fullmatch(
         r"file://[0-9a-f]{64}\.(?:bundle|sandbox|snapshot|overlay)"
         r"@(?:manifest|digest|hmac):[0-9a-f]{64}"
         r"@location:[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
-        ref,
+        base,
     )
     if not manifest_ref and not located_ref:
         raise ValueError
@@ -47,6 +62,7 @@ assert_only_manifest_ref_added() { # before-list manifest-ref label
     local before="$1" ref="$2" label="$3" key after additions final
     [[ "$ref" == manifest://* ]] || fail "$label expected a Manifest ref, got $ref"
     key=${ref#manifest://}
+    key=${key%%@runtime:*}
     after="$WORK/$label-manifests.after"
     additions="$WORK/$label-manifests.added"
     snapshot_manifest_keys "$after"
@@ -69,7 +85,7 @@ located_ref_details() { # ref -> "name<TAB>directory<TAB>file"
 import hashlib, pathlib, re, sys
 
 ref, parent = sys.argv[1:]
-match = re.search(r"@location:([A-Za-z0-9][A-Za-z0-9._-]{0,127})$", ref)
+match = re.search(r"@location:([A-Za-z0-9][A-Za-z0-9._-]{0,127})$", ref.split("@runtime:", 1)[0])
 assert match, ref
 name = match.group(1)
 payload = ref.removeprefix("file://").split("@", 1)[0]
