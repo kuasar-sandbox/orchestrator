@@ -1,0 +1,146 @@
+{
+  "case": "snapshot.dirty-memory.sh",
+  "task": "d818769c774845debf7bc4e9922c690e",
+  "host": "bms.dev-x86",
+  "exit_code": 0,
+  "scope": "actual KVM and CH, full RAM comparisons, capture identity checks, lost dirty-response recovery, same-state size comparisons and balloon release/reuse",
+  "size_association": {
+    "run_id": "7f218c0530a0453997a55d15a50c6df8",
+    "pid": 1861629,
+    "captures": 2,
+    "memory_bytes": 268435456,
+    "observer_materializes_memory": true,
+    "codec": "plaintext"
+  },
+  "comparisons": {
+    "balloon-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "c0321599023a9a26ad340e230f7811096329b933c03554e9be88319b54d18dc5",
+      "identity_deduplicated_local_bytes": 242117120
+    },
+    "c1-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "2ed511b8a30b67dea48cc9168919552a00eef3bf9726fa96957a59f3fc42e3de",
+      "identity_deduplicated_local_bytes": 72788992
+    },
+    "c2-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "c0a6f3ec53baac37be78913e9e70f2d554ae0754771a18c9f122e1ab29585abc",
+      "identity_deduplicated_local_bytes": 74115584
+    },
+    "cold-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "e71aa335da0deb8863e6769c615d3549993f63e2519d514b712eabb3bee2e140",
+      "identity_deduplicated_local_bytes": 72551424
+    },
+    "h-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "3a752043b9c03360ff6becaa5001fd56085b01493d3c543b8143fbbccaa14d53",
+      "identity_deduplicated_local_bytes": 341362688
+    },
+    "legacy-C-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "c0a6f3ec53baac37be78913e9e70f2d554ae0754771a18c9f122e1ab29585abc",
+      "identity_deduplicated_local_bytes": 268519936
+    },
+    "legacy-W-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "3a752043b9c03360ff6becaa5001fd56085b01493d3c543b8143fbbccaa14d53",
+      "identity_deduplicated_local_bytes": 537040896
+    },
+    "recovered-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "b95f716f8991491e54b2ba18f88c4fcb1f3440de356fdf9eba48f900e0ec60b1",
+      "identity_deduplicated_local_bytes": 74250752
+    },
+    "release-restore-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "b95f716f8991491e54b2ba18f88c4fcb1f3440de356fdf9eba48f900e0ec60b1",
+      "identity_deduplicated_local_bytes": 74250752
+    },
+    "restore1-restore-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "e71aa335da0deb8863e6769c615d3549993f63e2519d514b712eabb3bee2e140",
+      "identity_deduplicated_local_bytes": 72551424
+    },
+    "restore2-restore-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "a48f0d0f1e494272ae21969ce060b58d936fb546e3bf47c3a334646488c1bf79",
+      "identity_deduplicated_local_bytes": 341080064
+    },
+    "reuse-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "bef5175b0df1aba9f0ff0ca57f83df730b02492dae5347f939016ff0c7615937",
+      "identity_deduplicated_local_bytes": 74647552
+    },
+    "reuse-restore-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "c0321599023a9a26ad340e230f7811096329b933c03554e9be88319b54d18dc5",
+      "identity_deduplicated_local_bytes": 242117120
+    },
+    "reused-w-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "4766d9ab856b7af1085d216b386de6dbd691db42e9444b704c54e60e6f5c72d1",
+      "identity_deduplicated_local_bytes": 307922432
+    },
+    "w1-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "9a77b5d3c19d519d7146842571d3ab324497932622aa3ce4efe416659f731721",
+      "identity_deduplicated_local_bytes": 341080064
+    },
+    "w2-comparison.json": {
+      "complete_comparison": "equal",
+      "logical_bytes": 268435456,
+      "sha256": "a48f0d0f1e494272ae21969ce060b58d936fb546e3bf47c3a334646488c1bf79",
+      "identity_deduplicated_local_bytes": 341080064
+    }
+  },
+  "binary_sha256": {
+    "sandbox-ctl": "b78bfa29b45dc9857157c00eb3087dec8766b7090c27af1e7db6f0d82ac8ab94",
+    "cloud-hypervisor": "6f8d2fb5d9ca53bc7fcaedbbdfb297381811a3af3e0642ecbd90a63235308852",
+    "sandbox-runtime.bundle": "f5cedf4d0de9197af08c9caf929fe419bad50613f45cb80fe5fbcd9efbcdc5f9"
+  },
+  "helper_sha256": {
+    "memorybaseline": "9025d60084560c0ce15a4dc79e03eb10a8675fb55cd4e0d1b1f569ad3f95f87e",
+    "dirty-memory-guest": "0cb565536d5987118357246296a5b7ee0a42f481b7b75ac4b21ee221073b8656",
+    "memorycompare": "0f72e5324d0b6f0e370134dd7a8a34294ee271087f20d874c4b10176bf7c4860"
+  },
+  "script_sha256": {
+    "snapshot.dirty-memory.sh": "89020c4e71ad03c2f8cec9689f90e51a25962662558ba3e8fb97f32914423c57",
+    "lib/sandboxer/dirty_memory_evidence.py": "1f0560c39c756baa21e0ad0b1921aa67e786db88823003f82b55c8bc7fb8e170",
+    "lib/common.sh": "09fee06a8cbef711ea8af5de1383b5cef3590f36cb939f29a3a7f7f98ee09686"
+  },
+  "attempts": [
+    {
+      "task": "70ac95f6276147bf986fc9f72abfb86d",
+      "result": "setup failure: archive extraction raced incomplete upload, script absent; no VM test executed"
+    },
+    {
+      "task": "6ce4565af2f548d58a773f3041543bd3",
+      "result": "setup failure: WORK exceeded Unix socket path length; no successful cold boot"
+    },
+    {
+      "task": "d818769c774845debf7bc4e9922c690e",
+      "result": "pass with complete prepared inputs and short task-owned WORK directory"
+    }
+  ],
+  "helper_source": {
+    "sandboxer": "f83dd87f5b616f0746c0906caba07d75eb8a7144",
+    "note": "Helpers built while only dirty_memory_evidence.py and its Python regression test were modified; compiled Go helper sources were unchanged. The corrected Python files were then committed as 54d24f759e539217bbbeae6ae21bc1e42c923e4c."
+  }
+}

@@ -202,6 +202,34 @@
     "published_sha256": "e9bfaa4794bf3a783d29923da0b44127995954b74722c8317dda692538e94e21",
     "transformation": "byte-identical"
   },
+  "pr474-dirty-evidence-after.log": {
+    "bytes": 443,
+    "original_sha256": "9428b875bcd46a15fdce4fe4d43d0e0f392f0d1ce30fb5b8820a3475773191d0",
+    "original_task_path": "evidence/pr474-dirty-evidence-after.log",
+    "published_sha256": "9428b875bcd46a15fdce4fe4d43d0e0f392f0d1ce30fb5b8820a3475773191d0",
+    "transformation": "byte-identical"
+  },
+  "pr474-dirty-evidence-before.log": {
+    "bytes": 1978,
+    "original_sha256": "3623eca32e99bfc8a087bba0648e0db1607bfcf31571f7e458c513ce7ffea48f",
+    "original_task_path": "evidence/pr474-dirty-evidence-before.log",
+    "published_sha256": "3623eca32e99bfc8a087bba0648e0db1607bfcf31571f7e458c513ce7ffea48f",
+    "transformation": "byte-identical"
+  },
+  "pr474-dirty-memory-native-x86.json": {
+    "bytes": 6282,
+    "original_sha256": "5b865a37730caf809cab4de0a3e13954897db72e9e8c004877d7c47c64048881",
+    "original_task_path": "evidence/pr474-dirty-memory-native-x86.json",
+    "published_sha256": "5b865a37730caf809cab4de0a3e13954897db72e9e8c004877d7c47c64048881",
+    "transformation": "byte-identical"
+  },
+  "pr474-e2e-script-tests.log": {
+    "bytes": 1615,
+    "original_sha256": "d9c3fc30329a96d19592b77263e158b11cda528dbc4c473be148a306e2e1b941",
+    "original_task_path": "evidence/pr474-e2e-script-tests.log",
+    "published_sha256": "d9c3fc30329a96d19592b77263e158b11cda528dbc4c473be148a306e2e1b941",
+    "transformation": "byte-identical"
+  },
   "pr474-uffd-fixture-race.log": {
     "bytes": 26148,
     "original_sha256": "fb4aae43efa5ad092b7f97f7fb5888f2e28d80b4b90433aeec66ec6b46f749e6",

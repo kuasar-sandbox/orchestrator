@@ -47,7 +47,7 @@ before either proposal is closed.
 | Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` and component release `45296417785` passed; actual SDK and both-architecture tools verified as `v0.2.0-preview.20261124.2` |
 | Node Group foundation, #572 | head `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a`; merged `d9626893d02b7754dcd1542bc021146c24a58371` | exact-head run `45287872172` passed (24 successful jobs; four inapplicable jobs skipped); tested merge tree equals the final main tree, including the cursor escaping fix |
 | Shared support repository, #573 | `80c6e0114248c214bed4a3a94a86b8697d7edd2b` | rebased onto merged #572 with an unchanged support patch; official run `45295630484` pending |
-| Snapshot producer, sandboxer #474 | `f83dd87f5b616f0746c0906caba07d75eb8a7144` | production tree unchanged from tested `5bd60b2`; one UFFD fixture now uses a valid `.bundle` basename. Actual reader delivery gate satisfied; new exact-head run `45301574190` pending |
+| Snapshot producer, sandboxer #474 | `54d24f759e539217bbbeae6ae21bc1e42c923e4c` | production implementation unchanged from tested `5bd60b2`; UFFD and dirty-memory evidence fixtures account for runtime declarations. Actual reader delivery gate satisfied; exact-head run `45306961103` pending |
 | Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | final main rebase/CI/release pending |
 
 Sandboxer SDK `v0.2.0-preview.20261124.1` resolved to
@@ -290,6 +290,18 @@ script then passed. Producer CI also found a UFFD fixture with the retired
 [full UFFD race test](evidence/node-groups-20261124/pr474-uffd-fixture-race.log) pass,
 including actual release/capture/layered-restore execution. The failing official
 run `45298653710` is retained; its replacement must pass before producer merge.
+
+The following official run `45301574190` found a second test-fixture assumption:
+its dirty-memory evidence used the last `@` qualifier as the physical Snapshot
+identity. The new runtime declaration changed that last qualifier. Commit
+`54d24f7` compares the Snapshot's own first content-identity qualifier; it preserves
+the full-RAM equality and wrong-identity checks. New annotated/location regression
+cases failed before the fix and passed afterward. All E2E script tests passed,
+and a [fresh complete native x86 case](evidence/node-groups-20261124/pr474-dirty-memory-native-x86.json)
+passed all sixteen comparison records, lost-response recovery, same-state size
+checks and balloon release/reuse. Its initial local preparations (incomplete
+upload and an overlong Unix socket path) are recorded as fixture failures, not
+successful product runs. No production code changed for either fixture repair.
 
 ## Final closeout checklist
 

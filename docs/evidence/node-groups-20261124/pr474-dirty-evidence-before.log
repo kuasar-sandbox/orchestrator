@@ -1,0 +1,29 @@
+FF..
+======================================================================
+FAIL: test_associations_fail_closed (__main__.EvidenceTest.test_associations_fail_closed) (change='valid-runtime')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/grayc/work/cluster-refactor-20261123/sandboxer-producer/scripts/test_e2e_dirty_memory.py", line 59, in test_associations_fail_closed
+    self.assertEqual(evidence.validate(ram,out)["captures"],2)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/grayc/work/cluster-refactor-20261123/sandboxer-producer/test/e2e/lib/dirty_memory_evidence.py", line 28, in validate
+    assert result["snapshotRef"].rsplit("@", 1)[1] == compared["layers"][0]["Identity"], "wrong snapshot identity"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: wrong snapshot identity
+
+======================================================================
+FAIL: test_associations_fail_closed (__main__.EvidenceTest.test_associations_fail_closed) (change='valid-location-runtime')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/grayc/work/cluster-refactor-20261123/sandboxer-producer/scripts/test_e2e_dirty_memory.py", line 59, in test_associations_fail_closed
+    self.assertEqual(evidence.validate(ram,out)["captures"],2)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/grayc/work/cluster-refactor-20261123/sandboxer-producer/test/e2e/lib/dirty_memory_evidence.py", line 28, in validate
+    assert result["snapshotRef"].rsplit("@", 1)[1] == compared["layers"][0]["Identity"], "wrong snapshot identity"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: wrong snapshot identity
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.036s
+
+FAILED (failures=2)
