@@ -1,0 +1,8 @@
+test_associations_fail_closed (__main__.EvidenceTest.test_associations_fail_closed) ... ok
+test_loss_records_include_the_dropped_collection (__main__.EvidenceTest.test_loss_records_include_the_dropped_collection) ... ok
+test_loss_requires_new_bits_and_exact_geometry (__main__.EvidenceTest.test_loss_requires_new_bits_and_exact_geometry) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.030s
+
+OK

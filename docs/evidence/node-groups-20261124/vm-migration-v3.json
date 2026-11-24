@@ -1,0 +1,25 @@
+{
+  "source": {
+    "id": "sb-c2404bc8f4c413cd14b7b2ce56cb8585-g0",
+    "stable_id": "sb-c2404bc8f4c413cd14b7b2ce56cb8585",
+    "run_id": "",
+    "state": "paused"
+  },
+  "target": {
+    "id": "sb-c2404bc8f4c413cd14b7b2ce56cb8585-g1",
+    "stable_id": "sb-c2404bc8f4c413cd14b7b2ce56cb8585",
+    "run_id": "sr-01a20a41-4fb9-7ac9-97e8-b7d20c2c9d7b",
+    "state": "running"
+  },
+  "public_status": 200,
+  "stable_credentials": true,
+  "target_default_runtime_unavailable": true,
+  "runtime_source": "Node-decoded opaque KMT",
+  "late_source_cleaned": true,
+  "target_after_cleanup": {
+    "id": "sb-c2404bc8f4c413cd14b7b2ce56cb8585-g1",
+    "stable_id": "sb-c2404bc8f4c413cd14b7b2ce56cb8585",
+    "run_id": "sr-01a20a41-4fb9-7ac9-97e8-b7d20c2c9d7b",
+    "state": "running"
+  }
+}

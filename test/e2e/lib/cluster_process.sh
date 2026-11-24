@@ -259,9 +259,9 @@ node_link:
   node_dead_after: "5s"
 route_link:
   park_timeout: "180s"
-placer_link:
-  min_ready_placers: 1
-  place_timeout: "5s"
+placement:
+  candidates: 2
+  zone_admit_max: "yellow"
 EOF
     done
 }
@@ -282,11 +282,8 @@ import_groups:
     source_type: file
     path: "$WORK/g"
 placement:
-  candidates: 2
-  zone_admit_max: "yellow"
-  node_dead_after: "5s"
   import_source_lease_ttl: "10s"
-  selector_patch_refresh_interval: "1s"
+  import_refresh_interval: "1s"
 EOF
     cat > "$WORK/router.yaml" <<EOF
 domain: "$DOMAIN"
@@ -344,12 +341,13 @@ start_cluster_node() {
     NODE_PORT="$(free_port)"
     NODE_DATA_PORT="$(free_port)"
     local node_id="$1"
+    local runner="${2:-sandbox-runner@.service}" builder="${3:-sandbox-builder@.service}"
     cat > "$WORK/cluster-node.yaml" <<EOF
 api: { domain: $DOMAIN, listen: "127.0.0.1:$NODE_PORT" }
 encryption_key: "$ENC_KEY"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/cr, base_root: $WORK/cl, config_socket: $WORK/cn.sock }
-units: { dir: $UNIT_DIR }
+units: { dir: $UNIT_DIR, runner: "$runner", builder: "$builder" }
 sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }

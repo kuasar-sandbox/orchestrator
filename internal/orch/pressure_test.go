@@ -230,7 +230,7 @@ func TestNodeCreateAdmissionIsSourceIndependent(t *testing.T) {
 					}
 				} else {
 					_, _, fp := allowlistedBuildIdentity(t, o)
-					cmd := clusterCreateCommand(fp, "pressure-create")
+					cmd := clusterCreateCommand(t, o, fp, "pressure-create")
 					ack := o.HandleCommand(ctx, cmd)
 					if allowed {
 						if ack.Status != routesync.AckAccepted {

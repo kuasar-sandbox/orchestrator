@@ -660,6 +660,8 @@ func TestPrepareClusterConnectRejectsTokenMismatchBeforeInsert(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd.APISecretFingerprint = fingerprint
+			cmd.Cluster.Group = "/alternate-owner"
+			cmd.GroupAPIKey, cmd.ExpectedGroupVersion = clusterGroupFixture(t, fixture.o, fingerprint, cmd.Cluster.Group)
 			return migrationtoken.ErrCredentialMismatch
 		},
 		"runtime": func(t *testing.T, fixture *clusterConnectFixture, _ *routesync.Command) error {
@@ -765,13 +767,15 @@ func TestHandleClusterConnectRejectsInvalidTargetID(t *testing.T) {
 }
 
 type clusterConnectFixture struct {
-	o           *Orchestrator
-	dbPath      string
-	pair        store.KeyPair
-	fingerprint string
-	source      *types.Sandbox
-	token       string
-	launcher    *countingLauncher
+	groupAPIKey  string
+	groupVersion int64
+	o            *Orchestrator
+	dbPath       string
+	pair         store.KeyPair
+	fingerprint  string
+	source       *types.Sandbox
+	token        string
+	launcher     *countingLauncher
 }
 
 func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
@@ -822,11 +826,13 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &clusterConnectFixture{o: o, dbPath: dbPath, pair: pair, fingerprint: fingerprint, source: source, token: token, launcher: lc}
+	groupAPIKey, groupVersion := clusterGroupFixture(t, o, fingerprint, "/tenant/workloads")
+	return &clusterConnectFixture{o: o, dbPath: dbPath, pair: pair, fingerprint: fingerprint, source: source, token: token, launcher: lc, groupAPIKey: groupAPIKey, groupVersion: groupVersion}
 }
 
 func (f *clusterConnectFixture) command(targetID, token string) *routesync.Command {
 	return &routesync.Command{
+		GroupAPIKey: f.groupAPIKey, ExpectedGroupVersion: f.groupVersion,
 		CmdID: "connect-" + targetID, Kind: routesync.CmdConnect, SID: targetID,
 		Profile: string(f.source.Profile), APISecretFingerprint: f.fingerprint,
 		Cluster: &routesync.ClusterSandboxContext{

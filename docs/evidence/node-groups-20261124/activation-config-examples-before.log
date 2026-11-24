@@ -1,0 +1,27 @@
+--- FAIL: TestRoleConfigExamplesRoundTrip (0.01s)
+    --- FAIL: TestRoleConfigExamplesRoundTrip/registry (0.00s)
+        --- FAIL: TestRoleConfigExamplesRoundTrip/registry/generated (0.00s)
+            config_examples_test.go:25: shipped configuration rejected: clustercfg: parse /tmp/TestRoleConfigExamplesRoundTripregistrygenerated2384173620/001/generated.yaml: yaml: unmarshal errors:
+                  line 26: field node_list not found in type clustercfg.RegistryConfig
+                  line 30: field placer_replica_count not found in type clustercfg.PlacerLinkConfig
+                  line 31: field min_ready_placers not found in type clustercfg.PlacerLinkConfig
+                  line 32: field place_timeout not found in type clustercfg.PlacerLinkConfig
+        --- FAIL: TestRoleConfigExamplesRoundTrip/registry/deployment (0.00s)
+            config_examples_test.go:25: shipped configuration rejected: clustercfg: parse ../../deploy/registry.example.yaml: yaml: unmarshal errors:
+                  line 39: field placer_replica_count not found in type clustercfg.PlacerLinkConfig
+                  line 40: field min_ready_placers not found in type clustercfg.PlacerLinkConfig
+                  line 41: field place_timeout not found in type clustercfg.PlacerLinkConfig
+    --- FAIL: TestRoleConfigExamplesRoundTrip/placer (0.00s)
+        --- FAIL: TestRoleConfigExamplesRoundTrip/placer/generated (0.00s)
+            config_examples_test.go:25: shipped configuration rejected: clustercfg: parse /tmp/TestRoleConfigExamplesRoundTripplacergenerated2961011121/001/generated.yaml: yaml: unmarshal errors:
+                  line 18: field candidates not found in type clustercfg.PlacementConfig
+                  line 19: field zone_admit_max not found in type clustercfg.PlacementConfig
+                  line 22: field selector_patch_refresh_interval not found in type clustercfg.PlacementConfig
+        --- FAIL: TestRoleConfigExamplesRoundTrip/placer/deployment (0.00s)
+            config_examples_test.go:25: shipped configuration rejected: clustercfg: parse ../../deploy/placer.example.yaml: yaml: unmarshal errors:
+                  line 24: field candidates not found in type clustercfg.PlacementConfig
+                  line 25: field zone_admit_max not found in type clustercfg.PlacementConfig
+                  line 28: field selector_patch_refresh_interval not found in type clustercfg.PlacementConfig
+FAIL
+FAIL	github.com/kuasar-sandbox/orchestrator/cmd/cluster-ctl	0.015s
+FAIL

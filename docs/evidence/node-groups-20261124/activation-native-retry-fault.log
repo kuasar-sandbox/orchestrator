@@ -1,0 +1,141 @@
+FoundationDB 7.3 (v7.3.77)
+source version 3ea44ce1d9003ad095e408039e1f755c319c4dfb
+protocol fdb00b073000000
+test FoundationDB ready (7.3.77, single SSD; ordinary read/write checked)
+testing: warning: no tests to run
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/fdbdriver	1.035s [no tests to run]
+testing: warning: no tests to run
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	1.055s [no tests to run]
+testing: warning: no tests to run
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/sqlengine	1.031s [no tests to run]
+=== RUN   TestRegistryNativeCommitExitHelper
+--- PASS: TestRegistryNativeCommitExitHelper (0.00s)
+=== RUN   TestRegistryNativeProcessExitAfterCommitBeforeDispatch
+=== RUN   TestRegistryNativeProcessExitAfterCommitBeforeDispatch/sqlite
+    native_commit_exit_test.go:211: F02: SIGKILL after 8 native writes committed and before any dispatch; logical identity retained, sb-cd3502e7f1618912484118f515d35da6-g0 -> sb-cd3502e7f1618912484118f515d35da6-g1, old ownership and auth retained
+=== RUN   TestRegistryNativeProcessExitAfterCommitBeforeDispatch/postgres
+    native_commit_exit_test.go:211: F02: SIGKILL after 8 native writes committed and before any dispatch; logical identity retained, sb-3bb33125c944634622b2c6dfee6dc649-g0 -> sb-3bb33125c944634622b2c6dfee6dc649-g1, old ownership and auth retained
+=== RUN   TestRegistryNativeProcessExitAfterCommitBeforeDispatch/fdb
+    native_commit_exit_test.go:211: F02: SIGKILL after 8 native writes committed and before any dispatch; logical identity retained, sb-88ac3ceb4a0f407fe5d115eab6d07099-g0 -> sb-88ac3ceb4a0f407fe5d115eab6d07099-g1, old ownership and auth retained
+--- PASS: TestRegistryNativeProcessExitAfterCommitBeforeDispatch (1.46s)
+    --- PASS: TestRegistryNativeProcessExitAfterCommitBeforeDispatch/sqlite (0.58s)
+    --- PASS: TestRegistryNativeProcessExitAfterCommitBeforeDispatch/postgres (0.58s)
+    --- PASS: TestRegistryNativeProcessExitAfterCommitBeforeDispatch/fdb (0.29s)
+=== RUN   TestRegistryNativeIntentFaults
+=== RUN   TestRegistryNativeIntentFaults/sqlite
+=== RUN   TestRegistryNativeIntentFaults/sqlite/F01_native_rollback
+    native_intent_fault_test.go:205: F01_native_rollback: staged native writes=8, Node commands=0, durable route=false, exact ownership=false, retained auth=false
+=== RUN   TestRegistryNativeIntentFaults/sqlite/F02_native_commit_reply_lost
+    native_intent_fault_test.go:205: F02_native_commit_reply_lost: staged native writes=8, Node commands=0, durable route=true, exact ownership=true, retained auth=true
+=== RUN   TestRegistryNativeIntentFaults/sqlite/F07_generic_rejection_timeout
+    native_intent_fault_test.go:205: F07_generic_rejection_timeout: staged native writes=0, Node commands=1, durable route=false, exact ownership=true, retained auth=true
+=== RUN   TestRegistryNativeIntentFaults/postgres
+=== RUN   TestRegistryNativeIntentFaults/postgres/F01_native_rollback
+    native_intent_fault_test.go:205: F01_native_rollback: staged native writes=8, Node commands=0, durable route=false, exact ownership=false, retained auth=false
+=== RUN   TestRegistryNativeIntentFaults/postgres/F02_native_commit_reply_lost
+    native_intent_fault_test.go:205: F02_native_commit_reply_lost: staged native writes=8, Node commands=0, durable route=true, exact ownership=true, retained auth=true
+=== RUN   TestRegistryNativeIntentFaults/postgres/F07_generic_rejection_timeout
+    native_intent_fault_test.go:205: F07_generic_rejection_timeout: staged native writes=0, Node commands=1, durable route=false, exact ownership=true, retained auth=true
+=== RUN   TestRegistryNativeIntentFaults/fdb
+=== RUN   TestRegistryNativeIntentFaults/fdb/F01_native_rollback
+    native_intent_fault_test.go:205: F01_native_rollback: staged native writes=8, Node commands=0, durable route=false, exact ownership=false, retained auth=false
+=== RUN   TestRegistryNativeIntentFaults/fdb/F02_native_commit_reply_lost
+    native_intent_fault_test.go:205: F02_native_commit_reply_lost: staged native writes=8, Node commands=0, durable route=true, exact ownership=true, retained auth=true
+=== RUN   TestRegistryNativeIntentFaults/fdb/F07_generic_rejection_timeout
+    native_intent_fault_test.go:205: F07_generic_rejection_timeout: staged native writes=0, Node commands=1, durable route=false, exact ownership=true, retained auth=true
+--- PASS: TestRegistryNativeIntentFaults (1.96s)
+    --- PASS: TestRegistryNativeIntentFaults/sqlite (0.80s)
+        --- PASS: TestRegistryNativeIntentFaults/sqlite/F01_native_rollback (0.26s)
+        --- PASS: TestRegistryNativeIntentFaults/sqlite/F02_native_commit_reply_lost (0.30s)
+        --- PASS: TestRegistryNativeIntentFaults/sqlite/F07_generic_rejection_timeout (0.24s)
+    --- PASS: TestRegistryNativeIntentFaults/postgres (0.79s)
+        --- PASS: TestRegistryNativeIntentFaults/postgres/F01_native_rollback (0.23s)
+        --- PASS: TestRegistryNativeIntentFaults/postgres/F02_native_commit_reply_lost (0.24s)
+        --- PASS: TestRegistryNativeIntentFaults/postgres/F07_generic_rejection_timeout (0.32s)
+    --- PASS: TestRegistryNativeIntentFaults/fdb (0.37s)
+        --- PASS: TestRegistryNativeIntentFaults/fdb/F01_native_rollback (0.10s)
+        --- PASS: TestRegistryNativeIntentFaults/fdb/F02_native_commit_reply_lost (0.11s)
+        --- PASS: TestRegistryNativeIntentFaults/fdb/F07_generic_rejection_timeout (0.15s)
+=== RUN   TestRegistryNativeOldAndNewNodeLinkStreams
+=== RUN   TestRegistryNativeOldAndNewNodeLinkStreams/sqlite
+2026/11/24 07:45:14 INFO node-link: node connected node=n1 labels=map[]
+2026/11/24 07:45:14 INFO node-link: node connected node=n1 labels=map[]
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: route report did not converge group=/g route_key=stream-fence sid=sb-stream-fence-g0
+    native_stream_fence_test.go:187: F05: two real h2c streams; repeated CmdID; stale ACK/report rejected; fresh directory, exact ownership and current report preserved
+=== RUN   TestRegistryNativeOldAndNewNodeLinkStreams/postgres
+2026/11/24 07:45:14 INFO node-link: node connected node=n1 labels=map[]
+2026/11/24 07:45:14 INFO node-link: node connected node=n1 labels=map[]
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:14 WARN registry: route report did not converge group=/g route_key=stream-fence sid=sb-stream-fence-g0
+    native_stream_fence_test.go:187: F05: two real h2c streams; repeated CmdID; stale ACK/report rejected; fresh directory, exact ownership and current report preserved
+=== RUN   TestRegistryNativeOldAndNewNodeLinkStreams/fdb
+2026/11/24 07:45:14 INFO node-link: node connected node=n1 labels=map[]
+2026/11/24 07:45:15 INFO node-link: node connected node=n1 labels=map[]
+2026/11/24 07:45:15 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:15 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:15 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:15 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:15 WARN registry: apply route report group=/g route_key=stream-fence err="record: original condition changed"
+2026/11/24 07:45:15 WARN registry: route report did not converge group=/g route_key=stream-fence sid=sb-stream-fence-g0
+    native_stream_fence_test.go:187: F05: two real h2c streams; repeated CmdID; stale ACK/report rejected; fresh directory, exact ownership and current report preserved
+--- PASS: TestRegistryNativeOldAndNewNodeLinkStreams (1.20s)
+    --- PASS: TestRegistryNativeOldAndNewNodeLinkStreams/sqlite (0.48s)
+    --- PASS: TestRegistryNativeOldAndNewNodeLinkStreams/postgres (0.39s)
+    --- PASS: TestRegistryNativeOldAndNewNodeLinkStreams/fdb (0.34s)
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers/sqlite
+    native_template_carrier_test.go:119: C12: 592-byte reference / 799-byte template survived selection, framed NodeLink command/report, native commit/readback, RouteLink response and actual mmap
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers/postgres
+    native_template_carrier_test.go:119: C12: 592-byte reference / 799-byte template survived selection, framed NodeLink command/report, native commit/readback, RouteLink response and actual mmap
+=== RUN   TestRegistryNativeMaximumRuntimeTemplateCarriers/fdb
+    native_template_carrier_test.go:119: C12: 592-byte reference / 799-byte template survived selection, framed NodeLink command/report, native commit/readback, RouteLink response and actual mmap
+--- PASS: TestRegistryNativeMaximumRuntimeTemplateCarriers (0.43s)
+    --- PASS: TestRegistryNativeMaximumRuntimeTemplateCarriers/sqlite (0.21s)
+    --- PASS: TestRegistryNativeMaximumRuntimeTemplateCarriers/postgres (0.14s)
+    --- PASS: TestRegistryNativeMaximumRuntimeTemplateCarriers/fdb (0.09s)
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/sqlite
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/sqlite/different_valid_Group_credential
+    native_waiter_auth_test.go:135: F12: both callers passed initial Group auth and joined one flight; final exact-object permission rejected the incompatible waiter
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/sqlite/incompatible_caller_Placement
+    native_waiter_auth_test.go:135: F12: both callers passed initial Group auth and joined one flight; final exact-object permission rejected the incompatible waiter
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/postgres
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/postgres/different_valid_Group_credential
+    native_waiter_auth_test.go:135: F12: both callers passed initial Group auth and joined one flight; final exact-object permission rejected the incompatible waiter
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/postgres/incompatible_caller_Placement
+    native_waiter_auth_test.go:135: F12: both callers passed initial Group auth and joined one flight; final exact-object permission rejected the incompatible waiter
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/fdb
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/fdb/different_valid_Group_credential
+    native_waiter_auth_test.go:135: F12: both callers passed initial Group auth and joined one flight; final exact-object permission rejected the incompatible waiter
+=== RUN   TestRegistryNativeSharedWaitersValidateFinalPermission/fdb/incompatible_caller_Placement
+    native_waiter_auth_test.go:135: F12: both callers passed initial Group auth and joined one flight; final exact-object permission rejected the incompatible waiter
+--- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission (0.82s)
+    --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/sqlite (0.32s)
+        --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/sqlite/different_valid_Group_credential (0.17s)
+        --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/sqlite/incompatible_caller_Placement (0.16s)
+    --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/postgres (0.34s)
+        --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/postgres/different_valid_Group_credential (0.18s)
+        --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/postgres/incompatible_caller_Placement (0.17s)
+    --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/fdb (0.16s)
+        --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/fdb/different_valid_Group_credential (0.08s)
+        --- PASS: TestRegistryNativeSharedWaitersValidateFinalPermission/fdb/incompatible_caller_Placement (0.08s)
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/registry	7.005s
+testing: warning: no tests to run
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/cmd/cluster-ctl	1.106s [no tests to run]
+testing: warning: no tests to run
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/test/e2e/cluster_stub	1.129s [no tests to run]

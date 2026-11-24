@@ -1,0 +1,137 @@
+{
+  "runs": {
+    "before": 3,
+    "after": 3
+  },
+  "scope": "Real Registry/Router/Placer plus one Node-stub process representing four logical Nodes; FDB7.3.77 is separate and excluded from process CPU/RSS; no VM execution",
+  "clock_ticks_per_second": 100,
+  "resource_notes": "RSS sums four product processes and may double-count shared pages. Sum of per-process peak RSS is an upper bound, not a simultaneous physical-memory peak. No allocation count or transaction-conflict counter was collected.",
+  "phases": {
+    "ensure_existing": {
+      "before": {
+        "p50_ms": 10.383,
+        "p95_ms": 15.810799,
+        "p99_ms": 19.128604,
+        "rps": 88.21780905988622,
+        "cpu_ms_per_operation": 10.77,
+        "rss_after_mib": 202.36328125,
+        "sum_process_peak_rss_mib": 203.71875
+      },
+      "after": {
+        "p50_ms": 11.1749,
+        "p95_ms": 15.3937,
+        "p99_ms": 18.6763,
+        "rps": 86.30173571640555,
+        "cpu_ms_per_operation": 9.99,
+        "rss_after_mib": 223.75,
+        "sum_process_peak_rss_mib": 225.26953125
+      },
+      "p50_change_percent": 7.626890108831752
+    },
+    "control_get": {
+      "before": {
+        "p50_ms": 0.9314,
+        "p95_ms": 1.315,
+        "p99_ms": 1.6207,
+        "rps": 937.4493625008703,
+        "cpu_ms_per_operation": 1.35,
+        "rss_after_mib": 201.9140625,
+        "sum_process_peak_rss_mib": 205.890625
+      },
+      "after": {
+        "p50_ms": 5.0806,
+        "p95_ms": 6.215501,
+        "p99_ms": 6.886101,
+        "rps": 187.65513589653017,
+        "cpu_ms_per_operation": 5.71,
+        "rss_after_mib": 225.73828125,
+        "sum_process_peak_rss_mib": 227.0390625
+      },
+      "p50_change_percent": 445.4799226970151
+    },
+    "data_cached": {
+      "before": {
+        "p50_ms": 1.1583,
+        "p95_ms": 1.4508,
+        "p99_ms": 1.7547,
+        "rps": 791.2729672027968,
+        "cpu_ms_per_operation": 1.77,
+        "rss_after_mib": 204.80078125,
+        "sum_process_peak_rss_mib": 208.19140625
+      },
+      "after": {
+        "p50_ms": 1.1791,
+        "p95_ms": 1.8708,
+        "p99_ms": 2.2927,
+        "rps": 745.3838254836008,
+        "cpu_ms_per_operation": 1.835,
+        "rss_after_mib": 227.55859375,
+        "sum_process_peak_rss_mib": 230.26953125
+      },
+      "p50_change_percent": 1.7957351290684542
+    },
+    "first_create_serial": {
+      "before": {
+        "p50_ms": 60.098498,
+        "p95_ms": 91.868197,
+        "p99_ms": 147.536992,
+        "rps": 14.968374324770268,
+        "cpu_ms_per_operation": 33.4,
+        "rss_after_mib": 209.078125,
+        "sum_process_peak_rss_mib": 210.921875
+      },
+      "after": {
+        "p50_ms": 61.244701,
+        "p95_ms": 80.7629,
+        "p99_ms": 96.258899,
+        "rps": 15.717519996505777,
+        "cpu_ms_per_operation": 31.2,
+        "rss_after_mib": 229.3671875,
+        "sum_process_peak_rss_mib": 231.43359375
+      },
+      "p50_change_percent": 1.9072073980950455
+    },
+    "first_create_concurrent": {
+      "before": {
+        "p50_ms": 94.258595,
+        "p95_ms": 152.017092,
+        "p99_ms": 164.710891,
+        "rps": 76.80444165124483,
+        "cpu_ms_per_operation": 30.0,
+        "rss_after_mib": 211.4296875,
+        "sum_process_peak_rss_mib": 215.4453125
+      },
+      "after": {
+        "p50_ms": 88.276001,
+        "p95_ms": 143.044596,
+        "p99_ms": 175.307503,
+        "rps": 78.90776113756675,
+        "cpu_ms_per_operation": 25.05,
+        "rss_after_mib": 231.5390625,
+        "sum_process_peak_rss_mib": 234.90625
+      },
+      "p50_change_percent": -6.347001034759758
+    },
+    "delete": {
+      "before": {
+        "p50_ms": 14.2805,
+        "p95_ms": 23.397599,
+        "p99_ms": 30.210899,
+        "rps": 511.458747348537,
+        "cpu_ms_per_operation": 6.675,
+        "rss_after_mib": 217.4921875,
+        "sum_process_peak_rss_mib": 223.984375
+      },
+      "after": {
+        "p50_ms": 16.5433,
+        "p95_ms": 26.3633,
+        "p99_ms": 30.378603,
+        "rps": 444.20867131439735,
+        "cpu_ms_per_operation": 7.725,
+        "rss_after_mib": 235.68359375,
+        "sum_process_peak_rss_mib": 239.33984375
+      },
+      "p50_change_percent": 15.845383565001224
+    }
+  }
+}

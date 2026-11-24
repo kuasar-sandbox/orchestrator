@@ -22,7 +22,8 @@ func testNodeKeyPair(apiSecret, manifestKey string, expiresUnix int64) clusterst
 
 func TestUpsertNodeKeyPairRejectsFingerprintRebinding(t *testing.T) {
 	ctx := context.Background()
-	stores := newTestStores()
+	stores := newTestStores(t)
+	seedTestNode(t, stores, "n1")
 	original := testNodeKeyPair(
 		"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
 		"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
@@ -48,7 +49,8 @@ func TestUpsertNodeKeyPairRejectsFingerprintRebinding(t *testing.T) {
 func TestConcurrentUpsertNodeKeyPairCannotRebindFingerprint(t *testing.T) {
 	ctx := context.Background()
 	for iteration := 0; iteration < 25; iteration++ {
-		stores := newTestStores()
+		stores := newTestStores(t)
+		seedTestNode(t, stores, "n1")
 		left := testNodeKeyPair(
 			"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
 			strings.Repeat("2", 64), 123,
@@ -80,34 +82,6 @@ func TestConcurrentUpsertNodeKeyPairCannotRebindFingerprint(t *testing.T) {
 		if err != nil || !found || !sameNodeKeyPairMaterial(got, winner) {
 			t.Fatalf("iteration %d stored pair=%+v found=%v err=%v; winner=%+v", iteration, got, found, err, winner)
 		}
-	}
-}
-
-func TestSelectorPatchRejectsHalfPairWithoutProjection(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1"}); err != nil {
-		t.Fatal(err)
-	}
-	lease, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{
-		SourceID: "source", OwnerID: "placer", RunID: "run", TTLMillis: 1000,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pair := testNodeKeyPair(testAPISecret, testMK, 0)
-	patch := selectorPatchForTest("/g", []string{"n1"}, pair)
-	patch.ManifestKeyFingerprint = ""
-	patch.ImportSourceID = lease.Lease.SourceID
-	patch.ImportOwnerID = lease.Lease.OwnerID
-	patch.ImportRunID = lease.Lease.RunID
-	patch.ImportTerm = lease.Lease.Term
-	if err := reg.applySelectorPatch(ctx, patch); err == nil {
-		t.Fatal("half key pair was accepted")
-	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found || len(node.KeyPairs) != 0 {
-		t.Fatalf("half pair changed projection: found=%v err=%v node=%+v", found, err, node)
 	}
 }
 

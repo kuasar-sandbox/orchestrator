@@ -134,11 +134,11 @@ func TestRegistryMemberRuntimeWaitReadyRejectsMissingOwner(t *testing.T) {
 
 func newRegistryReloadTestRuntime(t *testing.T, cfg *clustercfg.RegistryConfig) (*registryRuntimeConfig, *registry.Registry) {
 	t.Helper()
-	stores, owners, remoteNodeOwners, err := newRegistryStores(cfg, metadatastore.New().Repositories())
+	stores, owners, remoteNodeOwners, err := newRegistryStores(cfg, metadatastore.New(t).Repositories())
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := registry.New(stores, cfg.RouteLink.ParkDur(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg.SetRemoteNodeOwners(remoteNodeOwners)
 	return newRegistryRuntimeConfig(cfg, owners), reg
 }

@@ -33,8 +33,10 @@ func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKe
 	return apiKey, manifestKey, fingerprint
 }
 
-func clusterBuildRegisterCommand(buildID, fingerprint string) *routesync.Command {
+func clusterBuildRegisterCommand(t *testing.T, o *Orchestrator, buildID, fingerprint string) *routesync.Command {
+	key, revision := clusterGroupFixture(t, o, fingerprint, "/test")
 	return &routesync.Command{
+		GroupAPIKey: key, ExpectedGroupVersion: revision,
 		CmdID:                "register-" + buildID,
 		Kind:                 routesync.CmdBuildRegister,
 		BuildID:              buildID,
@@ -42,8 +44,6 @@ func clusterBuildRegisterCommand(buildID, fingerprint string) *routesync.Command
 		Profile:              string(types.ProfileE2B),
 		APISecretFingerprint: fingerprint,
 		BuildResources:       routesync.BuildResourcesFromTypes(testBuildResources()),
-		ImageRepo:            "registry.test/repo",
-		RegistryAuth:         `{"auths":{"registry.test":{"auth":"opaque"}}}`,
 		Config: map[string]string{
 			clusterstate.ObjectMetadataKey: `{"group":"/test"}`,
 		},
@@ -94,7 +94,7 @@ func TestRegisterBuildHasNoSystemdQuotaEncodingGate(t *testing.T) {
 	t.Run("cluster", func(t *testing.T) {
 		o := testOrch(t)
 		_, _, fingerprint := allowlistedBuildIdentity(t, o)
-		cmd := clusterBuildRegisterCommand("build-systemd-overflow", fingerprint)
+		cmd := clusterBuildRegisterCommand(t, o, "build-systemd-overflow", fingerprint)
 		cmd.BuildResources.CPU = math.MaxInt64
 		err := o.registerClusterBuild(ctx, cmd)
 		if err != nil {
@@ -111,7 +111,7 @@ func TestClusterBuildRegisterRejectsInvalidBuildID(t *testing.T) {
 	o := testOrch(t)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	for _, buildID := range []string{strings.Repeat("x", 49), "build/id"} {
-		cmd := clusterBuildRegisterCommand(buildID, fingerprint)
+		cmd := clusterBuildRegisterCommand(t, o, buildID, fingerprint)
 		if err := o.registerClusterBuild(context.Background(), cmd); !errors.Is(err, api.ErrBadRequest) {
 			t.Fatalf("registerClusterBuild(%q) error = %v, want ErrBadRequest", buildID, err)
 		}
@@ -184,7 +184,7 @@ func TestBuildRegisterRejectsE2BLaunchOverrideBeforePersistence(t *testing.T) {
 	t.Run("cluster", func(t *testing.T) {
 		o := testOrch(t)
 		_, _, fingerprint := allowlistedBuildIdentity(t, o)
-		cmd := clusterBuildRegisterCommand("build-e2b-launch", fingerprint)
+		cmd := clusterBuildRegisterCommand(t, o, "build-e2b-launch", fingerprint)
 		cmd.Config[sandboxcfg.NsLaunch] = "{\"exec\":\"/tenant\"}"
 		err := o.registerClusterBuild(ctx, cmd)
 		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "e2b launch only permits systemd") {
@@ -352,12 +352,12 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	if err := o.registerClusterBuild(ctx, missing); err == nil {
 		t.Fatal("build_register without profile was accepted")
 	}
+	key, revision := clusterGroupFixture(t, o, fingerprint, "/test")
 	cmd := &routesync.Command{
+		GroupAPIKey: key, ExpectedGroupVersion: revision,
 		BuildID: "bare-cluster-build", TemplateRef: "transient-bare",
 		Profile: string(types.ProfileBare), APISecretFingerprint: fingerprint,
 		BuildResources: routesync.BuildResourcesFromTypes(testBuildResources()),
-		ImageRepo:      "registry.test/repo",
-		RegistryAuth:   `{"auths":{"registry.test":{"auth":"opaque"}}}`,
 		Config: map[string]string{
 			// Resource projection requires an explicit Sandbox for bare builds.
 			buildcfg.NsBuilder:             `{"target":{"kind":"sandbox","memory":false}}`,
@@ -371,8 +371,8 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	missingCredential.APISecretFingerprint = strings.Repeat("f", 64)
 	if err := o.registerClusterBuild(ctx, &missingCredential); err == nil {
 		t.Fatal("build_register accepted a missing credential pair")
-	} else if status, _ := clusterCommandRejection(err); status != http.StatusBadRequest {
-		t.Fatalf("missing credential rejection status = %d, want 400", status)
+	} else if status, _ := clusterCommandRejection(err); status != http.StatusForbidden {
+		t.Fatalf("missing credential rejection status = %d, want 403", status)
 	}
 	if stored, err := o.st.GetBuild(ctx, missingCredential.BuildID); err != nil || stored != nil {
 		t.Fatalf("missing credential rejection stored build = %+v, err=%v", stored, err)
@@ -393,13 +393,13 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	if _, leaked := stored.Metadata[clusterstate.ObjectMetadataKey]; leaked {
 		t.Fatalf("cluster ownership leaked into portable template metadata: %+v", stored.Metadata)
 	}
-	if stored.RegistryAuth != "" || stored.RegistrationRegistryAuth != cmd.RegistryAuth || stored.RegistrationImageRepo != cmd.ImageRepo {
+	if stored.RegistryAuth != "" || stored.RegistrationRegistryAuth != testGroupRegistryAuth || stored.RegistrationImageRepo != "registry.test/repo" {
 		t.Fatalf("cluster registry auth was not encrypted/restored with the durable Build")
 	}
 	o.clusterBuildMu.Lock()
 	delete(o.clusterBuilds, cmd.BuildID) // simulate controller restart
 	o.clusterBuildMu.Unlock()
-	if auth, cluster := o.clusterBuildCreds(stored); !cluster || auth != cmd.RegistryAuth {
+	if auth, cluster := o.clusterBuildCreds(stored); !cluster || auth != testGroupRegistryAuth {
 		t.Fatalf("durable cluster credentials after restart = cluster %v auth %q", cluster, auth)
 	}
 	// A lost ACK may be retried after operator policy has tightened below this
@@ -433,6 +433,7 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	}
 
 	invalid := &routesync.Command{
+		GroupAPIKey: key, ExpectedGroupVersion: revision,
 		BuildID: "invalid-cluster-resource", TemplateRef: "transient-invalid",
 		Profile: string(types.ProfileBare), APISecretFingerprint: fingerprint,
 		BuildResources: routesync.BuildResourcesFromTypes(testBuildResources()),
@@ -483,7 +484,7 @@ func TestClusterBuildRegisterPersistsConfidentialInstanceConfig(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterBuildRegisterCommand("cluster-instance-config", fingerprint)
+	cmd := clusterBuildRegisterCommand(t, o, "cluster-instance-config", fingerprint)
 	cmd.Config[buildcfg.NsBuilder] = `{"target":{"kind":"sandbox","memory":true}}`
 	cmd.Config[sandboxcfg.NsNetwork] = `{"hostname":"cluster-build"}`
 	cmd.BuildEnv = map[string]string{"BUILD_NAME": "cluster-build"}
@@ -556,7 +557,7 @@ func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
 	buildEvents, cancelBuildEvents := o.SubscribeBuilds()
 	defer cancelBuildEvents()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	cmd := clusterBuildRegisterCommand("durable-credential-replay", fingerprint)
+	cmd := clusterBuildRegisterCommand(t, o, "durable-credential-replay", fingerprint)
 	cmd.Config[buildcfg.NsBuilder] = `{"referer":{"enabled":true}}`
 	cmd.Config[sandboxcfg.NsResource] = `{"allocatable":{"memory":"1GiB"}}`
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
@@ -619,7 +620,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 			buildEvents, cancelBuildEvents := o.SubscribeBuilds()
 			defer cancelBuildEvents()
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
-			cmd := clusterBuildRegisterCommand("terminal-replay-"+tc.name, fingerprint)
+			cmd := clusterBuildRegisterCommand(t, o, "terminal-replay-"+tc.name, fingerprint)
 			cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","data":"registered"}]}`
 			if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 				t.Fatalf("initial BuildRegister ack = %+v", ack)

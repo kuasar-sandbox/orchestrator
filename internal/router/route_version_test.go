@@ -74,7 +74,7 @@ func TestRouteLinkRejectsUnversionedSuccessfulResponse(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		route := `{"group":"/g","route_key":"rk","sandbox_id":"stable","node_sandbox_id":"stable-g1"}`
 		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/route-link/reserve" {
+		if r.URL.Path == "/route-link/v2/reserve" {
 			_, _ = w.Write([]byte(`{"route":` + route + `}`))
 			return
 		}

@@ -25,7 +25,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 9
+	schema uint32 = 10
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1

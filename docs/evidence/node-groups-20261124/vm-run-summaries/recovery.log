@@ -1,0 +1,4 @@
+==> PASS: registry-2 accepted a new node-link after owner restart
+==> PASS: post-restart redirected topology placed a real sandbox and routed envd health (204)
+==> PASS: redirected topology delete reached node-local finalization
+PASS orchestrator.cluster-recovery.sh

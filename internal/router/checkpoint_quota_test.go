@@ -89,7 +89,7 @@ func TestCreateCheckpointQuotaReachesReservation(t *testing.T) {
 					if r.URL.Path == registry.RouteLinkVerifyKeyPath {
 						return textResponse(http.StatusOK, ""), nil
 					}
-					if r.URL.Path != "/route-link/reserve" {
+					if r.URL.Path != "/route-link/v2/reserve" {
 						t.Fatalf("unexpected request %s", r.URL.Path)
 					}
 					calls++

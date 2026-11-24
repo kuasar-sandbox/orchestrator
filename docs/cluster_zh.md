@@ -10,9 +10,9 @@
 
 - `registry`:有状态可靠集群,维护 node / route / placer import 等执行态。
 - `router`:e2b 兼容统一入口,按 sandbox-group 定位 route owner,热路径直转 node。
-- `placer`:group provider/importer 与放置调度器,消费 `node_list`,向 registry 提供 Place / verify-key。
+- `placer`: 从 `node_list` 选择静态导入目标，维护完整 Group 记录和有条件 Node 更新。
 
-Registry 通过类型化 repository 访问 FoundationDB 7.3.77 持久执行元数据。事务、复制与存储恢复由 FoundationDB 负责；Registry 保留生命周期规则、node 连接归属与命令下发。Router 和 Placer 继续使用业务协议，不引入数据库 client。
+Registry 通过类型化 repository 访问 SQLite、PostgreSQL 或 FoundationDB 7.3.77 持久执行元数据。SQLite 仅支持单 Registry，共享部署使用 PostgreSQL 或 FoundationDB。事务与存储恢复由所选数据库负责；Registry 保留生命周期规则、node 连接归属与命令下发。Router 和 Placer 继续使用业务协议，不引入数据库 client。
 
 **阅读路径：** [公共入口](#client-access) · [Group 与放置](#groups-and-placement) · [角色配置](#configuration) · [状态所有权](#membership-and-state) · [Link 协议](#protocols) · [故障与恢复](#failure-and-recovery)
 
@@ -30,19 +30,19 @@ flowchart TD
   router -->|"Reserve / Resolve"| registry["Registry services"]
   router -->|"Known target data"| node["Node Conductor and Proxy"]
   registry <-->|"node_link commands and state"| node
-  registry <-->|"placer_link / Place"| placer["Placer and Group provider"]
+  placer["Placer and Group source"] -->|"Conditional Group imports"| registry
   registry -->|"node_list WATCH_LIST"| placer
-  registry -->|"Typed metadata transactions"| fdb["FoundationDB"]
+  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
 ```
 
 稳态数据面不经过 registry.只有显式 create/connect/exec-session,以及数据面 target 缺失或
 typed stale fallback 路径需要 registry:
 
-- `POST /route-link/reserve` 以 `operation=create|connect|exec-session|data` 区分四种操作.create 直接
+- `POST /route-link/v2/reserve` 以 `operation=create|connect|exec-session|data` 区分四种操作.create 直接
   Reserve;connect/exec-session 由 registry 经 node-link 完成;data 只在 route 缺少完整 node target 或
   node proxy 返回 typed stale 时 Reserve。未知 route 不会隐式创建 sandbox。显式 build register 调用
   `ReserveBuild`。
-- registry 调 placer `PlaceSandbox` / `PlaceBuild`。
+- Registry 校验请求凭据，并通过有界 GroupSupport 查询选择 Node。
 - registry 经 node owner 下发 create/connect/exec_session/delete/build/key 命令.
 - node 经 node_link 上报 sandbox/build 状态和低频节点目录。
 
@@ -52,15 +52,14 @@ typed stale fallback 路径需要 registry:
 
 1. **group 是业务分片键**:所有 cluster 北向请求必须携带 `X-Kuasar-Sandbox-Group` 或等价 group
    身份。当前不支持无 group 的 cluster 数据面入口。
-2. **持久元数据由 FoundationDB 保存**：Registry 进程故障不会擦除元数据。数据库可用性由独立的 FoundationDB 冗余和故障域决定，不取决于 Registry owner 数。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
+2. **持久元数据由所选数据库保存**：Registry 进程故障不会擦除元数据。数据库可用性由其配置的冗余和故障域决定，不取决于 Registry owner 数。SQLite 只支持单 Registry；共享 PostgreSQL/FDB 可使用多个成员。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
 3. **操作保持类型化范围**：Route/Build 使用 group 与记录身份，node 操作使用 NodeID，低频目录按 bucket 有界分页。不能把无关局部列表拼成权威事实。
 4. **原子性对应业务不变量**：耦合的 intent/ownership、生命周期 fence 与投影通过类型化事务提交，Registry 成员不维护彼此的元数据副本。
 5. **成员健康不参与分片计算**:成员表来自版本化配置;`LocateN` 输入只使用 membership members。
    memberlist 只做健康检测和 meta 传播。
 6. **node 是运行态真相之源**:sandbox/build 是否仍存在以 node 上报为准。整机重启会丢失运行进程；保留的 durable row 仍须按实际 unit、checkpoint 与 cleanup ownership
    reconcile。conductor 进程重启可接管仍存活的 unit，不能把两者写成无条件清空持久行或自动重建全部旧 sandbox；见 [状态所有权与灾备边界](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry 可靠性](#registry-reliability)。
-7. **placer 不拥有生命周期**:placer 只做 group 导入、selector patch、shuffle-sharding、P2C 与 Place
-   建议。node owner 检查当前连接与 usage；Build 注册最终准入由 node 的 durable transaction 决定。
+7. **placer 不拥有生命周期**：Placer 维护静态目标上的 Group，Registry 从已发布支持选址，Node 准入复制业务输入并执行现有生命周期。
 8. **router 不订阅海量 group**:create Reserve 返回 READY 或失败;data Reserve 也可返回 PAUSING;connect/exec-session
    Reserve 在 node 同步准备完成后返回,不等待异步 resume.router 只维护有界 route cache;
    在途请求不作为新请求的路由来源.
@@ -73,7 +72,7 @@ typed stale fallback 路径需要 registry:
 |---|---|
 | registry member | 承载业务协议、实际 node 连接与 membership，通过类型化 repository 访问持久元数据 |
 | router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,按 create/connect/exec-session/data 调用 Reserve;热路径使用本地 route cache |
-| placer | 消费 `node_list` WATCH_LIST;通过 provider/importer 导入 group;维护 placement 与 selector patch;提供 Place / verify-key |
+| placer | 消费 `node_list`，导入完整 Group 定义，执行条件维护和显式 apply |
 | node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/exec_session/delete/build/key 命令 |
 
 <a id="client-access"></a>
@@ -100,7 +99,7 @@ Reserve operation;数据面 cache miss 先 Resolve.RouteResolve 同时返回 `AP
 开始。这里是单 group 验收，不是 HA 参考配置。
 
 1. 注册具有匹配 runtime/kernel、工件访问和目标 selector label 的合格节点，确认
-   node-link full sync 及该 group 的 ready placer。复用 provider JSON，把示意
+   node-link full sync 及该 Group 的完整 GroupSupport 发布。复用 provider JSON，把示意
    `tmpl-1` 换成精确 ready Build 发布的真实 canonical `e2b-img/sbx/snp-...` ID。
    按受保护 provider 契约配置 ManifestKey/APISecret，只给客户端该 APISecret
    签发的 API key。
@@ -212,7 +211,7 @@ Create 的 `checkpoint.max_checkpoints` 仅能放在 `X-Kuasar-Sandbox-Checkpoin
 内部 Reserve typed 字段，转发的 checkpoint config 只保留 `merge_ref`/`drop_caches`。
 已接纳配额在 Reserve 重试和 replacement 间保持不变（[Checkpoint policy 输入](sandbox-lifecycle_zh.md#request-checkpoint)）。
 
-Router 按 [Registry Reserve 协议](#reserve) 为共同的 `POST /route-link/reserve` 端点组装请求，传递对应操作的已认证上下文并保留期望的稳定身份。Create 在准入前严格归一化；Connect 保留可选 memory 选择及其缺省状态；exec-session 先严格解析公共 TTL/conditions 再转换为 Registry typed request；Data 使用既有 access-token/service/port 上下文。
+Router 按 [Registry Reserve 协议](#reserve) 为共同的 `POST /route-link/v2/reserve` 端点组装请求，传递对应操作的已认证上下文并保留期望的稳定身份。Create 在准入前严格归一化；Connect 保留可选 memory 选择及其缺省状态；exec-session 先严格解析公共 TTL/conditions 再转换为 Registry typed request；Data 使用既有 access-token/service/port 上下文。
 
 精确 query/Header/body schema 由 Registry 规范唯一维护，并在其边界重复校验。Conditions 不借无关 metadata、query 参数或配置 Header 传递；本篇只定义转换边界，不再维护一份可能失步的 schema 表。
 
@@ -223,11 +222,7 @@ connect/exec-session/data 中的 `sid` 均是客户期望的稳定 SandboxID,用
 
 ### 控制面
 
-API key 鉴权不可关闭.create/connect/exec-session 把客户端原始 API key 交给 Reserve,
-由 Registry 在任何生命周期副作用前完成验证:create 的 group admission 经 ready placer 使用
-provider APISecret,connect/exec-session 使用 Sandbox 业务记录已绑定的 APISecret.其它控制操作
-由 router 调 route owner `verify-key`,route owner failover 到 ready placer 验证.ManifestKey
-只用于内容路径,不参与 API 鉴权.
+API key 鉴权不可关闭。每次控制请求将原始 key 交给 Registry，在生命周期副作用前校验完整 MAC。新准入使用已发布 Group 支持；已有对象使用保留的凭据绑定。控制操作和 Build 后续请求都按具体对象重新鉴权。新建/导入命令将 key 和 expected Group version 交给 Node 准入，key 不进入持久记录、ACK 或日志。ManifestKey 只用于内容路径。
 
 | 操作 | 行为 |
 |---|---|
@@ -418,7 +413,7 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 
 | 名称 | 持有者 | 用途 |
 |---|---|---|
-| `APISecret` | provider/placer/node/registry/router/proxy | 签发并验证 API key及后续用途明确的认证材料;完整 SHA-256 指纹标识凭据对 |
+| `APISecret` | provider/placer/node/registry | 签发并验证 API key及后续用途明确的认证材料;完整 SHA-256 指纹标识凭据对 |
 | `ManifestKey` | provider/placer/node | 解密 manifest/镜像/快照内容,封装 pull token;router 不接触 |
 
 两者都是 32B / 64-lowercase-hex。APISecret 缺省时,placer 在物化 inline ManifestKey 时使用固定 KDF:
@@ -431,27 +426,7 @@ API key 只由 APISecret 签发/验证。API key 内 `SHA256(APISecret)[:12]` �
 node-link、生命周期命令和业务记录使用完整 64-hex `SHA256(APISecret)`。ManifestKey 也携带
 自己的完整 64-hex SHA-256 指纹,用于校验成对交付的内容键。
 
-APISecret 和 ManifestKey 都是 typed secret,支持 inline 或 ref 带外交付。selector patch 要么携带
-完整 pair(两项 typed carrier + 两项完整指纹),要么完全不携带凭据字段;半对必须拒绝。凭据分发只发生在
-shuffle-sharding/import/selector patch 路径:
-
-```text
-placer selector patch
-  │ target node set + APISecret/ManifestKey material/ref
-  ▼
-registry/node owner
-  │ CAS node_link key_pair cache (record key = APISecretFingerprint)
-  ▼
-node_link heartbeat refresh
-  │ key_put complete pair only when missing or near lease expiry
-  ▼
-node encrypted local key store
-```
-
-`key_put` 在 node 侧原子校验并安装完整 pair;同一 APISecret 完整指纹不得绑定不同 pair material。
-`key_drop` 以完整 APISecret 指纹定位 pair,但不是正确性依赖。节点侧租约按 TTL 淘汰未续租条目。
-凭据分发是 create/build 前置条件;drop、TTL 或 provider 更新都不修改已复制进现有 sandbox/build
-业务记录的凭据对。
+导入来源可使用 inline/ref typed secret。可信 Group 维护命令解析完整凭据对，并在同一 Node 事务中安装 pair 和执行 Group CAS；公开 Group body 不携带 root。Pair 到期或轮换不会改写已有对象绑定的凭据。管理操作按具体对象保留的 root 鉴权，不改用最新 Group 默认值。
 
 ServiceSecret 不是第三个 group root,而是每个 node Sandbox 业务记录的独立 service credential。缺省值由
 该 Sandbox 已绑定的 APISecret 和 `StableID()` 以固定 domain 派生;也可由本次 create 的
@@ -467,297 +442,77 @@ string array `conditions`。ServiceSecret 解码为 32-byte key 后
 ExecAccessToken;每个 exec-session API 调用独立签发,服务端不建 session row,revoke
 或 single-use/replay 状态.
 
-Registry 从 node route event 物化受保护 route 时,只采纳 APISecret、两项 root fingerprint、
-StableID、ServiceSecret 和 Envd/Traffic/Forward tokens;不采纳 ManifestKey 原文或既有
-node-link wire 中供节点 proxy/MMDS 使用的 MmdsSecret。Registry 本阶段以明文结构化字段保存
-这些受保护 route 凭据,不增加额外加密层;它们只可由受保护 Reserve/Resolve 返回给可信 router,
-不得进入普通 route watch/list、公开 create/get/list 响应、日志或观测接口。创建请求中的
-`kuasar-sandbox.credentials` 在 Reserve 入口从普通 config 分离,仅随 RESERVED 记录冻结并在 CmdCreate 前临时
-编码,READY 后清除。
+Registry 从权威 Node 事实保留受保护的对象凭据，不采纳 ManifestKey 原文或 proxy/MMDS 专用 MmdsSecret。RouteLink v2 分为控制投影（API endpoint 和公开结果 token）与数据投影（data endpoint 和 service 鉴权材料）；两者均不含 APISecret、ManifestKey 或 root 指纹。只有数据投影进入 Router 数据缓存。Create 凭据覆盖从 metadata 分离，随 RESERVED 冻结，READY 后清除。Root 不得出现在公开响应、普通列表、日志和观测接口。
 
 <a id="groups-and-placement"></a>
 
 ## Group、provider 与放置
 
-`cluster-ctl placer` 是独立放置调度器。它不持 node 连接,不拥有 sandbox 生命周期,也不实现 registry
-状态复制。它通过 `SandboxGroupProvider` / `SandboxGroupImporter` 获取 group 配置与密钥材料,消费
-registry 的 `node_list` WATCH_LIST,并向 registry 提供 `PlaceSandbox` / `PlaceBuild` / `verify-key`。
+Node 是 Group 定义及新 Sandbox/Build 输入上下文的权威。Registry 从 Node 已发布的 Group 支持中选择节点。Placer 负责导入定义和维护有条件的 Node 更新；Create、Build 和 API-key 鉴权不再调用 Placer。
+
+### Node Group 权威
+
+Node HTTP/UDS API 与可信 NodeLink 命令调用同一业务实现。公开接口使用 `X-API-KEY`，完整 MAC 校验通过后才能读取私有上下文或查看版本；短指纹只作候选预筛。当前凭据对授权创建 Group，保留的 owner root 继续授权管理已有 Group 和对象。
+
+| 操作 | Node API |
+|---|---|
+| 分页列举可见名称和版本 | `GET /groups?limit=128&cursor=...` |
+| 读取私有上下文 | `GET /groups?group=...` |
+| 创建/更新 | `PUT /groups?group=...`，body 为 `{"expected_version":0,"context":{...}}` |
+| 删除 | `DELETE /groups?group=...&expected_version=...` |
+
+Group 名称放在 query 中，名称中的 `/` 不参与 URL 路径解析。更新必须携带观察到的版本；零版本只创建从未存在的 Group。删除保留 tombstone，重建必须显式使用其已知版本。列表最多 128 条；body 和 NodeLink envelope 上限为 1 MiB，context 预算为 envelope 预留空间。未知/重复字段、非法模板、接口未定义的凭据或 placement 字段均被拒绝。
+
+Context 可含 `templateID`、`sandbox_config`、`image_repo`、`registry_auth`、`target_port`、`project_id` 和 metadata。仓库私有凭据保留在 Node；Registry 只接收鉴权和选择所需的 Group 版本、完整 API 指纹及可选默认模板。Group 快照/增量有界、有序，并绑定原 Node 注册代次。快照未完成时不能参与选择；缓冲溢出或序列错误通过重连和完整快照恢复。
+
+本地业务文件仅通过显式命令导入：
+
+```sh
+node-ctl group apply --socket /run/sandbox/node-ctl.socket -f /etc/sandbox/groups
+```
+
+命令从 `E2B_API_KEY` 读取凭据，经同一 UDS `/groups` 接口提交单文件或目录中按名称排序的普通 `.json` 文件。文件包含 `group`、`context` 对象和可选 `expected_version`。未给版本时只 GET 一次，再 CAS 一次；删除后的 Group 使用授权返回的 tombstone 版本。冲突直接报告，不重新读版本抢回更新。目录逐项提交，失败指出对应文件且不回滚成功项；不隐式安装根密钥，不 watch，也不按缺项 prune。
+
+### Registry 选择和请求输入
+
+Create 可传规范的显式 `templateID`，省略/null 则使用目标 Group 默认模板。Node 优先校验已有对象及其完整绑定；新对象在初始准入检查 Group 版本并复制输入。复制后，即使 Group 被更新或删除，该次调用仍继续使用已复制输入。默认模板 Create 合并 Node 持有的默认配置和请求覆盖；显式模板只使用请求配置。Build 使用 Node 复制的仓库及鉴权上下文，Registry 不额外维护一份默认配置来源。
+
+可选 `X-Kuasar-Sandbox-Placement` JSON header 与 `kuasar-sandbox.placement` metadata 使用同一 schema：`{"node_selectors":[{"pool":"gpu"}]}`。对象之间为 OR，对象内条件为 AND。两个来源都要校验；header 存在时整体替代 metadata 约束，包括空对象 `{}`。约束不会持久化进 Sandbox metadata。预算为 8 KiB、32 个分支、每分支 32 项、总计 256 项，并限制键和值的长度。
+
+Registry 有界扫描已正式发布的 Group 支持，校验完整 API-key MAC，再过滤 Node 存活、draining/zone、请求 selector、runtime 兼容性和 Build 准入容量。对不同候选采样后按负载选择；intent 事务再次检查选定 publication、原注册代次和相关 Node 条件。`placement.candidates`、`placement.zone_admit_max` 属于 Registry 配置。
+
+有效的历史无注解 SNP 继续可用。带注解的 SNP 额外要求同一 Node 的 runtime label 同时匹配 bundle basename 和声明 digest。非法注解直接失败，不剥离注解或回退。调度不读取 artifact，也不猜测宿主默认 runtime。对于 opaque migration token，由目标 Node 解密并校验实际恢复模板；Registry 不用 Group 默认值或历史 initial template 推断其 runtime 要求。
+
+### 受理、恢复与交付顺序
+
+Intent 绑定稳定逻辑 ID 和明确的 Node 本地 generation。超时、丢失 ACK、普通 400/409/429、NotFound、报告中缺失，都不能证明未执行；清理责任保留到权威对象事实或现有回收规则解决。迟到失败不能倒退新事实。只有 Node 初始准入、复制输入和 core 副作用之前产生的结构化 `GroupVersionConflict`，才可通过原注册及精确 intent 的原子检查撤销这次新投递。冲突返回调用方，Registry 不隐式重试隐藏它。不增加持久执行日志，也不承诺 exactly-once。
+
+先发布并交付实际可用的 reader SDK、工具及二进制，再允许 producer 输出带注解的引用。RouteLink v2 分离控制和数据投影，不把不兼容的旧 peer 当成兼容客户端。部署时应先完成消费端和协议升级，再启用新 writer。
+
+### Placer 导入与显式 apply
+
+Placer 使用有界 `Range` 加完整 `Read` 的 source 接口。一次维护操作只读取一次完整记录，并从同一值派生 context、凭据对和静态目标。文件和嵌入式来源复用同一适配器。静态 selector 和可选 shuffle sharding 决定所有维护目标，包括 draining、热点和当前缺少 runtime 的 Node；导入不使用 P2C。空交集不能扩大成全选。
+
+Ready importer 经 Registry 竞争有界、带 fence 的 source lease。页内所有项成功才以原 owner/run/term 推进 cursor；Registry 在转发命令前再次校验 lease。可信命令可在同一 Node SQLite 事务安装完整 key pair 并更新 Group；这条导入路径不向 Registry 写入独立的 desired-key 缓存。
+
+后台导入可创建缺失的 Group 或续租未变化的上下文；定义不同则报告冲突，不静默覆盖手工修改或复活 tombstone。`cluster-ctl placer apply --config ...` 复用同一来源和适配器执行一次显式遍历：读取各目标版本，只做一次有条件更新，按目标输出冲突和部分成功结果，不输出私有上下文或密钥。
+
+响应丢失后保留原定义、expected version 和绝对 key 到期时间。后续读到相同 context 只能证明 context 当前状态，不能证明 key 续租成功；只有对应的正向 Node ACK 才确认续租。未知写使用原条件重试；版本已变化则报告冲突，不自动重选版本。内存缓存有上限，可淘汰已确认的优化项，不能为新写丢弃未决写。来源移除或目标集合缩小不会隐式删除 Group；删除需要显式 Node 操作。
 
 <a id="placement-responsibilities"></a>
-
-### 概述
-
 <a id="placer-responsibilities"></a>
-
-#### 职责
-
-```text
-SandboxGroupProvider / Importer
-          │
-          ▼
-      placer
-          │  selector patch / Place / verify-key
-          ▼
-      registry
-          │ node owner commands
-          ▼
-        node
-```
-
-placer 负责:
-
-- group provider/importer 接入。
-- `node_list` WATCH_LIST 消费。
-- selector patch 与 APISecret/ManifestKey pair cache refresh。
-- shuffle-sharding、静态 selector、runtime match、P2C。
-- `PlaceSandbox` / `PlaceBuild` 建议。
-- API key verify 的 provider 侧校验。
-
-placer 不负责:
-
-- 连接 node。
-- 下发 `key_put` / create / delete / build 命令。
-- 维护 route/build 执行态。
-- 保存 registry 的 group/route 记录。
-
 <a id="placer-principles"></a>
-
-#### 原则
-
-1. **registry 不实现 group provider**:Provider/Importer 属于 placer 或外部平台。
-2. **WATCH_LIST 仅给 placer**:router 不消费 node_list。
-3. **高频负载不走 WATCH_LIST**:WATCH_LIST 只承载低频目录字段;最终资源确认由 node owner admission 完成。
-4. **source_id 是 import 执行单元**:多个 placer 配置相同 `source_id` 时,竞争同一条 source lease。
-5. **shuffle 只影响新建**:不迁移正在运行的 sandbox。
-6. **凭据对分发只影响 create/build 前置条件**:drop、租约过期或 provider 更新不修改已经复制到
-   现有 sandbox/build 记录的凭据对。
-
 <a id="placer-provider--importer"></a>
-
-### Provider / Importer
-
-placer 使用统一接口:
-
-```text
-SandboxGroupProvider:
-  Get(group)
-  GetPlacementHint(group)
-  GetKey(group)       # typed manifest_key
-  GetAPISecret(group) # typed APISecret
-
-SandboxGroupImporter:
-  Range(cursor, limit)
-```
-
-内置 file source 只用于本地开发和 e2e:
-
-```yaml
-import_groups:
-  - source_id: example-file-source
-    source_type: file
-    path: /path/to/dir
-```
-
-该 source 枚举目录下的 `*.json` 文件。每个文件是一个 `SandboxGroupRecord` JSON。文件数量预期较小,
-`Get/GetPlacementHint/GetKey/GetAPISecret` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
-
-示例:
-
-```json
-{
-  "group": "/cell/project/app/group",
-  "template_ref": "tmpl-1",
-  "target_port": 49983,
-  "api_secret": {"type": "inline", "value": "<64-lowercase-hex>"},
-  "manifest_key": {"type": "inline", "value": "<64-lowercase-hex>"},
-  "node_selectors": [{"pool": "default"}]
-}
-```
-
-显式 `api_secret` 优先。inline `manifest_key` 缺省 `api_secret` 时,placer 按
-`HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")` 派生默认值;
-ref ManifestKey 无法在 placer 本地物化,必须显式提供 APISecret。两项 root 及 ref 的完整指纹
-都必须是 64-lowercase-hex。
-
-`target_port` 是数据面强制端口,随 Place 结果返回给 route_link/router。它不参与节点筛选;
-节点筛选仍只由 `node_selectors` 与 shuffle-sharding 配置决定。
-
-多个 source 的语义需要区分:
-
-- Provider 点查可以按 source 顺序查找 group,若同一个 group 被多个 source 定义则报错。
-- Importer Range 按 `source_id` 独立执行,不把多个 source 合并成一个 Range 视图。
-- 每个 `source_id` 的 cursor/lease 独立维护。
-
-group 从 provider 消失后,新的 Place 找不到该 group,verify-key 拒绝缺失凭据,两者均不能
-继续使用已移除的 group。已经写入 node_link 的凭据对 cache 不主动删除,由 registry/node
-侧 TTL 淘汰;现有 sandbox/build 的持久凭据副本保持不变。
-
 <a id="placer-import-reconciliation"></a>
-
-### Import Reconcile
-
 <a id="placer-source-owner-selection"></a>
-
-#### source owner 选择
-
-每个 source 独立执行:
-
-```text
-readyPlacers = placer memberlist nodes where ready_label == active_registry_label
-sourceOwners = LocateN(source_id, readyPlacers, import_source_owner_count)
-
-sourceOwners race:
-  POST /placer-link/import-source-lease
-```
-
-source lease 是以 `source_id` 为 key 的持久 `ImportSourceRepository` 记录。业务键 `import/source/<source_id>` 选择服务候选，不选择存储副本。
-
-lease 请求携带 `source_id`、`owner_id`、`run_id` 和 `ttl_ms`。只有 lease 胜者执行该 source 的
-`Importer.Range(cursor, limit)`。
-
 <a id="placer-page-processing"></a>
-
-#### page 处理
-
-```text
-lease winner
-  │ Range(cursor, limit)
-  ▼
-groups in page
-  │ for each group:
-  │   GetPlacementHint
-  │   GetKey / GetAPISecret
-  │   calculate effective selectors
-  ▼
-selector patch with fencing
-  │
-  ▼
-registry refreshes node_link credential-pair cache
-  │
-  ▼
-cursor checkpoint after whole page succeeds
-```
-
-selector patch 必须携带 `import_source_id/import_owner_id/import_run_id/import_term`。registry 只接受与当前
-source lease 匹配的 patch。缺失 fencing 字段或 term/run_id 不匹配时拒绝。
-
-`NextCursor==""` 表示本轮结束:cursor 清空并递增 round。失败或 owner 崩溃时 cursor 不推进,后续 lease
-owner 从上次成功 cursor 继续或重放同一页。
-
 <a id="placer-selector-patch-refresh"></a>
-
-#### selector patch refresh
-
-placer 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
-credential-pair cache。group 从 provider 消失时不主动删除 cache;TTL 到期后自动淘汰。
-
 <a id="placer-placement"></a>
-
-### Placement
-
 <a id="placer-registry-selection-of-a-placer"></a>
-
-#### Registry 选择 placer
-
-registry 对 group 只做确定性 failover:
-
-```text
-readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
-               and ready_label == active_registry_label
-candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
-try candidates in order until success
-```
-
-registry 不对 placer 做 P2C。P2C 只用于 placer 内部从 node 候选中选择放置目标。
-
 <a id="placer-placesandbox"></a>
-
-#### PlaceSandbox
-
-输入:
-
-```text
-group, route_key, sandbox_id, target_runtime_digest?, config?, exclude_node_ids?
-```
-
-`sandbox_id` 是 Registry 持有的稳定公开 SandboxID;placer 不分配、解析或接收 NodeSandboxID
-和 SandboxGeneration.
-
-流程:
-
-```text
-provider.GetPlacementHint(group)
-  │
-  ▼
-filter node_list:
-  selector match
-  not draining
-  not in exclude_node_ids
-  zone <= admit max
-  runtime digest match
-  shuffle slot match
-  │
-  ▼
-P2C over candidates
-  │
-  ▼
-return node_id + create_spec + APISecret fingerprint + runtime/template hints
-```
-
-`node_list` 只提供低频目录,不判定 node 是否在线。route owner 在提交前向 node owner 查询当前
-node-link 连接；断线、admission 拒绝或命令拒绝的候选加入 `exclude_node_ids`,随后重新 Place,直到选中
-在线候选或 placer 返回无候选。node owner 是唯一存活权威。
-
 <a id="placer-placebuild"></a>
-
-#### PlaceBuild
-
-输入:
-
-```text
-group, build_id, template_id, resources
-```
-
-Build placement 与 sandbox 类似,但 Placer 的低频视图只按 configured registration capacity
-排除永远装不下单个 Build 的节点,不接收 heartbeat usage。当前 headroom 只在 Holder/节点边界读取:
-
-1. placer 返回静态 capacity 可容纳的建议 node。
-2. Registry 通过当前 Holder 确认 node-link 在线并读取最新 durable registration usage。
-3. headroom 已不足时 Registry 排除该候选并重调度,尚不创建注册 intent。
-4. Registry 持久化选中 node/build 的 STARTING intent,再发送 `build_register`。
-5. node 在 SQLite 事务中作最终 registration admission；明确无副作用拒绝才允许排除候选,
-   timeout/断连/ACK 丢失则固定该 node/BuildID 查询或重试。
-
 <a id="placer-key-distribution"></a>
-
-### Key Distribution
-
-placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
-
-1. 获取 group 的 typed `manifest_key` 和 `api_secret`;缺省 APISecret 只可由 inline ManifestKey 固定派生。
-2. 根据 placement selectors 和 shuffle 结果得到目标 node set。
-3. selector patch 要么携带完整 pair,要么完全不携带凭据字段。两项各带 typed carrier 和完整
-   64-hex SHA-256 指纹;半对拒绝。
-4. registry/node owner 以完整 `APISecretFingerprint` 为 record key,把 desired pair 写入 node_link
-   `KeyPairRepository` 持久记录；事务校验完整 pair 身份与 lease，替换使旧 ACK 失效。
-5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行原子 `key_put`;只有匹配
-   当前完整 desired pair 和 lease 的 ACK 才推进已交付状态。
-6. 同一 APISecret 完整指纹只能绑定完全相同的 pair material;冲突不得覆盖。
-7. 未续租 pair 由节点 TTL 淘汰,`key_drop` 以完整 APISecret 指纹定位,不作为正确性依赖。
-
-凭据对是 create/build 前置条件。cache 删除、key_drop、租约过期或后续 provider 更新不影响已经复制
-到现有 sandbox/build 业务记录的凭据对。
-
 <a id="provider-import-boundary"></a>
-
-### group provider 边界
-
-registry 不实现 `SandboxGroupProvider` / `SandboxGroupImporter`。group 配置、placement hint、APISecret、
-ManifestKey 属于 placer/provider。registry 只保存执行态和各 node 所需的凭据对 cache。
-
-group 从 provider 消失后,新的 Place/verify-key 按 group 不存在处理。已经进入 node_link 的凭据对
-cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbox/build 记录的凭据对不受影响。
-
 <a id="configuration"></a>
 
 ## 角色配置与节点接入
@@ -808,9 +563,10 @@ foundationdb:
 
 placer_link:
   placer_label: placer.default
-  placer_replica_count: 3      # registry 调 placer 的 failover 候选数
-  min_ready_placers: 1
-  place_timeout: 2s
+
+placement:
+  candidates: 2
+  zone_admit_max: yellow
 ```
 
 默认 path:
@@ -909,7 +665,7 @@ run-cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
 standalone placer 必须配置至少一个 `import_groups` source。嵌入式或生产集成可以直接注入自定义
-`SandboxGroupProvider` / `SandboxGroupImporter`。
+完整记录 `SandboxGroupSource`。
 
 <a id="placer-configuration"></a>
 
@@ -934,11 +690,9 @@ import_groups:
     path: /var/lib/kuasar/groups
 
 placement:
-  candidates: 2
-  zone_admit_max: yellow
   import_source_owner_count: 3
   import_source_lease_ttl: 15s
-  selector_patch_refresh_interval: 1m
+  import_refresh_interval: 1m
   # shuffle_sharding:
   #   - selector: { pool: gpu }
   #     shard_by: zone
@@ -954,14 +708,11 @@ placement:
 | `placer.advertise` | registry 调用 placer 的地址,同时作为 placer memberlist HTTP transport 地址 |
 | `placer.memberlist_label` | placer memberlist label,默认 `placer.default` |
 | `import_groups[]` | standalone placer 的 group source;内置 `source_type=file` |
-| `placement.candidates` | placer 内部 P2C 候选数量 |
-| `placement.zone_admit_max` | 可放置最高水位 |
 | `placement.import_source_owner_count` | 每个 source 可参与 lease 竞争的 placer 候选数 |
 | `placement.import_source_lease_ttl` | registry 侧 source lease TTL |
-| `placement.selector_patch_refresh_interval` | unchanged selector patch 刷新周期 |
+| `placement.import_refresh_interval` | 导入维护轮次的间隔 |
 | `placement.shuffle_sharding` | shuffle-sharding 规则 |
 
-registry 侧 `placer_link.placer_label` 指定 placer memberlist 域;`placer_link.placer_replica_count` 指定 registry
 对一个 group 调 placer 的 failover 候选数。它不是 registry 内部 `placer_link` namespace 的 owner count。
 
 <a id="node-attachment-configuration"></a>
@@ -1075,7 +826,7 @@ ready placer 由 placer memberlist meta 表达:
 ```
 
 registry 只把 `role=placer && alive && ready=true && ready_label==active_registry_label` 的成员作为
-Place / verify-key 候选。
+source lease 的 importer 竞争候选。
 
 <a id="registry-registry-state-model"></a>
 
@@ -1089,7 +840,7 @@ Registry 通过一份共享仓储实现，将执行元数据持久化到 SQLite�
 
 | 层次 | 目标 | 对调用方的最小接口 |
 |---|---|---|
-| Router / Placer | 鉴权转发，或基于已校验目录提出 placement | 既有 route_link / placer_link / node_list HTTP 契约 |
+| Router / Placer | 鉴权转发，或向已校验的静态目标条件导入 Group | 既有 route_link / placer_link / node_list HTTP 契约 |
 | Registry 业务服务 | 校验生命周期与归属、下发命令、处理节点报告 | Route、Build、Node、Ownership、KeyPair、Directory、ImportSource 类型化能力 |
 | `internal/cluster/metadata` | 定义中立记录、完整版本、领域结果与有界列表 | `Versioned[T]`、`Version`、领域 repository 方法、`Invalidation`、`ObservationAdmission` |
 | `internal/cluster/metastore` | 共享业务仓储实现 | 原子的生命周期、索引和归属操作 |
@@ -1106,7 +857,6 @@ Registry 通过一份共享仓储实现，将执行元数据持久化到 SQLite�
 
 `membership.owners.route_link/node_link/placer_link/node_list` 控制 Registry 服务候选与 node 连接 affinity。`LocateN` 和 Placer Maglev 仍承担业务路由职责，不选择 FoundationDB 存储副本，也不定义数据库复制因子。`ConnectionOwners` 只暴露本进程成员 ID 与某个 NodeID 的有序连接候选，不包含存储 API。
 
-Registry 可通过共享数据库读写获授权的记录，无需向 peer 获取本地副本。`link_owner` 仍表示实际持有 node stream 的进程，命令仍经 node-owner RPC 抵达它。`placer_link.placer_replica_count` 继续限定 ready placer 的 failover 候选数。
 
 <a id="registry-namespace-schema"></a>
 
@@ -1223,10 +973,10 @@ placer ready 条件:
 - 已拉取当前 registry membership。
 - 一个 active node_list WATCH_LIST 已完成 reset/bookmark。
 
-group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中时返回 NoNode /
+Group import 不构成全局 ready 门槛。Registry 只在请求 Group 的完整支持发布中选择；未命中时返回 NoNode /
 不可用,不阻塞其他 group。
 
-registry 只根据 memberlist meta 选择 ready placer:
+source lease 竞争者是 memberlist meta 发布的 ready importer：
 
 ```json
 {"role":"placer","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
@@ -1271,10 +1021,10 @@ node_link 维护以下类型化记录域:
   `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`
   完整归属表。
 - `build`:该 node 上 build 的 `build_id -> {group,template_id}` 完整归属表。
-- `key_pair`:selector patch 刷新的 APISecret+ManifestKey pair cache。
+- `key_pair`：显式管理路径维护的 APISecret+ManifestKey 缓存；Group 导入不会写入这份缓存。
 
 心跳只更新 `profile` 中的 runtime/liveness 字段，不得重写 `sandbox`、`build`、`key_pair` 记录。sandbox/build 表由 cluster 在任务下发前写入。registration usage 只统计无 cancel/delete 意图的 registered/waiting/building 行. execution usage 独立统计全部 claim, 包含取消及清理中的任务. 意图提交释放注册容量; exact host cleanup 与终态提交后才释放执行容量. 无归属终态历史不占准入额度. 归属保留到显式删除或节点 terminal retention 实际删除 Build 行并发送 `BuildDelete`;
-Registry 随后 exact-delete 对应 Build projection 与 owner ref。key_pair 由 selector patch 更新。
+Registry 随后 exact-delete 对应 Build projection 与 owner ref。Group 维护直接在 Node 原子更新 pair 和 context。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
 build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。高频 profile 更新不重写无关 ownership 记录。
 
@@ -1464,12 +1214,12 @@ import、鉴权/签名及同一 resume acceptance。
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster, idle_timeout?, auto_pause_memory?, auto_reset?}` | 冷启 `template_ref` + 保存/合并 `config`([生命周期与状态机](sandbox-lifecycle_zh.md#state-and-ownership);snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt、成功的 route/lease barrier |
+  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, group_api_key, expected_group_version, config, cluster, idle_timeout?, auto_pause_memory?, auto_reset?}` | 冷启 `template_ref` + 保存/合并 `config`([生命周期与状态机](sandbox-lifecycle_zh.md#state-and-ownership);snp 模板 = fresh Create 的快照恢复快启);新对象先完成 Group API-key 鉴权和 expected revision 校验，再复制 Node 上下文；已有精确对象使用保留的凭据绑定；`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt、成功的 route/lease barrier |
   | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?, memory?}` | `sid` 是 NodeSandboxID。target 已存在时忽略 token，校验完整指纹、profile 和 cluster context；对已有 paused S 的 false 是保留持久来源的一次 cold 尝试。target 缺失且带 KMT1 时，同步认证原始对并以命令 sid/context insert paused 行：false 永久选择 E-only；omitted/null 保留 token 来源；true 要求 S。随后用同一 selector 解析 ResumeMode（[Import 选择](sandbox-lifecycle_zh.md#import-selection)）。Ack 前完成旧 runner/network/RunDir 清理，并在 paused→starting acceptance 中恢复 canonical RunDir/UDS、持久化 deadline 与 resolved launch mode。Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint；restore 异步，缺失且无 token 则拒绝 |
-  | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
+  | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;新目标准入经可信 NodeLink 携 API key 和 expected Group revision，key 不持久化或写日志。节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致;Ack 仍只表示 exact owner 已持久转为 `deleting`,不等待 node-local finalizer 完成;deleting 管理 Upsert 在 Ack 返回前发布，业务路由撤销不是 cleanup 完成证明;pending 重放幂等([进程管理(systemd 模板单元,启动时自动生成安装)](node_zh.md#systemd-pools) kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰([密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model));registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | `config.builder.target` 是 canonical register-only requested target，参与 replay digest/node validation；节点以同一 canonical Build.Resources 做最终、事务化 registration admission。最终 Sandbox Create 配置/resources、build-only options 与 cluster group 分开持久化；A/B resources 不从 target Sandbox resources 推导。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
+  | `build_register{build_id, template_id, profile, resources, group_api_key, expected_group_version, api_secret_fingerprint, config}` | `config.builder.target` 是 canonical register-only requested target，参与 replay digest/node validation；节点以同一 canonical Build.Resources 做最终、事务化 registration admission。最终 Sandbox Create 配置/resources、build-only options 与 cluster group 分开持久化；A/B resources 不从 target Sandbox resources 推导。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
 
 保留 S 的自动 Import 在插入/Ack 前读取 S 与关联 E 元数据并检查 runtime 兼容性。节点本地
 四秒 context 覆盖该检查与插入，caller 更早取消时提前结束；helper 管道收尾另有最多 250 ms。
@@ -1554,6 +1304,8 @@ View 包含 NodeID、labels、runtime digest、分离的 API/Data endpoint、配
 
 ### route_link
 
+RouteLink v2 将 ControlRoute 与 DataRoute 分离。控制请求按具体对象鉴权并只返回 API endpoint 和公开 token；数据请求只返回 data endpoint 与 service 鉴权材料。Router 不接收租户 root，也不接受旧的合并投影。
+
 <a id="route-record"></a>
 
 #### route 记录
@@ -1574,7 +1326,7 @@ View 包含 NodeID、labels、runtime digest、分离的 API/Data endpoint、配
 | `api_secret_fingerprint` | sandbox 业务记录绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
 | `manifest_key_fingerprint` | 与 APISecret 配对的 ManifestKey 完整指纹;route 不保存或投影 ManifestKey 原文 |
 | `stable_id` | 跨 NodeSandboxID 变化保持的 sandbox identity；cluster 中等于 `sandbox_id`，并绑定 ServiceSecret/KAT |
-| `api_secret` | 当前 sandbox 已绑定的 APISecret;仅存在于受保护 route 存储和可信 router/proxy 投影 |
+| `api_secret` | 当前 sandbox 已绑定的 APISecret;仅存在于受保护 Registry/Node 存储，不进入 Router 投影 |
 | `service_secret` | 当前 sandbox 持久化的 service credential;用于签发和验证用途明确的 KAT token |
 | `envd_access_token` | e2b envd 端口使用的数据面 token |
 | `traffic_access_token` | 外部网关及 e2b 数据面组件使用的 token,cluster 平台层不消费 |
@@ -1607,7 +1359,7 @@ API 路径, 不调用删除 sandbox 的控制命令.
 #### Reserve
 
 ```text
-POST /route-link/reserve
+POST /route-link/v2/reserve
   ?operation=create|connect|exec-session|data
   &group=<group>&route_key=<route-key>
   [&sid=<stable-sandbox-id>][&port=<effective-port>]
@@ -1620,7 +1372,7 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
 `ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
 - `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.resource`、`kuasar-sandbox.traffic`、`kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
-  `kuasar-sandbox.checkpoint`；`max_checkpoints`（默认 1）、`idle_timeout`、`auto_pause_memory`（默认 true）与 `auto_reset`（默认 false）是独立 typed body 字段，拒绝 `memory`。Router 已提取公开 checkpoint 配额，此处 config 命名空间只携 `merge_ref`/`drop_caches`。`idle_timeout` 是可表示为 duration 的非负整数秒；absent/null 关闭策略，0 仍表示启用，它不是 config namespace。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+  `kuasar-sandbox.checkpoint`；`max_checkpoints`（默认 1）、`idle_timeout`、`auto_pause_memory`（默认 true）与 `auto_reset`（默认 false）是独立 typed body 字段，拒绝 `memory`。Router 已提取公开 checkpoint 配额，此处 config 命名空间只携 `merge_ref`/`drop_caches`。`idle_timeout` 是可表示为 duration 的非负整数秒；absent/null 关闭策略，0 仍表示启用，它不是 config namespace。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；Node 仅在默认模板创建时将请求叶子与本次复制的 Group 默认值合并。Registry 在选点和 route 写入前使用保留的 Group 支持做完整 API key MAC 校验,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
   attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
   Registry 内合并。
@@ -1637,8 +1389,7 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
 - `exec-session`:query 必须携期望的稳定 `sid`;typed body 携非负 int64 `ttl_seconds` 和
   已规范化的 CEL source string array;
   Header 携原始 `X-API-KEY` 和可选 `X-Kuasar-Migration-Token`.Registry 以 route 业务
-  记录已绑定的 APISecret 验证 API key,并校验 expected stable SID,之后原始 key 在
-  Registry verifier 终止,不进入 command,Ack,route,日志或错误文本.Registry 向
+  记录已绑定的 APISecret 验证 API key,并校验 expected stable SID,新目标的 Group 准入还经可信 command 携带该 key 和 expected revision；key 不进入 Ack、持久记录、日志或错误文本。Registry 向
   当前/新候选 NodeSandboxID 下发 `CmdExecSession{APISecretFingerprint,Profile,
   TTLSeconds,ExecConditions,MigrationToken?,Cluster?}`.其它 command kind 携
   `ExecConditions` 时必须拒绝.Node 同步完成可选 import,对象/凭据/context 校验,权威 CEL
@@ -1699,24 +1450,9 @@ registry observer joins placer.default memberlist
 ready placer view from memberlist meta
 ```
 
-registry 对 group 做确定性 failover:
-
-```text
-readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
-               and ready_label == active_registry_label
-candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
-try candidates in order until success
-```
-
-registry 不对 placer 做 P2C。P2C 属于 placer 内部从 node 候选中选择目标。
+Memberlist 提供 source lease 的 ready importer 候选，不参与 Create/Build 请求路径。Source 分页、lease fence 和有条件 Node 命令遵循 [Group 导入](#groups-and-placement)；不再暴露 Place、verify-key 或 selector-patch 入口。
 
 <a id="importsource"></a>
-
-#### Import/source
-
-`source_id` 是 Importer 唯一执行单位。Ready placer 通过 `LocateN(source_id, readyPlacers, import_source_owner_count)` 选出竞争候选，经 Registry 竞争 `ImportSourceRepository.Acquire(source_id, owner_id, run_id, ttl)`。这是数据库中的原子 lease；候选路由 key 不定义存储 shard。
-
-胜者有界分页 Range 单个 source，读取各 group 的 placement hint 和 credential pair，发送 selector patch。只有该 page 每一项成功，才能以相同 owner、run ID 和 term checkpoint cursor；过期或已替换 lease 不得推进 cursor。Provider 点查可跨 source 去重，Importer Range 不能将多个 source 合成一个执行 view。
 
 <a id="router-boundary"></a>
 
@@ -1761,12 +1497,7 @@ flowchart TD
    尚未发给任何 node 时允许该 retry。连接失败仍淘汰,后续请求重新 Resolve。
 5. **数据面字节不进 registry**:registry 只参与显式 create/connect/exec-session、cache miss Resolve,
    以及 target 缺失或 typed stale 时的 data Reserve fallback。
-6. **根凭据用途分离**:create/connect/exec-session 由 Reserve 强制验证原始 API key;
-   create 的 group admission 经 ready placer 使用 provider APISecret,connect/exec-session 使用
-   Sandbox 记录已绑定的 APISecret.其它控制操作由 router 调 route owner 的 verify-key,
-   registry failover 到 ready placer 验证.READY route 的受保护返回同时投影该 sandbox 已绑定的
-   APISecret,ServiceSecret 和用途明确的 access tokens 给可信 router;ManifestKey 原文不进入
-   registry/router 路由链路.
+6. **按对象鉴权**：Registry 对每次控制和 Build 操作校验完整 API key；已有对象使用其保留的 root。控制投影只含 API endpoint 和公开 token，数据投影只含 data endpoint 和 service 鉴权材料。Router 不接收 APISecret 或 ManifestKey。
 
 <a id="router-route-cache"></a>
 
@@ -1798,6 +1529,8 @@ route 是否已有完整 `NodeSandboxID + DataEndpoint`,不取决于 ready/pause
 
 #### route resolution cache
 
+只有 DataRoute 进入缓存；控制和 Build 后续请求每次都重新鉴权，缓存 endpoint 不能替代对象鉴权。
+
 key:
 
 ```text
@@ -1807,8 +1540,7 @@ key:
 value:
 
 ```text
-{node_id, api_endpoint, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id,
- api_secret, api_secret_fingerprint, manifest_key_fingerprint, service_secret,
+{node_id, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id, service_secret,
  envd_access_token, traffic_access_token, forward_access_token,
  target_port, route_revision, expires, last_used}
 ```
@@ -1864,6 +1596,7 @@ Resolve,不会隐式创建 sandbox。
 - node proxy 在 CONNECT 握手阶段返回带 `X-Kuasar-Proxy-Error: not_found|unauthorized` 的 404/401。
 - node data_endpoint 连接失败。
 - route TTL 或 idle timeout 到期。
+- 成功的 Create、Connect 或 exec-session 响应确认了另一个 Node/本地实例，且修订不早于缓存 route。此时淘汰旧数据目标；控制响应不填充数据缓存。
 
 握手成功后的 HTTP 401/403/404 是沙箱内应用或 envd 的响应,不淘汰 route。带上述 typed error 的
 握手失败会淘汰旧 target,以同一请求 credential 调用 `ReserveData` 复验并取得 fresh route,然后只
@@ -1874,14 +1607,14 @@ Resolve,不会隐式创建 sandbox。
 ### Build
 
 Build 记录由 group-scoped `BuildRepository` 访问。node 拥有 durable registration/execution
-claim 和 usage；node-link owner 持有当前连接与 profile 投影供 Registry 检查。
+claim 和 usage；node-link owner 持有当前连接与 profile 投影供 Registry 检查。首次注册在复制输入前核对所选 Group 修订；已有持久 Build 优先解析，之后的 Group 变化不会改写其原始输入。
 
 ```text
 router build register
   │ stable build_id/template_id + explicit profile
   ▼
-route owner ReserveBuild → PlaceBuild
-  │ placer filters configured capacity and suggests a node
+route owner ReserveBuild
+  │ Registry selects one Node from published Group/auth support, Placement and capacity
   ▼
 node owner: live connection + current registration usage check
   │
@@ -1907,7 +1640,7 @@ control HTTP 只缓存并拨该地址.结果不保留旧 `DataEndpoint` alias,Bu
 显式存在。`builder.target` 通过 `X-Kuasar-Sandbox-Builder` 请求头或 `metadata["kuasar-sandbox.builder"]` 提供，注册后不可更改：Image、top-level
 Sandbox E、memory Sandbox 三种 target 均随 canonical builder JSON、Registry replay identity、
 `build_register` 和节点 Build row 传递；构建声明或从来源模板继承 workspace 时，须在注册时显式指定 Sandbox 目标。无 workspace 的构建可以省略目标，由 worker 根据最终生效的 start/ready 命令自动选择。
-route owner 将 profile、target/config identity 与 placement 返回的 `APISecretFingerprint` 持久化进
+route owner 将 profile、target/config identity 与 所选 Group entry 的 `APISecretFingerprint` 持久化进
 BuildRecord,并随 `build_register` 下发,节点按该完整指纹从同一凭据对写入本地 build,同时将
 profile 写入 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bare build 可选择三种 target，
 但仍不接受 e2b 专属的 start/ready 命令。
@@ -1921,7 +1654,7 @@ header/metadata 归一化，也传递 `envVars`。Registry 的 durable BuildReco
 对 instance-only 输入的拒绝、restore 的无条件拒绝、target 与输出 ref 的一致性由 Router、Registry、
 节点和 worker 各自 fail closed，不能靠某一跳的过滤作为信任边界。
 
-Placer 筛选低频配置容量；Registry 验证 node 当前连接和 registration usage headroom，先持久化
+Registry 筛选已发布的 Group/auth 支持、请求 Placement 与配置容量，验证 node 当前连接和 registration usage headroom，先持久化
 immutable `BuildStarting` dispatch intent 与 `(node_id,build_id)` owner ref，再下发 `build_register`。
 Node 的 durable registration transaction 是唯一权威准入决定；Registry 没有 `AdmitBuild` lease
 或终态 `ReleaseBuild` RPC。明确余量不足或 definitive admission rejection 可在 exact intent cleanup
@@ -1994,7 +1727,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 | 事件 | 行为 |
 |---|---|
 | router 崩溃 | 丢本地缓存;重启后 cache miss 重新 Resolve |
-| placer 崩溃 | registry 对同 group failover 到下一个 ready placer;热路径不受影响 |
+| placer 崩溃 | 已有 Node Group 继续服务；其他 source lease owner 可恢复有条件导入，新定义等待成功导入 |
 | node_link 断线 | node owner 立即拒绝该 node 的新提交；route owner 排除并重选；断线节点最后心跳超过 node_dead_after 后，通过 revision fence 接管过期 profile，清理目录和符合条件的执行投影；dead/deleting Sandbox 管理行及精确归属仍保留，in-flight reservation 不被 sweep；node 重连后全量/增量重报 |
 | conductor 进程重启 | 依据 systemd unit reconcile durable row：接管活 sandbox/builder，重试 deleting/paused cleanup、已接纳的中断 restore，并清理/失败缺失的新执行；这不是整机重启 |
 | node 整机重启 | 运行进程丢失。SQLite/artifact 保留时仍 reconcile paused row、已接纳的中断 restore、cleanup owner 和保留的 Build；缺失执行经节点上报/exact route 清理收敛，不无条件删除全部 durable row 或自动重建全部旧 sandbox |
@@ -2009,7 +1742,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 ### Registry 性能
 
 - 数据面热路径:router 命中完整 node target 后直转 node,包括 pausing/paused/starting,不访问 registry。
-- Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner 当前连接/usage 检查 -> node 权威准入；明确失败的候选排除后重选，ambiguous Build dispatch 保持原绑定。
+- 控制面冷路径：Group → Registry 完整 MAC 鉴权和有界 GroupSupport 选择 → 原子 intent/ownership → 原始 Node 连接 → Node Group 准入。普通错误和未知投递保留清理责任，只有初始结构化版本冲突允许精确退役。
 - 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
 - 海量 node:profile/ownership 按 NodeID 定界；bucketed node_list 只承载低频目录，不承载高频水位。
 - membership 变更:不搬迁元数据或执行 peer read-repair；连接重注册与报告通过共享数据库协调业务状态。
@@ -2081,28 +1814,13 @@ Delete 并等待 node-local finalization. 该序列在 node-link 恢复后经过
 
 ### Placer 可靠性
 
-| 事件 | 行为 |
-|---|---|
-| placer 崩溃 | registry failover 到同 group 的下一个 ready placer;热路径不受影响 |
-| WATCH_LIST 断线 | placer 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
-| provider 不可用 | 受影响 group 的 Place/verify-key 返回不可用 |
-| node labels 旧 | node owner admission/create 兜底拒绝 |
-| source owner 崩溃 | source lease 到期后其他候选从已提交 cursor 接管;旧 owner patch/cursor 被 fencing 拒绝 |
-| key 续租投递失败 | timeout、断线或 reject 都不推进已交付状态；create/build 在 node 侧 reject，下一次 heartbeat refresh 重试 |
-| Build 注册超时或 ACK 丢失 | 保留已持久化的选定 node/BuildID intent,只查询或重试同一节点。持久 registration usage 由节点负责,placer 没有靠 admission lease 计时器释放它的机制;节点在 ready/error transition 时释放 registration usage，之后删除终态历史才移除 Registry 投影；两者是不同事件。源码见 [durable usage query](../internal/store/build_admission.go)。 |
-
-权威实现见 [注册下发与投影恢复](../internal/registry/build.go) 和
-[放置谓词](../internal/placer/scaler.go)。尤其不能把投递结果不明当作无副作用拒绝的证据。
+Importer 故障会停止新维护和续租；Registry 仍可鉴权已有对象并从已发布 Group 选址，Node 的 key 到期继续约束新准入。WATCH_LIST 断开后需完整重新订阅，source lease 丢失会阻止后续转发和 checkpoint。条件写冲突直接报告；未知结果保留原写入，读到相同 context 不等于续租成功。
 
 <a id="placer-performance"></a>
 
 ### Placer 性能
 
-- WATCH_LIST 只传低频字段,避免高频水位扇出。
-- Place QPS 通过 ready placer 集合按 group `LocateN` 分散。
-- placer 内部仅按当前本地目录视图比较抽样的 P2C 候选,不向节点同步轮询实时负载。
-- import/source 独立分页,不同 source 之间不做全量合并。
-- selector patch 是慢路径,可限速;unchanged patch 只用于刷新 TTL。
+Node view 和 source page 均有界。Import 遍历静态目标，不负责每个请求的调度。已确认 lease binding 是有界优化；未决写在协调完成前占用容量。Registry 对已发布支持采样执行 P2C，不调用 Placer 或读取 artifact。验收应在相同负载下对比 Registry 请求时延和导入/报告开销。
 
 <a id="related-contracts"></a>
 
@@ -2123,7 +1841,7 @@ Delete 并等待 node-local finalization. 该序列在 node-link 恢复后经过
 ### Router 引用
 
 - [cluster_zh.md](cluster_zh.md) — registry membership、route_link、Reserve 与数据模型。
-- [cluster_zh.md](#groups-and-placement) — verify-key、Place 和 key distribution 来源。
+- [cluster_zh.md](#groups-and-placement) — 对象鉴权、Group 选址和导入来源。
 - [node-proxy_zh.md](node-proxy_zh.md) — node 内部数据面转发、CONNECT 和 envd signature。
 
 - [Router 实现](../internal/router/router.go) — 鉴权模式、缓存寿命、端点选择和 exec admission。

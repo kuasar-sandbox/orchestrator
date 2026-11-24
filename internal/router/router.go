@@ -36,6 +36,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	requestplacement "github.com/kuasar-sandbox/orchestrator/internal/placement"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -256,6 +257,18 @@ func (rt *Router) Handler() http.Handler {
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
+		creation := host == "api."+rt.domain && r.Method == http.MethodPost && (isSandboxCollectionPath(r.URL.Path) || isTemplateCollectionPath(r.URL.Path))
+		if !creation {
+			_, selection, err := requestplacement.Extract(nil, r.Header)
+			if err != nil || len(selection.NodeSelectors) != 0 {
+				status := http.StatusBadRequest
+				if errors.Is(err, requestplacement.ErrHeaderTooLarge) {
+					status = http.StatusRequestHeaderFieldsTooLarge
+				}
+				http.Error(w, "Placement is only supported by Create and Build registration", status)
+				return
+			}
+		}
 		if host == "api."+rt.domain {
 			rt.serveControl(w, r)
 			return
@@ -367,7 +380,8 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var autoPauseMemory, autoReset *bool
 	var idleTimeout *int64
 	var maxCheckpoints *int
-	createConfig, err := createSandboxPoliciesWithQuota(w, r, &autoPauseMemory, &idleTimeout, &maxCheckpoints, &autoReset)
+	var selection createWireOptions
+	createConfig, err := createSandboxInputWithQuota(w, r, &autoPauseMemory, &idleTimeout, &maxCheckpoints, &selection, &autoReset)
 	var entries []workspace.Entry
 	if err == nil {
 		createConfig, entries, err = workspace.Extract(createConfig)
@@ -381,12 +395,15 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &maxBytesErr) {
 			status = http.StatusRequestEntityTooLarge
 		}
+		if errors.Is(err, requestplacement.ErrHeaderTooLarge) {
+			status = http.StatusRequestHeaderFieldsTooLarge
+		}
 		http.Error(w, err.Error(), status)
 		return
 	}
 	res, err := rt.routeLinkReserve(
 		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, autoReset, nil, nil,
-		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, createWireOptions{idleTimeout: idleTimeout, workspaces: entries, maxCheckpoints: maxCheckpoints},
+		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, createWireOptions{templateID: selection.templateID, placement: selection.placement, idleTimeout: idleTimeout, workspaces: entries, maxCheckpoints: maxCheckpoints},
 	)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
@@ -398,7 +415,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registry returned an invalid sandbox route", http.StatusBadGateway)
 		return
 	}
-	rt.rememberRoute(route)
+	rt.invalidateDifferentDataRoute(route)
 	// Public create responses expose only the profile-specific sandbox tokens.
 	// Tenant and sandbox credential roots remain inside the protected route link.
 	w.Header().Set("Content-Type", "application/json")
@@ -434,6 +451,9 @@ func createSandboxPolicies(w http.ResponseWriter, r *http.Request, autoPauseMemo
 	return createSandboxPoliciesWithQuota(w, r, autoPauseMemory, idleTimeout, nil, autoReset...)
 }
 func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, idleTimeout **int64, maxCheckpoints **int, autoReset ...**bool) (map[string]string, error) {
+	return createSandboxInputWithQuota(w, r, autoPauseMemory, idleTimeout, maxCheckpoints, nil, autoReset...)
+}
+func createSandboxInputWithQuota(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool, idleTimeout **int64, maxCheckpoints **int, selection *createWireOptions, autoReset ...**bool) (map[string]string, error) {
 	if maxCheckpoints != nil {
 		*maxCheckpoints = nil
 	}
@@ -452,6 +472,7 @@ func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, auto
 		}
 	}
 	var body struct {
+		TemplateID            *string           `json:"templateID"`
 		RemovedMaxCheckpoints json.RawMessage   `json:"max_checkpoints"`
 		Metadata              map[string]string `json:"metadata"`
 		AutoPauseMemory       *bool             `json:"autoPauseMemory,omitempty"`
@@ -480,6 +501,19 @@ func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, auto
 	if err := types.ValidateIdleTimeout(body.IdleTimeout); err != nil {
 		return nil, err
 	}
+	if body.TemplateID != nil {
+		if _, err := types.ParseTemplateID(*body.TemplateID); err != nil {
+			return nil, fmt.Errorf("templateID: %w", err)
+		}
+	}
+	cleanMetadata, constraints, err := requestplacement.Extract(body.Metadata, r.Header)
+	if err != nil {
+		return nil, err
+	}
+	body.Metadata = cleanMetadata
+	if selection != nil {
+		selection.templateID, selection.placement = body.TemplateID, constraints
+	}
 	if idleTimeout != nil {
 		*idleTimeout = types.CloneIdleTimeout(body.IdleTimeout)
 	}
@@ -495,7 +529,6 @@ func createSandboxPoliciesWithQuota(w http.ResponseWriter, r *http.Request, auto
 	if len(autoReset) > 0 && autoReset[0] != nil {
 		*autoReset[0] = sandboxcfg.CloneBool(body.AutoReset)
 	}
-	var err error
 	body.Metadata, err = workspace.WithHeader(body.Metadata, r.Header)
 	if err != nil {
 		return nil, err
@@ -813,6 +846,15 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	metadata, placement, err := requestplacement.Extract(metadata, r.Header)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, requestplacement.ErrHeaderTooLarge) {
+			status = http.StatusRequestHeaderFieldsTooLarge
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
 	metadata, entries, err := workspace.Extract(metadata)
 	if err != nil {
 		http.Error(w, "invalid workspace declaration", 400)
@@ -909,6 +951,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	res, err := rt.routeLinkReserveBuild(
 		r.Context(), group, profile, resources, metadata, body.EnvVars,
 		credentialEnvelope, mmdsSecrets, entries,
+		buildWireOptions{apiKey: apiKeyFromRequest(r), placement: placement},
 	)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
@@ -967,12 +1010,9 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	}
 	bid := extractBuildID(r.URL.Path)
 	cacheKey := buildCacheKey(group, bid)
-	rt.buildsMu.Lock()
-	e, ok := rt.builds[cacheKey]
-	rt.buildsMu.Unlock()
-	node := e.node
-	if !ok || node == "" || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel")) {
-		res, rerr := rt.routeLinkResolveBuild(r.Context(), group, bid)
+	var node string
+	{
+		res, rerr := rt.routeLinkResolveBuild(r.Context(), group, bid, apiKeyFromRequest(r))
 		if rerr != nil {
 			writeBuildResolveError(w, rerr)
 			return
@@ -992,8 +1032,8 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 func writeBuildResolveError(w http.ResponseWriter, err error) {
 	status := http.StatusServiceUnavailable
 	var response *routeLinkCallError
-	if errors.As(err, &response) && response.status == http.StatusNotFound {
-		status = http.StatusNotFound
+	if errors.As(err, &response) && (response.status == http.StatusNotFound || response.status == http.StatusUnauthorized || response.status == http.StatusForbidden) {
+		status = response.status
 	}
 	http.Error(w, "build lookup unavailable", status)
 }
@@ -1014,7 +1054,7 @@ func (rt *Router) handleBuildDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	path := fmt.Sprintf("%s?group=%s&template_id=%s", registry.RouteLinkBuildPath, url.QueryEscape(group), url.QueryEscape(templateID))
 	var res buildReserveResult
-	if err := rt.routeLinkCall(r.Context(), group, http.MethodGet, path, nil, nil, &res); err != nil {
+	if err := rt.routeLinkCall(r.Context(), group, http.MethodGet, path, nil, map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}, &res); err != nil {
 		writeBuildResolveError(w, err)
 		return
 	}
@@ -1138,7 +1178,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registry returned an invalid connect result", http.StatusBadGateway)
 		return
 	}
-	rt.rememberRoute(route)
+	rt.invalidateDifferentDataRoute(route)
 	out := map[string]any{
 		"sandboxID":          sandboxID,
 		"templateID":         connected.TemplateID,
@@ -1213,7 +1253,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "exec session unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	rt.rememberRoute(route)
+	rt.invalidateDifferentDataRoute(route)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1244,11 +1284,8 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	// Authenticate the caller against the sandbox's group before forwarding (the
 	// node re-authenticates too, but the ingress must not be an open relay / sid
 	// oracle — docs/cluster.md#router-data-plane).
-	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
-		return
-	}
 	if r.Method == http.MethodDelete && isSandboxResourcePath(r.URL.Path) {
-		status, msg, err := rt.routeLinkDelete(r.Context(), group, routeKey, sid)
+		status, msg, err := rt.routeLinkDelete(r.Context(), group, routeKey, sid, apiKeyFromRequest(r))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -1264,8 +1301,12 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	rr := rt.resolveRoute(r.Context(), group, routeKey, sid)
-	if rr == nil || rr.APIEndpoint == "" {
+	rr, err := rt.routeLinkControlRoute(r.Context(), group, routeKey, sid, apiKeyFromRequest(r))
+	if err != nil {
+		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+		return
+	}
+	if rr == nil || rr.APIEndpoint == "" || !routeMatchesIdentity(rr, group, routeKey, sid) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
@@ -1289,7 +1330,7 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := fmt.Sprintf("%s?group=%s", registry.RouteLinkListPath, url.QueryEscape(group))
-	resp, err := rt.routeLinkHTTP(r.Context(), group, http.MethodGet, path, nil, nil)
+	resp, err := rt.routeLinkHTTP(r.Context(), group, http.MethodGet, path, nil, map[string]string{HeaderAPIKey: apiKeyFromRequest(r)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1957,6 +1998,19 @@ func (rt *Router) evictRoute(group, routeKey, sid string) {
 	rt.cacheMu.Unlock()
 }
 
+// A successful control operation can migrate a stable sandbox to another local
+// instance. Its public projection cannot populate the data cache, but it must
+// invalidate a previously resolved target before the next data request.
+func (rt *Router) invalidateDifferentDataRoute(route *routeResolve) {
+	rt.cacheMu.Lock()
+	defer rt.cacheMu.Unlock()
+	current := rt.cache[routeCacheID(route.Group, route.RouteKey, route.SandboxID)]
+	if current != nil && route.RouteRevision.Compare(current.RouteRevision) >= 0 &&
+		(current.NodeID != route.NodeID || current.NodeSandboxID != route.NodeSandboxID) {
+		rt.evictRouteLocked(route.Group, route.RouteKey, route.SandboxID)
+	}
+}
+
 func (rt *Router) evictRouteIfCurrent(group, routeKey, sandboxID, nodeSandboxID string) {
 	rt.cacheMu.Lock()
 	if rr := rt.cache[routeCacheID(group, routeKey, sandboxID)]; rr != nil && rr.NodeSandboxID != nodeSandboxID {
@@ -2075,6 +2129,8 @@ func randomHexID() string {
 // --- control client ---
 
 type createWireOptions struct {
+	templateID     *string
+	placement      requestplacement.Request
 	maxCheckpoints *int
 	idleTimeout    *int64
 	workspaces     []workspace.Entry
@@ -2111,7 +2167,7 @@ func (rt *Router) routeLinkReserve(
 		create = opts[0]
 	}
 	if operation == "create" {
-		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, Workspaces: create.workspaces, MaxCheckpoints: create.maxCheckpoints, IdleTimeout: create.idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
+		body, _ = json.Marshal(registry.SandboxReserveReq{TemplateID: create.templateID, Placement: create.placement, Config: config, Workspaces: create.workspaces, MaxCheckpoints: create.maxCheckpoints, IdleTimeout: create.idleTimeout, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory), AutoReset: sandboxcfg.CloneBool(autoReset)})
 		if headers == nil {
 			headers = map[string]string{}
 		}
@@ -2130,13 +2186,22 @@ func (rt *Router) routeLinkReserve(
 		headers["Content-Type"] = "application/json"
 	}
 	var res reserveResult
-	if err := rt.routeLinkCallWithConflictRetry(ctx, group, http.MethodPost, path, body, headers, &res, operation != "connect"); err != nil {
+	if err := rt.routeLinkCallWithConflictRetry(ctx, group, http.MethodPost, path, body, headers, &res, operation != "connect" && operation != "create"); err != nil {
 		return nil, err
 	}
 	return &res, nil
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string, entries []workspace.Entry) (*buildReserveResult, error) {
+type buildWireOptions struct {
+	apiKey    string
+	placement requestplacement.Request
+}
+
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string, entries []workspace.Entry, opts ...buildWireOptions) (*buildReserveResult, error) {
+	var selection buildWireOptions
+	if len(opts) > 0 {
+		selection = opts[0]
+	}
 	var wireResources *routesync.BuildResources
 	if resources != nil {
 		wireResources = &routesync.BuildResources{
@@ -2144,11 +2209,12 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 		}
 	}
 	reqBody, _ := json.Marshal(registry.BuildReserveReq{
-		Group: group, BuildID: "bld-" + randomHexID(), TemplateID: "transient-" + randomHexID(),
+		Placement: selection.placement,
+		Group:     group, BuildID: "bld-" + randomHexID(), TemplateID: "transient-" + randomHexID(),
 		Profile: profile, Resources: wireResources,
 		Metadata: metadata, Env: env, Credentials: credentials, MMDSSecrets: mmdsSecrets, Workspaces: entries,
 	})
-	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
+	resp, err := rt.routeLinkHTTPWithConflictRetry(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json", HeaderAPIKey: selection.apiKey}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2167,10 +2233,14 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 	return &res, nil
 }
 
-func (rt *Router) routeLinkResolveBuild(ctx context.Context, group, buildID string) (*buildReserveResult, error) {
+func (rt *Router) routeLinkResolveBuild(ctx context.Context, group, buildID string, apiKeys ...string) (*buildReserveResult, error) {
+	key := ""
+	if len(apiKeys) > 0 {
+		key = apiKeys[0]
+	}
 	path := fmt.Sprintf("%s?group=%s&build_id=%s", registry.RouteLinkBuildPath, url.QueryEscape(group), url.QueryEscape(buildID))
 	var res buildReserveResult
-	if err := rt.routeLinkCall(ctx, group, http.MethodGet, path, nil, nil, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodGet, path, nil, map[string]string{HeaderAPIKey: key}, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -2185,9 +2255,22 @@ func (rt *Router) routeLinkRoute(ctx context.Context, group, routeKey, sid strin
 	return &rr, nil
 }
 
-func (rt *Router) routeLinkDelete(ctx context.Context, group, routeKey, sid string) (int, string, error) {
+func (rt *Router) routeLinkControlRoute(ctx context.Context, group, routeKey, sid, apiKey string) (*routeResolve, error) {
+	path := fmt.Sprintf("%s?group=%s&route_key=%s&sid=%s", registry.RouteLinkControlRoutePath, url.QueryEscape(group), url.QueryEscape(routeKey), url.QueryEscape(sid))
+	var rr routeResolve
+	if err := rt.routeLinkCall(ctx, group, http.MethodGet, path, nil, map[string]string{HeaderAPIKey: apiKey}, &rr); err != nil {
+		return nil, err
+	}
+	return &rr, nil
+}
+
+func (rt *Router) routeLinkDelete(ctx context.Context, group, routeKey, sid string, apiKeys ...string) (int, string, error) {
+	key := ""
+	if len(apiKeys) > 0 {
+		key = apiKeys[0]
+	}
 	path := fmt.Sprintf("%s?group=%s&route_key=%s&sid=%s", registry.RouteLinkDeletePath, url.QueryEscape(group), url.QueryEscape(routeKey), url.QueryEscape(sid))
-	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodDelete, path, nil, nil)
+	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodDelete, path, nil, map[string]string{HeaderAPIKey: key})
 	if err != nil {
 		return 0, "", err
 	}

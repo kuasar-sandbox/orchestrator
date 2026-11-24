@@ -58,7 +58,7 @@ fail() { exit 19; }
 record() { echo "$1" >> "$SEQUENCE"; [ "$1" != "$FAILURE" ]; }
 restart_redirect_owner() { record restart; }
 wait_redirect_node_link() { record node-link; }
-wait_redirect_placer() { record placer; }
+wait_redirect_group() { record group; }
 create_sandbox() {
     record create
     if [ "$FAILURE" = create-http ]; then echo 503; else echo 201; fi
@@ -89,14 +89,14 @@ wait_node_sandbox_finalized() { record finalized; }
                                                    "FIXTURE_WORK": directory})
             return result.returncode, log.read_text().splitlines() if log.exists() else []
 
-    def test_restart_node_link_and_placer_precede_real_create_data_delete(self):
+    def test_restart_node_link_and_group_precede_real_create_data_delete(self):
         status, calls = self.recovery()
         self.assertEqual(status, 0)
-        self.assertEqual(calls, ["restart", "node-link", "placer", "create", "request", "traffic",
+        self.assertEqual(calls, ["restart", "node-link", "group", "create", "request", "traffic",
                                  "delete", "list", "finalized"])
 
     def test_each_failed_gate_blocks_the_post_restart_request(self):
-        for gate in ("restart", "node-link", "placer"):
+        for gate in ("restart", "node-link", "group"):
             with self.subTest(gate=gate):
                 status, calls = self.recovery(gate)
                 self.assertNotEqual(status, 0)
@@ -114,7 +114,7 @@ wait_node_sandbox_finalized() { record finalized; }
     def test_read_only_data_readiness_converges_without_repeating_create(self):
         status, calls = self.recovery("slow-boot")
         self.assertEqual(status, 0)
-        self.assertEqual(calls, ["restart", "node-link", "placer", "create",
+        self.assertEqual(calls, ["restart", "node-link", "group", "create",
                                  "request", "request", "request", "traffic",
                                  "delete", "list", "finalized"])
 
@@ -128,12 +128,12 @@ wait_node_sandbox_finalized() { record finalized; }
 
     def test_missing_readiness_gate_mutant_is_detected(self):
         source = function("run_redirect_recovery")
-        mutant = re.sub(r"^    wait_redirect_placer.*\n", "", source, flags=re.M)
+        mutant = re.sub(r"^    wait_redirect_group.*\n", "", source, flags=re.M)
         self.assertNotEqual(source, mutant)
-        status, calls = self.recovery("placer", mutant)
+        status, calls = self.recovery("group", mutant)
         self.assertEqual(status, 0)
         self.assertIn("create", calls)  # A ports-only restart would wrongly start placement.
-        status, calls = self.recovery("placer", source)
+        status, calls = self.recovery("group", source)
         self.assertNotEqual(status, 0)
         self.assertNotIn("request", calls)
 
@@ -143,9 +143,9 @@ wait_node_sandbox_finalized() { record finalized; }
         self.assertIn('retry_data_by_sid "$sid" "$envd_token"', source)
         self.assertLess(source.index("run_redirect_recovery"), source.index('code="$(create_sandbox'))
         self.assertLess(source.index("run_redirect_recovery"), source.index("router_req DELETE"))
-        gate = function("wait_redirect_placer")
-        self.assertIn('"$SCRIPT_DIR/placer_readiness.py"', gate)
-        self.assertIn('--expected-node "$NODE_ID"', gate)
+        gate = function("wait_redirect_group")
+        self.assertIn('"$SCRIPT_DIR/group_readiness.py"', gate)
+        self.assertIn('--node-url "http://127.0.0.1:$NODE_PORT"', gate)
         restart = function("restart_redirect_owner")
         self.assertIn('"$WORK/$REDIRECT_OWNER.yaml"', restart)
         self.assertIn('"${REGISTRY_PIDS[$index]}"', restart)

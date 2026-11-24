@@ -49,9 +49,9 @@ func TestBuildDeleteForwardsExactActionInputsAfterRouterRestart(t *testing.T) {
 			defer node.Close()
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/verify-key":
+				case "/route-link/v2/verify-key":
 					w.WriteHeader(200)
-				case "/route-link/build":
+				case "/route-link/v2/build":
 					if r.URL.Query().Get("group") != "/g" || r.URL.Query().Get("template_id") != tid || r.URL.Query().Get("build_id") != "" {
 						t.Errorf("wrong resolve: %s", r.URL)
 					}
@@ -95,7 +95,7 @@ func TestBuildDeleteForwardsExactActionInputsAfterRouterRestart(t *testing.T) {
 func TestBuildDeleteAuthorityFailureNeverLooksLikeCompletion(t *testing.T) {
 	for _, code := range []int{404, 503, 500} {
 		control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/route-link/verify-key" {
+			if r.URL.Path == "/route-link/v2/verify-key" {
 				w.WriteHeader(200)
 				return
 			}
@@ -125,7 +125,7 @@ func TestBuildDeleteAuthorityFailureNeverLooksLikeCompletion(t *testing.T) {
 
 func TestBuildRegistrationRejectsCancelBeforeClusterDispatch(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/verify-key" {
+		if r.URL.Path == "/route-link/v2/verify-key" {
 			w.WriteHeader(200)
 			return
 		}

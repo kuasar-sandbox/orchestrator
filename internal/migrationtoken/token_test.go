@@ -115,6 +115,29 @@ func TestSealUsesFreshRandomNonce(t *testing.T) {
 	}
 }
 
+func TestMaximumRuntimeReferenceSurvivesEncryptedToken(t *testing.T) {
+	base := "file://" + strings.Repeat("a", 64) + ".snapshot@location:"
+	base += strings.Repeat("l", types.MaxPortableBaseRefBytes-len(base))
+	ref := base + "@runtime:" + strings.Repeat("r", 255-len(".bundle")) + ".bundle:digest:" + strings.Repeat("b", 64)
+	payload := validPayload()
+	payload.Profile = string(types.ProfileBare)
+	payload.EnvdAccessToken, payload.TrafficAccessToken = "", ""
+	payload.TemplateID = types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: ref}.String()
+	payload.ResumeSourceRef = ref
+	if len(ref) != types.MaxPortableRefBytes || len(payload.TemplateID) != types.MaxTemplateIDBytes {
+		t.Fatal("fixture does not reach both carrier limits")
+	}
+	token, err := Seal(testMaterial, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Open(testMaterial, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPayloadEqual(t, got, payload)
+}
+
 func TestWireSizeLimit(t *testing.T) {
 	atLimit := payloadForWireSize(t, MaxWireSize)
 	token, err := seal(bytes.NewReader(make([]byte, nonceSize)), testMaterial, atLimit)

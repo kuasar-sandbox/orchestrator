@@ -1457,7 +1457,7 @@ MMDS token 签名,不等于 route secret values;后者仅经上述可信投影�
 `MaxInflightPatch` 只在 routesync wire 上携带 Sandbox 显式叶子;master 将目标节点
 `proxy.yaml` 默认值与该 patch 合并后,把 fixed effective value 及
 `{admission slot,generation}` 写入 route SHM,不会把 pointer 写入 SHM 或用于 route equality。
-当前内部兼容边界为 routesync version 12、route SHM schema 9、worker bootstrap/config/FD
+当前内部兼容边界为 routesync version 12、route SHM schema 10、worker bootstrap/config/FD
 protocol version 3，以及 admission arena version 2。这些都是内部 hard cut；协议版本不匹配的
 conductor/proxy/registry/router 或旧 SHM/bootstrap 不兼容且 fail closed。
 

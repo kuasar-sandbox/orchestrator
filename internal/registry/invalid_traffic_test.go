@@ -18,7 +18,7 @@ func TestInvalidTrafficUpdateDoesNotDeleteRegistryOwnership(t *testing.T) {
 				t.Fatal(err)
 			}
 			ref := testNodeSandboxRef("/g", "rk", sid, "e2b", testAPIFingerprint)
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+			if err := addTestSandboxRef(t, reg.stores, ctx, "n1", ref); err != nil {
 				t.Fatal(err)
 			}
 			route := testE2BRoute(sid, state)

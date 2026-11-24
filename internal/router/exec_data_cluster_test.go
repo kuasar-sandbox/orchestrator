@@ -80,10 +80,10 @@ func TestClusterExecRejectsInvalidKATBeforeReserve(t *testing.T) {
 			var routeHits, reserveHits atomic.Int32
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/route":
+				case "/route-link/v2/data-route", "/route-link/v2/control-route":
 					routeHits.Add(1)
 					_ = json.NewEncoder(w).Encode(route)
-				case "/route-link/reserve":
+				case "/route-link/v2/reserve":
 					reserveHits.Add(1)
 					w.WriteHeader(http.StatusInternalServerError)
 				default:
@@ -109,7 +109,7 @@ func TestClusterExecRejectsInvalidKATBeforeReserve(t *testing.T) {
 func TestClusterExecSanitizesRouteLookupFailure(t *testing.T) {
 	const internalDetail = "registry sqlite failed at /private/registry.db"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/route-link/route" {
+		if r.URL.Path != "/route-link/v2/data-route" && r.URL.Path != "/route-link/v2/control-route" {
 			t.Fatalf("route-link path = %q", r.URL.Path)
 		}
 		http.Error(w, internalDetail, http.StatusInternalServerError)
@@ -147,9 +147,9 @@ func TestClusterExecSanitizesReserveFailure(t *testing.T) {
 			var reserveHits atomic.Int32
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/route":
+				case "/route-link/v2/data-route", "/route-link/v2/control-route":
 					_ = json.NewEncoder(w).Encode(paused)
-				case "/route-link/reserve":
+				case "/route-link/v2/reserve":
 					reserveHits.Add(1)
 					http.Error(w, internalDetail, test.upstream)
 				default:
@@ -197,10 +197,10 @@ func TestClusterExecConditionFailureDoesNotReserveOrDialNode(t *testing.T) {
 			var routeHits, reserveHits atomic.Int32
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/route":
+				case "/route-link/v2/data-route", "/route-link/v2/control-route":
 					routeHits.Add(1)
 					_ = json.NewEncoder(w).Encode(route)
-				case "/route-link/reserve":
+				case "/route-link/v2/reserve":
 					reserveHits.Add(1)
 					w.WriteHeader(http.StatusInternalServerError)
 				default:
@@ -242,9 +242,9 @@ func TestClusterExecReserveRevalidatesStableLineageBeforeNodeDial(t *testing.T) 
 	var reserveHits atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(initial)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits.Add(1)
 			_ = json.NewEncoder(w).Encode(reserveResult{Route: changed})
 		default:
@@ -378,9 +378,9 @@ func TestClusterExecKnownNonReadyTargetSkipsReserve(t *testing.T) {
 			var reserveHits atomic.Int32
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/route":
+				case "/route-link/v2/data-route", "/route-link/v2/control-route":
 					_ = json.NewEncoder(w).Encode(route)
-				case "/route-link/reserve":
+				case "/route-link/v2/reserve":
 					reserveHits.Add(1)
 					http.Error(w, "must not reserve a known target", http.StatusInternalServerError)
 				default:
@@ -437,9 +437,9 @@ func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	freshRoute.RouteRevision = routeVersionForTest(2, 0)
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(staleRoute)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits.Add(1)
 			if r.Header.Get(proxypkg.HeaderSandboxService) != string(proxypkg.ConnectServiceExec) {
 				t.Fatalf("reserve service=%q", r.Header.Get(proxypkg.HeaderSandboxService))
@@ -485,10 +485,10 @@ func TestClusterExecPausedReserveRechecksKATAndUsesCurrentNode(t *testing.T) {
 	var reserveService, reserveToken string
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			routeHits.Add(1)
 			_ = json.NewEncoder(w).Encode(paused)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits.Add(1)
 			if query := r.URL.Query(); query.Get("operation") != "data" || query.Get("sid") != "stable" || query.Get("port") != "" {
 				t.Fatalf("reserve query = %q", r.URL.RawQuery)

@@ -45,10 +45,9 @@ func TestReserveCreateAuthenticatesBeforePlacementOrRouteMutation(t *testing.T) 
 	ctx := context.Background()
 	placements := 0
 	reg := testReg(t)
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	countTestGroupReads(reg).before = func() {
 		placements++
-		return nil, ErrNoNode
-	}))
+	}
 
 	for _, req := range []SandboxReserveRequest{
 		{Operation: ReserveCreate, Group: "/g", RouteKey: "missing"},
@@ -86,7 +85,6 @@ func TestReserveCreateRollbackDoesNotCrossRecreatedLineage(t *testing.T) {
 				)
 
 				reg := testReg(t)
-				reg.SetPlacer(placementWithToken("n1"))
 				if existing {
 					original := testE2BSandboxRecord(group, routeKey, "sb-original", "n1", StatePaused)
 					if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
@@ -97,7 +95,8 @@ func TestReserveCreateRollbackDoesNotCrossRecreatedLineage(t *testing.T) {
 					t.Fatal(err)
 				}
 				commands := make(chan *routesync.Command, 1)
-				reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+				publishTestGroups(t, reg, "n1", "/g")
+				attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 					commands <- cmd
 				}})
 
@@ -309,23 +308,24 @@ func TestReserveConnectRejectRollsPausedStateBackWithoutConsumingGeneration(t *t
 	}
 }
 
-func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.T) {
+func TestReserveConnectMigrationRejectionRetainsOwnershipWithoutRetry(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "sb-migrate", "gone", StatePaused)
 	original.InstanceID, original.StateVersion = "source-parent", 45
-	initialRevision, err := reg.stores.PutSandbox(ctx, original)
+	_, err := reg.stores.PutSandbox(ctx, original)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, nodeID := range []string{"n1", "n2"} {
-		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+		if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, Counts: int(nodeID[1] - '1'), DataEndpoint: nodeID + ":9443"}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var mu sync.Mutex
 	commands := map[string]*routesync.Command{}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		mu.Lock()
 		commands["n1"] = cmd
 		mu.Unlock()
@@ -334,7 +334,8 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 			Reason: "target environment incompatible", HTTPStatus: http.StatusConflict,
 		})
 	}})
-	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n2", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
 		mu.Lock()
 		commands["n2"] = cmd
 		mu.Unlock()
@@ -343,55 +344,31 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 			Connect: testConnectResult(original, cmd.SID),
 		})
 	}})
-	placements := 0
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		placements++
-		has := func(nodeID string) bool {
-			for _, excluded := range req.ExcludeNodeIDs {
-				if excluded == nodeID {
-					return true
-				}
-			}
-			return false
-		}
-		if !has(original.NodeID) {
-			t.Fatalf("placement %d did not exclude original node: %+v", placements, req.ExcludeNodeIDs)
-		}
-		nodeID := "n1"
-		if placements > 1 {
-			if !has("n1") {
-				t.Fatalf("retry did not exclude rejected node: %+v", req.ExcludeNodeIDs)
-			}
-			nodeID = "n2"
-		}
-		return &Placement{NodeID: nodeID, APISecretFingerprint: original.APISecretFingerprint}, nil
-	}))
+	reads := countTestGroupReads(reg)
 	req := testConnectReserve(original)
 	req.MigrationToken = "kmt1.migration-ciphertext"
 	result, err := reg.ReserveSandbox(ctx, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if placements != 2 || result.Connect == nil || result.Route.SandboxID != original.SandboxID ||
-		result.Route.NodeSandboxID != EncodeNodeSandboxID(original.SandboxID, 2) || result.Route.NodeID != "n2" ||
-		result.Route.RouteRevision.Compare(initialRevision) <= 0 {
-		t.Fatalf("migration result=%+v placements=%d", result, placements)
+
+	var rejected *nodeCommandRejection
+	if result != nil || !errors.As(err, &rejected) || rejected.status != http.StatusConflict {
+		t.Fatalf("rejection result=%+v err=%v", result, err)
 	}
 	mu.Lock()
-	n1, n2 := commands["n1"], commands["n2"]
+	first, second := commands["n1"], commands["n2"]
 	mu.Unlock()
-	if n1 == nil || n1.SID != EncodeNodeSandboxID(original.SandboxID, 1) ||
-		n2 == nil || n2.SID != EncodeNodeSandboxID(original.SandboxID, 2) ||
-		n1.Kind != routesync.CmdConnect || n2.Kind != routesync.CmdConnect ||
-		n1.MigrationToken != req.MigrationToken || n2.MigrationToken != req.MigrationToken {
-		t.Fatalf("migration commands: n1=%+v n2=%+v", n1, n2)
+	if reads.calls != 1 || first == nil || second != nil {
+		t.Fatalf("ambiguous rejection retried: reads=%d first=%v second=%v", reads.calls, first != nil, second != nil)
+	}
+	if first.SID != EncodeNodeSandboxID(original.SandboxID, 1) || first.MigrationToken != req.MigrationToken || first.ExpectedGroupVersion != 1 || first.GroupAPIKey != req.APIKey {
+		t.Fatal("migration identity/admission not carried")
 	}
 	stored, _, found, err := reg.stores.GetSandbox(ctx, original.Group, original.RouteKey)
-	if err != nil || !found || stored.State != StateReserved || stored.SandboxGeneration != 2 ||
-		stored.NextSandboxGeneration != 3 || stored.NodeSandboxID != n2.SID || !sameRouteCredentials(stored, original) {
-		t.Fatalf("migration route=%+v found=%v err=%v", stored, found, err)
+	if err != nil || !found || stored.NodeID != original.NodeID || stored.NodeSandboxID != original.NodeSandboxID || stored.NextSandboxGeneration != 2 {
+		t.Fatal("migration rollback changed lineage or forgot allocated generation")
 	}
-	checkMigratedParentProjection(t, reg, original, stored)
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", first.SID); err != nil || !found {
+		t.Fatal("generic rejection dropped cleanup ownership")
+	}
 }
 
 func checkMigratedParentProjection(t *testing.T, reg *Registry, original, target *SandboxRecord) {
@@ -430,29 +407,23 @@ func TestReserveConnectMigrationStopsOnRequestWideNodeRejection(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, nodeID := range []string{"n1", "n2"} {
-				if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+				if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: nodeID, Counts: int(nodeID[1] - '1'), DataEndpoint: nodeID + ":9443"}); err != nil {
 					t.Fatal(err)
 				}
 			}
-			reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+			publishTestGroups(t, reg, "n1", "/g")
+			attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 				go reg.ackCommand(&routesync.CmdAck{
 					CmdID: cmd.CmdID, Status: routesync.AckRejected,
 					Reason: tc.reason, HTTPStatus: tc.status,
 				})
 			}})
 			secondCommands := 0
-			reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(*routesync.Command) {
+			publishTestGroups(t, reg, "n2", "/g")
+			attachTestNode(t, reg, &fakeConn{nodeID: "n2", onCmd: func(*routesync.Command) {
 				secondCommands++
 			}})
-			placements := 0
-			reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-				placements++
-				nodeID := "n1"
-				if placements > 1 {
-					nodeID = "n2"
-				}
-				return &Placement{NodeID: nodeID, APISecretFingerprint: original.APISecretFingerprint}, nil
-			}))
+			reads := countTestGroupReads(reg)
 
 			req := testConnectReserve(original)
 			req.MigrationToken = "kmt1.invalid-for-all-candidates"
@@ -461,8 +432,8 @@ func TestReserveConnectMigrationStopsOnRequestWideNodeRejection(t *testing.T) {
 			if result != nil || !errors.As(err, &rejected) || rejected.status != tc.status || rejected.reason != tc.reason {
 				t.Fatalf("result=%+v err=%v rejection=%+v", result, err, rejected)
 			}
-			if placements != 1 || secondCommands != 0 {
-				t.Fatalf("terminal rejection placements=%d secondCommands=%d, want 1/0", placements, secondCommands)
+			if reads.calls != 1 || secondCommands != 0 {
+				t.Fatalf("terminal rejection reads.calls=%d secondCommands=%d, want 1/0", reads.calls, secondCommands)
 			}
 			stored, _, found, err := reg.stores.GetSandbox(ctx, original.Group, original.RouteKey)
 			if err != nil || !found || stored.NodeID != original.NodeID ||
@@ -485,29 +456,27 @@ func TestReserveConnectMigrationRollbackPreservesPlacementTimeRecord(t *testing.
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		go reg.ackCommand(&routesync.CmdAck{
 			CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "candidate refused",
 		})
 	}})
 
-	placements := 0
-	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
-		placements++
-		if placements > 1 {
-			return nil, ErrNoNode
+	publishTestGroups(t, reg, "n1", "/g")
+	reads := countTestGroupReads(reg)
+	reads.before = func() {
+		if reads.calls != 1 {
+			return
 		}
-		// Placement runs before placeAndConnect re-reads the route. Model a
-		// same-generation lifecycle update committed in that window; a failed
-		// candidate must roll back to this record, not the caller's stale copy.
+		// Change the route after selection starts and before the migration's
+		// route re-read. Rollback must preserve this observed generation.
 		current := *original
 		current.State = StatePaused
 		current.TargetPort = 8088
 		if _, err := reg.stores.PutSandbox(ctx, &current); err != nil {
 			t.Fatal(err)
 		}
-		return &Placement{NodeID: "n1", APISecretFingerprint: original.APISecretFingerprint}, nil
-	}))
+	}
 
 	req := testConnectReserve(original)
 	req.MigrationToken = "kmt1.migration-ciphertext"
@@ -532,21 +501,14 @@ func TestReserveConnectMigratesReservedTargetAfterNodeLoss(t *testing.T) {
 	if err := putTestNode(reg.stores, ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
 		t.Fatal(err)
 	}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+	publishTestGroups(t, reg, "n1", "/g")
+	attachTestNode(t, reg, &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		go reg.ackCommand(&routesync.CmdAck{
 			CmdID: cmd.CmdID, Status: routesync.AckAccepted,
 			Connect: testConnectResult(original, cmd.SID),
 		})
 	}})
-	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
-		for _, nodeID := range req.ExcludeNodeIDs {
-			if nodeID == original.NodeID {
-				return &Placement{NodeID: "n1", APISecretFingerprint: original.APISecretFingerprint}, nil
-			}
-		}
-		t.Fatalf("placement did not exclude lost reserved node: %+v", req.ExcludeNodeIDs)
-		return nil, ErrNoNode
-	}))
+	_ = countTestGroupReads(reg)
 	req := testConnectReserve(original)
 	req.MigrationToken = "kmt1.migration-ciphertext"
 	result, err := reg.ReserveSandbox(ctx, req)

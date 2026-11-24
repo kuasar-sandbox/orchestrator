@@ -1,0 +1,49 @@
+{
+  "case": "C02-public-cluster-legacy-runtime",
+  "public_status": 409,
+  "legacy_reference_unannotated": true,
+  "explicit_template": true,
+  "selected_node": "legacy-incompatible-node",
+  "node_runtime_rejected": true,
+  "captured_runtime": "runtime-v1.bundle",
+  "configured_runtime": "runtime-v2.bundle",
+  "fallback_absent": true,
+  "node_rows": [
+    {
+      "id": "sb-8dfd6e10a6615d2b615b530e76e8f265-g0",
+      "stable_id": "sb-8dfd6e10a6615d2b615b530e76e8f265",
+      "run_id": "",
+      "dead_run_id": "sr-01a20b12-78fa-7024-8893-9d54d0bb3f7f",
+      "state": "dead"
+    }
+  ],
+  "runtime_rejection_lines": 2,
+  "scope": "actual Router, Registry/FDB, NodeLink, Node SQLite and existing runtime preflight; expected rejection before a restored VM becomes ready",
+  "remote_task_id": "4d8a6bf001344e25a513c74f4ec63b28",
+  "host": "bms.dev-x86",
+  "binary_sha256": {
+    "node-ctl": "604dd31bd8ebce33066bcb2fd424294805b27f2f3298262480b5469f0b2ac3e2",
+    "cluster-ctl": "5acdefdb599f718d405fc58a6eb6bd5eb143ccc746fa8a8904e0aed48d92e835",
+    "sandbox-ctl": "b78bfa29b45dc9857157c00eb3087dec8766b7090c27af1e7db6f0d82ac8ab94"
+  },
+  "fixture_sha256": {
+    "cluster-legacy-runtime.sh": "fe731b1645cda6d1645521de079ae8fb26bf00b048f04e3d42e6670f0455e544",
+    "cluster-legacy-runtime.py": "9320483d899c219f0a95108b24bc3152f4461ff6d1399ec0d8c1edeb8c61b18b"
+  },
+  "exit_code": 0,
+  "legacy_capture_sha256": "553db4ae425bd6c5eab32e142780ef6a205657df213b886db9e01400d90157ff",
+  "attempts": [
+    {
+      "task": "3d487df2e7504d39b9069672ae689626",
+      "result": "fixture failure: legacy location did not match the existing sharded location resolver; no runtime-rejection conclusion"
+    },
+    {
+      "task": "13bcc013aad240f186b8a2c507f1b97f",
+      "result": "pass after mapping the external location to the original artifact graph without changing artifacts"
+    },
+    {
+      "task": "4d8a6bf001344e25a513c74f4ec63b28",
+      "result": "pass with the checked-in reusable helper, explicit nonempty Node-row assertion and private response-file permissions"
+    }
+  ]
+}

@@ -18,8 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -704,6 +706,21 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 			sandboxcfg.NsCredentials:       `{"envd_access_token":"envd-override","traffic_access_token":"traffic-override"}`,
 		},
 	}
+	t.Cleanup(node.closeGroups)
+	core, _, err := node.groupService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := hex.DecodeString(apiSecret)
+	create.GroupAPIKey, err = apikey.Mint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := core.GroupPut(t.Context(), create.GroupAPIKey, "/g", nodegroup.PutRequest{Context: nodegroup.Context{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	create.ExpectedGroupVersion = group.Version
 	if got := node.HandleCommand(context.Background(), create); got.Status != routesync.AckAccepted {
 		t.Fatalf("create ack = %+v", got)
 	}
@@ -747,9 +764,10 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 
 	build := &routesync.Command{
 		CmdID: "build-1", Kind: routesync.CmdBuildRegister, BuildID: "b1",
+		GroupAPIKey: create.GroupAPIKey, ExpectedGroupVersion: group.Version,
 		TemplateRef: "template-1", Profile: "bare", APISecretFingerprint: apiSecretFingerprint,
 		BuildResources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
-		Config:         map[string]string{"stub.build_result": "timeout"},
+		Config:         map[string]string{"stub.build_result": "timeout", clusterstate.ObjectMetadataKey: `{"group":"/g"}`},
 	}
 	if got := node.HandleCommand(context.Background(), build); got.Status != routesync.AckAccepted {
 		t.Fatalf("build_register ack = %+v", got)
@@ -990,7 +1008,7 @@ func TestStubCreateRejectsUnavailableAPISecretMaterial(t *testing.T) {
 		APISecretFingerprint: apiFingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", StableID: "stable-sandbox"},
 	}
-	got := node.HandleCommand(context.Background(), create)
+	got := node.handleCreate(create)
 	if got.Status != routesync.AckRejected || got.Reason != "API secret material unavailable" {
 		t.Fatalf("ref-backed create ack = %+v", got)
 	}

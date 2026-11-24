@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-func newTestStores() *Stores {
-	stores, err := NewStores(metadatastore.New().Repositories(), metadatastore.Owners{ID: "registry"})
+func newTestStores(t testing.TB) *Stores {
+	stores, err := NewStores(metadatastore.New(t).Repositories(), metadatastore.Owners{ID: "registry"})
 	if err != nil {
 		panic(err)
 	}
@@ -18,7 +18,7 @@ func newTestStores() *Stores {
 }
 func newTestStoreCluster(t *testing.T, members []string, routeOwners, nodeOwners, scaleOwners, nodeListOwners int) map[string]*Stores {
 	t.Helper()
-	db := metadatastore.New()
+	db := metadatastore.New(t)
 	out := map[string]*Stores{}
 	for _, id := range members {
 		s, err := NewStores(db.Repositories(), metadatastore.Owners{ID: id, Members: members, Count: nodeOwners})

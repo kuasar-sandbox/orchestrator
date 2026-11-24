@@ -67,10 +67,10 @@ func TestListAlwaysEnforcesAPIKey(t *testing.T) {
 	var verifyHits, listHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/verify-key":
+		case "/route-link/v2/verify-key":
 			verifyHits++
 			w.WriteHeader(http.StatusForbidden)
-		case "/route-link/list":
+		case "/route-link/v2/list":
 			listHits++
 			_, _ = io.WriteString(w, "[]")
 		default:
@@ -100,7 +100,7 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 	var routeKeys []string
 	var results []reserveResult
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/route-link/reserve" {
+		if r.URL.Path != "/route-link/v2/reserve" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -189,7 +189,7 @@ func TestConnectUsesOperationAwareReserveAndShapesStableResponse(t *testing.T) {
 			nodeHost := strings.TrimPrefix(node.URL, "http://")
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/reserve":
+				case "/route-link/v2/reserve":
 					reserveHits++
 					query := r.URL.Query()
 					if query.Get("operation") != "connect" || query.Get("group") != "/g" ||
@@ -203,10 +203,10 @@ func TestConnectUsesOperationAwareReserveAndShapesStableResponse(t *testing.T) {
 						t.Fatalf("connect reserve body=%q err=%v, want empty", body, err)
 					}
 					_ = json.NewEncoder(w).Encode(routerTestConnectReserveResult(t, "sb-1", "/g", "rk", nodeHost, tc.profile))
-				case "/route-link/route":
+				case "/route-link/v2/data-route", "/route-link/v2/control-route":
 					routeHits++
 					w.WriteHeader(http.StatusInternalServerError)
-				case "/route-link/verify-key":
+				case "/route-link/v2/verify-key":
 					t.Fatal("connect performed a separate verify-key call")
 				default:
 					w.WriteHeader(http.StatusNotFound)
@@ -286,7 +286,7 @@ func TestConnectRejectsInconsistentReserveResult(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/route-link/reserve" {
+				if r.URL.Path != "/route-link/v2/reserve" {
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
@@ -322,7 +322,7 @@ func TestConnectRejectsInconsistentReserveResult(t *testing.T) {
 func TestConnectRejectsOversizedMigrationTokenBeforeReserve(t *testing.T) {
 	var reserveHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/reserve" {
+		if r.URL.Path == "/route-link/v2/reserve" {
 			reserveHits++
 		}
 		w.WriteHeader(http.StatusInternalServerError)
@@ -422,7 +422,7 @@ func TestConnectBoundsAndValidatesRequestBody(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var reserveHits int
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/route-link/reserve" {
+				if r.URL.Path != "/route-link/v2/reserve" {
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
@@ -452,7 +452,7 @@ func TestConnectBoundsAndValidatesRequestBody(t *testing.T) {
 func TestConnectPropagatesRouteLinkMigrationRejection(t *testing.T) {
 	var reserveHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/route-link/reserve" {
+		if r.URL.Path != "/route-link/v2/reserve" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -499,10 +499,10 @@ func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits++
 			_ = json.NewEncoder(w).Encode(routerTestReserveResult(t, "wrong", "/g", "rk", nodeHost, types.ProfileE2B))
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			routeHits++
 			_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B))
 		default:
@@ -556,7 +556,7 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 	}))
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/route-link/route" {
+		if r.URL.Path != "/route-link/v2/data-route" && r.URL.Path != "/route-link/v2/control-route" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -641,7 +641,7 @@ func TestServeDataForwardTokenByProfile(t *testing.T) {
 			nodeHost := strings.TrimPrefix(node.URL, "http://")
 			route := routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, profile)
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/route-link/route" {
+				if r.URL.Path != "/route-link/v2/data-route" && r.URL.Path != "/route-link/v2/control-route" {
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
@@ -691,11 +691,11 @@ func TestServeDataRejectsInvalidSignedFileBeforeReserve(t *testing.T) {
 	var reserveHits int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			route := routerTestRouteResolve(t, "sb-1", "/g", "rk", "", types.ProfileE2B)
 			route.State = "paused"
 			_ = json.NewEncoder(w).Encode(route)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			atomic.AddInt32(&reserveHits, 1)
 			w.WriteHeader(http.StatusServiceUnavailable)
 		default:
@@ -737,9 +737,9 @@ func TestServeDataSignedFileExplicitBadTokenNeverFallsBackWhenAuthOff(t *testing
 	paused.State = "paused"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(paused)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			atomic.AddInt32(&reserveHits, 1)
 			_ = json.NewEncoder(w).Encode(routerTestReserveResult(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B))
 		default:
@@ -791,9 +791,9 @@ func TestServeDataPausedUsesOperationAwareReserve(t *testing.T) {
 	paused.State = "paused"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(paused)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			atomic.AddInt32(&reserveHits, 1)
 			query := r.URL.Query()
 			if query.Get("operation") != "data" || query.Get("group") != "/g" ||
@@ -856,9 +856,9 @@ func TestServeDataPausedSignedFileUsesEnvdTokenOnlyOutside(t *testing.T) {
 	paused.State = "paused"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(paused)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			if r.URL.Query().Get("operation") != "data" || r.URL.Query().Get("port") != "49983" {
 				t.Fatalf("signed data reserve query=%q", r.URL.RawQuery)
 			}
@@ -910,9 +910,9 @@ func TestServeDataForwardsKnownTargetReturnedByFallbackReserve(t *testing.T) {
 	paused.State = "paused"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(paused)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			result := routerTestReserveResult(t, "sb-1", "/g", "rk", nodeHost, types.ProfileBare)
 			result.Route.State = "paused"
 			_ = json.NewEncoder(w).Encode(result)
@@ -958,9 +958,9 @@ func TestServeDataKnownNonReadyTargetSkipsReserve(t *testing.T) {
 			route.State = state
 			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/route-link/route":
+				case "/route-link/v2/data-route", "/route-link/v2/control-route":
 					_ = json.NewEncoder(w).Encode(route)
-				case "/route-link/reserve":
+				case "/route-link/v2/reserve":
 					reserveHits.Add(1)
 					http.Error(w, "must not reserve a known target", http.StatusInternalServerError)
 				default:
@@ -1021,9 +1021,9 @@ func TestServeDataTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	freshRoute.RouteRevision = routeVersionForTest(2, 0)
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(staleRoute)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			reserveHits.Add(1)
 			if r.URL.Query().Get("operation") != "data" || r.URL.Query().Get("port") != "8080" {
 				t.Fatalf("reserve query=%q", r.URL.RawQuery)
@@ -1070,9 +1070,9 @@ func TestServeDataRejectsReserveIdentityChange(t *testing.T) {
 	paused.State = "paused"
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			_ = json.NewEncoder(w).Encode(paused)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			atomic.AddInt32(&reserveHits, 1)
 			_ = json.NewEncoder(w).Encode(routerTestReserveResult(t, "sb-recreated", "/g", "rk", nodeHost, types.ProfileBare))
 		default:
@@ -1110,7 +1110,7 @@ func TestServeDataRejectsReserveIdentityChange(t *testing.T) {
 func TestServeDataNonSandboxHostDoesNotReserve(t *testing.T) {
 	var reserveHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/reserve" {
+		if r.URL.Path == "/route-link/v2/reserve" {
 			reserveHits++
 		}
 		w.WriteHeader(http.StatusOK)
@@ -1144,10 +1144,10 @@ func TestServeDataUnknownSandboxReturnsNotFoundWithoutReserve(t *testing.T) {
 	var reserveHits int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
+		case "/route-link/v2/data-route", "/route-link/v2/control-route":
 			atomic.AddInt32(&routeHits, 1)
 			http.Error(w, "sandbox not found", http.StatusNotFound)
-		case "/route-link/reserve":
+		case "/route-link/v2/reserve":
 			atomic.AddInt32(&reserveHits, 1)
 			w.WriteHeader(http.StatusServiceUnavailable)
 		default:
@@ -1190,11 +1190,11 @@ func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/verify-key" {
+		if r.URL.Path == "/route-link/v2/verify-key" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		if r.URL.Path != "/route-link/route" {
+		if r.URL.Path != "/route-link/v2/data-route" && r.URL.Path != "/route-link/v2/control-route" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}

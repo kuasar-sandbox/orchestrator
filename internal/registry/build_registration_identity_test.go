@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -37,7 +38,7 @@ func TestBuildOldRegistrationACKCannotAcceptReplacement(t *testing.T) {
 	defer cancel()
 	r := testReg(t)
 	seedTestNode(t, r.stores, "n1")
-	r.SetPlacer(placementWithToken("n1"))
+	publishTestGroups(t, r, "n1", "/g")
 	o := &identityBarrierOwner{dispatch: make(chan identityBuildDispatch, 2)}
 	r.SetNodeOwner(o)
 	type result struct {
@@ -46,7 +47,7 @@ func TestBuildOldRegistrationACKCannotAcceptReplacement(t *testing.T) {
 	}
 	finished := make(chan result, 2)
 	register := func() {
-		res, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+		res, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 		finished <- result{res, err}
 	}
 	go register()
@@ -82,7 +83,7 @@ func TestBuildOldRegistrationRejectionCannotDeleteReplacement(t *testing.T) {
 	defer cancel()
 	r := testReg(t)
 	seedTestNode(t, r.stores, "n1")
-	r.SetPlacer(placementWithToken("n1"))
+	publishTestGroups(t, r, "n1", "/g")
 	o := &identityBarrierOwner{dispatch: make(chan identityBuildDispatch, 2)}
 	r.SetNodeOwner(o)
 	type result struct {
@@ -91,7 +92,7 @@ func TestBuildOldRegistrationRejectionCannotDeleteReplacement(t *testing.T) {
 	}
 	finished := make(chan result, 2)
 	register := func() {
-		res, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+		res, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 		finished <- result{res, err}
 	}
 	go register()
@@ -128,9 +129,9 @@ func TestBuildStaleReplayRefreshCannotReplaceNewOwnerRef(t *testing.T) {
 	ctx := context.Background()
 	r := testReg(t)
 	seedTestNode(t, r.stores, "n1")
-	r.SetPlacer(placementWithToken("n1"))
+	publishTestGroups(t, r, "n1", "/g")
 	r.SetNodeOwner(&recordingNodeOwner{})
-	old, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+	old, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +143,7 @@ func TestBuildStaleReplayRefreshCannotReplaceNewOwnerRef(t *testing.T) {
 	if err := testApplyBuildDelete(r, ctx, "n1", "reused", old.TemplateID); err != nil {
 		t.Fatal(err)
 	}
-	next, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+	next, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +164,23 @@ func TestBuildStaleReplayRefreshCannotReplaceNewOwnerRef(t *testing.T) {
 
 type delayedPlacementKey struct{}
 
+type delayedBuildIntent struct {
+	metadata.BuildRepository
+	entered, release chan struct{}
+}
+
+func (b *delayedBuildIntent) CommitGroupRegistrationIntent(ctx context.Context, record metadata.BuildRecord, ref metadata.NodeBuildRef, admission metadata.GroupAdmission) (metadata.Version, error) {
+	if ctx.Value(delayedPlacementKey{}) != nil {
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return metadata.Version{}, ctx.Err()
+		}
+	}
+	return b.BuildRepository.CommitGroupRegistrationIntent(ctx, record, ref, admission)
+}
+
 func TestBuildLatePlacementCannotEraseAcceptedSuccessor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -170,27 +188,19 @@ func TestBuildLatePlacementCannotEraseAcceptedSuccessor(t *testing.T) {
 	seedTestNode(t, r.stores, "n1")
 	r.SetNodeOwner(&recordingNodeOwner{})
 	entered, release := make(chan struct{}), make(chan struct{})
-	first := true
-	base := placementWithToken("n1")
-	r.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
-		if ctx.Value(delayedPlacementKey{}) != nil && first {
-			first = false
-			close(entered)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		return base.Place(ctx, req)
-	}))
+	publishTestGroups(t, r, "n1", "/g")
+	r.stores.builds = &delayedBuildIntent{BuildRepository: r.stores.builds, entered: entered, release: release}
 	done := make(chan error, 1)
 	go func() {
-		_, err := r.ReserveBuild(context.WithValue(ctx, delayedPlacementKey{}, true), BuildReserveReq{Group: "/g", BuildID: "reused", TemplateID: "transient-delayed", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+		_, err := r.ReserveBuild(context.WithValue(ctx, delayedPlacementKey{}, true), BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", TemplateID: "transient-delayed", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 		done <- err
 	}()
-	<-entered
-	replacement, err := r.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "reused", TemplateID: "transient-replacement", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("intent commit was not reached")
+	}
+	replacement, err := r.ReserveBuild(ctx, BuildReserveReq{APIKey: testAPIKeyValue(), Group: "/g", BuildID: "reused", TemplateID: "transient-replacement", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatal(err)
 	}

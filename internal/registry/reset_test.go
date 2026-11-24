@@ -25,7 +25,7 @@ func TestResetTerminalManagementAndCreateFences(t *testing.T) {
 				t.Fatal(err)
 			}
 			ref := testNodeSandboxRef("/g", "rk", "retained", "e2b", testAPIFingerprint)
-			if err := r.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+			if err := addTestSandboxRef(t, r.stores, ctx, "n1", ref); err != nil {
 				t.Fatal(err)
 			}
 			resolved, found, err := r.ResolveSID(ctx, "/g", "rk", "retained")
@@ -38,7 +38,7 @@ func TestResetTerminalManagementAndCreateFences(t *testing.T) {
 			if err := r.startReserve(ctx, "/g", "rk", record, rev, true, nil, nil, true, false); !errors.Is(err, ErrReserveConflict) {
 				t.Fatalf("reserve bypassed terminal owner: %v", err)
 			}
-			if err := r.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false); !errors.Is(err, ErrReserveConflict) {
+			if err := r.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true, false, createOptions{apiKey: testAPIKeyValue()}); !errors.Is(err, ErrReserveConflict) {
 				t.Fatalf("placement bypassed terminal owner: %v", err)
 			}
 			// Node disappearance does not turn retained local data into a new owner.
@@ -69,7 +69,7 @@ func TestResetProjectionRejectsOldRunAndAcceptsCommittedPaused(t *testing.T) {
 	if _, err := r.stores.PutSandbox(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/g", "rk", "s1", "e2b", testAPIFingerprint)); err != nil {
+	if err := addTestSandboxRef(t, r.stores, ctx, "n1", testNodeSandboxRef("/g", "rk", "s1", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {

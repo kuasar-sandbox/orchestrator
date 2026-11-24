@@ -243,8 +243,9 @@ func ValidLocalSandboxID(id string) bool {
 }
 
 const (
-	MaxPortableRefBytes = 256
-	MaxTemplateIDBytes  = len("bare-snp-") + (MaxPortableRefBytes*4+2)/3
+	MaxPortableBaseRefBytes = 256
+	MaxPortableRefBytes     = MaxPortableBaseRefBytes + manifest.MaxRuntimeAnnotationBytes
+	MaxTemplateIDBytes      = len("bare-snp-") + (MaxPortableRefBytes*4+2)/3
 )
 
 // TemplateID is self-describing as <profile>-<kind>-<base64url(ref)>.
@@ -291,6 +292,9 @@ func ParseTemplateID(s string) (TemplateID, error) {
 	if err != nil {
 		return TemplateID{}, fmt.Errorf("templateID %q: %w", s, err)
 	}
+	if t.Kind != KindSnp && !ref.Runtime.IsZero() {
+		return TemplateID{}, fmt.Errorf("templateID %q: only snp references may declare a runtime", s)
+	}
 	if ref.Scheme == manifest.RefSchemeFile {
 		if t.Kind == KindImg &&
 			!strings.HasSuffix(ref.Path, ".image") && !strings.HasSuffix(ref.Path, ".bundle") {
@@ -323,6 +327,9 @@ func ParsePortableRef(raw string) (manifest.Ref, error) {
 	}
 	if !ref.Portable() || ref.String() != raw {
 		return manifest.Ref{}, fmt.Errorf("portable ref %q is not canonical and portable", raw)
+	}
+	if len(ref.Base().String()) > MaxPortableBaseRefBytes {
+		return manifest.Ref{}, fmt.Errorf("portable base ref exceeds %d bytes", MaxPortableBaseRefBytes)
 	}
 	return ref, nil
 }

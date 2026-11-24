@@ -8,6 +8,7 @@
 //	                                                                    # in-unit launchers (not for humans)
 //	node-ctl config <conductor|proxy|telemetry> [--template|--config PATH[:PATH...]|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
+//	node-ctl group apply --socket PATH -f FILE_OR_DIRECTORY    # explicit Group CAS through the business API
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain|pressure>                      # node reservation controller inspection (hosted in serve via resource_listen)
 //	node-ctl builder status                                    # durable Builder admission status (admin socket)
@@ -85,6 +86,8 @@ func main() {
 		err = manifestKeyCmd(os.Args[2:], log)
 	case "workspace":
 		err = workspaceCmd(os.Args[2:])
+	case "group":
+		err = groupCmd(os.Args[2:], os.Stdout)
 	case "export-sandbox":
 		err = exportSandboxCmd(os.Args[2:], log)
 	case "import-sandbox":
@@ -105,7 +108,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|workspace|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|workspace|group|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder|version} [args]")
 	os.Exit(2)
 }
 

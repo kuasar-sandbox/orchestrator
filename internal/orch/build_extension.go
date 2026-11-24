@@ -332,6 +332,7 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		Credentials          *sandboxcfg.Credentials
 		WorkspaceDigest      string `json:",omitempty"`
 		MMDSSecrets          map[string]string
+		GroupVersion         int64 `json:",omitempty"`
 	}
 	workspaceDigest, err := workspace.InputDigest(command.Workspaces)
 	if err != nil {
@@ -345,6 +346,7 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		Env: cloneStringMap(command.BuildEnv), Secure: command.BuildSecure,
 		Credentials: command.BuildCredentials,
 		MMDSSecrets: cloneStringMap(command.BuildMMDSSecrets), WorkspaceDigest: workspaceDigest,
+		GroupVersion: command.ExpectedGroupVersion,
 	})
 	if err != nil {
 		return "", fmt.Errorf("build_register: encode request identity: %w", err)

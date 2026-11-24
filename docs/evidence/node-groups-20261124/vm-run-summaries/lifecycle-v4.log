@@ -1,0 +1,6 @@
+PASS: WebSocket handshake, buffered text/binary, ping/pong and half-close tail
+==> PASS: cluster Pause(memory=false) produced wakeable E; stable-SID exec cold-resumed it with traffic parking -> idle
+==> PASS: explicit create -> SID route -> real envd /health (204)
+==> PASS: cluster stats control path returned current VMM memory/CPU with the resource controller disabled
+==> PASS: sandbox delete converged through route_link and node-local finalizer
+PASS orchestrator.cluster-lifecycle.sh

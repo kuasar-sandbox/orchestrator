@@ -500,6 +500,9 @@ func (a *API) WithMetricsProxy(handler http.Handler) *API {
 // Handler returns the routed http.Handler for api.<domain>.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	for _, method := range []string{"GET", "PUT", "DELETE"} {
+		mux.HandleFunc(method+" /groups", a.authAPIKey(a.groups))
+	}
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
 	mux.HandleFunc("POST /sandboxes", a.auth(a.create))
 	mux.HandleFunc("GET /sandboxes/{id}", a.auth(a.get))

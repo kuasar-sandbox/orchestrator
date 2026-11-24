@@ -6,12 +6,6 @@ import (
 	"sort"
 )
 
-type noPlacer struct{}
-
-func (noPlacer) Place(context.Context, PlaceRequest) (*Placement, error) {
-	return nil, ErrNoNode
-}
-
 type placementExclusions map[string]struct{}
 
 func (e placementExclusions) has(nodeID string) bool {

@@ -34,6 +34,20 @@ type Store struct {
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS node_group_sequence (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>=0));
+INSERT OR IGNORE INTO node_group_sequence(id,revision) VALUES(1,0);
+CREATE TABLE IF NOT EXISTS node_groups (
+  name TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  active INTEGER NOT NULL CHECK(active IN (0,1)),
+  owner_hash TEXT NOT NULL,
+  api_secret_enc TEXT NOT NULL DEFAULT '',
+  manifest_key_hash TEXT NOT NULL DEFAULT '',
+  manifest_key_enc TEXT NOT NULL DEFAULT '',
+  context_enc TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_node_groups_owner ON node_groups(owner_hash,name);
+CREATE INDEX IF NOT EXISTS idx_node_groups_candidate ON node_groups(substr(owner_hash,1,24),name);
 CREATE TABLE IF NOT EXISTS run_pool_ownership (run_id TEXT PRIMARY KEY, ownership TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_pool_pressure (name TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_recovery_placement (sandbox_id TEXT PRIMARY KEY, placement TEXT NOT NULL);
@@ -2289,6 +2303,29 @@ type KeyPairInfo struct {
 // never expires. Empty label or registryAuthJSON retains the existing value on a
 // refresh. It returns true only when a new row was inserted.
 func (s *Store) AddKeyPair(ctx context.Context, pair KeyPair, label string, ttlSec int64, registryAuthJSON string) (bool, error) {
+	var expires int64
+	if ttlSec > 0 {
+		expires = time.Now().Unix() + ttlSec
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	added, err := s.addKeyPairTx(ctx, tx, pair, label, expires, registryAuthJSON, false)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: add key pair commit: %w", err)
+	}
+	return added, nil
+}
+
+// addKeyPairTx shares the exact-pair checks with Group maintenance. Only the
+// combined Group operation requests extendOnly; standalone key_put retains its
+// established expiry replacement semantics. This helper never commits.
+func (s *Store) addKeyPairTx(ctx context.Context, tx *sql.Tx, pair KeyPair, label string, expires int64, registryAuthJSON string, extendOnly bool) (bool, error) {
 	apiHash, apiEnc, err := s.encSecret("API secret", pair.APISecret)
 	if err != nil {
 		return false, err
@@ -2297,10 +2334,6 @@ func (s *Store) AddKeyPair(ctx context.Context, pair KeyPair, label string, ttlS
 	if err != nil {
 		return false, err
 	}
-	var expires int64
-	if ttlSec > 0 {
-		expires = time.Now().Unix() + ttlSec
-	}
 	var registryAuthEnc string
 	if registryAuthJSON != "" {
 		registryAuthEnc, err = s.box.EncryptString(registryAuthJSON)
@@ -2308,12 +2341,6 @@ func (s *Store) AddKeyPair(ctx context.Context, pair KeyPair, label string, ttlS
 			return false, err
 		}
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx, `
 INSERT INTO manifest_keys
@@ -2329,9 +2356,6 @@ ON CONFLICT(api_secret_hash) DO NOTHING`,
 		return false, fmt.Errorf("store: add key pair rows affected: %w", err)
 	}
 	if inserted == 1 {
-		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("store: add key pair commit: %w", err)
-		}
 		return true, nil
 	}
 
@@ -2351,15 +2375,12 @@ ON CONFLICT(api_secret_hash) DO NOTHING`,
 
 	if _, err := tx.ExecContext(ctx, `
 UPDATE manifest_keys SET
-  expires_unix=?,
+	  expires_unix=CASE WHEN ? AND (expires_unix=0 OR (?<>0 AND expires_unix>?)) THEN expires_unix ELSE ? END,
   label=CASE WHEN ?='' THEN label ELSE ? END,
   registry_auth_enc=CASE WHEN ?='' THEN registry_auth_enc ELSE ? END
 WHERE api_secret_hash=?`,
-		expires, label, label, registryAuthJSON, registryAuthEnc, apiHash); err != nil {
+		extendOnly, expires, expires, expires, label, label, registryAuthJSON, registryAuthEnc, apiHash); err != nil {
 		return false, fmt.Errorf("store: refresh key pair: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("store: refresh key pair commit: %w", err)
 	}
 	return false, nil
 }

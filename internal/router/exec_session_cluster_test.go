@@ -20,7 +20,7 @@ import (
 func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 	var reserveHits atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/route-link/reserve" {
+		if r.URL.Path != "/route-link/v2/reserve" {
 			t.Fatalf("route-link path = %q", r.URL.Path)
 		}
 		reserveHits.Add(1)
@@ -91,8 +91,8 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 		t.Fatalf("public response = %#v", payload)
 	}
 	cached := rt.cachedRoute("/g", "rk", "stable")
-	if cached == nil || cached.NodeSandboxID != "stable-g3" || cached.State != "reserved" || cached.RouteRevision != routeVersionForTest(9, 0) {
-		t.Fatalf("cached current route = %+v", cached)
+	if cached != nil {
+		t.Fatalf("control projection entered the data route cache: %+v", cached)
 	}
 }
 

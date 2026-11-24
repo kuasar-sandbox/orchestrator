@@ -40,20 +40,19 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
 	if c.RouteLink.ParkTimeout != "30s" || c.FoundationDB.ClusterFile != "/etc/foundationdb/fdb.cluster" || c.FoundationDB.Prefix != "kuasar-sandbox/cluster/" ||
-		c.PlacerLink.PlaceTimeout != "2s" {
+		c.PlacerLink.PlacerLabel != "placer.default" {
 		t.Fatalf("link defaults not filled: route=%+v foundationdb=%+v scale=%+v", c.RouteLink, c.FoundationDB, c.PlacerLink)
 	}
 }
 
 func TestLoadPlacerPartialAppliesDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "placer.yaml")
-	os.WriteFile(path, []byte("placement:\n  candidates: 3\n"), 0o600)
+	os.WriteFile(path, []byte("placement:\n  import_source_owner_count: 3\n"), 0o600)
 	c, err := LoadPlacer(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if c.Placement.Candidates != 3 || c.Placement.ZoneAdmitMax != "yellow" ||
-		c.Placement.ImportSourceOwnerCount != 3 || c.Placement.ImportSourceLeaseTTL != "15s" || c.Placement.SelectorPatchRefresh != "1m" {
+	if c.Placement.ImportSourceOwnerCount != 3 || c.Placement.ImportSourceLeaseTTL != "15s" || c.Placement.ImportRefresh != "1m" {
 		t.Fatalf("placement merge wrong: %+v", c.Placement)
 	}
 	if c.Registry.Bootstrap == "" {

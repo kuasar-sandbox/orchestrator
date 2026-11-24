@@ -143,19 +143,19 @@ start_cluster_control_plane
 NODE_ID=real-node-1
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair
-PLACER_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/placer_readiness.py" \
-    --url "http://127.0.0.1:$PLACER_PORT" --group "$GROUP" --expected-node "$NODE_ID" \
-    --route-key "$ROUTE_KEY" --registry-url "http://127.0.0.1:$CONTROL_PORT"
+GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" \
+    --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" \
+    --registry-url "http://127.0.0.1:$CONTROL_PORT"
 run_cluster_flow
 # Prove Build ownership routing through the group, then recover retained status
-# through an empty Router cache. New writes wait for the current placer view.
+# through an empty Router cache. New writes wait for Group import/authentication.
 PYTHONPATH="$SCRIPT_DIR" BUILD_ACTION_API_KEY="$CLUSTER_API_KEY" python3 - \
     --url "http://127.0.0.1:$ROUTER_PORT" --host "api.$DOMAIN" --group "$GROUP" \
     --db "$WORK/cl/node-ctl.db" --run-root "$WORK/cr" --base-root "$WORK/cl" \
     --socket "$WORK/cn.sock" --bin "$BIN" --switch "$SWITCH" --conductor-pid "$CLUSTER_CONDUCTOR_PID" \
     --source "$TEMPLATE_REF" --evidence "$WORK/build-actions.json" \
     --restart-request "$WORK/restart-request" --restart-ready "$WORK/restart-ready" \
-    --placer-url "http://127.0.0.1:$PLACER_PORT" --expected-node "$NODE_ID" \
+    --node-url "http://127.0.0.1:$NODE_PORT" \
     --registry-url "http://127.0.0.1:$CONTROL_PORT" <<'PY_CLUSTER_BUILD' &
 from build_client import *
 args = configure()

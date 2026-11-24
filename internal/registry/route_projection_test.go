@@ -1,237 +1,81 @@
 package registry
 
 import (
-	"bytes"
-	"context"
-	"errors"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 )
 
-type routeProjectionFaults struct {
-	metadata.RouteRepository
-	reportErr, deleteErr error
-	reportFailures       int
-	commitBeforeError    bool
-	beforeReport         func()
-	reports, deletes     int
-	registrations        []metadata.Registration
-	refs                 []metadata.NodeSandboxRef
-}
-
-func (f *routeProjectionFaults) ApplyRouteReport(ctx context.Context, registration metadata.Registration, ref metadata.NodeSandboxRef, event routesync.RouteEntry) (metadata.RouteReportResult, error) {
-	f.reports++
-	f.registrations = append(f.registrations, registration)
-	f.refs = append(f.refs, ref)
-	if f.beforeReport != nil {
-		before := f.beforeReport
-		f.beforeReport = nil
-		before()
+func TestRouteV2SeparatesObjectControlAndProtectedData(t *testing.T) {
+	r := New(newTestStores(t), time.Second, nil)
+	raw, _ := hex.DecodeString(testAPISecret)
+	key, err := apikey.Mint(raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	fail := f.reportErr != nil && (f.reportFailures < 0 || f.reports <= f.reportFailures)
-	if fail && !f.commitBeforeError {
-		return metadata.RouteReportResult{}, f.reportErr
+	entry := nodegroup.Entry{AuthRef: testAPIFingerprint, AuthMaterial: nodegroup.AuthMaterial{APISecret: testAPISecret}}
+	reg := reportRegistryGroup(t, r, "node", nil, nodegroup.Support{Group: "g", Version: 1, Entries: []nodegroup.Entry{entry}})
+	r.SetNodeOwner(&recordingNodeOwner{})
+	rec := testE2BSandboxRecord("g", "rk", "sb-object", "node", StateReady)
+	rec.GroupVersion, rec.TemplateSource, rec.CreateTemplateID = 1, "explicit", testTemplateRef
+	if _, err := r.stores.PutSandbox(t.Context(), rec); err != nil {
+		t.Fatal(err)
 	}
-	result, err := f.RouteRepository.ApplyRouteReport(ctx, registration, ref, event)
-	if err != nil || !fail {
-		return result, err
+	if err := r.stores.groups.ApplyGroupSupport(t.Context(), reg, 2, nil, "g"); err != nil {
+		t.Fatal(err)
 	}
-	return metadata.RouteReportResult{}, f.reportErr
-}
-
-func (f *routeProjectionFaults) ApplyRouteDelete(ctx context.Context, registration metadata.Registration, expected metadata.Version, ref metadata.NodeSandboxRef, restore *metadata.SandboxRecord) error {
-	f.deletes++
-	if f.deleteErr != nil && !f.commitBeforeError {
-		return f.deleteErr
+	mux := http.NewServeMux()
+	r.ServeRouteLink(mux)
+	request := func(path, apiKey string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path+"?group=g&route_key=rk&sid=sb-object", nil)
+		if apiKey != "" {
+			req.Header.Set("X-API-KEY", apiKey)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
 	}
-	if err := f.RouteRepository.ApplyRouteDelete(ctx, registration, expected, ref, restore); err != nil {
-		return err
+	for _, path := range []string{RouteLinkControlRoutePath, RouteLinkListPath} {
+		if w := request(path, ""); w.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated control=%d %s", w.Code, w.Body.String())
+		}
+		if w := request(path, key); w.Code != http.StatusOK {
+			t.Fatalf("retained object inaccessible after Group withdrawal: %d %s", w.Code, w.Body.String())
+		}
 	}
-	return f.deleteErr
-}
-
-func TestRouteReportConflictReevaluatesSameReport(t *testing.T) {
-	for _, state := range []string{routesync.StateRunning, routesync.StatePaused} {
-		t.Run(state, func(t *testing.T) {
-			reg, _ := registryWithTypedFixture(t)
-			ctx := t.Context()
-			route := testSandboxIdentityRecord("/g", "report-conflict", "sb-report", "n1", StateReserved)
-			if _, ok, err := reg.stores.commitSandboxIntent(ctx, route, metadata.Version{}); err != nil || !ok {
-				t.Fatalf("seed: %v %v", ok, err)
-			}
-			call := &reserveCall{done: make(chan struct{}), expectedSandboxID: route.SandboxID}
-			reg.inflight[flightKey(route.Group, route.RouteKey)] = call
-			faults := &routeProjectionFaults{RouteRepository: reg.stores.routes, reportErr: metadata.ErrConflict, reportFailures: 1}
-			faults.beforeReport = func() {
-				// A concurrent settings update invalidates the report's first
-				// pinned version without changing its stream or sandbox identity.
-				next := *route
-				next.AutoReset = true
-				if _, err := reg.stores.PutSandbox(ctx, &next); err != nil {
-					t.Fatal(err)
-				}
-			}
-			reg.stores.routes = faults
-			event := testE2BRoute(route.SandboxID, state)
-			if err := reg.applyRoute(testNodeSession(ctx, reg.stores, "n1"), "n1", &event); err != nil {
-				t.Fatal(err)
-			}
-			if faults.reports != 2 || faults.registrations[0] != faults.registrations[1] || faults.refs[0] != faults.refs[1] {
-				t.Fatalf("retry changed authority: calls=%d registrations=%+v refs=%+v", faults.reports, faults.registrations, faults.refs)
-			}
-			actual, _, found, err := reg.stores.GetSandbox(ctx, route.Group, route.RouteKey)
-			want := StateReady
-			if state == routesync.StatePaused {
-				want = StatePaused
-			}
-			if err != nil || !found || actual.State != want || !actual.AutoReset {
-				t.Fatalf("report lost concurrent settings: %+v %v %v", actual, found, err)
-			}
-			if want == StateReady {
-				select {
-				case <-call.done:
-					if call.err != nil || call.result == nil || call.result.Route.SandboxID != route.SandboxID {
-						t.Fatalf("READY waiter: %+v %v", call.result, call.err)
-					}
-				default:
-					t.Fatal("committed READY did not finish waiter")
-				}
-			}
-		})
+	control := request(RouteLinkControlRoutePath, key)
+	data := request(RouteLinkRoutePath, "") // Signed file URL lookup has no APIKey/access token.
+	if data.Code != http.StatusOK {
+		t.Fatalf("data lookup=%d %s", data.Code, data.Body.String())
 	}
-}
-
-// serveProjectionStream runs the real node-link reader, including its final
-// bookmark, so a swallowed mutation error would visibly skip the failed frame.
-func serveProjectionStream(t *testing.T, reg *Registry, route *SandboxRecord, kind string) (*routesync.Hello, error) {
-	t.Helper()
-	var input, output bytes.Buffer
-	frames := []*routesync.Msg{{Type: routesync.TypeBuildSyncBegin}, {Type: routesync.TypeBuildSyncEnd}}
-	switch kind {
-	case "upsert":
-		event := testE2BRoute(route.SandboxID, routesync.StateRunning)
-		frames = append(frames, &routesync.Msg{Type: routesync.TypeUpsert, Route: &event})
-	case "delete":
-		frames = append(frames, &routesync.Msg{Type: routesync.TypeDelete, SID: route.NodeSandboxID})
-	case "full_snapshot":
-	default:
-		t.Fatalf("unknown projection kind %q", kind)
-	}
-	frames = append(frames, &routesync.Msg{Type: routesync.TypeBookmark, RevToken: "node-fp:2", FullSync: true})
-	for _, frame := range frames {
-		if err := routesync.WriteMsg(&input, frame); err != nil {
+	for _, tc := range []struct {
+		body      string
+		forbidden []string
+	}{
+		{control.Body.String(), []string{"api_secret", "service_secret", "data_endpoint"}},
+		{data.Body.String(), []string{"api_secret", "api_endpoint"}},
+	} {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(tc.body), &fields); err != nil {
 			t.Fatal(err)
 		}
-	}
-	err := reg.serveNodeLinkLocal(t.Context(), &output, func() {}, &input, &routesync.NodeRegister{NodeID: route.NodeID})
-	hello, readErr := routesync.ReadMsg(&output)
-	if readErr != nil || hello == nil || hello.Hello == nil {
-		t.Fatalf("missing hello: %+v %v", hello, readErr)
-	}
-	return hello.Hello, err
-}
-
-func seedProjectionStream(t *testing.T) (*Registry, *SandboxRecord) {
-	t.Helper()
-	reg, _ := registryWithTypedFixture(t)
-	reg.reaperCtx = t.Context()
-	route := testSandboxIdentityRecord("/g", "projection", "sb-projection", "n1", StateReserved)
-	if _, ok, err := reg.stores.commitSandboxIntent(t.Context(), route, metadata.Version{}); err != nil || !ok {
-		t.Fatalf("seed: %v %v", ok, err)
-	}
-	reg.updateNodeResume(testNodeSession(t.Context(), reg.stores, "n1"), "n1", "node-fp:1")
-	return reg, route
-}
-
-func assertProjectionBookmark(t *testing.T, reg *Registry, want string) {
-	t.Helper()
-	node, found, err := reg.stores.GetNode(t.Context(), "n1")
-	if err != nil || !found || node.ResumeToken != want {
-		t.Fatalf("bookmark: %+v %v %v, want %q", node, found, err, want)
-	}
-}
-
-func TestNodeLinkProjectionFailurePreservesBookmarkForReconnect(t *testing.T) {
-	for _, kind := range []string{"upsert", "delete", "full_snapshot"} {
-		for _, fault := range []struct {
-			name      string
-			err       error
-			committed bool
-		}{
-			{"conflict", metadata.ErrConflict, false},
-			{"unavailable", &metadata.Unavailable{Cause: errors.New("disconnected")}, false},
-			{"unknown_uncommitted", &metadata.Unknown{Cause: errors.New("reply lost")}, false},
-			{"unknown_committed", &metadata.Unknown{Cause: errors.New("reply lost")}, true},
-		} {
-			t.Run(kind+"/"+fault.name, func(t *testing.T) {
-				reg, route := seedProjectionStream(t)
-				faults := &routeProjectionFaults{RouteRepository: reg.stores.routes, reportErr: fault.err, deleteErr: fault.err, reportFailures: -1, commitBeforeError: fault.committed}
-				reg.stores.routes = faults
-				_, err := serveProjectionStream(t, reg, route, kind)
-				if !errors.Is(err, fault.err) {
-					t.Fatalf("projection error was swallowed: %v", err)
-				}
-				assertProjectionBookmark(t, reg, "node-fp:1")
-				calls := faults.reports + faults.deletes
-				wantCalls := 1
-				if kind == "upsert" && errors.Is(fault.err, metadata.ErrConflict) {
-					wantCalls = 5
-				}
-				if calls != wantCalls {
-					t.Fatalf("wrong retry policy: calls=%d want=%d", calls, wantCalls)
-				}
-				faults.reportErr, faults.deleteErr = nil, nil
-				hello, err := serveProjectionStream(t, reg, route, kind)
-				if err != nil || hello.ResumeFrom != "node-fp:1" {
-					t.Fatalf("reconnect did not replay from safe bookmark: %+v %v", hello, err)
-				}
-				assertProjectionBookmark(t, reg, "node-fp:2")
-				actual, _, found, err := reg.stores.GetSandbox(t.Context(), route.Group, route.RouteKey)
-				if err != nil || (kind == "upsert" && (!found || actual.State != StateReady)) || (kind != "upsert" && found) {
-					t.Fatalf("replayed projection did not converge: %+v %v %v", actual, found, err)
-				}
-			})
+		for _, field := range tc.forbidden {
+			if _, found := fields[field]; found {
+				t.Fatalf("projection leaked %s", field)
+			}
 		}
 	}
-}
-
-type unavailableProjectionOwner struct {
-	metadata.OwnershipRepository
-}
-
-func (f unavailableProjectionOwner) ReadSandboxOwner(context.Context, string, string) (metadata.Versioned[metadata.NodeSandboxRef], error) {
-	return metadata.Versioned[metadata.NodeSandboxRef]{}, &metadata.Unavailable{Cause: errors.New("ownership read failed")}
-}
-
-func TestNodeLinkOwnershipReadFailurePreservesBookmark(t *testing.T) {
-	for _, kind := range []string{"upsert", "delete", "full_snapshot"} {
-		t.Run(kind, func(t *testing.T) {
-			reg, route := seedProjectionStream(t)
-			reg.stores.ownership = unavailableProjectionOwner{reg.stores.ownership}
-			_, err := serveProjectionStream(t, reg, route, kind)
-			if !errors.Is(err, metadata.ErrUnavailable) {
-				t.Fatalf("ownership error was swallowed: %v", err)
-			}
-			assertProjectionBookmark(t, reg, "node-fp:1")
-		})
+	if !strings.Contains(data.Body.String(), `"service_secret"`) {
+		t.Fatal("data signature verification material lost")
 	}
-}
-
-func TestNodeLinkUnownedProjectionMayAdvanceBookmark(t *testing.T) {
-	for _, kind := range []string{"upsert", "delete", "full_snapshot"} {
-		t.Run(kind, func(t *testing.T) {
-			reg, route := seedProjectionStream(t)
-			// A known absent owner makes the frame irrelevant, rather than an
-			// unapplied storage failure that must prevent the next bookmark.
-			if err := reg.stores.RemoveNodeSandboxRef(t.Context(), "n1", route.NodeSandboxID); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := serveProjectionStream(t, reg, route, kind); err != nil {
-				t.Fatal(err)
-			}
-			assertProjectionBookmark(t, reg, "node-fp:2")
-		})
+	if w := request("/route-link/route", key); w.Code != http.StatusNotFound {
+		t.Fatal("old protocol still mounted")
 	}
 }

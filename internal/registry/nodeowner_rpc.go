@@ -10,12 +10,14 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const NodeOwnerRPCPath = "/internal/node-owner"
 
 type nodeOwnerRequest struct {
+	Registration         *metadata.Registration    `json:"registration,omitempty"`
 	Op                   string                    `json:"op"`
 	NodeID               string                    `json:"node_id,omitempty"`
 	KeyPair              *clusterstate.NodeKeyPair `json:"key_pair,omitempty"`
@@ -45,6 +47,13 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 	}
 	var out nodeOwnerResponse
 	var err error
+	if in.Registration != nil {
+		if in.Registration.NodeID != in.NodeID || in.Registration.LinkOwner == "" || !in.Registration.Fence.IsCommitted() {
+			http.Error(w, "invalid node registration", http.StatusBadRequest)
+			return
+		}
+		req = req.WithContext(withNodeRegistration(req.Context(), *in.Registration))
+	}
 	switch in.Op {
 	case "connected":
 		err = owner.Connected(req.Context(), in.NodeID)
@@ -137,10 +146,16 @@ func (o *HTTPNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, c
 	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
 		return out.Ack, context.DeadlineExceeded
 	}
+	if err == nil && out.Ack != nil && (cmd == nil || out.Ack.CmdID != cmd.CmdID) {
+		return nil, fmt.Errorf("node-owner: command ACK identity mismatch")
+	}
 	return out.Ack, err
 }
 
 func (o *HTTPNodeOwner) call(ctx context.Context, in nodeOwnerRequest) (nodeOwnerResponse, error) {
+	if reg, ok := ctx.Value(nodeRegistrationContextKey{}).(metadata.Registration); ok {
+		in.Registration = &reg
+	}
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(&in); err != nil {
 		return nodeOwnerResponse{}, err

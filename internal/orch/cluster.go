@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -61,13 +62,10 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		return reject(cmd, fmt.Errorf("cluster command contains non-canonical exec conditions: %w", api.ErrBadRequest))
 	}
 	switch cmd.Kind {
+	case routesync.CmdGroupGet, routesync.CmdGroupList, routesync.CmdGroupPut, routesync.CmdGroupDelete:
+		return o.handleGroupCommand(ctx, cmd)
 	case routesync.CmdCreate:
-		pair, tmpl, normalized, err := o.precheckCluster(ctx, cmd)
-		if err != nil {
-			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
-			return reject(cmd, err)
-		}
-		if _, _, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, normalized); err != nil {
+		if _, _, err := o.admitClusterCreate(ctx, cmd); err != nil {
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
@@ -191,7 +189,11 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		return err
 	}
 	var pair store.KeyPair
+	imageRepo, registryAuth := cmd.ImageRepo, cmd.RegistryAuth
 	if existing != nil {
+		if !ownsBuild(existing, cmd.GroupAPIKey) {
+			return nodegroup.ErrForbidden
+		}
 		fingerprint, err := store.APISecretHash(existing.APISecret)
 		if err != nil {
 			return fmt.Errorf("build_register: verify durable credential: %w", err)
@@ -200,13 +202,25 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 			return fmt.Errorf("build_register: %w: credential fingerprint differs", store.ErrBuildRegistrationConflict)
 		}
 		pair = store.KeyPair{APISecret: existing.APISecret, ManifestKey: existing.ManifestKey}
+		// Private inputs come from the accepted Build, not a changed Group.
+		imageRepo, registryAuth = existing.RegistrationImageRepo, existing.RegistrationRegistryAuth
 	} else {
-		pair, err = o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+		location, err := clusterstate.ObjectLocationFromMetadata(cmd.Config)
 		if err != nil {
-			if errors.Is(err, errClusterCredentialPairNotInstalled) {
-				return fmt.Errorf("%w: build_register credential: %v", api.ErrBadRequest, err)
-			}
+			return fmt.Errorf("%w: build_register cluster ownership: %v", api.ErrBadRequest, err)
+		}
+		var detail nodegroup.Detail
+		detail, pair, err = o.admitClusterGroup(ctx, cmd, location.Group)
+		if err != nil {
 			return err
+		}
+		if cmd.ImageRepo != "" || cmd.RegistryAuth != "" {
+			return fmt.Errorf("%w: build_register image credentials are Node Group inputs", api.ErrBadRequest)
+		}
+		imageRepo = detail.Context.ImageRepo
+		registryAuth = ""
+		if detail.Context.RegistryAuth != nil {
+			registryAuth = detail.Context.RegistryAuth.Value
 		}
 	}
 	registrationRequestDigest, err := clusterBuildRegistrationRequestDigest(pair.ManifestKey, cmd)
@@ -312,8 +326,8 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		Status:                    types.BuildRegistered,
 		FromImage:                 o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
 		Resources:                 resources,
-		RegistrationImageRepo:     cmd.ImageRepo,
-		RegistrationRegistryAuth:  cmd.RegistryAuth,
+		RegistrationImageRepo:     imageRepo,
+		RegistrationRegistryAuth:  registryAuth,
 		RegistrationRequestDigest: registrationRequestDigest,
 		ClusterGroup:              location.Group,
 		Metadata:                  meta,
@@ -429,7 +443,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		return nil
 	}
 	o.clusterBuildMu.Lock()
-	o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
+	o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: registered.RegistrationImageRepo, registryAuth: registered.RegistrationRegistryAuth}
 	o.clusterBuildMu.Unlock()
 	if inserted {
 		o.publishBuildState(cmd.BuildID, "registered", "", "")
@@ -747,13 +761,21 @@ func acceptBuildRegister(cmd *routesync.Command, target *types.BuildTarget) *rou
 
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 	status, reason := clusterCommandRejection(err)
-	return &routesync.CmdAck{
+	ack := &routesync.CmdAck{
 		CmdID: cmd.CmdID, Status: routesync.AckRejected,
 		Reason: reason, HTTPStatus: status,
 	}
+	var conflict *groupAdmissionConflict
+	if errors.As(err, &conflict) {
+		ack.ErrorCode = routesync.ErrorGroupVersionConflict
+	}
+	return ack
 }
 
 func clusterCommandRejection(err error) (int, string) {
+	if status := nodegroup.HTTPStatus(err); status != http.StatusInternalServerError {
+		return status, err.Error()
+	}
 	switch {
 	case errors.Is(err, api.ErrAlreadyExists):
 		return http.StatusConflict, api.ErrAlreadyExists.Error()
@@ -796,11 +818,7 @@ func clusterCommandRejection(err error) (int, string) {
 // HandleCommand. It waits for that exact attempt; it does not maintain a second
 // launch implementation.
 func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
-	pair, tmpl, normalized, err := o.precheckCluster(ctx, cmd)
-	if err != nil {
-		return nil, err
-	}
-	_, attempt, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, normalized)
+	_, attempt, err := o.admitClusterCreate(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -931,7 +949,7 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 		return nil, fmt.Errorf("cluster: sandbox not found")
 	}
 
-	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+	_, pair, err := o.admitClusterGroup(ctx, cmd, cmd.Cluster.Group)
 	if err != nil {
 		return nil, err
 	}
