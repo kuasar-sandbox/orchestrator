@@ -47,7 +47,7 @@ before either proposal is closed.
 | Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` and component release `45296417785` passed; actual SDK and both-architecture tools verified as `v0.2.0-preview.20261124.2` |
 | Node Group foundation, #572 | head `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a`; merged `d9626893d02b7754dcd1542bc021146c24a58371` | exact-head run `45287872172` passed (24 successful jobs; four inapplicable jobs skipped); tested merge tree equals the final main tree, including the cursor escaping fix |
 | Shared support repository, #573 | `80c6e0114248c214bed4a3a94a86b8697d7edd2b` | rebased onto merged #572 with an unchanged support patch; official run `45295630484` pending |
-| Snapshot producer, sandboxer #474 | `ecfd3ea66efb1968d6435f344e555decd2e873ca` | same tree as tested `5bd60b2`; actual reader delivery gate satisfied, exact-head run `45298653710` pending |
+| Snapshot producer, sandboxer #474 | `f83dd87f5b616f0746c0906caba07d75eb8a7144` | production tree unchanged from tested `5bd60b2`; one UFFD fixture now uses a valid `.bundle` basename. Actual reader delivery gate satisfied; new exact-head run `45301574190` pending |
 | Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | final main rebase/CI/release pending |
 
 Sandboxer SDK `v0.2.0-preview.20261124.1` resolved to
@@ -72,7 +72,7 @@ Both release archives matched published sizes/digests; `node-ctl`, `cluster-ctl`
 and `e2b-key-ctl` on both architectures report that clean source in their build
 information. [Binary hashes](evidence/node-groups-20261124/orchestrator-reader-delivery.json)
 identify the downloaded consumers. The producer became Ready only after these
-receipts were obtained. The final writer/activation aggregate is still pending.
+receipts were obtained. The final writer/activation aggregate is still pending. The [successful build input receipt](evidence/node-groups-20261124/orchestrator-reader-build-inputs.json) identifies actual accelerator, connector, Sandboxer and runtime source versions for both release builds; local `(devel)` replacements in Go build information alone are not treated as SDK-version proof.
 
 Both published readers restored snapshots from the updated producer on their
 native KVM hosts. The updated producer hashes are
@@ -119,7 +119,7 @@ that all earlier deliveries had no effects.
 | ID | Compatibility / selection coverage |
 |---|---|
 | C01 | Old SNP remains accepted by template, Group and import paths; old snapshots restore on both native architectures and new consumers. |
-| C02 | Legacy selection adds no runtime filter or artifact inspection. On both architectures the published reader accepted an unannotated old SNP, then its actual restore preflight rejected a wrong-digest primary runtime and missing v1 fallback. This is real restore-boundary evidence, combined with Registry selection tests; it is not a new full cluster incompatibility scenario. |
+| C02 | Legacy selection adds no runtime filter or artifact inspection. Both published reader architectures rejected an incompatible local runtime at actual restore preflight. The additional [x86 public-cluster experiment](evidence/node-groups-20261124/legacy-public-cluster-runtime-x86.json) passed a real old unannotated SNP through Router, Registry/FDB, NodeLink and Node SQLite; the selected Node rejected the wrong-digest primary and absent v1 fallback. The public 409 after Router retry was not treated as proof: exact task runner journals and the dead Node row establish the rejection. This full cluster case was not repeated on ARM. |
 | C03 | Runtime selection checks basename and digest together; another basename with the same digest does not match. |
 | C04 | Group/auth/runtime/Placement are checked on one candidate; empty OR branch cannot remove hard conditions. |
 | C05 | Shared parser, Group validation and request tests reject malformed, repeated and out-of-order declarations before installing a combined credential pair. |
@@ -282,12 +282,21 @@ resident memory. Both architectures executed the layout and long-template tests.
   403 after retry; it is not a successful full aggregate receipt. Later aggregate
   and final exact-source receipts must be recorded independently.
 
+The first public-cluster C02 attempt failed because its external artifact location
+did not match the existing sharded resolver. Mapping that location to the original
+artifact graph fixed the fixture; no snapshot artifact was changed. The reusable
+script then passed. Producer CI also found a UFFD fixture with the retired
+`file://runtime` test name; changing only that name to `runtime.bundle` made the
+[full UFFD race test](evidence/node-groups-20261124/pr474-uffd-fixture-race.log) pass,
+including actual release/capture/layered-restore execution. The failing official
+run `45298653710` is retained; its replacement must pass before producer merge.
+
 ## Final closeout checklist
 
 - [x] Reader changes reviewed and merged through normal protection.
 - [x] Native database, process, stream and real VM evidence collected.
 - [x] Before/after product and snapshot performance, including regressions.
-- [ ] Actual Orchestrator reader SDK/tools delivered before producer release.
+- [x] Actual Orchestrator reader SDK/tools delivered before producer enablement.
 - [ ] Remaining PRs rebased onto main, reviewed, exact-head CI passed and merged.
 - [ ] Final trusted component/aggregate releases and both-architecture identities.
 - [ ] Final F/C matrix and scope limitations attached to both original proposals.

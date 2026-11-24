@@ -97,6 +97,13 @@
     "published_sha256": "28557d16e3833e5f1f8548f91f9528ad26bf000242af5b15acd62bfa252a351c",
     "transformation": "byte-identical"
   },
+  "legacy-public-cluster-runtime-x86.json": {
+    "bytes": 2076,
+    "original_sha256": "2538174aa2e4f863602efaf9b1bfbb87e13096e3a42ac02f4f3f6af08c119bf6",
+    "original_task_path": "evidence/legacy-public-cluster-runtime-x86.json",
+    "published_sha256": "2538174aa2e4f863602efaf9b1bfbb87e13096e3a42ac02f4f3f6af08c119bf6",
+    "transformation": "byte-identical"
+  },
   "legacy-runtime-rejection-arm64.json": {
     "bytes": 1211,
     "original_sha256": "4cceae24e5fd44a14ab835dc6d72dd2169580d51a9377ebefa30bf7d2b3cf538",
@@ -174,6 +181,13 @@
     "published_sha256": "5e5b5946d43f1d97a73bc9c09e9b1b5d92c895d6a50d083ff223e049463bcce6",
     "transformation": "byte-identical"
   },
+  "orchestrator-reader-build-inputs.json": {
+    "bytes": 3867,
+    "original_sha256": "4a6a964badd628431c199afda9aa62a13ad36a3bd4a228fface0bb54a0ebd491",
+    "original_task_path": "evidence/orchestrator-reader-build-inputs.json",
+    "published_sha256": "4a6a964badd628431c199afda9aa62a13ad36a3bd4a228fface0bb54a0ebd491",
+    "transformation": "byte-identical"
+  },
   "orchestrator-reader-delivery.json": {
     "bytes": 1671,
     "original_sha256": "1f8499f825c93ef8a6c3b725ae6096bbad532108417731ddd483fc27660f9663",
@@ -186,6 +200,13 @@
     "original_sha256": "e9bfaa4794bf3a783d29923da0b44127995954b74722c8317dda692538e94e21",
     "original_task_path": "evidence/orchestrator-reader-sdk.json",
     "published_sha256": "e9bfaa4794bf3a783d29923da0b44127995954b74722c8317dda692538e94e21",
+    "transformation": "byte-identical"
+  },
+  "pr474-uffd-fixture-race.log": {
+    "bytes": 26148,
+    "original_sha256": "fb4aae43efa5ad092b7f97f7fb5888f2e28d80b4b90433aeec66ec6b46f749e6",
+    "original_task_path": "evidence/pr474-uffd-fixture-race.log",
+    "published_sha256": "fb4aae43efa5ad092b7f97f7fb5888f2e28d80b4b90433aeec66ec6b46f749e6",
     "transformation": "byte-identical"
   },
   "product-benchmark-final-after-1795467036.json": {

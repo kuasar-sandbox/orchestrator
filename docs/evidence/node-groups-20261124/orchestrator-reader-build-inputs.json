@@ -1,0 +1,45 @@
+{
+  "release_run": 45296417785,
+  "source": "d9626893d02b7754dcd1542bc021146c24a58371",
+  "build_jobs": [
+    {
+      "arch": "x86_64",
+      "job_id": 138118295395,
+      "dependency_commands": [
+        "2026-11-24T00:22:06.9947930Z runtime=()",
+        "2026-11-24T00:22:06.9948715Z   runtime+=(--dependency runtime \"runtime-v0.2.0-preview.20261124\" \"4fef83a33cc4bf0c92e62afdf882e011d1b3e2f0\")",
+        "2026-11-24T00:22:06.9950355Z python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar orchestrator \"$SOURCE_SHA\" src --dependency accelerator \"v0.2.0-preview.20261124\" \"127afc27958d2721beb4b36c135ee1b1fce86390\" --dependency connector \"v0.2.0-preview.20261119\" \"6b48c8f450dac707b708a08980a463c1d66ff847\" --dependency sandboxer \"v0.2.0-preview.20261124.1\" \"347b3fe657b66f69b0a86ce2c428bdb484471663\" \"${runtime[@]}\"",
+        "runtime=()",
+        "  runtime+=(--dependency guest-runtime 'runtime-v0.2.0-preview.20261124' '4fef83a33cc4bf0c92e62afdf882e011d1b3e2f0')",
+        "  --dependency accelerator 'v0.2.0-preview.20261124' '127afc27958d2721beb4b36c135ee1b1fce86390' \\",
+        "  --dependency connector 'v0.2.0-preview.20261119' '6b48c8f450dac707b708a08980a463c1d66ff847' \\",
+        "  --dependency sandboxer 'v0.2.0-preview.20261124.1' '347b3fe657b66f69b0a86ce2c428bdb484471663' \\",
+        "runtime=()",
+        "  runtime+=(--dependency guest-runtime 'runtime-v0.2.0-preview.20261124' '4fef83a33cc4bf0c92e62afdf882e011d1b3e2f0')",
+        "  --dependency accelerator 'v0.2.0-preview.20261124' '127afc27958d2721beb4b36c135ee1b1fce86390' \\",
+        "  --dependency connector 'v0.2.0-preview.20261119' '6b48c8f450dac707b708a08980a463c1d66ff847' \\",
+        "  --dependency sandboxer 'v0.2.0-preview.20261124.1' '347b3fe657b66f69b0a86ce2c428bdb484471663' \\"
+      ]
+    },
+    {
+      "arch": "aarch64",
+      "job_id": 138118295478,
+      "dependency_commands": [
+        "2026-11-24T00:22:06.1768596Z runtime=()",
+        "2026-11-24T00:22:06.1769594Z   runtime+=(--dependency runtime \"runtime-v0.2.0-preview.20261124\" \"4fef83a33cc4bf0c92e62afdf882e011d1b3e2f0\")",
+        "2026-11-24T00:22:06.1771723Z python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar orchestrator \"$SOURCE_SHA\" src --dependency accelerator \"v0.2.0-preview.20261124\" \"127afc27958d2721beb4b36c135ee1b1fce86390\" --dependency connector \"v0.2.0-preview.20261119\" \"6b48c8f450dac707b708a08980a463c1d66ff847\" --dependency sandboxer \"v0.2.0-preview.20261124.1\" \"347b3fe657b66f69b0a86ce2c428bdb484471663\" \"${runtime[@]}\"",
+        "runtime=()",
+        "  runtime+=(--dependency guest-runtime 'runtime-v0.2.0-preview.20261124' '4fef83a33cc4bf0c92e62afdf882e011d1b3e2f0')",
+        "  --dependency accelerator 'v0.2.0-preview.20261124' '127afc27958d2721beb4b36c135ee1b1fce86390' \\",
+        "  --dependency connector 'v0.2.0-preview.20261119' '6b48c8f450dac707b708a08980a463c1d66ff847' \\",
+        "  --dependency sandboxer 'v0.2.0-preview.20261124.1' '347b3fe657b66f69b0a86ce2c428bdb484471663' \\",
+        "runtime=()",
+        "  runtime+=(--dependency guest-runtime 'runtime-v0.2.0-preview.20261124' '4fef83a33cc4bf0c92e62afdf882e011d1b3e2f0')",
+        "  --dependency accelerator 'v0.2.0-preview.20261124' '127afc27958d2721beb4b36c135ee1b1fce86390' \\",
+        "  --dependency connector 'v0.2.0-preview.20261119' '6b48c8f450dac707b708a08980a463c1d66ff847' \\",
+        "  --dependency sandboxer 'v0.2.0-preview.20261124.1' '347b3fe657b66f69b0a86ce2c428bdb484471663' \\"
+      ]
+    }
+  ],
+  "note": "Commands from successful release build logs identify the exact source-workspace dependencies. Module declarations shown as v0.2.0 with local replacements in go version -m are not independently treated as published SDK version evidence."
+}

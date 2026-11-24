@@ -50,6 +50,29 @@ Record failures and the exact injection boundary. These cases do not by
 themselves establish every F01–F12/C01–C12 case, physical exactly-once execution,
 multi-host availability, or production performance.
 
+## Legacy runtime rejection through public Create
+
+`cluster-legacy-runtime.sh` uses an actual old, unannotated capture response and
+its immutable local artifact graph. Prepare the regular cluster fixture, then
+provide `LEGACY_CAPTURE_JSON`, `LEGACY_LOCATION_PARENT`, `LEGACY_LOCATION` and
+`INCOMPATIBLE_RUNTIME`. The first three identify the old response and artifact
+directory; the last is a valid bundle whose identity differs from the captured
+`runtime-v1.bundle`. The script isolates it as `runtime-v2.bundle` with no v1
+fallback. It adds only an external location hint and maps the existing sharded
+resolver to the unchanged graph.
+
+```sh
+bash test/e2e/manual/cluster-legacy-runtime.sh
+```
+
+The helper sends explicit public Create through Router and Registry, checks the
+selected Node's actual SQLite row, and reads only that task's exact runner
+journals for runtime-identity rejection. A 409 after Router retry can represent a
+retained dead slot, so status alone never passes the case. Keep complete responses
+private and publish only the JSON receipt and source/binary identities. This
+checks legacy admission and the existing restore preflight; it does not start a
+successful restored VM or change Registry into an artifact reader.
+
 ## Product-process measurements
 
 The optional benchmark uses the regular cluster-stub acceptance fixture. Four
