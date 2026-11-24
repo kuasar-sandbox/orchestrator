@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
@@ -42,6 +44,7 @@ type nodeChannel struct {
 	registration metadata.Registration
 	nodeID       string
 	mu           sync.Mutex
+	closing      atomic.Bool
 	w            io.Writer
 	flush        func()
 }
@@ -60,13 +63,39 @@ var errSupersededNodeBuildSession = errors.New("node-link: superseded Build sess
 func (c *nodeChannel) id() string { return c.nodeID }
 
 func (c *nodeChannel) send(cmd *routesync.Command) error {
+	if c.closing.Load() {
+		return ErrNodeGone
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A sender may retain this channel after the Registry's identity check.
+	// Once teardown starts, only the already admitted writer may finish.
+	if c.closing.Load() {
+		return ErrNodeGone
+	}
 	if err := routesync.WriteMsg(c.w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: cmd}); err != nil {
 		return err
 	}
 	c.flush()
 	return nil
+}
+
+// closeResponse fences new sends and joins the last admitted writer before
+// the HTTP handler returns its ResponseWriter to net/http. Never hold the
+// Registry or Build-frame lock while waiting for transport I/O.
+func (c *nodeChannel) closeResponse() {
+	c.closing.Store(true)
+	if !c.mu.TryLock() {
+		// The request may have reached EOF while the peer is no longer
+		// draining the response. Interrupt a flow-controlled HTTP/2 write
+		// on this ending stream before joining it. Do not set deadlines on
+		// healthy links or reinterpret a partial write as a proven non-send.
+		if w, ok := c.w.(http.ResponseWriter); ok {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
+		}
+		c.mu.Lock()
+	}
+	c.mu.Unlock()
 }
 
 func (r *Registry) withActiveNodeBuildFrame(conn *nodeChannel, apply func() error) error {
@@ -343,7 +372,10 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	flush()
 
 	r.addNode(conn)
-	defer r.removeNode(conn)
+	defer func() {
+		conn.closeResponse()
+		r.removeNode(conn)
+	}()
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
 	heartbeatCh := make(chan *routesync.Heartbeat, 1)
