@@ -160,9 +160,9 @@ func (p *buildPipeline) acceptSelectedSlots(table *rtconfig.PortableSandboxConfi
 
 // A memory build with data disks boots the assembled local E. The ordinary
 // run --from path restores binding records and allocates fresh private writers.
-func (p *buildPipeline) templateBoot() ([]byte, string, bool, error) {
+func (p *buildPipeline) templateBoot() (*sandboxcfg.LaunchProjection, string, bool, error) {
 	if len(p.spec.SandboxSpec.WorkspacePlan) == 0 {
-		doc, err := p.buildColdConfigYAML()
+		doc, err := p.buildColdLaunchProjection()
 		return doc, p.spec.SourceSandboxRef, p.spec.SourceSandboxRef != "", err
 	}
 	image, err := p.openCurrentImage()
@@ -188,7 +188,11 @@ func (p *buildPipeline) templateBoot() ([]byte, string, bool, error) {
 	}
 	host["boot"] = map[string]any{"kernel": cfg.Boot.Kernel, "runtime": cfg.Boot.Runtime}
 	doc, err := yaml.Marshal(host)
-	return doc, source, false, err
+	if err != nil {
+		return nil, "", false, err
+	}
+	projection, err := sandboxcfg.MarshalLaunchProjection(doc, cfg.Launch)
+	return projection, source, false, err
 }
 
 func (p *buildPipeline) assembleWorkspaceBoot(cfg *rtconfig.SandboxConfig, portable *rtconfig.PortableSandboxConfig) (string, error) {

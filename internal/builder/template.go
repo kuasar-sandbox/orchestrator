@@ -33,8 +33,7 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	if p.profile == types.ProfileE2B {
 		connect = []string{envdUDS + ":127.0.0.1:49983"}
 	}
-	sb, err := p.startSandboxYAML("c", document, connect,
-		from, replace)
+	sb, err := p.startSandboxYAML("c", document.Config, connect, from, replace)
 	if err != nil {
 		return "", err
 	}
@@ -188,11 +187,23 @@ func templateSnapshotArgs(pathID, output, runRoot, mode string, policy sandboxcf
 }
 
 func (p *buildPipeline) buildColdConfigYAML() ([]byte, error) {
+	projection, err := p.buildColdLaunchProjection()
+	if err != nil {
+		return nil, err
+	}
+	return projection.Config, nil
+}
+
+func (p *buildPipeline) buildColdLaunchProjection() (*sandboxcfg.LaunchProjection, error) {
 	cfg, err := p.buildColdConfig()
 	if err != nil {
 		return nil, err
 	}
-	return sandboxcfg.MarshalBuildColdConfig(cfg)
+	document, err := sandboxcfg.MarshalBuildColdConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return sandboxcfg.MarshalLaunchProjection(document, cfg.Launch)
 }
 
 func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {

@@ -1140,7 +1140,7 @@ Each instance receives configuration through reserved e2b metadata namespaces `k
 | resource | Strict partial patch for capacity, allocatable, startup, DiffCOW cache limits and cold-start discard policy ([resource schema](node-resource.md#request-resources)) |
 | traffic | Host-only explicit per-Sandbox max_inflight total/forward/e2b:envd/e2b:code-interpreter/exec; never guest configuration |
 | network | hostname/nexthop to guest; inner_ip/transit_* to vswitch Attach; dns to resolv.conf |
-| launch | exec/args/env/workdir/restart/user/stop_signal/plugin/cgroup_control; bare only, since e2b reserves launch for envd |
+| launch | `systemd: off/auto/runtime/provided` for both profiles; bare also accepts its existing exec/args/env/workdir/restart/user/stop_signal/plugin/cgroup_control fields. E2B accepts only the actual `systemd` key. See [Guest systemd launch](node.md#guest-systemd-launch). |
 | init / mounts / files | Typed init[]/mounts[]/files[] forwarding |
 | metadata | Runtime SANDBOX_CONFIG metadata, e.g. e2b.start_cmd |
 | restore | Current host prefetch policy: optional, explicit off/memory only |
@@ -1363,11 +1363,13 @@ Builder total/step/readiness deadlines retain their existing responsibilities.
 
 Ordinary accepted launches follow the attempt owner through prepare, readiness
 and /init, without the former implicit 60-second limit. Sandbox bootstrap version
-7 retains zero/omitted `absolute_deadline_unix_nano`; positive means an explicit
+9 retains zero/omitted `absolute_deadline_unix_nano`; positive means an explicit
 absolute cutoff and negative is invalid. Version 7 additionally requires fresh snp
-tasks to honor runtime admission. Deploy matching Conductor and sandbox runner
-versions; bootstrap version 6 is rejected instead of silently omitting that check.
-Shared prepare summary stays version 5. Builder uses version 8 for diffstore QoS;
+tasks to honor runtime admission. Version 9 also requires complete-source
+Launch projection and final-image product environment projection. Deploy matching
+Conductor and sandbox runner versions; earlier bootstraps are rejected.
+Shared prepare summary stays version 5. Builder uses version 9 for the same
+systemd/product environment contract while retaining version 8 diffstore QoS;
 its positive work deadline/reporting reserve, the cluster protocol and KMT V1
 retain their existing behavior.
 

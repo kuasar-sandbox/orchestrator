@@ -189,6 +189,9 @@ func (o *Orchestrator) normalizeSandboxCreateConfig(profile types.Profile, metad
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return sandboxCreateConfig{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec); err != nil {
+		return sandboxCreateConfig{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	return sandboxCreateConfig{Metadata: metadata, Credentials: credentials}, nil
 }
 
@@ -216,6 +219,15 @@ type sandboxCreateSpec struct {
 func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCreateSpec) (*types.Sandbox, *launchAttempt, error) {
 	if err := types.ValidateIdleTimeout(spec.IdleTimeout); err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if spec.Template.Kind == types.KindSnp {
+		launch, err := sandboxcfg.ParseSpec(spec.Config.Metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+		if launch.HasSystemdOverride() {
+			return nil, nil, fmt.Errorf("%w: Snapshot restore cannot override launch.systemd", api.ErrBadRequest)
+		}
 	}
 	launchMode, err := types.LaunchModeForTemplate(spec.Template.Kind)
 	if err != nil {

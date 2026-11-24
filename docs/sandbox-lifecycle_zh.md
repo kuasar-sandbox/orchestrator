@@ -1075,7 +1075,7 @@ JSON 对象字符串)注入,零 SDK/API 改动。这些独立的 typed 租户 sc
 | `resource` | 按叶子合并的严格资源 patch，支持 capacity、allocatable、startup、DiffCOW 缓存限制与冷启动 discard 策略（[资源 schema](node-resource_zh.md#request-resources)） |
 | `traffic` | host-only 的 per-Sandbox `max_inflight.{total,forward,e2b:envd,e2b:code-interpreter,exec}` 显式 patch;不进入 guest |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
-| `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
+| `launch` | 两种 profile 均允许 `systemd: off/auto/runtime/provided`；bare 继续允许既有 exec、args、env、workdir、restart、user、stop_signal、plugin、cgroup_control 等字段。E2B 只允许实际出现的 systemd 键。见 [Guest systemd 启动](node_zh.md#guest-systemd-启动)。 |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
@@ -1373,10 +1373,11 @@ E/S 制品不携带它。Socket 期限、API/Proxy 等待、assignment 预算、
 Builder 总期限/步骤/readiness 保持各自职责。
 
 普通已接纳启动从 prepare、readiness 到 /init 跟随 attempt owner，不再隐式附加
-60 秒总期限。Sandbox bootstrap 版本 7 继续允许 `absolute_deadline_unix_nano` 为零或
+60 秒总期限。Sandbox bootstrap 版本 9 继续允许 `absolute_deadline_unix_nano` 为零或
 省略；正数是显式绝对截止，负数非法。版本 7 还要求首次 snp task 执行 runtime 准入。
-Conductor 与 sandbox runner 须部署配套版本；bootstrap 版本 6 会被拒绝，避免静默漏检。
-共用 prepare summary 保持版本 5；Builder 使用版本 8 传递 diffstore QoS，正数 work
+版本 9 还要求完整来源 Launch 投影与最终镜像产品环境投影；Conductor 与 sandbox runner
+须部署配套版本，旧 bootstrap 被明确拒绝。共用 prepare summary 保持版本 5；
+Builder 使用版本 9 传递相同的 systemd/产品环境合同，保留版本 8 的 diffstore QoS。正数 work
 deadline 及结果上报预留、cluster protocol 和 KMT V1 保持既有行为。
 
 Manifest 打开复用 Sandboxer 的 `OpenManifestStream`/readretry，保留原 scoped

@@ -548,9 +548,12 @@ func TestRunAssignedSandboxPrepareFailureClosesReadinessFD(t *testing.T) {
 				fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
 					return nil, wantErr
 				},
-				setenv:     func(string, string) error { return nil },
-				chdir:      func(string) error { return nil },
-				startChild: func(string, []string, []string, *os.File, *os.File) error { t.Fatal("child Start called"); return nil },
+				setenv: func(string, string) error { return nil },
+				chdir:  func(string) error { return nil },
+				startChild: func(string, []string, []string, *os.File, *os.File) error {
+					t.Fatal("child Start called")
+					return nil
+				},
 			})
 		},
 	})

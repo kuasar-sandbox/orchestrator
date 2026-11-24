@@ -230,7 +230,7 @@ func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) 
 			if err != nil || replace {
 				t.Fatalf("template boot from=%q replace=%t: %v", from, replace, err)
 			}
-			host, presence, err := rtconfig.LoadConfigBytesWithPresence(doc)
+			host, presence, err := rtconfig.LoadConfigBytesWithPresence(doc.Config)
 			if err != nil {
 				t.Fatal(err)
 			}

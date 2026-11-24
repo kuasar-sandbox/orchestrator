@@ -14,10 +14,10 @@ import (
 // runners cannot complete this protocol.
 const ArtifactPrepareSchemaVersion = 5
 
-// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 8
-// supports adding devices before a fresh Sandbox-template cold boot.
+// SandboxBootstrapVersion gates task-local E-source Launch projection for
+// fresh creates. It does not alter the original image primary path.
 // ArtifactPrepareSummary and Builder retain their independent versions.
-const SandboxBootstrapVersion = 8
+const SandboxBootstrapVersion = 9
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -58,15 +58,16 @@ type ArtifactPrepareSpec struct {
 // Final and Prepare is non-nil. Cold image launches receive Final immediately;
 // restore launches complete Prepare and then receive a final LaunchSpec.
 type SandboxTaskSpec struct {
-	SandboxID string               `json:"sandbox_id"`
-	RunID     string               `json:"run_id"`
-	StableID  string               `json:"stable_id,omitempty"`
-	BaseDir   string               `json:"base_dir,omitempty"`
-	Workdir   string               `json:"workdir"`
-	Env       map[string]string    `json:"env,omitempty"`
-	Final     *LaunchSpec          `json:"final,omitempty"`
-	Prepare   *ArtifactPrepareSpec `json:"prepare,omitempty"`
-	Error     string               `json:"error,omitempty"`
+	AbsoluteDeadlineUnixNano int64                `json:"absolute_deadline_unix_nano,omitempty"`
+	SandboxID                string               `json:"sandbox_id"`
+	RunID                    string               `json:"run_id"`
+	StableID                 string               `json:"stable_id,omitempty"`
+	BaseDir                  string               `json:"base_dir,omitempty"`
+	Workdir                  string               `json:"workdir"`
+	Env                      map[string]string    `json:"env,omitempty"`
+	Final                    *LaunchSpec          `json:"final,omitempty"`
+	Prepare                  *ArtifactPrepareSpec `json:"prepare,omitempty"`
+	Error                    string               `json:"error,omitempty"`
 }
 
 type ArtifactCapacity struct {

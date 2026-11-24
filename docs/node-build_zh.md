@@ -277,7 +277,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   支持的 RunRoot 下仍不超过 Linux `sun_path`。
 
 - `POST /internal/task/build/bootstrap`(run-builder;req `{build_id,run_id,version}`)
-  当前 BuildTask schema 为 v8（v8 在执行与目标资源中携带整体及单盘 diffstore QoS；v7 携带当前节点的 runtime 启动超时策略；v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
+  当前 BuildTask schema 为 v9（v9 要求 systemd 策略以及基于完整来源和最终镜像默认值的产品 envd 环境投影；v8 在执行与目标资源中携带整体及单盘 diffstore QoS；v7 携带当前节点的 runtime 启动超时策略；v6 要求来源命令存在性摘要以按实际目标准备配置;v5 分离 checkpoint-location 与 image-class Bundle publication，
   删除旧 broad `publish_location_parent`；v4 增加 register-time requested target，并把 SBX/SNP
   source 收敛为通用 cold Sandbox E；v3 以 `run_dir`/`base_dir` 替代混合语义 workdir，
   `checkpoint_mode` 自 v2 起必需),sandbox ArtifactPrepare
