@@ -345,7 +345,7 @@ def checkpoint_path(ref):
 previous_s, current_s = (json.loads(pair)[2] for pair in (before, after))
 descriptor = memory_descriptor(checkpoint_path(current_s))
 previous_descriptor = memory_descriptor(checkpoint_path(previous_s))
-expected_parent = "file://" + os.path.join(root, previous_s.removeprefix("file://"))
+expected_parent = "file://" + os.path.join(root, previous_s.split("@runtime:", 1)[0].removeprefix("file://"))
 assert descriptor.get("parents") == [expected_parent], (descriptor, expected_parent)
 assert descriptor.get("working_set", False) == (sys.argv[3] == "false"), descriptor
 assert descriptor["memory_id"] != previous_descriptor["memory_id"], (descriptor, previous_descriptor)

@@ -40,7 +40,7 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 if row is None or row[:2] != ("paused", sys.argv[3]) or row[4]:
     raise SystemExit(f"invalid paused checkpoint: {row!r}")
 def physical(ref):
-    match = re.fullmatch(r"file://([^/@]+)@(digest|hmac|manifest):([0-9a-f]{64})", ref)
+    match = re.fullmatch(r"file://([^/@]+)@(digest|hmac|manifest):([0-9a-f]{64})", ref.split("@runtime:", 1)[0])
     if not match or match[1] in (".", "..") or "\\" in match[1]:
         raise SystemExit(f"checkpoint must retain a content-identified basename: {ref!r}")
     path = os.path.join(os.path.dirname(sys.argv[4]), match[1])
