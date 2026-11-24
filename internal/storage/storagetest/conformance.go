@@ -142,24 +142,36 @@ func Run(t *testing.T, factory Factory) {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
+				var lastRetry error
+				lastStage := "begin"
 				for attempt := 0; attempt < 100; attempt++ {
 					won := false
+					stage := "begin"
 					err := b.Update(t.Context(), func(tx storage.Tx) error {
+						stage = "get"
 						missing, err := tx.Get([]byte("claim"))
 						if err != nil {
 							return err
 						}
+						stage = "scan"
 						page, err := tx.Scan(storage.Range{Begin: []byte("slot/"), End: storage.PrefixEnd([]byte("slot/"))}, storage.Limit{Rows: 2, Bytes: 1024})
 						if err != nil {
 							return err
 						}
 						if missing.Exists || len(page.Rows) > 0 {
+							stage = "finish-read"
 							return nil
 						}
 						won = true
-						return tx.Put([]byte(fmt.Sprintf("slot/%d", id)), []byte("owned"))
+						stage = "put"
+						if err := tx.Put([]byte(fmt.Sprintf("slot/%d", id)), []byte("owned")); err != nil {
+							return err
+						}
+						stage = "finish-write"
+						return nil
 					})
 					if errors.Is(err, storage.ErrRetry) {
+						lastRetry, lastStage = err, stage
 						time.Sleep(time.Millisecond)
 						continue
 					}
@@ -170,7 +182,7 @@ func Run(t *testing.T, factory Factory) {
 					}
 					return
 				}
-				errs <- errors.New("retry exhausted")
+				errs <- fmt.Errorf("worker %d: retry exhausted after 100 attempts (last stage %s, committed winners %d): %w", id, lastStage, winners.Load(), lastRetry)
 			}(worker)
 		}
 		wg.Wait()
