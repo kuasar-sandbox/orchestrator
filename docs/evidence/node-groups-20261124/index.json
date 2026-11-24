@@ -398,6 +398,13 @@
     "published_sha256": "684e4461a514edad6c2e0a3e246ce30ecc4a1a52d83f64a33e036f13e81d5084",
     "transformation": "JSON-encode the original patch without changing its content"
   },
+  "snapshot-producer-ci-receipt.json": {
+    "bytes": 6227,
+    "original_sha256": "ad62962480698c5520a0bfe2877710c5d1d336508661e5f24cd10acbba597067",
+    "original_task_path": "evidence/snapshot-producer-ci-receipt.json",
+    "published_sha256": "ad62962480698c5520a0bfe2877710c5d1d336508661e5f24cd10acbba597067",
+    "transformation": "byte-identical"
+  },
   "vm-faults-v10.json": {
     "bytes": 2821,
     "original_sha256": "e57df385d266e88c74907aacc4e79a4ab479035c52a2e2e2183878c09cd0eab8",
