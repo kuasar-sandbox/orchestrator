@@ -5,12 +5,12 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 )
 
 // MemberView is the versioned registry member set. LocateN must use this stable
@@ -54,44 +54,11 @@ func (v MemberView) Owners(key string, n int) ([]string, error) {
 
 // Secret is a typed secret value. Inline values are carried by registry/placer;
 // ref values are resolved out-of-band by the node or provider.
-type Secret struct {
-	Type        string `json:"type"`                  // inline | ref
-	Value       string `json:"value,omitempty"`       // inline secret or provider reference
-	Fingerprint string `json:"fingerprint,omitempty"` // required for referenced credentials
-}
-
-func (s *Secret) UnmarshalJSON(raw []byte) error {
-	if string(raw) == "null" {
-		*s = Secret{}
-		return nil
-	}
-	var shorthand string
-	if len(raw) > 0 && raw[0] == '"' {
-		if err := json.Unmarshal(raw, &shorthand); err != nil {
-			return err
-		}
-		if shorthand == "" {
-			*s = Secret{}
-		} else {
-			*s = Secret{Type: SecretInline, Value: shorthand}
-		}
-		return nil
-	}
-	type alias Secret
-	var out alias
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return err
-	}
-	if out.Type == "" && out.Value != "" {
-		out.Type = SecretInline
-	}
-	*s = Secret(out)
-	return nil
-}
+type Secret = keys.Secret
 
 const (
-	SecretInline = "inline"
-	SecretRef    = "ref"
+	SecretInline = keys.SecretInline
+	SecretRef    = keys.SecretRef
 )
 
 // SandboxGroup is the group-level configuration consumed by route_link/placer.
