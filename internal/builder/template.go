@@ -3,7 +3,6 @@ package builder
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -16,7 +15,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
-	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -35,8 +33,7 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	if p.profile == types.ProfileE2B {
 		connect = []string{envdUDS + ":127.0.0.1:49983"}
 	}
-	sb, err := p.startSandboxYAML("c", document.Config, connect,
-		from, replace, document.Provenance)
+	sb, err := p.startSandboxYAML("c", document.Config, connect, from, replace)
 	if err != nil {
 		return "", err
 	}
@@ -198,25 +195,7 @@ func (p *buildPipeline) buildColdConfigYAML() ([]byte, error) {
 }
 
 func (p *buildPipeline) buildColdLaunchProjection() (*sandboxcfg.LaunchProjection, error) {
-	var imageEnv map[string]string
-	if p.profile == types.ProfileE2B {
-		if p.imageEnvRef != p.baseRef {
-			image, err := p.openCurrentImage()
-			if err != nil {
-				return nil, err
-			}
-			err = p.rememberImageEnvironment(image.ImageConfig)
-			closeErr := image.Close()
-			if err != nil {
-				return nil, err
-			}
-			if closeErr != nil {
-				return nil, closeErr
-			}
-		}
-		imageEnv = p.imageEnv
-	}
-	cfg, err := p.buildColdConfig(imageEnv)
+	cfg, err := p.buildColdConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -227,25 +206,13 @@ func (p *buildPipeline) buildColdLaunchProjection() (*sandboxcfg.LaunchProjectio
 	return sandboxcfg.MarshalLaunchProjection(document, cfg.Launch)
 }
 
-func (p *buildPipeline) rememberImageEnvironment(raw []byte) error {
-	env, err := taskartifact.ParseImageEnvironment(raw)
-	if err != nil {
-		return err
-	}
-	p.imageEnvRef, p.imageEnv = p.baseRef, env
-	if p.log != nil {
-		p.log.Info("build product environment resolved", "image_ref", p.baseRef, "image_config_sha256", fmt.Sprintf("%x", sha256.Sum256(raw)))
-	}
-	return nil
-}
-
-func (p *buildPipeline) buildColdConfig(imageEnv map[string]string) (*rtconfig.SandboxConfig, error) {
+func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {
 	namespaces := make(map[string]bool, len(p.spec.SandboxNamespaces))
 	for _, namespace := range p.spec.SandboxNamespaces {
 		namespaces[namespace] = true
 	}
 	cfg, err := (sandboxcfg.BuildColdParams{
-		Profile: p.profile, ImageRef: p.baseRef, ImageEnv: imageEnv, Source: p.spec.SourceSandboxConfig,
+		Profile: p.profile, ImageRef: p.baseRef, Source: p.spec.SourceSandboxConfig,
 		Kernel: p.spec.Paths.Kernel, Runtime: p.spec.Paths.Runtime,
 		OverlayDiffTpl: p.spec.Paths.OverlayDiffTpl,
 		TapFD: sandboxcfg.TapFD{

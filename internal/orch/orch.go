@@ -2501,12 +2501,6 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 			return nil, false, err
 		}
 		response.Final = o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)
-		if projection := response.Final.ImageLaunch; projection != nil && projection.ManifestConfig != "" {
-			projection.ManifestConfig, err = filepath.Abs(projection.ManifestConfig)
-			if err != nil {
-				return nil, false, fmt.Errorf("orch: absolute image manifest config: %w", err)
-			}
-		}
 		return response, true, nil
 	}
 	var deadlineUnixNano int64
@@ -2667,10 +2661,6 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 	}
 	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindSbx && sb.LaunchMode == types.LaunchCold {
 		result.SourceLaunch = &configsock.SourceLaunchProjection{Profile: tmpl.Profile, ConfigPath: o.sandboxConfigPath(sb)}
-	}
-	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindImg && sb.LaunchMode == types.LaunchImage && tmpl.Profile == types.ProfileE2B {
-		result.ImageLaunch = &configsock.ImageLaunchProjection{ConfigPath: o.sandboxConfigPath(sb), ImageRef: tmpl.Ref,
-			ManifestConfig: o.cfg.ManifestConfig, RefLocations: locations}
 	}
 	return result
 }

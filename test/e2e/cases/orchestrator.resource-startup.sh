@@ -149,13 +149,9 @@ PY
     done
     [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] || fail "vmm cgroup remained after StopUnit"
     journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
-    # Normal Delete attempts bounded Guest shutdown before StopUnit. It can
-    # retire CH cleanly before systemd sends a termination signal; with a
-    # non-zero exit, the signal/fence path must still be observable.
-    if ! grep -Fq '[sandbox-ctl] received terminated' "$LOW_JOURNAL"; then
-        grep -Fq '[sandbox-ctl] CH exited code=0' "$LOW_JOURNAL" \
-            || fail "low-allocatable[$iteration] saw neither StopUnit nor a clean CH exit"
-    fi
+    # KillMode=control-group may terminate CH before sandbox-ctl reaches the API.
+    grep -Fq '[sandbox-ctl] received terminated' "$LOW_JOURNAL" \
+        || fail "low-allocatable[$iteration] run did not observe StopUnit"
     grep -Fq '[sandbox-ctl] CH exited code=' "$LOW_JOURNAL" \
         || fail "low-allocatable[$iteration] run did not observe CH exit"
     # Under deliberate memory.high pressure, CH's direct systemd signal can race

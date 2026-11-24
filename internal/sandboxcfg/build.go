@@ -22,7 +22,6 @@ const (
 type BuildColdParams struct {
 	Profile          types.Profile
 	ImageRef         string
-	ImageEnv         map[string]string // defaults from the exact final image, read in the tenant task
 	Source           *rtconfig.PortableSandboxConfig
 	Kernel           string
 	Runtime          string
@@ -68,11 +67,6 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		return nil, err
 	}
 	if p.Source == nil {
-		if p.Profile == types.ProfileE2B {
-			if err := ProjectNewE2BEnvironment(&projected.Launch, p.ImageEnv); err != nil {
-				return nil, err
-			}
-		}
 		projected.Metadata = setBuildCommands(projected.Metadata, p.StartCmd, p.ReadyCmd)
 		return projected, nil
 	}
@@ -84,28 +78,15 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		return nil, fmt.Errorf("sandboxcfg: build source E data disks are not supported")
 	}
 
-	// Portable and runtime schemas intentionally share field spellings for
-	// non-host state. A YAML round trip is preferable to a second manual field
-	// allowlist and is followed by overwriting every host/boot-owned field.
-	// PATH origin is trusted artifact metadata, deliberately rejected by the
-	// ordinary Launch decoder. Carry it through the typed setter below instead
-	// of exposing a tenant-settable spelling in the intermediate host document.
-	sourceDefaults := *p.Source
-	sourceDefaults.Launch.SystemdPathDefault = false
-	sourceDefaults.Launch.Plugin = append([]rtconfig.PortablePluginConfig(nil), p.Source.Launch.Plugin...)
-	for i := range sourceDefaults.Launch.Plugin {
-		sourceDefaults.Launch.Plugin[i].SystemdPathDefault = false
-	}
-	raw, err := yaml.Marshal(&sourceDefaults)
+	// Portable and runtime schemas share the persistent non-boot fields.
+	// The source is already authoritative for its Env and primary layout.
+	raw, err := yaml.Marshal(p.Source)
 	if err != nil {
 		return nil, fmt.Errorf("sandboxcfg: encode source defaults: %w", err)
 	}
 	var merged rtconfig.SandboxConfig
 	if err := yaml.Unmarshal(raw, &merged); err != nil {
 		return nil, fmt.Errorf("sandboxcfg: decode source defaults: %w", err)
-	}
-	for i := range merged.Launch.Plugin {
-		merged.Launch.Plugin[i].SetSystemdPathDefault(p.Source.Launch.Plugin[i].SystemdPathDefault)
 	}
 	merged.Resources = projected.Resources
 	merged.Network = projected.Network
@@ -136,18 +117,6 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		merged.Launch = newE2BLaunch(mode, mergeStr(merged.Launch.Env, p.EnvVars), p.MMDSEnabled)
 	} else {
 		mergeBareBuildLaunch(&merged.Launch, p.Spec.Launch, p.Spec.LaunchCgroupControl, p.EnvVars)
-	}
-	_, requestPath := p.EnvVars["PATH"]
-	if p.Spec.Launch != nil {
-		_, launchPath := p.Spec.Launch.Env["PATH"]
-		requestPath = requestPath || launchPath
-	}
-	defaultPath := p.Source.Launch.SystemdPathDefault && !requestPath
-	merged.Launch.SetSystemdPathDefault(defaultPath)
-	if p.Profile == types.ProfileE2B {
-		if err := ProjectNewE2BEnvironment(&merged.Launch, p.ImageEnv); err != nil {
-			return nil, err
-		}
 	}
 	if p.NamespacePresent[NsMounts] {
 		merged.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)

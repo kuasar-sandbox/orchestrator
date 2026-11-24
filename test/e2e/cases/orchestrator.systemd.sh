@@ -138,6 +138,12 @@ checkpoint_guest /bin/sh -ceu '
         fi
     done
 ' >"$WORK/systemd-off.out"
-grep -q -- '-cgroup-root[= ]/sys/fs/cgroup' "$WORK/systemd-off.out" || fail "explicit off kept systemd delegation"
+# Direct envd's existing default is /sys/fs/cgroup; it needs no extra flag.
+! grep -q -- '-cgroup-root[= ]/run/sandbox-init/cgroup' "$WORK/systemd-off.out" \
+    || fail "explicit off kept systemd delegation"
+if grep -q -- '-cgroup-root' "$WORK/systemd-off.out"; then
+    grep -q -- '-cgroup-root[= ]/sys/fs/cgroup' "$WORK/systemd-off.out" \
+        || fail "explicit off used an unexpected cgroup root"
+fi
 systemd_delete
 echo "PASS orchestrator.systemd.sh"

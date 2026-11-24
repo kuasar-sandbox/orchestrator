@@ -229,7 +229,6 @@ type LaunchSpec struct {
 	Env          map[string]string       `json:"env,omitempty"`
 	Error        string                  `json:"error,omitempty"`
 	SourceLaunch *SourceLaunchProjection `json:"source_launch,omitempty"`
-	ImageLaunch  *ImageLaunchProjection  `json:"image_launch,omitempty"`
 }
 
 // SourceLaunchProjection asks the authenticated tenant task to finish a fresh
@@ -238,16 +237,6 @@ type LaunchSpec struct {
 type SourceLaunchProjection struct {
 	Profile    types.Profile `json:"profile"`
 	ConfigPath string        `json:"config_path"`
-}
-
-// ImageLaunchProjection completes the new E2B product environment inside its
-// authenticated task, including the image fast path. The same immutable ref
-// and location mapping are used by the actual sandbox-ctl boot.
-type ImageLaunchProjection struct {
-	ConfigPath     string            `json:"config_path"`
-	ImageRef       string            `json:"image_ref"`
-	ManifestConfig string            `json:"manifest_config,omitempty"`
-	RefLocations   map[string]string `json:"ref_locations,omitempty"`
 }
 
 // Provider resolves a config-id to its LaunchSpec + the pidfile used to

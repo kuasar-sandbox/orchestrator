@@ -142,7 +142,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndChildStart(t *testing.T) {
 					}
 					return nil
 				},
-				startChild: func(path string, argv, _ []string, vmm, ready *os.File, _ []byte) error {
+				startChild: func(path string, argv, _ []string, vmm, ready *os.File) error {
 					order = append(order, "start child")
 					assertCloseOnExec("start child", true)
 					assertCgroupCloseOnExec("start child", true)
@@ -455,7 +455,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			}
 			return nil
 		},
-		startChild: func(path string, argv, env []string, _, _ *os.File, _ []byte) error {
+		startChild: func(path string, argv, env []string, _, _ *os.File) error {
 			if !stopped {
 				t.Fatal("task cancellation resources were not stopped before child Start")
 			}
@@ -518,7 +518,7 @@ func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
 		},
 		setenv:     func(string, string) error { return nil },
 		chdir:      func(string) error { return nil },
-		startChild: func(string, []string, []string, *os.File, *os.File, []byte) error { return startErr },
+		startChild: func(string, []string, []string, *os.File, *os.File) error { return startErr },
 	})
 	if !errors.Is(err, startErr) || fetches != 1 {
 		t.Fatalf("cold launch = %v, fetches=%d", err, fetches)
@@ -550,7 +550,7 @@ func TestRunAssignedSandboxPrepareFailureClosesReadinessFD(t *testing.T) {
 				},
 				setenv: func(string, string) error { return nil },
 				chdir:  func(string) error { return nil },
-				startChild: func(string, []string, []string, *os.File, *os.File, []byte) error {
+				startChild: func(string, []string, []string, *os.File, *os.File) error {
 					t.Fatal("child Start called")
 					return nil
 				},
@@ -613,7 +613,7 @@ func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
 				},
 				setenv: func(string, string) error { return nil },
 				chdir:  func(string) error { return nil },
-				startChild: func(string, []string, []string, *os.File, *os.File, []byte) error {
+				startChild: func(string, []string, []string, *os.File, *os.File) error {
 					t.Fatal("child Start called")
 					return nil
 				},

@@ -48,8 +48,8 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 		captureIdentity: func(spec *configsock.SandboxTaskSpec) {
 			metricsIdentity = runnerMetricsIdentity{sandboxID: sandboxID, stableID: spec.StableID, runID: runID, baseDir: spec.BaseDir, runDir: spec.Workdir}
 		},
-		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File, provenance []byte) error {
-			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, provenance, metricsIdentity, stopSignals, log, retirements...)
+		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
+			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log, retirements...)
 		},
 		log: log,
 	})
@@ -67,15 +67,14 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 }
 
 type taskLaunchOps struct {
-	fetchBootstrap   func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error)
-	prepareArtifact  func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error)
-	imageEnvironment func(context.Context, configsock.ImageLaunchProjection) (*taskartifact.ImageEnvironment, error)
-	completePrepare  func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
-	setenv           func(string, string) error
-	chdir            func(string) error
-	captureIdentity  func(*configsock.SandboxTaskSpec)
-	startChild       func(string, []string, []string, *os.File, *os.File, []byte) error
-	log              *slog.Logger
+	fetchBootstrap  func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error)
+	prepareArtifact func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error)
+	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
+	setenv          func(string, string) error
+	chdir           func(string) error
+	captureIdentity func(*configsock.SandboxTaskSpec)
+	startChild      func(string, []string, []string, *os.File, *os.File) error
+	log             *slog.Logger
 }
 
 func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, ops taskLaunchOps) error {
@@ -170,7 +169,6 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if arg, ok := launchSpecArtifactArg(spec.Args); ok {
 		return fmt.Errorf("launch spec must not set task-owned artifact argument %q", arg)
 	}
-	var provenance []byte
 	if projection := spec.SourceLaunch; projection != nil {
 		if preparedSource.Kind != types.ResumeSourceSandbox {
 			return fmt.Errorf("source launch projection requires a prepared Sandbox E")
@@ -178,35 +176,9 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 		if err := taskCtx.Err(); err != nil {
 			return err
 		}
-		provenance, err = sandboxcfg.ProjectSourceLaunchFile(projection.ConfigPath, projection.Profile, sourceConfig)
-		if err != nil {
+		if err := sandboxcfg.ProjectSourceLaunchFile(projection.ConfigPath, projection.Profile, sourceConfig); err != nil {
 			return fmt.Errorf("project prepared source launch: %w", err)
 		}
-	}
-	if projection := spec.ImageLaunch; projection != nil {
-		if spec.SourceLaunch != nil || !preparedSource.Empty() || bootstrap.Prepare != nil {
-			return fmt.Errorf("image launch projection requires a fresh image task")
-		}
-		load := ops.imageEnvironment
-		if load == nil {
-			load = taskartifact.LoadImageEnvironment
-		}
-		image, err := load(taskCtx, *projection)
-		if err != nil {
-			return fmt.Errorf("read final image environment: %w", err)
-		}
-		if image == nil || image.ImageRef != projection.ImageRef {
-			return fmt.Errorf("final image environment identity mismatch")
-		}
-		if err := taskCtx.Err(); err != nil {
-			return err
-		}
-		provenance, err = sandboxcfg.ProjectImageLaunchFile(projection.ConfigPath, image.ImageRef, image.Env)
-		if err != nil {
-			return fmt.Errorf("project final image environment: %w", err)
-		}
-		ops.log.Info("sandbox product environment projected", "sid", sandboxID, "run_id", runID,
-			"image_ref", image.ImageRef, "image_config_sha256", image.ConfigSHA256)
 	}
 	workdir := spec.Workdir
 	if workdir == "" {
@@ -242,7 +214,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if ops.startChild == nil {
 		return errors.New("sandbox child starter is not configured")
 	}
-	return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready, provenance)
+	return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
 }
 
 func completeSandboxPrepareWithRetry(
@@ -379,7 +351,6 @@ func taskEnv(add map[string]string) []string {
 	skip := map[string]bool{
 		"TASK_PIDFILE": true, "TASK_CONFIG_SOCKET": true,
 		"TASK_RUN_ID": true, "TASK_SANDBOX_ID": true, "TASK_BUILD_ID": true,
-		rtconfig.ConfigProvenanceFDEnv: true,
 	}
 	out := make([]string, 0, len(os.Environ())+len(add))
 	for _, kv := range os.Environ() {
@@ -400,9 +371,6 @@ func taskEnv(add map[string]string) []string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if k == rtconfig.ConfigProvenanceFDEnv {
-			continue
-		}
 		v := add[k]
 		out = append(out, k+"="+v)
 	}
@@ -414,7 +382,7 @@ type sandboxRunReportedError struct{ err error }
 func (e sandboxRunReportedError) Error() string { return e.err.Error() }
 func (e sandboxRunReportedError) Unwrap() error { return e.err }
 
-func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File, provenance []byte, metricID runnerMetricsIdentity, stopSignals <-chan os.Signal, log *slog.Logger, retirements ...<-chan configsock.RunRetirementEvent) error {
+func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env []string, vmmCgroup, ready *os.File, metricID runnerMetricsIdentity, stopSignals <-chan os.Signal, log *slog.Logger, retirements ...<-chan configsock.RunRetirementEvent) error {
 	metrics := newRunnerMetrics(metricID, log)
 	if metrics != nil {
 		metrics.captureUsageBaseline(context.Background())
@@ -430,14 +398,7 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	provenanceFD, err := sandboxproc.AttachConfigProvenance(cmd, provenance)
-	if err != nil {
-		return err
-	}
 	startErr := sandboxproc.Start(cmd, vmmCgroup, ready)
-	if provenanceFD != nil {
-		_ = provenanceFD.Close()
-	}
 	if err := startErr; err != nil {
 		result := sandboxExecutionResult(sandboxID, runID, types.SandboxResultStart, err)
 		if reportErr := postSandboxResultWithRetry(socket, sandboxID, runID, result); reportErr != nil {
@@ -474,7 +435,7 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 	}, log)
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
-	err = nil
+	var err error
 	for waiting := true; waiting; {
 		select {
 		case event, open := <-events:

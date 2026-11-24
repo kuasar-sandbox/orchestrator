@@ -2,7 +2,6 @@ package sandboxcfg
 
 import (
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -64,7 +63,8 @@ func TestSystemdLaunchRequestPermissionsSurviveJSON(t *testing.T) {
 	}
 }
 
-func TestNewE2BLaunchUsesPlaceholderAndOrdinaryEnvdPlugin(t *testing.T) {
+// The existing envd primary remains the workload in every systemd mode.
+func TestNewE2BLaunchKeepsEnvdPrimary(t *testing.T) {
 	for _, mode := range []string{"", "off", "auto", "runtime", "provided"} {
 		for _, mmds := range []bool{false, true} {
 			p := baseParams(types.ProfileE2B)
@@ -77,121 +77,124 @@ func TestNewE2BLaunchUsesPlaceholderAndOrdinaryEnvdPlugin(t *testing.T) {
 				t.Fatal(err)
 			}
 			launch := cfg.Launch
-			if !launch.Placeholder || launch.Exec != "" || !launch.CgroupControl || launch.PIDNamespace != "shared" || len(launch.Plugin) != 1 {
-				t.Fatalf("new e2b topology: %+v", launch)
+			if launch.Placeholder || launch.Exec != envdExec || !launch.CgroupControl ||
+				launch.PIDNamespace != "shared" || len(launch.Plugin) != 0 || launch.User != "0:0" ||
+				launch.Restart != "always" || launch.Env["PRODUCT"] != "value" {
+				t.Fatalf("new E2B topology changed: %+v", launch)
 			}
-			plugin := launch.Plugin[0]
-			if plugin.Exec != envdExec || plugin.User != "0:0" || plugin.Restart != "always" || plugin.Env["PRODUCT"] != "value" {
-				t.Fatalf("envd supervision: %+v", plugin)
+			args := strings.Join(launch.Args, " ")
+			want := mode
+			if want == "" {
+				want = "off"
 			}
-			args := strings.Join(plugin.Args, " ")
-			if !strings.HasSuffix(args, "-cgroup-root "+envdCgroupRoot(mode)) || strings.Contains(args, "-isnotfc") == mmds {
-				t.Fatalf("mode %q, MMDS %t, args %q", mode, mmds, args)
+			if launch.Systemd != want || strings.Contains(args, "-isnotfc") == mmds {
+				t.Fatalf("mode %q mmds=%t args=%s", want, mmds, args)
 			}
-			if launch.Systemd == "" {
-				t.Fatal("complete definition omitted mode")
+			if want == "off" && strings.Contains(args, "-cgroup-root") {
+				t.Fatalf("direct envd gained unnecessary cgroup flag: %v", launch.Args)
+			}
+			if want != "off" && !strings.HasSuffix(args, "-cgroup-root "+systemdCgroupRoot) {
+				t.Fatalf("systemd envd lost delegated root: %v", launch.Args)
 			}
 		}
 	}
 }
 
-func TestPreparedSourceProjectionPreservesTopologyAndPresence(t *testing.T) {
-	for _, layout := range []string{"primary", "plugin", "unknown"} {
-		for _, mode := range []string{"", "off", "auto", "runtime", "provided"} {
-			t.Run(layout+"/"+mode, func(t *testing.T) {
-				source := rendererPortableConfig()
-				source.Launch.Systemd = "runtime"
-				source.Launch.CgroupControl = false // raw legacy choice must survive
-				source.Launch.PIDNamespace = "shared"
-				source.Launch.User = "0:0"
-				source.Launch.Args = []string{"-port", "49983", "-cgroup-root", systemdCgroupRoot}
-				source.Launch.Exec = envdExec
-				if layout == "plugin" {
-					source.Launch.Exec, source.Launch.Args, source.Launch.Placeholder = "", nil, true
-					source.Launch.Plugin = []rtconfig.PortablePluginConfig{{Exec: envdExec, Args: []string{"-port", "49983", "-cgroup-root=" + systemdCgroupRoot}, User: "0:0", Restart: "always"}, {Exec: "/other", Args: []string{"unchanged"}}}
-				} else if layout == "unknown" {
-					source.Launch.Exec = "/custom/product"
-				}
-				before, _ := json.Marshal(source)
-				p := artifactRendererParams(types.LaunchCold)
-				p.Sandbox.ResumeSource = types.ResumeSource{}
-				p.Template.Kind, p.Template.Profile = types.KindSbx, types.ProfileE2B
-				p.EnvVars = map[string]string{"INSTANCE": "yes"}
-				if mode != "" {
-					var err error
-					p.Spec, err = ParseSpec(map[string]string{NsLaunch: `{"systemd":"` + mode + `"}`})
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-				raw, err := p.BuildYAML()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if mode == "" && strings.Contains(string(raw), "systemd:") {
-					t.Fatalf("overlay eagerly defaulted mode:\n%s", raw)
-				}
-				projected, err := ProjectSourceLaunch(raw, types.ProfileE2B, source)
-				if layout == "unknown" && mode != "" {
-					if err == nil || !strings.Contains(err.Error(), "new cold definition") {
-						t.Fatalf("unknown layout: %v", err)
-					}
-					return
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				host, presence, err := rtconfig.LoadConfigBytesWithPresence(projected.Config)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !presence.Has("launch.systemd") || presence.Has("boot.root.base") {
-					t.Fatalf("projection lost host-only ownership:\n%s", projected.Config)
-				}
-				launch := host.Launch
-				if launch.Exec != source.Launch.Exec || launch.Placeholder != source.Launch.Placeholder || launch.CgroupControl || launch.PIDNamespace != "shared" || launch.Env["ARTIFACT"] != "yes" || launch.Env["INSTANCE"] != "yes" {
-					t.Fatalf("source was regenerated: %+v", launch)
-				}
-				wantMode := mode
-				if wantMode == "" {
-					wantMode = "runtime"
-				}
-				if launch.Systemd != wantMode {
-					t.Fatalf("effective mode %q, want %q", launch.Systemd, wantMode)
-				}
-				if mode == "" {
-					gotArgs, _ := yaml.Marshal(launch.Args)
-					wantArgs, _ := yaml.Marshal(source.Launch.Args)
-					gotPlugins, _ := yaml.Marshal(launch.Plugin)
-					expectedPlugins := append([]rtconfig.PortablePluginConfig(nil), source.Launch.Plugin...)
-					if layout == "plugin" {
-						expectedPlugins[0].Env = mergeStr(expectedPlugins[0].Env, p.EnvVars)
-					}
-					wantPlugins, _ := yaml.Marshal(expectedPlugins)
-					if string(gotArgs) != string(wantArgs) || string(gotPlugins) != string(wantPlugins) {
-						t.Fatal("no-override create rewrote layout")
-					}
-				} else if layout == "plugin" {
-					if !strings.HasSuffix(launch.Plugin[0].Args[2], "="+envdCgroupRoot(mode)) || launch.Plugin[1].Exec != source.Launch.Plugin[1].Exec || !reflect.DeepEqual(launch.Plugin[1].Args, source.Launch.Plugin[1].Args) {
-						t.Fatalf("plugin rewrite: %+v", launch.Plugin)
-					}
-				} else if launch.Args[3] != envdCgroupRoot(mode) {
-					t.Fatalf("primary rewrite: %v", launch.Args)
-				}
-				after, _ := json.Marshal(source)
-				if string(before) != string(after) {
-					t.Fatal("projection mutated prepared source")
-				}
-			})
-		}
-	}
-}
-
-func TestBuildSourceModePrecedesNewE2BProjection(t *testing.T) {
-	for _, mode := range []string{"", "off", "provided"} {
-		base := baseParams(types.ProfileE2B)
+func TestPreparedSourceProjectOnlyRewritesKnownEnvdPrimary(t *testing.T) {
+	for _, mode := range []string{"", "off", "auto", "runtime", "provided"} {
 		source := rendererPortableConfig()
 		source.Launch.Systemd = "runtime"
+		source.Launch.Exec = envdExec
+		source.Launch.Args = []string{"-port", "49983", "-cgroup-root", systemdCgroupRoot}
+		source.Launch.PIDNamespace = "shared"
+		source.Launch.CgroupControl = false // raw saved setting must survive
+		source.Launch.Env = map[string]string{"ARTIFACT": "yes", "PATH": "/chosen/bin:/bin"}
+		before, _ := json.Marshal(source)
+		p := artifactRendererParams(types.LaunchCold)
+		p.Sandbox.ResumeSource = types.ResumeSource{}
+		p.Template.Kind, p.Template.Profile = types.KindSbx, types.ProfileE2B
+		p.EnvVars = map[string]string{"INSTANCE": "yes"}
+		if mode != "" {
+			var err error
+			p.Spec, err = ParseSpec(map[string]string{NsLaunch: `{"systemd":"` + mode + `"}`})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		raw, err := p.BuildYAML()
+		if err != nil {
+			t.Fatal(err)
+		}
+		projected, err := ProjectSourceLaunch(raw, types.ProfileE2B, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, presence, err := rtconfig.LoadConfigBytesWithPresence(projected.Config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := mode
+		if want == "" {
+			want = "runtime"
+		}
+		if !presence.Has("launch.systemd") || host.Launch.Systemd != want ||
+			host.Launch.Exec != envdExec || host.Launch.Placeholder || len(host.Launch.Plugin) != 0 ||
+			host.Launch.CgroupControl || host.Launch.Env["ARTIFACT"] != "yes" ||
+			host.Launch.Env["INSTANCE"] != "yes" || host.Launch.Env["PATH"] != "/chosen/bin:/bin" {
+			t.Fatalf("source projection: %+v", host.Launch)
+		}
+		args := strings.Join(host.Launch.Args, " ")
+		if !strings.HasSuffix(args, "-cgroup-root "+envdCgroupRoot(want)) {
+			t.Fatalf("wrong envd root %v", host.Launch.Args)
+		}
+		after, _ := json.Marshal(source)
+		if string(after) != string(before) {
+			t.Fatal("mutated authenticated source E")
+		}
+	}
+}
+
+func TestEnvdModeOverrideRejectsUnrecognizedLayout(t *testing.T) {
+	for _, args := range [][]string{
+		{"--", "-cgroup-root", "/saved"}, {"positional"}, {"-unknown"},
+		{"-port", "-cgroup-root", "/saved"},
+		{"-cgroup-root", "/one", "--cgroup-root=/two"},
+		{"-cgroup-root"}, {"-isnotfc", "false"},
+	} {
+		launch := rtconfig.LaunchConfig{Systemd: "runtime", Exec: envdExec, Args: args}
+		before := strings.Join(args, "\x00")
+		if err := projectExistingEnvdRoot(&launch); err == nil {
+			t.Errorf("accepted unknown args %v", args)
+		}
+		if strings.Join(launch.Args, "\x00") != before {
+			t.Fatal("failure modified original envd args")
+		}
+	}
+	for _, layout := range []rtconfig.LaunchConfig{
+		{Systemd: "runtime", Exec: "/custom"},
+		{Systemd: "runtime", Placeholder: true},
+		{Systemd: "runtime", Exec: envdExec, Plugin: []rtconfig.PluginConfig{{Exec: "/other"}}},
+	} {
+		if err := projectExistingEnvdRoot(&layout); err == nil {
+			t.Errorf("accepted layout %+v", layout)
+		}
+	}
+	launch := rtconfig.LaunchConfig{Systemd: "provided", Exec: envdExec, Args: []string{"--isnotfc=false", "--port=49983", "--cgroup-root=/old"}}
+	if err := projectExistingEnvdRoot(&launch); err != nil {
+		t.Fatal(err)
+	}
+	if launch.Args[2] != "--cgroup-root="+systemdCgroupRoot {
+		t.Fatalf("envd flags %v", launch.Args)
+	}
+}
+
+func TestBuildSourceModePrecedesE2BLaunch(t *testing.T) {
+	base := baseParams(types.ProfileE2B)
+	for _, mode := range []string{"", "off", "provided"} {
+		source := rendererPortableConfig()
+		source.Launch.Systemd = "runtime"
+		source.Launch.Exec = envdExec
+		source.Launch.Env = map[string]string{"ARTIFACT": "yes", "PATH": "/image/bin:/usr/bin"}
 		p := BuildColdParams{Profile: types.ProfileE2B, ImageRef: base.Template.Ref, Kernel: base.Kernel,
 			Runtime: base.Runtime, Source: source, Resources: base.Resources, EnvVars: map[string]string{"INSTANCE": "yes"}}
 		if mode != "" {
@@ -205,25 +208,25 @@ func TestBuildSourceModePrecedesNewE2BProjection(t *testing.T) {
 		if want == "" {
 			want = "runtime"
 		}
-		if cfg.Launch.Systemd != want || !cfg.Launch.Placeholder || len(cfg.Launch.Plugin) != 1 || cfg.Launch.Env["ARTIFACT"] != "yes" || cfg.Launch.Plugin[0].Env["INSTANCE"] != "yes" {
-			t.Fatalf("build source mode %q: %+v", mode, cfg.Launch)
+		if cfg.Launch.Exec != envdExec || cfg.Launch.Placeholder || len(cfg.Launch.Plugin) != 0 ||
+			cfg.Launch.Systemd != want || cfg.Launch.Env["PATH"] != "/image/bin:/usr/bin" ||
+			cfg.Launch.Env["INSTANCE"] != "yes" {
+			t.Fatalf("source Build topology/Env changed: %+v", cfg.Launch)
 		}
-		args := cfg.Launch.Plugin[0].Args
-		if args[len(args)-1] != envdCgroupRoot(want) {
-			t.Fatalf("projection preceded merge: %v", args)
+		args := strings.Join(cfg.Launch.Args, " ")
+		if want != "off" && !strings.HasSuffix(args, "-cgroup-root "+systemdCgroupRoot) {
+			t.Fatalf("Build delegated envd root missing: %v", cfg.Launch.Args)
 		}
 		raw, err := MarshalBuildColdConfig(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var output rtconfig.SandboxConfig
-		if err := yaml.Unmarshal(raw, &output); err != nil {
+		var decoded rtconfig.SandboxConfig
+		if err := yaml.Unmarshal(raw, &decoded); err != nil {
 			t.Fatal(err)
 		}
-		wantLaunch, _ := yaml.Marshal(completeLaunchMap(cfg.Launch))
-		gotLaunch, _ := yaml.Marshal(completeLaunchMap(output.Launch))
-		if string(gotLaunch) != string(wantLaunch) {
-			t.Fatalf("E and C0 projection differ:\n%s", raw)
+		if decoded.Launch.Systemd != want || decoded.Launch.Exec != envdExec {
+			t.Fatal("C0 differs from E")
 		}
 	}
 }
@@ -233,143 +236,11 @@ func TestSnapshotSystemdOverrideAndPausedSourceAuthority(t *testing.T) {
 		p := artifactRendererParams(types.LaunchMemory)
 		p.Spec.Launch = &rtconfig.LaunchConfig{Systemd: mode}
 		if _, err := p.BuildYAML(); err != nil {
-			t.Fatalf("durable source reapplied historical create metadata: %v", err)
+			t.Fatalf("durable source ignored %s: %v", mode, err)
 		}
 		p.Sandbox.ResumeSource = types.ResumeSource{}
 		if _, err := p.BuildYAML(); err == nil {
 			t.Fatalf("fresh S accepted %s", mode)
 		}
-	}
-}
-
-func TestSourceDefaultPATHKeepsProvenanceAcrossHostProjection(t *testing.T) {
-	for _, defaultPath := range []bool{false, true} {
-		for _, explicit := range []string{"inherit", "", "/request/bin"} {
-			t.Run(explicit+"/"+map[bool]string{true: "default", false: "legacy-explicit"}[defaultPath], func(t *testing.T) {
-				source := rendererPortableConfig()
-				source.Launch.Exec, source.Launch.Systemd = envdExec, "runtime"
-				source.Launch.Env["PATH"] = "/image/bin:/usr/bin"
-				source.Launch.SystemdPathDefault = defaultPath
-				p := artifactRendererParams(types.LaunchCold)
-				p.Sandbox.ResumeSource = types.ResumeSource{}
-				p.Template.Kind, p.Template.Profile = types.KindSbx, types.ProfileE2B
-				p.Spec.Launch = &rtconfig.LaunchConfig{Systemd: "off"}
-				p.EnvVars = map[string]string{"INSTANCE": "yes"}
-				if explicit != "inherit" {
-					p.EnvVars["PATH"] = explicit
-				}
-				raw, err := p.BuildYAML()
-				if err != nil {
-					t.Fatal(err)
-				}
-				projected, err := ProjectSourceLaunch(raw, types.ProfileE2B, source)
-				if err != nil {
-					t.Fatal(err)
-				}
-				host, presence, err := rtconfig.LoadConfigBytesWithPresence(projected.Config)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := rtconfig.ApplyConfigProvenance(projected.Config, host, projected.Provenance); err != nil {
-					t.Fatal(err)
-				}
-				wantDefault := defaultPath && explicit == "inherit"
-				if !presence.Has("launch.env.PATH") || host.Launch.PersistentSystemdPathDefault() != wantDefault {
-					t.Fatalf("host overlay lost concrete PATH or trusted origin:\n%s", projected.Config)
-				}
-				runtime, c0, err := rtconfig.ApplyFromRules(source, host, presence, rtconfig.ApplyFromOptions{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				wantPath := "/image/bin:/usr/bin"
-				if explicit != "inherit" {
-					wantPath = explicit
-				}
-				if runtime.Launch.Env["PATH"] != wantPath || runtime.Launch.PersistentSystemdPathDefault() != wantDefault || c0.Launch.SystemdPathDefault != wantDefault {
-					t.Fatalf("PATH=%q default=%t portable=%t, want %q/%t", runtime.Launch.Env["PATH"], runtime.Launch.PersistentSystemdPathDefault(), c0.Launch.SystemdPathDefault, wantPath, wantDefault)
-				}
-			})
-		}
-	}
-}
-
-func TestBuildDefaultPATHSurvivesTypedAssemblyAndC0(t *testing.T) {
-	source := rendererPortableConfig()
-	source.Launch.Systemd = "runtime"
-	source.Launch.Env["PATH"] = "/image/bin:/usr/bin"
-	source.Launch.SystemdPathDefault = true
-	base := baseParams(types.ProfileE2B)
-	base.Resources.Overhead = nil
-	for _, explicit := range []bool{false, true} {
-		p := BuildColdParams{Profile: types.ProfileE2B, ImageRef: base.Template.Ref,
-			Kernel: base.Kernel, Runtime: base.Runtime, Resources: base.Resources, Source: source,
-			OverlayDiffTpl: "file:///overlay.ext4", TapFD: TapFD{Exec: []string{"/bin/true"}},
-			PortMAC: base.Sandbox.PortMAC, InnerIP: base.Sandbox.InnerIP}
-		if explicit {
-			p.EnvVars = map[string]string{"PATH": ""}
-		}
-		cfg, err := p.BuildColdConfig()
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := "/image/bin:/usr/bin"
-		if explicit {
-			want = ""
-		}
-		if cfg.Launch.Env["PATH"] != want || cfg.Launch.PersistentSystemdPathDefault() == explicit {
-			t.Fatal("typed top-level E config lost source PATH provenance")
-		}
-		pluginPath := want
-		if !explicit {
-			pluginPath = systemdToolsPath + ":" + want
-		}
-		if cfg.Launch.Plugin[0].Env["PATH"] != pluginPath {
-			t.Fatal("envd plugin lost its product PATH projection")
-		}
-		raw, err := MarshalBuildColdConfig(cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		host, presence, err := rtconfig.LoadConfigBytesWithPresence(raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if presence.Has("launch.env.PATH") != explicit {
-			t.Fatal("C0 overlay lost PATH provenance")
-		}
-		runtime, _, err := rtconfig.ApplyFromRules(source, host, presence, rtconfig.ApplyFromOptions{ReplaceBoot: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if runtime.Launch.Env["PATH"] != want || runtime.Launch.PersistentSystemdPathDefault() == explicit {
-			t.Fatal("C0 launch lost PATH provenance")
-		}
-	}
-}
-
-func TestEnvdModeOverrideRejectsAmbiguousArgumentBoundaries(t *testing.T) {
-	for _, args := range [][]string{
-		{"--", "-cgroup-root", "/saved"},
-		{"positional"},
-		{"-unknown", "-cgroup-root"},
-		{"-port", "-cgroup-root", "/saved"},
-		{"-cgroup-root", "/one", "--cgroup-root=/two"},
-		{"-cgroup-root"},
-		{"-isnotfc", "false"},
-	} {
-		launch := rtconfig.LaunchConfig{Systemd: "runtime", Exec: envdExec, Args: args}
-		if err := projectExistingEnvdRoot(&launch); err == nil || !strings.Contains(err.Error(), "new cold definition") {
-			t.Fatalf("accepted %v: %v", args, err)
-		}
-		if !reflect.DeepEqual(launch.Args, args) {
-			t.Fatal("failed projection mutated saved args")
-		}
-	}
-	launch := rtconfig.LaunchConfig{Systemd: "provided", Exec: envdExec, Args: []string{"--isnotfc=false", "--port=49983", "--cgroup-root=/saved"}}
-	if err := projectExistingEnvdRoot(&launch); err != nil {
-		t.Fatal(err)
-	}
-	if launch.Args[2] != "--cgroup-root="+systemdCgroupRoot {
-		t.Fatalf("known flags not projected: %v", launch.Args)
 	}
 }

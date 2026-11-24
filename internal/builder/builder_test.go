@@ -428,7 +428,7 @@ func TestNetworkDocTapFDSocket(t *testing.T) {
 
 func decodeBuildColdConfig(t *testing.T, p *buildPipeline) *rtconfig.SandboxConfig {
 	t.Helper()
-	projected, err := p.buildColdConfig(nil)
+	projected, err := p.buildColdConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,13 +501,13 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 	if !template.Launch.CgroupControl {
 		t.Fatalf("template launch.cgroup_control = false, want true")
 	}
-	if got := template.Launch.Plugin[0].Args; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983", "-cgroup-root", "/sys/fs/cgroup"}) {
+	if got := template.Launch.Args; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983"}) {
 		t.Fatalf("template envd args = %#v", got)
 	}
 
 	p.spec.MMDSEnabled = true
 	template = decodeBuildColdConfig(t, p)
-	if !template.Launch.CgroupControl || !reflect.DeepEqual(template.Launch.Plugin[0].Args, []string{"-port", "49983", "-cgroup-root", "/sys/fs/cgroup"}) {
+	if !template.Launch.CgroupControl || !reflect.DeepEqual(template.Launch.Args, []string{"-port", "49983"}) {
 		t.Fatalf("MMDS template launch = %#v", template.Launch)
 	}
 }

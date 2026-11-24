@@ -91,8 +91,6 @@ type buildPipeline struct {
 	imagePath    string // BuildBaseDir/checkpoint/image.img once a local image exists
 	baseImageRef string // portable ref for an already-published base image
 	baseRef      string // phase B/C boot.root.base ("file://..." | "manifest://...")
-	imageEnvRef  string // exact final image identity for task-local E2B environment defaults
-	imageEnv     map[string]string
 	startCmd     string // effective (request else template-inherited)
 	readyCmd     string
 	target       types.BuildTarget

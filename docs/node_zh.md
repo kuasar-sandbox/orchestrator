@@ -897,8 +897,8 @@ node worker 统计一次.
   **补齐到 2 MiB 对齐**(virtio-pmem 后端要求,否则 cloud-hypervisor 报
   `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部 padding/ZIP 对 guest mount
   不可见)。
-- **启动链**：sandbox-init 将 runtime 工具投影到 Guest。新的 E2B 冷定义使用 placeholder primary 加普通 envd plugin；plugin 执行 `/opt/sandbox-runtime/bin/envd`，端口保持 49983，启用 MMDS 时去掉 `-isnotfc`（[MMDS](node-proxy_zh.md#mmds)），使用 `restart=always`、root 用户 `0:0` 和产品环境。envd 需要 CAP_SETUID/SETGID 按镜像 Config.User 执行业务命令；业务进程保留目标用户。已有 E/S 保持其保存的 primary/plugin 布局。
-- **cgroup 委派**：新 direct E2B 定义保留 `launch.cgroup_control=true`，向 envd 传入 `-cgroup-root /sys/fs/cgroup`；systemd 模式改用 `/run/sandbox-init/cgroup`。后者是 Guest 提供的 executor service 委派根别名，既不是 manager 的整棵树，也不是 executor 自身的 `init` 叶子。systemd 模式恒定委派，无需额外开关。bare direct 保留现有可选 `cgroup_control` 行为；临时 builder steps 保持现有 direct 执行方式。
+- **启动链**：sandbox-init 将 runtime 工具投影到 Guest。新的 E2B 冷定义继续由 envd 担任 primary；envd 执行 `/opt/sandbox-runtime/bin/envd`，端口保持 49983，启用 MMDS 时去掉 `-isnotfc`（[MMDS](node-proxy_zh.md#mmds)），使用 `restart=always`、root 用户 `0:0` 和产品环境。envd 需要 CAP_SETUID/SETGID 按镜像 Config.User 执行业务命令；业务进程保留目标用户。已有 E/S 保持其保存的 primary/plugin 布局。
+- **cgroup 委派**：新 direct E2B 定义保留 `launch.cgroup_control=true`，使用 envd 既有的默认根 `/sys/fs/cgroup`；systemd 模式改用 `/run/sandbox-init/cgroup`。后者是 Guest 提供的 executor service 委派根别名，既不是 manager 的整棵树，也不是 executor 自身的 `init` 叶子。systemd 模式恒定委派，无需额外开关。bare direct 保留现有可选 `cgroup_control` 行为；临时 builder steps 保持现有 direct 执行方式。
 - envd 是 **guest-runtime/native-deps** 的原生构建产物(与 vmlinux/mkfs.erofs
   并列):`make -C guest-runtime/native-deps envd` 使用 e2b-dev/runtime 源码 tarball（`ENVD_TARBALL`，默认 tag
   `2026.22`，并固定 `ENVD_TARBALL_SHA256`；覆盖源码时一并更新匹配的校验和），需要构建产物时在 `packages/envd` 内构建；已有可执行产物直接复用。`make -C guest-runtime sandbox-runtime` 负责把它和构建工具链一起注入 runtime。
@@ -929,15 +929,15 @@ Create 和 Build 共用既有 `kuasar-sandbox.launch` metadata 对象。E2B 在�
 
 `systemd` 严格接受 `off`、`auto`、`runtime`、`provided`。`off` 使用 direct 执行；`runtime` 要求 runtime 配套 systemd payload；`provided` 要求最终 rootfs 中兼容的 manager；`auto` 在提供的 manager 存在时选择它，否则选择 runtime payload。已选择候选损坏、不兼容或启动失败时明确报错，不回退。非 off 模式要求 Guest 能力 `systemd_v1`，普通 direct 请求不增加该门槛。
 
-省略表示继承来源，显式 `off` 可以覆盖来源。没有来源的新定义默认 off。Build 先合并完整来源，再生成供顶层 E 和内存 C0 共用的最终 Launch。从 E 新建时，tenant task 保留已经准备好的完整来源到最终投影，保持来源的进程布局。显式改变模式时，只对已识别的 envd-primary 或 placeholder/envd-plugin 布局更新产品拥有的 cgroup 根；未知或歧义布局要求新建冷定义。暂停 E 的冷恢复使用持久来源，不重放历史创建 metadata。S 恢复已经捕获的状态，拒绝任何新模式覆盖，包括 off。
+省略表示继承来源，显式 `off` 可以覆盖来源。没有来源的新定义默认 off。Build 先合并完整来源，再生成供顶层 E 和内存 C0 共用的最终 Launch。从 E 新建时，tenant task 保留已经准备好的完整来源到最终投影，保持来源的进程布局。显式改变模式时，只对已识别的产品 envd-primary 布局更新产品拥有的 cgroup 根；未知或歧义布局要求新建冷定义。暂停 E 的冷恢复使用持久来源，不重放历史创建 metadata。S 恢复已经捕获的状态，拒绝任何新模式覆盖，包括 off。
 
-新的产品 envd 插件取得最终镜像的完整默认环境，再叠加来源和请求覆盖。tenant task 读取与实际启动相同的不可变镜像身份，fresh image 路径同样执行；镜像环境不回传 Conductor。PATH 来自默认值时，非 off 模式在前面加入 `/run/sandbox-runtime/systemd/bin`，保留镜像 PATH 的全部目录；仅实际 runtime 模式在该目录投影工具，provided 下目录不存在时由普通 PATH 查找跳过。显式 PATH（包括空值）保持不变。已保存 E 的插件 PATH 继续具有权威性；只有该插件携带可信默认 PATH 来源标记时，模式覆盖才调整平台前缀。Host 在 artifact 和任务到 CLI 的内部交接中保留来源，不从字符串相等推断；旧 E 插件无标记时保持 PATH 不变。其他插件保留各自独立的环境。
+envd 继续作为 primary，OCI/Launch 环境由 Sandboxer 按已有规则合并。Orchestrator 不重复读取镜像 Env、不改写 PATH，也不传递默认 PATH 来源标记。调用者显式 PATH 保留原值；实际选中 Runtime systemd 时，native exec 默认 PATH 包含私有工具目录。
 
-包括 `off` 模式在内的新 E2B 冷定义，其 primary stdout/stderr 继续经既有应用 MUX 进入 `sandbox` journal 输出；envd 作为普通 plugin，其自身进程的 stdout/stderr 沿 Guest console 进入 `console` 输出。已有 E/S 保留 envd primary 时，继续使用原有应用输出路径。参见[日志身份与输出目标](observability_zh.md#journal-ownership-and-output-targets)。
+全部 E2B 模式均保留 envd primary，其 stdout/stderr 继续经应用 MUX 进入 `sandbox` journal；本轮不新增 envd plugin，不改变日志分类。
 
-Runtime readiness 或 placeholder 的 `app_started` 不代表 E2B Running。当前 run 必须在既有 launch context 中成功完成 `POST /init`；取消、期限耗尽或 run 已失效都不能发布 Running。零启动超时保留现有无上限语义；Guest service 就绪不要求任意用户 unit 全部健康。
+Runtime readiness 或 envd primary 的 `app_started` 不代表 E2B Running。当前 run 必须在既有 launch context 中成功完成 `POST /init`；取消、期限耗尽或 run 已失效都不能发布 Running。零启动超时保留现有无上限语义；Guest service 就绪不要求任意用户 unit 全部健康。
 
-活动实例的普通删除在接纳时记录精确 run，先请求有界 Host/Guest 正常关机，再执行 runner fence 和资源回收。原有物理清理超时在关机阶段之后开始。重复删除复用 Host 已受理的期限；paused、冻结捕获、已经退出以及无新标记的旧 deleting 行保留原有销毁清理，不为 Shutdown 解冻。没有新增 Launch 配置或第二份 grace。
+活动 systemd 实例的普通删除在接纳时记录精确 run，先请求有界 Host/Guest 正常关机，再执行 runner fence 和资源回收。原有物理清理超时在关机阶段之后开始。重复删除复用 Host 已受理的期限；paused、冻结捕获、已经退出以及无新标记的旧 deleting 行保留原有销毁清理，不为 Shutdown 解冻。Direct 实例继续使用既有 StopUnit/fence 行为。没有新增 Launch 配置或第二份 grace。
 
 本版本要求 Sandbox bootstrap 版本 9 和 Builder task 版本 9。应随 Conductor 更新 node-ctl worker，并在分配新任务前替换旧预热 worker；旧 worker 不能正确解释新的 Launch 策略。Artifact preparation summary 仍保持版本 5。
 

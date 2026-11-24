@@ -14,9 +14,8 @@ import (
 // runners cannot complete this protocol.
 const ArtifactPrepareSchemaVersion = 5
 
-// SandboxBootstrapVersion gates only sandbox bootstrap semantics: version 9
-// requires task-local complete-source launch projection for fresh E creates
-// and final-image environment projection for new E2B image launches.
+// SandboxBootstrapVersion gates task-local E-source Launch projection for
+// fresh creates. It does not alter the original image primary path.
 // ArtifactPrepareSummary and Builder retain their independent versions.
 const SandboxBootstrapVersion = 9
 
