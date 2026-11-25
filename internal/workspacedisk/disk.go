@@ -16,7 +16,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
-	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
@@ -177,34 +176,6 @@ func OpenLayer(ctx context.Context, s *artifact.ProcessStorage, r manifest.Ref, 
 		return nil, errors.New("workspace file has no trusted directory")
 	}
 	return s.OpenFileWithLocations(ctx, path, r, loc)
-}
-
-// Qualify names only newly published Bundle members. Already published layers
-// keep their original reference and location; exporting a disk does not move them.
-func Qualify(d *rtconfig.DiskV1, dir, name string) error {
-	qualify := func(raw string) (string, error) {
-		if ref, err := types.ParsePortableRef(raw); err == nil &&
-			(ref.Scheme == manifest.RefSchemeManifest || ref.Digest != "") {
-			return raw, nil
-		}
-		ref, err := manifest.ParseRef(raw)
-		if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || ref.DigestScheme != "manifest" || filepath.Dir(ref.Path) != dir {
-			return "", fmt.Errorf("disk publication returned a layer outside its destination")
-		}
-		ref.Location = name
-		ref.Path = filepath.Base(ref.Path)
-		return ref.String(), nil
-	}
-	var err error
-	if d.Base, err = qualify(d.Base); err != nil {
-		return err
-	}
-	for i, raw := range d.BaseFromRefs {
-		if d.BaseFromRefs[i], err = qualify(raw); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func AuthorizeLayers(ctx context.Context, disk rtconfig.DiskV1, locations rtconfig.RefLocations, o Options) error {
