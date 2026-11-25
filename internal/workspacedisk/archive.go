@@ -165,8 +165,7 @@ func (a *workspaceArchive) publish(guard context.Context, request Request, name 
 		if err != nil {
 			return nil, err
 		}
-		req.Upload = false
-		req.OutputDir = output.Path
+		req.ToRefLocation = rtconfig.RefLocations{publication: output.Path}
 		// Path derivation does not open layers. Keep these optional mappings
 		// for legacy conversion or layer-limit compaction, which actually read
 		// selected parents. Retaining portable refs needs no configured parent.
@@ -188,11 +187,6 @@ func (a *workspaceArchive) publish(guard context.Context, request Request, name 
 	}
 	if err != nil {
 		return nil, err
-	}
-	if !req.Upload {
-		if err := Qualify(&disk, output.Path, publication); err != nil {
-			return nil, err
-		}
 	}
 	// ExportDisk validates its actual source and committed output. Retained
 	// portable layers are already published and may be unavailable on this node;
