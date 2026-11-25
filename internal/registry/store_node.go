@@ -63,8 +63,32 @@ func (s *Stores) GetNodeProfile(ctx context.Context, id string) (*NodeRecord, bo
 	}
 	return nodeRecord(v), true, nil
 }
-func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
+
+// GetNodeWithKeyPairs reads only the profile and key leases needed by heartbeat
+// refreshes. Ownership lists can be much larger and are unrelated to renewal.
+func (s *Stores) GetNodeWithKeyPairs(ctx context.Context, id string) (*NodeRecord, bool, error) {
 	n, found, err := s.GetNodeProfile(ctx, id)
+	if err != nil || !found {
+		return n, found, err
+	}
+	for cursor := metadata.Cursor(""); ; {
+		page, err := s.keyPairs.ListKeyPairs(ctx, id, cursor, 256)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, v := range page.Items {
+			n.KeyPairs = append(n.KeyPairs, clusterstate.NodeKeyPair(v.Value))
+		}
+		if page.Next == "" {
+			break
+		}
+		cursor = page.Next
+	}
+	return n, true, nil
+}
+
+func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
+	n, found, err := s.GetNodeWithKeyPairs(ctx, id)
 	if err != nil || !found {
 		return n, found, err
 	}
@@ -91,19 +115,6 @@ func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, err
 		}
 		for _, v := range page.Items {
 			n.Builds = append(n.Builds, clusterstate.NodeBuildRef(v.Value))
-		}
-		if page.Next == "" {
-			break
-		}
-		cursor = page.Next
-	}
-	for cursor := metadata.Cursor(""); ; {
-		page, err := s.keyPairs.ListKeyPairs(ctx, id, cursor, 256)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, v := range page.Items {
-			n.KeyPairs = append(n.KeyPairs, clusterstate.NodeKeyPair(v.Value))
 		}
 		if page.Next == "" {
 			break

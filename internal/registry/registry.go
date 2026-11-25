@@ -1675,8 +1675,8 @@ func (r *Registry) updateNodeProfile(ctx context.Context, nodeID string, create 
 	return rec, true, nil
 }
 
-func (r *Registry) getNodeForLinkUpdate(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
-	return r.stores.GetNode(ctx, nodeID)
+func (r *Registry) getNodeForKeyRefresh(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	return r.stores.GetNodeWithKeyPairs(ctx, nodeID)
 }
 
 // RunReaper configures event-driven dead-node cleanup. A node-link disconnect

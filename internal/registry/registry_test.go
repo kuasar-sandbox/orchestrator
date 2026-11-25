@@ -109,7 +109,7 @@ func testRouteFromRecord(record *SandboxRecord, sid, state string) routesync.Rou
 
 func updateHeartbeatAndRefreshKeyPairs(reg *Registry, ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
 	reg.updateHeartbeat(testNodeSession(ctx, reg.stores, nodeID), nodeID, hb)
-	rec, found, err := reg.getNodeForLinkUpdate(ctx, nodeID)
+	rec, found, err := reg.getNodeForKeyRefresh(ctx, nodeID)
 	if err == nil && found {
 		reg.refreshNodeKeyPairs(ctx, rec)
 	}
