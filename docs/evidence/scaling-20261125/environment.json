@@ -1,0 +1,24 @@
+{
+  "date": "2026-11-25",
+  "baseline": "2cc052363d0dd5646a41606f9a77ce14b04053e5",
+  "go": "go1.26.4 linux/amd64",
+  "sqlite_driver": "modernc.org/sqlite v1.40.1",
+  "cpu": "AMD EPYC 9V74 80-Core Processor",
+  "GOMAXPROCS": 1,
+  "benchmark_iterations": 1,
+  "dependencies": {
+    "accelerator": "127afc27958d2721beb4b36c135ee1b1fce86390",
+    "connector": "6b48c8f450dac707b708a08980a463c1d66ff847",
+    "sandboxer": "7cc1d0f21b2a512cb567fc06964996a92e3e7d4a",
+    "guest-runtime": "7bfcecf8e519d9c28fa688f58022d03cc814091e"
+  },
+  "limits": [
+    "Paired single-iteration observations, not latency quantiles or throughput under concurrency.",
+    "Local shared machine; no full-cluster or real VM density capacity claim.",
+    "B/op reports cumulative Go allocation, not peak RSS.",
+    "SQLite inventories include production row decoding and decryption, but exclude telemetry calculation/export.",
+    "File imports use real importSource with stub lease/checkpoint replies and no target Nodes.",
+    "Group reports include real streamGroups and ValidateMessage; exclude database snapshot, network transport and Registry publication.",
+    "The 10k and 100k quadratic file-import baseline was not run."
+  ]
+}

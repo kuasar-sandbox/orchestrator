@@ -1,0 +1,12 @@
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage	0.005s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/observe	0.004s
+?   	github.com/kuasar-sandbox/orchestrator/internal/storage/record	[no test files]
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/sqlengine	0.366s
+?   	github.com/kuasar-sandbox/orchestrator/internal/storage/storagetest	[no test files]
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata	0.015s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	1.218s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/registry	13.229s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/router	0.392s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/store	2.303s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/placer	0.904s
+ok  	github.com/kuasar-sandbox/orchestrator/internal/nodelink	0.523s

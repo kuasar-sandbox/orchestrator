@@ -1,0 +1,18 @@
+{
+  "source_tree_before_evidence_commit": "91fd14e27ed54965b5d1623760e5776aad358a22",
+  "full_affected_packages": "go test ./internal/storage/... ./internal/cluster/metadata ./internal/cluster/metastore ./internal/registry ./internal/router ./internal/store ./internal/placer ./internal/nodelink -count=1",
+  "targeted_race": "go test -race -p=1 ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry ./internal/router ./internal/store ./internal/placer ./internal/nodelink -run Test(ScanBinaryBounds|SQLiteScanSeeksToCursor|GroupAuthCandidate|VerifyGroupAPIKeyChecksEveryCandidateMAC|PublicList|RouteList|RouteCursor|HeartbeatKeyRefresh|GetNodeWithKeyPairs|SandboxQueryIndexes|SandboxListPaging|OpenReplacesSandboxQueryIndexes|FileGroupSnapshot|ImportSourceUsesOneFileSnapshot|BatchGroupSnapshot|GroupStream) -count=1",
+  "exit_codes": {
+    "full_affected_packages": 0,
+    "targeted_race": 0
+  },
+  "local_backend": "SQLite; PostgreSQL and native FoundationDB are required CI gates, not claimed as executed locally",
+  "independent_review": [
+    "Heartbeat narrow-read semantics, key pagination and real NodeLink/ACK fixture: passed.",
+    "SQLite upgrade, index coverage, cursor results and retention-index preservation: passed.",
+    "File snapshot isolation and report batch byte/entry/row limits: passed.",
+    "Authentication key order, lower bound, collision pages and full MAC verification: passed.",
+    "Generic SQL inclusive/exclusive byte ranges and actual modernc VM cursor seek: passed.",
+    "Public list budget, all five inventory consumers, opaque cursor AEAD/AAD, key initialization concurrency/unknown outcomes and removed-key guard: passed."
+  ]
+}

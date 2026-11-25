@@ -1,0 +1,30 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/store
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkSandboxQueryScaling/1000/previous/OwnerPage         	       1	   4474803 ns/op	  852168 B/op	   16098 allocs/op
+BenchmarkSandboxQueryScaling/1000/previous/StatePage         	       1	   3532716 ns/op	  847320 B/op	   15952 allocs/op
+BenchmarkSandboxQueryScaling/1000/previous/PublicStatesPage  	       1	   5410801 ns/op	  849896 B/op	   16090 allocs/op
+BenchmarkSandboxQueryScaling/1000/previous/Inventory         	       1	  57818256 ns/op	        10.00 pages/op	      1000 rows/op	 8489040 B/op	  160689 allocs/op
+BenchmarkSandboxQueryScaling/1000/composite/OwnerPage        	       1	   1742922 ns/op	  852168 B/op	   16098 allocs/op
+BenchmarkSandboxQueryScaling/1000/composite/StatePage        	       1	   1575110 ns/op	  847240 B/op	   15951 allocs/op
+BenchmarkSandboxQueryScaling/1000/composite/PublicStatesPage 	       1	   3512655 ns/op	  849896 B/op	   16090 allocs/op
+BenchmarkSandboxQueryScaling/1000/composite/Inventory        	       1	  39304519 ns/op	        10.00 pages/op	      1000 rows/op	 8483312 B/op	  160676 allocs/op
+BenchmarkSandboxQueryScaling/10000/previous/OwnerPage        	       1	  28664931 ns/op	  852168 B/op	   16098 allocs/op
+BenchmarkSandboxQueryScaling/10000/previous/StatePage        	       1	  19689012 ns/op	  847240 B/op	   15951 allocs/op
+BenchmarkSandboxQueryScaling/10000/previous/PublicStatesPage 	       1	  32260253 ns/op	  849896 B/op	   16090 allocs/op
+BenchmarkSandboxQueryScaling/10000/previous/Inventory        	       1	3315938284 ns/op	       100.0 pages/op	     10000 rows/op	84922464 B/op	 1608250 allocs/op
+BenchmarkSandboxQueryScaling/10000/composite/OwnerPage       	       1	   1946689 ns/op	  852168 B/op	   16098 allocs/op
+BenchmarkSandboxQueryScaling/10000/composite/StatePage       	       1	   1677334 ns/op	  847240 B/op	   15951 allocs/op
+BenchmarkSandboxQueryScaling/10000/composite/PublicStatesPage         	       1	   3387957 ns/op	  849896 B/op	   16090 allocs/op
+BenchmarkSandboxQueryScaling/10000/composite/Inventory                	       1	 409317349 ns/op	       100.0 pages/op	     10000 rows/op	84923856 B/op	 1608240 allocs/op
+BenchmarkSandboxQueryScaling/100000/previous/OwnerPage                	       1	 259110697 ns/op	  852168 B/op	   16098 allocs/op
+BenchmarkSandboxQueryScaling/100000/previous/StatePage                	       1	 191398773 ns/op	  847240 B/op	   15951 allocs/op
+BenchmarkSandboxQueryScaling/100000/previous/PublicStatesPage         	       1	 294017863 ns/op	  849896 B/op	   16090 allocs/op
+BenchmarkSandboxQueryScaling/100000/previous/Inventory                	       1	304359196432 ns/op	      1000 pages/op	    100000 rows/op	849315688 B/op	16083930 allocs/op
+BenchmarkSandboxQueryScaling/100000/composite/OwnerPage               	       1	   2365349 ns/op	  852168 B/op	   16098 allocs/op
+BenchmarkSandboxQueryScaling/100000/composite/StatePage               	       1	   2069184 ns/op	  847240 B/op	   15951 allocs/op
+BenchmarkSandboxQueryScaling/100000/composite/PublicStatesPage        	       1	   3680358 ns/op	  849896 B/op	   16090 allocs/op
+BenchmarkSandboxQueryScaling/100000/composite/Inventory               	       1	4213946593 ns/op	      1000 pages/op	    100000 rows/op	849305472 B/op	16083873 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/store	326.176s

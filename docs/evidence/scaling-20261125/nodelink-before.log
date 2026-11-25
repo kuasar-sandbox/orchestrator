@@ -1,0 +1,9 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/nodelink
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkGroupStreamSnapshot/1000         	       1	  25534041 ns/op	17287336 B/op	    4875 allocs/op
+BenchmarkGroupStreamSnapshot/10000        	       1	 261254835 ns/op	173897696 B/op	   20968 allocs/op
+BenchmarkGroupStreamSnapshot/100000       	       1	2837917349 ns/op	1747615872 B/op	  208762 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/nodelink	3.178s
