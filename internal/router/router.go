@@ -1329,7 +1329,18 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
-	path := fmt.Sprintf("%s?group=%s", registry.RouteLinkListPath, url.QueryEscape(group))
+	parameters, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "invalid list query", http.StatusBadRequest)
+		return
+	}
+	query := url.Values{"group": {group}}
+	for _, name := range []string{"limit", "nextToken", "state"} {
+		if values, present := parameters[name]; present {
+			query[name] = values
+		}
+	}
+	path := registry.RouteLinkListPath + "?" + query.Encode()
 	resp, err := rt.routeLinkHTTP(r.Context(), group, http.MethodGet, path, nil, map[string]string{HeaderAPIKey: apiKeyFromRequest(r)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)

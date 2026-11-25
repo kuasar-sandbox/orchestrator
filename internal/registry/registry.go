@@ -94,6 +94,7 @@ type Registry struct {
 	stores              *Stores
 	parkTimeout         time.Duration
 	log                 *slog.Logger
+	listCursor          publicListCursorCodec
 
 	mu    sync.Mutex
 	nodes map[string]nodeConn // node_id -> channel

@@ -1,7 +1,9 @@
 package metastore
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
@@ -319,7 +321,21 @@ func (s *Store) ListRoutes(ctx context.Context, group string, cursor metadata.Cu
 	if err := validateParts(group); err != nil {
 		return metadata.Page[metadata.Versioned[metadata.SandboxRecord]]{}, err
 	}
-	page, err := listTyped[metadata.SandboxRecord](ctx, s, s.routeScope(group), cursor, limit)
+	scope := s.routeScope(group)
+	last, err := decodeCursor(scope, cursor)
+	if err != nil {
+		return metadata.Page[metadata.Versioned[metadata.SandboxRecord]]{}, fmt.Errorf("%w: %w", metadata.ErrInvalidCursor, err)
+	}
+	if last != nil {
+		if len(last) <= len(scope)+4 {
+			return metadata.Page[metadata.Versioned[metadata.SandboxRecord]]{}, metadata.ErrInvalidCursor
+		}
+		id := string(last[len(scope)+4:])
+		if validateParts(id) != nil || !bytes.Equal(last, scope.Child(id)) {
+			return metadata.Page[metadata.Versioned[metadata.SandboxRecord]]{}, metadata.ErrInvalidCursor
+		}
+	}
+	page, err := listTyped[metadata.SandboxRecord](ctx, s, scope, cursor, limit)
 	if err != nil {
 		return metadata.Page[metadata.Versioned[metadata.SandboxRecord]]{}, err
 	}

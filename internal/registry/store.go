@@ -68,6 +68,7 @@ type Stores struct {
 	directory    metadata.NodeDirectory
 	imports      metadata.ImportSourceRepository
 	observations metadata.ObservationAdmission
+	listCursors  metadata.PublicListCursorRepository
 	owners       metadata.ConnectionOwners
 }
 
@@ -75,10 +76,10 @@ func NewStores(repos metadata.Repositories, owners metadata.ConnectionOwners) (*
 	if repos.Groups == nil {
 		return nil, errors.New("registry: Group support repository is required")
 	}
-	if repos.Routes == nil || repos.Builds == nil || repos.Nodes == nil || repos.Ownership == nil || repos.KeyPairs == nil || repos.Directory == nil || repos.Imports == nil || repos.Observations == nil || owners == nil || owners.LocalID() == "" {
+	if repos.Routes == nil || repos.Builds == nil || repos.Nodes == nil || repos.Ownership == nil || repos.KeyPairs == nil || repos.Directory == nil || repos.Imports == nil || repos.Observations == nil || repos.ListCursors == nil || owners == nil || owners.LocalID() == "" {
 		return nil, errors.New("registry: all typed metadata repositories and connection owners are required")
 	}
-	return &Stores{groups: repos.Groups, routes: repos.Routes, builds: repos.Builds, nodes: repos.Nodes, ownership: repos.Ownership, keyPairs: repos.KeyPairs, directory: repos.Directory, imports: repos.Imports, observations: repos.Observations, owners: owners}, nil
+	return &Stores{groups: repos.Groups, routes: repos.Routes, builds: repos.Builds, nodes: repos.Nodes, ownership: repos.Ownership, keyPairs: repos.KeyPairs, directory: repos.Directory, imports: repos.Imports, observations: repos.Observations, listCursors: repos.ListCursors, owners: owners}, nil
 }
 func (s *Stores) WriterID() string { return s.owners.LocalID() }
 func (s *Stores) NodeOwnerCandidates(ctx context.Context, nodeID string) ([]string, error) {

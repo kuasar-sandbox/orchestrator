@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
@@ -128,9 +129,41 @@ type ListItem struct {
 }
 
 func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
-	group := req.URL.Query().Get("group")
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q, err := url.ParseQuery(req.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "invalid list query", http.StatusBadRequest)
+		return
+	}
+	group := q.Get("group")
 	if group == "" {
 		http.Error(w, "group is required", http.StatusBadRequest)
+		return
+	}
+	limit := 100
+	if values, present := q["limit"]; present {
+		var err error
+		limit, err = strconv.Atoi(q.Get("limit"))
+		if len(values) != 1 || err != nil || limit < 1 || limit > 1000 {
+			http.Error(w, "limit must be an integer in 1..1000", http.StatusBadRequest)
+			return
+		}
+	}
+	if len(q["nextToken"]) > 1 || len(q["state"]) > 1 {
+		http.Error(w, "duplicate list query parameter", http.StatusBadRequest)
+		return
+	}
+	state := SandboxState(q.Get("state"))
+	if state == "running" {
+		state = StateReady
+	}
+	switch state {
+	case "", StateReady, StatePausing, StatePaused, StateReserved, StateDead, StateDeleting:
+	default:
+		http.Error(w, "unsupported sandbox state", http.StatusBadRequest)
 		return
 	}
 	if err := r.authenticateCreate(req.Context(), group, req.Header.Get("X-API-KEY")); err != nil {
@@ -138,14 +171,37 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	out := []ListItem{}
-	for cursor := metadata.Cursor(""); ; {
-		page, err := r.stores.routes.ListRoutes(req.Context(), group, cursor, 128)
+	cursor, err := r.decodePublicListCursor(req.Context(), group, state, req.Header.Get("X-API-KEY"), q.Get("nextToken"))
+	if err != nil {
+		if errors.Is(err, metadata.ErrInvalidCursor) {
+			http.Error(w, "invalid nextToken", http.StatusBadRequest)
+		} else {
+			http.Error(w, "sandbox listing unavailable", routeLinkStatus(err))
+		}
+		return
+	}
+	// Bound scanned candidates, not visible rows. Authorization and state
+	// filters can yield short or empty pages; the cursor still advances past
+	// every examined record so sparse visibility never causes a full-group scan.
+	for remaining := limit; remaining > 0; {
+		page, err := r.stores.routes.ListRoutes(req.Context(), group, cursor, min(remaining, 128))
 		if err != nil {
+			if errors.Is(err, metadata.ErrInvalidCursor) {
+				http.Error(w, "invalid nextToken", http.StatusBadRequest)
+				return
+			}
 			http.Error(w, err.Error(), routeLinkStatus(err))
 			return
 		}
 		for _, item := range page.Items {
 			s := &item.Value
+			if state == "" {
+				if s.State != StateReady && s.State != StatePausing && s.State != StatePaused {
+					continue
+				}
+			} else if s.State != state {
+				continue
+			}
 			if err := r.authenticateSandboxAPIKey(req.Context(), s, req.Header.Get("X-API-KEY")); err != nil {
 				if errors.Is(err, ErrReserveForbidden) {
 					continue
@@ -153,15 +209,27 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 				http.Error(w, err.Error(), routeLinkStatus(err))
 				return
 			}
-			if s.State == StateReady || s.State == StatePausing || s.State == StatePaused {
-				out = append(out, ListItem{IdleTimeout: types.CloneIdleTimeout(s.IdleTimeout), SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
-			}
+			out = append(out, ListItem{IdleTimeout: types.CloneIdleTimeout(s.IdleTimeout), SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
 		}
-		if page.Next == "" {
+		remaining -= len(page.Items)
+		cursor = page.Next
+		if cursor == "" {
 			break
 		}
-		cursor = page.Next
+		if len(page.Items) == 0 {
+			http.Error(w, "sandbox listing did not advance", http.StatusServiceUnavailable)
+			return
+		}
 	}
+	if cursor != "" {
+		next, err := r.encodePublicListCursor(req.Context(), group, state, req.Header.Get("X-API-KEY"), cursor)
+		if err != nil {
+			http.Error(w, "sandbox listing unavailable", routeLinkStatus(err))
+			return
+		}
+		w.Header().Set("x-next-token", next)
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, out)
 }
 

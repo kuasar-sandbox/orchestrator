@@ -14,6 +14,7 @@ var (
 	ErrCapacity          = storage.ErrCapacity
 	ErrStaleLease        = errors.New("metadata: stale import source lease")
 	ErrInvalidRecord     = storage.ErrInvalid
+	ErrInvalidCursor     = errors.New("metadata: invalid cursor")
 )
 
 type Conflict = record.Conflict
