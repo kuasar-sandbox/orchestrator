@@ -646,6 +646,8 @@ Intent 绑定稳定逻辑 ID 和明确的 Node 本地 generation。超时、丢�
 
 Placer 使用有界 `Range` 加完整 `Read` 的 source 接口。一次维护操作只读取一次完整记录，并从同一值派生 context、凭据对和静态目标。文件和嵌入式来源复用同一适配器。静态 selector 和可选 shuffle sharding 决定所有维护目标，包括 draining、热点和当前缺少 runtime 的 Node；导入不使用 P2C。空交集不能扩大成全选。
 
+取得 source lease 后，文件来源每轮只读取并校验一次目录，所有分页和目标读取复用这份不可变快照。本轮扫描后的文件变化在下一轮生效；该快照只在本轮内保持稳定，不保证扫描文件期间的文件系统原子快照。
+
 Ready importer 经 Registry 竞争有界、带 fence 的 source lease。页内所有项成功才以原 owner/run/term 推进 cursor；Registry 在转发命令前再次校验 lease。可信命令可在同一 Node SQLite 事务安装完整 key pair 并更新 Group；这条导入路径不向 Registry 写入独立的 desired-key 缓存。
 
 后台导入可创建缺失的 Group 或续租未变化的上下文；定义不同则报告冲突，不静默覆盖手工修改或复活 tombstone。`cluster-ctl placer apply --config ...` 复用同一来源和适配器执行一次显式遍历：读取各目标版本，只做一次有条件更新，按目标输出冲突和部分成功结果，不输出私有上下文或密钥。

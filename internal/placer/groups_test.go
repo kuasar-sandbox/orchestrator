@@ -1,11 +1,14 @@
 package placer
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -57,6 +60,101 @@ func TestFileGroupSourceCompleteRecordAndPagination(t *testing.T) {
 	got, ok, err := source.Read(t.Context(), "/a")
 	if err != nil || !ok || got.TargetPort != 456 || got.TemplateRef != "" || got.Metadata["revision"] != "new" {
 		t.Fatalf("mixed record revisions: %v", err)
+	}
+}
+
+func TestFileGroupSnapshotKeepsDetachedRecordsUntilNextPass(t *testing.T) {
+	source := testGroupSource(t,
+		clusterstate.SandboxGroupRecord{Group: "/b"},
+		clusterstate.SandboxGroupRecord{
+			Group: "/a", TemplateRef: testGroupTemplate(), TargetPort: 123,
+			Config:        map[string]string{"app": "old"},
+			Metadata:      map[string]string{"revision": "old"},
+			NodeSelectors: []map[string]string{{"pool": "old"}},
+		})
+	snapshot, err := source.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := snapshot.Range(t.Context(), "", 1)
+	if err != nil || !reflect.DeepEqual(page.Groups, []string{"/a"}) || page.NextCursor != "1" {
+		t.Fatalf("first snapshot page: %+v, %v", page, err)
+	}
+	record, found, err := snapshot.Read(t.Context(), "/a")
+	if err != nil || !found {
+		t.Fatalf("snapshot read: found=%v, %v", found, err)
+	}
+	// Neither returned slices/maps nor a later file edit may alter this pass.
+	page.Groups[0] = "/changed"
+	record.Config["app"] = "changed"
+	record.Metadata["revision"] = "changed"
+	record.NodeSelectors[0]["pool"] = "changed"
+	record.NodeSelectors = append(record.NodeSelectors, map[string]string{"pool": "extra"})
+	writeGroupFile(t, source.dir, "group-1.json", clusterstate.SandboxGroupRecord{Group: "/a", TargetPort: 456})
+	if err := os.Remove(filepath.Join(source.dir, "group-0.json")); err != nil {
+		t.Fatal(err)
+	}
+	again, found, err := snapshot.Read(t.Context(), "/a")
+	if err != nil || !found || again.TargetPort != 123 || again.Config["app"] != "old" ||
+		again.Metadata["revision"] != "old" || len(again.NodeSelectors) != 1 || again.NodeSelectors[0]["pool"] != "old" {
+		t.Fatalf("snapshot changed: %+v, found=%v, %v", again, found, err)
+	}
+	all, err := snapshot.Range(t.Context(), "", 0)
+	if err != nil || !reflect.DeepEqual(all.Groups, []string{"/a", "/b"}) || all.NextCursor != "" {
+		t.Fatalf("snapshot names changed: %+v, %v", all, err)
+	}
+	last, err := snapshot.Range(t.Context(), page.NextCursor, 1)
+	if err != nil || !reflect.DeepEqual(last.Groups, []string{"/b"}) || last.NextCursor != "" {
+		t.Fatalf("next snapshot page: %+v, %v", last, err)
+	}
+	if _, found, err := snapshot.Read(t.Context(), "/missing"); err != nil || found {
+		t.Fatalf("missing snapshot record: found=%v, %v", found, err)
+	}
+	next, err := source.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, found, err := next.Read(t.Context(), "/a")
+	if err != nil || !found || updated.TargetPort != 456 || updated.TemplateRef != "" {
+		t.Fatalf("next pass missed replacement: %+v, found=%v, %v", updated, found, err)
+	}
+	if _, found, err := next.Read(t.Context(), "/b"); err != nil || found {
+		t.Fatalf("next pass retained removed input: found=%v, %v", found, err)
+	}
+}
+
+func TestFileGroupSnapshotValidationAndCancellation(t *testing.T) {
+	duplicate := testGroupSource(t, clusterstate.SandboxGroupRecord{Group: "/g"}, clusterstate.SandboxGroupRecord{Group: "/g"})
+	if _, err := duplicate.snapshot(t.Context()); err == nil {
+		t.Fatal("snapshot accepted duplicate definitions")
+	}
+	source := testGroupSource(t, clusterstate.SandboxGroupRecord{Group: "/g"})
+	snapshot, err := source.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snapshot.Range(t.Context(), "-1", 1); err == nil {
+		t.Fatal("snapshot accepted invalid cursor")
+	}
+	if page, err := snapshot.Range(t.Context(), "1", 1); err != nil || len(page.Groups) != 0 || page.NextCursor != "" {
+		t.Fatalf("snapshot end cursor: %+v, %v", page, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := source.snapshot(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot cancellation: %v", err)
+	}
+	if _, err := snapshot.Range(ctx, "", 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("range cancellation: %v", err)
+	}
+	if _, _, err := snapshot.Read(ctx, "/g"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("read cancellation: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source.dir, "group-0.json"), []byte(`{"group":"/g","unknown":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.snapshot(t.Context()); err == nil {
+		t.Fatal("snapshot skipped strict input validation")
 	}
 }
 

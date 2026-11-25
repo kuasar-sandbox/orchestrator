@@ -36,27 +36,10 @@ func streamGroups(ctx context.Context, source routesync.GroupSource, out chan<- 
 	if err := send(routesync.TypeGroupBegin, &routesync.GroupReport{SyncID: syncID, Sequence: sequence, Total: len(groups)}); err != nil {
 		return err
 	}
-	for offset := 0; offset < len(groups); {
-		batch := []nodegroup.Support{}
-		entries := 0
-		for i := offset; i < len(groups) && len(batch) < 128; i++ {
-			candidate := append(batch, groups[i])
-			raw, err := json.Marshal(candidate)
-			if err != nil {
-				return err
-			}
-			if len(raw) > 256<<10 || entries+len(groups[i].Entries) > 128 {
-				break
-			}
-			batch, entries = candidate, entries+len(groups[i].Entries)
-		}
-		if len(batch) == 0 {
-			return nodegroup.ErrTooLarge
-		}
-		if err := send(routesync.TypeGroupBatch, &routesync.GroupReport{SyncID: syncID, Sequence: sequence, Offset: offset, Groups: batch}); err != nil {
-			return err
-		}
-		offset += len(batch)
+	if err := batchGroupSnapshot(groups, func(offset int, batch []nodegroup.Support) error {
+		return send(routesync.TypeGroupBatch, &routesync.GroupReport{SyncID: syncID, Sequence: sequence, Offset: offset, Groups: batch})
+	}); err != nil {
+		return err
 	}
 	if err := send(routesync.TypeGroupEnd, &routesync.GroupReport{SyncID: syncID, Sequence: sequence}); err != nil {
 		return err
@@ -87,4 +70,36 @@ func streamGroups(ctx context.Context, source routesync.GroupSource, out chan<- 
 			sequence = event.Sequence
 		}
 	}
+}
+
+// batchGroupSnapshot counts each record's exact JSON size once. An array adds
+// two brackets and one comma between records; repeated prefix encoding is not
+// needed to retain the existing row, entry and byte budgets.
+func batchGroupSnapshot(groups []nodegroup.Support, send func(int, []nodegroup.Support) error) error {
+	offset, entries, size := 0, 0, 2
+	for i := range groups {
+		raw, err := json.Marshal(groups[i])
+		if err != nil {
+			return err
+		}
+		nextSize := size + len(raw)
+		if i > offset {
+			nextSize++ // comma before this record
+		}
+		if i > offset && (i-offset == 128 || entries+len(groups[i].Entries) > 128 || nextSize > 256<<10) {
+			if err := send(offset, groups[offset:i]); err != nil {
+				return err
+			}
+			offset, entries, nextSize = i, 0, len(raw)+2
+		}
+		if len(groups[i].Entries) > 128 || nextSize > 256<<10 {
+			return nodegroup.ErrTooLarge
+		}
+		entries += len(groups[i].Entries)
+		size = nextSize
+	}
+	if offset < len(groups) {
+		return send(offset, groups[offset:])
+	}
+	return nil
 }

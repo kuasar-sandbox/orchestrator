@@ -640,6 +640,8 @@ Reader SDKs, tools and binaries must be published and available before the snaps
 
 Placer's full-record source interface combines bounded `Range` and `Read`. Each maintenance operation reads one complete source record once and derives context, credential pair and static targets from that same value. File sources and embedded sources use the same adapter. Static selectors and optional shuffle sharding determine all intended targets, including draining/hot Nodes and Nodes currently missing a runtime. Import does not run P2C. An empty intersection stays empty.
 
+After acquiring the source lease, each file-source pass reads and validates the directory once, then shares that immutable snapshot across all pages and target reads. File changes after this scan become visible on the next pass. This is a pass-local snapshot, not an atomic filesystem snapshot while files are being read.
+
 Ready importers compete for a bounded, fenced source lease through Registry. Pages advance only after every item succeeds, using the original owner/run/term. Registry validates this lease again immediately before forwarding the Node command. The trusted command can install a complete key pair and update Group context in one Node SQLite transaction; the import path creates no independent desired-key cache in Registry.
 
 Background import may create an absent Group or renew an unchanged context. A different definition is a conflict. It never silently overwrites a manual edit or revives a tombstone. `cluster-ctl placer apply --config ...` performs one explicit pass using the same sources and adapter; it reads each target revision and makes one conditional attempt. Conflicts and partial outcomes are reported per target without private context or key material.
