@@ -80,9 +80,6 @@ func (s *fileGroupSource) Read(ctx context.Context, group string) (clusterstate.
 }
 
 func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
-	if limit <= 0 {
-		limit = defaultGroupPageLimit
-	}
 	records, err := s.records(ctx)
 	if err != nil {
 		return clusterstate.GroupPage{}, err
@@ -92,6 +89,13 @@ func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (
 		groups = append(groups, rec.Group)
 	}
 	sort.Strings(groups)
+	return groupPage(groups, cursor, limit)
+}
+
+func groupPage(groups []string, cursor string, limit int) (clusterstate.GroupPage, error) {
+	if limit <= 0 {
+		limit = defaultGroupPageLimit
+	}
 	start, err := parseGroupCursor(cursor)
 	if err != nil {
 		return clusterstate.GroupPage{}, err
@@ -99,15 +103,52 @@ func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (
 	if start >= len(groups) {
 		return clusterstate.GroupPage{}, nil
 	}
-	end := start + limit
-	if end > len(groups) {
-		end = len(groups)
-	}
+	end := start + min(limit, len(groups)-start)
 	next := ""
 	if end < len(groups) {
 		next = strconv.Itoa(end)
 	}
-	return clusterstate.GroupPage{Groups: groups[start:end], NextCursor: next}, nil
+	return clusterstate.GroupPage{Groups: append([]string(nil), groups[start:end]...), NextCursor: next}, nil
+}
+
+// snapshot validates the file source once for an import pass. Source changes
+// become visible on the next pass; pages and records are detached so callers
+// cannot change another target's input within the current pass.
+func (s *fileGroupSource) snapshot(ctx context.Context) (*fileGroupSnapshot, error) {
+	records, err := s.records(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := &fileGroupSnapshot{
+		records: make(map[string]clusterstate.SandboxGroupRecord, len(records)),
+		groups:  make([]string, 0, len(records)),
+	}
+	for _, record := range records {
+		snapshot.records[record.Group] = record
+		snapshot.groups = append(snapshot.groups, record.Group)
+	}
+	sort.Strings(snapshot.groups)
+	return snapshot, nil
+}
+
+type fileGroupSnapshot struct {
+	records map[string]clusterstate.SandboxGroupRecord
+	groups  []string
+}
+
+func (s *fileGroupSnapshot) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
+	if err := ctx.Err(); err != nil {
+		return clusterstate.GroupPage{}, err
+	}
+	return groupPage(s.groups, cursor, limit)
+}
+
+func (s *fileGroupSnapshot) Read(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return clusterstate.SandboxGroupRecord{}, false, err
+	}
+	record, found := s.records[group]
+	return cloneGroupRecord(record), found, nil
 }
 
 func (s *fileGroupSource) find(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {

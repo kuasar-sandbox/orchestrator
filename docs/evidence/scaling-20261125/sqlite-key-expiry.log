@@ -1,0 +1,12 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/store
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkKeyExpiryScaling/1000/previous         	       1	    213882 ns/op	     424 B/op	      10 allocs/op
+BenchmarkKeyExpiryScaling/1000/expiry_index     	       1	     42674 ns/op	     424 B/op	      10 allocs/op
+BenchmarkKeyExpiryScaling/10000/previous        	       1	   2584339 ns/op	     424 B/op	      10 allocs/op
+BenchmarkKeyExpiryScaling/10000/expiry_index    	       1	     57496 ns/op	     424 B/op	      10 allocs/op
+BenchmarkKeyExpiryScaling/100000/previous       	       1	  28503278 ns/op	     424 B/op	      10 allocs/op
+BenchmarkKeyExpiryScaling/100000/expiry_index   	       1	     73370 ns/op	     424 B/op	      10 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/store	3.001s

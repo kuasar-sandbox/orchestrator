@@ -76,18 +76,39 @@ data_by_sid_code() {
 }
 wait_cluster_traffic_stats() { record traffic; }
 router_req() {
+    [ "$3" = test-key ] || exit 18
     if [ "$1" = DELETE ]; then
         record delete; echo 204
     else
-        record list; echo '[]' > "$WORK/router-resp.body"; echo 200
+        record list
+        echo '[]' > "$WORK/router-resp.body"
+        : > "$WORK/router-resp.headers"
+        if [ "$FAILURE" = list-pages ]; then
+            case "$(grep -c '^list$' "$SEQUENCE")" in
+                1)
+                    [ "$2" = /v2/sandboxes ] || exit 18
+                    printf 'x-next-token: fixture+/=\r\n' > "$WORK/router-resp.headers"
+                    ;;
+                2)
+                    [ "$2" = '/v2/sandboxes?nextToken=fixture%2B%2F%3D' ] || exit 18
+                    echo '[{"sandboxID":"exact-sid"}]' > "$WORK/router-resp.body"
+                    ;;
+                3)
+                    [ "$2" = /v2/sandboxes ] || exit 18
+                    ;;
+                *) exit 18 ;;
+            esac
+        fi
+        echo 200
     fi
 }
 node_sandbox_id() { record local-id; [ "$1" = exact-sid ] || exit 18; echo exact-sid-g7; }
 wait_node_sandbox_finalized() { [ "$1" = exact-sid-g7 ] || exit 18; record finalized; }
-''' + function("retry_data_by_sid") + '\n' + (source or function("run_redirect_recovery")) + '\n' + function("run_redirect_flow") + '\nrun_redirect_flow\n'
+''' + function("retry_data_by_sid") + '\n' + function("router_list_all") + '\n' + (source or function("run_redirect_recovery")) + '\n' + function("run_redirect_flow") + '\nrun_redirect_flow\n'
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                                     timeout=5, env={**os.environ, "SEQUENCE": str(log), "FAILURE": failure,
                                                    "FIXTURE_WORK": directory})
+            self.assertNotEqual(result.returncode, 127, result.stderr)
             return result.returncode, log.read_text().splitlines() if log.exists() else []
 
     def test_restart_node_link_and_group_precede_real_create_data_delete(self):
@@ -104,6 +125,12 @@ wait_node_sandbox_finalized() { [ "$1" = exact-sid-g7 ] || exit 18; record final
                 self.assertEqual(calls[-1], gate)
                 self.assertNotIn("create", calls)
                 self.assertNotIn("request", calls)
+
+    def test_delete_waits_for_all_pages_after_an_empty_first_page(self):
+        status, calls = self.recovery("list-pages")
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, ["restart", "node-link", "group", "create", "request", "traffic",
+                                 "local-id", "delete", "list", "list", "list", "finalized"])
 
     def test_failed_create_is_never_retried(self):
         status, calls = self.recovery("create-http")

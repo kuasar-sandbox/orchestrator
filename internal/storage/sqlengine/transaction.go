@@ -81,18 +81,7 @@ func (t *transaction) Scan(bounds storage.Range, limit storage.Limit) (storage.P
 	if err := t.meter.Add(len(bounds.Begin) + len(bounds.End) + len(bounds.After) + 32); err != nil {
 		return storage.Page{}, err
 	}
-	args := []any{t.owner.namespace, nonNil(bounds.Begin)}
-	query := "SELECT key,value FROM kuasar_storage_v2 WHERE namespace=" + t.param(1) + " AND key >= " + t.param(2)
-	if bounds.End != nil {
-		args = append(args, bounds.End)
-		query += " AND key < " + t.param(len(args))
-	}
-	if bounds.After != nil {
-		args = append(args, bounds.After)
-		query += " AND key > " + t.param(len(args))
-	}
-	args = append(args, limit.Rows+1)
-	query += " ORDER BY key LIMIT " + t.param(len(args))
+	query, args := t.scanQuery(bounds, limit)
 	rows, err := t.tx.QueryContext(t.ctx, query, args...)
 	if err != nil {
 		return storage.Page{}, err
@@ -117,6 +106,26 @@ func (t *transaction) Scan(bounds storage.Range, limit storage.Limit) (storage.P
 	}
 	return out, rows.Err()
 }
+
+// scanQuery receives validated bounds. After is at least Begin, so its exclusive
+// lower bound subsumes Begin. Keeping both predicates lets SQLite seek to Begin
+// and filter every preceding key before reaching After on each cursor page.
+func (t *transaction) scanQuery(bounds storage.Range, limit storage.Limit) (string, []any) {
+	lower, comparison := bounds.Begin, ">="
+	if bounds.After != nil {
+		lower, comparison = bounds.After, ">"
+	}
+	args := []any{t.owner.namespace, nonNil(lower)}
+	query := "SELECT key,value FROM kuasar_storage_v2 WHERE namespace=" + t.param(1) + " AND key " + comparison + " " + t.param(2)
+	if bounds.End != nil {
+		args = append(args, bounds.End)
+		query += " AND key < " + t.param(len(args))
+	}
+	args = append(args, limit.Rows+1)
+	query += " ORDER BY key LIMIT " + t.param(len(args))
+	return query, args
+}
+
 func (t *transaction) Put(key, value []byte) error {
 	if err := storage.ValidateKey(key); err != nil {
 		return err

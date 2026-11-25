@@ -17,7 +17,7 @@ func (r *Registry) VerifyGroupAPIKey(ctx context.Context, group, key string) (bo
 	}
 	prefix := hex.EncodeToString(parsed.CandidateFingerprint)
 	for cursor := metadata.Cursor(""); ; {
-		page, err := r.stores.groups.ListGroupAuth(ctx, group, cursor, metadata.MaxGroupSupportBatchRows)
+		page, err := r.stores.groups.ListGroupAuthCandidates(ctx, group, prefix, cursor, metadata.MaxGroupSupportBatchRows)
 		if err != nil {
 			return false, err
 		}

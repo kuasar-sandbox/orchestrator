@@ -165,6 +165,13 @@ type ConnectionOwners interface {
 	Candidates(context.Context, string) ([]string, error)
 }
 
+// PublicListCursorRepository holds the server-only encryption key for public
+// sandbox list continuations. The key is immutable within a metadata namespace;
+// it is not derived from client credentials or exposed by a public API.
+type PublicListCursorRepository interface {
+	GetOrCreatePublicListCursorKey(context.Context) ([32]byte, error)
+}
+
 // Repositories groups constructor dependencies; consumers retain only the narrow
 // capability they use. It is not a general transaction/KV interface.
 type Repositories struct {
@@ -177,4 +184,5 @@ type Repositories struct {
 	Directory    NodeDirectory
 	Imports      ImportSourceRepository
 	Observations ObservationAdmission
+	ListCursors  PublicListCursorRepository
 }

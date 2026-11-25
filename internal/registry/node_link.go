@@ -513,7 +513,7 @@ func (r *Registry) runNodeKeyPairRefreshes(ctx context.Context, nodeID string, c
 			if !ok {
 				return
 			}
-			rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
+			rec, found, err := r.getNodeForKeyRefresh(ctx, nodeID)
 			if err == nil && found {
 				r.refreshNodeKeyPairs(ctx, rec)
 			}

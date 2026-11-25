@@ -1,6 +1,7 @@
 package placer
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -10,6 +11,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +23,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/testutil/metadatastore"
 )
@@ -275,6 +280,64 @@ func TestImportSourceLeaseAllowsOnlyOnePlacerToRange(t *testing.T) {
 				t.Fatalf("Range calls svc1=%d svc2=%d, want exactly one source owner", c1, c2)
 			}
 		})
+	}
+}
+
+func TestImportSourceReusesFileSnapshotAcrossPages(t *testing.T) {
+	ctx := t.Context()
+	_, backend := testScaleRegistry(t, ctx, "n1")
+	defer backend.Close()
+	groups := make([]clusterstate.SandboxGroupRecord, nodegroup.MaxPageSize+1)
+	for i := range groups {
+		groups[i] = clusterstate.SandboxGroupRecord{
+			Group:     "/g-" + strconv.Itoa(i),
+			APISecret: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
+		}
+	}
+	source := testGroupSource(t, groups...)
+	checkpoints := make(chan registry.ImportSourceCursorRequest, 2)
+	var checkpointCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == registry.PlacerLinkSourceCursorPath {
+			raw, err := io.ReadAll(req.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			var checkpoint registry.ImportSourceCursorRequest
+			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			req.Body = io.NopCloser(bytes.NewReader(raw))
+			checkpoints <- checkpoint
+			if checkpointCalls.Add(1) == 1 {
+				// Changing the directory between pages must not trigger a rescan
+				// or mix file revisions into the already validated pass.
+				if err := os.WriteFile(filepath.Join(source.dir, "group-0.json"), []byte(`{"group":`), 0600); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+		backend.Config.Handler.ServeHTTP(w, req)
+	}))
+	defer server.Close()
+	svc := NewRemoteLinks([]RegistryLink{{Name: "registry", BaseURL: server.URL, Client: server.Client()}}, clustercfg.PlacementConfig{}, nil)
+	input := ImportSource{SourceID: "test", Importer: source}
+	emit := func(result ImportResult) { t.Errorf("unexpected import result: %+v", result) }
+	if err := svc.importSource(ctx, input, nil, false, emit); err != nil {
+		t.Fatalf("file change interrupted current pass: %v", err)
+	}
+	if len(checkpoints) != 2 {
+		t.Fatalf("checkpoints=%d, want two pages", len(checkpoints))
+	}
+	first, last := <-checkpoints, <-checkpoints
+	if first.Cursor != strconv.Itoa(nodegroup.MaxPageSize) || first.Complete || last.Cursor != "" || !last.Complete {
+		t.Fatalf("wrong page checkpoints: first=%+v, last=%+v", first, last)
+	}
+	if err := svc.importSource(ctx, input, nil, false, emit); err == nil {
+		t.Fatal("next pass did not revalidate changed file")
 	}
 }
 

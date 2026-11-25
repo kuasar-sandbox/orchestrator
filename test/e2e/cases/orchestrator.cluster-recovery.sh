@@ -134,7 +134,7 @@ run_redirect_flow() {
     code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { fail "redirect delete returned $code"; }
     for _ in $(seq 1 80); do
-        code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"
+        code="$(router_list_all "$CLUSTER_API_KEY")"
         if [ "$code" = "200" ] && python3 - "$WORK/router-resp.body" "$sid" <<'PY_DELETE'
 import json, sys
 rows = json.load(open(sys.argv[1]))

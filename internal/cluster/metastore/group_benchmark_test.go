@@ -106,3 +106,35 @@ func BenchmarkGroupDirectory(b *testing.B) {
 		})
 	}
 }
+
+// Candidate lookup uses the persisted full-fingerprint directory directly.
+// Seeding is outside the measured loop; each lookup includes record decoding and
+// full fingerprint/material validation on the selected authentication root.
+func BenchmarkGroupAuthCandidates(b *testing.B) {
+	for name, open := range benchmarkBackends {
+		if selected := os.Getenv("STORAGE_BENCH_BACKEND"); selected != "" && selected != name {
+			continue
+		}
+		b.Run(name, func(b *testing.B) {
+			for _, count := range []int{1000, 10000, 100000} {
+				b.Run(fmt.Sprint(count), func(b *testing.B) {
+					s := open(b)
+					b.Cleanup(func() {
+						if err := s.Close(); err != nil {
+							b.Error(err)
+						}
+					})
+					roots := seedAuthCandidates(b, s, count)
+					root := roots[count/2]
+					b.ReportAllocs()
+					for b.Loop() {
+						page, err := s.ListGroupAuthCandidates(b.Context(), "g", root.AuthRef[:24], "", metadata.MaxGroupSupportBatchRows)
+						if err != nil || len(page.Items) != 1 || page.Items[0].Value != root || page.Next != "" {
+							b.Fatalf("candidate lookup: page=%+v err=%v", page, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
