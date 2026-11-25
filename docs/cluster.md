@@ -439,20 +439,6 @@ silently replaced.
 There is no public key deletion or rotation API; a future rotation protocol must
 explicitly define which cursor versions remain accepted.
 
-**Upgrade requirement:** an older cluster-list client that does not consume
-`x-next-token` will silently see only the first page after the server upgrade.
-Update such clients before enabling this behavior; the JSON shape alone does not
-make the change backward compatible.
-
-Do not perform a mixed-version rolling cutover for this endpoint. The previous
-Router forwards only the Group and drops `limit`/`nextToken`; with a new
-Registry this can repeatedly return the first page. A previous Registry ignores
-the pagination parameters and returns the complete list, so a mixed Registry
-pool does not provide consistent bounded behavior. Drain or isolate traffic so
-all Router and Registry peers serving paginated clients are upgraded together,
-then enable clients that follow continuation tokens. Existing sandbox records
-and API credentials do not require migration.
-
 <a id="router-control-plane"></a>
 
 ### Control plane

@@ -379,15 +379,6 @@ namespace 一起进入一致数据库备份，并随元数据恢复；恢复后�
 fail closed，不能静默重建。当前无公开删除或轮换 API，未来轮换协议须明确旧游标
 版本的接受边界。
 
-**升级要求：** 不读取 `x-next-token` 的旧 cluster 列表客户端升级后会静默地只看到第一页。
-必须先升级这类客户端，再启用新服务端行为；JSON 响应形状不变不代表行为向后兼容。
-
-该接口不能采用新旧版本混合的滚动切换。旧 Router 只转发 Group，会丢弃
-`limit`/`nextToken`；连接新 Registry 时可能反复返回第一页。旧 Registry 则忽略分页参数并
-返回完整列表，因此新旧 Registry 混合池也无法提供一致的有界分页语义。应先 drain 或隔离流量，
-确保服务分页客户端的 Router 和 Registry peer 一起升级，再启用读取续页 token 的客户端。
-现有 sandbox 记录和 API 凭据无需迁移。
-
 <a id="router-control-plane"></a>
 
 ### 控制面
