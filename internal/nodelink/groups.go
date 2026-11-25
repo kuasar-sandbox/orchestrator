@@ -78,6 +78,12 @@ func streamGroups(ctx context.Context, source routesync.GroupSource, out chan<- 
 func batchGroupSnapshot(groups []nodegroup.Support, send func(int, []nodegroup.Support) error) error {
 	offset, entries, size := 0, 0, 2
 	for i := range groups {
+		if i-offset == 128 {
+			if err := send(offset, groups[offset:i]); err != nil {
+				return err
+			}
+			offset, entries, size = i, 0, 2
+		}
 		raw, err := json.Marshal(groups[i])
 		if err != nil {
 			return err
@@ -86,7 +92,7 @@ func batchGroupSnapshot(groups []nodegroup.Support, send func(int, []nodegroup.S
 		if i > offset {
 			nextSize++ // comma before this record
 		}
-		if i > offset && (i-offset == 128 || entries+len(groups[i].Entries) > 128 || nextSize > 256<<10) {
+		if i > offset && (entries+len(groups[i].Entries) > 128 || nextSize > 256<<10) {
 			if err := send(offset, groups[offset:i]); err != nil {
 				return err
 			}

@@ -152,10 +152,10 @@ func TestBatchGroupSnapshotErrors(t *testing.T) {
 		"bytes":   {Group: strings.Repeat("x", 256<<10)},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, prefix := range []int{0, 1} {
+			for _, prefix := range []int{0, 1, 128} {
 				groups := make([]nodegroup.Support, prefix, prefix+1)
-				if prefix != 0 {
-					groups[0] = nodegroup.Support{Group: "/small", Version: 1}
+				for i := range groups {
+					groups[i] = nodegroup.Support{Group: "/small/" + strconv.Itoa(i), Version: 1}
 				}
 				groups = append(groups, oversized)
 				sent := 0
