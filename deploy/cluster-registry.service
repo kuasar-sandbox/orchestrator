@@ -1,9 +1,9 @@
 # cluster-registry.service — cluster control-plane registry (docs/cluster.md):
-# registry state cluster + node-link hub. One of three independent roles; run it
-# (and router/placer) as separate processes, each with its own config file.
+# execution metadata, authentication/selection and node-link service. Run Registry
+# and Router, plus optional Placer, as separate processes with their own configs.
 # Operator-managed.
 [Unit]
-Description=kuasar cluster-ctl registry (state cluster + node-link hub)
+Description=kuasar cluster-ctl registry (metadata, selection and node-link)
 After=network-online.target
 Wants=network-online.target
 

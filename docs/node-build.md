@@ -42,6 +42,8 @@ kind = os.environ["BUILD_KIND"]  # img, sbx, snp
 
 def call(method, path, body=None, extra=None):
     headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+    if os.environ.get("KUASAR_GROUP"):
+        headers["X-Kuasar-Sandbox-Group"] = os.environ["KUASAR_GROUP"]
     headers.update(extra or {})
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(api + path, data=data, headers=headers, method=method)

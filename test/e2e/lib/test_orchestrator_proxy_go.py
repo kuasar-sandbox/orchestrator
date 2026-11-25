@@ -253,20 +253,20 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
                 result = subprocess.run(['bash',str(wrapper),arch,str(output)],cwd=owner,env=env,text=True,capture_output=True)
                 self.assertEqual(result.returncode,0,result.stderr)
                 rows = [json.loads(line) for line in log.read_text().splitlines()]
-                self.assertEqual(len(rows),7)
-                self.assertEqual([r['env']['GOWORK'] for r in rows],[env['GOWORK']]*7)
+                self.assertEqual(len(rows),8)
+                self.assertEqual([r['env']['GOWORK'] for r in rows],[env['GOWORK']]*8)
                 for row in rows:
                     self.assertEqual(row['env'],dict(GOWORK=row['env']['GOWORK'],GOARCH=goarch,GOOS='linux',
                                                      CGO_ENABLED='0',GOTOOLCHAIN='local',CC='preserved-cc'))
                 self.assertEqual(rows[2]['argv'],['-C',str(owner),'test','-c','-trimpath','-o',str(output/'node-ctl-runner-test'),'./cmd/node-ctl'])
                 for row, name, package in zip(rows[3:],
-                        ['proxy-lifecycle', 'proxy-lifecycle-target', 'node-ctl-inplace-target', 'custom-proxy-inplace-target'],
-                        ['./test/e2e/proxy-lifecycle', './test/e2e/proxy-lifecycle', './cmd/node-ctl', './examples/custom-proxy'], strict=True):
+                        ['nodelink-fault-relay', 'proxy-lifecycle', 'proxy-lifecycle-target', 'node-ctl-inplace-target', 'custom-proxy-inplace-target'],
+                        ['./test/e2e/nodelink-fault-relay', './test/e2e/proxy-lifecycle', './test/e2e/proxy-lifecycle', './cmd/node-ctl', './examples/custom-proxy'], strict=True):
                     self.assertEqual(row['argv'][:4], ['-C', str(owner), 'build', '-trimpath'])
                     self.assertEqual(row['argv'][-3:], ['-o', str(output/name), package])
-                self.assertIn('-X main.buildIdentity=target', rows[4]['argv'])
-                self.assertIn('-X main.version=inplace-target', rows[5]['argv'])
-                self.assertIn('-buildid=orchestrator-inplace-target', rows[6]['argv'])
+                self.assertIn('-X main.buildIdentity=target', rows[5]['argv'])
+                self.assertIn('-X main.version=inplace-target', rows[6]['argv'])
+                self.assertIn('-buildid=orchestrator-inplace-target', rows[7]['argv'])
                 self.assertEqual(json.loads(native_log.read_text().splitlines()[-1]),
                     ['-B', str(owner/'scripts/test_fdb_assets.py'), '--arch', arch, '--output', str(output)])
         selected_root = self.root / 'selected-root'
@@ -277,7 +277,7 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
         result=subprocess.run(['bash',str(wrapper),'x86_64',str(output)],cwd=owner,
                               env=goroot_env,text=True,capture_output=True)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(len(log.read_text().splitlines()),7)
+        self.assertEqual(len(log.read_text().splitlines()),8)
         log.unlink()
         result = subprocess.run(['bash',str(wrapper),'x86_64',str(output)],cwd=owner,
                                 env=dict(env,FAIL_NODE='1'),text=True,capture_output=True)

@@ -14,5 +14,7 @@ docs/observability.md
 docs/observability_zh.md
 docs/cluster.md
 docs/cluster_zh.md
+docs/cluster-storage.md
+docs/cluster-storage_zh.md
 docs/extensions.md
 docs/extensions_zh.md

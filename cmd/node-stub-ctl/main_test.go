@@ -1017,6 +1017,67 @@ func TestStubCreateRejectsUnavailableAPISecretMaterial(t *testing.T) {
 	}
 }
 
+func TestStubMaterializedRouteIdentityAndEmptyReboot(t *testing.T) {
+	svc := newService("", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	node := newStubNode(stubNodeOptions{ID: "n1", NodeLink: "127.0.0.1:1", CreateDelay: time.Millisecond}, svc)
+	t.Cleanup(func() { node.crash(); node.closeGroups() })
+	secret := strings.Repeat("11", 32)
+	fingerprint := testStubFingerprint(t, secret)
+	node.keyPairs[fingerprint] = stubKeyPair{
+		APISecret: secret, APISecretType: "inline", APISecretFingerprint: fingerprint,
+		ManifestKeyFingerprint: strings.Repeat("b", 64),
+	}
+	cmd := &routesync.Command{
+		CmdID: "create", Kind: routesync.CmdCreate, SID: "stable-g0", Profile: "bare",
+		TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		APISecretFingerprint: fingerprint,
+		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", StableID: "stable"},
+	}
+	events, cancel := node.Subscribe()
+	defer cancel()
+	if got := node.handleCreate(cmd); got.Status != routesync.AckAccepted {
+		t.Fatal("stub rejected valid Create")
+	}
+	var first routesync.RouteEntry
+	select {
+	case event := <-events:
+		first = event.Route
+	case <-time.After(2 * time.Second):
+		t.Fatal("stub did not publish its materialized execution")
+	}
+	if first.InstanceID == "" || first.PressureVersion == 0 || first.State != routesync.StateRunning {
+		t.Fatal("ready route omitted materialized execution identity")
+	}
+	connect := *cmd
+	connect.Kind = routesync.CmdConnect
+	if got := node.handleConnect(&connect); got.Status != routesync.AckAccepted {
+		t.Fatal("stub rejected Connect for its existing execution")
+	}
+	if next := (<-events).Route; next.InstanceID != first.InstanceID || next.PressureVersion != first.PressureVersion {
+		t.Fatal("Connect replaced an unchanged execution fact")
+	}
+	count := 0
+	if err := node.Range(t.Context(), func(entry routesync.RouteEntry) error {
+		count++
+		if entry.InstanceID != first.InstanceID || entry.PressureVersion != first.PressureVersion {
+			t.Fatal("full snapshot changed execution identity")
+		}
+		return nil
+	}); err != nil || count != 1 {
+		t.Fatal("full snapshot lost the running execution")
+	}
+	node.rebootEmpty()
+	count = 0
+	if err := node.Range(t.Context(), func(routesync.RouteEntry) error { count++; return nil }); err != nil || count != 0 {
+		t.Fatal("reboot retained sandbox state in the next full snapshot")
+	}
+	select {
+	case <-events:
+		t.Fatal("empty reboot fabricated a terminal route report")
+	default:
+	}
+}
+
 func assertNoInternalCredentialFields(t *testing.T, response map[string]any) {
 	t.Helper()
 	for _, field := range []string{

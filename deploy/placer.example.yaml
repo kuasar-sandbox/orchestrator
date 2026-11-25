@@ -7,9 +7,9 @@
 placer:
   id: placer-1
   listen: ":7800"
-  advertise: "https://placer-1.example:7800"
+  advertise: "http://placer-1.example:7800"
   memberlist_label: placer.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for importer memberlist
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS; then use https:// advertise
 
 registry:
   bootstrap: registry-1.example:7700

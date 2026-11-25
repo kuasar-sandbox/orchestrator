@@ -2,6 +2,8 @@ package metastore
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -147,13 +149,36 @@ func (s *Store) AcceptBuildRegistration(ctx context.Context, key metadata.BuildK
 func (s *Store) AcceptGroupBuildRegistration(ctx context.Context, registration metadata.Registration, key metadata.BuildKey, templateID string, target *types.BuildTarget) (metadata.Versioned[metadata.BuildRecord], error) {
 	return s.acceptBuildRegistration(ctx, key, registration.NodeID, templateID, target, &registration)
 }
+
+// mergeBuild retries revision races only for ACK/report merges, whose callbacks
+// re-read state and recheck registration and identity without a caller-supplied
+// expected revision. Keep all fresh transactions within record.Update's budget.
+func (s *Store) mergeBuild(ctx context.Context, fn func(*mutation) (bool, error)) (metadata.Version, error) {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	for {
+		version, err := s.mutate(ctx, fn)
+		var conflict *metadata.Conflict
+		if !errors.As(err, &conflict) || errors.Is(err, metadata.ErrUnknown) || errors.Is(err, metadata.ErrUnavailable) {
+			return version, err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return metadata.Version{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *Store) acceptBuildRegistration(ctx context.Context, key metadata.BuildKey, nodeID, templateID string, target *types.BuildTarget, registration *metadata.Registration) (metadata.Versioned[metadata.BuildRecord], error) {
 	if err := validateParts(key.Group, key.BuildID, nodeID, templateID); err != nil {
 		return metadata.Versioned[metadata.BuildRecord]{}, err
 	}
 	var out metadata.Versioned[metadata.BuildRecord]
 	var changed bool
-	version, err := s.mutate(ctx, func(m *mutation) (bool, error) {
+	version, err := s.mergeBuild(ctx, func(m *mutation) (bool, error) {
 		if registration != nil {
 			if err := s.guardRegistration(m, *registration); err != nil {
 				return false, err
@@ -288,7 +313,7 @@ func (s *Store) ApplyBuildReport(ctx context.Context, registration metadata.Regi
 	default:
 		return nil
 	}
-	_, err := s.mutate(ctx, func(m *mutation) (bool, error) {
+	_, err := s.mergeBuild(ctx, func(m *mutation) (bool, error) {
 		if err := s.guardRegistration(m, registration); err != nil {
 			return false, err
 		}

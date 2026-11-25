@@ -7,8 +7,8 @@ listen: 127.0.0.1:$STORE_PORT
 backend: fs
 fs: { root: $WORK/s, verify_content_key: true }
 EOF
-    "$BIN/store-ctl" init --config "$WORK/store.yaml" --generation G1 >"$WORK/store-init.log" 2>&1 || { cat "$WORK/store-init.log"; fail "store init"; }
-    "$BIN/store-ctl" serve --config "$WORK/store.yaml" > >(tee "$WORK/store-serve.log" >&2) 2>&1 &
+    "$BIN/store-ctl" init --config "$WORK/store.yaml" --generation G1 >"$WORK/store-init.log" 2>&1 || { fail "store init"; }
+    "$BIN/store-ctl" serve --config "$WORK/store.yaml" >"$WORK/store-serve.log" 2>&1 &
     PIDS+=("$!")
     wait_port "$STORE_PORT" store-ctl
 
@@ -26,7 +26,7 @@ EOF
     docker image inspect "$ORCHESTRATOR_BASE_IMAGE" >/dev/null || fail "prepared base image is missing"
     docker tag "$ORCHESTRATOR_BASE_IMAGE" "$REF"
     TAGS+=("$REF")
-    docker push "$REF" > >(tee "$WORK/push.log" >&2) 2>&1 || fail "docker push e2e image"
+    docker push "$REF" >"$WORK/push.log" 2>&1 || fail "docker push e2e image"
     step "store-ctl + zot up; seeded $REF"
 
     MGMT_VIP="169.254.169.254"
@@ -41,7 +41,7 @@ EOF
         --mac-addr=02:00:00:00:00:01 \
         --floating-ip-base=100.100.96.0 \
         --mode=tap \
-        --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 > >(tee "$WORK/vswitch-start.log" >&2) 2>&1 || fail "vswitch start"
+        --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch-start.log" 2>&1 || fail "vswitch start"
     SW_STARTED=1
     ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
         || fail "configure management VIP on ${SWITCH}m0"
@@ -62,10 +62,10 @@ make_ext4_templates() {
     [ -x "$MKFS_EXT4" ] || fail "mkfs.ext4 not found"
     OVL="$WORK/overlay-1G.ext4"
     truncate -s 1G "$OVL"
-    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs-overlay.log" 2>&1 || { cat "$WORK/mkfs-overlay.log"; fail "mkfs overlay"; }
+    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$OVL" >"$WORK/mkfs-overlay.log" 2>&1 || { fail "mkfs overlay"; }
     BLD="$WORK/builder-2G.ext4"
     truncate -s 2G "$BLD"
-    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-builder.log" 2>&1 || { cat "$WORK/mkfs-builder.log"; fail "mkfs builder"; }
+    "$MKFS_EXT4" -F -q -b 4096 -O ^has_journal "$BLD" >"$WORK/mkfs-builder.log" 2>&1 || { fail "mkfs builder"; }
 }
 
 build_template_with_standalone_node() {
@@ -86,7 +86,7 @@ builder:
 checkpoint: { mode: local }
 EOF
     step "starting temporary standalone node-ctl for template build (:${BUILD_PORT})"
-    "$BIN/node-ctl" conductor serve --config "$WORK/build-node.yaml" > >(tee "$WORK/build-node.log" >&2) 2>&1 &
+    "$BIN/node-ctl" conductor serve --config "$WORK/build-node.yaml" >"$WORK/build-node.log" 2>&1 &
     local build_pid="$!"
     PIDS+=("$build_pid")
     wait_api_health "$BUILD_PORT" "temporary node-ctl"
@@ -97,12 +97,12 @@ EOF
     # Target Sandbox resources resolve independently from node policy;
     # parent Builder services/slices add no CPU or memory policy.
     code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl","cpuCount":2,"memoryMB":6144}')"
-    [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template register returned $code"; }
+    [ "$code" = "202" ] || { fail "template register returned $code"; }
     tid="$(json_field "$WORK/node-resp.body" templateID)"
     bid="$(json_field "$WORK/node-resp.body" buildID)"
     step "building template through temporary node: templateID=$tid buildID=$bid"
     code="$(node_req "$BUILD_PORT" POST "/v2/templates/$tid/builds/$bid" "$BUILD_API_KEY" "{\"fromImage\":\"$GUEST_REF\"}")"
-    [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template build trigger returned $code"; }
+    [ "$code" = "202" ] || { fail "template build trigger returned $code"; }
     TEMPLATE_REF=""
     for _ in $(seq 1 180); do
         node_req "$BUILD_PORT" GET "/templates/$tid/builds/$bid/status" "$BUILD_API_KEY" >/dev/null
@@ -113,20 +113,13 @@ EOF
                 break
                 ;;
             error)
-                run_id="$(json_field "$WORK/node-resp.body" runID)"
-                if [ -n "$run_id" ]; then
-                    echo "---- journal sandbox-builder@${run_id}.service ----" >&2
-                    journalctl -u "sandbox-builder@${run_id}.service" --no-pager -n 100 2>/dev/null \
-                        | sed 's/^/  builder| /' >&2 || true
-                fi
-                cat "$WORK/node-resp.body"
                 fail "template build error"
                 ;;
         esac
         sleep 1
     done
     [ -n "$TEMPLATE_REF" ] || fail "template build did not become ready"
-    step "built reusable template: $TEMPLATE_REF"
+    step "built reusable template"
 
     kill "$build_pid" 2>/dev/null || true
     wait "$build_pid" 2>/dev/null || true
@@ -217,9 +210,31 @@ start_cluster_fdb() {
 }
 
 write_registry_configs() {
-    start_cluster_fdb
-    CONTROL_PORTS=()
     local registries="$1"
+    case "${CLUSTER_STORAGE_BACKEND:-foundationdb}" in
+        foundationdb)
+            start_cluster_fdb
+            CLUSTER_STORAGE_YAML="storage: { backend: fdb }
+foundationdb:
+  cluster_file: \"$CLUSTER_FDB_FILE\"
+  prefix: \"$CLUSTER_FDB_PREFIX\""
+            ;;
+        sqlite)
+            [ "$registries" = 1 ] || fail "SQLite requires a single Registry"
+            CLUSTER_STORAGE_YAML="storage:
+  backend: sqlite
+  sqlite_path: \"$WORK/registry.db\""
+            ;;
+        postgres)
+            start_test_postgres || fail "PostgreSQL readiness"
+            CLUSTER_STORAGE_YAML="storage:
+  backend: postgres
+  postgres_dsn_env: STORAGE_TEST_POSTGRES_DSN
+  namespace: \"/cluster-e2e/$(python3 -c 'import uuid; print(uuid.uuid4().hex)')/\""
+            ;;
+        *) fail "unsupported cluster test backend" ;;
+    esac
+    CONTROL_PORTS=()
     for _ in $(seq 1 "$registries"); do
         CONTROL_PORTS+=("$(free_port)")
     done
@@ -240,9 +255,7 @@ write_registry_configs() {
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
-foundationdb:
-  cluster_file: "$CLUSTER_FDB_FILE"
-  prefix: "$CLUSTER_FDB_PREFIX"
+$CLUSTER_STORAGE_YAML
 membership:
   active: 1
   versions:
@@ -305,7 +318,7 @@ start_cluster_control_plane() {
     for i in $(seq 1 "$registries"); do
         local port="${CONTROL_PORTS[$((i-1))]}"
         step "starting registry-$i (:${port})"
-        "$BIN/run-cluster-ctl" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
+        "$BIN/run-cluster-ctl" registry --config "$WORK/registry-$i.yaml" >"$WORK/registry-$i.log" 2>&1 &
         PIDS+=("$!")
         REGISTRY_PIDS+=("$!")
         wait_port "$port" "registry-$i"
@@ -317,21 +330,25 @@ port, want = sys.argv[1], int(sys.argv[2])
 m = json.load(urllib.request.urlopen("http://127.0.0.1:%s/cluster/membership" % port, timeout=2))
 active = m.get("active", m.get("Active"))
 versions = m.get("versions", m.get("Versions", []))
-assert active, m
+assert active, "Registry membership has no active version"
 active_versions = [v for v in versions if v.get("version", v.get("Version")) == active]
-assert len(active_versions) == 1, m
+assert len(active_versions) == 1, "Registry membership active version is ambiguous"
 members = active_versions[0].get("members", active_versions[0].get("Members", []))
-assert len(members) == want, m
-assert active_versions[0].get("label", active_versions[0].get("Label")), m
+assert len(members) == want, "Registry membership count differs from fixture"
+assert active_versions[0].get("label", active_versions[0].get("Label")), "Registry membership label is missing"
 PY
 
-    step "starting placer (:${PLACER_PORT})"
-    "$BIN/run-cluster-ctl" placer --config "$WORK/placer.yaml" > >(tee "$WORK/placer.log" >&2) 2>&1 &
-    PIDS+=("$!")
-    wait_port "$PLACER_PORT" placer
+    if [ "$CLUSTER_USE_PLACER" = 1 ]; then
+        step "starting placer (:${PLACER_PORT})"
+        "$BIN/run-cluster-ctl" placer --config "$WORK/placer.yaml" >"$WORK/placer.log" 2>&1 &
+        PIDS+=("$!")
+        wait_port "$PLACER_PORT" placer
+    elif [ "$CLUSTER_USE_PLACER" != 0 ]; then
+        fail "invalid Placer fixture mode"
+    fi
 
     step "starting router (:${ROUTER_PORT})"
-    "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
+    "$BIN/run-cluster-ctl" router --config "$WORK/router.yaml" >"$WORK/router.log" 2>&1 &
     ROUTER_PID=$!
     PIDS+=("$ROUTER_PID")
     wait_port "$ROUTER_PORT" router
@@ -351,7 +368,7 @@ units: { dir: $UNIT_DIR, runner: "$runner", builder: "$builder" }
 sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }
-  boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle, overlay_diff_template: $OVL }
+  boot: { kernel: $BIN/vmlinux, runtime: ${CLUSTER_NODE_RUNTIME:-$BIN/sandbox-runtime.bundle}, overlay_diff_template: $OVL }
 builder:
   admission:
     registration: { max_builds: 16 }
@@ -368,10 +385,10 @@ cluster:
   api_endpoint: "127.0.0.1:$NODE_PORT"
   data_endpoint: "127.0.0.1:$NODE_DATA_PORT"
   heartbeat_interval: "500ms"
-  labels: { pool: "real" }
+  labels: { pool: "real", fixture_node: "$node_id" }
 EOF
-    step "starting cluster conductor node_id=$node_id (API :${NODE_PORT}, no manual manifest-key add)"
-    "$BIN/node-ctl" conductor serve --config "$WORK/cluster-node.yaml" > >(tee "$WORK/cluster-node.log" >&2) 2>&1 &
+    step "starting cluster conductor node_id=$node_id (API :${NODE_PORT})"
+    "$BIN/node-ctl" conductor serve --config "$WORK/cluster-node.yaml" >"$WORK/cluster-node.log" 2>&1 &
     CLUSTER_CONDUCTOR_PID=$!
     PIDS+=("$CLUSTER_CONDUCTOR_PID")
     wait_api_health "$NODE_PORT" "cluster node-ctl"
@@ -399,6 +416,30 @@ wait_cluster_node_key_pair() {
         fi
         sleep 0.5
     done
-    cat "$WORK/cluster-node-keys.out" >&2 || true
     fail "node credential-pair cache did not receive $API_SECRET_FP"
+}
+
+install_cluster_group() {
+    # The no-Placer path deliberately follows the documented local admin flow.
+    # Installing root credentials is separate from versioned business context.
+    "$BIN/node-ctl" manifest-key add --socket "$WORK/cn.sock" "$MANIFEST_KEY" \
+        >"$WORK/group-root.private" 2>&1 || fail "Node root installation"
+    python3 - "$WORK/direct-group.json" "$GROUP" "${TEMPLATE_REF:-}" <<'PY_GROUP'
+import json, sys
+with open(sys.argv[1], "w") as output:
+    context = {"templateID": sys.argv[3]} if sys.argv[3] else {}
+    json.dump({"group": sys.argv[2], "context": context}, output)
+PY_GROUP
+    E2B_API_KEY="$CLUSTER_API_KEY" "$BIN/node-ctl" group apply --socket "$WORK/cn.sock" \
+        -f "$WORK/direct-group.json" >"$WORK/group-apply.private" 2>&1 || fail "direct Group apply"
+}
+
+stop_cluster_extra_node_units() {
+    local root="$1" runner="$2" builder="$3" unit spec
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        spec=$(systemctl show --property=ExecStart --value "$unit") || continue
+        case "$spec" in *"$root/"*) systemctl stop "$unit" ;; esac
+    done < <(systemctl list-units "${runner/@.service/@*.service}" "${builder/@.service/@*.service}" \
+        --all --output=json --no-pager | python3 -c 'import json,sys; [print(u["unit"]) for u in json.load(sys.stdin)]')
 }

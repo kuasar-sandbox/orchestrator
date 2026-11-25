@@ -60,7 +60,7 @@ PR 应聚焦明确的问题与解决方案，关联已有 issue，在行为变�
 | `internal/orch` | 节点生命周期、Build pool、本地路由权威、单元生成与重启对账 |
 | `internal/nodectl` | reservation 准入、pool/水位/grant、inventory/StateSync 恢复与审计;不接管 Sandbox balloon/cgroup 闭环 |
 | `internal/nodelink` | Conductor–Registry 注册、心跳、事件与命令,帧化 JSON/h2c |
-| `internal/{registry,router,placer}` | 类型化 FoundationDB 元数据、Reserve/Build 状态与 node-link key cache;E2B 统一入口/active cache;provider/importer、WATCH_LIST、P2C 放置 |
+| `internal/{registry,router,placer}` | Registry 鉴权、完整 GroupSupport 选点与执行所有权；E2B 统一入口/data-route cache；可选完整 Group 导入器与 source lease。类型化元数据 repository 共用 SQLite/PostgreSQL/FDB 存储，driver 不包含 Group 业务规则。 |
 | `internal/api` | E2B 控制 REST、X-API-KEY 鉴权、export/import 与 ExecAccessToken 签发 |
 | `internal/proxy`, `internal/proxyshm`, `internal/proxyadmission`, `internal/routesync` | L7 转发、service-addressed CONNECT/native exec gate、固定共享 route view、独立 inflight arena、MMDS confidential heap、park/wake 与 generation cleanup;route/node-link 注册/bookmark/typed result |
 | `internal/configsock` | Run/task/admin/plugin/API、exact-run bootstrap/prepare、manifest-key/MMDS/Builder 管理与受控 route;SO_PEERCRED/pidfile 鉴权 |
@@ -162,6 +162,8 @@ capability 的对象。本地排查可设置 `CLUSTER_STUB_KEEP_WORK=1` 保留�
 守护进程输出直接写入私有文件,不流向 CI;诊断文件的私有 umask 仅在本地
 二进制构建结束后应用。
 
+必需 source gate 分别运行 FDB、SQLite 和 PostgreSQL 流程。SQLite 使用其支持的单 Registry 拓扑，共享后端还覆盖多成员/joint view。`scripts/with-test-postgres.sh` 在事务/repository 测试和 source 流程前创建隔离的真实 PostgreSQL，不能因缺少 DSN 而静默跳过。prepared VM 用例使用声明的 PostgreSQL 镜像/fault-relay helper，不在运行阶段拉取或编译。
+
 真实 execute/MMDS 用例从已有私有运行目录生成交换机、netns、veth 和
 runner/builder unit 名称。清理只停止这些 unit 实例,只移除本次创建的资源。
 显式指定的名称若已存在,或交换机状态不一致,会被拒绝,不会接管或强制删除。
@@ -237,8 +239,11 @@ fixture、进程、网络、HTTP 和观测原语，每个 case 自己拥有测�
 | [`orchestrator.proxy-wake.sh`](test/e2e/cases/orchestrator.proxy-wake.sh) | 条件拒绝的 exec 不改变 paused guest；同一合法 KAT 冷恢复并使 health/traffic 收敛。 |
 | [`orchestrator.proxy-restart.sh`](test/e2e/cases/orchestrator.proxy-restart.sh) | 已准备的自定义扩展入口/private WebSocket；master 缺失时准入 503 且不占资源；master 路由 resync、worker 故障/替换就绪、metrics 和 worker 回收。 |
 | [`orchestrator.mmds.sh`](test/e2e/cases/orchestrator.mmds.sh); [`orchestrator.mmds-recovery.sh`](test/e2e/cases/orchestrator.mmds-recovery.sh) | 独立 guest 覆盖 static、initial/unresolved secret、更新/轮换/删除、未声明 route 拒绝及 UDS service；恢复用例在更新和 full resync 之间重启 Proxy；两者检查 DB/log/route-table 明文不泄露。 |
-| [`orchestrator.cluster-lifecycle.sh`](test/e2e/cases/orchestrator.cluster-lifecycle.sh) | node-link/placer 就绪后单次 Create；group/stable-ID exec、E pause/wake、WebSocket、data/stats/list 及 route/node/目录最终收敛；路由 Build 取消释放容量；Router 重启后首先读取保留状态；canonical peer/reuse 在 transient 删除后仍可用，且无目录 FD 残留。 |
-| [`orchestrator.cluster-recovery.sh`](test/e2e/cases/orchestrator.cluster-recovery.sh) | 三个 Registry 观测真实 node-link redirect、重启实际 owner、等待 node-link 和 placer 收敛，随后单次 Create、data 就绪及 Registry/node DELETE 最终清理。 |
+| [`orchestrator.cluster-lifecycle.sh`](test/e2e/cases/orchestrator.cluster-lifecycle.sh) | 完整且关联当前 registration 的 GroupSupport 就绪后单次 Create；group/stable-ID exec、E pause/wake、WebSocket、data/stats/list 及 route/node/目录最终收敛；路由 Build 取消释放容量；Router 重启后首先读取保留状态；canonical peer/reuse 在 transient 删除后仍可用，且无目录 FD 残留。 |
+| [`orchestrator.cluster-recovery.sh`](test/e2e/cases/orchestrator.cluster-recovery.sh) | 三个 Registry 观测真实 node-link redirect、重启实际 owner、等待 node-link 与确切 Group revision 发布收敛，随后单次 Create、data 就绪及 Registry/node DELETE 最终清理。 |
+| [`orchestrator.cluster-lifecycle-sqlite.sh`](test/e2e/cases/orchestrator.cluster-lifecycle-sqlite.sh); [`orchestrator.cluster-lifecycle-postgres.sh`](test/e2e/cases/orchestrator.cluster-lifecycle-postgres.sh) | 无 Placer 的双 Node 原生 root/Group apply、CRUD/CAS/tombstone/重建、Registry 重启与真实 VM 生命周期；SQLite 单 Registry、PostgreSQL 三 Registry。 |
+| [`orchestrator.cluster-faults.sh`](test/e2e/cases/orchestrator.cluster-faults.sh); [`orchestrator.cluster-migration.sh`](test/e2e/cases/orchestrator.cluster-migration.sh) | 通过交付 fault relay 验证 ACK 模糊结果与初始 Group version conflict；真实 VM/KMT 迁移和迟到 source 清理。 |
+| [`orchestrator.cluster-legacy-runtime.sh`](test/e2e/cases/orchestrator.cluster-legacy-runtime.sh) | 真实当前 capture 的无注解引用，以及不同有效 runtime identity 的选点/Node 拒绝；不作为旧 producer provenance 证据。 |
 | [`builder.image.sh`](test/e2e/cases/builder.image.sh) | 重复 pool 独立预热、请求所选 DNS 的真实 image pull/flatten 和 Phase-A reservation、终态冲突/list、e2b/bare image 结果与 Build-row TTL 后 canonical cold Create。 |
 | [`builder.steps.sh`](test/e2e/cases/builder.steps.sh) | 真实 RUN/ENV/WORKDIR、guest cgroup 委派、start/ready 继承、conductor SIGKILL 后原 worker/claim/进程接管、限定 phase 清理和 A/B/C 资源归属；snapshot/image metadata、单次 task-local source 准备、SNP-to-image 实体化及 Build MMDS 不可变/终态保密。 |
 | [`builder.context.sh`](test/e2e/cases/builder.context.sh) | 未配置 COPY/files 的 501、格式错误或缺失 context 的 400、presigned 直接上传与 present false→true 幂等、真实 COPY 默认/chown 归属及 A/B 请求 DNS。 |

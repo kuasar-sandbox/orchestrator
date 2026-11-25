@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manual real-VM migration and late-source cleanup acceptance.
+# e2e-requires: ["bpf-map","bpf-tc","cgroup-v2","docker","journald","kvm","netns","systemd","tun","userfaultfd"]
 set -euo pipefail
 . "${E2E_LIB:?}/orchestrator/cluster_env.sh"
 GROUP=/e2e/cluster/migration
@@ -22,7 +22,7 @@ start_cluster_node "$NODE_ID"
 SOURCE_PID=$CLUSTER_CONDUCTOR_PID
 SOURCE_PORT=$NODE_PORT
 wait_cluster_node_key_pair
-GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" --registry-url "http://127.0.0.1:$CONTROL_PORT"
+GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --node-id "$NODE_ID" --group "$GROUP" --registry-url "http://127.0.0.1:$CONTROL_PORT"
 code=$(create_sandbox "$WORK/migration-create.secret")
 [ "$code" = 201 ] || fail "migration source Create=$code"
 SID=$(json_field "$WORK/migration-create.secret" sandboxID)
@@ -51,24 +51,18 @@ for unit in "$TARGET_RUNNER" "$TARGET_BUILDER"; do
   [ ! -e "$UNIT_DIR/$unit" ] || fail "target unit already exists"
   OURS+=("$UNIT_DIR/$unit")
 done
-migration_cleanup() {
-  set +e
-  while IFS= read -r unit; do
-    [ -n "$unit" ] || continue
-    spec=$(systemctl show --property=ExecStart --value "$unit") || continue
-    case "$spec" in *"$MAIN_WORK/target/"*) systemctl stop "$unit" ;; esac
-  done < <(systemctl list-units "${TARGET_RUNNER/@.service/@*.service}" "${TARGET_BUILDER/@.service/@*.service}" --all --output=json --no-pager | python3 -c 'import json,sys; [print(u["unit"]) for u in json.load(sys.stdin)]')
+cluster_extra_cleanup() {
   WORK=$MAIN_WORK
-  cleanup
+  stop_cluster_extra_node_units "$MAIN_WORK/target" "$TARGET_RUNNER" "$TARGET_BUILDER"
 }
-trap migration_cleanup EXIT
 start_cluster_node "$NODE_ID" "$TARGET_RUNNER" "$TARGET_BUILDER"
 TARGET_PORT=$NODE_PORT
 wait_cluster_node_key_pair
-GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --group "$GROUP" --registry-url "http://127.0.0.1:$CONTROL_PORT"
+GROUP_API_KEY="$CLUSTER_API_KEY" python3 "$SCRIPT_DIR/group_readiness.py" --node-url "http://127.0.0.1:$NODE_PORT" --node-host "api.$DOMAIN" --node-id "$NODE_ID" --group "$GROUP" --registry-url "http://127.0.0.1:$CONTROL_PORT"
 WORK=$MAIN_WORK
+export MIGRATION_NODE_ID="$NODE_ID" MIGRATION_REGISTRY="http://127.0.0.1:$CONTROL_PORT"
 export MIGRATION_WORK="$WORK" MIGRATION_OUT="$CASE_OUT" MIGRATION_SID="$SID" MIGRATION_API_KEY="$CLUSTER_API_KEY" MIGRATION_GROUP="$GROUP" MIGRATION_ROUTE="$ROUTE_KEY" MIGRATION_DOMAIN="$DOMAIN" MIGRATION_ROUTER_PORT="$ROUTER_PORT" MIGRATION_NODE_PORT="$TARGET_PORT" MIGRATION_SOURCE_PID="$SOURCE_PID"
-python3 "${MIGRATION_CLIENT:-$SCRIPT_DIR/cluster_migration.py}"
+python3 "${MIGRATION_CLIENT:-$SCRIPT_DIR/cluster_migration.py}" >"$WORK/cluster-migration.log" 2>&1
 guest /bin/cat /migration-marker > "$CASE_OUT/migration-marker.actual"
 test "$(cat "$CASE_OUT/migration-marker.actual")" = migration-guest-marker || fail "migration lost actual guest data"
 # Return the original Node with its old paused row and old local identity.
@@ -92,7 +86,13 @@ path=pathlib.Path(sys.argv[3]);result=json.loads(path.read_text());result['late_
 PY
 guest /bin/cat /migration-marker > "$CASE_OUT/migration-marker-after-cleanup.actual"
 cmp "$CASE_OUT/migration-marker.actual" "$CASE_OUT/migration-marker-after-cleanup.actual"
+WORK=$MAIN_WORK/target
+TARGET_LOCAL_SID=$(node_sandbox_id "$SID") || fail "missing target local identity before Delete"
+WORK=$MAIN_WORK
 code=$(router_req DELETE "/sandboxes/$SID" "$CLUSTER_API_KEY" "$ROUTE_KEY")
 [ "$code" = 204 ] || fail "migration target Delete=$code"
+WORK=$MAIN_WORK/target
+wait_node_sandbox_finalized "$TARGET_LOCAL_SID" || fail "migration target not finalized"
+WORK=$MAIN_WORK
 rm -f "$WORK/migration-create.secret" "$WORK/migration-export.secret"
 echo 'PASS: opaque Snapshot token migration, stable public identity/credentials, new local generation and late-source cleanup'

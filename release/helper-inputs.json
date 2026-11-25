@@ -11,32 +11,61 @@
     {
       "name": "fdbserver-test",
       "env": "FDB_SERVER_TEST_BIN",
-      "cases": ["orchestrator.cluster-*.sh"]
+      "cases": [
+        "orchestrator.cluster-lifecycle.sh",
+        "orchestrator.cluster-recovery.sh",
+        "orchestrator.cluster-reset.sh",
+        "orchestrator.cluster-faults.sh",
+        "orchestrator.cluster-migration.sh",
+        "orchestrator.cluster-legacy-runtime.sh"
+      ]
     },
     {
       "name": "fdbcli-test",
       "env": "FDB_CLI_TEST_BIN",
-      "cases": ["orchestrator.cluster-*.sh"]
+      "cases": [
+        "orchestrator.cluster-lifecycle.sh",
+        "orchestrator.cluster-recovery.sh",
+        "orchestrator.cluster-reset.sh",
+        "orchestrator.cluster-faults.sh",
+        "orchestrator.cluster-migration.sh",
+        "orchestrator.cluster-legacy-runtime.sh"
+      ]
+    },
+    {
+      "name": "nodelink-fault-relay",
+      "env": "NODELINK_FAULT_RELAY_BIN",
+      "cases": [
+        "orchestrator.cluster-faults.sh"
+      ]
     },
     {
       "name": "proxy-lifecycle",
       "env": "PROXY_LIFECYCLE_BIN",
-      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+      "cases": [
+        "orchestrator.proxy-inplace-restart.sh"
+      ]
     },
     {
       "name": "proxy-lifecycle-target",
       "env": "PROXY_LIFECYCLE_TARGET_BIN",
-      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+      "cases": [
+        "orchestrator.proxy-inplace-restart.sh"
+      ]
     },
     {
       "name": "node-ctl-inplace-target",
       "env": "NODE_CTL_INPLACE_TARGET_BIN",
-      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+      "cases": [
+        "orchestrator.proxy-inplace-restart.sh"
+      ]
     },
     {
       "name": "custom-proxy-inplace-target",
       "env": "CUSTOM_PROXY_INPLACE_TARGET_BIN",
-      "cases": ["orchestrator.proxy-inplace-restart.sh"]
+      "cases": [
+        "orchestrator.proxy-inplace-restart.sh"
+      ]
     },
     {
       "name": "custom-proxy",

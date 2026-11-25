@@ -862,20 +862,18 @@ func (n *stubNode) rebootEmpty() {
 	n.crash()
 	n.closeGroups()
 	n.mu.Lock()
-	var old []routesync.RouteEntry
-	for _, sb := range n.sandboxes {
-		old = append(old, routesync.RouteEntry{SandboxID: sb.SID, Profile: sb.Profile, State: routesync.StateDead})
-	}
+	deleted := len(n.sandboxes)
 	n.sandboxes = map[string]*stubSandbox{}
 	n.builds = map[string]*stubBuild{}
 	n.keyPairs = map[string]stubKeyPair{}
 	n.mu.Unlock()
-	for _, r := range old {
-		n.publishRoute(r)
-	}
+	// A reboot loses execution state without publishing terminal facts. The new
+	// NodeLink's complete empty snapshot must retire previously materialized
+	// ownership. Credentialless dead upserts would be invalid route reports and
+	// could hide a broken absence reconciliation if accepted by a test double.
 	time.Sleep(50 * time.Millisecond)
 	n.restartLink()
-	n.svc.logEvent(n.ID, "node_reboot_empty", map[string]any{"deleted": len(old)})
+	n.svc.logEvent(n.ID, "node_reboot_empty", map[string]any{"deleted": deleted})
 }
 
 func (n *stubNode) setDraining(v bool) {
@@ -1072,7 +1070,7 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 			n.mu.Unlock()
 			return
 		}
-		cur.State = routesync.StateRunning
+		cur.setState(routesync.StateRunning)
 		entry := cur.routeEntry()
 		n.mu.Unlock()
 		n.publishRoute(entry)
@@ -1107,7 +1105,7 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 	if cmd.TimeoutSeconds > 0 {
 		sb.DeadlineUnix = time.Now().Add(time.Duration(cmd.TimeoutSeconds) * time.Second).Unix()
 	}
-	sb.State = routesync.StateRunning
+	sb.setState(routesync.StateRunning)
 	entry := sb.routeEntry()
 	n.mu.Unlock()
 	n.publishRoute(entry)
@@ -1212,7 +1210,7 @@ func (n *stubNode) scheduleExecResume(sid string, expected *stubSandbox) {
 			n.mu.Unlock()
 			return
 		}
-		current.State = routesync.StateRunning
+		current.setState(routesync.StateRunning)
 		entry := current.routeEntry()
 		n.mu.Unlock()
 		n.publishRoute(entry)
@@ -1525,6 +1523,7 @@ func (n *stubNode) createAdminSandbox(req sandboxAdminRequest) (*sandboxSnapshot
 		TemplateID: req.TemplateID,
 		Behavior:   beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	sb.setState(state)
 	n.mu.Lock()
 	n.sandboxes[sb.SID] = sb
 	n.mu.Unlock()
@@ -1784,6 +1783,8 @@ type stubSandbox struct {
 	Profile                string
 	Metadata               map[string]string
 	State                  string
+	InstanceID             string
+	PressureVersion        uint64
 	TemplateID             string
 	StableID               string
 	APISecret              string `json:"-"`
@@ -1830,9 +1831,24 @@ func stubConnectResult(s *stubSandbox) (*routesync.ConnectResult, error) {
 	return result, nil
 }
 
+// setState gives a simulated materialized execution the same stable identity
+// and monotonic state fact carried by a real Node. An accepted but not yet
+// materialized create deliberately keeps InstanceID empty.
+func (s *stubSandbox) setState(state string) {
+	if s.InstanceID == "" && (state == routesync.StateRunning || state == routesync.StatePaused) {
+		s.InstanceID = randHex(16)
+		s.PressureVersion++
+	} else if s.State != state {
+		s.PressureVersion++
+	}
+	s.State = state
+}
+
 func (s *stubSandbox) routeEntry() routesync.RouteEntry {
 	return routesync.RouteEntry{
 		SandboxID: s.SID, State: s.State,
+		InstanceID:             s.InstanceID,
+		PressureVersion:        s.PressureVersion,
 		TemplateID:             s.TemplateID,
 		Profile:                s.Profile,
 		StableID:               s.StableID,

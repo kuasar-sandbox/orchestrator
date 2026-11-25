@@ -264,7 +264,9 @@ resident memory. Both architectures executed the layout and long-template tests.
 
 ## Reproduction and limits
 
-- `test/e2e/manual/cluster-faults.sh` and `cluster-migration.sh` exercise real
+- The acceptance-era `test/e2e/manual/cluster-faults.sh` and `cluster-migration.sh`
+  (now maintained as `test/e2e/cases/orchestrator.cluster-faults.sh` and
+  `orchestrator.cluster-migration.sh`) exercise real
   Node/VM windows; their relay only controls stream delivery and ordering.
 - `TestRegistryNative*` under native `scripts/cluster-native.py test` covers real
   transaction, child-process, stream and waiter boundaries. PostgreSQL requires

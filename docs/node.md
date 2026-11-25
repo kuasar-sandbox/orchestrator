@@ -136,6 +136,7 @@ BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<Bui
 | `builder status` / `builder cancel <build-id>` / `builder delete <transient-template-id> [--cancel]` | Inspect durable usage, transient IDs, operation intent and claims; cancel execution or delete one Build record ([Cancel and delete a Build record](node-build.md#cancel-and-delete-a-build-record)) |
 | `config` | Normalize/validate configuration or print a commented template |
 | `manifest-key` | `add`/`remove`/`check`/`list`: manage credential-pair allowlisting for create/build/import ([Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)); Registry also writes leased entries ([Cluster integration (node-link)](cluster.md#node-attachment)) |
+| `group apply` | Read once and conditionally apply Group JSON through the Node business API; install roots separately ([Node Group authority](cluster.md#node-group-authority)) |
 | `export-sandbox` / `import-sandbox` | Promote paused sandboxes to templates or migrate them ([Artifact capture, templates and migration](sandbox-lifecycle.md#capture-and-pause)) |
 | `version` | Print version |
 
@@ -164,7 +165,7 @@ export E2B_DOMAIN=sandboxes.example.com        # Production (TLS, DNS / TLS)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3443
 ```
 
-In cluster mode, Registry distributes leased keys through node-link ([Cluster integration (node-link)](cluster.md#node-attachment) and [cluster.md](cluster.md)); manual `manifest-key add` is unnecessary.
+For direct Group maintenance in cluster mode, install the same tenant pair on each intended Node through `manifest-key add`, then use `group apply`. The optional Placer can instead install/renew the pair atomically with a trusted Group import through Registry/NodeLink. Merely connecting a Node does not provision credentials; see the [minimum cluster setup](cluster.md#minimum-cluster).
 
 <a id="conductor-command"></a>
 

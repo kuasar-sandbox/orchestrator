@@ -9,6 +9,7 @@ source "$ROOT/scripts/ci-e2e-build.sh"
 bash "$ROOT/scripts/ci-e2e-build.sh" fixtures "$1" "$2"
 # Retain the admitted workspace: node-ctl tests consume the selected SDK sources.
 e2e_go -C "$ROOT" test -c -trimpath -o "$2/node-ctl-runner-test" ./cmd/node-ctl
+e2e_go -C "$ROOT" build -trimpath -o "$2/nodelink-fault-relay" ./test/e2e/nodelink-fault-relay
 e2e_go -C "$ROOT" build -trimpath -o "$2/proxy-lifecycle" ./test/e2e/proxy-lifecycle
 e2e_go -C "$ROOT" build -trimpath -ldflags '-X main.buildIdentity=target' \
     -o "$2/proxy-lifecycle-target" ./test/e2e/proxy-lifecycle

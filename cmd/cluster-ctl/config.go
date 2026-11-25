@@ -76,10 +76,11 @@ func configCmd(args []string) error {
 }
 
 const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (docs/cluster.md).
+# Protected private HTTP example; enable listener mTLS and https:// advertise together.
 member:                              # unified HTTP control plane
   id: registry-1
   listen: ":7700"
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS; then use https:// advertise
 membership:
   active: 1
   # next: 2                         # joint owner set target during membership change
@@ -88,7 +89,7 @@ membership:
   versions:
     - version: 1
       members:
-        - { id: registry-1, advertise: "https://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
+        - { id: registry-1, advertise: "http://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
   owners:
     route_link: 1
     node_link: 1
@@ -100,6 +101,16 @@ node_link:
   node_dead_after: 30s
 route_link:
   park_timeout: 30s
+storage:
+  backend: fdb                      # fdb (default), sqlite or postgres; open only this backend
+  namespace: kuasar-sandbox/cluster/records-v2/
+  # sqlite_path: /var/lib/cluster-ctl/metadata.sqlite  # persistent local file; one Registry only
+  # postgres_dsn_env: CLUSTER_STORAGE_POSTGRES_DSN    # name of a service environment variable
+foundationdb:                       # used only with backend: fdb
+  cluster_file: /etc/foundationdb/fdb.cluster
+  prefix: kuasar-sandbox/cluster/    # namespace defaults to prefix + records-v2/ if omitted
+# PostgreSQL: supply the DSN through the Registry service's protected EnvironmentFile.
+# All PostgreSQL/FDB peers must use the same database and namespace.
 placer_link:
   placer_label: placer.default          # placer memberlist label; not a configured placer list
 placement:
@@ -131,9 +142,9 @@ const placerConfigSkeleton = `# cluster-ctl placer config — cluster-ctl placer
 placer:
   id: placer-1
   listen: ":7800"
-  advertise: "https://placer-1.example:7800"
+  advertise: "http://placer-1.example:7800"
   memberlist_label: placer.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for importer memberlist
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS; then use https:// advertise
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane

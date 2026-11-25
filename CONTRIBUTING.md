@@ -73,7 +73,7 @@ Draft pull requests are welcome for early feedback, but they are not merge candi
 | Path | Role |
 |---|---|
 | `cmd/node-ctl` | Conductor/Proxy/Telemetry serve, managed run-sandbox/run-builder, resource status/list/drain, builder status, config, manifest-key, export/import and version |
-| `cmd/cluster-ctl` | Independent Registry/Router/Placer processes, config and version |
+| `cmd/cluster-ctl` | Independent Registry/Router/optional Placer processes, config, read-only Group/Node status and version |
 | `cmd/node-stub-ctl` | E2E node-link participants with separate admin/API/data listeners, restart/reset, Sandbox/Build state and fault injection; no microVM |
 | `cmd/e2b-key-ctl` | DB/config-free gen-key, derive-api-secret, gen-apikey, fingerprint and seal-pull-token |
 | `config`, `app/conductor`, `app/proxy`, `app/telemetry` | Public declarative configuration and static custom Apps; sealed-memfd/in-place-exec bootstrap and startup Config/Runtime Hooks |
@@ -81,7 +81,7 @@ Draft pull requests are welcome for early feedback, but they are not merge candi
 | `internal/orch` | Node lifecycle, Build pools, local route authority, unit generation and restart reconciliation |
 | `internal/nodectl` | Reservation admission, pools/watermarks/grants, inventory/StateSync recovery and audit; not the Sandbox balloon/cgroup loop |
 | `internal/nodelink` | Conductor–Registry registration, heartbeat, events and commands over framed JSON/h2c |
-| `internal/{registry,router,placer}` | Typed FoundationDB metadata, Reserve/Build state and node-link key cache; unified E2B ingress/active cache; provider/importer, WATCH_LIST and P2C placement |
+| `internal/{registry,router,placer}` | Registry authentication, completed GroupSupport selection and execution ownership; unified E2B ingress/data-route cache; optional full-record Group importer and source leases. Typed metadata repositories share SQLite/PostgreSQL/FDB storage; drivers contain no Group business rules. |
 | `internal/api` | E2B control REST, X-API-KEY authentication, export/import and ExecAccessToken issuance |
 | `internal/proxy`, `internal/proxyshm`, `internal/proxyadmission`, `internal/routesync` | L7 forwarding, service-addressed CONNECT/native-exec gate, fixed shared route view, independent inflight arena, confidential MMDS heap, park/wake and generation cleanup; route/node-link register/bookmark/typed results |
 | `internal/configsock` | Run/task/admin/plugin/API planes, exact-run bootstrap/prepare, manifest-key/MMDS/Builder administration and controlled routes; SO_PEERCRED/pidfile authentication |
@@ -201,6 +201,14 @@ For local diagnosis, set `CLUSTER_STUB_KEEP_WORK=1` to retain the run directory
 and inspect it privately; do not upload its unredacted files. This does not
 replace the real MicroVM integration suite.
 
+The required source gate runs this flow with FDB, SQLite and PostgreSQL.
+SQLite uses its supported single-Registry topology; shared backends also run
+multi-member/joint-view cases. `scripts/with-test-postgres.sh` provisions an
+isolated real PostgreSQL database before the transaction/repository tests and
+source flow, so the required gate does not silently skip because a DSN is absent.
+Prepared VM cases consume the declared PostgreSQL image/fault-relay helpers and
+never pull or compile them at runtime.
+
 The real execute/MMDS cases allocate switch, namespace, veth and runner/builder
 unit names from their existing private run directory. Cleanup stops only those
 unit instances and removes only resources created by that run. Explicit names
@@ -284,8 +292,11 @@ for aggregation and release acceptance.
 | [`orchestrator.proxy-wake.sh`](test/e2e/cases/orchestrator.proxy-wake.sh) | Condition-denied exec leaves a paused guest untouched; the same authorized KAT cold-resumes it and health/traffic converge. |
 | [`orchestrator.proxy-restart.sh`](test/e2e/cases/orchestrator.proxy-restart.sh) | Prepared custom extension ingress/private WebSocket; missing-master admission 503 without resource ownership; master route resync, worker failure/replacement readiness, metrics and worker reaping. |
 | [`orchestrator.mmds.sh`](test/e2e/cases/orchestrator.mmds.sh); [`orchestrator.mmds-recovery.sh`](test/e2e/cases/orchestrator.mmds-recovery.sh) | Independent guests run static, initial/unresolved secret, update/rotation/delete, undeclared-route rejection and UDS service assertions. Recovery restarts Proxy between update and full resync. Both inspect DB/log/route-table plaintext secrecy. |
-| [`orchestrator.cluster-lifecycle.sh`](test/e2e/cases/orchestrator.cluster-lifecycle.sh) | One Create after node-link/placer readiness; group/stable-ID exec, E pause/wake, WebSocket, data/stats/list and route/node/directory finalization. Routed Build cancellation frees capacity; retained status is the first request after Router restart; canonical peer/reuse survives transient deletion with no retained directory FDs. |
-| [`orchestrator.cluster-recovery.sh`](test/e2e/cases/orchestrator.cluster-recovery.sh) | Three Registries observe a real node-link redirect, restart its actual owner, await node-link and placer convergence, then one Create, data readiness and DELETE finalization on Registry and node. |
+| [`orchestrator.cluster-lifecycle.sh`](test/e2e/cases/orchestrator.cluster-lifecycle.sh) | FDB + Placer; one Create after completed GroupSupport for the current registration; group/stable-ID exec, E pause/wake, WebSocket, data/stats/list and route/node/directory finalization. Routed Build cancellation frees capacity; retained status is the first request after Router restart; canonical peer/reuse survives transient deletion with no retained directory FDs. |
+| [`orchestrator.cluster-recovery.sh`](test/e2e/cases/orchestrator.cluster-recovery.sh) | Three Registries observe a real node-link redirect, restart its actual owner, await node-link and exact Group revision publication, then one Create, data readiness and DELETE finalization on Registry and node. |
+| [`orchestrator.cluster-lifecycle-sqlite.sh`](test/e2e/cases/orchestrator.cluster-lifecycle-sqlite.sh); [`orchestrator.cluster-lifecycle-postgres.sh`](test/e2e/cases/orchestrator.cluster-lifecycle-postgres.sh) | Two Nodes without Placer: native root/Group apply, CRUD/CAS/tombstone/recreation, Registry restart and real VM lifecycle. SQLite uses one Registry; PostgreSQL uses three. |
+| [`orchestrator.cluster-faults.sh`](test/e2e/cases/orchestrator.cluster-faults.sh); [`orchestrator.cluster-migration.sh`](test/e2e/cases/orchestrator.cluster-migration.sh) | Delivered fault relay checks ambiguous ACKs and initial Group-version conflicts; real VM/KMT migration and late-source cleanup. |
+| [`orchestrator.cluster-legacy-runtime.sh`](test/e2e/cases/orchestrator.cluster-legacy-runtime.sh) | A real current capture with an unannotated reference, plus different valid runtime identity selection/Node rejection; not evidence of old-producer provenance. |
 | [`builder.image.sh`](test/e2e/cases/builder.image.sh) | Independent duplicate-pool prewarm, real image pull/flatten with request-selected DNS and Phase-A reservation; terminal conflict/list state; e2b/bare image results and canonical cold Create after Build-row TTL. |
 | [`builder.steps.sh`](test/e2e/cases/builder.steps.sh) | Real RUN/ENV/WORKDIR, delegated guest cgroups, start/ready inheritance, exact live worker/claim/process adoption after conductor SIGKILL, scoped phase cleanup and A/B/C resource ownership. Snapshot/image metadata, one task-local source preparation, SNP-to-image materialization, and Build MMDS immutability/terminal secrecy remain asserted. |
 | [`builder.context.sh`](test/e2e/cases/builder.context.sh) | Unconfigured COPY/files 501, malformed or missing context 400, presigned direct upload and present false→true idempotency, real COPY default/chown ownership and A/B request DNS. |

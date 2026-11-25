@@ -196,6 +196,7 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 | `builder status` / `builder cancel <build-id>` / `builder delete <transient-template-id> [--cancel]` | 查看持久用量、transient ID、操作意图与 claim; 取消执行或删除一条 Build 记录 ([取消与删除 Build 记录](node-build_zh.md#cancel-and-delete-a-build-record)) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
 | `manifest-key` | `add`/`remove`/`check`/`list`:create/build/import 凭据对白名单管理([密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model);集群下另由 registry 租约写入,[集群接入(node-link)](cluster_zh.md#node-attachment)) |
+| `group apply` | 通过 Node 业务 API 读取一次并条件应用 Group JSON；根凭据单独安装（[Node Group 权威](cluster_zh.md#node-group-权威)） |
 | `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移([Artifact lifecycle、转模板与迁移](sandbox-lifecycle_zh.md#capture-and-pause)) |
 | `version` | 版本 |
 
@@ -224,8 +225,7 @@ export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, DNS / TLS)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3443
 ```
 
-集群模式下密钥由 registry 经 node-link 租约下发([集群接入(node-link)](cluster_zh.md#node-attachment)、cluster.md),无须手动
-`manifest-key add`。
+集群中直接维护 Group 时，在每个目标 Node 通过 `manifest-key add` 安装同一租户凭据对，再执行 `group apply`。可选 Placer 则可通过 Registry/NodeLink 在受信 Group 导入中原子安装/续期凭据对。Node 仅连接 Registry 不会自动获得凭据，完整顺序见[最小集群配置](cluster_zh.md#minimum-cluster)。
 
 <a id="conductor-command"></a>
 

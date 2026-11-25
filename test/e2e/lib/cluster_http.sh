@@ -107,7 +107,7 @@ exec_argv_denied_through_cluster() {
         fail "cluster executed a condition-denied argv"
     fi
     grep -Fq "exec: remote exec rejected" "$diagnostics" \
-        || { sed 's/^/  client| /' "$diagnostics" >&2; fail "cluster denial was not redacted"; }
+        || { fail "cluster denial was not redacted"; }
 }
 
 exec_through_cluster_connect() {
@@ -214,9 +214,6 @@ SH
         fi
         [ "$attempt" = "$retries" ] || sleep 0.5
     done
-    sed 's/^/  client| /' "$diagnostics" >&2
-    sed 's/^/  stdout| /' "$output" >&2 2>/dev/null
-    sed 's/^/  stderr| /' "$error_output" >&2 2>/dev/null
     fail "native exec did not complete after $retries attempt(s), last exit=$status"
 }
 
@@ -277,8 +274,19 @@ PY
         fi
         sleep 0.05
     done
-    step "traffic stats sid=$sid mode=$mode last_status=$code body=$(cat "$WORK/router-resp.body" 2>/dev/null)"
+    step "traffic stats did not converge: mode=$mode status=$code"
     return 1
+}
+
+node_sandbox_id() { # $1=stable public sandbox ID; must exist before Delete
+    python3 - "$WORK/cl/node-ctl.db" "$1" <<'PY_LOCAL_ID'
+import sqlite3, sys
+with sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=5) as db:
+    rows = db.execute("select id from sandboxes where stable_id=?", (sys.argv[2],)).fetchall()
+if len(rows) != 1 or not isinstance(rows[0][0], str) or not rows[0][0]:
+    raise SystemExit("expected one current Node-local sandbox identity before Delete")
+print(rows[0][0])
+PY_LOCAL_ID
 }
 
 wait_node_sandbox_finalized() { # $1=node-local sandbox id
@@ -304,7 +312,11 @@ PY
 
 create_sandbox() {
     local out="$1"
-    http_code "$out" \
+    local placement=()
+    if [ -n "${CLUSTER_SELECTED_NODE:-}" ]; then
+        placement=(-H "X-Kuasar-Sandbox-Placement: {\"node_selectors\":[{\"fixture_node\":\"$CLUSTER_SELECTED_NODE\"}]}")
+    fi
+    http_code "$out" "${placement[@]}" \
         -X POST \
         -H "Host: api.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
@@ -363,12 +375,12 @@ expected = {
 }
 for key, want in expected.items():
     if values.get(key) != want:
-        raise SystemExit(f"{path}: {key}={values.get(key)!r}, want {want!r}; values={values}")
+        raise SystemExit(f"cluster resource YAML property mismatch: {key}")
 for forbidden in ("resources.control.controller", "resources.control.cgroup_path",
                   "resources.watermark_high.memory",
                   "resources.control.sensor.mode"):
     if forbidden in values:
-        raise SystemExit(f"{path}: static cluster YAML contains {forbidden}: {values}")
+        raise SystemExit(f"cluster resource YAML contains forbidden property: {forbidden}")
 PY
 }
 
@@ -393,7 +405,6 @@ retry_data_by_sid() {
             return 0
         fi
         if grep -qiE 'credential pair (is )?not (installed|distributed)' "$WORK/data-health.body" 2>/dev/null; then
-			cat "$WORK/data-health.body" >&2
 			fail "data-plane hit node before credential-pair cache was ready"
         fi
         step "data-plane attempt $i returned $code; retrying while sandbox boot converges"
