@@ -133,8 +133,8 @@ func TestWorkspaceSavedDiskHandoff(t *testing.T) {
 		t.Fatal(got, err)
 	}
 	inline, _ := json.Marshal(d)
-	if _, _, err := Resolve(ctx, inline, opt); err != nil {
-		t.Fatal(err)
+	if _, _, err := Resolve(ctx, inline, opt); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("inline named-location tarstream bypassed authorization: %v", err)
 	}
 	invalid := opt
 	invalid.ManifestKey = strings.Repeat("c", 64)
