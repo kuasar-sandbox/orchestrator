@@ -290,6 +290,10 @@ Workspace export shares the node's publication destination with sandbox export:
 `checkpoint.remote.ref_location_parent` selects a named directory derived from
 the source Sandbox's StableID; when unset, new layers go to the Manifest Store
 selected by `manifest_config`. The API and CLI have no destination override.
+The selected destination is passed to Sandboxer, which returns final portable
+references. Named-directory export keeps the Manifest Bundle representation:
+newly materialized layers share one Bundle and carry its final `@location`
+selectors without a later reference rewrite in Orchestrator.
 Already published immutable layers keep their original Store or named-location
 references and order. Only private layers, or layers requiring format conversion
 or compaction, are materialized at the selected destination. A newly written
