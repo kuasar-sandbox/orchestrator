@@ -1,0 +1,5 @@
+--- FAIL: TestImportSourceReusesFileSnapshotAcrossPages (0.30s)
+    remote_test.go:330: file change interrupted current pass: placer: file group source "test": parse /tmp/TestImportSourceReusesFileSnapshotAcrossPages1673754331/002/group-0.json: invalid JSON: EOF
+FAIL
+FAIL	github.com/kuasar-sandbox/orchestrator/internal/placer	0.309s
+FAIL

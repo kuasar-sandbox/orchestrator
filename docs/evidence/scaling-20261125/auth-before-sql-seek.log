@@ -1,0 +1,9 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkGroupAuthCandidates/sqlite/1000    	       1	    502616 ns/op	  215640 B/op	    1931 allocs/op
+BenchmarkGroupAuthCandidates/sqlite/10000   	       1	   1581680 ns/op	  215640 B/op	    1931 allocs/op
+BenchmarkGroupAuthCandidates/sqlite/100000  	       1	  13382336 ns/op	  215752 B/op	    1932 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/cluster/metastore	5.767s

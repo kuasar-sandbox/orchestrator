@@ -377,7 +377,7 @@ against its receipt clock. No node-link Pause command is added.
 | connect | group + route_key + stable sandbox_id | Call Reserve with `operation=connect`; the registry dispatches CmdConnect through node-link. No Resolve or forwarding to node HTTP `/connect`. |
 | exec session | group + route_key + stable sandbox_id | Call Reserve with `operation=exec-session`; the registry verifies the API key and dispatches CmdExecSession through node-link. Only ExecAccessToken is returned publicly. |
 | get/stats/pause/timeout/export | group + route_key + stable sandbox_id | Resolve the current NodeSandboxID and APIEndpoint through the route owner; rewrite the path and forward to the node conductor. Stats bodies have no SID and need no response identity adaptation. Missing APIEndpoint fails closed. |
-| list/get | group | Read the group shard; individual sandbox lookup also uses the identity described above. |
+| list/get | group | Read a bounded page of the group shard; individual sandbox lookup also uses the identity described above. |
 | data plane | group + route_key + stable sandbox_id + target | With known NodeSandboxID/DataEndpoint, open a one-use node CONNECT, including paused/starting states. Fall back to `operation=data` only for a missing target or typed stale response; a miss starts with Resolve. |
 | build register | group + build_id | Normalize the body/Builder header into Build.Resources, parse the target Sandbox ResourcePatch independently, then call `ReserveBuild`. The selected node performs final registration admission. |
 | build cancel | group + build_id | ResolveBuild afresh for each call and forward through the current APIEndpoint without selecting another node. |
@@ -397,6 +397,47 @@ The router constructs requests to the shared `POST /route-link/v2/reserve` endpo
 The Registry specification owns the exact query/header/body schemas and repeats validation at its boundary. Conditions are not carried in unrelated metadata, query parameters or configuration Headers. Keeping this transformation boundary separate avoids a second, potentially stale schema table here.
 
 For connect/exec-session/data, `sid` is the customer's expected stable SandboxID. It prevents requests from crossing lineage when a route_key is deleted and recreated.
+
+#### Sandbox list pagination
+
+**Compatibility change:** cluster `GET /v2/sandboxes` (and its `/sandboxes`
+alias) now returns a page by default, instead of the entire group. The response
+remains a JSON array with the existing item fields. Clients that need the full
+list must follow the `x-next-token` response header, passing its value as the
+next request's `nextToken`, until that header is absent. A short or empty array
+does **not** indicate completion when the header is present.
+
+`limit` defaults to 100 and accepts integers from 1 through 1,000. It bounds the
+number of route records examined per request, before per-object authorization
+and state filtering; therefore a page can contain fewer visible items. The
+Registry reads at most 128 route records per storage transaction. Omitted
+`state` selects `ready`, `pausing`, and `paused`. Explicit filters accept those
+states plus `reserved`, `dead`, and `deleting`; `running` is an alias for the
+existing cluster `ready` projection. Item state values remain unchanged. Invalid
+limits, unknown states, repeated pagination parameters, and invalid continuation
+tokens return 400. Node `starting` reports are not retained as a distinct cluster
+route state and are not a supported cluster list filter.
+
+Keep the same group, state filter, and API token throughout a traversal; changing
+any of them requires starting again without `nextToken`. Each page rechecks the
+API token and every returned object's complete MAC. Tokens are encrypted and
+authenticated with XChaCha20-Poly1305 using a server-only namespace key, so an
+empty page's continuation does not expose another root's filtered `route_key`.
+They hide object names, not page counts, empty pages, or token lengths. They
+remain valid across Registry peers and process restarts using the same metadata
+namespace. Pagination has no snapshot across requests: concurrent creation,
+deletion, or state changes can change the set seen during a traversal.
+
+The namespace initializes one random 32-byte cursor encryption key atomically,
+only after an authenticated listing needs a continuation. Registry caches only
+a successfully loaded key; pages create no durable cursor sessions. Include
+this immutable record in consistent metadata backups and restore it with its
+namespace, then restart cache consumers as required by the recovery contract.
+A new namespace has a different key, and existing continuations must be
+discarded. Corrupt or previously deleted key records fail closed and are never
+silently replaced.
+There is no public key deletion or rotation API; a future rotation protocol must
+explicitly define which cursor versions remain accepted.
 
 <a id="router-control-plane"></a>
 
@@ -639,6 +680,8 @@ Reader SDKs, tools and binaries must be published and available before the snaps
 ### Placer import and explicit apply
 
 Placer's full-record source interface combines bounded `Range` and `Read`. Each maintenance operation reads one complete source record once and derives context, credential pair and static targets from that same value. File sources and embedded sources use the same adapter. Static selectors and optional shuffle sharding determine all intended targets, including draining/hot Nodes and Nodes currently missing a runtime. Import does not run P2C. An empty intersection stays empty.
+
+After acquiring the source lease, each file-source pass reads and validates the directory once, then shares that immutable snapshot across all pages and target reads. File changes after this scan become visible on the next pass. This is a pass-local snapshot, not an atomic filesystem snapshot while files are being read.
 
 Ready importers compete for a bounded, fenced source lease through Registry. Pages advance only after every item succeeds, using the original owner/run/term. Registry validates this lease again immediately before forwarding the Node command. The trusted command can install a complete key pair and update Group context in one Node SQLite transaction; the import path creates no independent desired-key cache in Registry.
 
@@ -1011,6 +1054,7 @@ A Registry may read or change an authorized record through the shared database w
 | KeyPair | `(node_id, api_secret_fingerprint)` | Desired pair, lease and matching acknowledgement; replacement invalidates an old ACK |
 | Directory | Fixed 256 buckets of low-frequency node projections | Paginated checked view and bucket change tokens |
 | ImportSource | `source_id` | Lease holder, run ID, business term and successful-page cursor |
+| PublicListCursor | One `public-list-cursor-key/v1` record per namespace | Immutable server-only random encryption key; atomic first initialization, read-only reuse across Registry peers |
 
 Point operations address one business identity. Listing methods take a scoped opaque cursor and bounded page size. The shared record layer chunks payloads inside one transaction and enforces common budgets alongside backend-native limits. A listing cursor continues one typed scope; it is not a permanent database snapshot.
 

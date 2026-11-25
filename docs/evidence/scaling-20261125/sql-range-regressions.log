@@ -1,0 +1,21 @@
+=== RUN   TestScanBinaryBounds
+=== RUN   TestScanBinaryBounds/sqlite
+    scan_test.go:101: checked 340 valid ranges (74 empty) and 991 invalid ranges
+=== RUN   TestScanBinaryBounds/postgres
+    scan_test.go:42: requires isolated PostgreSQL
+--- PASS: TestScanBinaryBounds (0.01s)
+    --- PASS: TestScanBinaryBounds/sqlite (0.01s)
+    --- SKIP: TestScanBinaryBounds/postgres (0.00s)
+=== RUN   TestSQLiteScanSeeksToCursor
+=== RUN   TestSQLiteScanSeeksToCursor/first_page
+    scan_test.go:157: VM SeekGE uses parameter 2 = 61
+=== RUN   TestSQLiteScanSeeksToCursor/after_begin
+    scan_test.go:157: VM SeekGT uses parameter 2 = 61
+=== RUN   TestSQLiteScanSeeksToCursor/later_page
+    scan_test.go:157: VM SeekGT uses parameter 2 = 61ff
+--- PASS: TestSQLiteScanSeeksToCursor (0.00s)
+    --- PASS: TestSQLiteScanSeeksToCursor/first_page (0.00s)
+    --- PASS: TestSQLiteScanSeeksToCursor/after_begin (0.00s)
+    --- PASS: TestSQLiteScanSeeksToCursor/later_page (0.00s)
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/storage/sqlengine	0.016s

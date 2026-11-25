@@ -112,7 +112,7 @@ func TestWorkspaceSavedDiskHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := *result.Disk
-	if strings.Contains(d.Base, dir) || !strings.HasSuffix(d.Base, "@location:sandbox-a") {
+	if strings.Contains(d.Base, dir) || !strings.Contains(d.Base, ".bundle@manifest:") || !strings.HasSuffix(d.Base, "@location:sandbox-a") {
 		t.Fatal(d)
 	}
 	m := migrationtoken.KeyMaterial{APISecret: strings.Repeat("b", 64), ManifestKey: key}
@@ -133,8 +133,8 @@ func TestWorkspaceSavedDiskHandoff(t *testing.T) {
 		t.Fatal(got, err)
 	}
 	inline, _ := json.Marshal(d)
-	if _, _, err := Resolve(ctx, inline, opt); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("inline named-location tarstream bypassed authorization: %v", err)
+	if _, _, err := Resolve(ctx, inline, opt); err != nil {
+		t.Fatal(err)
 	}
 	invalid := opt
 	invalid.ManifestKey = strings.Repeat("c", 64)

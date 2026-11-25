@@ -1,0 +1,7 @@
+goos: linux
+goarch: amd64
+pkg: github.com/kuasar-sandbox/orchestrator/internal/placer
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkFileGroupImportPass/1000         	       1	18573770224 ns/op	8884737464 B/op	161361470 allocs/op
+PASS
+ok  	github.com/kuasar-sandbox/orchestrator/internal/placer	18.602s

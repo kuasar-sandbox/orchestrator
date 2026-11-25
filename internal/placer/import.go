@@ -380,6 +380,13 @@ func (s *Service) importSource(ctx context.Context, source ImportSource, nodes [
 		}
 		return nil
 	}
+	if files, ok := source.Importer.(*fileGroupSource); ok {
+		snapshot, err := files.snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		source.Importer = snapshot
+	}
 	cursor := lease.lease.Cursor
 	if apply {
 		cursor = ""

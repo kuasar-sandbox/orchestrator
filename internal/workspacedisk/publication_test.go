@@ -83,6 +83,18 @@ func TestWorkspaceExportRetainsPublishedLayersWithoutReadingThem(t *testing.T) {
 			if result.Disk == nil || !slices.Equal(result.Disk.BaseFromRefs, []string{original}) || !strings.HasSuffix(result.Disk.Base, "@location:source") {
 				t.Fatalf("export rewrote a published parent: %+v", result.Disk)
 			}
+			published, err := manifest.ParseRef(result.Disk.Base)
+			requireWorkspaceIO(t, err)
+			if published.Scheme != manifest.RefSchemeFile || published.DigestScheme != "manifest" || filepath.Ext(published.Path) != ".bundle" || filepath.Base(published.Path) != published.Path {
+				t.Fatalf("named export changed the Bundle representation: %s", result.Disk.Base)
+			}
+			output, err := reflocation.Resolve(parent, "source")
+			requireWorkspaceIO(t, err)
+			files, err := os.ReadDir(output.Path)
+			requireWorkspaceIO(t, err)
+			if len(files) != 1 || files[0].Name() != published.Path {
+				t.Fatalf("expected one committed Bundle, got %v", files)
+			}
 			material := migrationtoken.KeyMaterial{APISecret: strings.Repeat("b", 64), ManifestKey: key}
 			token, err := migrationtoken.SealWorkspace(material, *result.Disk)
 			requireWorkspaceIO(t, err)
@@ -114,8 +126,13 @@ func TestWorkspaceExportRetainsPublishedLayersWithoutReadingThem(t *testing.T) {
 			}
 			inline, err := json.Marshal(disk)
 			requireWorkspaceIO(t, err)
-			if _, _, _, err := Plan(inline, options); !errors.Is(err, ErrUnauthorized) {
-				t.Fatalf("untrusted inline tarstream bypassed authorization: %v", err)
+			if format != "manifest" {
+				if _, _, _, err := Plan(inline, options); !errors.Is(err, ErrUnauthorized) {
+					t.Fatalf("untrusted inline tarstream bypassed authorization: %v", err)
+				}
+			} else {
+				_, _, err := Resolve(ctx, inline, options)
+				requireWorkspaceIO(t, err)
 			}
 			options.APISecret = strings.Repeat("c", 64)
 			if _, _, _, err := Plan(input, options); !errors.Is(err, ErrUnauthorized) {
@@ -135,11 +152,30 @@ func TestWorkspaceExportRetainedGraphNeedsNoLocationOrStore(t *testing.T) {
 	req := savedWorkspaceRequest(t, t.TempDir(), rtconfig.PortableDiskConfig{Name: "work", PureBlock: true,
 		Slot: &rtconfig.DiskSlotConfig{}, Binding: &rtconfig.SlotBinding{ID: "bound", SourceID: "saved", SizeBytes: 8192},
 		PortableRootConfig: rtconfig.PortableRootConfig{Base: base, BaseFromRefs: parents}})
-	req.ManifestConfig = configPath // No Store endpoint and no ref_location_parent.
-	result, err := execute(t.Context(), req, key)
-	requireWorkspaceIO(t, err)
-	if result.Disk == nil || result.Disk.Base != base || !slices.Equal(result.Disk.BaseFromRefs, parents) || *result.Disk.Size != 8192 {
-		t.Fatalf("already published disk changed: %+v", result.Disk)
+	req.ManifestConfig = configPath // No Store endpoint.
+	for _, named := range []bool{false, true} {
+		label := "store"
+		if named {
+			label = "named"
+		}
+		t.Run(label, func(t *testing.T) {
+			request := req
+			var destination string
+			if named {
+				destination = filepath.Join(t.TempDir(), "not-created")
+				request.RefLocationParent = "file://" + destination
+			}
+			result, err := execute(t.Context(), request, key)
+			requireWorkspaceIO(t, err)
+			if result.Disk == nil || result.Disk.Base != base || !slices.Equal(result.Disk.BaseFromRefs, parents) || *result.Disk.Size != 8192 {
+				t.Fatalf("already published disk changed: %+v", result.Disk)
+			}
+			if named {
+				if _, err := os.Stat(destination); !os.IsNotExist(err) {
+					t.Fatalf("retained graph created a publication directory: %v", err)
+				}
+			}
+		})
 	}
 }
 

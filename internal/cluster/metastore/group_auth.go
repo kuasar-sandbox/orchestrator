@@ -1,11 +1,14 @@
 package metastore
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
@@ -147,6 +150,92 @@ func (s *Store) ListGroupAuth(ctx context.Context, group string, cursor metadata
 	for _, auth := range page.Items {
 		if auth.Value.Group != group || !validGroupAuth(auth.Value.AuthRef, auth.Value.APISecret) {
 			return metadata.Page[metadata.Versioned[metadata.GroupAuth]]{}, invalidRecord("Group authentication identity")
+		}
+	}
+	return page, nil
+}
+
+// ListGroupAuthCandidates uses the existing ordered full-fingerprint keys. All
+// fingerprints are fixed-width lower-case hex components, below the record
+// codec's hashing threshold, so their physical and logical order agree. No
+// secondary index or migration of retained authentication roots is needed.
+//
+// A page reads at most limit roots. Once a different prefix is reached, the
+// search ends; even an absent candidate reads at most one unrelated page.
+// Candidate-fingerprint collisions remain paginated, never truncated or trusted.
+func (s *Store) ListGroupAuthCandidates(ctx context.Context, group, candidate string, cursor metadata.Cursor, limit int) (out metadata.Page[metadata.Versioned[metadata.GroupAuth]], err error) {
+	if err = nodegroup.ValidateName(group); err != nil {
+		return
+	}
+	if len(candidate) != apikey.CandidateFingerprintLen*2 || !metadata.ValidFingerprint(candidate+strings.Repeat("0", (apikey.FullFingerprintLen-apikey.CandidateFingerprintLen)*2)) {
+		return out, invalidRecord("Group auth candidate fingerprint")
+	}
+	if limit < 1 || limit > metadata.MaxGroupSupportBatchRows {
+		return out, invalidRecord("Group auth candidate page limit must be 1..128")
+	}
+	scope := s.key("group-auth", group)
+	last, err := decodeCursor(scope, cursor)
+	if err != nil {
+		return out, err
+	}
+	if last == nil {
+		// Scan's lower bound is exclusive. NUL padding sorts before every hex
+		// suffix, including a legitimate fingerprint ending in forty zeroes.
+		last = scope.Child(candidate + strings.Repeat("\x00", (apikey.FullFingerprintLen-apikey.CandidateFingerprintLen)*2))
+	} else if ref, err := groupAuthKeyFingerprint(scope, last); err != nil || !strings.HasPrefix(ref, candidate) {
+		return out, invalidRecord("Group auth candidate cursor")
+	}
+	err = s.read(ctx, func(tr *records.Tx) error {
+		out = metadata.Page[metadata.Versioned[metadata.GroupAuth]]{}
+		page, err := scanGroupAuthCandidates(tr, scope, last, candidate, limit)
+		if err != nil {
+			return err
+		}
+		for _, item := range page.Items {
+			auth, err := typed[metadata.GroupAuth](wrapRecord(item.Value))
+			if err != nil {
+				return err
+			}
+			if auth.Value.Group != group || !bytes.Equal(item.Key, s.groupAuthKey(group, auth.Value.AuthRef)) || !validGroupAuth(auth.Value.AuthRef, auth.Value.APISecret) {
+				return invalidRecord("Group authentication identity")
+			}
+			out.Items = append(out.Items, auth)
+		}
+		if page.More && len(page.Items) > 0 {
+			out.Next = encodeCursor(scope, page.Items[len(page.Items)-1].Key)
+		}
+		return nil
+	})
+	return
+}
+
+func groupAuthKeyFingerprint(scope, key records.Key) (string, error) {
+	if len(key) != len(scope)+4+apikey.FullFingerprintLen*2 {
+		return "", invalidRecord("Group auth key identity")
+	}
+	ref := string(key[len(scope)+4:])
+	if !metadata.ValidFingerprint(ref) || !bytes.Equal(key, scope.Child(ref)) {
+		return "", invalidRecord("Group auth key identity")
+	}
+	return ref, nil
+}
+
+// Keep range selection separate from authentication-material validation: the
+// first key outside the candidate range ends the page without decoding its JSON.
+func scanGroupAuthCandidates(tr *records.Tx, scope, after records.Key, candidate string, limit int) (records.Page, error) {
+	page, err := tr.Scan(scope, after, pageLimit(limit))
+	if err != nil {
+		return records.Page{}, err
+	}
+	for i, item := range page.Items {
+		ref, err := groupAuthKeyFingerprint(scope, item.Key)
+		if err != nil {
+			return records.Page{}, err
+		}
+		if !strings.HasPrefix(ref, candidate) {
+			page.Items = page.Items[:i]
+			page.More = false
+			break
 		}
 	}
 	return page, nil

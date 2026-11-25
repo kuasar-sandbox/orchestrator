@@ -219,10 +219,61 @@ SH
 
 router_req() {
     local method="$1" path="$2" key="$3" route_key="${4:-}" body="${5:-}"
-    local args=(-sS --noproxy '*' --max-time 260 -o "$WORK/router-resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $key")
+    local args=(-sS --noproxy '*' --max-time 260 -D "$WORK/router-resp.headers" -o "$WORK/router-resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $key")
     [ -n "$route_key" ] && args+=(-H "X-Kuasar-Route-Key: $route_key")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$ROUTER_PORT$path"
+}
+
+# Inventory assertions must traverse every public page, including empty pages
+# with a continuation. Keep router_req's status/body contract for callers.
+router_list_all() {
+    local key="$1" path=/v2/sandboxes code next pages
+    pages="$(mktemp "$WORK/router-list-pages.XXXXXX")" || return 1
+    while :; do
+        code="$(router_req GET "$path" "$key")" || { rm -f "$pages"; return 1; }
+        if [ "$code" != 200 ]; then
+            rm -f "$pages"
+            printf '%s' "$code"
+            return 0
+        fi
+        if ! next="$(python3 - "$WORK/router-resp.body" "$WORK/router-resp.headers" "$pages" <<'PY_LIST_PAGE'
+import json, sys
+from urllib.parse import urlencode
+rows = json.load(open(sys.argv[1]))
+if not isinstance(rows, list):
+    raise SystemExit("sandbox list response must be an array")
+with open(sys.argv[3], "a") as pages:
+    pages.write(json.dumps(rows) + "\n")
+token = ""
+for line in open(sys.argv[2]):
+    name, separator, value = line.partition(":")
+    if separator and name.strip().lower() == "x-next-token":
+        token = value.strip()
+if token:
+    print("/v2/sandboxes?" + urlencode({"nextToken": token}))
+PY_LIST_PAGE
+        )"; then
+            rm -f "$pages"
+            return 1
+        fi
+        [ -n "$next" ] || break
+        path="$next"
+    done
+    if ! python3 - "$pages" "$WORK/router-resp.body" <<'PY_LIST_DONE'
+import json, sys
+rows = []
+for page in open(sys.argv[1]):
+    rows.extend(json.loads(page))
+with open(sys.argv[2], "w") as output:
+    json.dump(rows, output)
+PY_LIST_DONE
+    then
+        rm -f "$pages"
+        return 1
+    fi
+    rm -f "$pages"
+    printf '200'
 }
 
 wait_cluster_traffic_stats() { # $1=sid, $2=parking|idle|paused

@@ -157,11 +157,9 @@ func (a *workspaceArchive) inventory(ctx context.Context, plan []workspace.Entry
 func (a *workspaceArchive) publish(guard context.Context, request Request, name string) (*rtconfig.DiskV1, error) {
 	req := artifact.ExportDiskRequest{SourceRef: a.ref, SourceDir: a.dir, DiskName: name, RefLocations: a.locations, Upload: true}
 	parent := request.RefLocationParent
-	var output reflocation.Location
-	var err error
 	publication := reflocation.PublicationName(request.Publication)
 	if parent != "" {
-		output, err = reflocation.Resolve(parent, publication)
+		output, err := reflocation.Resolve(parent, publication)
 		if err != nil {
 			return nil, err
 		}

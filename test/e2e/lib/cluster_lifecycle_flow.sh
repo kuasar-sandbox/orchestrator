@@ -87,7 +87,7 @@ PY_RESOURCE
     step "PASS: cluster stats control path returned current VMM memory/CPU with the resource controller disabled"
 
     step "checking group-local sandbox list through router"
-    code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"
+    code="$(router_list_all "$CLUSTER_API_KEY")"
     [ "$code" = "200" ] || { fail "list returned $code"; }
     python3 - "$WORK/router-resp.body" "$sid" <<'PY' || fail "sandbox list did not contain created sandbox $sid"
 import json, sys
@@ -103,7 +103,7 @@ PY
     code="$(router_req DELETE "/sandboxes/$sid" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { fail "delete returned $code"; }
     for _ in $(seq 1 80); do
-        code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"
+        code="$(router_list_all "$CLUSTER_API_KEY")"
         [ "$code" = "200" ] || { sleep 0.25; continue; }
         if python3 - "$WORK/router-resp.body" "$sid" <<'PY'
 import json, sys

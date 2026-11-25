@@ -39,6 +39,41 @@ fail() {
     exit 1
 }
 
+# These visibility/cleanup assertions need the entire authenticated route list,
+# including later pages after a short or empty filtered page.
+list_registry_routes() {
+    local port="$1" output="$2" absent_sid="${3:-}"
+    python3 - "$port" "$GROUP" "$output" "$absent_sid" <<'PY_LIST_ROUTES'
+import json, os, sys, time, urllib.parse, urllib.request
+port, group, out, absent = sys.argv[1:]
+base = "http://127.0.0.1:%s/route-link/v2/list" % port
+def list_all():
+    rows, token = [], ""
+    while True:
+        query = {"group": group}
+        if token:
+            query["nextToken"] = token
+        request = urllib.request.Request(base + "?" + urllib.parse.urlencode(query),
+                                         headers={"X-API-KEY": os.environ["E2B_API_KEY"]})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            page = json.load(response)
+            if not isinstance(page, list):
+                raise ValueError("route list response must be an array")
+            rows.extend(page)
+            token = response.headers.get("x-next-token", "")
+        if not token:
+            return rows
+for _ in range(100 if absent else 1):
+    rows = list_all()
+    with open(out, "w") as output:
+        json.dump(rows, output)
+    if not absent or all(row.get("sandboxID") != absent for row in rows):
+        sys.exit(0)
+    time.sleep(0.1)
+raise SystemExit("route list still contains the rebooted sandbox")
+PY_LIST_ROUTES
+}
+
 build_cluster_stub_binaries() {
     command -v go >/dev/null 2>&1 || fail "go not on PATH"
     mkdir -p "$BIN"
@@ -806,8 +841,7 @@ fi
 
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     step "checking joint route visibility from next-only registry"
-    curl -sS --noproxy '*' -H "X-API-KEY: $API_KEY" --get --data-urlencode "group=$GROUP" \
-        "http://127.0.0.1:${CONTROL_PORTS[3]}/route-link/v2/list" >"$WORK/joint-routes.json"
+    list_registry_routes "${CONTROL_PORTS[3]}" "$WORK/joint-routes.json"
     python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the ready route"
 import json, sys
 routes = json.load(open(sys.argv[1]))
@@ -1036,22 +1070,8 @@ if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
 elif [ "$CLUSTER_STUB_CASE" = registry-owner-failover ]; then
     ROUTE_LIST_PORT="${CONTROL_PORTS[1]}"
 fi
-python3 - "$ROUTE_LIST_PORT" "$GROUP" "$STABLE_SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
-import json, os, sys, time, urllib.parse, urllib.request
-port, group, sid, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-url = "http://127.0.0.1:%s/route-link/v2/list?%s" % (port, urllib.parse.urlencode({"group": group}))
-last = None
-for _ in range(100):
-    req = urllib.request.Request(url, headers={"X-API-KEY": os.environ["E2B_API_KEY"]})
-    with urllib.request.urlopen(req, timeout=2) as resp:
-        last = json.load(resp)
-    with open(out, "w") as f:
-        json.dump(last, f)
-    if all(r.get("sandboxID") != sid for r in last):
-        sys.exit(0)
-    time.sleep(0.1)
-raise SystemExit("route list still contains the rebooted sandbox")
-PY
+list_registry_routes "$ROUTE_LIST_PORT" "$WORK/routes.json" "$STABLE_SID" \
+    || fail "route_link still contains rebooted sandbox"
 
 # Optional measurement on the same verified product-process fixture.
 if [ -n "${CLUSTER_BENCH_OUTPUT:-}" ]; then

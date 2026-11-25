@@ -317,7 +317,10 @@ node-ctl workspace export "$A" --name project |
 Workspace export 与整机 export 共用节点发布目的地：配置
 `checkpoint.remote.ref_location_parent` 时，按源沙箱 StableID 派生具名目录；
 未配置时，新层写入 `manifest_config` 指定的 Manifest Store。API 和 CLI 均不提供
-单次目的地覆盖。已经发布的不可变层保留原 Store 或具名位置引用及层序，只将私有层、
+单次目的地覆盖。选定的目的地直接传给 Sandboxer，由它返回最终的可迁移引用。
+具名目录导出保持 Manifest Bundle 表示：新物化的层共用一个 Bundle，直接携带
+最终的 `@location` selector，Orchestrator 不再于导出后改写引用。
+已经发布的不可变层保留原 Store 或具名位置引用及层序，只将私有层、
 需要格式转换或合并的层物化到本次目的地。新 Bundle 不要求包含整盘，整盘已经发布时
 也可以不生成新 Bundle。导出不会为了检查可用性而重新打开保留的父层。接收节点须能
 读取盘图中的每一层；只要盘或 token 仍有引用，就应保留对应的已发布对象。删除源沙箱

@@ -313,7 +313,7 @@ create 和有效路由/列表视图完整传递；0 保留为立即启用策略�
 | connect | group + route_key + stable sandbox_id | 调用 `operation=connect` Reserve;registry 经 node-link 下发 CmdConnect,不 Resolve 或转发 node HTTP `/connect` |
 | exec session | group + route_key + stable sandbox_id | 调用 `operation=exec-session` Reserve;Registry 验证 API key,经 node-link 下发 CmdExecSession,只对外返回 ExecAccessToken |
 | get/stats/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID 与 APIEndpoint,Router 重写路径后转发到 node conductor;stats body 无 SID,无需响应身份适配;APIEndpoint 缺失时 fail closed |
-| list/get | group | 读取 group 分片;单个 sandbox 的查询另需上表中的完整身份 |
+| list/get | group | 有界分页读取 group 分片；单个 sandbox 的查询另需上表中的完整身份 |
 | data plane | group + route_key + stable sandbox_id + target | 已知 NodeSandboxID/DataEndpoint 即直接建立一次性 node CONNECT,包括 paused/starting;target 缺失或 typed stale 才 fallback `operation=data`;miss 先 Resolve |
 | build register | group + build_id | 规范化 body/Builder header 为 Build.Resources,独立解析目标 Sandbox ResourcePatch,再调用 `ReserveBuild`;选中节点执行最终 registration admission |
 | build cancel | group + build_id | 每次重新 ResolveBuild, 按当前 APIEndpoint 转发; 不重选节点 |
@@ -350,6 +350,34 @@ Router 按 [Registry Reserve 协议](#reserve) 为共同的 `POST /route-link/v2
 
 connect/exec-session/data 中的 `sid` 均是客户期望的稳定 SandboxID,用于防止 route_key 被删除重建后请求
 跨越 lineage。
+
+#### Sandbox 列表分页
+
+**兼容性变更：** cluster `GET /v2/sandboxes`（及 `/sandboxes` 别名）默认返回一页，
+不再一次返回整个 group。响应保持原有 JSON 数组与 item 字段。需要完整列表的客户端
+必须读取 `x-next-token` 响应头，并作为下一次请求的 `nextToken` 继续，直到该响应头
+消失；只要响应头仍存在，短页或空数组都不表示结束。
+
+`limit` 默认 100，允许 1 至 1,000 的整数。它限制每次请求检查的 route 记录数，
+之后再做逐对象鉴权与状态过滤，因此可见结果可能少于 limit。Registry 每个存储事务
+最多读取 128 条。省略 `state` 时选择 `ready`、`pausing`、`paused`；显式过滤还支持
+`reserved`、`dead`、`deleting`，`running` 是现有 cluster `ready` 投影的别名，
+响应中的状态值保持不变。非法 limit、未知 state、重复分页参数及非法续读 token
+返回 400。Node 的 `starting` 报告未保存为独立 cluster route 状态，不支持该过滤值。
+
+一次遍历应保持相同 group、state 和 API token；改变任一项须去掉 `nextToken`
+重新开始。每页重新验证 API token，每个返回对象仍校验完整 MAC。公开游标使用
+server-only namespace key 和 XChaCha20-Poly1305 加密并认证，空页的游标不会暴露
+被过滤的其他 root 的 `route_key`。该保护隐藏对象名称，不隐藏页数、空页和 token
+长度。同一 metadata namespace 的 Registry peer 或重启进程可以继续读取。分页不
+提供跨请求快照；并发创建、删除及状态变化可能改变遍历时看到的集合。
+
+只有已鉴权的列表需要续读时，namespace 才原子初始化一个随机 32-byte 游标加密 key。
+Registry 仅缓存成功读取的 key，不为每页写入持久 cursor session。该不可变记录应随
+namespace 一起进入一致数据库备份，并随元数据恢复；恢复后按既有恢复合同重启缓存
+消费者。新 namespace 会有不同 key，旧游标须丢弃。损坏或已有删除历史的 key
+fail closed，不能静默重建。当前无公开删除或轮换 API，未来轮换协议须明确旧游标
+版本的接受边界。
 
 <a id="router-control-plane"></a>
 
@@ -645,6 +673,8 @@ Intent 绑定稳定逻辑 ID 和明确的 Node 本地 generation。超时、丢�
 ### Placer 导入与显式 apply
 
 Placer 使用有界 `Range` 加完整 `Read` 的 source 接口。一次维护操作只读取一次完整记录，并从同一值派生 context、凭据对和静态目标。文件和嵌入式来源复用同一适配器。静态 selector 和可选 shuffle sharding 决定所有维护目标，包括 draining、热点和当前缺少 runtime 的 Node；导入不使用 P2C。空交集不能扩大成全选。
+
+取得 source lease 后，文件来源每轮只读取并校验一次目录，所有分页和目标读取复用这份不可变快照。本轮扫描后的文件变化在下一轮生效；该快照只在本轮内保持稳定，不保证扫描文件期间的文件系统原子快照。
 
 Ready importer 经 Registry 竞争有界、带 fence 的 source lease。页内所有项成功才以原 owner/run/term 推进 cursor；Registry 在转发命令前再次校验 lease。可信命令可在同一 Node SQLite 事务安装完整 key pair 并更新 Group；这条导入路径不向 Registry 写入独立的 desired-key 缓存。
 
@@ -1028,6 +1058,7 @@ Registry 通过一份共享仓储实现，将执行元数据持久化到 SQLite�
 | KeyPair | `(node_id, api_secret_fingerprint)` | desired pair、租约和匹配的 ACK；替换会使旧 ACK 失效 |
 | Directory | 固定 256 个低频节点投影 bucket | 分页校验后的完整 view 与 bucket change token |
 | ImportSource | `source_id` | 租约 owner、run ID、业务 term 与成功 page 的 cursor |
+| PublicListCursor | namespace 内唯一的 `public-list-cursor-key/v1` 记录 | 不可变的 server-only 随机加密 key；首次原子初始化，Registry peer 后续只读复用 |
 
 点操作只访问一个业务身份。列表接口接收范围限定的 opaque cursor 与有界 page size。较大 payload 由共享记录层在同一事务内分块，同时受公共预算与后端原生限制。列表 cursor 是范围内的续读位置，不保证跨事务固定快照。
 
