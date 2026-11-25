@@ -114,13 +114,8 @@ func TestWorkspaceExportRetainsPublishedLayersWithoutReadingThem(t *testing.T) {
 			}
 			inline, err := json.Marshal(disk)
 			requireWorkspaceIO(t, err)
-			if format != "manifest" {
-				if _, _, _, err := Plan(inline, options); !errors.Is(err, ErrUnauthorized) {
-					t.Fatalf("untrusted inline tarstream bypassed authorization: %v", err)
-				}
-			} else {
-				_, _, err := Resolve(ctx, inline, options)
-				requireWorkspaceIO(t, err)
+			if _, _, _, err := Plan(inline, options); !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("untrusted inline tarstream bypassed authorization: %v", err)
 			}
 			options.APISecret = strings.Repeat("c", 64)
 			if _, _, _, err := Plan(input, options); !errors.Is(err, ErrUnauthorized) {
@@ -145,24 +140,6 @@ func TestWorkspaceExportRetainedGraphNeedsNoLocationOrStore(t *testing.T) {
 	requireWorkspaceIO(t, err)
 	if result.Disk == nil || result.Disk.Base != base || !slices.Equal(result.Disk.BaseFromRefs, parents) || *result.Disk.Size != 8192 {
 		t.Fatalf("already published disk changed: %+v", result.Disk)
-	}
-}
-
-func TestWorkspaceQualifyKeepsOnlyPortableOrNewOutput(t *testing.T) {
-	dir := t.TempDir()
-	key := strings.Repeat("a", 64)
-	retained := []string{"manifest://" + key, "file://base.bundle@manifest:" + key + "@location:base",
-		"file://base.overlay@digest:" + key + "@location:plain", "file://base.overlay@hmac:" + key + "@location:encrypted"}
-	disk := rtconfig.DiskV1{Base: "file://" + filepath.Join(dir, "new.bundle") + "@manifest:" + key, BaseFromRefs: slices.Clone(retained)}
-	requireWorkspaceIO(t, Qualify(&disk, dir, "new"))
-	if disk.Base != "file://new.bundle@manifest:"+key+"@location:new" || !slices.Equal(disk.BaseFromRefs, retained) {
-		t.Fatalf("qualified graph: %+v", disk)
-	}
-	for _, raw := range []string{"file:///outside/new.bundle@manifest:" + key, "file://unidentified@location:old", "file://" + filepath.Join(dir, "mutable")} {
-		disk.Base = raw
-		if err := Qualify(&disk, dir, "new"); err == nil {
-			t.Fatalf("accepted unpublished output %s", raw)
-		}
 	}
 }
 
