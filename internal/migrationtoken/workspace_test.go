@@ -44,10 +44,34 @@ func TestWorkspaceMigrationVectorAndPurpose(t *testing.T) {
 			t.Fatal("accepted whole-machine token as workspace")
 		}
 	}
-	for _, ref := range []string{"file:///host/disk.bundle", "file://disk@location:name", "file://raw@digest:" + strings.Repeat("f", 64) + "@location:other"} {
+	for _, ref := range []string{"file:///host/disk.bundle", "file://disk@location:name", "file:///host/raw@digest:" + strings.Repeat("f", 64)} {
 		d.Base = ref
 		if _, err := SealWorkspace(testMaterial, d); err == nil {
 			t.Fatalf("accepted nonportable disk %s", ref)
+		}
+	}
+}
+
+func TestWorkspaceTokenRetainsIdentifiedTarstreamLayers(t *testing.T) {
+	size := int64(8192)
+	disk := rtconfig.DiskV1{Kind: "disk", Version: 1, Size: &size,
+		Base: "file://current.bundle@manifest:" + strings.Repeat("a", 64) + "@location:current",
+		BaseFromRefs: []string{
+			"file://older.overlay@digest:" + strings.Repeat("b", 64) + "@location:older",
+			"file://encrypted.overlay@hmac:" + strings.Repeat("c", 64) + "@location:encrypted",
+		},
+	}
+	token, err := SealWorkspace(testMaterial, disk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := OpenWorkspace(testMaterial, token)
+	if err != nil || !reflect.DeepEqual(got, disk) {
+		t.Fatalf("mixed portable layers did not round trip: %+v %v", got, err)
+	}
+	for _, key := range []KeyMaterial{{testManifestKey, testManifestKey}, {testAPISecret, testAPISecret}} {
+		if _, err := OpenWorkspace(key, token); err == nil {
+			t.Fatal("retained tarstream token accepted other tenant credentials")
 		}
 	}
 }
