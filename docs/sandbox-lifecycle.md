@@ -286,6 +286,24 @@ node-ctl workspace export "$A" --name project |
 
 Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. After attach returns 204, a new access to B’s guest path can trigger the mount even if an earlier access started while the slot was empty. The guest mounts the filesystem on access and reports filesystem or subdirectory errors to the caller.
 
+Workspace export shares the node's publication destination with sandbox export:
+`checkpoint.remote.ref_location_parent` selects a named directory derived from
+the source Sandbox's StableID; when unset, new layers go to the Manifest Store
+selected by `manifest_config`. The API and CLI have no destination override.
+Already published immutable layers keep their original Store or named-location
+references and order. Only private layers, or layers requiring format conversion
+or compaction, are materialized at the selected destination. A newly written
+Bundle need not contain the whole disk, and an already published disk need not
+create a new Bundle. Export does not reopen retained parents to test their
+availability. The receiving node must be able to read every referenced layer;
+retain those published objects for as long as a disk or token depends on them.
+Deleting the source Sandbox only releases its owned local data. Authenticated
+workspace tokens may retain identified tarstream layers as well as Manifest
+layers; inline disk requests still undergo the existing source authorization.
+The `kwt1` token version is unchanged. Tokens retaining `@digest` or `@hmac`
+layers require a receiver with this support; Manifest-only and Bundle-selector
+tokens keep their existing compatibility.
+
 An empty-disk Attach first reuses any saved default choice. On the first
 selection, it uses the configured workspace template or queries the live owner
 for the named unbound fixed slot's capacity. A dynamic slot's temporary geometry
@@ -1223,7 +1241,7 @@ These fields belong to Conductor configuration. Shared loading, path and environ
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30` + `169.254.0.22` / `169.254.1.1/31` + `169.254.1.0` | Per-profile `{inner_ip,nexthop}` reused inside guests; floating IP uniquely identifies a sandbox. e2b's /30 and gateway support envd port forwarding |
 | `checkpoint.mode` | `local` | Local paused capture: role tarstream or multi-Manifest ZIP Bundle; output stays in Sandbox BaseDir/checkpoint ([Node directories and identities](node.md#node-directories-and-identities), [Artifact capture, templates and migration](#capture-and-pause)) |
 | `checkpoint.merge_ref` / `.drop_caches` | Unset | Node tri-state Pause policy. Explicit true/false reaches sandbox-ctl snapshot; omitted/YAML null uses sandboxer's default |
-| `checkpoint.remote.ref_location_parent` | Empty | Optional absolute hostless file URI. Named-location parent for Build checkpoint graphs/export-sandbox and located Build image Bundle resolution; does not change Pause mode |
+| `checkpoint.remote.ref_location_parent` | Empty | Optional absolute hostless file URI. Named-location parent for Build checkpoint graphs, export-sandbox and workspace export; also resolves located Build image Bundles and workspace layers. Does not change Pause mode |
 | `checkpoint.remote.manifest` | `false` | False sends image-class outputs to Manifest Store. True instead materializes single-root Manifest Bundles at the required named parent; it does not change checkpoint mode or checkpoint-class policy ([Target-aware execution and publication](node-build.md#execution-and-publication)) |
 
 <a id="state-and-ownership"></a>

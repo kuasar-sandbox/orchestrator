@@ -1,9 +1,11 @@
 """Exercise workspace handoff through the node API on a real Guest."""
 import base64
+import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -17,7 +19,7 @@ image = "bare-img-" + base64.urlsafe_b64encode(root_ref).decode().rstrip("=")
 mounts = [{"path": "/data", "subpath": "project"}, {"path": "/output", "subpath": "results"}]
 live = set()
 samples = []
-metrics_file = Path(out_dir, "workspace-timings.jsonl")
+metrics_file = Path(out_dir, "workspace-timings-named.jsonl" if os.environ.get("WORKSPACE_NAMED_PARENT") else "workspace-timings.jsonl")
 
 
 def request(method, path, body=None, *, status=200, headers=None):
@@ -229,7 +231,28 @@ def fixed_slot_defaults():
     delete(dynamic)
 
 
-def handoff():
+def assert_published_parents(template, parent, source_ids):
+    # Inspect the public SBX artifact, without decoding the opaque workspace token.
+    profile, kind, encoded = template.split("-", 2)
+    assert profile == "bare" and kind == "sbx"
+    ref = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+    args = [bin_dir / "sandbox-ctl", "info", "--json", "--manifest-config", os.environ["WORKSPACE_MANIFEST_CONFIG"]]
+    for sid in source_ids:
+        digest = hashlib.sha256(sid.encode()).hexdigest()
+        location = Path(parent, digest[:2], digest[2:4], sid)
+        args.extend(["--ref-location", sid + "=" + location.as_uri()])
+    info = json.loads(subprocess.check_output([*args, ref], timeout=90))
+    disk = next(d for d in info["Boot"]["Disks"] if d["Name"] == "project")
+    refs = [disk["Base"], *(disk.get("BaseFromRefs") or [])]
+    locations = {match.group(1) for raw in refs if (match := re.search(r"@location:([^@]+)", raw))}
+    assert set(source_ids[:-1]) <= locations, "workspace export copied or lost an already published parent"
+    Path(out_dir, "workspace-publication.json").write_text(json.dumps({
+        "destination": "named", "preserved_parent_locations": len(source_ids) - 1,
+        "second_handoff": "passed",
+    }) + "\n")
+
+
+def handoff(named_parent=None):
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
     metrics_file.write_text("")
     source = create(image, declared(1, {"disk": {}}), "img-new-disk", 1)
@@ -249,7 +272,7 @@ def handoff():
     delete(source)
     imported = create(image, declared(1, {"disk": {"migrationToken": token}}), "img-import", 1)
     guest(imported, "test \"$(cat /data/value)\" = source; test \"$(cat /output/value)\" = result; echo private-b > /data/value; sync")
-    for n in [0, 1, 8]:
+    for n in ([1] if named_parent else [0, 1, 8]):
         seed = create(image, declared(n) if n else None, "img", n)
         if n:
             assert all(x["state"] == "unattached" for x in states(seed).values())
@@ -269,12 +292,23 @@ def handoff():
             captured_choice = create(template, [{"name": "project", "disk": {"migrationToken": token}}], "snp-create-attach", 1)
             guest(captured_choice, "test \"$(cat /data/value)\" = source")
             delete(captured_choice)
+    if named_parent:
+        pause(imported, False)
+        next_token = control(imported, "project", "export", {})["token"]
+        receiver = create(image, declared(1), "named-second-handoff", 1)
+        attach(receiver, next_token, "named-second-handoff")
+        guest(receiver, 'test "$(cat /data/value)" = private-b; test "$(cat /output/value)" = result; sync')
+        pause(receiver, False)
+        assert_published_parents(template_of(receiver), named_parent, [source, imported, receiver])
+        delete(receiver)
     delete(imported)
 
 
 try:
     if os.environ.get("WORKSPACE_DEFAULT_TEST") == "fixed-slot":
         fixed_slot_defaults()
+    elif os.environ.get("WORKSPACE_DEFAULT_TEST") == "named-handoff":
+        handoff(named_parent=os.environ["WORKSPACE_NAMED_PARENT"])
     else:
         handoff()
         sbx_append()

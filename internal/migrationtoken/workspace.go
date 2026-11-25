@@ -40,7 +40,7 @@ func ValidateWorkspaceDisk(d rtconfig.DiskV1) error {
 	}
 	for _, raw := range append([]string{d.Base}, d.BaseFromRefs...) {
 		ref, err := types.ParsePortableRef(raw)
-		if err != nil || ref.Scheme == manifest.RefSchemeFile && (ref.Location == "" || ref.DigestScheme != "manifest") {
+		if err != nil || ref.Scheme == manifest.RefSchemeFile && ref.Digest == "" {
 			return ErrInvalidPayload
 		}
 	}

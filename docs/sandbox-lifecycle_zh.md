@@ -314,6 +314,18 @@ node-ctl workspace export "$A" --name project |
 
 导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 返回 204 后，新发起的目录访问可以直接触发挂载，即使同一目录此前已有在空盘位上发起的访问。Guest 在实际访问时挂载文件系统，并向该访问返回文件系统或子目录本身的错误。
 
+Workspace export 与整机 export 共用节点发布目的地：配置
+`checkpoint.remote.ref_location_parent` 时，按源沙箱 StableID 派生具名目录；
+未配置时，新层写入 `manifest_config` 指定的 Manifest Store。API 和 CLI 均不提供
+单次目的地覆盖。已经发布的不可变层保留原 Store 或具名位置引用及层序，只将私有层、
+需要格式转换或合并的层物化到本次目的地。新 Bundle 不要求包含整盘，整盘已经发布时
+也可以不生成新 Bundle。导出不会为了检查可用性而重新打开保留的父层。接收节点须能
+读取盘图中的每一层；只要盘或 token 仍有引用，就应保留对应的已发布对象。删除源沙箱
+只释放其拥有的本地数据。经过认证的 workspace token 可保留带内容身份的 tarstream
+层和 Manifest 层；内联磁盘请求继续执行原有的来源授权。
+`kwt1` token 版本不变。保留 `@digest` 或 `@hmac` 层的 token 需要接收端也支持
+这些引用；仅包含 Manifest 或 Bundle selector 的 token 保持现有兼容性。
+
 空 disk 的 Attach 首先复用已保存默认选择。仅首次选择时才使用配置的 workspace
 模板，或查询实际运行 owner，取得目标未绑定固定 slot 的容量。动态 slot 的临时
 几何不能作为创建容量。完整规范 DiskV1 在绑定前保存；重试、暂停恢复和之后的节点
@@ -1195,7 +1207,7 @@ Pause 与 Build 的 checkpoint 输入仍只接受 `merge_ref`/`drop_caches`；�
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
 | `checkpoint.mode` | `local` | 暂停态本机 capture:`local` = 现有 tarstream,`bundle` = multi-Manifest ZIP Bundle；输出固定在 Sandbox `BaseDir/checkpoint`([节点目录与身份](node_zh.md#node-directories-and-identities)、[Artifact lifecycle、转模板与迁移](#capture-and-pause)) |
 | `checkpoint.merge_ref` / `.drop_caches` | 未设置 | Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省 |
-| `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute hostless `file://` URI；Builder checkpoint 类 graph 和 `export-sandbox` 的 named-location parent，也用于解析 located Build image Bundle；不改变 Pause capture mode |
+| `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute hostless `file://` URI；Builder checkpoint 类 graph、`export-sandbox` 和 workspace export 的 named-location parent，也用于解析 located Build image Bundle 及 workspace 层；不改变 Pause capture mode |
 | `checkpoint.remote.manifest` | `false` | `false`：Build image 类进入 Manifest store；`true`：image 类不写 Manifest store，而以 single-root Manifest Bundle 物化到上述 named location，且 parent 必填。它不改变 `checkpoint.mode` 或 checkpoint 类 policy（[按目标执行与发布](node-build_zh.md#execution-and-publication)） |
 
 <a id="state-and-ownership"></a>
