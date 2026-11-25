@@ -88,5 +88,8 @@ type GroupSupportRepository interface {
 	ListGroupSupport(context.Context, string, Cursor, int) (Page[GroupSupportSelection], error)
 	ReadGroupAuth(context.Context, string, string) (Versioned[GroupAuth], error)
 	ListGroupAuth(context.Context, string, Cursor, int) (Page[Versioned[GroupAuth]], error)
+	// ListGroupAuthCandidates seeks the token's 96-bit candidate fingerprint in
+	// the full-fingerprint directory. Candidates still require full MAC checks.
+	ListGroupAuthCandidates(context.Context, string, string, Cursor, int) (Page[Versioned[GroupAuth]], error)
 	CleanupGroupSupport(context.Context, ReapClaim) (bool, error)
 }
