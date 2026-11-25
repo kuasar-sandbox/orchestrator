@@ -108,9 +108,9 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   sandbox_result_run_id TEXT NOT NULL DEFAULT '',
   sandbox_result_json   TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
+CREATE INDEX IF NOT EXISTS idx_sandboxes_state_id ON sandboxes(state,id);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_ashash ON sandboxes(api_secret_hash);
-CREATE INDEX IF NOT EXISTS idx_sandboxes_ascandidate ON sandboxes(substr(api_secret_hash,1,24));
+CREATE INDEX IF NOT EXISTS idx_sandboxes_ascandidate_id ON sandboxes(substr(api_secret_hash,1,24),id);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_mkhash ON sandboxes(manifest_key_hash);
 
 CREATE TABLE IF NOT EXISTS workspace_defaults (
@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS manifest_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_ascandidate ON manifest_keys(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_key_hash);
+CREATE INDEX IF NOT EXISTS idx_manifest_keys_expiry ON manifest_keys(expires_unix) WHERE expires_unix>0;
 CREATE TRIGGER IF NOT EXISTS resource_recovery_clear AFTER UPDATE OF resource_obligation ON sandboxes
  WHEN NEW.resource_obligation=0 BEGIN
  DELETE FROM resource_recovery_placement WHERE sandbox_id=NEW.id;
@@ -376,6 +377,14 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS node_pressure (singleton INTEGER PRIMARY KEY CHECK(singleton=1), zone TEXT NOT NULL, version INTEGER NOT NULL, reason TEXT NOT NULL, since_unix INTEGER NOT NULL)`); err != nil {
 		db.Close()
 		return nil, err
+	}
+	// The composite indexes created above also serve their leading-column
+	// lookups. Retire the superseded indexes only after a supported database has
+	// opened successfully; keeping both would duplicate every sandbox write.
+	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_sandboxes_state;
+DROP INDEX IF EXISTS idx_sandboxes_ascandidate;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: replace sandbox query indexes: %w", err)
 	}
 	return &Store{db: db, box: box}, nil
 }
