@@ -7,6 +7,7 @@ set -euo pipefail
 rm -f -- "$OVL" "$BLD"
 OVL='mkfs://ext4?size=1GiB'
 BLD='mkfs://ext4?size=2GiB'
+write_workspace_config() {
 write_orchestrator_config unset static
 python3 - "$WORK/config.yaml" <<'PY'
 from pathlib import Path
@@ -17,6 +18,8 @@ assert text.count("overlay_diff_template: ") == 1
 path.write_text(text.replace("overlay_diff_template: ",
     'workspace_diff_template: "mkfs://ext4?size=1GiB", overlay_diff_template: '))
 PY
+}
+write_workspace_config
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null
@@ -30,4 +33,16 @@ write_orchestrator_config unset static
 start_orchestrator "$WORK/orch-fixed-slot.log"
 wait_mmds_listener
 WORKSPACE_DEFAULT_TEST=fixed-slot python3 "$SCRIPT_DIR/workspace_handoff.py" "$PORT" "$DOMAIN" "$BIN" "$PROXY_PORT" "$CASE_OUT"
+stop_orchestrator
+write_workspace_config
+cat >> "$WORK/config.yaml" <<EOF
+  remote: { ref_location_parent: "file://$WORK/workspace-published" }
+EOF
+start_orchestrator "$WORK/orch-workspace-location.log"
+wait_mmds_listener
+# Repeat only handoff against named publication, including a second export that
+# must retain the first sandbox's published parent instead of copying it again.
+WORKSPACE_DEFAULT_TEST=named-handoff WORKSPACE_NAMED_PARENT="$WORK/workspace-published" \
+    WORKSPACE_MANIFEST_CONFIG="$WORK/manifest.yaml" MANIFEST_KEY="$MK" \
+    python3 "$SCRIPT_DIR/workspace_handoff.py" "$PORT" "$DOMAIN" "$BIN" "$PROXY_PORT" "$CASE_OUT"
 echo "PASS orchestrator.workspace.sh"

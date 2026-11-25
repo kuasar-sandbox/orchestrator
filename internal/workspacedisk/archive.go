@@ -8,6 +8,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -66,7 +67,9 @@ func openArchive(ctx context.Context, req Request, key string) (_ *workspaceArch
 	}()
 	if opened, ok := a.root.(*artifact.OpenedFile); ok {
 		a.dir = filepath.Dir(opened.ResolvedPath())
-		if bundle := opened.BundleReader(); bundle != nil {
+		// Supply available trusted paths for selected Bundle members. Export
+		// may retain external refs without a mapping on this publishing node.
+		if bundle := opened.BundleReader(); bundle != nil && (req.Operation == "list" || req.RefLocationParent != "") {
 			for _, ref := range bundle.Refs() {
 				if err := add(ref); err != nil {
 					return nil, err
@@ -164,11 +167,13 @@ func (a *workspaceArchive) publish(guard context.Context, request Request, name 
 		}
 		req.Upload = false
 		req.OutputDir = output.Path
-	}
-	// Resolve only the selected disk: an unrelated disk can be unavailable
-	// or use a location that is not mounted on this node.
-	for _, saved := range a.config.Boot.Disks {
-		if saved.Name == name {
+		// Path derivation does not open layers. Keep these optional mappings
+		// for legacy conversion or layer-limit compaction, which actually read
+		// selected parents. Retaining portable refs needs no configured parent.
+		for _, saved := range a.config.Boot.Disks {
+			if saved.Name != name {
+				continue
+			}
 			for _, raw := range append([]string{saved.Base}, saved.BaseFromRefs...) {
 				if err := AddLocation(a.locations, parent, raw); err != nil {
 					return nil, err
@@ -188,22 +193,12 @@ func (a *workspaceArchive) publish(guard context.Context, request Request, name 
 		if err := Qualify(&disk, output.Path, publication); err != nil {
 			return nil, err
 		}
-		a.locations[publication] = output.Path
 	}
-	// Validate every returned root independently in its exported namespace,
-	// even if the publisher reused an existing content-addressed object.
-	for _, raw := range append([]string{disk.Base}, disk.BaseFromRefs...) {
-		ref, err := manifest.ParseRef(raw)
-		if err != nil {
-			return nil, err
-		}
-		layer, err := OpenLayer(guard, a.storage, ref, "", a.locations)
-		if err != nil {
-			return nil, err
-		}
-		if err := layer.Close(); err != nil {
-			return nil, err
-		}
+	// ExportDisk validates its actual source and committed output. Retained
+	// portable layers are already published and may be unavailable on this node;
+	// check their transfer contract without reopening or remapping them here.
+	if err := migrationtoken.ValidateWorkspaceDisk(disk); err != nil {
+		return nil, err
 	}
 	return &disk, nil
 }
