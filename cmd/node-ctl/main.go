@@ -14,7 +14,7 @@
 //	node-ctl builder status                                    # durable Builder admission status (admin socket)
 //	node-ctl builder cancel <build-id>                          # cancel execution, retain diagnostics
 //	node-ctl builder delete <transient-template-id> [--cancel]  # delete a Build record
-//	node-ctl version
+//	node-ctl --version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.
 // The guest runtime image is built by the guest-runtime repo.
@@ -36,9 +36,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
+	"github.com/kuasar-sandbox/orchestrator/internal/version"
 )
-
-var version = "0.2.0-dev"
 
 func main() {
 	if proxyapp.WorkerBootstrapPresent() || proxyapp.ContinuationPresent() {
@@ -54,6 +53,9 @@ func main() {
 	// Top-level component bootstrap belongs only to a custom App. node-ctl never
 	// propagates stale bootstrap state into utility commands or helpers.
 	componentexec.ClearEnvironment()
+	if version.PrintIfRequested("node-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		usage()
 	}
@@ -96,8 +98,6 @@ func main() {
 		os.Exit(resourceCmd(os.Args[2:]))
 	case "builder":
 		os.Exit(builderCmd(os.Args[2:]))
-	case "version", "-v", "--version":
-		fmt.Println("node-ctl", version)
 	default:
 		usage()
 	}
@@ -108,7 +108,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|workspace|group|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|telemetry|run-sandbox|run-builder|config|manifest-key|workspace|group|export-sandbox|import-sandbox|checkpoint-cleanup|resource|builder} [args]\n       node-ctl --version")
 	os.Exit(2)
 }
 

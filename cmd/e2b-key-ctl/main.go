@@ -9,7 +9,7 @@
 //	e2b-key-ctl fingerprint       [<API_SECRET>]
 //	e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] --registry-username/-password | -token
 //	                                            # opaque registry pull token for api_headers
-//	e2b-key-ctl version
+//	e2b-key-ctl --version
 package main
 
 import (
@@ -22,11 +22,13 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/version"
 )
 
-var version = "0.1.0-dev"
-
 func main() {
+	if version.PrintIfRequested("e2b-key-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		usage()
 	}
@@ -46,8 +48,6 @@ func main() {
 		fmt.Println(hex.EncodeToString(apikey.FullFingerprint(rootSecretArg(os.Args[2:], "API_SECRET"))))
 	case "seal-pull-token":
 		check(sealPullToken(os.Args[2:]))
-	case "version", "-v", "--version":
-		fmt.Println("e2b-key-ctl", version)
 	default:
 		usage()
 	}
@@ -61,7 +61,7 @@ func usage() {
   e2b-key-ctl fingerprint       [<API_SECRET>]   # print the full 64-hex API-secret fingerprint
   e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-password P | --registry-token T}
                                               # opaque pull token for the SDK's api_headers (X-Kuasar-Pull-Token)
-  e2b-key-ctl version`)
+  e2b-key-ctl --version`)
 	os.Exit(2)
 }
 

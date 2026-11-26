@@ -265,7 +265,7 @@ class OrchestratorProxyGoSelection(unittest.TestCase):
                     self.assertEqual(row['argv'][:4], ['-C', str(owner), 'build', '-trimpath'])
                     self.assertEqual(row['argv'][-3:], ['-o', str(output/name), package])
                 self.assertIn('-X main.buildIdentity=target', rows[5]['argv'])
-                self.assertIn('-X main.version=inplace-target', rows[6]['argv'])
+                self.assertIn('-buildid=orchestrator-node-ctl-inplace-target', rows[6]['argv'])
                 self.assertIn('-buildid=orchestrator-inplace-target', rows[7]['argv'])
                 self.assertEqual(json.loads(native_log.read_text().splitlines()[-1]),
                     ['-B', str(owner/'scripts/test_fdb_assets.py'), '--arch', arch, '--output', str(output)])
