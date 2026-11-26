@@ -2295,6 +2295,7 @@ func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, s
 		Sandbox: sb, Template: tmpl,
 		Runtime:        o.cfg.Sandbox.Boot.Runtime,
 		Kernel:         o.cfg.Sandbox.Boot.Kernel,
+		Cmdline:        o.cfg.Sandbox.Boot.Cmdline,
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFD:          sandboxTapFD(o.vs.TapFD(sb.VswitchPort)), EnvVars: sb.Env,
 		Resources:   resources,

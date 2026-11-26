@@ -72,6 +72,7 @@ func TestCheckpointCleanupFailureRetainsMarkerAndRestartRetries(t *testing.T) {
 		}
 		return os.RemoveAll(path)
 	}
+	checkpointGCLifecycle(t, restarted)
 	if err := restarted.ReconcileSandboxes(context.Background()); err != nil {
 		t.Fatal(err)
 	}

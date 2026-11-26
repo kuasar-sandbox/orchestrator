@@ -186,7 +186,7 @@ func (p *buildPipeline) templateBoot() (*sandboxcfg.LaunchProjection, string, bo
 	if err = yaml.Unmarshal(document, &host); err != nil {
 		return nil, "", false, err
 	}
-	host["boot"] = map[string]any{"kernel": cfg.Boot.Kernel, "runtime": cfg.Boot.Runtime}
+	host["boot"] = map[string]any{"kernel": cfg.Boot.Kernel, "runtime": cfg.Boot.Runtime, "cmdline": cfg.Boot.Cmdline}
 	doc, err := yaml.Marshal(host)
 	if err != nil {
 		return nil, "", false, err

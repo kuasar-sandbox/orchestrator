@@ -117,6 +117,10 @@ sandbox:
     bare: { inner_ip: 169.254.1.1/31,  nexthop: 169.254.1.0 }
   boot:
     kernel: /opt/sandbox/kernel/6.1/vmlinux
+    # Extra parameters paired with kernel for sandbox and builder cold starts.
+    # Omit to inherit source parameters; "" clears them. Memory restores retain
+    # the captured parameters. sandbox-ctl appends extras after its boot defaults.
+    # cmdline: "loglevel=4 printk.time=1"
     runtime: /opt/sandbox/runtime/v1/sandbox-runtime.bundle
     # Generate the cold-boot ext4 upper without a separately prepared template file.
     # Raw file paths and explicit file/manifest template references remain supported.
