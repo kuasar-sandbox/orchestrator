@@ -13,7 +13,7 @@ e2e_go -C "$ROOT" build -trimpath -o "$2/nodelink-fault-relay" ./test/e2e/nodeli
 e2e_go -C "$ROOT" build -trimpath -o "$2/proxy-lifecycle" ./test/e2e/proxy-lifecycle
 e2e_go -C "$ROOT" build -trimpath -ldflags '-X main.buildIdentity=target' \
     -o "$2/proxy-lifecycle-target" ./test/e2e/proxy-lifecycle
-e2e_go -C "$ROOT" build -trimpath -ldflags '-X main.version=inplace-target' \
+e2e_go -C "$ROOT" build -trimpath -ldflags '-buildid=orchestrator-node-ctl-inplace-target' \
     -o "$2/node-ctl-inplace-target" ./cmd/node-ctl
 e2e_go -C "$ROOT" build -trimpath -ldflags '-buildid=orchestrator-inplace-target' \
     -o "$2/custom-proxy-inplace-target" ./examples/custom-proxy

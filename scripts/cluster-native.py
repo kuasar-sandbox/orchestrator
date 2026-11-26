@@ -299,7 +299,7 @@ def main():
     # Exercise the bundled loader and full dependency closure on the native
     # runner; version does not connect to a database or start a cluster role.
     smoke_env = {key: value for key, value in os.environ.items() if not key.startswith("LD_")}
-    subprocess.run([str(bundle / "bin/run-cluster-ctl"), "version"], env=smoke_env,
+    subprocess.run([str(bundle / "bin/run-cluster-ctl"), "--version"], env=smoke_env,
                    stdout=subprocess.DEVNULL, check=True, timeout=30)
     for name in ("cluster-ctl", "run-cluster-ctl"):
         link = output / name

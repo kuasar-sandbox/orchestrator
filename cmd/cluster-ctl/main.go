@@ -5,7 +5,7 @@
 //	cluster-ctl placer    --config <placer.yaml>     # optional Group importer
 //	cluster-ctl config <registry|router|placer> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	cluster-ctl status --registry <URL> --group <group> --node-id <node> # read published Group support
-//	cluster-ctl version
+//	cluster-ctl --version
 //
 // One binary, three roles as independent processes.
 package main
@@ -14,11 +14,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/version"
 )
 
-var version = "0.1.0-dev"
-
 func main() {
+	if version.PrintIfRequested("cluster-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		usage()
 	}
@@ -35,8 +38,6 @@ func main() {
 		err = configCmd(os.Args[2:])
 	case "status":
 		err = statusCmd(os.Args[2:], os.Stdout)
-	case "version", "-v", "--version":
-		fmt.Println("cluster-ctl", version)
 	default:
 		usage()
 	}
@@ -47,6 +48,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|placer|config|status|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|placer|config|status} [flags]\n       cluster-ctl --version")
 	os.Exit(2)
 }

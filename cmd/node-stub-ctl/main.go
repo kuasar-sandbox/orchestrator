@@ -42,10 +42,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/version"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
-
-var version = "0.1.0-dev"
 
 const (
 	defaultCreateDelay = 10 * time.Millisecond
@@ -53,6 +52,9 @@ const (
 )
 
 func main() {
+	if version.PrintIfRequested("node-stub-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		usage()
 	}
@@ -75,8 +77,6 @@ func main() {
 		err = runSandbox(os.Args[2:])
 	case "build":
 		err = runBuild(os.Args[2:])
-	case "version", "-v", "--version":
-		fmt.Println("node-stub-ctl", version)
 	default:
 		usage()
 	}
@@ -96,7 +96,7 @@ func usage() {
   node-stub-ctl sandbox delete --admin http://HOST:PORT --node NODE --sid SID
   node-stub-ctl sandbox orphan --admin http://HOST:PORT --node NODE --sid SID [--metadata k=v ...]
   node-stub-ctl build list --admin http://HOST:PORT [--node NODE]
-  node-stub-ctl version`)
+  node-stub-ctl --version`)
 	os.Exit(2)
 }
 
