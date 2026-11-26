@@ -171,14 +171,21 @@ func TestWorkspacePublishedGraphKeepsEveryLayer(t *testing.T) {
 }
 
 func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) {
-	for _, bundle := range []bool{false, true} {
-		name := "store-image"
-		if bundle {
-			name = "located-image"
-		}
-		t.Run(name, func(t *testing.T) {
+	empty, selected := "", "panic=0 new_kernel_option=1"
+	for _, tc := range []struct {
+		name    string
+		bundle  bool
+		cmdline *string
+		want    string
+	}{
+		{name: "store-image", want: "panic=10"},
+		{name: "located-image", bundle: true, want: "panic=10"},
+		{name: "clear-cmdline", bundle: true, cmdline: &empty},
+		{name: "replace-cmdline", bundle: true, cmdline: &selected, want: selected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newPublicationFixture(t)
-			p := f.pipeline(t, "workspace-memory", f.localImageRef, nil, bundle)
+			p := f.pipeline(t, "workspace-memory", f.localImageRef, nil, tc.bundle)
 			p.target = types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
 			upper := bytes.Repeat([]byte{0x60}, 8192)
 			upper[1080], upper[1081] = 0x53, 0xef
@@ -210,6 +217,7 @@ func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) 
 			}
 			binding := rtconfig.SlotBinding{ID: "initial", SourceID: "original", SizeBytes: 4096}
 			parentConfig.Version = 2
+			parentConfig.Boot.Cmdline = "panic=10"
 			parentConfig.Boot.Disks = []rtconfig.PortableDiskConfig{
 				{Name: "empty", Slot: &rtconfig.DiskSlotConfig{}},
 				{Name: "ready", Slot: &rtconfig.DiskSlotConfig{}, PureBlock: true, Binding: &binding, PortableRootConfig: rtconfig.PortableRootConfig{Base: diskRef}},
@@ -222,6 +230,7 @@ func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) 
 			parentConfig.Metadata = map[string]string{workspace.Namespace: workspace.Topology(plan)}
 			p.spec.SandboxSpec.WorkspacePlan = plan
 			p.spec.SourceSandboxConfig = parentConfig
+			p.spec.BootCmdline = tc.cmdline
 			if err := p.publishPhaseCImage(); err != nil {
 				t.Fatal(err)
 			}
@@ -234,6 +243,9 @@ func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
+			if !presence.Has("boot.cmdline") || host.Boot.Cmdline != tc.want {
+				t.Fatalf("workspace host boot lost selected cmdline: %+v", host.Boot)
+			}
 			source, err := sandbox.OpenRunSource(p.ctx, from, p.artifacts.storage, p.artifacts.locations)
 			if err != nil {
 				t.Fatal(err)
@@ -245,6 +257,9 @@ func TestWorkspaceMemoryTargetKeepsPublishedImageInCheckpointRoot(t *testing.T) 
 			}
 			parent := launch.SourceBinding.SandboxRef
 			portable := launch.PortableConfig
+			if portable.Boot.Cmdline != tc.want || parentConfig.Boot.Cmdline != "panic=10" {
+				t.Fatalf("workspace E cmdline=%q source=%q, want %q", portable.Boot.Cmdline, parentConfig.Boot.Cmdline, tc.want)
+			}
 			if portable.Boot.Root.Base != immutableImage || portable.Boot.Root.Overlay.Base != "self" || !portable.Boot.Disks[0].Unbound() || !reflect.DeepEqual(portable.Boot.Disks[1].Binding, &binding) {
 				t.Fatalf("phase C disk graph = %+v; immutable image = %q", portable.Boot, immutableImage)
 			}

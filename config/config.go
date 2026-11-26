@@ -91,6 +91,7 @@ func (c *Conductor) Clone() *Conductor {
 		out.Units.BuilderPools[i].Capacity = clonePtr(c.Units.BuilderPools[i].Capacity)
 	}
 	out.Cluster.Labels = cloneMap(c.Cluster.Labels)
+	out.Sandbox.Boot.Cmdline = clonePtr(c.Sandbox.Boot.Cmdline)
 	out.Sandbox.Network.DNS = cloneSlice(c.Sandbox.Network.DNS)
 	out.Sandbox.Resources.Allocatable.CPU = clonePtr(c.Sandbox.Resources.Allocatable.CPU)
 	out.Sandbox.Resources.Allocatable.Memory = clonePtr(c.Sandbox.Resources.Allocatable.Memory)
@@ -684,10 +685,11 @@ type ProfileNet struct {
 
 // BootConfig is the boot artifacts that define a sandbox instance.
 type BootConfig struct {
-	WorkspaceDiffTemplate string `yaml:"workspace_diff_template,omitempty" json:"workspace_diff_template,omitempty"` // default source for an explicitly requested workspace disk
-	Kernel                string `yaml:"kernel" json:"kernel"`                                                       // vmlinux path
-	Runtime               string `yaml:"runtime" json:"runtime"`                                                     // guest runtime erofs
-	OverlayDiffTemplate   string `yaml:"overlay_diff_template" json:"overlay_diff_template"`                         // source of the cold-boot writable ext4 upper
+	WorkspaceDiffTemplate string  `yaml:"workspace_diff_template,omitempty" json:"workspace_diff_template,omitempty"` // default source for an explicitly requested workspace disk
+	Kernel                string  `yaml:"kernel" json:"kernel"`                                                       // vmlinux path
+	Cmdline               *string `yaml:"cmdline,omitempty" json:"cmdline,omitempty"`                                 // extra kernel parameters: nil inherits, empty clears
+	Runtime               string  `yaml:"runtime" json:"runtime"`                                                     // guest runtime erofs
+	OverlayDiffTemplate   string  `yaml:"overlay_diff_template" json:"overlay_diff_template"`                         // source of the cold-boot writable ext4 upper
 }
 
 // BuilderConfig is the build-instance settings. Durable registration/execution

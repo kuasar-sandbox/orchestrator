@@ -296,9 +296,20 @@ The following table owns shared node-service fields. Capability-specific configu
 | `units.pool_wait_timeout` | `5s` | Positive budget from StartUnit through entry into WaitAssignment; timeout cleans that RunID and replenishes the pool |
 | `units.install` | `true` | False delegates unit installation to operations |
 | `sandbox.boot.kernel` | — | vmlinux path |
+| `sandbox.boot.cmdline` | Absent | Extra kernel parameters paired with `kernel` for sandbox and builder cold starts. Absent inherits the source artifact's extras (empty without a source); `""` clears them; a nonempty string replaces them. Memory restore retains captured parameters |
 | `sandbox.boot.runtime` | — | Single guest runtime Bundle: offset-zero EROFS plus digest-marker ZIP, containing envd and flatten-ctl ([Guest profiles: envd and the toolchain](#guest-runtime)) |
 | `sandbox.boot.overlay_diff_template` | — | Template reference for a fresh cold-boot writable ext4 upper. For example, `mkfs://ext4?size=1GiB` generates an empty filesystem. Restore obtains its disk graph from the captured artifacts |
 | `sandbox.boot.workspace_diff_template` | Optional | Template reference selected only by an explicit workspace `disk:{}` request. If absent, the request needs an existing unbound fixed slot from which to obtain capacity. It does not inherit `overlay_diff_template`; see [Workspace storage](sandbox-lifecycle.md#workspace-storage) |
+
+**Kernel parameters.** Select `sandbox.boot.cmdline` alongside `sandbox.boot.kernel`,
+for example `cmdline: "loglevel=4 printk.time=1"`. The selected extras are appended
+after sandboxer's automatic boot parameters without splitting, deduplication or
+shell expansion. Repeated options follow their individual kernel semantics.
+Sandboxer manages `init`, `root`, `rootfstype`, `rootflags`, `console` and
+`sandbox.root.layout`; leave these to its boot configuration. Cold starts from
+existing Sandbox artifacts and every builder cold-start phase use the same
+three-state selection. New artifacts retain the selected extras with the kernel
+identity; changes do not alter an existing memory snapshot's running kernel.
 
 <a id="diff-template-references"></a>
 

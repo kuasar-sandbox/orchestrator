@@ -362,6 +362,7 @@ type Params struct {
 	ArtifactDisks  types.ArtifactDiskTopology // task-projected shape for host-owned active bindings
 	Runtime        string                     // erofs path (file path, no scheme)
 	Kernel         string                     // vmlinux path
+	Cmdline        *string                    // extras paired with Kernel; nil inherits, empty clears
 	OverlayDiffTpl string                     // template URI or legacy host path for the cold-boot ext4 upper
 	TapFD          TapFD
 	EnvVars        map[string]string        // create-time launch env
@@ -414,6 +415,13 @@ type hostBootConfig struct {
 	Disks   []hostActiveDiskConfig `yaml:"disks,omitempty"`
 }
 
+// Only cold starts can select new parameters for the chosen kernel. Keep them
+// out of the boot type shared with memory restore.
+type coldHostBootConfig struct {
+	hostBootConfig `yaml:",inline"`
+	Cmdline        *string `yaml:"cmdline,omitempty"`
+}
+
 // SandboxHostConfig is the presence-aware host/instance document for
 // sandbox-ctl run --from. Its root/disk DTOs can express only host-owned active
 // diff fields plus the artifact-projected name/order/topology; immutable graph
@@ -422,7 +430,7 @@ type SandboxHostConfig struct {
 	Resources      rtconfig.ResourcesConfig `yaml:"resources"`
 	Usage          rtconfig.UsageConfig     `yaml:"usage"`
 	Network        rtconfig.NetworkConfig   `yaml:"network"`
-	Boot           hostBootConfig           `yaml:"boot"`
+	Boot           coldHostBootConfig       `yaml:"boot"`
 	Restore        rtconfig.RestoreConfig   `yaml:"restore,omitempty"`
 	Timeouts       rtconfig.TimeoutsConfig  `yaml:"timeouts,omitempty"`
 	Launch         map[string]any           `yaml:"launch,omitempty"`
@@ -497,6 +505,9 @@ func (p Params) buildImageColdConfig() (*rtconfig.SandboxConfig, error) {
 
 	// --- boot ---
 	c.Boot.Kernel = "file://" + p.Kernel
+	if p.Cmdline != nil {
+		c.Boot.Cmdline = *p.Cmdline
+	}
 	c.Boot.Runtime = "file://" + p.Runtime
 	c.Boot.Root.Overlay = &rtconfig.OverlayConfig{}
 	// boot.root.base is the read-only rootfs. Cold boot (img) = the flattened image
@@ -564,7 +575,7 @@ func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
 		Timeouts:       p.Timeouts,
 		Usage:          usage,
 		Network:        p.buildRuntimeNetwork(),
-		Boot:           boot,
+		Boot:           coldHostBootConfig{hostBootConfig: boot, Cmdline: p.Cmdline},
 		Restore:        rtconfig.RestoreConfig{Prefetch: p.Spec.Restore.Prefetch},
 		EphemeralFiles: guestFiles(p.Network.Hostname, p.Network.DNS),
 	}

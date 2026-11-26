@@ -1392,11 +1392,12 @@ preparation 不得替换已导入或已持久保存的 E.
 - `ImageColdConfig`:用于 `run --config`;可包含 image root、writable diff template、launch/env/files、
   mounts/init/plugin、resources/network/metadata。
 - `SandboxHostConfig`:用于 `run --from E --config`;只声明 `ApplyFromRules` 允许的 host/instance 字段,
-  包括 kernel/runtime 实际 binding、active diff binding、resource controller/host policy、network provider
+  包括 kernel/runtime 实际 binding、可选的节点 cmdline、active diff binding、resource controller/host policy、network provider
   和实例 IP/MAC/hostname、timeout、允许的 persistent override、`ephemeral_files`、
-  `launch.ephemeral_env`。它不能声明 immutable root/data disk graph。paused E 或 S+cold 时 E 的 C0
-  权威,不重放 row 中旧 launch/env/files;只有 fresh `KindSbx` Create 可有意提交 create-time persistent
-  override。
+  `launch.ephemeral_env`。它不能声明 immutable root/data disk graph。每次冷启动都可与目标 kernel
+  一起选择 cmdline：未配置继承 E，显式字符串（包括空字符串）替换新 C0 中的额外参数。
+  paused E 或 S+cold 保留 E 的工作负载配置，不重放 row 中旧 launch/env/files；只有 fresh
+  `KindSbx` Create 可有意提交当前工作负载 override。
 - `SnapshotHostConfig`:用于 `run --restore S --config`;renderer 输出 `ApplyRestoreRules` 允许的 runtime 候选、
   active diff、resource controller/allocatable、network provider/实例字段、restore policy 和 timeout。
   renderer 清空并省略 kernel binding，因为运行中的 guest kernel 已保存在 S 中。

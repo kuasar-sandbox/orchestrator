@@ -134,6 +134,9 @@ func (p *buildPipeline) importYAML() (map[string]any, error) {
 		},
 		"launch": map[string]any{"systemd": "off", "placeholder": true},
 	}
+	if s.BootCmdline != nil {
+		doc["boot"].(map[string]any)["cmdline"] = *s.BootCmdline
+	}
 	files := p.dnsFiles()
 	tlsFiles, err := p.flattenConfigFiles()
 	if err != nil {
@@ -168,6 +171,9 @@ func (p *buildPipeline) stepsYAML(plan []workspace.Prepared) (map[string]any, er
 	boot := map[string]any{
 		"kernel": "file://" + s.Paths.Kernel, "runtime": "file://" + s.Paths.Runtime,
 		"root": p.rootDoc(template),
+	}
+	if s.BootCmdline != nil {
+		boot["cmdline"] = *s.BootCmdline
 	}
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
@@ -243,6 +249,9 @@ func (p *buildPipeline) sourceStepsYAML() (map[string]any, error) {
 			"user": "0:0", "restart": "always", "cgroup_control": true,
 			"placeholder": false, "pid_namespace": "shared", "stop_signal": "", "stop_grace_period": "", "start_timeout": "",
 		},
+	}
+	if s.BootCmdline != nil {
+		doc["boot"].(map[string]any)["cmdline"] = *s.BootCmdline
 	}
 	if s.SourceSandboxConfig != nil {
 		// --from protects disk projections. flatten --skip-mounts excludes

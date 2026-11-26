@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -579,6 +580,8 @@ type nodeStub struct {
 	cancel    context.CancelFunc
 	pw        *io.PipeWriter
 	resp      *http.Response
+	readDone  chan struct{}
+	closeOnce sync.Once
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
@@ -619,7 +622,10 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, apiEndpoint, d
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		stub.close()
+		_ = db.Close()
+	})
 	stub.groupDB = db
 	stub.groupCore = orch.New(&config.Config{}, db, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	stub.write(t, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
@@ -651,11 +657,15 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, apiEndpoint, d
 	stub.write(t, &routesync.Msg{Type: routesync.TypeBuildSyncEnd})
 	stub.write(t, &routesync.Msg{Type: routesync.TypeGroupBegin, Group: &routesync.GroupReport{SyncID: "initial", Sequence: 0}})
 	stub.write(t, &routesync.Msg{Type: routesync.TypeGroupEnd, Group: &routesync.GroupReport{SyncID: "initial", Sequence: 0}})
+	// Leave readDone nil until startup succeeds so cleanup cannot wait for an
+	// unstarted loop after an earlier Fatal.
+	stub.readDone = make(chan struct{})
 	go stub.readLoop()
 	return stub
 }
 
 func (n *nodeStub) readLoop() {
+	defer close(n.readDone)
 	for {
 		m, err := routesync.ReadMsg(n.resp.Body)
 		if err != nil {
@@ -681,6 +691,9 @@ func (n *nodeStub) readLoop() {
 			if cmd.Kind == routesync.CmdGroupPut && ack.Status == routesync.AckAccepted && ack.GroupResult.Version != *cmd.Group.ExpectedVersion {
 				support, err := n.groupDB.GroupSupport(n.ctx, cmd.Group.Group)
 				if err != nil {
+					if ctxErr := n.ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+						return
+					}
 					n.t.Errorf("Group support: %v", err)
 					return
 				}
@@ -690,6 +703,9 @@ func (n *nodeStub) readLoop() {
 		}
 		if cmd.Kind == routesync.CmdCreate && cmd.TemplateRef == "" {
 			detail, _, err := n.groupDB.GroupAdmit(n.ctx, cmd.GroupAPIKey, cmd.Cluster.Group, cmd.ExpectedGroupVersion)
+			if ctxErr := n.ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				return
+			}
 			if err != nil || detail.Context.TemplateID == nil {
 				n.t.Errorf("Group input: %v", err)
 				return
@@ -840,9 +856,14 @@ func (n *nodeStub) write(t *testing.T, msg *routesync.Msg) {
 }
 
 func (n *nodeStub) close() {
-	n.cancel()
-	_ = n.pw.Close()
-	if n.resp != nil {
-		_ = n.resp.Body.Close()
-	}
+	n.closeOnce.Do(func() {
+		n.cancel()
+		_ = n.pw.Close()
+		if n.resp != nil {
+			_ = n.resp.Body.Close()
+		}
+		if n.readDone != nil {
+			<-n.readDone
+		}
+	})
 }

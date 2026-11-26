@@ -18,12 +18,14 @@ const (
 
 // BuildColdParams is the shared cold-config projection used by both a
 // top-level Sandbox E target and the initial C0 of a memory target. Source is
-// a task-local E and contributes only portable non-boot defaults.
+// a task-local E and contributes portable non-boot defaults plus its cmdline
+// when the node has not selected one.
 type BuildColdParams struct {
 	Profile          types.Profile
 	ImageRef         string
 	Source           *rtconfig.PortableSandboxConfig
 	Kernel           string
+	Cmdline          *string
 	Runtime          string
 	OverlayDiffTpl   string
 	TapFD            TapFD
@@ -57,7 +59,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	ordinary := Params{
 		Sandbox:  fake,
 		Template: types.TemplateID{Profile: p.Profile, Kind: types.KindImg, Ref: p.ImageRef},
-		Runtime:  p.Runtime, Kernel: p.Kernel, OverlayDiffTpl: p.OverlayDiffTpl,
+		Runtime:  p.Runtime, Kernel: p.Kernel, Cmdline: p.Cmdline, OverlayDiffTpl: p.OverlayDiffTpl,
 		TapFD: p.TapFD, EnvVars: p.EnvVars, Resources: p.Resources,
 		Timeouts: p.Timeouts,
 		Network:  p.Network, MMDSEnabled: p.MMDSEnabled, Spec: p.Spec,
@@ -72,6 +74,9 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	}
 	if err := p.Source.Validate(); err != nil {
 		return nil, fmt.Errorf("sandboxcfg: build source E: %w", err)
+	}
+	if p.Cmdline == nil {
+		projected.Boot.Cmdline = p.Source.Boot.Cmdline
 	}
 	captured := workspace.Captured(p.Source)
 	if len(p.Source.Boot.Disks) > 0 && len(captured) == 0 || len(p.Spec.WorkspacePlan) < len(captured) {

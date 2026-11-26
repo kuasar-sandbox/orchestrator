@@ -290,6 +290,7 @@ type BuildSpec struct {
 	ReadyCmd                    string                    `json:"ready_cmd,omitempty"`
 	Env                         map[string]string         `json:"env,omitempty"` // run-builder local only after merging authenticated BuildTaskSpec.Env
 	Paths                       BuildPaths                `json:"paths"`
+	BootCmdline                 *string                   `json:"boot_cmdline,omitempty"`
 	Net                         BuildNet                  `json:"net"`
 	TemplateNetwork             sandboxcfg.NetworkSpec    `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
 	Resources                   rtconfig.ResourcesConfig  `json:"resources"`        // A/B execution resources
