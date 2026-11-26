@@ -141,7 +141,8 @@ class EnvironmentTools(unittest.TestCase):
             consumer.parent.mkdir(parents=True)
             consumer.write_text('test "$GOWORK" = "$HOME/selected.go.work"\n')
             selected_program = program.replace("/inputs/release/.ci/component-packaging", str(root / "tooling"))
-            (root / "orchestrator").mkdir()
+            version_marker = root / "orchestrator/internal/version/version.go"
+            version_marker.parent.mkdir(parents=True)
             tools.mkdir()
             scripts.mkdir(parents=True)
             workspace_command = (
@@ -185,31 +186,36 @@ class EnvironmentTools(unittest.TestCase):
             observed = root / "observed"
             calls = root / "calls"
             for arch in ("x86_64", "aarch64"):
-                with self.subTest(arch=arch):
-                    observed.unlink(missing_ok=True)
-                    calls.unlink(missing_ok=True)
-                    # Workbench does not inherit the release job's host env.
-                    environment = {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                   "HOME": str(root), "TARGET_ARCH": arch,
-                                   "OBSERVED": str(observed), "CALLS": str(calls)}
-                    result = subprocess.run([shutil.which("bash"), "-euo", "pipefail", "-c", selected_program],
-                                            cwd=root, env=environment, text=True, capture_output=True, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(calls.read_text().splitlines(), [
-                        "python3|" + "|".join(workspace_command.split()),
-                        *(["make|test", "make|vet"] if arch == "x86_64" else []),
-                        "make|build",
-                        "python3|" + "|".join(native_command.split()),
-                        "make|test-cluster-native",
-                    ])
-                    self.assertEqual(observed.read_text().splitlines(), [
-                        "|".join((operation, values["version"], arch, values["accelerator_version"],
-                                  values["connector_version"], values["sandboxer_version"], values["runtime_version"]))
-                        for operation in ("package", "validate")])
-                    for rejected in (workspace_command + " unexpected", native_command + " unexpected"):
-                        result = subprocess.run([tools / "python3", *rejected.split()],
-                                                env=environment, text=True, capture_output=True, timeout=10)
-                        self.assertEqual(result.returncode, 98, result.stderr)
+                for versioned in (False, True):
+                    version_marker.unlink(missing_ok=True)
+                    if versioned:
+                        version_marker.touch()
+                    with self.subTest(arch=arch, versioned=versioned):
+                        observed.unlink(missing_ok=True)
+                        calls.unlink(missing_ok=True)
+                        # Workbench does not inherit the release job's host env.
+                        environment = {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                       "HOME": str(root), "TARGET_ARCH": arch,
+                                       "OBSERVED": str(observed), "CALLS": str(calls)}
+                        result = subprocess.run([shutil.which("bash"), "-euo", "pipefail", "-c", selected_program],
+                                                cwd=root, env=environment, text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(calls.read_text().splitlines(), [
+                            "python3|" + "|".join(workspace_command.split()),
+                            *(["make|test", "make|vet"] if arch == "x86_64" else []),
+                            "make|build|BUILD_VERSION=" + values["version"],
+                            *(["make|check-version|BUILD_VERSION=" + values["version"]] if versioned else []),
+                            "python3|" + "|".join(native_command.split()),
+                            "make|test-cluster-native",
+                        ])
+                        self.assertEqual(observed.read_text().splitlines(), [
+                            "|".join((operation, values["version"], arch, values["accelerator_version"],
+                                      values["connector_version"], values["sandboxer_version"], values["runtime_version"]))
+                            for operation in ("package", "validate")])
+                        for rejected in (workspace_command + " unexpected", native_command + " unexpected"):
+                            result = subprocess.run([tools / "python3", *rejected.split()],
+                                                    env=environment, text=True, capture_output=True, timeout=10)
+                            self.assertEqual(result.returncode, 98, result.stderr)
 
 
 if __name__ == "__main__":

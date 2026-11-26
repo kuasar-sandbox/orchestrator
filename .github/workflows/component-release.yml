@@ -329,7 +329,8 @@ jobs:
             # after downloading and checking their SHA256 against the repo lock.
             command -v cc
             command -v readelf
-            make build
+            make build BUILD_VERSION='${{ needs.preflight.outputs.version }}'
+            if [ -f internal/version/version.go ]; then make check-version BUILD_VERSION='${{ needs.preflight.outputs.version }}'; fi
             python3 -B scripts/with-test-fdb.py -- make test-cluster-native
             VERSION='${{ needs.preflight.outputs.version }}'
             [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]

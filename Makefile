@@ -32,6 +32,12 @@ endif
 
 GO             := go
 GO_BUILD_FLAGS := -trimpath
+# Version is explicitly supplied by release builds; ordinary builds are dev.
+BUILD_VERSION ?= dev
+VERSION_TAG := $(shell git tag --points-at HEAD --list 'v[0-9]*' --sort=refname 2>/dev/null | \
+	grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$$' | \
+	awk -v preferred="$(BUILD_VERSION)" 'NR == 1 { first = $$0 } $$0 == preferred { exact = $$0 } END { print (exact != "" ? exact : first) }')
+VERSION_LDFLAGS := -X github.com/kuasar-sandbox/orchestrator/internal/version.releaseVersion=$(BUILD_VERSION) -X github.com/kuasar-sandbox/orchestrator/internal/version.gitTag=$(VERSION_TAG)
 BINDIR         := bin/$(TARGET_ARCH)
 
 define link_bin
@@ -50,14 +56,14 @@ build-core: node-ctl node-stub-ctl e2b-key-ctl
 # e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
 	@mkdir -p "$(BINDIR)"
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/e2b-key-ctl" ./cmd/e2b-key-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -o "$(BINDIR)/e2b-key-ctl" ./cmd/e2b-key-ctl
 	$(call link_bin,e2b-key-ctl)
 
 # node-ctl: the node executable — e2b-compatible conductor (serve), independent
 # data plane (proxy), telemetry, sandbox/build runners, and resource controller.
 node-ctl:
 	@mkdir -p "$(BINDIR)"
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-ctl" ./cmd/node-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -o "$(BINDIR)/node-ctl" ./cmd/node-ctl
 	$(call link_bin,node-ctl)
 
 # cluster-ctl: the cluster control plane (registry / router / placer, cluster.md).
@@ -67,7 +73,7 @@ prepare-cluster-native:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/cluster-native.py prepare --arch "$(TARGET_ARCH)"
 
 build-cluster-native:
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/cluster-native.py build --arch "$(TARGET_ARCH)" --output "$(BINDIR)" --go "$(GO)" -- $(GO_BUILD_FLAGS)
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/cluster-native.py build --arch "$(TARGET_ARCH)" --output "$(BINDIR)" --go "$(GO)" -- $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)'
 	$(call link_bin,cluster-ctl)
 	$(call link_bin,run-cluster-ctl)
 
@@ -80,7 +86,7 @@ test-cluster-native:
 # control-plane behavior without launching microVMs.
 node-stub-ctl:
 	@mkdir -p "$(BINDIR)"
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-stub-ctl" ./cmd/node-stub-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -o "$(BINDIR)/node-stub-ctl" ./cmd/node-stub-ctl
 	$(call link_bin,node-stub-ctl)
 
 test: test-core
@@ -130,7 +136,7 @@ release:
 	runtime_tag="$(RUNTIME_VERSION)"; \
 	workspace="$$(python3 -B "$(KUASAR_PLATFORM_DIR)/ci/integration/go_workspace.py" \
 		--root .. --owners orchestrator --version "$(VERSION)" --dependency-tag "accelerator=$$accelerator_tag" --dependency-tag "connector=$$connector_tag" --dependency-tag "sandboxer=$$sandboxer_tag" --dependency-tag "guest-runtime=$$runtime_tag")"; \
-	$(release_make) build GOWORK="$$workspace" BINDIR="$(abspath $(BINDIR))"; \
+	$(release_make) build GOWORK="$$workspace" BUILD_VERSION="$(VERSION)" BINDIR="$(abspath $(BINDIR))"; \
 	rm -rf "build/release-bundle"; \
 	GOWORK="$$workspace" RELEASE_BIN_DIR="$(abspath $(BINDIR))" \
 	RELEASE_SOURCE_ROOT="$(CURDIR)" \
@@ -162,3 +168,19 @@ help:
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
+
+.PHONY: check-version
+# Verify the newly built clean release binaries on their native architecture.
+check-version:
+	@test "$(HOST_ARCH)" = "$(TARGET_ARCH)"
+	@set -e; source="$(VERSION_TAG)"; \
+	if [ -z "$$source" ]; then source="$$(git rev-parse HEAD | cut -c1-12)"; fi; \
+	for name in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do \
+	  binary="$(BINDIR)/$$name"; \
+	  if [ "$$name" = cluster-ctl ]; then binary="$(BINDIR)/run-cluster-ctl"; fi; \
+	  actual="$$("$$binary" --version)"; \
+	  rc=0; "$$binary" --version unexpected >/dev/null 2>&1 || rc=$$?; \
+	  if [ "$$rc" -ne 2 ]; then echo "$$name accepted extra version arguments" >&2; exit 1; fi; \
+	  expected="$$name $(BUILD_VERSION) ($$source)"; \
+	  if [ "$$actual" != "$$expected" ]; then printf 'expected %s, got %s\n' "$$expected" "$$actual" >&2; exit 1; fi; \
+	done
