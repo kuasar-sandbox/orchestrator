@@ -2228,6 +2228,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			FlattenCtl:     o.executables.FlattenCtl(),
 			ManifestConfig: o.cfg.ManifestConfig,
 		},
+		BootCmdline: o.cfg.Sandbox.Boot.Cmdline,
 		Net: configsock.BuildNet{
 			TapFD:    buildTapFD(pend.tapFD),
 			MAC:      pend.mac,

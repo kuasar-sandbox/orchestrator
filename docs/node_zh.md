@@ -391,9 +391,18 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
+| `sandbox.boot.cmdline` | 缺省 | 与 `kernel` 配套的额外内核参数，用于沙箱及 builder 冷启动。未配置继承来源制品的额外参数（无来源时为空）；`""` 清除；非空字符串替换。内存恢复保留捕获时的参数 |
 | `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl([guest profile:envd 与工具链](#guest-runtime)) |
 | `sandbox.boot.overlay_diff_template` | – | 冷启动新建 ext4 可写 upper 使用的模板引用。例如 `mkfs://ext4?size=1GiB` 自动生成空文件系统。恢复使用捕获制品中的磁盘图 |
 | `sandbox.boot.workspace_diff_template` | 可选 | 仅显式 workspace `disk:{}` 请求选择的模板引用。缺省时，请求需要从已有未绑定固定 slot 取得容量；不继承 `overlay_diff_template`。见 [Workspace 存储](sandbox-lifecycle_zh.md#workspace-storage) |
+
+**内核参数。** 配置 `sandbox.boot.kernel` 时，可同时通过 `sandbox.boot.cmdline`
+选择配套参数，例如 `cmdline: "loglevel=4 printk.time=1"`。选定的额外参数追加到
+sandboxer 自动生成的启动参数之后，保留顺序和引号，不拆分、去重或做 shell 展开；
+重复参数遵循各自的内核语义。`init`、`root`、`rootfstype`、`rootflags`、`console`
+和 `sandbox.root.layout` 由 sandboxer 的启动配置管理。从已有 Sandbox 制品冷启动
+以及 builder 各冷启动阶段都采用同一三态规则；新制品将选定的额外参数与内核身份
+一起保存。修改节点配置不会改变已有内存快照中已经运行的内核及其参数。
 
 <a id="diff-template-references"></a>
 

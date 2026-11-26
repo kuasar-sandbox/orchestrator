@@ -214,6 +214,7 @@ func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {
 	cfg, err := (sandboxcfg.BuildColdParams{
 		Profile: p.profile, ImageRef: p.baseRef, Source: p.spec.SourceSandboxConfig,
 		Kernel: p.spec.Paths.Kernel, Runtime: p.spec.Paths.Runtime,
+		Cmdline:        p.spec.BootCmdline,
 		OverlayDiffTpl: p.spec.Paths.OverlayDiffTpl,
 		TapFD: sandboxcfg.TapFD{
 			Exec: append([]string(nil), p.spec.Net.TapFD.Exec...), Socket: p.spec.Net.TapFD.Socket,
