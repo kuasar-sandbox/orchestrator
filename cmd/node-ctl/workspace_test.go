@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
 func TestWorkspaceCLIUsesControlSocketAndPipesToken(t *testing.T) {
@@ -30,7 +33,9 @@ func TestWorkspaceCLIUsesControlSocketAndPipesToken(t *testing.T) {
 			if r.Method != "POST" || r.URL.Query().Get("name") != "project" {
 				t.Error("bad export")
 			}
-			out, _ := json.Marshal(map[string]string{"token": token})
+			out, _ := json.Marshal(types.WorkspaceExportResult{Result: token, DiskReport: artifact.DiskReport{
+				Refs: true, DiskRefs: []string{"manifest://" + strings.Repeat("a", 64)}, RemovedRefs: []string{},
+			}})
 			w.Write(out)
 		case "/sandboxes/B/workspaces/attach":
 			body, err := io.ReadAll(r.Body)
@@ -106,5 +111,46 @@ func TestWorkspaceCLIRestrictsInput(t *testing.T) {
 		if err := workspaceCmd(args); err == nil || strings.Contains(fmt.Sprint(err), "reach orchestrator") {
 			t.Errorf("invalid args reached server: %v, %v", args, err)
 		}
+	}
+}
+
+func TestWorkspaceCLIJSONMatchesAPIReport(t *testing.T) {
+	t.Setenv("E2B_API_KEY", "owner")
+	root := "manifest://" + strings.Repeat("a", 64)
+	valid := `{"result":"kwt1.test","refs":true,"diskRefs":["` + root + `"],"removedRefs":[]}`
+	for _, test := range []struct {
+		name, body string
+		bad        bool
+	}{
+		{"complete", valid, false},
+		{"legacy token envelope", `{"token":"kwt1.test"}`, true},
+		{"unknown with delta", `{"result":"kwt1.test","refs":false,"removedRefs":[]}`, true},
+		{"diskRef", strings.Replace(valid, `"diskRefs":`, `"diskRef":"`+root+`","diskRefs":`, 1), true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "ctl.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, test.body) })}
+			go server.Serve(listener)
+			defer server.Close()
+			out, err := captureStdout(t, func() error {
+				return workspaceCmd([]string{"export", "A", "--name", "project", "--json", "--socket", socket})
+			})
+			if (err != nil) != test.bad {
+				t.Fatalf("output=%q err=%v", out, err)
+			}
+			if test.bad {
+				if out != "" {
+					t.Fatalf("failed command emitted output: %s", out)
+				}
+				return
+			}
+			if out != valid+"\n" {
+				t.Fatalf("CLI changed report: %s", out)
+			}
+		})
 	}
 }

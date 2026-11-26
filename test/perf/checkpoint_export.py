@@ -37,8 +37,24 @@ def unique_object(pairs):
 
 def validate_response(raw):
     result = json.loads(raw, object_pairs_hook=unique_object)
-    required = {"result", "sandboxRef", "removedRefs"}
-    if not isinstance(result, dict) or set(result) not in (required, required | {"snapshotRef"}):
+    if not isinstance(result, dict):
+        raise ValueError("unexpected export response fields")
+    required = {"result", "sandboxRef"}
+    groups = {"sandboxRefs": "sandboxRef"}
+    if "snapshotRef" in result:
+        required.add("snapshotRef")
+        groups["snapshotRefs"] = "snapshotRef"
+    legacy = "refs" not in result
+    if legacy:
+        required.add("removedRefs")
+    else:
+        if type(result["refs"]) is not bool:
+            raise ValueError("refs must be a boolean")
+        required.add("refs")
+        if result["refs"]:
+            required.update(groups)
+            required.add("removedRefs")
+    if set(result) != required:
         raise ValueError("unexpected export response fields")
     root = result.get("snapshotRef", result["sandboxRef"])
     # The measurement fixture publishes to its manifest store. A local file
@@ -50,12 +66,29 @@ def validate_response(raw):
     template = "e2b-" + kind + "-" + base64.urlsafe_b64encode(root.encode()).decode().rstrip("=")
     if result["result"] != template:
         raise ValueError("export template does not match its publication root")
-    removed = result["removedRefs"]
-    if not isinstance(removed, list) or any(not isinstance(ref, str) or not ref or ref.strip() != ref
-                                          or any(ord(char) < 32 for char in ref) for ref in removed):
-        raise ValueError("invalid removedRefs array")
-    if removed != sorted(set(removed)) or result["sandboxRef"] in removed or root in removed:
-        raise ValueError("removedRefs must be sorted, unique, and exclude final roots")
+    def reference_set(field):
+        refs = result[field]
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref or ref.strip() != ref
+                                            or any(ord(char) < 32 for char in ref) for ref in refs):
+            raise ValueError("invalid " + field + " array")
+        if refs != sorted(set(refs)):
+            raise ValueError(field + " must be sorted and unique")
+        return set(refs)
+
+    final_refs = {result["sandboxRef"], root}
+    if result.get("refs") is True:
+        for group, field in groups.items():
+            refs = reference_set(group)
+            if result[field] not in refs:
+                raise ValueError(group + " must include its final root")
+            final_refs.update(refs)
+    if legacy or result["refs"]:
+        if reference_set("removedRefs") & final_refs:
+            raise ValueError("removedRefs must exclude final references")
+    if legacy:
+        # A legacy difference cannot establish a complete dependency set.
+        result.pop("removedRefs")
+        result["refs"] = False
     return result
 
 
