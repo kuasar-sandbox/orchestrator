@@ -25,11 +25,17 @@ REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
 bash test/source/resource_pool_units.sh
 bash test/source/capture_cli.sh
 bash test/source/cluster_fixture_configs.sh
-REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
-CLUSTER_STUB_BACKEND=sqlite REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+# All 13 topology cases keep private databases and fault state. Only immutable
+# CLI bytes are reused, inside this invocation's exact source/dependency workspace.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+BIN="$work/cluster-native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
+BIN="$work/cluster-pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
+BIN="$work/cluster-native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_PREBUILT=1 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+BIN="$work/cluster-pure" CLUSTER_STUB_PREBUILT=1 CLUSTER_STUB_BACKEND=sqlite REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
 # Provision real PostgreSQL explicitly: these backend contracts must never
 # silently skip because the DSN was absent from the required source gate.
-bash scripts/with-test-postgres.sh -- bash -euc '
+BIN="$work/cluster-pure" CLUSTER_STUB_PREBUILT=1 bash scripts/with-test-postgres.sh -- bash -euc '
     test -n "$STORAGE_TEST_POSTGRES_DSN"
     CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m \
         ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry
@@ -40,8 +46,6 @@ bash test/source/telemetry_backends.sh
 # prepared product E2E runner. Discover the maintained helper tests as one set so
 # execute/resource/cluster/capture regressions cannot disappear during cutover.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/e2e/lib -p 'test_*.py' -v
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
 bash scripts/ci-e2e-build.sh source "$(uname -m)" "$work"
 telemetry_privilege=()
 if [ "$(id -u)" -ne 0 ]; then telemetry_privilege=(sudo -n); fi
