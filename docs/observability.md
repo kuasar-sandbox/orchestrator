@@ -8,6 +8,32 @@ Choose an observation surface by its ownership and precision. Journal output, na
 
 **Read by task:** [Choose a surface](#observation-surfaces) · [Current stats](#native-stats-api) · [Exact usage](#native-usage) · [Logs](#logs) · [Telemetry](#telemetry) · [Configure Telemetry](#telemetry-configuration)
 
+<a id="diagnose-a-request"></a>
+
+## Diagnose a request in order
+
+Retain the SandboxID or BuildID, operation, response and installed version. For a cluster also retain Group and the current Node target. Start with read-only observations so an inspection does not unintentionally wake a paused sandbox.
+
+| Symptom or question | First observation | Next decision |
+|---|---|---|
+| Create/Connect was accepted, but commands are unavailable | `GET /sandboxes/{id}` and its state/execution result | `starting` needs readiness/admission diagnosis; `dead` needs the recorded failure and retention decision |
+| New work waits or capacity appears exhausted | [Resource status, list and pressure](node-resource.md#operate-resources) | Identify the pool, reservation, startup or recovery constraint before changing budgets |
+| API works but guest commands/files do not | [Client data-path check](node-proxy.md#connect-a-client), Proxy/guest logs and `/stats/traffic` | Verify the actual data endpoint, authorization and readiness; API success alone is insufficient |
+| Build appears stuck or the client timed out | Status for the saved transient TemplateID and BuildID; `node-ctl builder status` | Inspect the current phase and cleanup intent, then cancel/delete using the existing handles if needed |
+| Current sandbox memory/CPU or traffic | `/sandboxes/{id}/stats/resource` and `/stats/traffic` | Use valid observed fields; unavailable fields are not zero and reading does not wake the guest |
+| Cumulative accounting | `/sandboxes/{id}/stats/usage` | Keep exact integer accounting and its checkpoint/retention semantics; do not substitute sampled metric sums |
+| Historical metrics are missing | Telemetry service/configuration and `/sandboxes/{id}/metrics` | Confirm collection, local/remote writes and the chosen query backend separately |
+| Cluster default Create has no eligible Node | `run-cluster-ctl status` for the Group and each Node | Compare publication revision, registration and eligibility as in [first cluster](cluster.md#minimum-cluster) |
+
+The API observations use the owning tenant key, and cluster requests also carry the Group. For logs on the responsible host, use the explicit identities rather than a broad search by guest process name:
+
+```sh
+journalctl KUASAR_SANDBOX_ID="$SANDBOX_ID"
+journalctl KUASAR_BUILD_ID="$BUILD_ID"
+```
+
+Narrow a sandbox investigation to `KUASAR_RUN_ID` when an identity has multiple executions, or query `KUASAR_STABLE_ID` when following an identity-preserving move. The [journal contract](#logs) explains which output carries each field and its delivery limits. Native current stats and usage remain available independently of Telemetry where their runtime/retained data exists; Telemetry failure is not evidence that the Sandbox lifecycle failed.
+
 <a id="observation-surfaces"></a>
 
 ## Observation surfaces

@@ -1,5 +1,7 @@
 # Group support repository foundation
 
+Implementation reference for GroupSupport publication. For current setup and operator checks, use [cluster operations](cluster.md#minimum-cluster) and [publication diagnostics](cluster.md#groups-and-placement). This foundation does not add a deployment step or a feature switch.
+
 This is the shared metadata foundation for [proposal
 #570](https://github.com/kuasar-sandbox/orchestrator/issues/570). The typed
 repository uses the existing record/short-transaction layer. No storage driver

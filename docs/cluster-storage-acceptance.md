@@ -1,5 +1,7 @@
 # Storage refactor acceptance, 2026-11-22
 
+Historical acceptance evidence at the source revisions and environments recorded below. Use [cluster metadata storage](cluster-storage.md) for current deployment and recovery. Measurements and delivery receipts here do not describe every later release.
+
 This report covers the storage replacement and shared storage stages of
 [proposal #566](https://github.com/kuasar-sandbox/orchestrator/issues/566) and
 orchestrator PR #563. The subsequent Node-owned Group/create-accept-close

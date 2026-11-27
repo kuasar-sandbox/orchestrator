@@ -1,5 +1,7 @@
 # Node Group internal foundation
 
+Implementation reference for Node Group persistence. For the supported user workflow, use [Group operations](cluster.md#groups-and-placement); no direct database editing is required.
+
 This document describes the local foundation of the Node-owned Group resource
 in [proposal #570](https://github.com/kuasar-sandbox/orchestrator/issues/570).
 HTTP/UDS and trusted NodeLink maintenance use this same transaction core;

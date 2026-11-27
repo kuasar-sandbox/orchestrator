@@ -4,186 +4,136 @@
 
 # orchestrator
 
-For the first cross-component sandbox or Demo, follow the project
-[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
-with the matching aggregate release and
-[workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md).
-This component can still be built/deployed independently; workbench is not a
-production runtime dependency. Published architectures are specific to the
-selected release; source support does not imply all historical assets exist.
+`orchestrator` provides the **E2B-compatible API, node services and multi-node control plane** for [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox). Use it to build templates, create and manage sandboxes, connect SDK clients, and operate a fleet of compute nodes.
 
-`orchestrator` is the **E2B-compatible node service and multi-node control plane** for [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox).
-
-It provides the northbound API, node-local lifecycle orchestration, data-plane proxy integration, tenant credentials, resource admission, and the Registry/Router/Placer control plane used to operate a cluster of Kuasar Sandbox nodes. The repository evolves and releases independently while participating in project-level cross-component validation and aggregate releases.
+For a first deployment, follow the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md): install a matching aggregate release with **node-infra**, verify a persistent standalone node, and build your own template. The aggregate release supplies compatible runtime, network, storage and orchestration components. Use this repository's guides for the operations and configuration below.
 
 <a id="documentation"></a>
 
-## Choose a capability
+## Recommended path
 
-The eight maintained topics below contain both operational usage and the complete capability contract. Public use appears before internal ownership and protocols. Each topic has matching English and Chinese editions. Cross-component installation and upgrade belong to the [main project](https://github.com/kuasar-sandbox/kuasar-sandbox); source contributions and component packaging belong to [CONTRIBUTING.md](CONTRIBUTING.md).
+| Your next task | Guide | Completion check |
+|---|---|---|
+| Install and start a persistent node | [Project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md), then [Node operation](docs/node.md#operate-a-node) | Conductor and Proxy are running; both client endpoints are reachable |
+| Build your application template | [Template Build](docs/node-build.md#client-workflow) | This Build is `ready`; retain its canonical TemplateID |
+| Run, pause and reconnect a sandbox | [Sandbox lifecycle](docs/sandbox-lifecycle.md#recommended-workflow) and [SDK access](docs/node-proxy.md#connect-a-client) | Commands and files work through the configured data endpoint |
+| Add outbound access or change network policy | [Project networking guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#native-egress) | The guest reaches only the intended destinations through the selected egress path |
+| Add a second compute node | [First cluster](docs/cluster.md#minimum-cluster) | Both Nodes publish the intended Group revision; the default template is eligible |
+| Diagnose capacity, traffic or failures | [Resources](docs/node-resource.md#operate-resources), [Observability](docs/observability.md#diagnose-a-request) | Inspect the original SandboxID/BuildID and the responsible service before retrying |
 
-| Topic | Contents |
+A template's canonical ID is an output of a successful Build, not an arbitrary image name. An accepted Create starts a lifecycle operation; it does not certify guest readiness. The guides explain what to wait for and which identifiers to retain.
+
+### Capability references
+
+Each topic owns its fields and behavior. User workflows appear first, followed by configuration, recovery and implementation contracts. English and Chinese editions cover the same capabilities.
+
+| Topic | Scope |
 |---|---|
-| [Node operation](docs/node.md) | Services, shared configuration, systemd pools, local channels and recovery |
-| [Sandbox lifecycle](docs/sandbox-lifecycle.md) | Create and identity, Pause/Resume, Reset/dead retention, Delete and migration |
-| [Template Build](docs/node-build.md) | Build API, request inputs, immutable artifacts, execution, publication and cancellation |
-| [Access and proxy](docs/node-proxy.md) | SDK access, credentials, exec, forwarding, MMDS, traffic admission and routesync |
-| [Resources and admission](docs/node-resource.md) | Capacity/startup policy, reservation, node pressure, recovery and resource protocols |
-| [Observability](docs/observability.md) | Journal output, native stats, lossless usage, OTLP metrics and history queries |
-| [Cluster control](docs/cluster.md) | Public ingress, Groups, role configuration, execution ownership, routing and recovery |
-| [Application extensions](docs/extensions.md) | Static App bootstrap, public Go contracts, object sources, hooks and wrappers |
+| [Node operation](docs/node.md) | Services, configuration, systemd workers, local channels and recovery |
+| [Sandbox lifecycle](docs/sandbox-lifecycle.md) | Create, Pause/Resume, workspace, Reset, Delete and migration |
+| [Template Build](docs/node-build.md) | Build inputs, target choice, canonical artifacts, cancellation and retention |
+| [Access and proxy](docs/node-proxy.md) | SDKs, credentials, native exec, forwarding, MMDS and traffic admission |
+| [Resources and admission](docs/node-resource.md) | Capacity, startup policy, resource pools, drain and pressure recovery |
+| [Observability](docs/observability.md) | Logs, current stats, exact usage, OTLP metrics and history queries |
+| [Cluster control](docs/cluster.md) | Registry/Router, Group publication, Node selection, routing and recovery |
+| [Application extensions](docs/extensions.md) | Custom Conductor/Proxy/Telemetry applications and public Go APIs |
 
 <a id="responsibilities"></a>
 
-## Responsibilities
+## Services and deployment choices
 
 <a id="standalone-node"></a>
 
 ### Standalone node
 
-`node-ctl` runs the compute-node services:
+A compute node runs **Conductor** for the API and lifecycle, and **Proxy** for sandbox data traffic. Add **Telemetry** when you need metric collection or historical queries. Conductor manages sandbox and Build workers through systemd; users operate the API or SDK, without launching `run-sandbox` or `run-builder` manually.
 
-- **Conductor** — authoritative control-plane API, sandbox and build lifecycle, node-local routing, credential management, and optional node resource admission;
-- **Proxy** — the single sandbox data ingress for Envd traffic, floating-IP services, native exec, MMDS, and traffic observation;
-- **Telemetry** — independent envd/native stats/OTLP collection, trusted sandbox identity, native Collector pipelines, optional local TSDB, separate remote writes and queries, and E2B/custom HTTP handlers;
-- **Node link** — an optional client that attaches the node to a cluster control plane;
-- **Launch helpers** — systemd-managed sandbox and build runners;
-- **Administration** — resource status/drain, template-build status, configuration inspection, manifest-key management, and sandbox export/import.
-
-A standalone deployment exposes an E2B-compatible API that can be used by the unmodified E2B SDK and CLI.
+A standalone node supports the documented E2B SDK/CLI workflows. Its API and data listeners are distinct. Configure both for development HTTP access, or use the deployment's TLS domain. [Access and proxy](docs/node-proxy.md#connect-a-client) explains these choices and the supported SDK versions.
 
 <a id="multi-node-cluster"></a>
 
 ### Multi-node cluster
 
-`cluster-ctl` runs three independent roles:
+Start with [one SQLite Registry, one Router and two Nodes](docs/cluster.md#minimum-cluster). Each Node retains its local lifecycle and complete Group context. Registry stores cluster metadata and chooses Nodes from their published Group support; Router provides the shared API and data ingress.
 
-- **Registry** — durable cluster metadata, Node selection and the node-channel hub;
-- **Router** — the cluster-wide E2B-compatible unified control- and data-plane ingress and stable-sandbox routing layer;
-- **Placer** — optional import and conditional maintenance of Node-owned Groups and credential leases. Registry selects Nodes from published support; Nodes own execution and resource admission.
-
-The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration. Start with [one SQLite Registry, one Router and two Nodes](docs/cluster.md#minimum-cluster); direct Group maintenance needs no Placer.
-
-<a id="security-and-multi-tenancy"></a>
-
-## Security and multi-tenancy
-
-The node and cluster paths keep platform credentials, content-protection keys, and scoped data-plane capabilities separate. API access, regular data forwarding, and native exec use purpose-specific credentials. Content-protection keys are not exposed to the guest.
-
-Node resource admission is also part of the multi-tenant boundary: the reservation controller owns node-wide admission, resource-pool accounting, grants, watermarks, and recovery. Per-sandbox cgroup, balloon, and VMM execution remains owned by `sandboxer`; the node controller does not take over the sandbox-internal resource loop.
-
-For security architecture and deployment trust boundaries, see the [project system overview](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/architecture.md) and [deployment guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md). Report vulnerabilities privately through the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy).
-
-<a id="main-commands"></a>
-
-## Main commands
-
-| Command | Purpose |
-| --- | --- |
-| `node-ctl conductor serve` | Start the authoritative node control-plane API |
-| `node-ctl proxy serve` | Start the node data-plane proxy master/worker |
-| `node-ctl telemetry serve` | Start sandbox metrics collection and history queries |
-| `node-ctl run-sandbox` | Launch one sandbox inside its managed unit |
-| `node-ctl run-builder` | Launch one template-build execution |
-| `node-ctl resource ...` | Inspect or drain node resource reservations |
-| `node-ctl builder status` | Inspect build execution state |
-| `node-ctl export-sandbox` / `import-sandbox` | Move portable sandbox state across nodes |
-| `run-cluster-ctl registry` | Start a Registry process |
-| `run-cluster-ctl router` | Start the unified cluster control- and data-plane ingress |
-| `run-cluster-ctl placer` | Start Group import maintenance |
-| `run-cluster-ctl status ...` | Read one authenticated Group/Node publication and template eligibility without lifecycle effects |
-| `node-ctl group apply ...` | Conditionally maintain a Node Group through its local business API; root installation is separate |
-| `e2b-key-ctl ...` | Generate and derive tenant credentials |
-
-A successful move export accepts source deletion durably; RunDir, BaseDir and
-checkpoint cleanup may finish later. Same-ID Create/import conflicts until cleanup
-completes. `--keep-source` preserves the source. See the [node export/import contract](docs/sandbox-lifecycle.md#export-import-command).
-
-The repository also builds `node-stub-ctl`, an E2E helper that simulates node-link participants without starting MicroVMs.
+**Placer is optional.** Add it for source-driven Group import and credential renewal. Direct Group maintenance through `node-ctl group apply` is sufficient for the first cluster. SQLite supports one Registry; use a shared PostgreSQL or FoundationDB backend when deploying multiple Registry members. Backend selection and recovery are covered by [cluster metadata storage](docs/cluster-storage.md).
 
 <a id="profiles"></a>
 
-## Profiles
+## Choose a sandbox profile
 
-- **`e2b`** — the guest runs Envd and exposes the supported E2B-compatible data services;
-- **`bare`** — the guest does not require Envd and is reached through its network services and native platform integration.
+- **`e2b`** runs Envd for the supported SDK command, file and code-interpreter services.
+- **`bare`** runs a customer image without requiring Envd; use its network services or native exec.
+
+Build registration defaults to `e2b`. The output profile is part of artifact identity and cannot be changed by renaming the template. See [profiles](docs/node.md#two-sandbox-profiles) and [Build targets](docs/node-build.md#artifact-identity).
+
+<a id="main-commands"></a>
+
+## Operator commands
+
+| Command | Purpose |
+|---|---|
+| `node-ctl --version` / `e2b-key-ctl --version` | Inspect the installed node tools |
+| `node-ctl config conductor --config FILE --resolve` | Inspect the effective configuration before deployment |
+| `node-ctl conductor serve` / `proxy serve` / `telemetry serve` | Service entry points; normally started by the deployment's units |
+| `node-ctl resource status` / `list` / `pressure` | Inspect admission, reservations and resource pressure |
+| `node-ctl resource drain` / `drain --disable` | Stop or resume new admission |
+| `node-ctl builder status` | Inspect a Build execution |
+| `node-ctl group apply -f FILE` | Maintain a Node Group with the tenant API key |
+| `run-cluster-ctl status ...` | Inspect authenticated Group publication and template eligibility |
+| `run-cluster-ctl registry` / `router` / `placer` | Cluster service entry points from the complete native release bundle |
+| `node-ctl export-sandbox` / `import-sandbox` | Transfer portable sandbox state under the [export/import contract](docs/sandbox-lifecycle.md#export-import-command) |
+| `e2b-key-ctl ...` | Generate and derive tenant credentials |
+
+Resource `status`, `list` and `drain` use the resource-controller socket. `pressure`, Group and manifest-key administration use the Conductor control socket. If your deployment changes these paths, select the appropriate `--socket`; do not point every command at one socket. Full options are in the capability guides.
 
 <a id="deployment-overview"></a>
 
-## Deployment overview
+## Deploy and operate
 
-A standalone node runs Conductor and Proxy; start the independent Telemetry service when needed. Telemetry uses the Plugin Plane without joining Create/Resume barriers, and its failure does not change Sandbox lifecycle. The example configuration explicitly enables embedded Prometheus TSDB. Local storage requires `local.enabled`; an unconfigured query backend defaults to `none`, and writes and queries are assembled independently. See [observability](docs/observability.md#telemetry). A cluster adds Registry and Router, with optional Placer import maintenance. Registry uses the configured SQLite, PostgreSQL or FoundationDB backend; SQLite supports one Registry. Install the complete native runtime bundle and start cluster roles through `run-cluster-ctl`; Registry peers must share the same database and metadata namespace. Configuration examples and systemd units are under `deploy/`; see [native build and runtime](docs/cluster.md#native-build-and-runtime).
+Use [node-infra](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md) for the maintained release installation and persistent service layout. Before admitting a workload, configure durable node state and its encryption key, tenant credentials, compatible kernel/runtime artifacts, writable storage, network egress, and measured resource budgets. The [project deployment guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md) owns cross-component installation, trust boundaries and upgrades.
 
-The release-based installation path is the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md). Production deployments should use durable storage, production TLS, protected credentials, an explicit network policy and capacity settings validated against their workloads.
+For an existing installation, retain its service names, overlay order, sockets and state paths when applying this repository's examples. `deploy/` contains component examples, not a second configuration to copy over a working node-infra instance. Validate the complete effective configuration, then use the installed service units. A config inspection does not start services or move existing workers.
+
+<a id="security-and-multi-tenancy"></a>
+
+## Credentials and tenant isolation
+
+Install each tenant's **APISecret/ManifestKey pair** through the authorized local administration path. Give application clients the generated API key. Data-plane capabilities have separate purposes and scopes; neither a ManifestKey nor the node database encryption key belongs in an SDK or guest image. Clearing an allowlist affects new resource admission and does not automatically revoke credentials already bound to existing resources. See [credential lifecycle](docs/node-proxy.md#credential-model).
+
+Keep the node's internal listeners and administration sockets within the deployment's trust boundary. Registry/NodeLink TLS and public Router TLS are separate from Router-to-Node transport; follow the [cluster trust boundary](docs/cluster.md#minimum-cluster). Report vulnerabilities privately through the [project Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy).
 
 <a id="development-example"></a>
 
-## Development example
+## Development and customization
 
-Prepare binaries, kernel/Runtime artifacts, networking and protected configuration using the project Quick Start. Run each long-lived role below in its own service or terminal; these are separate commands, not one foreground shell script. Start Conductor before using its manifest-key administration socket. Examples use the default config-socket path; custom paths require the corresponding CLI option. Treat generated credentials and the shell environment as sensitive.
-
-```bash
-node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
-node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
-# Optional: independent metrics collection and history query service
-node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
-```
-
-The examples use plaintext API `:3000` and data `:3443`. Configuration may enable resource_listen and Proxy traffic.max_inflight defaults. Cluster registration requires distinct api_endpoint/data_endpoint values; production ingress TLS and trusted node-link/network boundaries follow the deployment owner.
-
-```bash
-# Tenant roots: the standalone default derives APISecret from ManifestKey.
-MK=$(e2b-key-ctl gen-key)
-API_SECRET=$(e2b-key-ctl derive-api-secret "$MK")
-node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
-export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
-
-# Optional cluster roles, each in its own service/terminal.
-run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
-run-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
-# Optional Group import/renewal only:
-run-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
-
-# Standalone development; replace host and the canonical template placeholder.
-export E2B_API_URL=http://host:3000
-export E2B_SANDBOX_URL=http://host:3443
-python - <<'PY'
-from e2b import Sandbox
-sandbox = Sandbox.create("<canonical-template-id>")
-try:
-    print(sandbox.commands.run("uname -a").stdout)
-finally:
-    sandbox.kill()
-PY
-```
-
-Continue with [node configuration](docs/node.md), [Sandbox API](docs/sandbox-lifecycle.md), [access and credentials](docs/node-proxy.md), or [cluster ingress](docs/cluster.md#client-access).
+Use the project [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md) for source development, demos and cross-component validation. For a custom service integration, start with [Application extensions](docs/extensions.md) and its runnable examples. Component builds, contribution requirements and tests belong to [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <a id="contract-ownership"></a>
 
-## Contract ownership
+## Reference ownership
 
-Node roots, object RunDir/BaseDir and RunID/PathID belong to [node directories and identities](docs/node.md#node-directories-and-identities). Public Create identity, conflicts/retries, state changes, Reset/dead retention and cleanup belong to [Sandbox lifecycle](docs/sandbox-lifecycle.md); credential binding belongs to [access and proxy](docs/node-proxy.md#credential-model). [Build](docs/node-build.md) owns Build directory/task/publication/recovery and retention; [cluster Build](docs/cluster.md#cluster-build) owns the retained Registry projection and reconnect convergence. Canonical artifacts remain long-term launch authority independently of retained Build rows. Named publication is a logical commit without a final-file/parent fsync power-loss guarantee; Build owns the full matrix and failure behavior.
+Each capability guide owns its configuration and failure semantics. Node directories and identities belong to [Node operation](docs/node.md#node-directories-and-identities); public Sandbox identities and cleanup belong to [lifecycle](docs/sandbox-lifecycle.md); credential binding belongs to [access](docs/node-proxy.md#credential-model); artifact publication and retained Build records belong to [Build](docs/node-build.md). Cluster projection and recovery extend those local operations without replacing their owners.
 
 <a id="release-model"></a>
 
 ## Release model
 
-This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the node and cluster binaries plus deployment files. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Source-only tests and unselected maintenance material remain in the source repositories.
+This repository publishes component tags `vX.Y.Z`. The main repository publishes aggregate tags `release-vX.Y.Z` that select exact component versions and validate the combined system. The numbers need not match. Install a complete native-architecture release archive, including the cluster launcher's private runtime libraries. Source support does not imply that every historical release has an asset for every architecture.
 
-The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact component tags and validating the combined system on real KVM infrastructure. An orchestrator component version and a project aggregate version are related by the aggregate selection; they are not required to have the same number.
-
-Complete component-branch, Preview/Stable/Latest, mutation-group and cancelled-operation retry rules are maintained only in the project [release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md) and [latest Stable aggregate release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
+Version selection, upgrade and rollback rules are maintained in the project [release guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md). Use [aggregate releases](https://github.com/kuasar-sandbox/kuasar-sandbox/releases) to select a compatible platform; the [latest Stable aggregate](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) is the normal starting point.
 
 <a id="project-boundaries"></a>
 
 ## Project boundaries
 
-- system-level design, shared integration tests infrastructure, demos, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox);
-- MicroVM lifecycle and guest control belong to [`sandboxer`](https://github.com/kuasar-sandbox/sandboxer);
-- image and snapshot data infrastructure belongs to [`accelerator`](https://github.com/kuasar-sandbox/accelerator);
-- high-density MicroVM networking belongs to [`connector`](https://github.com/kuasar-sandbox/connector);
-- the guest kernel and runtime image belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime).
+| Repository | Responsibility |
+|---|---|
+| [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) | Platform installation, user journeys, integration validation and aggregate releases |
+| [sandboxer](https://github.com/kuasar-sandbox/sandboxer) | MicroVM lifecycle, snapshots and guest control |
+| [accelerator](https://github.com/kuasar-sandbox/accelerator) | Image, artifact and snapshot data infrastructure |
+| [connector](https://github.com/kuasar-sandbox/connector) | MicroVM networking and egress |
+| [guest-runtime](https://github.com/kuasar-sandbox/guest-runtime) | Guest kernel and runtime image |
 
 <a id="license"></a>
 

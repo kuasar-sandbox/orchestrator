@@ -8,6 +8,44 @@
 
 **阅读路径：** [SDK 访问](#sdk-configuration) · [凭据](#credential-model) · [Exec session](#exec-session-api) · [配置](#proxy-configuration) · [部署](#deployment) · [MMDS](#mmds) · [流量准入](#admission) · [路由协议](#route-synchronization)
 
+<a id="connect-a-client"></a>
+
+## 接入客户端并检查两条路径
+
+准备租户 API key 和成功 Build 返回的 canonical TemplateID，按部署选择客户端入口：
+
+| 部署 | 客户端配置 | 必须可达的目标 |
+|---|---|---|
+| 单节点开发 HTTP | `E2B_API_URL=http://NODE:API_PORT`、`E2B_SANDBOX_URL=http://NODE:DATA_PORT`、`E2B_API_KEY` | 分别可达 Conductor API 与 Proxy data listener |
+| 公共 TLS 入口 | `E2B_DOMAIN=sandboxes.example.com`、`E2B_API_KEY` | `api.sandboxes.example.com` 与通配 Sandbox host，TLS 有效 |
+| 集群 Router | 公共 TLS 配置，并在每个控制/数据请求携带 Group | Router 入口；使用完整[集群 SDK 配方](cluster_zh.md#client-onboarding) |
+
+读取已安装服务的实际 listener，端口由部署决定。主项目 node-infra 使用 API 3000、data 3001；独立组件 Proxy 示例可能使用其他数据端口。切换部署时移除残留的 endpoint override。
+
+单节点导出所选配置和 `TEMPLATE_ID` 后执行：
+
+```python
+import os
+from e2b import Sandbox
+
+sandbox = Sandbox.create(os.environ["TEMPLATE_ID"])
+print("SandboxID:", sandbox.sandbox_id)
+try:
+    result = sandbox.commands.run("uname -a")
+    if result.exit_code != 0:
+        raise RuntimeError(result.stderr)
+    print(result.stdout)
+    sandbox.files.write("/tmp/kuasar-client-check", "client data path works\n")
+    if sandbox.files.read("/tmp/kuasar-client-check") != "client data path works\n":
+        raise RuntimeError("File round trip did not preserve the content")
+finally:
+    sandbox.kill()
+```
+
+Create 检查控制面，命令和文件操作检查数据面。如果 Create 成功而后续调用失败，先核对 Proxy 可达性、数据入口、guest 就绪和限定用途的 token，再决定下一步；单独验证 API key 不能证明数据路径可用。排查客户端差异时使用[诊断顺序](observability_zh.md#diagnose-a-request)和 [SDK 基线](#sdk-configuration)。
+
+**Guest 出站使用 Connector egress。** Proxy 负责客户端到 guest 的转发，不提供 DNS、通用 guest HTTP 代理或出站 NAT。按[原生 egress 指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md#native-egress)部署，并匹配请求/模板中的 [transit gateway 和 Area VNI](sandbox-lifecycle_zh.md#network-and-egress)。普通 E2B 访问使用 SDK 的限定 token；API key、转发 token 与 native-exec token 不可互换。
+
 <a id="proxy-role"></a>
 
 ## 概述

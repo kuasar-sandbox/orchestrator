@@ -17,14 +17,29 @@ This is the complete node Build contract: registration and target selection, imm
 Use an already configured Node/API key/TLS trust and a reachable, native-architecture
 `APP_IMAGE` pinned by digest. The image already contains your application. Reuse
 Node's registry credentials; this recipe needs no COPY bucket. The [Build API](#build-api) defines registration, trigger and status. This HTTP recipe selects an explicit target through the Register Header. The project's pinned E2B Python 2.25.1 supports the auto flow,
-but `Template.build(headers=...)` sends Builder headers to both Register and
-Trigger and is therefore unsuitable for register-only explicit targets.
+and shares `headers` across Register and Trigger. This source revision accepts
+an unchanged `X-Kuasar-Sandbox-Network` and a Builder header containing only the
+already registered `target` as **assertions** on Trigger. It cannot add or change
+those inputs. Releases predating that support reject the repeated configuration
+headers; the separate HTTP calls below work with those releases as well. Other
+configuration headers and Trigger metadata remain registration-only.
 
 Choose `BUILD_KIND=img` to publish only the image, `sbx` for cold E with portable
 Sandbox defaults, or `snp` for initialized memory S. For S, set `APP_START` and
 `APP_READY` to the actual service start and readiness commands. Explicit Image
 must not receive them. When the build declares or inherits a workspace, set this example’s `BUILD_KIND` to `sbx` or `snp` so the registration request includes an explicit Sandbox target. For builds without workspaces, `auto` selects memory S when an effective start or ready command exists, or Image otherwise.
 This example uses the Demo's execution budget; validate admission for your node.
+
+For native egress or another nondefault transit path, set `KUASAR_NETWORK_JSON`
+to the deployment's [network object](sandbox-lifecycle.md#network-and-egress)
+before running this recipe. For example, an Area 7 deployment needs
+`{"transit_gateway_ip":"192.0.2.10","transit_geneve_vni":7}` with the actual
+reachable egress underlay address in place of `192.0.2.10`. Add the deployment's
+DNS settings when node defaults do not provide a working resolver. The example
+sends this object on **Register only**. Trigger receives source and build steps,
+not general configuration headers. Sandbox E/S outputs retain their logical
+network; an Image output supplies the Build's network but does not turn that
+network into an image-level sandbox default.
 
 ```python
 import json, os, time, urllib.request
@@ -51,9 +66,15 @@ def call(method, path, body=None, extra=None):
         raw = response.read()
         return json.loads(raw) if raw else None
 
+register_headers = {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})}
+if os.environ.get("KUASAR_NETWORK_JSON"):
+    network = json.loads(os.environ["KUASAR_NETWORK_JSON"])
+    if not isinstance(network, dict):
+        raise ValueError("KUASAR_NETWORK_JSON must be a JSON object")
+    register_headers["X-Kuasar-Sandbox-Network"] = json.dumps(network)
 registered = call("POST", "/v3/templates",
     {"name": "explicit-example", "profile": "e2b", "cpuCount": 2, "memoryMB": 6144},
-    {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})})
+    register_headers)
 tid, bid = registered["templateID"], registered["buildID"]
 print("Keep registration/build handles:", tid, bid)
 trigger = {"fromImage": os.environ["APP_IMAGE"]}
@@ -110,7 +131,7 @@ These implement the e2b v2 Build-system endpoint family used by SDK Template.bui
 | Operation | Method and path | Contract |
 |---|---|---|
 | Register | POST /v3/templates → 202 | Body accepts name/tags/profile?/cpuCount/memoryMB/metadata?/envVars?. CPU/memory define immutable Build.Resources for admission and A/B sandbox specifications; final target Sandbox resources are resolved independently. X-Kuasar-Sandbox-Builder.resources may assert identical CPU/memory and add storage; disagreement returns 400. Builder target is register-only immutable input. X-Kuasar-Sandbox-Resource configures final template resources, not A/B. Profile defaults e2b and accepts e2b/bare. Response exposes the requested target. A workspace declaration requires an explicit Sandbox target |
-| Trigger | POST /v2/templates/{tid}/builds/{bid} → 202 | fromImage/fromTemplate/fromImageRegistry username/password/steps/startCmd/readyCmd. Only one registered→waiting transition. Compatibility cpuCount/memoryMB may only assert registration values; increase/decrease returns 400 before credential/COPY/queue side effects. Trigger metadata, Builder/Resource and other general configuration headers are rejected. Insufficient execution capacity leaves FIFO waiting on the fixed node |
+| Trigger | POST /v2/templates/{tid}/builds/{bid} → 202 | fromImage/fromTemplate/fromImageRegistry username/password/steps/startCmd/readyCmd. Only one registered→waiting transition. Compatibility cpuCount/memoryMB may only assert registration values; increase/decrease returns 400 before credential/COPY/queue side effects. Trigger may repeat the registered Network or a Builder header containing only the registered target as equal-value assertions. A missing registration value or a mismatch returns 400 before Hook/COPY/credential/queue effects. Other Builder options, Resource and other configuration headers, and nonempty Trigger metadata remain rejected. Insufficient execution capacity leaves FIFO waiting on the fixed node |
 | Status | GET /templates/{tid}/builds/{bid}/status | SDK fields, requested target, terminal derived kind, canonical resources cpuMilli/memoryBytes/storageBytes, cancelRequested/deleteRequested, executionClaimed/runID/storageEnforcement and phase name/sandboxID. In-progress SDK status remains building while retaining internal phase/claim details |
 | Files | GET /templates/{tid}/files/{hash} → 201 | Resolve tid→Build→owner, then return present/url. present skips duplicate upload; URL is a direct-bucket presigned PUT, never bytes through control plane. No files_storage returns 501; missing/non-owned tid returns 404 ([Target-aware execution and publication](#execution-and-publication)) |
 | List | GET /templates | Tenant's ready templates with persistent templateID, immutable profile, requested target and resolved artifact kind |
@@ -169,7 +190,7 @@ These Conductor configuration fields govern the Build service. Shared process, p
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | Guest pull/flatten, each RUN step, readyCmd polling and whole Build. Step budget also reaches the guest as Connect-Timeout-Ms. Ready polling interval is 2s; absent readyCmd waits 20s. The unit sets no TimeoutStartSec; fencing/host cleanup has a separate 60-second window ([Persistence, recovery and retention](#recovery)) |
 | `builder.files_storage` | Empty | COPY context S3/OBS storage: endpoint/region/bucket (required)/prefix/access_key/secret_key/force_path_style/presign_expiry. Empty returns 501 for COPY. Conductor only presigns/HEADs. Custom Runtime credentials override YAML/AWS defaults, support session token/expiry/refresh and never fall back after error. force_path_style defaults false; versitygw/minio use true. PUT expiry defaults 1h; GET uses total+5m. Local deployments may use versitygw ([Target-aware execution and publication](#execution-and-publication)) |
 
-For independent NUMA budgets, use [resource pools and placement](node-resource.md#resource-pools); [Node NUMA deployment](node.md#numa-deployment-with-multiple-pools) also shows manually managed placement templates sharing the default resource budget. Validate effective placement and cross-pool recovery on the actual host. Builder placement follows global execution admission and can change its preparation worker before final launch when authoritative artifact Capacity becomes known. All A/B/C phases that actually execute stay under one Builder unit and its selected resource pool. Builder `size` is a prewarm target; optional worker `capacity` bounds slots, while resource-pool capacity and allocatable budget are separate. Later Sandboxes created from the output select their own runner; an artifact does not pin them to the Build host's NUMA node.
+For independent NUMA budgets, use [resource pools and placement](node-resource.md#resource-pools); [Node NUMA deployment](node.md#numa-deployment-with-multiple-pools) gives the setup and verification order, including migration from placement-only templates. Validate effective placement and cross-pool recovery on the actual host. Builder placement follows global execution admission and can change its preparation worker before final launch when authoritative artifact Capacity becomes known. All A/B/C phases that actually execute stay under one Builder unit and its selected resource pool. Builder `size` is a prewarm target; optional worker `capacity` bounds slots, while resource-pool capacity and allocatable budget are separate. Later Sandboxes created from the output select their own runner; an artifact does not pin them to the Build host's NUMA node.
 
 The Builder schema replaces these legacy names without aliases:
 
@@ -202,7 +223,7 @@ For builds without workspaces, omitting the target selects memory Sandbox when e
 
 Build resources govern execution/admission only; referer/registry govern this Build. Parsed target/build-only fields leave template metadata and persist in builds.builder_json, never in later create/resume runtime config.
 
-Create and Register share the typed parser for resource/network/traffic/launch/init/mounts/files/metadata, `envVars` and instance options; namespace fields and Header/metadata merge rules remain in [Sandbox configuration propagation](sandbox-lifecycle.md#request-configuration). Register always rejects `kuasar-sandbox.identity`, tenant-supplied node-managed cluster metadata, `restore` and `autoPauseMemory`. The removed top-level Build Register `secure` input returns HTTP 400 whenever present, including false or null; it is not a Build security mode. Build runtime inputs use `builds.metadata_json`; build-only input uses `builds.builder_json`. They serve this execution and artifact generation, not long-term canonical TemplateID lookup. Trigger cannot replace registered metadata, Builder/Resource or other general configuration headers; nonempty general metadata/headers are rejected.
+Create and Register share the typed parser for resource/network/traffic/launch/init/mounts/files/metadata, `envVars` and instance options; namespace fields and Header/metadata merge rules remain in [Sandbox configuration propagation](sandbox-lifecycle.md#request-configuration). Register always rejects `kuasar-sandbox.identity`, tenant-supplied node-managed cluster metadata, `restore` and `autoPauseMemory`. The removed top-level Build Register `secure` input returns HTTP 400 whenever present, including false or null; it is not a Build security mode. Build runtime inputs use `builds.metadata_json`; build-only input uses `builds.builder_json`. They serve this execution and artifact generation, not long-term canonical TemplateID lookup. Trigger cannot replace any registered configuration. Only the repeated Network and Builder target headers described above are accepted as assertions; other general metadata/headers remain rejected. Network assertions use the known JSON schema, reject duplicate/unknown fields and null, and compare normalized values rather than JSON whitespace or object-key order. These assertions remain core-owned across extension Hooks.
 
 - At synchronous admission, a known Image target rejects any remaining normalized Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace, nonempty `envVars`, nonzero credential overrides or explicit MMDS routes/secrets. Ordinary metadata labels and Build execution resources remain allowed; empty `envVars` alone is not a rejection condition.
 - Every target accepts `X-Kuasar-Sandbox-Network` / `kuasar-sandbox.network` for the Build execution network, including explicit or automatically resolved Image targets and an empty network object. Network input does not require a Sandbox output; A/B use it for image import and build steps, and Sandbox targets also project it into E.

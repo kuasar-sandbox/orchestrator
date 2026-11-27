@@ -1,5 +1,7 @@
 # Cardinality performance validation
 
+Historical performance evidence for the revisions and environment recorded below. Use [cluster operations](cluster.md) and [resource operations](node-resource.md) for current user workflows; these measurements are not production capacity recommendations.
+
 This change addresses repeated or unrelated work as sandbox, Group and authentication-root counts grow. The baseline is `2cc052363d0dd5646a41606f9a77ce14b04053e5`. It does not establish a 100,000-VM capacity limit or a production latency SLO.
 
 ## Scope and invariants

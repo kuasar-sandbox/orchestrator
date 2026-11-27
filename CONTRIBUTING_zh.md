@@ -87,18 +87,18 @@ telemetry backend、network namespace 检查, 保留全部能力要求与断言.
 Publisher 的归档校验器在独立 Workbench 调用中从受信发布源码编译, 该调用禁用缓存
 恢复和保存. 组装与发布执行同一校验器, 不再次编译.
 
-Go 源码构建需要 Go 1.26.1+。独立构建解析 `go.mod` 中真实可获取的版本；协调 Preview 构建使用选定的本地 `orchestrator`、`sandboxer`、`accelerator`、`connector` 模块：
+Go 源码构建需要 Go 1.26.1+。协调源码开发应准备选定的本地 `orchestrator`、`sandboxer`、`accelerator`、`connector` 及所需 `guest-runtime` 模块闭包，使用下面的工作区；不能假设 `go.mod` 中所有内部模块版本都已经发布：
 
 ```bash
-GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator)" || exit 1
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator --source-requirements)" || exit 1
 export GOWORK
 make build
 ```
 
-工作区验证 module path，并通过 `use` 精确选择该闭包，不重复添加 `replace`，不改写 `go.mod`/`go.sum`。产品、helper 和源码测试使用同一组模块；真实沙箱测试另需 Runtime/Kernel 制品。
+工作区验证 module path，并精确选择本地源码闭包。`--source-requirements` 还将带版本的内部依赖绑定到所选本地模块，避免为尚未发布的依赖版本发起无谓下载；这些替换只存在于生成的工作区，不改写 `go.mod`/`go.sum`。闭包包括所选 Sandboxer 需要的 `guest-runtime` 模块。产品、helper 和源码测试使用同一组模块；真实沙箱测试另需 Runtime/Kernel 制品。
 
 
-Go 二进制使用 `CGO_ENABLED=0` 构建。
+`node-ctl`、`node-stub-ctl`、`e2b-key-ctl` 使用 `CGO_ENABLED=0`。官方 `cluster-ctl` 链接固定的原生 FoundationDB client 和私有运行库，`make build` 组合两条路径。见 [cluster 原生构建与运行](docs/cluster_zh.md#native-build-and-runtime)。
 
 ```bash
 make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
@@ -299,11 +299,12 @@ go test ./internal/orch -run '^$' -bench '^BenchmarkNativeUsageBatch$' -benchmem
 
 许可证和声明放在 `share/licenses/<component>`。声明缺失、目录不可读或遍历不完整时收集失败。包验证检查必需文件、载荷身份及归档路径、类型和权限。下载使用 GitHub 原生资产大小和摘要，包内及 Release 不发布来源或历史测试记录、独立 `SHA256SUMS`。
 
-`make release` 先核对 `ACCELERATOR_VERSION`、`CONNECTOR_VERSION`、`SANDBOXER_VERSION` 与干净的相邻源码 checkout，生成四模块 Go workspace，再编译并打包同一输出。项目 checkout 不在 `../kuasar-sandbox` 时设置 `KUASAR_PLATFORM_DIR`。缺 Tag、缺模块或源码目录冲突会在编译前停止。发布者使用人类说明，拒绝覆盖同名不同内容资产。
+`make release` 先核对 `ACCELERATOR_VERSION`、`CONNECTOR_VERSION`、`SANDBOXER_VERSION` 与干净的相邻源码 checkout，生成所选依赖闭包的 Go workspace，再编译并打包同一输出。项目 checkout 不在 `../kuasar-sandbox` 时设置 `KUASAR_PLATFORM_DIR`。缺 Tag、缺模块或源码目录冲突会在编译前停止。发布者使用人类说明，拒绝覆盖同名不同内容资产。
 
 四个官方 Go 可执行文件必须分别标识自身的 Orchestrator 命令 main package,
-目标为所选 Linux 架构（x86_64 对应 amd64，aarch64 对应 arm64），且 `CGO_ENABLED=0`。
-打包从所选源码树复制十二个部署文件,
+目标为所选 Linux 架构（x86_64 对应 amd64，aarch64 对应 arm64）。三个节点工具保持纯 Go，
+`cluster-ctl` 连同固定原生运行库闭包及启动器验证。打包复制 `scripts/release.sh` 和归档
+校验器声明的部署文件集合，
 通过既有 `RELEASE_*_SOURCE_DIR`、可选 `RELEASE_*_SOURCE_SHA` 及版本选择
 收集实际 Accelerator、Connector、Sandboxer 依赖材料。独立验证只检查 bundle
 中的依赖 URL/commit 字段相互一致,不要求验证主机具备兄弟仓或依赖 Tag。

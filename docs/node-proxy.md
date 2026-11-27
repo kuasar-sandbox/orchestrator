@@ -8,6 +8,44 @@ Configure client access, tenant credentials, native exec and forwarding; then op
 
 **Read by task:** [SDK access](#sdk-configuration) · [Credentials](#credential-model) · [Exec sessions](#exec-session-api) · [Configure](#proxy-configuration) · [Deploy](#deployment) · [MMDS](#mmds) · [Traffic admission](#admission) · [Route protocol](#route-synchronization)
 
+<a id="connect-a-client"></a>
+
+## Connect a client and check both paths
+
+Obtain a tenant API key and a canonical TemplateID from a completed Build. Choose the endpoint form for your deployment:
+
+| Deployment | Client settings | What must be reachable |
+|---|---|---|
+| Standalone development HTTP | `E2B_API_URL=http://NODE:API_PORT`, `E2B_SANDBOX_URL=http://NODE:DATA_PORT`, `E2B_API_KEY` | Conductor API and Proxy data listener separately |
+| Public TLS ingress | `E2B_DOMAIN=sandboxes.example.com`, `E2B_API_KEY` | `api.sandboxes.example.com` and wildcard sandbox hosts, with valid TLS |
+| Cluster Router | The public TLS settings plus the Group on every control and data request | Router ingress; see the complete [cluster SDK recipe](cluster.md#client-onboarding) |
+
+Read the actual installed listener values; ports are deployment choices. The main project's node-infra layout uses API 3000 and data 3001. A component Proxy example may use another data port. Remove stale endpoint overrides when switching deployments.
+
+For a standalone node, export the chosen settings and `TEMPLATE_ID`, then run:
+
+```python
+import os
+from e2b import Sandbox
+
+sandbox = Sandbox.create(os.environ["TEMPLATE_ID"])
+print("SandboxID:", sandbox.sandbox_id)
+try:
+    result = sandbox.commands.run("uname -a")
+    if result.exit_code != 0:
+        raise RuntimeError(result.stderr)
+    print(result.stdout)
+    sandbox.files.write("/tmp/kuasar-client-check", "client data path works\n")
+    if sandbox.files.read("/tmp/kuasar-client-check") != "client data path works\n":
+        raise RuntimeError("File round trip did not preserve the content")
+finally:
+    sandbox.kill()
+```
+
+Create exercises the control plane; commands and files exercise the data plane. If Create succeeds but these calls fail, inspect Proxy reachability, the data endpoint, guest readiness and the scoped token before issuing another Create. A successful API-key verification alone does not test those paths. Use [the diagnostic sequence](observability.md#diagnose-a-request) and the [SDK baseline](#sdk-configuration) when identifying a client mismatch.
+
+**Guest outbound access uses Connector egress.** Proxy forwards client-to-guest traffic; it does not supply DNS, a general guest HTTP proxy or an outbound NAT path. Configure [native egress](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#native-egress) and match the request/template's [transit gateway and Area VNI](sandbox-lifecycle.md#network-and-egress). For ordinary E2B access, use the SDK's scoped tokens; API keys, forwarding tokens and native-exec tokens are not interchangeable.
+
 <a id="proxy-role"></a>
 
 ## Overview

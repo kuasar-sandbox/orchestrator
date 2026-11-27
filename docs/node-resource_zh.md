@@ -13,6 +13,27 @@ snapshot 生命周期均由 sandboxer 自闭环管理,不属于 node controller�
 
 **阅读路径：** [术语](#units-and-terms) · [配置](#resource-policy) · [请求资源](#request-resources) · [资源池](#resource-pools) · [模型](#resource-model) · [协议](#controller-protocol) · [准入](#admission-and-pressure) · [恢复](#recovery)
 
+<a id="operate-resources"></a>
+
+## 配置并检查容量
+
+首次节点沿用部署的单资源池，先建立工作负载预算，再增加 NUMA 池。区分 Sandbox 的固定 VM **capacity**、冷启动 **startup headroom** 和稳定阶段 **allocatable memory**。降低稳态 headroom 不会消除冷启动或捕获内存的准入要求。Builder 的注册/执行限制是另一层预算，见 [Build](node-build_zh.md#build-configuration)。
+
+1. 使用 `node-ctl config conductor --config FILE[:OVERLAY...] --resolve` 验证安装配置，按真实主机核对宿主预留、可分配内存与 `resource_listen` 是否启用。
+2. 提高并发前先检查准入与实际 reservation。默认 socket 下执行：
+
+   ```sh
+   node-ctl resource status --socket /run/sandbox-resource.sock
+   node-ctl resource list --socket /run/sandbox-resource.sock
+   node-ctl resource pressure --socket /run/sandbox/node-ctl.socket
+   ```
+
+   `status` 提供节点汇总，`list` 列出 reservation，`pressure` 解释池使用率、等待任务与恢复。前两者使用资源协议，`pressure` 使用 Conductor admin API；路径不同时改成安装中的实际值。
+3. 计划维护时使用 `node-ctl resource drain` 暂停新准入，维护完成并确认观测正常后执行 `node-ctl resource drain --disable`。非默认资源 socket 需增加 `--socket`。Drain 不停止或迁移现有执行，也不是完整节点疏散流程。
+4. 需要 NUMA 局部性或独立预算时，采用[资源池部署](node_zh.md#numa-deployment-with-multiple-pools)，同时验证声明容量与 unit 实际 CPU/内存放置。Worker 预热数量不是内存预算。
+
+准入等待时，先检查所属池、启动在途预算、unknown/recovery reservation 与压力原因，再调整限额。排查期间保留同一个 SandboxID/BuildID。不要手工修改 balloon/cgroup 来绕过保留的 reservation；资源释放遵循所属生命周期。
+
 <a id="units-and-terms"></a>
 
 ## 术语

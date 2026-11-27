@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -190,7 +191,10 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		if request == nil {
 			return fmt.Errorf("%w: extension removed build trigger candidate", api.ErrBadRequest)
 		}
+		// These are immutable client preconditions, not mutable Hook inputs.
+		networkAssertion, targetAssertion := spec.NetworkAssertion, spec.TargetAssertion
 		spec = internalBuildTriggerRequest(request)
+		spec.NetworkAssertion, spec.TargetAssertion = networkAssertion, targetAssertion
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -308,6 +312,21 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 func validateBuildTriggerDefinition(build *types.Build, spec api.TriggerSpec) error {
 	if err := assertBuildResources(build.Resources, spec.ResourceAssertion); err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if spec.TargetAssertion != nil {
+		if build.Builder.Target == nil || *spec.TargetAssertion != *build.Builder.Target {
+			return fmt.Errorf("%w: trigger target does not match the registered target", api.ErrBadRequest)
+		}
+	}
+	if spec.NetworkAssertion != nil {
+		raw, present := build.Metadata[sandboxcfg.NsNetwork]
+		if !present {
+			return fmt.Errorf("%w: trigger network was not declared at registration", api.ErrBadRequest)
+		}
+		registered, err := sandboxcfg.ParseSpec(map[string]string{sandboxcfg.NsNetwork: raw})
+		if err != nil || !reflect.DeepEqual(*spec.NetworkAssertion, registered.Network) {
+			return fmt.Errorf("%w: trigger network does not match the registered network", api.ErrBadRequest)
+		}
 	}
 	if err := types.ValidateWorkspaceBuildTarget(build.Builder.Target, len(build.WorkspacePlan) != 0); err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -450,8 +469,8 @@ func (o *Orchestrator) validateBuildOptions(opts types.BuildOptions, fromTemplat
 }
 
 // validateRegistryTLS checks the per-build registry TLS trust policy. It is
-// register-time only (a trigger-time builder.registry is rejected before Merge
-// runs); fromTemplate builds must not carry it (their base image is already
+// register-time only (a trigger-time builder.registry is rejected at the API
+// boundary); fromTemplate builds must not carry it (their base image is already
 // resolved, so there is no source-registry pull to tune).
 func validateRegistryTLS(reg *types.BuildRegistryOptions, fromTemplate bool) error {
 	if reg == nil || reg.TLS == nil {

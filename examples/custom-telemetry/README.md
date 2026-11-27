@@ -4,10 +4,12 @@
 
 This is a runnable static App integration. The complete public SDK and lifecycle contracts belong to [application extensions](../../docs/extensions.md#examples); deployment and operational requirements stay with the corresponding capability document.
 
-Build the trusted statically linked App:
+From the repository root, use the [selected-source build workspace](../../CONTRIBUTING.md) and build as your development user. Install the completed executable separately:
 
 ```sh
-CGO_ENABLED=0 go build -o /opt/kuasar/bin/custom-telemetry ./examples/custom-telemetry
+mkdir -p out
+CGO_ENABLED=0 go build -o out/custom-telemetry ./examples/custom-telemetry
+sudo install -D -o root -g root -m 0755 out/custom-telemetry /opt/kuasar/bin/custom-telemetry
 ```
 
 Protect the executable against group/world writes. Root dispatch requires root

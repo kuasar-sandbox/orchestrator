@@ -1,11 +1,13 @@
 # Node Group and snapshot runtime acceptance
 
+Historical acceptance evidence at the recorded source revisions. Use [first cluster](cluster.md#minimum-cluster) for current setup. The delivery checklist records the state of this evidence collection; current proposal and release status belongs to the linked issue history and release receipts.
+
 This report accompanies [orchestrator #570](https://github.com/kuasar-sandbox/orchestrator/issues/570)
 and [sandboxer #472](https://github.com/kuasar-sandbox/sandboxer/issues/472).
 It separates source tests, native database tests, product processes with simulated
 Node execution, and actual Node/KVM experiments. Results from one level do not
-stand in for another. Final merge, release and aggregate receipts must be attached
-before either proposal is closed.
+stand in for another. Final merge, release and aggregate receipts were separate closeout requirements
+for this evidence collection. The checklist below is retained as a historical record.
 
 ## Delivered behavior
 
@@ -315,7 +317,7 @@ checks and balloon release/reuse. Its initial local preparations (incomplete
 upload and an overlong Unix socket path) are recorded as fixture failures, not
 successful product runs. No production code changed for either fixture repair.
 
-## Final closeout checklist
+## Historical closeout checklist
 
 - [x] Reader changes reviewed and merged through normal protection.
 - [x] Native database, process, stream and real VM evidence collected.

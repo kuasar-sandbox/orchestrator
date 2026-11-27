@@ -1,5 +1,7 @@
 # Snapshot runtime reference compatibility
 
+Reader-stage compatibility record. Current capture production and deployment behavior are defined in [runtime inventory and selection](cluster.md#groups-and-placement) and [Sandbox capture](sandbox-lifecycle.md#capture-and-pause). The final paragraph below describes the scope of the original reader change, not a current prohibition on annotated capture.
+
 An SNP template may carry a terminal
 `@runtime:<basename>:digest:<64-lowercase-hex>` on its snapshot reference. It uses
 the existing `<profile>-<kind>-<base64url(ref)>` TemplateID encoding. There is no

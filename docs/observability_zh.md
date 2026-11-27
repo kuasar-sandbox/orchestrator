@@ -8,6 +8,32 @@
 
 **阅读路径：** [选择观测面](#observation-surfaces) · [当前统计](#native-stats-api) · [精确 usage](#native-usage) · [日志](#logs) · [Telemetry](#telemetry) · [Telemetry 配置](#telemetry-configuration)
 
+<a id="diagnose-a-request"></a>
+
+## 按顺序排查请求
+
+保留 SandboxID 或 BuildID、操作、响应及安装版本；集群场景再保留 Group 和当前目标 Node。先使用只读观测，避免检查动作意外唤醒暂停 Sandbox。
+
+| 现象或问题 | 首先检查 | 后续判断 |
+|---|---|---|
+| Create/Connect 已接受，但命令不可用 | `GET /sandboxes/{id}` 的状态与执行结果 | `starting` 排查就绪/准入，`dead` 按记录的失败处理并决定保留数据 |
+| 新工作等待或容量不足 | [资源 status、list、pressure](node-resource_zh.md#operate-resources) | 调整预算前定位池、reservation、启动或恢复约束 |
+| API 正常，guest 命令/文件失败 | [客户端数据路径](node-proxy_zh.md#connect-a-client)、Proxy/guest 日志与 `/stats/traffic` | 检查实际数据入口、鉴权和就绪；API 成功不足以证明这些路径 |
+| Build 卡住或客户端超时 | 保存的 transient TemplateID/BuildID 对应 status，以及 `node-ctl builder status` | 检查阶段及清理意图，需要取消/删除时沿用原身份 |
+| Sandbox 当前内存/CPU 或流量 | `/sandboxes/{id}/stats/resource` 与 `/stats/traffic` | 使用有效观测字段；不可用不等于零，查询不会唤醒 guest |
+| 累计计量 | `/sandboxes/{id}/stats/usage` | 保留精确整数及检查点/保留语义，不以采样指标求和替代 |
+| 缺少历史指标 | Telemetry 服务/配置及 `/sandboxes/{id}/metrics` | 分别核实采集、本地/远端写入与查询后端 |
+| 集群默认 Create 没有 eligible Node | 对 Group 及每个 Node 执行 `run-cluster-ctl status` | 按[首次集群](cluster_zh.md#minimum-cluster)核对发布版本、registration 与 eligibility |
+
+API 观测使用所属租户 key，集群请求同时携带 Group。在负责执行的宿主查询日志时使用显式身份，无需按 guest 进程名做宽泛搜索：
+
+```sh
+journalctl KUASAR_SANDBOX_ID="$SANDBOX_ID"
+journalctl KUASAR_BUILD_ID="$BUILD_ID"
+```
+
+同一身份有多次执行时用 `KUASAR_RUN_ID` 缩小范围；跟踪保留逻辑身份的迁移时用 `KUASAR_STABLE_ID`。[日志契约](#logs)定义各输出携带的字段及投递限制。在相应运行期/保留数据存在时，native 即时统计与用量独立于 Telemetry；Telemetry 失败不能说明 Sandbox 生命周期失败。
+
 <a id="observation-surfaces"></a>
 
 ## 观测面选择
