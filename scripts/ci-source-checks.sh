@@ -4,7 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 bash test/source/go_consumer.sh
-go test -count=1 -timeout=5m ./...
+# Validate the required Builder contracts from this ordinary run, including
+# every started subcase, instead of executing the same tests a third time.
+go test -json -count=1 -timeout=5m ./... \
+    | python3 -B test/source/builder_state.py --results -
 # Give each race-instrumented package the source Workbench's two CPUs. Tests
 # retain their own goroutine/subprocess concurrency and per-package deadline.
 CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m ./...
@@ -20,7 +23,6 @@ bash test/source/runtask_privilege.sh
 bash test/source/vmm_cgroup.sh
 REQUIRE_BUILDER=1 bash test/source/builder_unit_upgrade.sh
 bash test/source/resource_pool_units.sh
-bash test/source/journal_contract.sh
 bash test/source/capture_cli.sh
 bash test/source/cluster_fixture_configs.sh
 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
@@ -33,7 +35,6 @@ bash scripts/with-test-postgres.sh -- bash -euc '
         ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry
     CLUSTER_STUB_BACKEND=postgres REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
 '
-bash test/source/builder_state.sh
 bash test/source/telemetry_backends.sh
 # Helper/source regressions stay in this compiler-capable gate, not in the
 # prepared product E2E runner. Discover the maintained helper tests as one set so
