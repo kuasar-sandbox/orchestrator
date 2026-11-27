@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
@@ -100,10 +102,13 @@ func TestRetainedMemoryRPCAbandonedAdoptionWithoutRestart(t *testing.T) {
 				}
 				_ = client.Close()
 				path := retentionPath(socket, "retained-sid")
-				if err := os.Remove(path); err != nil {
+				// Restore the saved receipt atomically with the blocking directory.
+				// Removing the directory first lets the periodic sweeper publish
+				// holding before a later rename overwrites it with stale adopting.
+				if err := unix.Renameat2(unix.AT_FDCWD, path+".saved", unix.AT_FDCWD, path, unix.RENAME_EXCHANGE); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Rename(path+".saved", path); err != nil {
+				if err := os.Remove(path + ".saved"); err != nil {
 					t.Fatal(err)
 				}
 			}
