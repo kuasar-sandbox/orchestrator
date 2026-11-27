@@ -77,7 +77,7 @@ esac
 run_low_allocatable_case() { # $1=iteration
     local iteration="$1" code LOW_START_MS LOW_SID LOW_TOKEN LOW_ELAPSED_MS
     local LOW_RUN_ID LOW_UNIT LOW_CG LOW_CTL_PID LOW_CTL_CG LOW_VMM_PROCS
-    local LOW_JOURNAL VMM_MEMBERS_ERROR
+    local LOW_JOURNAL LOW_IDENTITY LOW_PROOF LOW_SHUTDOWN_DEADLINE VMM_MEMBERS_ERROR
 
     LOW_START_MS=$(date +%s%3N)
     code=$(req POST /sandboxes "$AK" "$LOW_CREATE_BODY")
@@ -142,23 +142,24 @@ PY
     [ "$LOW_HIGH" -gt 0 ] && [ "$LOW_HIGH" -le 8623489024 ] \
         || fail "low-allocatable[$iteration] memory.high=$LOW_HIGH outside (0,memory.max]"
 
+    LOW_IDENTITY="$WORK/low-allocatable-$iteration.identity.log"
+    LOW_PROOF="$WORK/low-allocatable-$iteration.shutdown.log"
+    python3 "$SCRIPT_DIR/resource_shutdown.py" capture \
+        --run-id "$LOW_RUN_ID" --sandbox-id "$LOW_SID" --control-group "$LOW_CG" \
+        --parent-pid "$LOW_CTL_PID" --sandbox-binary "$BIN/sandbox-ctl" --ch-binary "$BIN/cloud-hypervisor" \
+        --identity "$LOW_IDENTITY" || fail "low-allocatable[$iteration] shutdown owner identity"
+
     code=$(req DELETE "/sandboxes/$LOW_SID" "$AK"); [ "$code" = "204" ] || fail "delete low-allocatable[$iteration] sandbox=$code"
-    for _ in $(seq 1 50); do
-        [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] && break
-        sleep 0.1
-    done
-    [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] || fail "vmm cgroup remained after StopUnit"
-    journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
-    # KillMode=control-group may terminate CH before sandbox-ctl reaches the API.
-    grep -Fq '[sandbox-ctl] received terminated' "$LOW_JOURNAL" \
-        || fail "low-allocatable[$iteration] run did not observe StopUnit"
-    grep -Fq '[sandbox-ctl] CH exited code=' "$LOW_JOURNAL" \
-        || fail "low-allocatable[$iteration] run did not observe CH exit"
-    # Under deliberate memory.high pressure, CH's direct systemd signal can race
-    # sandbox-ctl's shutdown API and make CH report a non-zero shutdown exit. The
-    # lifecycle contract here is bounded exit and cgroup removal without SIGKILL.
-    ! grep -Fq "CH didn't exit within" "$LOW_JOURNAL" \
-        || fail "low-allocatable[$iteration] run escalated shutdown to SIGKILL"
+    LOW_SHUTDOWN_DEADLINE=$(python3 -c 'import time; print(time.monotonic() + 5)')
+    # Native journal records carry the task and sender even if unit attribution
+    # disappears after cleanup. Require the exact CH's positive wait outcome;
+    # missing diagnostic records remain a failure. SIGTERM and ordinary nonzero
+    # exits remain valid under direct systemd termination; SIGKILL does not.
+    # Cgroup removal and journal visibility share the original post-DELETE budget.
+    python3 "$SCRIPT_DIR/resource_shutdown.py" observe \
+        --identity "$LOW_IDENTITY" --journal "$LOW_JOURNAL" --proof "$LOW_PROOF" \
+        --deadline "$LOW_SHUTDOWN_DEADLINE" \
+        || fail "low-allocatable[$iteration] missing or invalid CH shutdown proof"
     echo "==> PASS: 8GiB/256MiB runner[$iteration] ready in ${LOW_ELAPSED_MS}ms; mem_report progressed; ctl/vmm isolated and cleaned"
 }
 
