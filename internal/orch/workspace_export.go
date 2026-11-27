@@ -30,10 +30,10 @@ func (o *Orchestrator) workspaceOperation(ctx context.Context) (context.Context,
 	return child, func() { stop(); cancel(); finish() }, nil
 }
 
-func (o *Orchestrator) ExportWorkspace(ctx context.Context, id, apiKey, name string) (string, error) {
+func (o *Orchestrator) ExportWorkspace(ctx context.Context, id, apiKey, name string) (types.WorkspaceExportResult, error) {
 	ctx, finish, err := o.workspaceOperation(ctx)
 	if err != nil {
-		return "", err
+		return types.WorkspaceExportResult{}, err
 	}
 	defer finish()
 	// Keep both the SID lifecycle fence and applicable on-disk ownership grant
@@ -41,30 +41,34 @@ func (o *Orchestrator) ExportWorkspace(ctx context.Context, id, apiKey, name str
 	// cannot release a selected version or change its subtree underneath us.
 	guard, release, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
-		return "", err
+		return types.WorkspaceExportResult{}, err
 	}
 	defer release()
 	sb, err := o.st.Get(guard, id)
 	if err != nil {
-		return "", err
+		return types.WorkspaceExportResult{}, err
 	}
 	if !ownsSandbox(sb, apiKey) {
-		return "", api.ErrNotFound
+		return types.WorkspaceExportResult{}, api.ErrNotFound
 	}
 	if !workspaceDeclared(sb, name) && (len(sb.WorkspacePlan) > 0 || sb.State != types.StatePaused) {
-		return "", api.ErrNotFound
+		return types.WorkspaceExportResult{}, api.ErrNotFound
 	}
 	if sb.State != types.StatePaused {
-		return "", api.ErrWorkspaceConflict
+		return types.WorkspaceExportResult{}, api.ErrWorkspaceConflict
 	}
 	result, err := o.workspaceArchiveOperation(guard, sb, "export", name)
 	if err != nil {
-		return "", err
+		return types.WorkspaceExportResult{}, err
 	}
-	if result.Disk == nil {
-		return "", api.ErrWorkspaceUnavailable
+	if err := result.ValidateExport(); err != nil {
+		return types.WorkspaceExportResult{}, api.ErrWorkspaceUnavailable
 	}
-	return migrationtoken.SealWorkspace(migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey}, *result.Disk)
+	token, err := migrationtoken.SealWorkspace(migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey}, *result.Disk)
+	if err != nil {
+		return types.WorkspaceExportResult{}, err
+	}
+	return types.WorkspaceExportResult{Result: token, DiskReport: *result.Report}, nil
 }
 
 func (o *Orchestrator) workspaceArchiveOperation(ctx context.Context, sb *types.Sandbox, operation, name string) (workspacedisk.Result, error) {
@@ -100,7 +104,11 @@ func (o *Orchestrator) callWorkspaceStorage(ctx context.Context, key string, req
 	cmd := helperexec.CommandContext(ctx, o.executables.OrchestratorCtl(), "workspace-storage")
 	cmd.Env = append(os.Environ(), manifest.CustomerKeyEnv+"="+key)
 	inheritSourceOperation(ctx, cmd)
-	output := &snapshotCheckOutput{limit: rtconfig.MaxPortableConfigBytes}
+	limit := rtconfig.MaxPortableConfigBytes
+	if req.Operation == "export" {
+		limit = workspacedisk.MaxExportResultBytes
+	}
+	output := &snapshotCheckOutput{limit: limit}
 	stderr := &snapshotCheckOutput{limit: 4 << 10}
 	cmd.Stdin = bytes.NewReader(raw)
 	cmd.Stdout = output

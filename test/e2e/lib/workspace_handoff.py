@@ -294,7 +294,14 @@ def handoff(named_parent=None):
             delete(captured_choice)
     if named_parent:
         pause(imported, False)
-        next_token = control(imported, "project", "export", {})["token"]
+        exported = control(imported, "project", "export", {})
+        assert set(exported) == {"result", "refs", "diskRefs", "removedRefs"}, exported
+        assert exported["refs"] is True, exported
+        assert exported["diskRefs"] and exported["diskRefs"] == sorted(set(exported["diskRefs"])), exported
+        assert exported["removedRefs"] == sorted(set(exported["removedRefs"])), exported
+        assert not set(exported["diskRefs"]) & set(exported["removedRefs"]), exported
+        next_token = exported["result"]
+        assert next_token.startswith("kwt1."), exported
         receiver = create(image, declared(1), "named-second-handoff", 1)
         attach(receiver, next_token, "named-second-handoff")
         guest(receiver, 'test "$(cat /data/value)" = private-b; test "$(cat /output/value)" = result; sync')

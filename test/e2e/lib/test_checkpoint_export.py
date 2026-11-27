@@ -21,7 +21,7 @@ spec.loader.exec_module(client)
 def publication():
     root = "manifest://" + "a" * 64
     return {"result": "e2b-sbx-" + base64.urlsafe_b64encode(root.encode()).decode().rstrip("="),
-            "sandboxRef": root, "removedRefs": []}
+            "refs": True, "sandboxRef": root, "sandboxRefs": [root], "removedRefs": []}
 
 
 @contextmanager
@@ -94,12 +94,50 @@ class CheckpointExport(unittest.TestCase):
                    json.dumps({**valid, "extra": True}).encode(),
                    json.dumps({**valid, "sandboxRef": "file://local.sandbox"}).encode(),
                    json.dumps({**valid, "result": "e2b-sbx-bad"}).encode(),
+                   json.dumps({**valid, "refs": None}).encode(),
+                   json.dumps({**valid, "refs": 1}).encode(),
+                   json.dumps({**valid, "sandboxRefs": []}).encode(),
+                   json.dumps({**valid, "sandboxRefs": None}).encode(),
+                   json.dumps({**valid, "sandboxRefs": [valid["sandboxRef"], valid["sandboxRef"]]}).encode(),
+                   json.dumps({k: v for k, v in valid.items() if k != "removedRefs"}).encode(),
                    json.dumps({**valid, "removedRefs": None}).encode(),
                    json.dumps({**valid, "removedRefs": ["same", "same"]}).encode(),
                    json.dumps({**valid, "removedRefs": [valid["sandboxRef"]]}).encode()]
         for raw in invalid:
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 client.validate_response(raw)
+
+    def test_unknown_report_omits_every_collection(self):
+        unknown = {key: value for key, value in publication().items()
+                   if key not in {"sandboxRefs", "removedRefs"}}
+        unknown["refs"] = False
+        self.assertEqual(client.validate_response(json.dumps(unknown)), unknown)
+        for field in ("snapshotRefs", "sandboxRefs", "diskRefs", "removedRefs"):
+            for value in (None, [], [unknown["sandboxRef"]]):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    client.validate_response(json.dumps({**unknown, field: value}))
+
+    def test_exact_legacy_report_is_validated_then_normalized_without_delta(self):
+        legacy = {key: value for key, value in publication().items()
+                  if key not in {"refs", "sandboxRefs"}}
+        legacy["removedRefs"] = ["file://old.sandbox"]
+        normalized = client.validate_response(json.dumps(legacy))
+        self.assertIs(normalized["refs"], False)
+        self.assertNotIn("removedRefs", normalized)
+        for extra in ("sandboxRefs", "snapshotRefs", "diskRefs"):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                client.validate_response(json.dumps({**legacy, extra: []}))
+
+    def test_snapshot_groups_are_complete_and_removals_exclude_every_final_ref(self):
+        report = publication()
+        snapshot = "manifest://" + "b" * 64
+        parent = "manifest://" + "c" * 64
+        report.update(result="e2b-snp-" + base64.urlsafe_b64encode(snapshot.encode()).decode().rstrip("="),
+                      snapshotRef=snapshot, snapshotRefs=[snapshot, parent])
+        self.assertEqual(client.validate_response(json.dumps(report)), report)
+        for change in ({"removedRefs": [parent]}, {"snapshotRefs": [parent]}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                client.validate_response(json.dumps({**report, **change}))
 
     def test_invalid_timeout_id_or_key_fails_before_connect(self):
         for timeout, sid, key in ((0, "id", "secret"), (-1, "id", "secret"),

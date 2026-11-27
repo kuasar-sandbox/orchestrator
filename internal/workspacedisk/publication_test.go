@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -82,6 +83,14 @@ func TestWorkspaceExportRetainsPublishedLayersWithoutReadingThem(t *testing.T) {
 			requireWorkspaceIO(t, err)
 			if result.Disk == nil || !slices.Equal(result.Disk.BaseFromRefs, []string{original}) || !strings.HasSuffix(result.Disk.Base, "@location:source") {
 				t.Fatalf("export rewrote a published parent: %+v", result.Disk)
+			}
+			if err := result.ValidateExport(); err != nil {
+				t.Fatalf("incomplete upload report: %v", err)
+			}
+			oldTop, err := artifact.PublicRef(top)
+			requireWorkspaceIO(t, err)
+			if !slices.Contains(result.Report.DiskRefs, original) || !slices.Contains(result.Report.RemovedRefs, oldTop) || slices.Contains(result.Report.RemovedRefs, original) {
+				t.Fatalf("upload report lost retained parent or known delta: %+v", result.Report)
 			}
 			published, err := manifest.ParseRef(result.Disk.Base)
 			requireWorkspaceIO(t, err)
@@ -169,6 +178,9 @@ func TestWorkspaceExportRetainedGraphNeedsNoLocationOrStore(t *testing.T) {
 			requireWorkspaceIO(t, err)
 			if result.Disk == nil || result.Disk.Base != base || !slices.Equal(result.Disk.BaseFromRefs, parents) || *result.Disk.Size != 8192 {
 				t.Fatalf("already published disk changed: %+v", result.Disk)
+			}
+			if err := result.ValidateExport(); err != nil || len(result.Report.RemovedRefs) != 0 {
+				t.Fatalf("retained graph report: %+v, %v", result.Report, err)
 			}
 			if named {
 				if _, err := os.Stat(destination); !os.IsNotExist(err) {

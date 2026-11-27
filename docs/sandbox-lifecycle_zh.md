@@ -302,7 +302,7 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 |---|---|---|
 | 查看设备 | `GET /sandboxes/{id}/workspaces` | `node-ctl workspace list B --json` |
 | 对运行中沙箱的空位接盘 | `POST /sandboxes/{id}/workspaces/attach?name=project`，正文为 `{"disk":{}}`、以 `disk` 包裹的完整磁盘，或 `{"disk":{"migrationToken":"…"}}` | `node-ctl workspace attach B --name project` 使用默认盘，也可用 `--disk-spec FILE` 或 `--token-file FILE` 选择来源 |
-| 导出已暂停沙箱的一个已启用盘 | `POST /sandboxes/{id}/workspaces/export?name=project`，正文为 `{}`，返回 `{"token":"…"}` | `node-ctl workspace export A --name project`；加 `--json` 输出含 token 的 JSON 对象 |
+| 导出已暂停沙箱的一个已启用盘 | `POST /sandboxes/{id}/workspaces/export?name=project`，正文为 `{}`，返回 `result`（kwt1）、`refs`、`diskRefs`、`removedRefs` | `node-ctl workspace export A --name project` 默认输出单行 token；加 `--json` 输出相同 API 对象 |
 
 命令使用沙箱所有者的 `E2B_API_KEY`。A 同步应用写入并暂停后，可通过标准输入将盘交给 B：
 
@@ -311,6 +311,20 @@ set -o pipefail
 node-ctl workspace export "$A" --name project |
   node-ctl workspace attach "$B" --name project --token-file -
 ```
+
+Workspace 导出的 token 与完整磁盘报告来自同一份最终 DiskV1。`diskRefs` 排序去重，
+包含 `base` 与全部 `base_from_refs`；容量及恢复层序仍保存在未改变的 kwt1 载荷中。
+各层均不设 `diskRef`。例如，仅含一个不可变层且没有已知移除引用的磁盘返回：
+
+```json
+{"result":"kwt1.…","refs":true,"diskRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
+```
+
+HTTP／CLI JSON 字段由 `token` 改为 `result`，即使忽略未知字段的旧客户端也需要
+更新读取字段；CLI 默认 token 输出保持兼容。私有存储 helper 直接调用 SDK，并将同次
+DiskV1 与报告交给 core，不解析 `sandbox-ctl export` 包装。`removedRefs` 只涉及
+选中磁盘，不释放保留的源 checkpoint。[报告消费规则](#publication-and-migration)
+同样适用于 Workspace。
 
 导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 返回 204 后，新发起的目录访问可以直接触发挂载，即使同一目录此前已有在空盘位上发起的访问。Guest 在实际访问时挂载文件系统，并向该访问返回文件系统或子目录本身的错误。
 
@@ -548,7 +562,7 @@ CaptureSandbox:
 ```
 
 capture 返回生产者的实际身份: `snapshot --json` 返回
-`{snapshotRef,sandboxRef,removedRefs}`, `export --json` 返回
+`{snapshotRef,sandboxRef,removedRefs}`, 本地 `export --output DIR --json` 返回
 `{sandboxRef,removedRefs}`. capture 的差集为 `[]`. Snapshot Bundle 在同一物理文件
 中携带 S 和 E 两个 selector. 本地引用保留身份限定符, 只公开 basename; checkpoint
 目录属于执行上下文. 默认人类可读输出及 upload-key stdout 不变. 适配器先验证完整
@@ -878,26 +892,37 @@ conductor 与 task reader 共用 `internal/reflocation` 的 deterministic 解析
 恢复不依赖额外 side table。
 
 需属主鉴权的 `POST /sandboxes/{id}/export` 请求仍为
-`{"toTemplate":false,"keepSource":true}`。成功响应保留既有 `result`，恰好增加对应的
-发布根引用与 `removedRefs`。Sandbox 响应有三个字段：
+`{"toTemplate":false,"keepSource":true}`。成功响应保留既有 `result`，并包含对应
+发布报告。完整的 Sandbox 报告为：
 
 ```json
-{"result":"kmt1.…","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":[]}
+{"result":"kmt1.…","refs":true,"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
 ```
 
-Snapshot 响应有四个字段：
+完整的 Snapshot 报告还包含内存引用集合：
 
 ```json
-{"result":"kmt1.…","snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.snapshot"]}
+{"result":"kmt1.…","refs":true,"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","snapshotRefs":["manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.snapshot"]}
 ```
 
 `toTemplate:true` 仅把 `result` 的含义改为对应 `sbx`/`snp` TemplateID。Snapshot 始终
 返回最终 S 实际引用的 E，包括选中的 located Bundle 成员。发布适配器严格解析单个
 `sandbox-ctl publish --json` 文档，并在源 finalization **之前**检查期望 S/E 角色、
-portable 最终根、必需的最终 E、有序唯一差集和安全文件 basename，不把诊断 stderr 当作
+portable 最终根、必需的最终 E、完整适用引用集合、有序唯一差集和安全文件 basename，不把诊断 stderr 当作
 成功结果。Builder checkpoint publication 共用同一契约。Core 方法统一返回
-`types.ExportResult`，HTTP 的 `result` 字段继续兼容既有客户端。采用新内部 CLI 契约时，
-sandboxer 与 orchestrator 应部署来自相匹配来源集的版本。
+`types.ExportResult`，HTTP 与 `node-ctl --json` 使用相同形状，CLI 默认仍输出单行
+结果字符串。新增字段会影响旧严格消费者。采用新内部 CLI 契约时，sandboxer 与
+orchestrator 应部署来自相匹配来源集的版本。
+
+`refs:true` 时，`snapshotRefs` 包含最终 S 与内存父层，`sandboxRefs` 包含最终 E
+以及根盘、数据盘、Workspace 的全部不可变层。集合排序去重，并包含对应主引用。
+`removedRefs` 必须存在，已知空差集使用 `[]`。上例没有保留父层。完整性描述元数据，
+不表示重新验证保留制品此刻可访问。
+
+只有缺少 `refs` 且精确符合旧 S/E 报告形状的输入才按旧规则兼容校验，再归一为
+`refs:false` 并丢弃旧 `removedRefs`。显式 false 必须省略全部复数集合及
+`removedRefs`，即使空或 null 数组也不允许。重复／未知键、null `refs`、不完整
+集合及尾随输出均失败。本地 capture 与全部 sandbox-ctl snapshot 保持原输出合同。
 
 本地发布的报告和 token 同时使用 S1/E1; keep-source 的 SQLite 与 cache 继续保存
 S0/E0. capture 及其生产者结果由 [Capture 与 Pause](#capture-and-pause) 维护.
@@ -910,11 +935,16 @@ S0/E0. capture 及其生产者结果由 [Capture 与 Pause](#capture-and-pause) 
 对的记录重新导出。不得用旧 token 或读取
 S 元数据重建持久对。
 
-已 portable 的源不再发布，返回 `removedRefs:[]`；portable Snapshot 直接返回 SQLite
+已 portable 的源不再发布，返回 `refs:false`，省略 `snapshotRefs`、`sandboxRefs`、
+`diskRefs`、`removedRefs`；portable Snapshot 直接返回 SQLite
 中保存的精确 S/E 对。即使两份工件都离线，Export 也不打开工件、不配置存储、不检查
 元数据、不启动元数据子进程。缺少 E 的 paused 对无效，绝不通过读取 S 修复。普通、keep-source、move 和已受理的 detached-template 成功分支
-均携带同一套一致根引用与差集。Resume/preemption、属主检查、生命周期取消、幂等及并发
+均遵守相同的报告完整性规则。Resume/preemption、属主检查、生命周期取消、幂等及并发
 继续遵守下文原有顺序。
+
+消费方通过完整集合登记持有关系。遇到 `refs:false`，继续保留身份与存储作用域一致的
+既有完整登记，不以空图覆盖，也不推断移除候选。只固定根文件不能保护未知父层，因此
+不能将未知图作为空分支参与删除判断。
 
 差集表示已知旧拓扑减去最终保留引用，不是字段改写事件或删除命令；包含确实退出的本地根
 和内部引用，最终拓扑中其他位置仍使用的共享引用会排除。skip 模式中被替换旧引用即使

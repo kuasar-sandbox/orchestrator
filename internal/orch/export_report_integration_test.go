@@ -189,10 +189,10 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						if err := result.Validate(); err != nil {
 							t.Fatal(err)
 						}
-						if portable && len(result.RemovedRefs) != 0 {
+						if portable && (result.Refs || result.RemovedRefs != nil || result.SnapshotRefs != nil || result.SandboxRefs != nil) {
 							t.Fatalf("portable removals=%v", result.RemovedRefs)
 						}
-						if !portable && len(result.RemovedRefs) == 0 {
+						if !portable && (!result.Refs || len(result.RemovedRefs) == 0 || len(result.SandboxRefs) == 0) {
 							t.Fatal("local roots not reported")
 						}
 						if strings.Contains(response.Body.String(), dir) {
@@ -203,6 +203,12 @@ func TestExportPublicationCLIAPI(t *testing.T) {
 						want := 3
 						if kind == types.ResumeSourceSnapshot {
 							want = 4
+						}
+						if !portable {
+							want += 2 // sandboxRefs and removedRefs accompany refs:true.
+							if kind == types.ResumeSourceSnapshot {
+								want++ // snapshotRefs completes the S group.
+							}
 						}
 						if len(fields) != want {
 							t.Fatalf("shape=%s", response.Body.String())
