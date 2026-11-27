@@ -6,7 +6,7 @@
 
 `orchestrator` provides the **E2B-compatible API, node services and multi-node control plane** for [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox). Use it to build templates, create and manage sandboxes, connect SDK clients, and operate a fleet of compute nodes.
 
-For a first deployment, follow the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md): install a matching aggregate release with **node-infra**, verify a persistent standalone node, and build your own template. The aggregate release supplies compatible runtime, network, storage and orchestration components. Use this repository's guides for the operations and configuration below.
+Start with the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md): pull the **node-infra** image with Docker, run it with a dedicated data volume, and execute your first Guest command. The image supplies compatible runtime, network, storage and orchestration components. Then configure a persistent site Node and build your own application template. Use this repository's guides for the operations and configuration below.
 
 <a id="documentation"></a>
 
@@ -14,7 +14,8 @@ For a first deployment, follow the project [Quick Start](https://github.com/kuas
 
 | Your next task | Guide | Completion check |
 |---|---|---|
-| Install and start a persistent node | [Project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md), then [Node operation](docs/node.md#operate-a-node) | Conductor and Proxy are running; both client endpoints are reachable |
+| Run your first Guest command | [Project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md) | The Guest command returns its output and exit status |
+| Configure a persistent site Node | [Project deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md), then [Node operation](docs/node.md#operate-a-node) | Conductor and Proxy are running; both client endpoints are reachable |
 | Build your application template | [Template Build](docs/node-build.md#client-workflow) | This Build is `ready`; retain its canonical TemplateID |
 | Run, pause and reconnect a sandbox | [Sandbox lifecycle](docs/sandbox-lifecycle.md#recommended-workflow) and [SDK access](docs/node-proxy.md#connect-a-client) | Commands and files work through the configured data endpoint |
 | Add outbound access or change network policy | [Project networking guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#native-egress) | The guest reaches only the intended destinations through the selected egress path |

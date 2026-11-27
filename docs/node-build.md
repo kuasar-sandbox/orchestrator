@@ -17,18 +17,18 @@ This is the complete node Build contract: registration and target selection, imm
 Use an already configured Node/API key/TLS trust and a reachable, native-architecture
 `APP_IMAGE` pinned by digest. The image already contains your application. Reuse
 Node's registry credentials; this recipe needs no COPY bucket. The [Build API](#build-api) defines registration, trigger and status. This HTTP recipe selects an explicit target through the Register Header. The project's pinned E2B Python 2.25.1 supports the auto flow,
-and shares `headers` across Register and Trigger. This source revision accepts
-an unchanged `X-Kuasar-Sandbox-Network` and a Builder header containing only the
-already registered `target` as **assertions** on Trigger. It cannot add or change
-those inputs. Releases predating that support reject the repeated configuration
-headers; the separate HTTP calls below work with those releases as well. Other
-configuration headers and Trigger metadata remain registration-only.
+and shares `headers` across Register and Trigger. Trigger accepts an unchanged
+`X-Kuasar-Sandbox-Network` and a Builder header containing only the already
+registered `target` as **equality assertions**. It cannot add or change those
+inputs. Other Sandbox configuration headers remain registration-only, and
+Trigger rejects nonempty `metadata`. The separate HTTP calls below send configuration only on
+Register and source/build steps on Trigger.
 
 Choose `BUILD_KIND=img` to publish only the image, `sbx` for cold E with portable
 Sandbox defaults, or `snp` for initialized memory S. For S, set `APP_START` and
 `APP_READY` to the actual service start and readiness commands. Explicit Image
 must not receive them. When the build declares or inherits a workspace, set this example’s `BUILD_KIND` to `sbx` or `snp` so the registration request includes an explicit Sandbox target. For builds without workspaces, `auto` selects memory S when an effective start or ready command exists, or Image otherwise.
-This example uses the Demo's execution budget; validate admission for your node.
+This example requests 2 vCPUs and 6,144 MiB of execution memory; size the request for your workload and validate admission on your Node.
 
 For native egress or another nondefault transit path, set `KUASAR_NETWORK_JSON`
 to the deployment's [network object](sandbox-lifecycle.md#network-and-egress)

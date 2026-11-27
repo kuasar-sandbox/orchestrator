@@ -2,12 +2,9 @@
 
 Implementation reference for Node Group persistence. For the supported user workflow, use [Group operations](cluster.md#groups-and-placement); no direct database editing is required.
 
-This document describes the local foundation of the Node-owned Group resource
-in [proposal #570](https://github.com/kuasar-sandbox/orchestrator/issues/570).
-HTTP/UDS and trusted NodeLink maintenance use this same transaction core;
-[cluster operations](cluster.md) describes reporting, import and request
-admission. The foundation was delivered before those consumers and introduces
-no runtime feature switch.
+The Node owns Group persistence. HTTP/UDS and trusted NodeLink maintenance use
+the same transaction core; [cluster operations](cluster.md) describes reporting,
+import and request admission. Group persistence requires no runtime feature switch.
 
 `node_groups` stores each active name, revision, owner fingerprint, fixed
 API/manifest-root binding and the complete private context. Root material and

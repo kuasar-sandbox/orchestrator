@@ -17,14 +17,14 @@
 前提是已配置 Node/API key/TLS 信任，`APP_IMAGE` 为可达、原生架构、digest 固定
 且已包含应用的镜像。复用 Node 的 registry 凭据，不需要 COPY bucket。[Build API](#build-api)定义 Register、Trigger、Status 的权威契约；本用例使用 HTTP，显式目标通过 Register Header 表达。
 项目固定的 E2B Python 2.25.1 支持 auto 流程，并在 Register、Trigger 间共用 `headers`。
-本源码版本允许 Trigger 重发完全相同的 `X-Kuasar-Sandbox-Network`，以及仅含已注册
-`target` 的 Builder 头，作为**等值断言**，不允许新增或修改这些输入。此前发布版本
-仍拒绝重发配置头；下面的分步 HTTP 配方也适用于这些版本。其他配置头与 Trigger
-metadata 仍限注册时使用。
+Trigger 允许重发完全相同的 `X-Kuasar-Sandbox-Network`，以及仅含已注册
+`target` 的 Builder 头，作为**等值断言**，不允许新增或修改这些输入。其他 Sandbox
+配置头仅在 Register 接受；Trigger 拒绝非空 `metadata`。下面的分步 HTTP 配方只在 Register 发送
+配置，在 Trigger 提交来源及构建步骤。
 
 选择 `BUILD_KIND=img` 仅发布镜像，`sbx` 发布带 portable 默认值的冷 E，`snp`
 发布初始化内存 S。S 需设置实际服务 `APP_START` 和 `APP_READY`；显式 Image
-不能传入这些命令。构建声明或继承 workspace 时，将本例的 `BUILD_KIND` 设为 `sbx` 或 `snp`，注册请求就会包含显式的 Sandbox 目标。无 workspace 的构建可使用 auto，有有效 start 或 ready 命令时选内存 S，否则选 Image。本例使用 Demo 执行预算，请按节点检查准入。
+不能传入这些命令。构建声明或继承 workspace 时，将本例的 `BUILD_KIND` 设为 `sbx` 或 `snp`，注册请求就会包含显式的 Sandbox 目标。无 workspace 的构建可使用 auto，有有效 start 或 ready 命令时选内存 S，否则选 Image。本例申请 2 vCPU、6,144 MiB 执行内存；请按工作负载调整，并检查 Node 的准入预算。
 
 原生 egress 或非默认 transit 路径需要在运行前将 `KUASAR_NETWORK_JSON` 设为
 部署的[网络对象](sandbox-lifecycle_zh.md#network-and-egress)。例如 Area 7 使用

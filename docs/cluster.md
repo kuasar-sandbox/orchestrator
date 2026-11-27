@@ -395,8 +395,8 @@ namespace, then restart cache consumers as required by the recovery contract.
 A new namespace has a different key, and existing continuations must be
 discarded. Corrupt or previously deleted key records fail closed and are never
 silently replaced.
-There is no public key deletion or rotation API; a future rotation protocol must
-explicitly define which cursor versions remain accepted.
+There is no public cursor-key deletion or rotation API. Preserve the namespace
+key in database backups so existing continuations can remain valid.
 
 <a id="router-control-plane"></a>
 
@@ -1241,7 +1241,7 @@ High-frequency usage and liveness are not projected to node_list. That directory
 
 #### Incremental subscriptions
 
-When starting a subscription, the node owner can supply an opaque revision string. The current format is `source_fingerprint:seq`, parsed privately by the node; callers must treat the token as opaque. Matching fingerprints and available changelog history permit incremental replay; otherwise a full resync occurs. A randomly staggered 1–6 hour full-resync cycle was a design recommendation, not an implemented periodic timer. Current full sync is driven by connection/resume-token and replay-window conditions.
+When starting a subscription, the node owner can supply an opaque revision string. The current format is `source_fingerprint:seq`, parsed privately by the node; callers must treat the token as opaque. Matching fingerprints and available changelog history permit incremental replay; otherwise a full resync occurs. Full sync is driven by connection, resume-token and replay-window conditions; there is no periodic full-resync timer.
 
 Before full subscription starts, the nodelink owner captures that node's sandbox-ownership baseline. At the completion bookmark, it cleans only baseline entries absent by node_sandbox_id in this snapshot. Before cleanup, it rereads and verifies that the complete current stable/node-generation ownership still matches the baseline, protecting work newly dispatched or rebound during synchronization. An incremental-replay bookmark only advances the resume token and does not clean missing entries.
 
@@ -1671,13 +1671,11 @@ Build placement continues to use registration headroom and the selected node's d
 
 The node is the authority for sandbox/build execution state. Sandbox/build records in `route_link`, reverse ownership in `node_link`, and admission-related projections derive from node facts for routing, queries or scheduling; operator files cannot create or transfer them. A terminal Build remains a projection of one node execution. Its produced template/manifest is durably reusable; the BuildRecord is not.
 
-The selected backend's consistent database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. The explicit recovery/bootstrap protocol is not implemented; [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) is a historical proposal closed as not planned, not an available recovery procedure; manually writing execution rows must not bypass that limitation.
-
-The historical proposal [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33), closed as not planned, described an **unbound durable route** with a migration token as the disaster-recovery object for a portable paused sandbox, not SandboxRecord. It would contain no old SID/NodeID/admission and use fresh placement, target-node snapshot validation and a new identity before READY established the runtime route. This recovery-only workflow is not implemented or available through normal route_link APIs.
+The selected backend's consistent database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. There is no supported recovery/bootstrap operation to reconstruct that lost ownership from surviving Nodes. Do not manually write execution rows to bypass this boundary.
 
 Manifest Bundle does not change migration-token/KMT wire format: the existing source fields identify E-only or an exact S/E pair, including Bundle refs. Import retaining S reads only S and paired E metadata in a tenant helper for runtime admission. Target-node task-local launch preflight reads the root Bundle's contiguous metadata prefix, gathers the selected launch's located sources from flat `bundle/refs`, and deterministically derives the mapping using `checkpoint.remote.ref_location_parent`. Same-directory siblings need no mapping; cold selection does not require the memory-only closure. The shared conductor does not open or recursively scan referenced Bundles. Export/promote still delegates to sandboxer, publishing the root Bundle and its unlocated siblings unchanged while retaining the addresses of externally located dependencies.
 
-Group inputs and tenant roots must be retained by their administration/import source. Node databases own applied Group context and bound object credentials; the optional Placer is not a substitute for Node or Registry backup. The current protocol has no operator runtime-import fallback for complete Registry execution-state loss; #33/#34 are historical proposals, not implementation commitments. It must be reported as unrecoverable through the current protocol, instead of constructing route/build ownership that could conflict with nodes.
+Group inputs and tenant roots must be retained by their administration/import source. Node databases own applied Group context and bound object credentials; the optional Placer is not a substitute for Node or Registry backup. Complete Registry execution-state loss has no operator runtime-import fallback. Report that ownership as unrecoverable through the control plane instead of constructing route/build records that could conflict with surviving Nodes.
 
 <a id="registry-reliability"></a>
 
@@ -1692,9 +1690,9 @@ Group inputs and tenant roots must be retained by their administration/import so
 | Node host reboot | Running processes are gone. If node SQLite/artifacts survive, reconciliation still processes paused rows, accepted interrupted restores, cleanup owners and retained Builds. Missing executions converge through node reports/exact route cleanup; no blanket durable-row deletion or automatic recreation of every old sandbox |
 | One Registry member fails | With a shared PostgreSQL/FDB backend, other service candidates still access durable metadata; a single SQLite Registry must restart. Nodes whose stream owner failed reconnect; registration fences reject stale overlapping sessions |
 | The selected database is unavailable or cannot commit | Metadata operations fail or return an explicit unknown commit outcome; Registry does not fall back to local writes |
-| Registry metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; the application recovery/bootstrap protocol remains unavailable (#34 is historical) |
+| Registry metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; without a consistent Registry database backup, that ownership is unrecoverable |
 | Membership change | Changes service candidates and node-link affinity; all views keep using the same database and prefix |
-| Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. Provider data and portable templates/manifests remain reusable, but do not restore lost Registry execution ownership. Migration-token route recovery (#33) is a historical, unimplemented proposal, not an execution-row import or an available fallback |
+| Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. Provider data and portable templates/manifests remain reusable, but do not restore lost Registry execution ownership. A retained migration token does not reconstruct lost Registry ownership |
 
 <a id="registry-performance"></a>
 

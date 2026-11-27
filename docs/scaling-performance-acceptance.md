@@ -2,7 +2,7 @@
 
 Historical performance evidence for the revisions and environment recorded below. Use [cluster operations](cluster.md) and [resource operations](node-resource.md) for current user workflows; these measurements are not production capacity recommendations.
 
-This change addresses repeated or unrelated work as sandbox, Group and authentication-root counts grow. The baseline is `2cc052363d0dd5646a41606f9a77ce14b04053e5`. It does not establish a 100,000-VM capacity limit or a production latency SLO.
+The measured implementations bound repeated or unrelated work as sandbox, Group and authentication-root counts grow. The baseline is `2cc052363d0dd5646a41606f9a77ce14b04053e5`. It does not establish a 100,000-VM capacity limit or a production latency SLO.
 
 ## Scope and invariants
 
@@ -118,6 +118,8 @@ The SQLite benchmark reconstructs the previous index layout only inside its temp
 
 Regression coverage includes old-database reopen and exact decoded-record preservation; mixed owners/states and cross-page completeness; production query plans; key renewal without any ownership reads; missing/cancelled/partial key reads; file snapshot isolation and next-pass visibility; exact JSON size limits and report ordering; fingerprint-bound seeks and full-MAC checks; and public pagination, cursor privacy, current authorization, namespace-key concurrency and unknown outcomes.
 
-The required merge gate is `ci / finalize`. The source workflow runs the full Go suite, race detector, vet, real PostgreSQL and FoundationDB repository contracts, source fixtures and the native integration suite. Final gate status belongs to the PR's exact submitted head.
+The source verification workflow runs the full Go suite, race detector, vet,
+real PostgreSQL and FoundationDB repository contracts, source fixtures and the
+native integration suite.
 
-This change does not remove every linear task: target selection still considers Group–Node bindings, key renewal still visits that Node's key leases, complete inventories still visit all records, and background reaping, idle scheduling, reconnect snapshots and observation fan-out have separate cardinality costs. No native port-capacity increase, revision-cell deletion, recovery/fencing redesign or 100,000-live-VM claim is included.
+Some operations still perform linear work: target selection still considers Group–Node bindings, key renewal still visits that Node's key leases, complete inventories still visit all records, and background reaping, idle scheduling, reconnect snapshots and observation fan-out have separate cardinality costs. No native port-capacity increase, revision-cell deletion, recovery/fencing redesign or 100,000-live-VM claim is included.

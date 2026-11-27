@@ -323,8 +323,8 @@ server-only namespace key 和 XChaCha20-Poly1305 加密并认证，空页的游�
 Registry 仅缓存成功读取的 key，不为每页写入持久 cursor session。该不可变记录应随
 namespace 一起进入一致数据库备份，并随元数据恢复；恢复后按既有恢复合同重启缓存
 消费者。新 namespace 会有不同 key，旧游标须丢弃。损坏或已有删除历史的 key
-fail closed，不能静默重建。当前无公开删除或轮换 API，未来轮换协议须明确旧游标
-版本的接受边界。
+fail closed，不能静默重建。游标密钥没有公开删除或轮换 API；数据库备份必须保留
+namespace 密钥，才能继续验证既有 continuation。
 
 <a id="router-control-plane"></a>
 
@@ -1271,8 +1271,8 @@ pending 重放幂等.standalone 与 cluster Delete 使用同一 finalizer,node-l
 #### 增量订阅
 
 node owner 发起订阅时可传 opaque rev 字符串。当前格式为 `source_fingerprint:seq`，由 node 私有解析，调用方仍须将 token 视为 opaque。
-fingerprint 匹配且 changelog 可用时 replay 增量，否则全量 resync。1h–6h 随机打散周期的全量
-resync 是原设计建议，当前没有实现该周期 timer；实际全量同步由连接、resume token 与 replay window 条件触发。
+fingerprint 匹配且 changelog 可用时 replay 增量，否则全量 resync。全量同步由连接、resume token
+及 replay window 条件触发，没有周期性全量 resync timer。
 
 全量订阅开始前,nodelink owner 捕获本节点 sandbox 归属表基线。bookmark 表示本轮同步结束时,只清理
 基线中未按 node_sandbox_id 出现的条目;清理前再次读取并确认当前完整稳定/节点代际归属
@@ -1894,13 +1894,8 @@ node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/bu
 所选后端的一致数据库 backup/restore 保存的是数据库记录，与应用层 import 不同。恢复须与 node 事实协调，并重启旧数据库历史的缓存消费者；恢复元数据本身不能证明旧进程仍然存在。registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
 build execution、node ref、admission 或本机 checkpoint。节点虽持久化 cluster sandbox 的独立系统上下文,
 但当前 node-link full report 不回传 Registry-owned identity;元数据数据库不可恢复地丢失时不能仅靠 route event
-重建 ownership,也不能预装 ownership 让旧事件看似合法。这条显式 recovery/bootstrap 协议尚未实现;
-[issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 是以 not planned 关闭的历史提案,不是可用恢复步骤;当前不得用手工写入执行 row 规避该限制。
-
-以 not planned 关闭的历史提案 [issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33)
-曾将带 migration token 的**未绑定持久 route**设计为可移植 paused sandbox 的灾备对象,而不是 SandboxRecord。
-该设计不携带旧 SID/NodeID/admission,拟重新 placement,由目标 node 校验 remote snapshot 并创建新身份,
-再由 READY 上报建立运行态 route。此 recovery-only workflow 尚未实现,正常 route_link API 不提供该能力。
+重建 ownership，也不能预装 ownership 让旧事件看似合法。系统不提供从存活 Node 重建这类丢失
+归属的 recovery/bootstrap 操作，不得通过手工写入 execution row 绕过这一边界。
 
 Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 E-only 或精确 S/E 对，
 其中可以使用 Bundle ref。保留 S 的 Import 只在租户 helper 中读取 S 与关联 E 元数据进行 runtime
@@ -1911,8 +1906,8 @@ Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 
 Bundle 及其无 location sibling，带 location 的外部依赖保持原地址。
 
 Group 输入和租户根凭据由其管理入口/导入源保留。Node 数据库持有已应用的 Group 上下文和对象凭据绑定；可选 Placer 不能替代 Node 或 Registry 备份。
-当前协议对完整 registry 执行态丢失没有 operator runtime import 兜底;#33/#34 是历史提案,不是实现承诺;系统必须明确报告不可恢复,
-而不是构造可能与节点冲突的 route/build ownership。
+完整 Registry 执行态丢失没有 operator runtime import 兜底。应明确报告该归属无法通过控制面恢复，
+不能构造可能与存活 Node 冲突的 route/build 记录。
 
 <a id="registry-reliability"></a>
 
@@ -1927,9 +1922,9 @@ Group 输入和租户根凭据由其管理入口/导入源保留。Node 数据�
 | node 整机重启 | 运行进程丢失。SQLite/artifact 保留时仍 reconcile paused row、已接纳的中断 restore、cleanup owner 和保留的 Build；缺失执行经节点上报/exact route 清理收敛，不无条件删除全部 durable row 或自动重建全部旧 sandbox |
 | registry 单成员故障 | 共享 PostgreSQL/FDB 的其他服务候选仍可访问持久元数据；单 SQLite Registry 需要重启。stream owner 故障的 node 重连，registration fence 拒绝重叠旧 session |
 | 所选数据库不可用或无法提交 | 元数据操作失败或返回明确 Unknown commit 结果，不回退到 Registry 本地写入 |
-| Registry 元数据不可恢复地丢失但 node 存活 | 普通 route event 无法重建丢失 ownership，应用 recovery/bootstrap 协议仍不可用（#34 是历史提案） |
+| Registry 元数据不可恢复地丢失但 node 存活 | 普通 route event 无法重建丢失 ownership；缺少一致的 Registry 数据库备份时，该归属不可恢复 |
 | membership 变更 | 改变服务候选与 node-link affinity；各视图继续使用同一数据库和 prefix |
-| 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。provider 数据与 portable template/manifest 仍可复用，但不能恢复丢失的 Registry 执行归属。migration-token route 恢复（#33）是未实现的历史提案，不是执行 row import 或可用兜底 |
+| 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。provider 数据与 portable template/manifest 仍可复用，但不能恢复丢失的 Registry 执行归属。保留的 migration token 不能重建丢失的 Registry 归属 |
 
 <a id="registry-performance"></a>
 

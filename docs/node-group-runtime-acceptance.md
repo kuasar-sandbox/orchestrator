@@ -1,13 +1,11 @@
 # Node Group and snapshot runtime acceptance
 
-Historical acceptance evidence at the recorded source revisions. Use [first cluster](cluster.md#minimum-cluster) for current setup. The delivery checklist records the state of this evidence collection; current proposal and release status belongs to the linked issue history and release receipts.
+Historical acceptance evidence at the recorded source revisions. Use [first cluster](cluster.md#minimum-cluster) for deployment. The measurements below describe the identified binaries and environments, not a capacity guarantee for other releases.
 
-This report accompanies [orchestrator #570](https://github.com/kuasar-sandbox/orchestrator/issues/570)
-and [sandboxer #472](https://github.com/kuasar-sandbox/sandboxer/issues/472).
-It separates source tests, native database tests, product processes with simulated
-Node execution, and actual Node/KVM experiments. Results from one level do not
-stand in for another. Final merge, release and aggregate receipts were separate closeout requirements
-for this evidence collection. The checklist below is retained as a historical record.
+This report records Node Group and snapshot runtime validation. It separates
+source tests, native database tests, product processes with simulated Node
+execution, and actual Node/KVM experiments. Results from one level do not stand
+in for another.
 
 ## Delivered behavior
 
@@ -49,8 +47,8 @@ for this evidence collection. The checklist below is retained as a historical re
 | Orchestrator reader, #571 | head `ccc4cd82d40d40d343f36aa083ba795c2c7124a7`; merged `a0cf03d51ae9e8d15b7bc877d43c4afb351f11d0` | exact-head run `45274746152` and component release `45296417785` passed; actual SDK and both-architecture tools verified as `v0.2.0-preview.20261124.2` |
 | Node Group foundation, #572 | head `187e04a98d67fc4dfe9a96bc6c1aaa0d8bd1f45a`; merged `d9626893d02b7754dcd1542bc021146c24a58371` | exact-head run `45287872172` passed (24 successful jobs; four inapplicable jobs skipped); tested merge tree equals the final main tree, including the cursor escaping fix |
 | Shared support repository, #573 | head `80c6e0114248c214bed4a3a94a86b8697d7edd2b`; merged `caa007de10fcf156e239af7c820f952d9945c2f6` | official run `45295630484`, attempt 2, passed (24 successful jobs; four inapplicable skips). Initial ARM input-download HTTP 503 was retried without source changes; tested and merged trees match |
-| Snapshot producer, sandboxer #474 | head `54d24f759e539217bbbeae6ae21bc1e42c923e4c`; merged `2f6187eb26585215d57658382753c9ceaf38c2e3` | exact-head run `45306961103` passed (30 successful jobs; three inapplicable skips), including both-architecture snapshot E2E. Tested and merged trees match. Actual reader gate preceded enablement; final combined release remains pending |
-| Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | rebased onto actual merged #573 with identical full tree and all 22 patches unchanged; official CI/release pending |
+| Snapshot producer, sandboxer #474 | head `54d24f759e539217bbbeae6ae21bc1e42c923e4c`; merged `2f6187eb26585215d57658382753c9ceaf38c2e3` | exact-head run `45306961103` passed (30 successful jobs; three inapplicable skips), including both-architecture snapshot E2E. Tested and merged trees match; the tested reader binaries accepted producer output on both native architectures |
+| Cluster activation, #574 | runtime core through `85d1ce7`; failure/carrier tests through `1c6ff22`; operator config repair `174733c` | native database, control-plane and VM evidence below uses the listed source; no published activation binary is claimed for those runs |
 
 The [support CI receipt](evidence/node-groups-20261124/group-support-ci-receipt.json)
 records all jobs and the tested/merged tree identity. The activation main rebase
@@ -68,9 +66,8 @@ Published `sandbox-ctl` SHA-256:
 Aggregate `release-v0.2.0-preview.20261124.1` passed run `45274512568`,
 including both native published-download checks (47 successful jobs and four
 inapplicable jobs skipped). The [CI receipt](evidence/node-groups-20261124/reader-aggregate-receipt.json)
-records every job. It selects the Sandboxer reader
-but predates Orchestrator #571; it does not satisfy the remaining Orchestrator
-consumer gate.
+records every job. Its selected Sandboxer includes the reader; its Orchestrator
+selection does not include the annotated-reference reader.
 
 Orchestrator `v0.2.0-preview.20261124.2` subsequently delivered #571 from clean
 source `d9626893d02b7754dcd1542bc021146c24a58371`. Its actual public module sums
@@ -78,8 +75,7 @@ and default platform selection are retained in the [SDK receipt](evidence/node-g
 Both release archives matched published sizes/digests; `node-ctl`, `cluster-ctl`
 and `e2b-key-ctl` on both architectures report that clean source in their build
 information. [Binary hashes](evidence/node-groups-20261124/orchestrator-reader-delivery.json)
-identify the downloaded consumers. The producer became Ready only after these
-receipts were obtained. The final writer/activation aggregate is still pending. The [successful build input receipt](evidence/node-groups-20261124/orchestrator-reader-build-inputs.json) identifies actual accelerator, connector, Sandboxer and runtime source versions for both release builds; local `(devel)` replacements in Go build information alone are not treated as SDK-version proof.
+identify the downloaded consumers. The [successful build input receipt](evidence/node-groups-20261124/orchestrator-reader-build-inputs.json) identifies actual accelerator, connector, Sandboxer and runtime source versions for both release builds; local `(devel)` replacements in Go build information alone are not treated as SDK-version proof.
 
 Both published readers restored snapshots from the updated producer on their
 native KVM hosts. The updated producer hashes are
@@ -288,8 +284,7 @@ resident memory. Both architectures executed the layout and long-template tests.
   Opaque-token migration has no new Registry runtime prefilter. No production
   scale, HA SLA or rolling mixed-version protocol compatibility is claimed.
 - Aggregate `45226273027` failed at published-download validation with GitHub
-  403 after retry; it is not a successful full aggregate receipt. Later aggregate
-  and final exact-source receipts must be recorded independently.
+  403 after retry; it is not a successful full aggregate receipt.
 
 The first public-cluster C02 attempt failed because its external artifact location
 did not match the existing sharded resolver. Mapping that location to the original
@@ -301,9 +296,8 @@ including actual release/capture/layered-restore execution. The failing official
 run `45298653710` is retained; its replacements and both-architecture snapshot E2E subsequently passed before the normal protected merge.
 
 The [producer CI receipt](evidence/node-groups-20261124/snapshot-producer-ci-receipt.json)
-records the final successful official run and both retained initial fixture
-failures. The source producer is now merged; the final aggregate must exercise
-its actual published products together with the activation products.
+records the successful official run and both retained initial fixture failures.
+The source-run and released-binary results remain separate evidence categories.
 
 The following official run `45301574190` found a second test-fixture assumption:
 its dirty-memory evidence used the last `@` qualifier as the physical Snapshot
@@ -316,17 +310,6 @@ passed all sixteen comparison records, lost-response recovery, same-state size
 checks and balloon release/reuse. Its initial local preparations (incomplete
 upload and an overlong Unix socket path) are recorded as fixture failures, not
 successful product runs. No production code changed for either fixture repair.
-
-## Historical closeout checklist
-
-- [x] Reader changes reviewed and merged through normal protection.
-- [x] Native database, process, stream and real VM evidence collected.
-- [x] Before/after product and snapshot performance, including regressions.
-- [x] Actual Orchestrator reader SDK/tools delivered before producer enablement.
-- [ ] Remaining PRs rebased onto main, reviewed, exact-head CI passed and merged.
-- [ ] Final trusted component/aggregate releases and both-architecture identities.
-- [ ] Final F/C matrix and scope limitations attached to both original proposals.
-- [ ] Proposals closed only after the preceding delivery receipts are complete.
 
 ## Retained evidence
 

@@ -801,7 +801,7 @@ only then are the parent row and management location removed. Paused gains no TT
 Build terminal_ttl keeps its existing finished_unix and owner-free exact-delete rules. No automatic
 VACUUM or remote artifact GC is introduced.
 
-These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v11 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
+Export uses separate publication and finalization steps; move deletion uses the same durable acceptance and Node-local finalizer. Build execution retains its two admission levels and cgroup ownership. Post-registration Build projection converges through full synchronization and live deletion while preserving immutable registered-Node binding. Node-local cleanup does not perform remote-artifact garbage collection or maintain a second path authority.
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 

@@ -919,7 +919,7 @@ Create 和 Build 共用既有 `kuasar-sandbox.launch` metadata 对象。E2B 在�
 
 envd 继续作为 primary，OCI/Launch 环境由 Sandboxer 按已有规则合并。Orchestrator 不重复读取镜像 Env、不改写 PATH，也不传递默认 PATH 来源标记。调用者显式 PATH 保留原值；实际选中 Runtime systemd 时，native exec 默认 PATH 包含私有工具目录。
 
-全部 E2B 模式均保留 envd primary，其 stdout/stderr 继续经应用 MUX 进入 `sandbox` journal；本轮不新增 envd plugin，不改变日志分类。
+全部 E2B 模式均运行 envd primary，其 stdout/stderr 经应用 MUX 进入 `sandbox` journal，无需额外的 envd 日志 plugin。
 
 Runtime readiness 或 envd primary 的 `app_started` 不代表 E2B Running。当前 run 必须在既有 launch context 中成功完成 `POST /init`；取消、期限耗尽或 run 已失效都不能发布 Running。零启动超时保留现有无上限语义；Guest service 就绪不要求任意用户 unit 全部健康。
 
@@ -1047,12 +1047,10 @@ Reset 先提交则旧 TTL 候选失效，Delete 先提交则 Reset 无法发布 
 重试，全部清理完成后才移除父记录和管理定位；paused 不增加 TTL。Build terminal_ttl 继续
 沿用 finished_unix 与 owner-free exact-delete 合同，不增加自动 VACUUM 或远端 artifact GC。
 
-以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。Export 保持
-publish/finalize 两阶段竞争，move 复用相同的持久删除接纳与 finalizer（#348）；#205 的 Build resources、两级准入和 cgroup
-权威不变；当前 main 仍有 post-registration Build projection，故 routesync v11 沿用 v6 引入的 Build full sync +
-live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
-节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
-cleanup stage 或第二份路径权威。
+Export 分别执行 publication 与 finalization，move 删除复用相同的持久接纳与 Node-local
+finalizer。Build 执行保持两级准入及 cgroup 归属。注册后的 Build 投影通过全量同步与实时删除
+收敛，保持已注册 Node 的不可变绑定。Node-local 清理不执行远端 artifact GC，也不维护第二份
+路径权威。
 
 因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
 已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。

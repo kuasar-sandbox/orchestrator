@@ -6,7 +6,7 @@
 
 `orchestrator` 为 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 提供 **E2B 兼容 API、节点服务和多节点控制面**。用它构建模板、创建和管理 Sandbox、接入 SDK 客户端，并运维计算节点集群。
 
-首次部署请从主项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)进入：使用 **node-infra** 安装匹配的聚合版本，验证持久单节点，再构建自己的模板。聚合版本提供相互兼容的运行时、网络、存储和编排组件。本仓指南负责下列具体操作与配置。
+从主项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)进入：用 Docker 拉取 **node-infra** 镜像，挂载专用数据卷运行，然后执行首个 Guest 命令。镜像提供相互兼容的运行时、网络、存储和编排组件。接着配置持久站点 Node，再构建自己的应用模板。本仓指南负责下列具体操作与配置。
 
 <a id="documentation"></a>
 
@@ -14,7 +14,8 @@
 
 | 下一步任务 | 指南 | 完成判据 |
 |---|---|---|
-| 安装并启动持久节点 | 主项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)，再看[节点运维](docs/node_zh.md#operate-a-node) | Conductor、Proxy 正常运行，客户端可访问两个入口 |
+| 执行首个 Guest 命令 | 主项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md) | 返回 Guest 命令的输出和退出码 |
+| 配置持久站点 Node | 主项目[部署指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)，再看[节点运维](docs/node_zh.md#operate-a-node) | Conductor、Proxy 正常运行，客户端可访问两个入口 |
 | 构建应用模板 | [模板构建](docs/node-build_zh.md#client-workflow) | 本次 Build 达到 `ready`，保存其 canonical TemplateID |
 | 运行、暂停和重新连接 Sandbox | [生命周期](docs/sandbox-lifecycle_zh.md#recommended-workflow)与 [SDK 接入](docs/node-proxy_zh.md#connect-a-client) | 命令和文件操作能通过配置的数据入口完成 |
 | 开通出站访问或调整网络策略 | 主项目[网络指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md#native-egress) | Guest 经所选 egress 路径访问预期目的地 |

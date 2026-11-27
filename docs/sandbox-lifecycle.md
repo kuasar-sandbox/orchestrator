@@ -120,7 +120,7 @@ and uses normal defaults.
 An empty string field means unspecified. An absent StableID remains empty in the
 stored optional field; `Sandbox.StableID()` supplies the local-ID fallback.
 
-Both nonempty fields in this new Create configuration use the existing
+Nonempty `id` and `stable_id` fields in Create identity configuration follow the
 `ValidLocalSandboxID` contract: 1..57 bytes, lowercase ASCII letters, digits and
 hyphens, starting and ending with a letter or digit. The exact pattern is
 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
@@ -897,7 +897,7 @@ Cold launch from E uses the target node's configured kernel and runtime, preserv
 
 If Connect must import a missing target, its memory selector also chooses the imported durable source: false stores E-only before cold launch. A later launch failure leaves paused E. For subsequent paused resumes, auto remains cold and true returns 409 until a new S is captured. This differs from one cold attempt on an existing local paused S. Import never rewrites the original token or deletes its S/E artifacts; see [Import selection](#import-selection).
 
-Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. A future autoResume=false must be separate traffic policy, not inferred from E/S kind; complete E2B autoResume is not implemented.
+Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. E/S kind selects the restore source; it does not disable traffic-triggered Wake. `autoResume=false` is not a supported traffic policy.
 
 <a id="reset-and-retention"></a>
 
@@ -1205,7 +1205,7 @@ send the same object as a JSON string in existing Create metadata:
 ```
 
 For a Build, choose this input at **registration**. Trigger cannot change it;
-newer servers accept the identical Network header as an assertion for SDKs that
+it accepts the identical Network header as an equality assertion for SDKs that
 reuse headers. The separate-call [Build recipe](node-build.md#client-workflow) accepts `KUASAR_NETWORK_JSON`
 for that purpose. A Sandbox E/S template carries its logical network with E;
 explicit current fields override inherited artifact fields. Image artifacts do

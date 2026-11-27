@@ -146,7 +146,7 @@ Header `{}` 清除两个低优先级选择，改用正常默认值。
 字段空字符串表示未指定。未指定 StableID 时，其可选持久化字段仍为空，
 由 `Sandbox.StableID()` 回落为本地 ID。
 
-本次新增 Create 配置的两个非空字段都使用现有 `ValidLocalSandboxID` 契约：
+Create 身份配置中的 `id` 与 `stable_id` 非空时都遵循 `ValidLocalSandboxID` 契约：
 1..57 字节，只允许小写 ASCII 字母、数字和连字符，首尾必须是字母或数字。
 精确模式是 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。大写、点、斜线、空白、NUL
 和超长值直接拒绝，不做自动转换。迁移 token 编码层保留历史 StableID 契约；节点 Import
@@ -812,8 +812,8 @@ Proxy 的 ordinary ingress 和 native exec activation 都经 `OnWake` 使用
 对应的数据面 adapter.这些入口全部只传 `ResumeAuto`:S 默认 memory,E 默认 cold.两种 source
 都保留既有 Wake 能力;
 proxy SHM 不携 source kind 或 cold gate。已鉴权的首个 E 请求保持 parked,直到 node
-完成 cold launch、route 变为 running 并成功拨通 backend 后才继续转发。未来的 `autoResume=false`
-若实现,必须是独立 traffic policy,不能从 E/S kind 推导。本变更不宣称完整实现 E2B autoResume。
+完成 cold launch、route 变为 running 并成功拨通 backend 后才继续转发。E/S kind 选择恢复来源，
+不会禁用流量触发的 Wake；`autoResume=false` 不是受支持的流量策略。
 
 <a id="reset-and-retention"></a>
 
@@ -1128,8 +1128,8 @@ X-Kuasar-Sandbox-Network: {"transit_gateway_ip":"192.0.2.10","transit_geneve_vni
 }
 ```
 
-Build 在**注册**时选择该输入，Trigger 不能修改。较新服务端允许 SDK 重用相同
-Network 头作为断言；分步 [Build 配方](node-build_zh.md#client-workflow)
+Build 在**注册**时选择该输入，Trigger 不能修改。SDK 可以重发相同
+Network 头作为等值断言；分步 [Build 配方](node-build_zh.md#client-workflow)
 通过 `KUASAR_NETWORK_JSON` 接收该对象。Sandbox E/S 模板的逻辑网络随 E 保存，
 当前显式字段覆盖 artifact 继承字段。Image artifact 不携带这些 Sandbox 默认值，
 从 Image 创建时需要再次指定网络。修改节点示例文件不会为已捕获状态自动应用新网络策略。

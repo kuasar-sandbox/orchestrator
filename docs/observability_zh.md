@@ -391,15 +391,15 @@ journalctl SYSLOG_IDENTIFIER=sandbox-ctl KUASAR_STABLE_ID=worker-42
 journalctl SYSLOG_IDENTIFIER=build KUASAR_BUILD_ID=build-17
 ```
 
-查询只作用于正在读取的 journal；跨节点汇聚由平台运营方负责。本修改不增加
+查询只作用于正在读取的 journal；跨节点汇聚由平台运营方负责。journal 集成不提供
 exporter 或中心日志存储。
 
 <a id="journal-boundaries-and-verification"></a>
 
 ### 边界与验证
 
-不改变 guest 环境、StdioSpec/MUX 协议、公共 API、metadata/header、快照格式或认证
-身份。`MANIFEST_KEY` 保留现有秘密传递路径，绝不写入输出目标。
+journal 路由独立于 guest 环境、StdioSpec/MUX 协议、公共 API、metadata/header、快照格式及认证
+身份。`MANIFEST_KEY` 使用秘密传递路径，绝不写入输出目标。
 `--log-to` 只选择运行时组件诊断出口，不替换进程描述符，不接管 Cloud Hypervisor
 stderr、runtime panic、node-ctl pre-exec 信息或 systemd 事件。
 
@@ -431,20 +431,16 @@ Telemetry 独立配置与部署；下文维护 source/identity、exporter graph 
 
 <a id="telemetry-release-scope"></a>
 
-### 源码与发布范围
+### 支持的数据与部署
 
-本契约描述 orchestrator main，包括已合入的独立服务（#359）、namespace 契约
-（#364）、原生 Collector 组装（#370）和查询/导出分离（#371）。它已实现，
-不是早期系统级 OTel 提案。独立的控制面 tracing PR #219 不构成已交付 API
-tracing 的证据。此处沙箱业务入口/查询仅支持指标；链接的基础设施 Collector
-组件不代表提供沙箱日志或 traces 查询。
+Telemetry 是独立服务，提供租户 namespace 隔离、原生 Collector 组装，并分别配置
+指标 exporter 与查询 backend。沙箱业务入口和查询支持指标；该服务不提供控制面
+API tracing 或沙箱日志/traces 查询。链接的基础设施 Collector 组件不会扩展此契约。
 
-部署时固定一个 aggregate Release，核对所选 orchestrator 版本、打包指南和
-该二进制的 `node-ctl telemetry --help`，用它校验配置并执行本文验证流程。
-main 文档、Preview manifest 或未合入版本选择 PR 都不能证明 Stable 已包含。
-不要推测旧版本支持此配置。单测和 namespace/OTLP 集成覆盖仅证明其已测场景，
-不证明任意 exporter 目标或生产容量；须验证所选 exporter、查询后端、身份
-隔离与保留策略在自身故障条件下的行为。
+固定一个 aggregate release，使用匹配二进制的打包指南及
+`node-ctl telemetry --help`。校验完整配置后，执行下文验证流程。在部署环境的
+故障条件下检查所选 exporter、查询 backend、租户隔离和保留策略；配置有效本身
+不能证明后端可用或满足生产容量。
 
 <a id="telemetry-components"></a>
 
@@ -527,10 +523,10 @@ conductor/Proxy 并列部署，不作为它们的 required dependency。
 | 本地加远端 fan-out | 启用 local, 同时引用 `sandboxlocal` 与远端 exporter; 明确选择一个 query backend |
 | 定制查询合同 | 静态绑定 `Runtime.MetricsHandler`, 配置 `query.handler: custom` |
 
-未发布的 `telemetry.storage`、组合接口 `extension.Storage`、`Runtime.Storage` 和
-`Runtime.StorageHeaders` 直接被替换. 使用 `local`、`query`、`Runtime.QueryBackend`
-及 `Runtime.QueryHeaders`; 本地 Collector exporter 改为 `sandboxlocal`. 不保留解析
-alias 或第二条运行路径. 写 exporter 与读 backend 分别配置和验证: OTLP destination
+通过 `local` 与 `query` 配置存储，自定义 backend 使用 `Runtime.QueryBackend`
+及 `Runtime.QueryHeaders`。本地 Collector exporter 为 `sandboxlocal`。
+`telemetry.storage`、`extension.Storage`、`Runtime.Storage` 和 `Runtime.StorageHeaders`
+均为不支持的名称，不提供解析 alias。写 exporter 与读 backend 分别配置和验证： OTLP destination
 不自动成为 query backend. 远端错误不会改选本地数据库, 也不会变成成功的空历史.
 
 <a id="local-tsdb"></a>

@@ -409,16 +409,16 @@ journalctl SYSLOG_IDENTIFIER=build KUASAR_BUILD_ID=build-17
 ```
 
 Queries operate on the journal being read; cross-node collection is the
-platform operator's responsibility. This change does not add an exporter or a
-central log store.
+platform operator's responsibility. The journal integration provides no exporter
+or central log store.
 
 <a id="journal-boundaries-and-verification"></a>
 
 ### Boundaries and verification
 
-No guest environment, StdioSpec/MUX wire, public API, metadata/header, snapshot
-format or authentication identity is changed. `MANIFEST_KEY` stays on the
-existing secret delivery path and is never included in output targets.
+Journal routing is independent of the guest environment, StdioSpec/MUX wire,
+public API, metadata/header, snapshot format and authentication identity.
+`MANIFEST_KEY` uses the secret delivery path and is never included in output targets.
 `--log-to` only selects runtime component diagnostics: it does not replace
 process descriptors or capture Cloud Hypervisor stderr, runtime panics,
 node-ctl pre-exec messages or systemd events.
@@ -456,23 +456,20 @@ Telemetry is independently configured and deployed. Its source/identity rules, e
 
 <a id="telemetry-release-scope"></a>
 
-### Source and release scope
+### Supported data and deployment
 
-This contract describes orchestrator main, including the merged standalone service
-(#359), namespace contract (#364), native Collector assembly (#370) and query/export
-separation (#371). It is implemented, not the earlier system-wide OTel proposal.
-The separate control-plane tracing PR #219 does not establish delivered API tracing.
-Sandbox business ingress/query here is metrics-specific; linked infrastructure
-Collector components do not imply sandbox logs/traces query support.
+Telemetry runs as an independent service. It separates tenant namespaces,
+assembles native Collector components, and configures metric export and query
+backends independently. Sandbox business ingress and query support metrics;
+control-plane API tracing and sandbox log/trace queries are not provided by this
+service. Linked infrastructure Collector components do not expand that contract.
 
-For deployment, pin one aggregate Release and inspect its selected orchestrator
-version, packaged guide and `node-ctl telemetry --help`; validate configuration with
-that binary and run this document's verification path. A main-branch guide, a
-Preview manifest or an open release-selection PR is not proof of Stable inclusion.
-Do not backport this configuration by inference to older releases. Unit tests and
-namespace/OTLP integration coverage establish their tested cases, not arbitrary
-exporter destinations or production capacity. Validate your chosen exporter,
-query backend, identity isolation and retention under your own failure conditions.
+Pin an aggregate release and use its packaged guide and
+`node-ctl telemetry --help` with the matching binary. Validate the complete
+configuration and follow the verification steps below. Test the selected exporter,
+query backend, tenant isolation and retention under your deployment's failure
+conditions; configuration validity alone does not establish backend availability
+or production capacity.
 
 <a id="telemetry-components"></a>
 
@@ -564,12 +561,11 @@ Enabling local storage alone selects neither a write pipeline nor a query backen
 | Local plus remote fan-out | Enable local and reference `sandboxlocal` plus remote exporters; explicitly select one query backend |
 | Custom query contract | Statically bind `Runtime.MetricsHandler` with `query.handler: custom` |
 
-The old unreleased `telemetry.storage`, combined `extension.Storage`,
-`Runtime.Storage` and `Runtime.StorageHeaders` contracts are replaced directly.
-Use `local`, `query`, `Runtime.QueryBackend` and `Runtime.QueryHeaders`; the local
-Collector exporter is now `sandboxlocal`. There is no parsing alias or second
-runtime path. The write exporter and read backend are configured and validated
-separately: an OTLP destination is not automatically a query backend. Remote
+Configure storage with `local` and `query`, and bind custom backends through
+`Runtime.QueryBackend` and `Runtime.QueryHeaders`. The local Collector exporter
+is `sandboxlocal`. `telemetry.storage`, `extension.Storage`, `Runtime.Storage`
+and `Runtime.StorageHeaders` are unsupported names, with no parsing aliases.
+The write exporter and read backend are configured and validated separately: an OTLP destination is not automatically a query backend. Remote
 errors never select a local database or become successful empty history.
 
 <a id="local-tsdb"></a>
