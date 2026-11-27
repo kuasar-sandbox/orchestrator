@@ -3,6 +3,7 @@ package placer
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -50,6 +52,7 @@ type importBinding struct {
 	registration      metadata.Registration
 	version           int64
 	apiFP, manifestFP string
+	manifestCarrier   string // exact delivered text; material identity alone cannot confirm a carrier update
 	expires           int64
 }
 type importState struct {
@@ -95,11 +98,31 @@ func (s *Service) importState(target importTarget) (*importState, error) {
 }
 
 func importCommand(rec clusterstate.SandboxGroupRecord) (routesync.GroupCommand, error) {
+	return importCommandContext(context.Background(), rec)
+}
+
+func importCommandContext(ctx context.Context, rec clusterstate.SandboxGroupRecord) (routesync.GroupCommand, error) {
 	c, _, err := importContext(rec)
 	if err != nil {
 		return routesync.GroupCommand{}, err
 	}
-	api, err := materializeAPISecret(rec.ManifestKey, rec.APISecret)
+	var manifestFP string
+	if !secretAbsent(rec.ManifestKey) && (rec.ManifestKey.Type == "" || rec.ManifestKey.Type == clusterstate.SecretInline) {
+		key, err := manifestkey.Resolve(ctx, rec.ManifestKey.Value)
+		if err != nil {
+			return routesync.GroupCommand{}, err
+		}
+		manifestFP = manifestkey.Fingerprint(key)
+		if _, err := manifestkey.KnownFingerprint(rec.ManifestKey.Value, manifestFP); err != nil {
+			clear(key[:])
+			return routesync.GroupCommand{}, err
+		}
+		if secretAbsent(rec.APISecret) {
+			rec.APISecret = clusterstate.Secret{Type: clusterstate.SecretInline, Value: hex.EncodeToString(apikey.DeriveAPISecret(key[:]))}
+		}
+		clear(key[:])
+	}
+	api, err := materializeAPISecretContext(ctx, rec.ManifestKey, rec.APISecret)
 	if err != nil {
 		return routesync.GroupCommand{}, err
 	}
@@ -126,7 +149,7 @@ func importCommand(rec clusterstate.SandboxGroupRecord) (routesync.GroupCommand,
 		if err != nil {
 			return routesync.GroupCommand{}, err
 		}
-		cmd.KeyPut = &nodegroup.KeyPut{APISecret: secret, ManifestKey: value, ExpiresUnix: time.Now().Add(importPairTTL).Unix()}
+		cmd.KeyPut = &nodegroup.KeyPut{APISecret: secret, ManifestKey: value, ManifestKeyFingerprint: manifestFP, ExpiresUnix: time.Now().Add(importPairTTL).Unix()}
 	}
 	return cmd, nil
 }
@@ -141,7 +164,8 @@ func bindingFor(reply registry.NodeGroupResponse, cmd routesync.GroupCommand) im
 	b := importBinding{registration: reply.Registration, version: reply.Ack.GroupResult.Version}
 	if cmd.KeyPut != nil {
 		b.apiFP, _ = apiSecretFingerprint(cmd.KeyPut.APISecret)
-		b.manifestFP, _ = manifestKeyFingerprint(cmd.KeyPut.ManifestKey)
+		b.manifestFP, _ = manifestKeyFingerprint(cmd.KeyPut.ManifestKey, cmd.KeyPut.ManifestKeyFingerprint)
+		b.manifestCarrier = cmd.KeyPut.ManifestKey
 		b.expires = cmd.KeyPut.ExpiresUnix
 	}
 	return b
@@ -152,9 +176,9 @@ func (b importBinding) fresh(reply registry.NodeGroupResponse, cmd routesync.Gro
 		return false
 	}
 	apiFP, _ := apiSecretFingerprint(cmd.KeyPut.APISecret)
-	manifestFP, _ := manifestKeyFingerprint(cmd.KeyPut.ManifestKey)
+	manifestFP, _ := manifestKeyFingerprint(cmd.KeyPut.ManifestKey, cmd.KeyPut.ManifestKeyFingerprint)
 	return b.registration == reply.Registration && b.version == reply.Ack.GroupDetail.Version &&
-		b.apiFP == apiFP && b.manifestFP == manifestFP && b.expires > time.Now().Add(importRenewBefore).Unix()
+		b.apiFP == apiFP && b.manifestFP == manifestFP && b.manifestCarrier == cmd.KeyPut.ManifestKey && b.expires > time.Now().Add(importRenewBefore).Unix()
 }
 
 // maintainGroup performs at most one CAS. Ambiguity is inspected on the same
@@ -411,7 +435,7 @@ func (s *Service) importSource(ctx context.Context, source ImportSource, nodes [
 			if rec.Group != group {
 				return errors.New("import source returned a different Group")
 			}
-			cmd, err := importCommand(rec)
+			cmd, err := importCommandContext(ctx, rec)
 			if err != nil {
 				emit(ImportResult{SourceID: source.SourceID, Group: group, Status: "rejected", Error: err.Error()})
 				continue

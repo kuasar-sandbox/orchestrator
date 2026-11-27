@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
@@ -403,6 +404,7 @@ func TestRunAssignedSandboxSessionReconnectDoesNotDuplicateAssignmentOrLaunch(t 
 
 func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 	t.Setenv("MANIFEST_KEY", "inherited-wrong-key")
+	t.Setenv(secret.Env, "inherited::/wrong.sock")
 	t.Setenv("KUASAR_RUN_ID", "inherited-run")
 	t.Setenv("TASK_SANDBOX_ID", "bootstrap-only")
 	vmm, err := os.Open(t.TempDir())
@@ -418,7 +420,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			fetches++
 			return &configsock.SandboxTaskSpec{
 				SandboxID: "sid", RunID: "run-1", Workdir: "/task-work",
-				Env: map[string]string{"MANIFEST_KEY": "authoritative-key", "KUASAR_RUN_ID": "run-1"},
+				Env: map[string]string{"MANIFEST_KEY": "authoritative-key", "KUASAR_RUN_ID": "run-1", secret.Env: "kms::/run/node-broker.sock"},
 				Prepare: &configsock.ArtifactPrepareSpec{RunID: "run-1",
 					RootRef: "manifest://root", AbsoluteDeadlineUnixNano: time.Now().Add(time.Minute).UnixNano(),
 				},
@@ -429,6 +431,9 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			reads++
 			if os.Getenv("MANIFEST_KEY") != "authoritative-key" || spec.RootRef != "manifest://root" {
 				t.Fatalf("prepare environment/root = %q/%q", os.Getenv("MANIFEST_KEY"), spec.RootRef)
+			}
+			if os.Getenv(secret.Env) != "kms::/run/node-broker.sock" {
+				t.Fatal("plugin configuration was not installed before artifact preparation")
 			}
 			return &taskartifact.Result{
 				PreparedSource: types.ResumeSource{SandboxRef: "manifest://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Kind: types.ResumeSourceSnapshot, Ref: "manifest://root"},
@@ -446,7 +451,7 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			}
 			return &configsock.LaunchSpec{
 				Exec: "/bin/sandbox-ctl", Args: []string{"run"},
-				Env: map[string]string{"MANIFEST_KEY": "must-not-win", "FINAL_ONLY": "yes"},
+				Env: map[string]string{"MANIFEST_KEY": "must-not-win", "FINAL_ONLY": "yes", secret.Env: "guest::/untrusted.sock"},
 			}, nil
 		},
 		chdir: func(path string) error {
@@ -467,19 +472,26 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			if path != "/bin/sandbox-ctl" || len(argv) < len(wantSuffix) || !reflect.DeepEqual(argv[len(argv)-len(wantSuffix):], wantSuffix) {
 				t.Fatalf("child path/argv = %q, %q", path, argv)
 			}
-			manifestEntries := 0
+			manifestEntries, pluginEntries := 0, 0
 			for _, entry := range env {
 				switch {
 				case entry == "MANIFEST_KEY=authoritative-key":
 					manifestEntries++
 				case strings.HasPrefix(entry, "MANIFEST_KEY="):
 					t.Fatalf("non-authoritative manifest key in child env: %q", entry)
+				case entry == secret.Env+"=kms::/run/node-broker.sock":
+					pluginEntries++
+				case strings.HasPrefix(entry, secret.Env+"="):
+					t.Fatal("child received untrusted plugin configuration")
 				case strings.HasPrefix(entry, "TASK_"):
 					t.Fatalf("bootstrap variable leaked into child env: %q", entry)
 				}
 			}
 			if manifestEntries != 1 {
 				t.Fatalf("authoritative MANIFEST_KEY entries = %d", manifestEntries)
+			}
+			if pluginEntries != 1 {
+				t.Fatalf("authoritative plugin configuration entries = %d", pluginEntries)
 			}
 			return startErr
 		},

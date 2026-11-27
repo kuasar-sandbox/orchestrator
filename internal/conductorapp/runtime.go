@@ -78,7 +78,7 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Conductor, bindings B
 		}
 		box, err = secretbox.New(keys)
 	} else {
-		box, err = secretbox.NewFromColonHex(configresolve.EncryptionKeySpec(cfg))
+		box, err = secretbox.NewFromSpec(ctx, configresolve.EncryptionKeySpec(cfg))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("conductor runtime: encryption keys: %w", err)
@@ -103,7 +103,7 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Conductor, bindings B
 		// Preserve the established built-in behavior: a broken optional COPY
 		// store disables COPY and is reported, while provider failures above are
 		// always fatal and never fall back.
-		files, err = filestore.New(cfg.Builder.FilesStorage)
+		files, err = filestore.NewWithCredentials(ctx, cfg.Builder.FilesStorage, nil)
 		if err != nil {
 			logger.Warn("builder.files_storage init failed; COPY steps will be rejected", "err", err)
 			files = nil
@@ -117,7 +117,7 @@ func resolveTLS(ctx context.Context, cfg *publicconfig.Conductor, provider func(
 	if provider == nil {
 		var apiTLS *tls.Config
 		if cfg.API.TLS.Cert != "" || cfg.API.TLS.Key != "" {
-			cert, err := tls.LoadX509KeyPair(cfg.API.TLS.Cert, cfg.API.TLS.Key)
+			cert, err := (clustercfg.TLS{Cert: cfg.API.TLS.Cert, Key: cfg.API.TLS.Key}).Certificate(ctx)
 			if err != nil {
 				return nil, nil, fmt.Errorf("conductor runtime: api tls: %w", err)
 			}
@@ -129,7 +129,7 @@ func resolveTLS(ctx context.Context, cfg *publicconfig.Conductor, provider func(
 				Cert: cfg.Cluster.NodeLink.TLS.Cert,
 				Key:  cfg.Cluster.NodeLink.TLS.Key,
 				CA:   cfg.Cluster.NodeLink.TLS.CA,
-			}).ClientConfig("")
+			}).ClientConfigContext(ctx, "")
 			if err != nil {
 				return nil, nil, fmt.Errorf("conductor runtime: cluster node-link tls: %w", err)
 			}

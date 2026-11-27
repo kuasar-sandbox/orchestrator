@@ -59,7 +59,7 @@ func (n *stubNode) groupService() (*orch.Orchestrator, *store.Store, error) {
 				continue
 			}
 		}
-		if _, err := db.AddKeyPair(context.Background(), store.KeyPair{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey}, "stub", ttl, ""); err != nil {
+		if _, err := db.AddKeyPair(context.Background(), store.KeyPair{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, ManifestKeyFingerprint: pair.ManifestKeyFingerprint}, "stub", ttl, ""); err != nil {
 			_ = db.Close()
 			_ = os.RemoveAll(dir)
 			return nil, nil, err
@@ -108,7 +108,7 @@ func (n *stubNode) handleGroup(ctx context.Context, cmd *routesync.Command) *rou
 	if result.Status == routesync.AckAccepted && cmd.Kind == routesync.CmdGroupPut && cmd.Group.KeyPut != nil {
 		put := cmd.Group.KeyPut
 		apiFP, _ := store.APISecretHash(put.APISecret)
-		manifestFP, _ := store.ManifestKeyHash(put.ManifestKey)
+		manifestFP := put.ManifestKeyFingerprint
 		pair := stubKeyPair{APISecretFingerprint: apiFP, ManifestKeyFingerprint: manifestFP, APISecretType: "inline", ManifestKeyType: "inline",
 			APISecret: put.APISecret, ManifestKey: put.ManifestKey, ExpiresUnix: put.ExpiresUnix}
 		n.mu.Lock()
@@ -244,7 +244,7 @@ func (n *stubNode) updateGroupPair(ctx context.Context, pair stubKeyPair) error 
 			return nodegroup.ErrInvalid
 		}
 	}
-	_, err := n.groupDB.AddKeyPair(ctx, store.KeyPair{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey}, "stub", ttl, "")
+	_, err := n.groupDB.AddKeyPair(ctx, store.KeyPair{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, ManifestKeyFingerprint: pair.ManifestKeyFingerprint}, "stub", ttl, "")
 	return err
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/orchestrator/internal/difftemplate"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
@@ -33,16 +34,22 @@ type Options struct {
 
 // Storage fixes the customer key per operation; a conductor can serve multiple
 // tenants concurrently and must never set MANIFEST_KEY in its own environment.
-func Storage(cfgPath, manifestKey string) (*artifact.ProcessStorage, error) {
+func Storage(cfgPath, manifestKeyText string) (*artifact.ProcessStorage, error) {
+	return StorageContext(context.Background(), cfgPath, manifestKeyText)
+}
+
+// StorageContext resolves and binds an explicit tenant key once, independently
+// of the ambient MANIFEST_KEY and the key in the shared storage configuration.
+func StorageContext(ctx context.Context, cfgPath, manifestKeyText string) (*artifact.ProcessStorage, error) {
 	cfg, err := rtconfig.LoadManifestConfig(cfgPath)
 	if err != nil && !errors.Is(err, manifest.ErrConfigNotProvided) {
 		return nil, err
 	}
-	key, err := manifest.ParseHexKey(manifestKey)
+	key, err := manifestkey.Resolve(ctx, manifestKeyText)
 	if err != nil {
-		return nil, errors.New("invalid tenant manifest key")
+		return nil, fmt.Errorf("workspace disk: resolve tenant manifest key: %w", err)
 	}
-	return artifact.NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return [32]byte(key), nil })
+	return artifact.NewProcessStorageWithCustomerKey(cfg, func() ([32]byte, error) { return key, nil })
 }
 
 func AddLocation(loc rtconfig.RefLocations, parent, raw string) error {
@@ -72,7 +79,7 @@ func AddLocation(loc rtconfig.RefLocations, parent, raw string) error {
 }
 
 func Resolve(ctx context.Context, input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocations, error) {
-	d, locations, check, err := Plan(input, o)
+	d, locations, check, err := PlanContext(ctx, input, o)
 	if err == nil && check {
 		err = AuthorizeLayers(ctx, d, locations, o)
 	}
@@ -82,6 +89,11 @@ func Resolve(ctx context.Context, input json.RawMessage, o Options) (rtconfig.Di
 // Plan fixes the source and rejects unsafe paths before accepting an operation.
 // Layer authentication can then run in the tenant worker before opening a VM.
 func Plan(input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocations, bool, error) {
+	return PlanContext(context.Background(), input, o)
+}
+
+// PlanContext is Plan with cancellation when authenticating a migration token.
+func PlanContext(ctx context.Context, input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocations, bool, error) {
 	var fields map[string]json.RawMessage
 	if strictjson.Decode(input, &fields) != nil || fields == nil {
 		return rtconfig.DiskV1{}, nil, false, ErrSelection
@@ -105,7 +117,7 @@ func Plan(input json.RawMessage, o Options) (rtconfig.DiskV1, rtconfig.RefLocati
 			return disk, nil, false, ErrSelection
 		}
 		var err error
-		disk, err = migrationtoken.OpenWorkspace(migrationtoken.KeyMaterial{APISecret: o.APISecret, ManifestKey: o.ManifestKey}, token)
+		disk, err = migrationtoken.OpenWorkspaceContext(ctx, migrationtoken.KeyMaterial{APISecret: o.APISecret, ManifestKey: o.ManifestKey}, token)
 		if err != nil {
 			return disk, nil, false, ErrUnauthorized
 		}
@@ -179,7 +191,7 @@ func OpenLayer(ctx context.Context, s *artifact.ProcessStorage, r manifest.Ref, 
 }
 
 func AuthorizeLayers(ctx context.Context, disk rtconfig.DiskV1, locations rtconfig.RefLocations, o Options) error {
-	st, err := Storage(o.ManifestConfig, o.ManifestKey)
+	st, err := StorageContext(ctx, o.ManifestConfig, o.ManifestKey)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package conductorext
 
 import (
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
@@ -32,7 +33,7 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		view.Cluster = &conductorextension.SandboxClusterView{Group: sandbox.Cluster.Group, RouteKey: sandbox.Cluster.RouteKey}
 	}
 	view.APISecretFingerprint, _ = store.APISecretHash(sandbox.APISecret)
-	view.ManifestKeyFingerprint, _ = store.ManifestKeyHash(sandbox.ManifestKey)
+	view.ManifestKeyFingerprint, _ = manifestkey.KnownFingerprint(sandbox.ManifestKey, sandbox.ManifestKeyFingerprint)
 	return view
 }
 
@@ -73,7 +74,7 @@ func projectBuild(build *types.Build) conductorextension.BuildView {
 		RuntimePortMAC: build.RuntimePortMAC, ClusterGroup: build.ClusterGroup,
 	}
 	view.APISecretFingerprint, _ = store.APISecretHash(build.APISecret)
-	view.ManifestKeyFingerprint, _ = store.ManifestKeyHash(build.ManifestKey)
+	view.ManifestKeyFingerprint, _ = manifestkey.KnownFingerprint(build.ManifestKey, build.ManifestKeyFingerprint)
 	return view
 }
 

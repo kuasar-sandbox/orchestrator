@@ -15,16 +15,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	_ "modernc.org/sqlite"
 )
 
@@ -472,8 +474,12 @@ var (
 // business records. APISecret authenticates API requests; ManifestKey protects
 // manifest content. Neither field is a fingerprint.
 type KeyPair struct {
-	APISecret   string
-	ManifestKey string
+	APISecret              string
+	ManifestKey            string
+	ManifestKeyFingerprint string `json:"-"`
+	manifestKeyBytes       [32]byte
+	manifestKeySource      string
+	manifestKeyResolved    bool
 }
 
 func secretHash(name, secretHex string) (string, error) {
@@ -495,7 +501,7 @@ func APISecretHash(apiSecretHex string) (string, error) {
 
 // ManifestKeyHash returns the complete SHA-256 fingerprint of a hex manifest key.
 func ManifestKeyHash(manifestKeyHex string) (string, error) {
-	return secretHash("manifest key", manifestKeyHex)
+	return manifestkey.KnownFingerprint(manifestKeyHex, "")
 }
 
 func keyPairHashes(pair KeyPair) (apiHash, manifestHash string, err error) {
@@ -503,7 +509,7 @@ func keyPairHashes(pair KeyPair) (apiHash, manifestHash string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	manifestHash, err = ManifestKeyHash(pair.ManifestKey)
+	manifestHash, err = manifestkey.KnownFingerprint(pair.ManifestKey, pair.ManifestKeyFingerprint)
 	if err != nil {
 		return "", "", err
 	}
@@ -527,7 +533,9 @@ func equalSecretHex(a, b string) bool {
 
 func equalKeyPair(a, b KeyPair) bool {
 	apiEqual := equalSecretHex(a.APISecret, b.APISecret)
-	manifestEqual := equalSecretHex(a.ManifestKey, b.ManifestKey)
+	aHash, aErr := manifestkey.KnownFingerprint(a.ManifestKey, a.ManifestKeyFingerprint)
+	bHash, bErr := manifestkey.KnownFingerprint(b.ManifestKey, b.ManifestKeyFingerprint)
+	manifestEqual := aErr == nil && bErr == nil && hmac.Equal([]byte(aHash), []byte(bHash))
 	return apiEqual && manifestEqual
 }
 
@@ -716,7 +724,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	manifestHash, manifestEnc, err := s.encSecret("manifest key", sb.ManifestKey)
+	manifestHash, manifestEnc, err := s.encManifestKey(sb.ManifestKey, sb.ManifestKeyFingerprint)
 	if err != nil {
 		return nil, err
 	}
@@ -865,7 +873,7 @@ func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
 			return err
 		}
 	}
-	args, err := s.prepareSandboxInsert(sb)
+	args, err := s.prepareSandboxInsertContext(ctx, sb)
 	if err != nil {
 		return sandboxWriteError("put", sb, err)
 	}
@@ -879,7 +887,7 @@ func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
 // InsertSandbox writes a new sandbox record and returns ErrSandboxExists when
 // the ID is already present. It never changes an existing row.
 func (s *Store) InsertSandbox(ctx context.Context, sb *types.Sandbox) error {
-	args, err := s.prepareSandboxInsert(sb)
+	args, err := s.prepareSandboxInsertContext(ctx, sb)
 	if err != nil {
 		return sandboxWriteError("insert sandbox", sb, err)
 	}
@@ -1558,6 +1566,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	}
 	sb.APISecret = pair.APISecret
 	sb.ManifestKey = pair.ManifestKey
+	sb.ManifestKeyFingerprint = manifestHash
 	for name, encrypted := range map[string]struct {
 		ciphertext string
 		dest       *string
@@ -1893,6 +1902,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 	}
 	b.APISecret = pair.APISecret
 	b.ManifestKey = pair.ManifestKey
+	b.ManifestKeyFingerprint = manifestHash
 	if raEnc != "" {
 		if b.RegistryAuth, err = s.box.DecryptString(raEnc); err != nil {
 			return nil, fmt.Errorf("store: decrypt registry auth for build %s: %w", b.BuildID, err)
@@ -1975,7 +1985,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}
-	manifestHash, manifestEnc, err := s.encSecret("manifest key", b.ManifestKey)
+	manifestHash, manifestEnc, err := s.encManifestKey(b.ManifestKey, b.ManifestKeyFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}
@@ -2048,7 +2058,7 @@ func boolInt(value bool) int {
 // PutBuild upserts a build record. The credential pair is written only by the
 // initial insert; later build-state updates cannot rebind an existing build.
 func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
-	args, err := s.prepareBuildWrite(b)
+	args, err := s.prepareBuildWriteContext(ctx, b)
 	if err != nil {
 		return err
 	}
@@ -2312,6 +2322,11 @@ type KeyPairInfo struct {
 // never expires. Empty label or registryAuthJSON retains the existing value on a
 // refresh. It returns true only when a new row was inserted.
 func (s *Store) AddKeyPair(ctx context.Context, pair KeyPair, label string, ttlSec int64, registryAuthJSON string) (bool, error) {
+	var resolveErr error
+	pair, resolveErr = ResolveKeyPair(ctx, pair)
+	if resolveErr != nil {
+		return false, resolveErr
+	}
 	var expires int64
 	if ttlSec > 0 {
 		expires = time.Now().Unix() + ttlSec
@@ -2339,7 +2354,7 @@ func (s *Store) addKeyPairTx(ctx context.Context, tx *sql.Tx, pair KeyPair, labe
 	if err != nil {
 		return false, err
 	}
-	manifestHash, manifestEnc, err := s.encSecret("manifest key", pair.ManifestKey)
+	manifestHash, manifestEnc, err := s.encManifestKey(pair.ManifestKey, pair.ManifestKeyFingerprint)
 	if err != nil {
 		return false, err
 	}
@@ -2384,11 +2399,12 @@ ON CONFLICT(api_secret_hash) DO NOTHING`,
 
 	if _, err := tx.ExecContext(ctx, `
 UPDATE manifest_keys SET
+  manifest_key_enc=?,
 	  expires_unix=CASE WHEN ? AND (expires_unix=0 OR (?<>0 AND expires_unix>?)) THEN expires_unix ELSE ? END,
   label=CASE WHEN ?='' THEN label ELSE ? END,
   registry_auth_enc=CASE WHEN ?='' THEN registry_auth_enc ELSE ? END
 WHERE api_secret_hash=?`,
-		extendOnly, expires, expires, expires, label, label, registryAuthJSON, registryAuthEnc, apiHash); err != nil {
+		manifestEnc, extendOnly, expires, expires, expires, label, label, registryAuthJSON, registryAuthEnc, apiHash); err != nil {
 		return false, fmt.Errorf("store: refresh key pair: %w", err)
 	}
 	return false, nil
@@ -2397,6 +2413,11 @@ WHERE api_secret_hash=?`,
 // RegistryAuthForKeyPair returns the registry credentials stored with an exact
 // pair, or "" when the pair is absent or has no credentials.
 func (s *Store) RegistryAuthForKeyPair(ctx context.Context, pair KeyPair) (string, error) {
+	var resolveErr error
+	pair, resolveErr = ResolveKeyPair(ctx, pair)
+	if resolveErr != nil {
+		return "", resolveErr
+	}
 	apiHash, _, err := keyPairHashes(pair)
 	if err != nil {
 		return "", err
@@ -2444,18 +2465,26 @@ func (s *Store) decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEn
 	if err != nil {
 		return KeyPair{}, fmt.Errorf("store: invalid stored API secret: %w", err)
 	}
-	actualManifestHash, err := ManifestKeyHash(pair.ManifestKey)
+	actualManifestHash, err := manifestkey.KnownFingerprint(pair.ManifestKey, manifestHash)
 	if err != nil {
 		return KeyPair{}, fmt.Errorf("store: invalid stored manifest key: %w", err)
 	}
 	if actualAPIHash != apiHash || actualManifestHash != manifestHash {
 		return KeyPair{}, fmt.Errorf("store: key pair fingerprint mismatch")
 	}
+	if secret.IsReference(pair.ManifestKey) {
+		pair.ManifestKeyFingerprint = manifestHash
+	}
 	return pair, nil
 }
 
 // HasKeyPair reports whether an exact, non-expired pair is in the allowlist.
 func (s *Store) HasKeyPair(ctx context.Context, pair KeyPair) (bool, error) {
+	var resolveErr error
+	pair, resolveErr = ResolveKeyPair(ctx, pair)
+	if resolveErr != nil {
+		return false, resolveErr
+	}
 	apiHash, _, err := keyPairHashes(pair)
 	if err != nil {
 		return false, err
@@ -2477,6 +2506,11 @@ WHERE api_secret_hash=? AND (expires_unix=0 OR expires_unix>?)`,
 
 // RemoveKeyPair deletes an exact allowlist pair and returns the number removed.
 func (s *Store) RemoveKeyPair(ctx context.Context, pair KeyPair) (int, error) {
+	var resolveErr error
+	pair, resolveErr = ResolveKeyPair(ctx, pair)
+	if resolveErr != nil {
+		return 0, resolveErr
+	}
 	apiHash, _, err := keyPairHashes(pair)
 	if err != nil {
 		return 0, err

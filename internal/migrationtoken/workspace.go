@@ -1,6 +1,7 @@
 package migrationtoken
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,15 +19,21 @@ const workspacePrefix = "kwt1."
 // by protocol and by both tenant credentials, even for tenants sharing a
 // manifest key. The prefix is authenticated and cannot be changed to kmt1.
 func workspaceKey(m KeyMaterial) ([]byte, error) {
+	return workspaceKeyContext(context.Background(), m)
+}
+
+func workspaceKeyContext(ctx context.Context, m KeyMaterial) ([]byte, error) {
 	api, ok := decodeCanonicalHex32(m.APISecret)
 	if !ok {
 		return nil, ErrInvalidKeyMaterial
 	}
-	key, ok := decodeCanonicalHex32(m.ManifestKey)
-	if !ok {
-		return nil, ErrInvalidKeyMaterial
+	defer clear(api)
+	key, err := resolveManifest(ctx, m.ManifestKey)
+	if err != nil {
+		return nil, err
 	}
-	mac := hmac.New(sha256.New, key)
+	defer clear(key[:])
+	mac := hmac.New(sha256.New, key[:])
 	mac.Write([]byte("kuasar-workspace-token-v1\x00"))
 	mac.Write(api)
 	return mac.Sum(nil), nil
@@ -48,16 +55,27 @@ func ValidateWorkspaceDisk(d rtconfig.DiskV1) error {
 }
 
 func SealWorkspace(m KeyMaterial, d rtconfig.DiskV1) (string, error) {
-	return sealWorkspace(rand.Reader, m, d)
+	return SealWorkspaceContext(context.Background(), m, d)
 }
+
+// SealWorkspaceContext is SealWorkspace with cancellable ManifestKey resolution.
+func SealWorkspaceContext(ctx context.Context, m KeyMaterial, d rtconfig.DiskV1) (string, error) {
+	return sealWorkspaceContext(ctx, rand.Reader, m, d)
+}
+
 func sealWorkspace(random io.Reader, m KeyMaterial, d rtconfig.DiskV1) (string, error) {
+	return sealWorkspaceContext(context.Background(), random, m, d)
+}
+
+func sealWorkspaceContext(ctx context.Context, random io.Reader, m KeyMaterial, d rtconfig.DiskV1) (string, error) {
 	if err := ValidateWorkspaceDisk(d); err != nil {
 		return "", err
 	}
-	key, err := workspaceKey(m)
+	key, err := workspaceKeyContext(ctx, m)
 	if err != nil {
 		return "", err
 	}
+	defer clear(key)
 	raw, err := json.Marshal(d)
 	if err != nil {
 		return "", ErrInvalidPayload
@@ -66,11 +84,17 @@ func sealWorkspace(random io.Reader, m KeyMaterial, d rtconfig.DiskV1) (string, 
 }
 
 func OpenWorkspace(m KeyMaterial, token string) (rtconfig.DiskV1, error) {
+	return OpenWorkspaceContext(context.Background(), m, token)
+}
+
+// OpenWorkspaceContext is OpenWorkspace with cancellable ManifestKey resolution.
+func OpenWorkspaceContext(ctx context.Context, m KeyMaterial, token string) (rtconfig.DiskV1, error) {
 	var disk rtconfig.DiskV1
-	key, err := workspaceKey(m)
+	key, err := workspaceKeyContext(ctx, m)
 	if err != nil {
 		return disk, err
 	}
+	defer clear(key)
 	raw, err := openEnvelope(token, workspacePrefix, key, []byte(workspacePrefix))
 	if err != nil {
 		return disk, err

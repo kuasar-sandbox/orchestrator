@@ -24,7 +24,7 @@ func (o *Orchestrator) workspaceDiskOptions(sb *types.Sandbox) workspacedisk.Opt
 }
 
 func (o *Orchestrator) resolveWorkspaceDisk(ctx context.Context, sb *types.Sandbox, raw json.RawMessage) (rtconfig.DiskV1, rtconfig.RefLocations, error) {
-	d, l, check, err := workspacedisk.Plan(raw, o.workspaceDiskOptions(sb))
+	d, l, check, err := workspacedisk.PlanContext(ctx, raw, o.workspaceDiskOptions(sb))
 	if err == nil && check {
 		err = o.authorizeWorkspaceLayers(ctx, sb, d, l)
 	}

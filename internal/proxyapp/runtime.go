@@ -14,6 +14,7 @@ import (
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
 // TLSMaterial contains only process-local key and trust material. The proxy
@@ -80,7 +81,7 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Proxy, bindings Bindi
 			dataTLS = serverTLSConfig(certificate, clonePool(material.ClientCAs))
 		}
 	} else if cfg.TLS.Cert != "" || cfg.TLS.Key != "" {
-		certificate, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
+		certificate, err := (clustercfg.TLS{Cert: cfg.TLS.Cert, Key: cfg.TLS.Key}).Certificate(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("proxy runtime: data TLS: %w", err)
 		}

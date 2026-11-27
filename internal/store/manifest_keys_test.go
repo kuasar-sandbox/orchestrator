@@ -354,9 +354,10 @@ func TestSecretValidation(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	for name, pair := range map[string]KeyPair{
-		"short API secret":     {APISecret: "aa", ManifestKey: strings.Repeat("1", 64)},
-		"uppercase API secret": {APISecret: strings.Repeat("A", 64), ManifestKey: strings.Repeat("1", 64)},
-		"short manifest key":   {APISecret: strings.Repeat("1", 64), ManifestKey: "bb"},
+		"short API secret":       {APISecret: "aa", ManifestKey: strings.Repeat("1", 64)},
+		"uppercase API secret":   {APISecret: strings.Repeat("A", 64), ManifestKey: strings.Repeat("1", 64)},
+		"short manifest key":     {APISecret: strings.Repeat("1", 64), ManifestKey: "bb"},
+		"uppercase manifest key": {APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("AB", 32)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := st.AddKeyPair(ctx, pair, "", 0, ""); err == nil {
@@ -369,6 +370,41 @@ func TestSecretValidation(t *testing.T) {
 	}
 	if _, _, err := st.AllowedKeyPairByAPISecretFingerprint(ctx, strings.Repeat("A", 64)); err == nil {
 		t.Fatal("exact lookup accepted a non-canonical fingerprint")
+	}
+}
+
+func TestNativeManifestUppercaseRejectedBeforeTransaction(t *testing.T) {
+	st := testStore(t)
+	st.db.SetMaxOpenConns(1)
+	tx, err := st.db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	upper := strings.Repeat("AB", 32)
+	if _, err := ManifestKeyHash(upper); err == nil {
+		t.Fatal("manifest fingerprint accepted non-canonical native material")
+	}
+	_, err = st.AddKeyPair(ctx, KeyPair{APISecret: strings.Repeat("1", 64), ManifestKey: upper}, "", 0, "")
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "lowercase hex") {
+		t.Fatalf("native registration was not rejected before the held transaction: %v", err)
+	}
+	sb := testSandboxWithServiceCredentials("uppercase-manifest", types.ProfileBare)
+	sb.ManifestKey = upper
+	if err := st.InsertSandbox(ctx, sb); err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "lowercase hex") {
+		t.Fatalf("native sandbox root was not rejected before the held transaction: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.ListKeyPairs(t.Context())
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("invalid native root was persisted: %v", err)
+	}
+	if row, err := st.Get(t.Context(), sb.ID); err != nil || row != nil {
+		t.Fatalf("invalid native sandbox root was persisted: %v", err)
 	}
 }
 

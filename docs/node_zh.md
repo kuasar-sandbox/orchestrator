@@ -369,6 +369,21 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 现有 PATH fallback。
 
 
+ManifestKey、`encryption_key` 的各个环条目、TLS 私钥字段和已配置的静态 S3
+AK/SK 支持 `@plugin/key` 引用。在节点进程环境中配置插件，例如：
+
+```bash
+export KUASAR_SECRET_PLUGINS='kms::/run/secret-broker.sock:cache_ttl=30s:cache_size=4k'
+export NODE_CONFIG_ENCRYPTION_KEY='@kms/node-key-v2:@kms/node-key-v1'
+```
+
+节点将可信的插件配置和租户 ManifestKey 引用传递给 host task；实际运行用户需有
+socket 访问权限，guest 无需连接 broker。YAML 中的引用使用引号。普通输入保留
+hex、文件路径或字面值语义，`@` 为引用保留前缀；APISecret 和 ServiceSecret
+仍使用规范 hex。插件失败不回退到其他材料源。缓存到期只影响后续解析，不触发已
+运行的存储、TLS 或静态 S3 client 自动换钥。稳定的版本化引用、缓存规则及 UDS
+协议见 [Secret plugin 配置与协议](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/secret-plugins_zh.md)。
+
 下表维护节点服务的共享字段。能力专属配置与行为同处维护：[实例生命周期](sandbox-lifecycle_zh.md#node-defaults)、[访问与凭据](node-proxy_zh.md#conductor-access-configuration)、[资源](node-resource_zh.md#conductor-resource-configuration)、[Build](node-build_zh.md#build-configuration)、[观测](observability_zh.md#node-observation-configuration)和[集群接入](cluster_zh.md#node-attachment-configuration)。同处一个 YAML 文件不意味着再维护一套字段定义。
 
 | 字段 | 默认 | 说明 |

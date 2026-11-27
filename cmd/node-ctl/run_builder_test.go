@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
@@ -124,12 +125,14 @@ func TestBuildTaskWorkDeadlineReservesFinalResultTail(t *testing.T) {
 func TestInstallBuildTaskEnvironmentKeepsRegistryCredentialsNonAmbient(t *testing.T) {
 	processEnv := map[string]string{
 		"MANIFEST_KEY":              "inherited-manifest-key",
+		secret.Env:                  "inherited::/wrong.sock",
 		"FLATTEN_REGISTRY_TOKEN":    "inherited-token",
 		"FLATTEN_REGISTRY_USERNAME": "inherited-user",
 		"FLATTEN_REGISTRY_PASSWORD": "inherited-password",
 	}
 	bootstrapEnv := map[string]string{
 		"MANIFEST_KEY":              "authoritative-manifest-key",
+		secret.Env:                  "kms::/run/node-broker.sock:cache_ttl=30s",
 		"FLATTEN_REGISTRY_TOKEN":    "task-token",
 		"FLATTEN_REGISTRY_USERNAME": "task-user",
 		"FLATTEN_REGISTRY_PASSWORD": "task-password",
@@ -150,6 +153,9 @@ func TestInstallBuildTaskEnvironmentKeepsRegistryCredentialsNonAmbient(t *testin
 	if got := processEnv["MANIFEST_KEY"]; got != "authoritative-manifest-key" {
 		t.Fatalf("process MANIFEST_KEY = %q", got)
 	}
+	if processEnv[secret.Env] != bootstrapEnv[secret.Env] {
+		t.Fatal("trusted node plugin configuration was not installed before artifact preparation")
+	}
 	for _, key := range []string{"FLATTEN_REGISTRY_TOKEN", "FLATTEN_REGISTRY_USERNAME", "FLATTEN_REGISTRY_PASSWORD"} {
 		if value, ok := processEnv[key]; ok {
 			t.Fatalf("registry credential %s remained ambient as %q", key, value)
@@ -160,6 +166,13 @@ func TestInstallBuildTaskEnvironmentKeepsRegistryCredentialsNonAmbient(t *testin
 	}
 	if got := mergeAuthoritativeEnv(nil, bootstrapEnv)["FLATTEN_REGISTRY_TOKEN"]; got != "task-token" {
 		t.Fatalf("registry credential was not retained for explicit spec use: %q", got)
+	}
+	if got := mergeAuthoritativeEnv(map[string]string{secret.Env: "guest::/untrusted.sock"}, bootstrapEnv)[secret.Env]; got != bootstrapEnv[secret.Env] {
+		t.Fatal("task spec replaced trusted plugin configuration")
+	}
+	bootstrapEnv[secret.Env] = ""
+	if err := installBuildTaskEnvironment(bootstrapEnv, setenv, unsetenv); err != nil || processEnv[secret.Env] != "" {
+		t.Fatalf("empty node configuration did not clear inherited plugins: %v", err)
 	}
 }
 

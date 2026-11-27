@@ -210,6 +210,11 @@ func TestFileGroupCredentialShorthandAndStableDerivation(t *testing.T) {
 			t.Fatal("invalid explicit root silently derived")
 		}
 	}
+	rec.APISecret = clusterstate.Secret{Value: testAPISecret}
+	rec.ManifestKey = clusterstate.Secret{Value: strings.Repeat("AB", 32)}
+	if _, err := importCommand(rec); err == nil {
+		t.Fatal("import accepted non-canonical native ManifestKey")
+	}
 }
 
 func TestConfiguredGroupSourcesRemainIndependentAndOptional(t *testing.T) {

@@ -274,6 +274,25 @@ from their reader and never discover or open files.
 Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under `resources`/`network`/`boot`), `builder`, `checkpoint`, `mmds`, `cluster` (node-link, [Cluster integration (node-link)](cluster.md#node-attachment)) and `resource_listen` (embedded controller with all tuning inline; [node-resource.md](node-resource.md)). `encryption_key` and `manifest_config` are top-level values. Built-in node-ctl explicitly performs final declarative validation, then runtime resolution reads the environment/YAML encryption key. Custom conductor validates after Configure; Runtime providers may supply key/TLS/object-store material. A provider overrides environment/YAML and never falls back after failure. Helper executable paths (`sandbox-ctl`, `connector-ctl`, `flatten-ctl`) are outside public Config. Resolution starts at the original node-ctl's exact adjacent release directory, retaining PATH fallback when a helper is absent.
 
 
+ManifestKey, each `encryption_key` ring entry, TLS private-key fields and configured
+static S3 access/secret keys accept `@plugin/key` references. Configure plugins in
+the node process environment, for example:
+
+```bash
+export KUASAR_SECRET_PLUGINS='kms::/run/secret-broker.sock:cache_ttl=30s:cache_size=4k'
+export NODE_CONFIG_ENCRYPTION_KEY='@kms/node-key-v2:@kms/node-key-v1'
+```
+
+The node forwards its trusted plugin configuration and the tenant ManifestKey
+reference to host tasks. Their runtime user must be able to access the socket;
+the guest does not need a broker connection. Quote references in YAML. Normal
+values retain their hex, file-path or literal meaning, while `@` is reserved for
+references. APISecret and ServiceSecret remain canonical hex. Plugin errors do
+not fall back to another material source. Cache expiry only affects subsequent
+resolves, not keys already bound to running storage, TLS or S3 clients. See the
+[Secret plugin protocol and configuration](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/secret-plugins.md)
+for stable versioned references, cache rules and the UDS resolve protocol.
+
 The following table owns shared node-service fields. Capability-specific configuration is defined with its behavior: [instance lifecycle](sandbox-lifecycle.md#node-defaults), [access and credentials](node-proxy.md#conductor-access-configuration), [resources](node-resource.md#conductor-resource-configuration), [Build](node-build.md#build-configuration), [observability](observability.md#node-observation-configuration), and [cluster attachment](cluster.md#node-attachment-configuration). A shared YAML file does not create a second definition of those fields.
 
 | Field | Default | Meaning |

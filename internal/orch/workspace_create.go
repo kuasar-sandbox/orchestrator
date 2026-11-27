@@ -4,18 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 	"slices"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func (o *Orchestrator) prepareBuildWorkspaces(ctx context.Context, b *types.Build, entries []workspace.Entry) error {
-	sb := &types.Sandbox{Metadata: b.Metadata, APISecret: b.APISecret, ManifestKey: b.ManifestKey}
+	sb := &types.Sandbox{Metadata: b.Metadata, APISecret: b.APISecret, ManifestKey: b.ManifestKey, ManifestKeyFingerprint: b.ManifestKeyFingerprint}
 	if err := o.prepareCreateWorkspaces(ctx, sb, entries, false); err != nil {
 		return err
 	}
@@ -43,7 +43,7 @@ func (o *Orchestrator) prepareCreateWorkspaces(ctx context.Context, sb *types.Sa
 	for _, e := range entries {
 		p := workspace.Prepared{Name: e.Name, Mounts: e.Mounts, Slot: e.Slot}
 		if e.Disk != nil {
-			d, l, check, err := workspacedisk.Plan(e.Disk, o.workspaceDiskOptions(sb))
+			d, l, check, err := workspacedisk.PlanContext(ctx, e.Disk, o.workspaceDiskOptions(sb))
 			if errors.Is(err, workspacedisk.ErrDefaultNeedsSlot) {
 				p.DefaultFromSlot = true
 				sb.WorkspacePlan = append(sb.WorkspacePlan, p)

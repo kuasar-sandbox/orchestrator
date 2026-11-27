@@ -35,6 +35,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -956,7 +957,7 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	case routesync.CmdGroupGet, routesync.CmdGroupList, routesync.CmdGroupPut, routesync.CmdGroupDelete:
 		return n.handleGroup(ctx, cmd)
 	case routesync.CmdKeyPut:
-		pair, err := stubKeyPairFromCommand(cmd)
+		pair, err := stubKeyPairFromCommandContext(ctx, cmd)
 		if err != nil {
 			return ack(cmd, routesync.AckRejected, err.Error())
 		}
@@ -2098,6 +2099,10 @@ type stubKeyPairSnapshot struct {
 }
 
 func stubKeyPairFromCommand(cmd *routesync.Command) (stubKeyPair, error) {
+	return stubKeyPairFromCommandContext(context.Background(), cmd)
+}
+
+func stubKeyPairFromCommandContext(ctx context.Context, cmd *routesync.Command) (stubKeyPair, error) {
 	pair := stubKeyPair{
 		APISecretFingerprint:   cmd.APISecretFingerprint,
 		APISecretType:          cmd.APISecretType,
@@ -2128,6 +2133,20 @@ func stubKeyPairFromCommand(cmd *routesync.Command) (stubKeyPair, error) {
 	if err != nil {
 		return stubKeyPair{}, err
 	}
+	if pair.ManifestKeyType == "inline" {
+		key, err := manifestkey.Resolve(ctx, pair.ManifestKey)
+		if err != nil {
+			return stubKeyPair{}, err
+		}
+		fp := manifestkey.Fingerprint(key)
+		clear(key[:])
+		if _, err := manifestkey.KnownFingerprint(pair.ManifestKey, fp); err != nil {
+			return stubKeyPair{}, err
+		}
+		if fp != pair.ManifestKeyFingerprint {
+			return stubKeyPair{}, fmt.Errorf("manifest key fingerprint does not match material")
+		}
+	}
 	return pair, nil
 }
 
@@ -2139,6 +2158,9 @@ func normalizeStubSecret(name, typ, value, ref, fingerprint string) (string, err
 	case "inline":
 		if value == "" || ref != "" {
 			return "", fmt.Errorf("%s inline carrier is incomplete", name)
+		}
+		if name == "manifest key" {
+			break
 		}
 		if !validStubSecret(value) {
 			return "", fmt.Errorf("%s must be 64 lowercase hex characters", name)
@@ -2173,7 +2195,7 @@ func validStubFingerprint(fingerprint string) bool {
 func sameStubKeyPair(a, b stubKeyPair) bool {
 	apiSecretEqual := hmac.Equal([]byte(a.APISecret), []byte(b.APISecret))
 	apiRefEqual := hmac.Equal([]byte(a.APISecretRef), []byte(b.APISecretRef))
-	manifestKeyEqual := hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
+	manifestKeyEqual := a.ManifestKeyFingerprint == b.ManifestKeyFingerprint
 	manifestRefEqual := hmac.Equal([]byte(a.ManifestKeyRef), []byte(b.ManifestKeyRef))
 	return a.APISecretFingerprint == b.APISecretFingerprint &&
 		a.APISecretType == b.APISecretType && apiSecretEqual && apiRefEqual &&

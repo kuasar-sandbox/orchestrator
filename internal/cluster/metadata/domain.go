@@ -78,12 +78,20 @@ func NormalizeKeyPair(p NodeKeyPair) (NodeKeyPair, error) {
 	if !ValidFingerprint(p.APISecretFingerprint) || !ValidFingerprint(p.ManifestKeyFingerprint) {
 		return NodeKeyPair{}, invalid("invalid key pair fingerprints")
 	}
-	normalize := func(typ, value, ref, fp string) (string, error) {
+	normalize := func(typ, value, ref, fp string, manifest bool) (string, error) {
 		if typ == "" && value != "" && ref == "" {
 			typ = SecretInline
 		}
 		switch typ {
 		case SecretInline:
+			// ManifestKey is an opaque carrier. Its actual material is validated
+			// at the context-aware receiving boundary, never in normalization.
+			if manifest {
+				if value == "" || ref != "" {
+					return "", invalid("invalid inline manifest key carrier")
+				}
+				break
+			}
 			if !ValidFingerprint(value) || ref != "" {
 				return "", invalid("invalid inline secret")
 			}
@@ -102,15 +110,15 @@ func NormalizeKeyPair(p NodeKeyPair) (NodeKeyPair, error) {
 		return typ, nil
 	}
 	var err error
-	p.APISecretType, err = normalize(p.APISecretType, p.APISecret, p.APISecretRef, p.APISecretFingerprint)
+	p.APISecretType, err = normalize(p.APISecretType, p.APISecret, p.APISecretRef, p.APISecretFingerprint, false)
 	if err != nil {
 		return NodeKeyPair{}, err
 	}
-	p.ManifestKeyType, err = normalize(p.ManifestKeyType, p.ManifestKey, p.ManifestKeyRef, p.ManifestKeyFingerprint)
+	p.ManifestKeyType, err = normalize(p.ManifestKeyType, p.ManifestKey, p.ManifestKeyRef, p.ManifestKeyFingerprint, true)
 	return p, err
 }
 func SameKeyPairMaterial(a, b NodeKeyPair) bool {
-	return a.APISecretFingerprint == b.APISecretFingerprint && a.APISecretType == b.APISecretType && hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.APISecretRef), []byte(b.APISecretRef)) && a.ManifestKeyFingerprint == b.ManifestKeyFingerprint && a.ManifestKeyType == b.ManifestKeyType && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey)) && hmac.Equal([]byte(a.ManifestKeyRef), []byte(b.ManifestKeyRef))
+	return a.APISecretFingerprint == b.APISecretFingerprint && a.APISecretType == b.APISecretType && hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.APISecretRef), []byte(b.APISecretRef)) && a.ManifestKeyFingerprint == b.ManifestKeyFingerprint && a.ManifestKeyType == b.ManifestKeyType && hmac.Equal([]byte(a.ManifestKeyRef), []byte(b.ManifestKeyRef))
 }
 func SameBuildTarget(a, b *types.BuildTarget) bool {
 	if a == nil || b == nil {

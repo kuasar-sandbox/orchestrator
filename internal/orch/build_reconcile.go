@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
-
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // reconcileBuilds accounts every durable execution claim against the current
@@ -378,7 +377,7 @@ func (o *Orchestrator) publishRecoveredBuildMMDS(build *types.Build) *types.Sand
 		State: types.StateRunning, RunID: build.RunID, FloatingIP: build.RuntimeFloatingIP,
 		EnvdAccessToken: build.RuntimeEnvdAccessToken, APISecret: build.APISecret,
 		ServiceSecret: build.ServiceSecret, TrafficAccessToken: build.TrafficAccessToken,
-		ManifestKey: build.ManifestKey, Metadata: build.Metadata, CreatedUnix: time.Now().Unix(),
+		ManifestKey: build.ManifestKey, ManifestKeyFingerprint: build.ManifestKeyFingerprint, Metadata: build.Metadata, CreatedUnix: time.Now().Unix(),
 	}
 	o.setMMDSBuildOwner(row.ID, build.BuildID)
 	o.cache(row)

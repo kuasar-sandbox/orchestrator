@@ -152,7 +152,7 @@ type RouteEntry struct {
 	// MIGRATION_TOKEN is minted on demand by export-sandbox, never broadcast here.
 	ArtifactLocation string `json:"artifact_location,omitempty"`
 	// MmdsSecret is the per-sandbox MMDS signing key (hex), derived deterministically
-	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
+	// from the API secret + node-local id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
 	// RunID is the current launch/resume incarnation used by MMDSv2 tokens.

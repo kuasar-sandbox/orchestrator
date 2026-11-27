@@ -107,9 +107,10 @@ func (p *PutRequest) UnmarshalJSON(raw []byte) error {
 // callers never provide roots in a Group body. Expiry is absolute, including
 // retries; zero means permanent.
 type KeyPut struct {
-	APISecret   string `json:"api_secret"`
-	ManifestKey string `json:"manifest_key"`
-	ExpiresUnix int64  `json:"expires_unix"`
+	APISecret              string `json:"api_secret"`
+	ManifestKey            string `json:"manifest_key"`
+	ManifestKeyFingerprint string `json:"-"` // verified identity; receiving nodes independently validate and populate it
+	ExpiresUnix            int64  `json:"expires_unix"`
 }
 
 type Result struct {

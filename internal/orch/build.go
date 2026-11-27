@@ -3,10 +3,10 @@ package orch
 import (
 	"context"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"math"
 	"os"
 	"path/filepath"
@@ -16,15 +16,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/remote"
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
@@ -32,6 +32,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -64,6 +65,10 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	}
 	if pair.APISecret == "" {
 		return nil, api.ErrNotAllowed
+	}
+	pair, err = store.ResolveKeyPair(ctx, pair)
+	if err != nil {
+		return nil, err
 	}
 	bid, err := uuid.NewV7()
 	if err != nil {
@@ -133,7 +138,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	defer unlockRetention()
 	unlockEvent := o.lockBuildEvent(b.BuildID)
 	defer unlockEventFence(unlockEvent)
-	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
+	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues, pair)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
 		return nil, fmt.Errorf("%w: %v", api.ErrBuildAdmission, err)
@@ -480,6 +485,10 @@ func validateRegistryTLS(reg *types.BuildRegistryOptions, fromTemplate bool) err
 }
 
 func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildImportReferer, error) {
+	return o.effectiveImportRefererContext(context.Background(), b)
+}
+
+func (o *Orchestrator) effectiveImportRefererContext(ctx context.Context, b *types.Build) (configsock.BuildImportReferer, error) {
 	cfg := o.cfg.Builder.Referer
 	if !cfg.Enabled || b.FromImage == "" {
 		return configsock.BuildImportReferer{}, nil
@@ -497,9 +506,13 @@ func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildI
 	if !enabled {
 		return configsock.BuildImportReferer{}, nil
 	}
-	ck, err := manifest.ParseHexKey(b.ManifestKey)
+	ck, err := manifestkey.Resolve(ctx, b.ManifestKey)
 	if err != nil {
 		return configsock.BuildImportReferer{}, fmt.Errorf("build: manifest key: %w", err)
+	}
+	defer clear(ck[:])
+	if b.ManifestKeyFingerprint != "" && manifestkey.Fingerprint(ck) != b.ManifestKeyFingerprint {
+		return configsock.BuildImportReferer{}, fmt.Errorf("build: manifest key fingerprint mismatch")
 	}
 	owner := remote.Owner{
 		ArtifactType: remote.RefererArtifactType,
@@ -544,7 +557,13 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 	var creds regcreds.Creds
 	switch {
 	case pullToken != "":
-		c, err := regcreds.Open(b.ManifestKey, pullToken)
+		pair, err := store.ResolveKeyPair(ctx, store.KeyPair{APISecret: b.APISecret, ManifestKey: b.ManifestKey, ManifestKeyFingerprint: b.ManifestKeyFingerprint})
+		if err != nil {
+			return "", err
+		}
+		key, _ := pair.ManifestKeyBytes()
+		c, err := regcreds.OpenContext(ctx, hex.EncodeToString(key[:]), pullToken)
+		clear(key[:])
 		if err != nil {
 			return "", fmt.Errorf("build: pull token: %w", err)
 		}
@@ -557,7 +576,7 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
 	default:
 		authJSON, err := o.st.RegistryAuthForKeyPair(ctx, store.KeyPair{
-			APISecret: b.APISecret, ManifestKey: b.ManifestKey,
+			APISecret: b.APISecret, ManifestKey: b.ManifestKey, ManifestKeyFingerprint: b.ManifestKeyFingerprint,
 		})
 		if err != nil {
 			return "", err
@@ -2102,7 +2121,7 @@ func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID 
 }
 
 func buildTaskEnv(b *types.Build) map[string]string {
-	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
+	env := map[string]string{"MANIFEST_KEY": b.ManifestKey, secret.Env: os.Getenv(secret.Env)}
 	if b.RegistryAuth != "" {
 		var creds regcreds.Creds
 		if json.Unmarshal([]byte(b.RegistryAuth), &creds) == nil {
@@ -2147,7 +2166,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		return nil, err
 	}
 	if len(b.WorkspacePlan) > 0 {
-		sb := &types.Sandbox{APISecret: b.APISecret, ManifestKey: b.ManifestKey, WorkspacePlan: b.WorkspacePlan}
+		sb := &types.Sandbox{APISecret: b.APISecret, ManifestKey: b.ManifestKey, ManifestKeyFingerprint: b.ManifestKeyFingerprint, WorkspacePlan: b.WorkspacePlan}
 		if err := o.authorizeWorkspacePlan(ctx, sb); err != nil {
 			return nil, err
 		}
@@ -2196,7 +2215,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 	// directory.
 	checkpointParent := o.cfg.Checkpoint.Remote.RefLocationParent
 
-	importReferer, err := o.effectiveImportReferer(b)
+	importReferer, err := o.effectiveImportRefererContext(ctx, b)
 	if err != nil {
 		return nil, err
 	}
