@@ -6,6 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -21,6 +24,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/testsecret"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestNativeManifestRegistrationRejectsUppercase(t *testing.T) {
@@ -202,6 +209,65 @@ func TestManifestPluginOrchestratorBoundaries(t *testing.T) {
 		}
 		if row, err := o.st.Get(ctx, "changed-root-target"); err != nil || row != nil {
 			t.Fatalf("failed migration import wrote a target: %v", err)
+		}
+	})
+
+	t.Run("workspace report and token share one resolved root", func(t *testing.T) {
+		dir := t.TempDir()
+		o := migrationOrchestrator(t, dir, []byte("runtime"))
+		sb := migrationSandbox(t, dir, "plugin-workspace", hex.EncodeToString(material), "manifest://"+strings.Repeat("e", 64))
+		apiKey := mintTestAPIKey(t, sb.APISecret)
+		sb.WorkspacePlan = []workspace.Prepared{{Name: "project", Mounts: []workspace.Mount{{Path: "/data"}}}}
+		sb.State = types.StatePaused
+		sb.ManifestKey, sb.ManifestKeyFingerprint = reference, expectedFP
+		sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("e", 64)}
+		if err := o.st.Put(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+		size := int64(8192)
+		disk := rtconfig.DiskV1{Kind: "disk", Version: 1, Size: &size, Base: "manifest://" + strings.Repeat("a", 64), BaseFromRefs: []string{"manifest://" + strings.Repeat("b", 64)}}
+		report := artifact.DiskReport{Refs: true, DiskRefs: []string{disk.Base, disk.BaseFromRefs[0]}, RemovedRefs: []string{"file://old.overlay"}}
+		result := workspacedisk.Result{Disk: &disk, Report: &report}
+		file := installWorkspaceResult(t, o, result)
+		before := broker.Count("Tenant/Manifest_v1")
+		out, err := o.ExportWorkspace(ctx, sb.ID, apiKey, "project")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if broker.Count("Tenant/Manifest_v1") != before+1 {
+			t.Fatal("workspace token did not bind exactly one resolved root")
+		}
+		decoded, err := migrationtoken.OpenWorkspace(migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: hex.EncodeToString(material)}, out.Result)
+		if err != nil || decoded.Base != disk.Base || !slices.Equal(decoded.BaseFromRefs, disk.BaseFromRefs) || !out.Refs || !slices.Equal(out.DiskRefs, report.DiskRefs) || !slices.Equal(out.RemovedRefs, report.RemovedRefs) {
+			t.Fatalf("plugin workspace token/report mismatch: %v", err)
+		}
+		writeResult := func(value workspacedisk.Result) {
+			t.Helper()
+			raw, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writeResult(workspacedisk.Result{Disk: &disk})
+		before = broker.Count("Tenant/Manifest_v1")
+		if got, err := o.ExportWorkspace(ctx, sb.ID, apiKey, "project"); !errors.Is(err, api.ErrWorkspaceUnavailable) || got.Result != "" {
+			t.Fatalf("invalid report produced a workspace token: %v", err)
+		}
+		if broker.Count("Tenant/Manifest_v1") != before {
+			t.Fatal("invalid workspace report reached key resolution")
+		}
+		writeResult(result)
+		broker.Set("Tenant/Manifest_v1", bytes.Repeat([]byte{0xcd}, 32))
+		defer broker.Set("Tenant/Manifest_v1", material)
+		if got, err := o.ExportWorkspace(ctx, sb.ID, apiKey, "project"); err == nil || got.Result != "" {
+			t.Fatal("workspace export accepted a changed retained root")
+		}
+		stored, err := o.st.Get(ctx, sb.ID)
+		if err != nil || stored.ManifestKey != reference || stored.ManifestKeyFingerprint != expectedFP || stored.ResumeSource != sb.ResumeSource || stored.State != types.StatePaused {
+			t.Fatalf("workspace export changed retained identity or source: %v", err)
 		}
 	})
 
