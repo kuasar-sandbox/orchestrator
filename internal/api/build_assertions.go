@@ -60,6 +60,26 @@ func parseBuildTriggerAssertions(h http.Header) (*sandboxcfg.NetworkSpec, *types
 		if options.Target == nil || options.Resources != nil || options.Referer != nil || options.Registry != nil {
 			return nil, nil, fmt.Errorf("trigger-time builder configuration is deprecated; only a repeated registered target is accepted")
 		}
+		// Require canonical keys so case aliases cannot replace an earlier
+		// assertion value during encoding/json's struct decoding.
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(*raw), &fields); err != nil {
+			return nil, nil, fmt.Errorf("trigger builder assertion: %w", err)
+		}
+		for name := range fields {
+			if name != "target" {
+				return nil, nil, fmt.Errorf("trigger builder assertion: unknown field %q", name)
+			}
+		}
+		var targetFields map[string]json.RawMessage
+		if err := json.Unmarshal(fields["target"], &targetFields); err != nil {
+			return nil, nil, fmt.Errorf("trigger target assertion: %w", err)
+		}
+		for name := range targetFields {
+			if name != "kind" && name != "memory" {
+				return nil, nil, fmt.Errorf("trigger target assertion: unknown field %q", name)
+			}
+		}
 		target = options.Target
 	}
 	return network, target, nil

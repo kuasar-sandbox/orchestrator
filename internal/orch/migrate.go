@@ -161,7 +161,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	// Phase one only publishes and prepares the immutable result. It never
 	// mutates the source row, cache, route, or local checkpoint.
 	artifact := source.ResumeSource
-	report := artifactresult.PublishReport{SandboxRef: artifact.Ref, RemovedRefs: []string{}}
+	report := artifactresult.PublishReport{SandboxRef: artifact.Ref}
 	if artifact.Kind == types.ResumeSourceSnapshot {
 		report.SnapshotRef, report.SandboxRef = artifact.Ref, artifact.SandboxRef
 	}

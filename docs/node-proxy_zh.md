@@ -44,7 +44,7 @@ finally:
 
 Create 检查控制面，命令和文件操作检查数据面。如果 Create 成功而后续调用失败，先核对 Proxy 可达性、数据入口、guest 就绪和限定用途的 token，再决定下一步；单独验证 API key 不能证明数据路径可用。排查客户端差异时使用[诊断顺序](observability_zh.md#diagnose-a-request)和 [SDK 基线](#sdk-configuration)。
 
-**Guest 出站使用 Connector egress。** Proxy 负责客户端到 guest 的转发，不提供 DNS、通用 guest HTTP 代理或出站 NAT。按[原生 egress 指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md#native-egress)部署，并匹配请求/模板中的 [transit gateway 和 Area VNI](sandbox-lifecycle_zh.md#network-and-egress)。普通 E2B 访问使用 SDK 的限定 token；API key、转发 token 与 native-exec token 不可互换。
+**Guest 出站使用 Connector egress。** Proxy 负责客户端到 guest 的转发，不提供 DNS、通用 guest HTTP 代理或出站 NAT。按[原生 egress 指南](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress_zh.md#部署和归属)部署，并匹配请求/模板中的 [transit gateway 和 Area VNI](sandbox-lifecycle_zh.md#network-and-egress)。普通 E2B 访问使用 SDK 的限定 token；API key、转发 token 与 native-exec token 不可互换。
 
 <a id="proxy-role"></a>
 

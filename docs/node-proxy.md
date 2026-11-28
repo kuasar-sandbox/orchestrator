@@ -44,7 +44,7 @@ finally:
 
 Create exercises the control plane; commands and files exercise the data plane. If Create succeeds but these calls fail, inspect Proxy reachability, the data endpoint, guest readiness and the scoped token before issuing another Create. A successful API-key verification alone does not test those paths. Use [the diagnostic sequence](observability.md#diagnose-a-request) and the [SDK baseline](#sdk-configuration) when identifying a client mismatch.
 
-**Guest outbound access uses Connector egress.** Proxy forwards client-to-guest traffic; it does not supply DNS, a general guest HTTP proxy or an outbound NAT path. Configure [native egress](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#native-egress) and match the request/template's [transit gateway and Area VNI](sandbox-lifecycle.md#network-and-egress). For ordinary E2B access, use the SDK's scoped tokens; API keys, forwarding tokens and native-exec tokens are not interchangeable.
+**Guest outbound access uses Connector egress.** Proxy forwards client-to-guest traffic; it does not supply DNS, a general guest HTTP proxy or an outbound NAT path. Configure [native egress](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress.md#deployment-and-ownership) and match the request/template's [transit gateway and Area VNI](sandbox-lifecycle.md#network-and-egress). For ordinary E2B access, use the SDK's scoped tokens; API keys, forwarding tokens and native-exec tokens are not interchangeable.
 
 <a id="proxy-role"></a>
 

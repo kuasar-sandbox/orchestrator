@@ -287,7 +287,7 @@ On an SBX or SNP template, select an existing empty device by name, for example 
 |---|---|---|
 | Inspect current devices | `GET /sandboxes/{id}/workspaces` | `node-ctl workspace list B --json` |
 | Attach to an empty device in a running sandbox | `POST /sandboxes/{id}/workspaces/attach?name=project` with `{"disk":{}}`, a complete disk in `disk` or `{"disk":{"migrationToken":"…"}}` | `node-ctl workspace attach B --name project`; use `--disk-spec FILE` or `--token-file FILE` to select another source |
-| Export an attached device from a paused sandbox | `POST /sandboxes/{id}/workspaces/export?name=project` with `{}` returns `{"token":"…"}` | `node-ctl workspace export A --name project`; `--json` returns the token envelope |
+| Export an attached device from a paused sandbox | `POST /sandboxes/{id}/workspaces/export?name=project` with `{}` returns `result` (kwt1), `refs`, `diskRefs` and `removedRefs` | `node-ctl workspace export A --name project`; default stdout is one token, `--json` returns the same API object |
 
 Use the owner's `E2B_API_KEY`. Once A has synced application writes and paused, B can receive the disk through stdin:
 
@@ -296,6 +296,24 @@ set -o pipefail
 node-ctl workspace export "$A" --name project |
   node-ctl workspace attach "$B" --name project --token-file -
 ```
+
+Workspace export returns the token and complete disk reference report from the
+same final DiskV1. `diskRefs` is sorted and unique, containing `base` and every
+`base_from_refs` entry; capacity and recovery order stay in the unchanged kwt1
+payload. There is no `diskRef` field at either layer. For example, a disk with
+one immutable layer and no known removed references returns:
+
+```json
+{"result":"kwt1.…","refs":true,"diskRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
+```
+
+The HTTP/CLI JSON field changes from `token` to `result`; clients must update
+even if they otherwise ignore unknown fields. Default CLI token output remains
+compatible. The private storage helper calls the SDK directly and carries the
+same DiskV1/report to core; it does not parse a `sandbox-ctl export` envelope.
+`removedRefs` concerns only the selected disk and does not release the retained
+source checkpoint. The [report consumption rules](#publication-and-migration)
+also apply to Workspace.
 
 Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. After attach returns 204, a new access to B’s guest path can trigger the mount even if an earlier access started while the slot was empty. The guest mounts the filesystem on access and reports filesystem or subdirectory errors to the caller.
 
@@ -599,7 +617,7 @@ CaptureSandbox:
 ```
 
 Capture returns the producer's actual identities: `snapshot --json` returns
-`{snapshotRef,sandboxRef,removedRefs}` and `export --json` returns
+`{snapshotRef,sandboxRef,removedRefs}` and local `export --output DIR --json` returns
 `{sandboxRef,removedRefs}`. Capture removals are `[]`. A Snapshot Bundle carries
 the S and E selectors in the same physical file. Local refs retain their identity
 qualifiers but expose only basenames; the checkpoint directory is execution
@@ -977,29 +995,45 @@ The name itself is the directory key: every publication of one logical entity �
 
 The authenticated `POST /sandboxes/{id}/export` request remains
 `{"toTemplate":false,"keepSource":true}`. Its successful response preserves the
-existing `result` field and adds exactly the corresponding publication roots and
-`removedRefs`. A Sandbox response has three fields:
+existing `result` field and includes the corresponding publication report.
+A complete Sandbox report is:
 
 ```json
-{"result":"kmt1.…","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":[]}
+{"result":"kmt1.…","refs":true,"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
 ```
 
-A Snapshot response has four:
+A complete Snapshot report also includes its memory reference set:
 
 ```json
-{"result":"kmt1.…","snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.snapshot"]}
+{"result":"kmt1.…","refs":true,"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","snapshotRefs":["manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.snapshot"]}
 ```
 
 For `toTemplate:true`, only the meaning of `result` changes to the corresponding
 `sbx`/`snp` TemplateID. Snapshot always returns the E actually referenced by final
 S, including a selected located Bundle member. The publication adapter parses
 one strict `sandbox-ctl publish --json` document and checks expected S/E role,
-portable final roots, required final E, sorted unique removals and safe file
+portable final roots, required final E, complete applicable reference sets,
+sorted unique removals and safe file
 basenames **before** source finalization. It never treats diagnostic stderr as a
 successful result. Builder checkpoint publication consumes the same contract.
-The Core method returns one `types.ExportResult`; the HTTP `result` field remains
-compatible with existing clients. Deploy sandboxer and orchestrator from the
-matching source set when adopting the new internal CLI contract.
+The Core method returns one `types.ExportResult`; HTTP and `node-ctl --json`
+use the same shape, while default CLI output remains one result string. New
+fields affect older strict consumers. Deploy sandboxer and orchestrator from
+the matching source set when adopting the new internal CLI contract.
+
+With `refs:true`, `snapshotRefs` contains final S and its memory parents, and
+`sandboxRefs` contains final E plus all immutable root/data/Workspace disk
+layers. Sets are sorted and unique; each includes its corresponding root.
+`removedRefs` is mandatory and uses `[]` for a known empty difference. The
+examples above have no retained parents. Completeness describes metadata, not
+a fresh accessibility check of retained artifacts.
+
+Only exact legacy S/E reports without `refs` are accepted under the old field
+rules, then normalized to `refs:false` with their old `removedRefs` discarded.
+Explicit false reports must omit every plural set and `removedRefs`, including
+empty/null arrays. Duplicate/unknown keys, null `refs`, incomplete sets and
+trailing output fail. Local capture and all sandbox-ctl snapshot outputs keep
+their existing contract.
 
 Local publication returns S1/E1 in both report and token; keep-source retains
 S0/E0 in SQLite and the cache. Capture and its producer result are specified in
@@ -1016,14 +1050,21 @@ Snapshot tokens missing E, are invalid; discard stale tokens and re-export from 
 complete paired record.
 Do not use an old token or an S metadata read to reconstruct a durable pair.
 
-An already portable source is not republished and has `removedRefs:[]`. A
+An already portable source is not republished and returns `refs:false`, omitting
+`snapshotRefs`, `sandboxRefs`, `diskRefs` and `removedRefs`. A
 portable Snapshot returns the exact S/E pair already stored in SQLite. Export
 does not open artifacts, configure storage, inspect metadata or start a metadata
 subprocess, even when both artifacts are offline. An incomplete paused pair is
-invalid and is never repaired by reading S. The same roots and removals
-accompany normal, keep-source, move and accepted detached-template returns.
+invalid and is never repaired by reading S. Normal, keep-source, move and
+accepted detached-template returns use the same report completeness rules.
 Resume/preemption, ownership checks, lifecycle cancellation, idempotence and
 concurrency retain the ordering below.
+
+Consumers register ownership from complete sets. For `refs:false`, retain any
+existing complete registration with the same immutable identity and storage
+scope; do not replace it with an empty graph or infer removal candidates.
+Keeping only the root file cannot protect unknown parents, so an unknown graph
+must not participate as an empty branch in deletion decisions.
 
 Removals describe the old known topology minus retained final references, not
 field rewrite events or deletion commands. They include local roots and internal
@@ -1168,8 +1209,8 @@ success. The full response contract is documented in [Publication, templates and
 
 ## Select the network and outbound egress
 
-Prepare the native egress and DNS path described in the [project networking
-guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#native-egress),
+Prepare the native egress and DNS path described in the [Connector networking
+guide](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress.md#deployment-and-ownership),
 then match the workload's logical network to that deployment. API/Proxy ingress
 can work while guest outbound access is still unconfigured.
 

@@ -19,7 +19,9 @@ func TestExportSandboxJSONClient(t *testing.T) {
 	t.Setenv("E2B_API_KEY", "test-owner")
 	root := "manifest://" + strings.Repeat("a", 64)
 	e := "manifest://" + strings.Repeat("b", 64)
-	report := types.ExportResult{Result: "kmt1.test", PublishReport: artifact.PublishReport{SnapshotRef: root, SandboxRef: e, RemovedRefs: []string{"file://old.snapshot"}}}
+	report := types.ExportResult{Result: "kmt1.test", PublishReport: artifact.PublishReport{
+		Refs: true, SnapshotRef: root, SnapshotRefs: []string{root}, SandboxRef: e, SandboxRefs: []string{e}, RemovedRefs: []string{"file://old.snapshot"},
+	}}
 	valid, _ := json.Marshal(report)
 	tests := []struct {
 		name     string

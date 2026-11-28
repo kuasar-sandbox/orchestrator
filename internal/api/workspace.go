@@ -10,6 +10,7 @@ import (
 	"net/url"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
@@ -30,7 +31,7 @@ type WorkspaceList struct {
 type workspaceCore interface {
 	ListWorkspaces(context.Context, string, string) (WorkspaceList, error)
 	AttachWorkspace(context.Context, string, string, string, json.RawMessage) error
-	ExportWorkspace(context.Context, string, string, string) (string, error)
+	ExportWorkspace(context.Context, string, string, string) (types.WorkspaceExportResult, error)
 }
 
 func (a *API) listWorkspaces(w http.ResponseWriter, r *http.Request) {
@@ -98,10 +99,10 @@ func (a *API) exportWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !decodeWorkspaceBody(w, r, &struct{}{}, maxPauseRequestBytes) {
 		return
 	}
-	token, err := a.core.ExportWorkspace(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), name)
+	result, err := a.core.ExportWorkspace(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), name)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": token})
+	writeJSON(w, http.StatusOK, result)
 }

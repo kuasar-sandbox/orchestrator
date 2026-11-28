@@ -18,7 +18,7 @@
 | 配置持久站点 Node | 主项目[部署指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)，再看[节点运维](docs/node_zh.md#operate-a-node) | Conductor、Proxy 正常运行，客户端可访问两个入口 |
 | 构建应用模板 | [模板构建](docs/node-build_zh.md#client-workflow) | 本次 Build 达到 `ready`，保存其 canonical TemplateID |
 | 运行、暂停和重新连接 Sandbox | [生命周期](docs/sandbox-lifecycle_zh.md#recommended-workflow)与 [SDK 接入](docs/node-proxy_zh.md#connect-a-client) | 命令和文件操作能通过配置的数据入口完成 |
-| 开通出站访问或调整网络策略 | 主项目[网络指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md#native-egress) | Guest 经所选 egress 路径访问预期目的地 |
+| 开通出站访问或调整网络策略 | Connector [网络指南](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress_zh.md#部署和归属) | Guest 经所选 egress 路径访问预期目的地 |
 | 增加第二个计算节点 | [首次集群](docs/cluster_zh.md#minimum-cluster) | 两个 Node 均发布目标 Group 版本，默认模板 eligible |
 | 排查容量、流量或失败 | [资源管理](docs/node-resource_zh.md#operate-resources)、[可观测性](docs/observability_zh.md#diagnose-a-request) | 重试前先检查原 SandboxID/BuildID 及负责该操作的服务 |
 

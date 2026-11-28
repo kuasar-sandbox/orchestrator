@@ -15,7 +15,7 @@
 从持久化 [node-infra 安装](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)开始。安装布局决定服务名称、状态目录和有序配置 overlay，应用本指南时沿用这些值。`deploy/` 的组件示例说明相同 schema，但不是已有安装的替换配置。
 
 1. **确认安装版本与实际输入。** 记录 `node-ctl --version` 及聚合版本，从已安装 Conductor/Proxy unit 读取完整 `--config` 文件列表。分别执行 `node-ctl config conductor --config FILE[:OVERLAY...] --resolve` 和 `node-ctl config proxy --config FILE[:OVERLAY...]` 验证。后文件覆盖前文件，列表整体替换而非追加。渲染配置应采用与源配置相同的访问保护。
-2. **接纳 Build 前先验证存储与网络。** 持久保存 `paths.base_root`、Node 数据库及其加密密钥；准备配置中的 kernel/runtime、artifact store 或命名位置。新可写盘采用[模板引用](#diff-template-references)，原生 egress 和 DNS 按主项目[网络指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md#native-egress)配置。Proxy 入站和 guest 出站是两条独立路径。
+2. **接纳 Build 前先验证存储与网络。** 持久保存 `paths.base_root`、Node 数据库及其加密密钥；准备配置中的 kernel/runtime、artifact store 或命名位置。新可写盘采用[模板引用](#diff-template-references)，原生 egress 和 DNS 按 Connector [网络指南](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress_zh.md#部署和归属)配置。Proxy 入站和 guest 出站是两条独立路径。
 3. **启动已安装服务并授权一个租户。** SDK 流程需要 Conductor 与 Proxy。通过 Conductor 本地 admin socket 安装租户根凭据对，再按[凭据指南](node-proxy_zh.md#credential-model)签发客户端 API key。租户凭据对、Node 加密密钥须与依赖它们的数据一同保留。需要历史指标时增加 Telemetry。
 4. **构建并运行应用。** 完成 [Build 配方](node-build_zh.md#client-workflow)，保存 canonical TemplateID，再执行[客户端检查](node-proxy_zh.md#connect-a-client)。数据请求仍等待启动时检查同一个 SandboxID；准入等待由[资源检查](node-resource_zh.md#operate-resources)定位。
 5. **有序变更配置。** 重启负责该配置的服务前，验证完整有序文件列表。现有执行按[恢复](#recovery)处理；worker 放置变更按 [NUMA/资源池](#numa-deployment-with-multiple-pools)处理。配置有效或 daemon-reload 不表示运行中的 guest 已修改，也不会移动 worker。

@@ -223,7 +223,7 @@ For builds without workspaces, omitting the target selects memory Sandbox when e
 
 Build resources govern execution/admission only; referer/registry govern this Build. Parsed target/build-only fields leave template metadata and persist in builds.builder_json, never in later create/resume runtime config.
 
-Create and Register share the typed parser for resource/network/traffic/launch/init/mounts/files/metadata, `envVars` and instance options; namespace fields and Header/metadata merge rules remain in [Sandbox configuration propagation](sandbox-lifecycle.md#request-configuration). Register always rejects `kuasar-sandbox.identity`, tenant-supplied node-managed cluster metadata, `restore` and `autoPauseMemory`. The removed top-level Build Register `secure` input returns HTTP 400 whenever present, including false or null; it is not a Build security mode. Build runtime inputs use `builds.metadata_json`; build-only input uses `builds.builder_json`. They serve this execution and artifact generation, not long-term canonical TemplateID lookup. Trigger cannot replace any registered configuration. Only the repeated Network and Builder target headers described above are accepted as assertions; other general metadata/headers remain rejected. Network assertions use the known JSON schema, reject duplicate/unknown fields and null, and compare normalized values rather than JSON whitespace or object-key order. These assertions remain core-owned across extension Hooks.
+Create and Register share the typed parser for resource/network/traffic/launch/init/mounts/files/metadata, `envVars` and instance options; namespace fields and Header/metadata merge rules remain in [Sandbox configuration propagation](sandbox-lifecycle.md#request-configuration). Register always rejects `kuasar-sandbox.identity`, tenant-supplied node-managed cluster metadata, `restore` and `autoPauseMemory`. The removed top-level Build Register `secure` input returns HTTP 400 whenever present, including false or null; it is not a Build security mode. Build runtime inputs use `builds.metadata_json`; build-only input uses `builds.builder_json`. They serve this execution and artifact generation, not long-term canonical TemplateID lookup. Trigger cannot replace any registered configuration. Only the repeated Network and Builder target headers described above are accepted as assertions; other general metadata/headers remain rejected. Network assertions use the known JSON schema, reject duplicate/unknown fields and null, and compare normalized values rather than JSON whitespace or object-key order. Builder target assertions require the canonical `target`, `kind` and `memory` field names; case aliases and conflicting spellings are rejected. These assertions remain core-owned across extension Hooks.
 
 - At synchronous admission, a known Image target rejects any remaining normalized Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace, nonempty `envVars`, nonzero credential overrides or explicit MMDS routes/secrets. Ordinary metadata labels and Build execution resources remain allowed; empty `envVars` alone is not a rejection condition.
 - Every target accepts `X-Kuasar-Sandbox-Network` / `kuasar-sandbox.network` for the Build execution network, including explicit or automatically resolved Image targets and an empty network object. Network input does not require a Sandbox output; A/B use it for image import and build steps, and Sandbox targets also project it into E.
@@ -534,9 +534,12 @@ Managed sandbox checkpoint cleanup does not run between Build phases. A phase ma
 ### Checkpoint publication reports
 
 The builder invokes `sandbox-ctl publish --json --quiet` for a checkpoint S and
-validates exactly `snapshotRef`, final `sandboxRef` and `removedRefs` before
-accepting the checkpoint. Roots must be portable and have the expected logical
-role; removals must be sorted, unique and safe public refs. Invalid/trailing JSON,
+validates the S/E reference report before accepting the checkpoint. Roots must
+be portable and have the expected logical role. `refs:true` requires complete
+`snapshotRefs`/`sandboxRefs` sets and `removedRefs`; false omits all collections.
+Only the exact legacy shape without `refs` is normalized to false, dropping
+its old difference. Sets and removals must be sorted, unique and safe public
+refs, and no removal may remain in a final set. Invalid/trailing JSON,
 missing roots and polluted stdout fail the build publication. Progress stderr is
 kept separate. The builder continues returning its canonical `snp` TemplateID;
 Export's additional HTTP report fields are documented in

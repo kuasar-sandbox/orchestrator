@@ -18,7 +18,7 @@ Start with the project [Quick Start](https://github.com/kuasar-sandbox/kuasar-sa
 | Configure a persistent site Node | [Project deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md), then [Node operation](docs/node.md#operate-a-node) | Conductor and Proxy are running; both client endpoints are reachable |
 | Build your application template | [Template Build](docs/node-build.md#client-workflow) | This Build is `ready`; retain its canonical TemplateID |
 | Run, pause and reconnect a sandbox | [Sandbox lifecycle](docs/sandbox-lifecycle.md#recommended-workflow) and [SDK access](docs/node-proxy.md#connect-a-client) | Commands and files work through the configured data endpoint |
-| Add outbound access or change network policy | [Project networking guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md#native-egress) | The guest reaches only the intended destinations through the selected egress path |
+| Add outbound access or change network policy | [Connector networking guide](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress.md#deployment-and-ownership) | The guest reaches only the intended destinations through the selected egress path |
 | Add a second compute node | [First cluster](docs/cluster.md#minimum-cluster) | Both Nodes publish the intended Group revision; the default template is eligible |
 | Diagnose capacity, traffic or failures | [Resources](docs/node-resource.md#operate-resources), [Observability](docs/observability.md#diagnose-a-request) | Inspect the original SandboxID/BuildID and the responsible service before retrying |
 

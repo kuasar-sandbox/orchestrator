@@ -235,7 +235,7 @@ Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/met
 已移除的 Build Register 顶层 `secure` 字段只要出现就返回 HTTP 400，包括 false 或 null；它不是 Build 安全模式。
 普通 Build runtime 输入存 `builds.metadata_json`,build-only 输入存 `builds.builder_json`;
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
-Trigger 不能覆盖任何注册配置。仅允许前述 Network 和 Builder target 头作为等值断言，其他通用 metadata/header 仍拒绝。Network 断言使用已知 JSON schema，拒绝重复/未知字段及 null；比较规范化值，不比较 JSON 空白和对象键顺序。断言跨 extension Hook 保持由 core 拥有。
+Trigger 不能覆盖任何注册配置。仅允许前述 Network 和 Builder target 头作为等值断言，其他通用 metadata/header 仍拒绝。Network 断言使用已知 JSON schema，拒绝重复/未知字段及 null；比较规范化值，不比较 JSON 空白和对象键顺序。Builder target 断言只接受规范字段名 `target`、`kind` 和 `memory`，拒绝大小写别名和冲突拼写。断言跨 extension Hook 保持由 core 拥有。
 
 - 同步接纳时,已知为 Image 的 target 拒绝归一化后仍存在的 Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
   以及非空 `envVars`、非零 credential override 或显式 MMDS routes/secrets。
@@ -881,8 +881,10 @@ registration usage 只统计 status IN (registered, waiting, building) 且两个
 ### Checkpoint 发布报告
 
 Builder 对 checkpoint S 调用 `sandbox-ctl publish --json --quiet`，接受 checkpoint
-前验证且只接受 `snapshotRef`、最终 `sandboxRef` 和 `removedRefs`。根必须 portable
-且角色正确；差集必须有序、唯一并采用安全的公开引用。无效/尾随 JSON、缺少根和 stdout
+前校验 S/E 引用报告。根必须 portable 且角色正确；`refs:true` 要求完整的
+`snapshotRefs`／`sandboxRefs` 及 `removedRefs`，false 则省略全部集合。只有缺少
+`refs` 的精确旧形状才归一为 false 并丢弃旧差集。集合与差集必须有序、唯一并采用
+安全的公开引用，移除项不能仍在最终集合中。无效/尾随 JSON、缺少根和 stdout
 污染都会使发布失败，进度 stderr 单独处理。Builder 继续返回规范 `snp` TemplateID；
 Export 新增 HTTP 报告字段见[节点发布与迁移](sandbox-lifecycle_zh.md#publication-and-migration)。
 直接发布 image/Sandbox 的 `PublishSource` 调用保持既有 role/ref 契约、source 所有权和
