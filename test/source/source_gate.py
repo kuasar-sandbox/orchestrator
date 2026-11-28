@@ -67,11 +67,11 @@ python3 -B scripts/with-test-fdb.py -- \
 (
     cluster_work="$(mktemp -d)"
     trap 'rm -rf "$cluster_work"' EXIT
-    BIN="$cluster_work/native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
-    BIN="$cluster_work/pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
+    CLUSTER_STUB_COMMON_BIN= BIN="$cluster_work/native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
+    CLUSTER_STUB_COMMON_BIN="$cluster_work/native" BIN="$cluster_work/pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
     BIN="$cluster_work/native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_PREBUILT=1 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
-    BIN="$cluster_work/pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_PREBUILT=1 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
-    BIN="$cluster_work/pure" CLUSTER_STUB_PREBUILT=1 bash scripts/with-test-postgres.sh -- bash -euc '
+    CLUSTER_STUB_COMMON_BIN="$cluster_work/native" BIN="$cluster_work/pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_PREBUILT=1 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+    CLUSTER_STUB_COMMON_BIN="$cluster_work/native" BIN="$cluster_work/pure" CLUSTER_STUB_PREBUILT=1 bash scripts/with-test-postgres.sh -- bash -euc '
     test -n "$STORAGE_TEST_POSTGRES_DSN"
     CGO_ENABLED=1 go test -vet=off -skip="^TestRace" -p=1 -count=1 -timeout=5m \
         ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry

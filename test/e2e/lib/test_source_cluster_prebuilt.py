@@ -74,7 +74,7 @@ else:
                "CLUSTER_STUB_BACKEND": backend, "FDB_CLUSTER_FILE": str(self.cluster_file),
                "STORAGE_TEST_POSTGRES_DSN": "fixture-dsn"}
         for key in ("CLUSTER_STUB_CASE", "CLUSTER_STUB_PREBUILT", "CLUSTER_STUB_BUILD_ONLY",
-                    "CLUSTER_CTL", "NODE_STUB_CTL", "E2B_KEY_CTL"):
+                    "CLUSTER_CTL", "NODE_STUB_CTL", "E2B_KEY_CTL", "CLUSTER_STUB_COMMON_BIN"):
             env.pop(key, None)
         env.update(extra)
         return subprocess.run(["bash", str(self.script)], env=env,
@@ -105,15 +105,24 @@ else:
         native, pure = self.root / "native", self.root / "pure"
         for backend, binary in (("foundationdb", native), ("sqlite", pure)):
             result = self.run_stub(backend, binary=binary, CLUSTER_STUB_BUILD_ONLY="1",
-                                   FDB_CLUSTER_FILE="", STORAGE_TEST_POSTGRES_DSN="")
+                                   FDB_CLUSTER_FILE="", STORAGE_TEST_POSTGRES_DSN="",
+                                   CLUSTER_STUB_COMMON_BIN=str(native) if backend == "sqlite" else "")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("executed-case:", result.stdout)
         builds = [row for row in self.call_rows() if row[1] == "build"]
         for backend, count, binary in (("foundationdb", 6, native), ("sqlite", 1, pure), ("postgres", 6, pure)):
-            self.assert_cases(self.run_stub(backend, binary=binary, CLUSTER_STUB_PREBUILT="1"), count, backend)
+            self.assert_cases(self.run_stub(backend, binary=binary, CLUSTER_STUB_PREBUILT="1",
+                                            CLUSTER_STUB_COMMON_BIN=str(native) if backend != "foundationdb" else ""), count, backend)
         self.assertEqual([row for row in self.call_rows() if row[1] == "build"], builds)
         self.assertEqual(sum(row[:2] == ["native", "build"] for row in builds), 1)
-        self.assertEqual(sum(row[:2] == ["go", "build"] for row in builds), 5)
+        self.assertEqual(sum(row[:2] == ["go", "build"] for row in builds), 3)
+
+    def test_missing_common_binary_fails_before_any_build(self):
+        result = self.run_stub("sqlite", CLUSTER_STUB_BUILD_ONLY="1",
+                               CLUSTER_STUB_COMMON_BIN=str(self.root / "missing"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing common", result.stderr)
+        self.assertEqual(self.call_rows(), [])
 
     def test_missing_prebuilt_binary_fails_without_build_fallback(self):
         result = self.run_stub("sqlite", CLUSTER_STUB_PREBUILT="1")

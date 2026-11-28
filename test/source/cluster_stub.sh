@@ -6,8 +6,9 @@ NODES_EXPLICIT="${NODES+x}"
 SCALERS_EXPLICIT="${SCALERS+x}"
 BIN="${BIN:-$ROOT/bin/$(uname -m)}"
 CLUSTER_CTL="${CLUSTER_CTL:-$BIN/run-cluster-ctl}"
-NODE_STUB_CTL="${NODE_STUB_CTL:-$BIN/node-stub-ctl}"
-E2B_KEY_CTL="${E2B_KEY_CTL:-$BIN/e2b-key-ctl}"
+COMMON_BIN="${CLUSTER_STUB_COMMON_BIN:-$BIN}"
+NODE_STUB_CTL="${NODE_STUB_CTL:-$COMMON_BIN/node-stub-ctl}"
+E2B_KEY_CTL="${E2B_KEY_CTL:-$COMMON_BIN/e2b-key-ctl}"
 DOMAIN="${DOMAIN:-cluster.stub.local}"
 GROUP="${GROUP:-/e2e/stub/group}"
 NODES="${NODES:-4}"
@@ -94,6 +95,13 @@ build_cluster_stub_binaries() {
         ;;
     *) fail "CLUSTER_STUB_PREBUILT must be 0 or 1" ;;
     esac
+    # These two executables have identical inputs/flags for every backend.
+    # The source gate supplies its fresh native bundle; never rebuild silently
+    # when explicitly requested common binaries are absent.
+    if [ -n "${CLUSTER_STUB_COMMON_BIN:-}" ]; then
+        [ -x "$NODE_STUB_CTL" ] || fail "missing common node-stub-ctl at $NODE_STUB_CTL"
+        [ -x "$E2B_KEY_CTL" ] || fail "missing common e2b-key-ctl at $E2B_KEY_CTL"
+    fi
     step "building cluster stub binaries: backend=$CLUSTER_STUB_BACKEND arch=$(uname -m) flags=-trimpath"
     command -v go >/dev/null 2>&1 || fail "go not on PATH"
     mkdir -p "$BIN"
@@ -103,8 +111,10 @@ build_cluster_stub_binaries() {
         (cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -o "$BIN/cluster-ctl-pure" ./cmd/cluster-ctl)
         CLUSTER_CTL="$BIN/cluster-ctl-pure"
     fi
-    (cd "$ROOT" && go build -trimpath -o "$NODE_STUB_CTL" ./cmd/node-stub-ctl)
-    (cd "$ROOT" && go build -trimpath -o "$E2B_KEY_CTL" ./cmd/e2b-key-ctl)
+    if [ -z "${CLUSTER_STUB_COMMON_BIN:-}" ]; then
+        (cd "$ROOT" && go build -trimpath -o "$NODE_STUB_CTL" ./cmd/node-stub-ctl)
+        (cd "$ROOT" && go build -trimpath -o "$E2B_KEY_CTL" ./cmd/e2b-key-ctl)
+    fi
     go version
     if [ "$CLUSTER_STUB_BACKEND" = foundationdb ]; then
         sha256sum "$BIN/cluster-runtime/bin/cluster-ctl" "$BIN/cluster-runtime/bin/run-cluster-ctl"
