@@ -17,7 +17,14 @@ func InSubprocess(t *testing.T) bool {
 	if os.Getenv(marker) == t.Name() {
 		return true
 	}
-	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1", "-test.timeout=2m")
+	binary := os.Args[0]
+	args := []string{"-test.run=^" + regexp.QuoteMeta(t.Name()) + "$", "-test.count=1", "-test.timeout=2m"}
+	// Keep the pinned native runtime when go test itself runs through its loader.
+	if loader := os.Getenv("CLUSTER_NATIVE_TEST_LOADER"); loader != "" {
+		args = append([]string{"--inhibit-cache", "--library-path", os.Getenv("CLUSTER_NATIVE_TEST_LIBRARY_PATH"), binary}, args...)
+		binary = loader
+	}
+	command := exec.CommandContext(t.Context(), binary, args...)
 	command.Env = append(os.Environ(), marker+"="+t.Name())
 	output, err := command.CombinedOutput()
 	if err != nil {
