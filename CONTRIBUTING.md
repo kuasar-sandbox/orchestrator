@@ -111,7 +111,9 @@ The publisher's archive validator is compiled from trusted publisher source in a
 separate Workbench invocation with cache restore/save disabled. Assembly and
 publication execute that exact validator without another compilation.
 
-The Go binaries are built with `CGO_ENABLED=0`.
+`node-ctl`, `node-stub-ctl` and `e2b-key-ctl` use `CGO_ENABLED=0`. The official
+`cluster-ctl` build includes the pinned native FoundationDB client and its private
+runtime; `make build` assembles both paths. See [native cluster build/runtime](docs/cluster.md#native-build-and-runtime).
 
 ```bash
 make build                      # node-ctl, cluster-ctl, node-stub-ctl, e2b-key-ctl
@@ -177,19 +179,22 @@ to its maintained focused case.
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
-Source builds require Go 1.26.1 or newer. Standalone builds resolve the obtainable
-versions committed in `go.mod`. Coordinated Preview builds use the selected local
-`orchestrator`, `sandboxer`, `accelerator` and `connector` modules:
+Source builds require Go 1.26.1 or newer. For coordinated source development,
+check out the selected local `orchestrator`, `sandboxer`, `accelerator`, `connector`
+and required `guest-runtime` module closure. Generate the workspace below instead
+of assuming every internal module version in `go.mod` has already been published:
 
 ```bash
-GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator)" || exit 1
+GOWORK="$(python3 ../kuasar-sandbox/ci/integration/go_workspace.py --root .. --owners orchestrator --source-requirements)" || exit 1
 export GOWORK
 make build
 ```
 
-The workspace verifies module paths and uses exactly this closure without redundant
-`replace` directives or changes to `go.mod`/`go.sum`. Product, helper and source tests
-share the selected modules. Runtime/Kernel artifacts remain additional prerequisites
+The workspace verifies module paths and selects exactly this source closure.
+`--source-requirements` also binds versioned internal requirements to those
+selected local modules, avoiding an unnecessary fetch of unpublished dependency
+versions. These replacements belong only to the generated workspace; no
+`go.mod`/`go.sum` rewrite is needed. Product, helper and source tests share the selected modules. Runtime/Kernel artifacts remain additional prerequisites
 for real sandbox tests.
 
 The source `REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh` flow starts real control-plane processes
@@ -386,12 +391,14 @@ the official package. Selected Kuasar sources are provided through the explicit 
 
 Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. Packages and Releases do not carry source or historical test records, or independent `SHA256SUMS`.
 
-`make release` verifies `ACCELERATOR_VERSION`, `CONNECTOR_VERSION` and `SANDBOXER_VERSION` against clean sibling checkouts, generates the four-module Go workspace, then builds and packages the same outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. The publisher uses human release notes and refuses to replace an existing asset with different bytes.
+`make release` verifies `ACCELERATOR_VERSION`, `CONNECTOR_VERSION` and `SANDBOXER_VERSION` against clean sibling checkouts, generates the selected dependency Go workspace, then builds and packages the same outputs. Set `KUASAR_PLATFORM_DIR` when the project checkout is not at `../kuasar-sandbox`. Missing tags, modules or conflicting source directories stop before compilation. The publisher uses human release notes and refuses to replace an existing asset with different bytes.
 
 The four official Go executables must identify their own Orchestrator command
 main packages and target the selected Linux architecture (amd64 for x86_64,
-arm64 for aarch64) with `CGO_ENABLED=0`. Packaging copies
-the twelve deployment files from the selected source tree and collects the actual
+arm64 for aarch64). The three node tools remain pure Go; `cluster-ctl` is validated
+with its pinned native runtime closure and launcher. Packaging copies the
+deployment-file set declared in `scripts/release.sh` and the archive validator,
+and collects the actual
 Accelerator, Connector and Sandboxer dependency materials using the existing
 `RELEASE_*_SOURCE_DIR`, optional `RELEASE_*_SOURCE_SHA` and version selections.
 Standalone validation checks the bundle's dependency URL/commit fields agree;

@@ -8,6 +8,19 @@ Use this contract to create, inspect, pause, resume, reset, delete, export and i
 
 **Read by task:** [API](#sandbox-api) · [Identity](#create-identity) · [Pause](#capture-and-pause) · [Resume](#resume) · [Reset and retention](#reset-and-retention) · [Export and migrate](#publication-and-migration) · [Request inputs](#request-configuration) · [State ownership](#state-and-ownership)
 
+<a id="recommended-workflow"></a>
+
+## Recommended application workflow
+
+1. **Choose and retain a real template.** Use the canonical ID from a successful [Build](node-build.md#client-workflow). Choose Image for a cold image start, Sandbox E for a cold start with captured disk/configuration, or Snapshot S to restore initialized memory. Keep the referenced artifacts and their tenant keys available.
+2. **Decide persistent inputs before Create.** Declare application environment, resources, [network/egress](#network-and-egress) and any [workspace](#workspace-storage) through the supported request namespaces. Use a workspace for data that will pass between sandboxes; its explicit disk size or source avoids relying on an undeclared node default.
+3. **Create once and retain the returned SandboxID.** HTTP 201 accepts durable `starting`; it is not a guest-readiness result. Use the normal [SDK command/file path](node-proxy.md#connect-a-client). If startup fails or a request times out, inspect the original identity and execution result before creating a replacement. Caller-selected identity has [conflict semantics](#create-identity), not unconditional idempotent replay.
+4. **Pause and reconnect with the intended state.** The default memory pause retains S and its paired disk E. `memory:false` on Pause retains disk/configuration without running memory. On Connect, omit memory to use the retained source, require `memory:true` only when S exists, or choose `memory:false` for a cold restart from E. Wait for the requested operation and inspect state instead of assuming a transport timeout rolled it back.
+5. **Share the intended object.** To hand over one data disk, sync application writes, pause the source and [export/attach its workspace](#workspace-storage). To move a whole paused sandbox or publish it as a template, use [export/import](#export-import-command). Workspace consumers get private writable layers; exporting a disk does not create a shared concurrent writable filesystem.
+6. **Finish or preserve explicitly.** Delete when the sandbox and its owned local data are no longer needed. Delete acceptance can precede physical cleanup, and the same node-local ID remains occupied until cleanup completes. Keep `--keep-source` when an export should retain its source; without it, successful sandbox export accepts source deletion. Canonical remote artifacts have their own retention lifetime.
+
+For a `dead` sandbox with useful data, inspect the execution result and [Reset/retention choices](#reset-and-retention) before Delete. Reset creates a cold-startable paused E; it does not restore the failed process's memory.
+
 <a id="reading-path"></a>
 
 ## Reading the lifecycle
@@ -107,7 +120,7 @@ and uses normal defaults.
 An empty string field means unspecified. An absent StableID remains empty in the
 stored optional field; `Sandbox.StableID()` supplies the local-ID fallback.
 
-Both nonempty fields in this new Create configuration use the existing
+Nonempty `id` and `stable_id` fields in Create identity configuration follow the
 `ValidLocalSandboxID` contract: 1..57 bytes, lowercase ASCII letters, digits and
 hyphens, starting and ending with a letter or digit. The exact pattern is
 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
@@ -274,7 +287,7 @@ On an SBX or SNP template, select an existing empty device by name, for example 
 |---|---|---|
 | Inspect current devices | `GET /sandboxes/{id}/workspaces` | `node-ctl workspace list B --json` |
 | Attach to an empty device in a running sandbox | `POST /sandboxes/{id}/workspaces/attach?name=project` with `{"disk":{}}`, a complete disk in `disk` or `{"disk":{"migrationToken":"…"}}` | `node-ctl workspace attach B --name project`; use `--disk-spec FILE` or `--token-file FILE` to select another source |
-| Export an attached device from a paused sandbox | `POST /sandboxes/{id}/workspaces/export?name=project` with `{}` returns `{"token":"…"}` | `node-ctl workspace export A --name project`; `--json` returns the token envelope |
+| Export an attached device from a paused sandbox | `POST /sandboxes/{id}/workspaces/export?name=project` with `{}` returns `result` (kwt1), `refs`, `diskRefs` and `removedRefs` | `node-ctl workspace export A --name project`; default stdout is one token, `--json` returns the same API object |
 
 Use the owner's `E2B_API_KEY`. Once A has synced application writes and paused, B can receive the disk through stdin:
 
@@ -283,6 +296,24 @@ set -o pipefail
 node-ctl workspace export "$A" --name project |
   node-ctl workspace attach "$B" --name project --token-file -
 ```
+
+Workspace export returns the token and complete disk reference report from the
+same final DiskV1. `diskRefs` is sorted and unique, containing `base` and every
+`base_from_refs` entry; capacity and recovery order stay in the unchanged kwt1
+payload. There is no `diskRef` field at either layer. For example, a disk with
+one immutable layer and no known removed references returns:
+
+```json
+{"result":"kwt1.…","refs":true,"diskRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
+```
+
+The HTTP/CLI JSON field changes from `token` to `result`; clients must update
+even if they otherwise ignore unknown fields. Default CLI token output remains
+compatible. The private storage helper calls the SDK directly and carries the
+same DiskV1/report to core; it does not parse a `sandbox-ctl export` envelope.
+`removedRefs` concerns only the selected disk and does not release the retained
+source checkpoint. The [report consumption rules](#publication-and-migration)
+also apply to Workspace.
 
 Export captures the complete disk, including unmounted directories. A stays paused and can resume or be deleted after export. For memory pauses, the selected content comes from the paired disk artifact. After attach returns 204, a new access to B’s guest path can trigger the mount even if an earlier access started while the slot was empty. The guest mounts the filesystem on access and reports filesystem or subdirectory errors to the caller.
 
@@ -586,7 +617,7 @@ CaptureSandbox:
 ```
 
 Capture returns the producer's actual identities: `snapshot --json` returns
-`{snapshotRef,sandboxRef,removedRefs}` and `export --json` returns
+`{snapshotRef,sandboxRef,removedRefs}` and local `export --output DIR --json` returns
 `{sandboxRef,removedRefs}`. Capture removals are `[]`. A Snapshot Bundle carries
 the S and E selectors in the same physical file. Local refs retain their identity
 qualifiers but expose only basenames; the checkpoint directory is execution
@@ -884,7 +915,7 @@ Cold launch from E uses the target node's configured kernel and runtime, preserv
 
 If Connect must import a missing target, its memory selector also chooses the imported durable source: false stores E-only before cold launch. A later launch failure leaves paused E. For subsequent paused resumes, auto remains cold and true returns 409 until a new S is captured. This differs from one cold attempt on an existing local paused S. Import never rewrites the original token or deletes its S/E artifacts; see [Import selection](#import-selection).
 
-Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. A future autoResume=false must be separate traffic policy, not inferred from E/S kind; complete E2B autoResume is not implemented.
+Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. E/S kind selects the restore source; it does not disable traffic-triggered Wake. `autoResume=false` is not a supported traffic policy.
 
 <a id="reset-and-retention"></a>
 
@@ -964,29 +995,45 @@ The name itself is the directory key: every publication of one logical entity �
 
 The authenticated `POST /sandboxes/{id}/export` request remains
 `{"toTemplate":false,"keepSource":true}`. Its successful response preserves the
-existing `result` field and adds exactly the corresponding publication roots and
-`removedRefs`. A Sandbox response has three fields:
+existing `result` field and includes the corresponding publication report.
+A complete Sandbox report is:
 
 ```json
-{"result":"kmt1.…","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":[]}
+{"result":"kmt1.…","refs":true,"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
 ```
 
-A Snapshot response has four:
+A complete Snapshot report also includes its memory reference set:
 
 ```json
-{"result":"kmt1.…","snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.snapshot"]}
+{"result":"kmt1.…","refs":true,"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","snapshotRefs":["manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.snapshot"]}
 ```
 
 For `toTemplate:true`, only the meaning of `result` changes to the corresponding
 `sbx`/`snp` TemplateID. Snapshot always returns the E actually referenced by final
 S, including a selected located Bundle member. The publication adapter parses
 one strict `sandbox-ctl publish --json` document and checks expected S/E role,
-portable final roots, required final E, sorted unique removals and safe file
+portable final roots, required final E, complete applicable reference sets,
+sorted unique removals and safe file
 basenames **before** source finalization. It never treats diagnostic stderr as a
 successful result. Builder checkpoint publication consumes the same contract.
-The Core method returns one `types.ExportResult`; the HTTP `result` field remains
-compatible with existing clients. Deploy sandboxer and orchestrator from the
-matching source set when adopting the new internal CLI contract.
+The Core method returns one `types.ExportResult`; HTTP and `node-ctl --json`
+use the same shape, while default CLI output remains one result string. New
+fields affect older strict consumers. Deploy sandboxer and orchestrator from
+the matching source set when adopting the new internal CLI contract.
+
+With `refs:true`, `snapshotRefs` contains final S and its memory parents, and
+`sandboxRefs` contains final E plus all immutable root/data/Workspace disk
+layers. Sets are sorted and unique; each includes its corresponding root.
+`removedRefs` is mandatory and uses `[]` for a known empty difference. The
+examples above have no retained parents. Completeness describes metadata, not
+a fresh accessibility check of retained artifacts.
+
+Only exact legacy S/E reports without `refs` are accepted under the old field
+rules, then normalized to `refs:false` with their old `removedRefs` discarded.
+Explicit false reports must omit every plural set and `removedRefs`, including
+empty/null arrays. Duplicate/unknown keys, null `refs`, incomplete sets and
+trailing output fail. Local capture and all sandbox-ctl snapshot outputs keep
+their existing contract.
 
 Local publication returns S1/E1 in both report and token; keep-source retains
 S0/E0 in SQLite and the cache. Capture and its producer result are specified in
@@ -1003,14 +1050,21 @@ Snapshot tokens missing E, are invalid; discard stale tokens and re-export from 
 complete paired record.
 Do not use an old token or an S metadata read to reconstruct a durable pair.
 
-An already portable source is not republished and has `removedRefs:[]`. A
+An already portable source is not republished and returns `refs:false`, omitting
+`snapshotRefs`, `sandboxRefs`, `diskRefs` and `removedRefs`. A
 portable Snapshot returns the exact S/E pair already stored in SQLite. Export
 does not open artifacts, configure storage, inspect metadata or start a metadata
 subprocess, even when both artifacts are offline. An incomplete paused pair is
-invalid and is never repaired by reading S. The same roots and removals
-accompany normal, keep-source, move and accepted detached-template returns.
+invalid and is never repaired by reading S. Normal, keep-source, move and
+accepted detached-template returns use the same report completeness rules.
 Resume/preemption, ownership checks, lifecycle cancellation, idempotence and
 concurrency retain the ordering below.
+
+Consumers register ownership from complete sets. For `refs:false`, retain any
+existing complete registration with the same immutable identity and storage
+scope; do not replace it with an empty graph or infer removal candidates.
+Keeping only the root file cannot protect unknown parents, so an unknown graph
+must not participate as an empty branch in deletion decisions.
 
 Removals describe the old known topology minus retained final references, not
 field rewrite events or deletion commands. They include local roots and internal
@@ -1150,6 +1204,61 @@ stdout. Invalid/trailing JSON, polluted stdout, missing result or roots, wrong
 root role, unsafe local refs and incoherent template/root pairs fail explicitly.
 The client also checks response read errors. No empty credential is printed as
 success. The full response contract is documented in [Publication, templates and migration](#publication-and-migration).
+
+<a id="network-and-egress"></a>
+
+## Select the network and outbound egress
+
+Prepare the native egress and DNS path described in the [Connector networking
+guide](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress.md#deployment-and-ownership),
+then match the workload's logical network to that deployment. API/Proxy ingress
+can work while guest outbound access is still unconfigured.
+
+| Input | Meaning | Where to set it |
+|---|---|---|
+| `transit_gateway_ip` | Reachable underlay IPv4 address of the egress/transit gateway | Create or Build Register network namespace; inherited from Sandbox E/S when present |
+| `transit_geneve_vni` | Connector Area VNI, for example `7` | The same request namespace; must match the egress Area |
+| `inner_ip` / `nexthop` | Guest NIC CIDR and its default-route next hop | Request network namespace or node's per-profile `sandbox.network.e2b` / `.bare` defaults |
+| `dns` | Resolver addresses written into guest configuration | Request network namespace or `sandbox.network.dns`; the chosen path must actually reach these resolvers |
+
+The gateway underlay address is not the guest `nexthop`, and Area VNI is not a
+guest subnet or an API port. Conductor's `sandbox.network` schema has no
+`transit_gateway_ip` or `transit_geneve_vni` default fields. Connector does not
+infer Area 7 from the deployed egress attachment. An omitted/zero VNI is not a
+request for that Area.
+
+For a deployment whose egress Area is 7, the request header is:
+
+```http
+X-Kuasar-Sandbox-Network: {"transit_gateway_ip":"192.0.2.10","transit_geneve_vni":7}
+```
+
+Replace `192.0.2.10` with the real egress underlay address before use. An SDK can
+send the same object as a JSON string in existing Create metadata:
+
+```json
+{
+  "templateID": "<canonical-template-id>",
+  "metadata": {
+    "kuasar-sandbox.network": "{\"transit_gateway_ip\":\"192.0.2.10\",\"transit_geneve_vni\":7}"
+  }
+}
+```
+
+For a Build, choose this input at **registration**. Trigger cannot change it;
+it accepts the identical Network header as an equality assertion for SDKs that
+reuse headers. The separate-call [Build recipe](node-build.md#client-workflow) accepts `KUASAR_NETWORK_JSON`
+for that purpose. A Sandbox E/S template carries its logical network with E;
+explicit current fields override inherited artifact fields. Image artifacts do
+not carry those Sandbox defaults, so supply the network again when creating
+from an Image. Existing captured state does not acquire a new network policy
+because an operator edits a node example file.
+
+Validate guest DNS and an intended outbound destination from the actual
+workload, then inspect Connector counters when the path fails. For inbound
+commands/files, use [Proxy/client diagnosis](node-proxy.md#connect-a-client).
+Do not patch a guest's Envd address or use a client-side HTTP proxy to compensate
+for a missing transit/Area match.
 
 <a id="request-configuration"></a>
 

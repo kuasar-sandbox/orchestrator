@@ -1,5 +1,7 @@
 # Snapshot runtime reference compatibility
 
+Snapshot runtime declarations let Registry select a Node with the required runtime before execution. Use [runtime inventory and selection](cluster.md#groups-and-placement) to configure the available runtimes and [Sandbox capture](sandbox-lifecycle.md#capture-and-pause) to create reusable snapshots.
+
 An SNP template may carry a terminal
 `@runtime:<basename>:digest:<64-lowercase-hex>` on its snapshot reference. It uses
 the existing `<profile>-<kind>-<base64url(ref)>` TemplateID encoding. There is no
@@ -28,7 +30,8 @@ recreates the route view and resynchronizes it through the existing lifecycle.
 Upgrade the master and its workers together, as required for previous schema
 changes.
 
-Deploy compatible SDKs and actual consumer binaries before producers emit new
-references. A new reader accepting old inputs does not make an old reader capable
-of accepting new outputs. This consumer change does not enable annotated capture
-production or impose a new rejection policy on legacy SNP templates.
+Capture emits the runtime declaration and consumers preserve it through
+publication, Build, export and restore. When upgrading, deploy readers that
+accept annotated references before producers can emit them. Reader compatibility
+with legacy inputs does not imply that older readers accept annotated outputs.
+Valid legacy SNP templates remain accepted under the runtime checks above.

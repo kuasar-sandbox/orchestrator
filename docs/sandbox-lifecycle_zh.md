@@ -8,6 +8,19 @@
 
 **阅读路径：** [API](#sandbox-api) · [身份](#create-identity) · [Pause](#capture-and-pause) · [Resume](#resume) · [Reset 与保留](#reset-and-retention) · [发布与迁移](#publication-and-migration) · [请求输入](#request-configuration) · [状态所有权](#state-and-ownership)
 
+<a id="recommended-workflow"></a>
+
+## 推荐应用流程
+
+1. **选择并保留真实模板。** 使用成功 [Build](node-build_zh.md#client-workflow) 返回的 canonical ID。Image 用于镜像冷启动，Sandbox E 用于带捕获磁盘/配置的冷启动，Snapshot S 用于恢复初始化内存。保留引用的 artifact 及其租户密钥。
+2. **Create 前明确持久输入。** 通过支持的请求 namespace 配置应用环境、资源、[网络/egress](#network-and-egress)和 [workspace](#workspace-storage)。需要在 Sandbox 间交接数据时使用 workspace，显式指定盘容量或来源，避免依赖未配置的节点默认值。
+3. **创建一次并保存返回的 SandboxID。** HTTP 201 表示 `starting` 已持久接受，不表示 guest 就绪。通过正常 [SDK 命令/文件路径](node-proxy_zh.md#connect-a-client)访问；启动失败或请求超时后，先检查原身份及执行结果，再考虑替换实例。调用者指定身份遵循[冲突规则](#create-identity)，不是无条件幂等结果重放。
+4. **按预期状态暂停与重新连接。** 默认内存 Pause 保留 S 及配对磁盘 E；Pause 的 `memory:false` 仅保留磁盘/配置。Connect 省略 memory 使用保留来源，只有 S 存在时才要求 `memory:true`，选择 `memory:false` 则从 E 冷启动。等待操作并查询状态，不能由传输超时推断已回滚。
+5. **交接正确对象。** 仅交接一块数据盘时，先同步应用写入、暂停源，再[导出并接入 workspace](#workspace-storage)。移动整个暂停 Sandbox 或将其发布为模板，使用[导出/导入](#export-import-command)。Workspace 消费者各有私有可写层，磁盘导出不会产生并发共享写文件系统。
+6. **明确结束或保留。** 不再需要 Sandbox 及其自有本地数据时 Delete。接受 Delete 后物理清理可能尚未完成，完成前同一个 node-local ID 仍被占用。导出后需保留源时使用 `--keep-source`；否则 Sandbox 导出成功会接受源删除。远端 canonical artifact 有独立保留周期。
+
+`dead` Sandbox 仍有有用数据时，Delete 前检查执行结果及 [Reset/保留选择](#reset-and-retention)。Reset 生成可冷启动的暂停 E，不恢复失败进程的内存。
+
 <a id="reading-path"></a>
 
 ## 生命周期阅读顺序
@@ -133,7 +146,7 @@ Header `{}` 清除两个低优先级选择，改用正常默认值。
 字段空字符串表示未指定。未指定 StableID 时，其可选持久化字段仍为空，
 由 `Sandbox.StableID()` 回落为本地 ID。
 
-本次新增 Create 配置的两个非空字段都使用现有 `ValidLocalSandboxID` 契约：
+Create 身份配置中的 `id` 与 `stable_id` 非空时都遵循 `ValidLocalSandboxID` 契约：
 1..57 字节，只允许小写 ASCII 字母、数字和连字符，首尾必须是字母或数字。
 精确模式是 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。大写、点、斜线、空白、NUL
 和超长值直接拒绝，不做自动转换。迁移 token 编码层保留历史 StableID 契约；节点 Import
@@ -302,7 +315,7 @@ runtime 严格完成 readiness wire→(e2b)直接 `POST /init` 置 env/默认用
 |---|---|---|
 | 查看设备 | `GET /sandboxes/{id}/workspaces` | `node-ctl workspace list B --json` |
 | 对运行中沙箱的空位接盘 | `POST /sandboxes/{id}/workspaces/attach?name=project`，正文为 `{"disk":{}}`、以 `disk` 包裹的完整磁盘，或 `{"disk":{"migrationToken":"…"}}` | `node-ctl workspace attach B --name project` 使用默认盘，也可用 `--disk-spec FILE` 或 `--token-file FILE` 选择来源 |
-| 导出已暂停沙箱的一个已启用盘 | `POST /sandboxes/{id}/workspaces/export?name=project`，正文为 `{}`，返回 `{"token":"…"}` | `node-ctl workspace export A --name project`；加 `--json` 输出含 token 的 JSON 对象 |
+| 导出已暂停沙箱的一个已启用盘 | `POST /sandboxes/{id}/workspaces/export?name=project`，正文为 `{}`，返回 `result`（kwt1）、`refs`、`diskRefs`、`removedRefs` | `node-ctl workspace export A --name project` 默认输出单行 token；加 `--json` 输出相同 API 对象 |
 
 命令使用沙箱所有者的 `E2B_API_KEY`。A 同步应用写入并暂停后，可通过标准输入将盘交给 B：
 
@@ -311,6 +324,20 @@ set -o pipefail
 node-ctl workspace export "$A" --name project |
   node-ctl workspace attach "$B" --name project --token-file -
 ```
+
+Workspace 导出的 token 与完整磁盘报告来自同一份最终 DiskV1。`diskRefs` 排序去重，
+包含 `base` 与全部 `base_from_refs`；容量及恢复层序仍保存在未改变的 kwt1 载荷中。
+各层均不设 `diskRef`。例如，仅含一个不可变层且没有已知移除引用的磁盘返回：
+
+```json
+{"result":"kwt1.…","refs":true,"diskRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
+```
+
+HTTP／CLI JSON 字段由 `token` 改为 `result`，即使忽略未知字段的旧客户端也需要
+更新读取字段；CLI 默认 token 输出保持兼容。私有存储 helper 直接调用 SDK，并将同次
+DiskV1 与报告交给 core，不解析 `sandbox-ctl export` 包装。`removedRefs` 只涉及
+选中磁盘，不释放保留的源 checkpoint。[报告消费规则](#publication-and-migration)
+同样适用于 Workspace。
 
 导出覆盖整盘，包括未映射的目录。A 保持暂停，之后可恢复或删除。暂停保存了内存时，导出取配对磁盘制品中的数据。attach 返回 204 后，新发起的目录访问可以直接触发挂载，即使同一目录此前已有在空盘位上发起的访问。Guest 在实际访问时挂载文件系统，并向该访问返回文件系统或子目录本身的错误。
 
@@ -548,7 +575,7 @@ CaptureSandbox:
 ```
 
 capture 返回生产者的实际身份: `snapshot --json` 返回
-`{snapshotRef,sandboxRef,removedRefs}`, `export --json` 返回
+`{snapshotRef,sandboxRef,removedRefs}`, 本地 `export --output DIR --json` 返回
 `{sandboxRef,removedRefs}`. capture 的差集为 `[]`. Snapshot Bundle 在同一物理文件
 中携带 S 和 E 两个 selector. 本地引用保留身份限定符, 只公开 basename; checkpoint
 目录属于执行上下文. 默认人类可读输出及 upload-key stdout 不变. 适配器先验证完整
@@ -799,8 +826,8 @@ Proxy 的 ordinary ingress 和 native exec activation 都经 `OnWake` 使用
 对应的数据面 adapter.这些入口全部只传 `ResumeAuto`:S 默认 memory,E 默认 cold.两种 source
 都保留既有 Wake 能力;
 proxy SHM 不携 source kind 或 cold gate。已鉴权的首个 E 请求保持 parked,直到 node
-完成 cold launch、route 变为 running 并成功拨通 backend 后才继续转发。未来的 `autoResume=false`
-若实现,必须是独立 traffic policy,不能从 E/S kind 推导。本变更不宣称完整实现 E2B autoResume。
+完成 cold launch、route 变为 running 并成功拨通 backend 后才继续转发。E/S kind 选择恢复来源，
+不会禁用流量触发的 Wake；`autoResume=false` 不是受支持的流量策略。
 
 <a id="reset-and-retention"></a>
 
@@ -878,26 +905,37 @@ conductor 与 task reader 共用 `internal/reflocation` 的 deterministic 解析
 恢复不依赖额外 side table。
 
 需属主鉴权的 `POST /sandboxes/{id}/export` 请求仍为
-`{"toTemplate":false,"keepSource":true}`。成功响应保留既有 `result`，恰好增加对应的
-发布根引用与 `removedRefs`。Sandbox 响应有三个字段：
+`{"toTemplate":false,"keepSource":true}`。成功响应保留既有 `result`，并包含对应
+发布报告。完整的 Sandbox 报告为：
 
 ```json
-{"result":"kmt1.…","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":[]}
+{"result":"kmt1.…","refs":true,"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":[]}
 ```
 
-Snapshot 响应有四个字段：
+完整的 Snapshot 报告还包含内存引用集合：
 
 ```json
-{"result":"kmt1.…","snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","removedRefs":["file://old.snapshot"]}
+{"result":"kmt1.…","refs":true,"snapshotRef":"manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","snapshotRefs":["manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"sandboxRef":"manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandboxRefs":["manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"removedRefs":["file://old.snapshot"]}
 ```
 
 `toTemplate:true` 仅把 `result` 的含义改为对应 `sbx`/`snp` TemplateID。Snapshot 始终
 返回最终 S 实际引用的 E，包括选中的 located Bundle 成员。发布适配器严格解析单个
 `sandbox-ctl publish --json` 文档，并在源 finalization **之前**检查期望 S/E 角色、
-portable 最终根、必需的最终 E、有序唯一差集和安全文件 basename，不把诊断 stderr 当作
+portable 最终根、必需的最终 E、完整适用引用集合、有序唯一差集和安全文件 basename，不把诊断 stderr 当作
 成功结果。Builder checkpoint publication 共用同一契约。Core 方法统一返回
-`types.ExportResult`，HTTP 的 `result` 字段继续兼容既有客户端。采用新内部 CLI 契约时，
-sandboxer 与 orchestrator 应部署来自相匹配来源集的版本。
+`types.ExportResult`，HTTP 与 `node-ctl --json` 使用相同形状，CLI 默认仍输出单行
+结果字符串。新增字段会影响旧严格消费者。采用新内部 CLI 契约时，sandboxer 与
+orchestrator 应部署来自相匹配来源集的版本。
+
+`refs:true` 时，`snapshotRefs` 包含最终 S 与内存父层，`sandboxRefs` 包含最终 E
+以及根盘、数据盘、Workspace 的全部不可变层。集合排序去重，并包含对应主引用。
+`removedRefs` 必须存在，已知空差集使用 `[]`。上例没有保留父层。完整性描述元数据，
+不表示重新验证保留制品此刻可访问。
+
+只有缺少 `refs` 且精确符合旧 S/E 报告形状的输入才按旧规则兼容校验，再归一为
+`refs:false` 并丢弃旧 `removedRefs`。显式 false 必须省略全部复数集合及
+`removedRefs`，即使空或 null 数组也不允许。重复／未知键、null `refs`、不完整
+集合及尾随输出均失败。本地 capture 与全部 sandbox-ctl snapshot 保持原输出合同。
 
 本地发布的报告和 token 同时使用 S1/E1; keep-source 的 SQLite 与 cache 继续保存
 S0/E0. capture 及其生产者结果由 [Capture 与 Pause](#capture-and-pause) 维护.
@@ -910,11 +948,16 @@ S0/E0. capture 及其生产者结果由 [Capture 与 Pause](#capture-and-pause) 
 对的记录重新导出。不得用旧 token 或读取
 S 元数据重建持久对。
 
-已 portable 的源不再发布，返回 `removedRefs:[]`；portable Snapshot 直接返回 SQLite
+已 portable 的源不再发布，返回 `refs:false`，省略 `snapshotRefs`、`sandboxRefs`、
+`diskRefs`、`removedRefs`；portable Snapshot 直接返回 SQLite
 中保存的精确 S/E 对。即使两份工件都离线，Export 也不打开工件、不配置存储、不检查
 元数据、不启动元数据子进程。缺少 E 的 paused 对无效，绝不通过读取 S 修复。普通、keep-source、move 和已受理的 detached-template 成功分支
-均携带同一套一致根引用与差集。Resume/preemption、属主检查、生命周期取消、幂等及并发
+均遵守相同的报告完整性规则。Resume/preemption、属主检查、生命周期取消、幂等及并发
 继续遵守下文原有顺序。
+
+消费方通过完整集合登记持有关系。遇到 `refs:false`，继续保留身份与存储作用域一致的
+既有完整登记，不以空图覆盖，也不推断移除候选。只固定根文件不能保护未知父层，因此
+不能将未知图作为空分支参与删除判断。
 
 差集表示已知旧拓扑减去最终保留引用，不是字段改写事件或删除命令；包含确实退出的本地根
 和内部引用，最终拓扑中其他位置仍使用的共享引用会排除。skip 模式中被替换旧引用即使
@@ -1076,6 +1119,54 @@ node-ctl import-sandbox <token> [--memory=true|false] [--socket S]
 TemplateID），发布进度不会进入 stdout。无效/尾随 JSON、被污染的 stdout、缺少 result
 或根、错误根角色、不安全本地引用，以及 TemplateID 与根不一致都会明确失败。客户端也
 检查响应读取错误，不会把空凭据打印为成功。完整响应契约见 [Publish、template 与 migration](#publication-and-migration)。
+
+<a id="network-and-egress"></a>
+
+## 选择网络与出站 egress
+
+先按 Connector [网络指南](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress_zh.md#部署和归属)
+准备原生 egress 与 DNS 路径，再让工作负载的逻辑网络匹配部署。API/Proxy 入站正常，
+不代表 guest 出站已经配置。
+
+| 输入 | 含义 | 设置位置 |
+|---|---|---|
+| `transit_gateway_ip` | Egress/transit gateway 可达的 underlay IPv4 地址 | Create 或 Build Register 的 network namespace；Sandbox E/S 可继承已保存值 |
+| `transit_geneve_vni` | Connector Area VNI，例如 `7` | 同一个请求 namespace，须与 egress Area 一致 |
+| `inner_ip` / `nexthop` | Guest 网卡 CIDR 与默认路由下一跳 | 请求 network namespace，或节点按 profile 的 `sandbox.network.e2b` / `.bare` 默认值 |
+| `dns` | 写入 guest 配置的 resolver 地址 | 请求 network namespace 或 `sandbox.network.dns`；所选路径必须实际可达这些 resolver |
+
+Gateway underlay 地址不同于 guest `nexthop`；Area VNI 也不是 guest 子网或 API 端口。
+Conductor 的 `sandbox.network` schema 没有 `transit_gateway_ip`、
+`transit_geneve_vni` 默认字段。Connector 不会从 egress attachment 推断 Area 7；
+省略或传零 VNI 不会自动选择它。
+
+Egress Area 为 7 的部署使用以下请求头：
+
+```http
+X-Kuasar-Sandbox-Network: {"transit_gateway_ip":"192.0.2.10","transit_geneve_vni":7}
+```
+
+使用前把 `192.0.2.10` 替换为实际 egress underlay 地址。SDK 可在已有 Create metadata
+中以 JSON 字符串发送同一对象：
+
+```json
+{
+  "templateID": "<canonical-template-id>",
+  "metadata": {
+    "kuasar-sandbox.network": "{\"transit_gateway_ip\":\"192.0.2.10\",\"transit_geneve_vni\":7}"
+  }
+}
+```
+
+Build 在**注册**时选择该输入，Trigger 不能修改。SDK 可以重发相同
+Network 头作为等值断言；分步 [Build 配方](node-build_zh.md#client-workflow)
+通过 `KUASAR_NETWORK_JSON` 接收该对象。Sandbox E/S 模板的逻辑网络随 E 保存，
+当前显式字段覆盖 artifact 继承字段。Image artifact 不携带这些 Sandbox 默认值，
+从 Image 创建时需要再次指定网络。修改节点示例文件不会为已捕获状态自动应用新网络策略。
+
+从真实工作负载检查 guest DNS 及预期出站目的地，失败时检查 Connector 计数器。
+入站命令/文件使用 [Proxy/客户端诊断](node-proxy_zh.md#connect-a-client)。不要通过修改
+Envd 地址或客户端 HTTP 代理来补偿缺失的 transit/Area 匹配。
 
 <a id="request-configuration"></a>
 

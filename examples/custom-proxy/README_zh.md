@@ -4,10 +4,12 @@
 
 本示例是可运行的静态 App 集成入口。公共 SDK 与生命周期契约见[应用扩展](../../docs/extensions_zh.md#examples)；部署和运行要求仍由对应能力文档维护。
 
-构建示例：
+在仓库根目录，按[所选源码构建工作区](../../CONTRIBUTING_zh.md)使用开发用户构建，再单独安装产物：
 
 ```sh
-go build -o /opt/kuasar/bin/xproxy ./examples/custom-proxy
+mkdir -p out
+go build -o out/xproxy ./examples/custom-proxy
+sudo install -D -o root -g root -m 0755 out/xproxy /opt/kuasar/bin/xproxy
 ```
 
 程序须由 root 或非 root node-ctl 服务 UID 拥有，禁止 group/world 写入。

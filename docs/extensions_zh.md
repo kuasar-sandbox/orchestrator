@@ -14,6 +14,13 @@ Conductor、独立 Proxy 和 Telemetry 支持静态链接的运行期扩展，�
 
 **阅读路径：** [运行示例](#examples) · [配置 API](#public-configuration-entry-points) · [Conductor App](#conductor-bootstrap) · [Proxy App](#proxy-bootstrap) · [Telemetry App](#telemetry-bootstrap-and-extension) · [对象源](#conductor-object-sources) · [Hook](#conductor-lifecycle-hooks)
 
+## 选择配置或自定义应用
+
+优先使用内置服务及其文档配置。节点资源池、原生 egress、Group 维护、guest systemd 启动与 Telemetry 后端都不要求自定义 App。只有需要现有配置无法表达的可信进程内材料 provider、生命周期集成、对象观测或 HTTP wrapper 时，才使用本扩展边界。
+
+按部署使用的同一 orchestrator revision 构建并运行对应示例。安装受保护的 executable，通过角色配置选择它，验证完整配置，并继续使用 `node-ctl <role> serve` 启动。自定义二进制参与这一 bootstrap，不是另外手工启动的替代 CLI。启动后同时验证普通客户端流程及定制行为。
+
+
 <a id="examples"></a>
 
 ## 可运行示例

@@ -4,10 +4,12 @@
 
 This is a runnable static App integration. The complete public SDK and lifecycle contracts belong to [application extensions](../../docs/extensions.md#examples); deployment and operational requirements stay with the corresponding capability document.
 
-Build the example with:
+From the repository root, use the [selected-source build workspace](../../CONTRIBUTING.md) and build as your development user. Install the completed executable separately:
 
 ```sh
-go build -o /opt/kuasar/bin/xproxy ./examples/custom-proxy
+mkdir -p out
+go build -o out/xproxy ./examples/custom-proxy
+sudo install -D -o root -g root -m 0755 out/xproxy /opt/kuasar/bin/xproxy
 ```
 
 Own the binary with root or the non-root node-ctl service UID, protect it from

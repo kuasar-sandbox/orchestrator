@@ -1,9 +1,10 @@
 # Storage refactor acceptance, 2026-11-22
 
-This report covers the storage replacement and shared storage stages of
-[proposal #566](https://github.com/kuasar-sandbox/orchestrator/issues/566) and
-orchestrator PR #563. The subsequent Node-owned Group/create-accept-close
-redesign remains a separate stage. Hosted delivery status is recorded below.
+Historical acceptance evidence at the source revisions and environments recorded below. Use [cluster metadata storage](cluster-storage.md) for current deployment and recovery. Measurements and delivery receipts here do not describe every later release.
+
+This report covers the shared metadata storage engine and its three native
+backends. Node Group publication and request-acceptance validation are recorded
+separately in [Node Group and runtime acceptance](node-group-runtime-acceptance.md).
 
 ## Implementation and source identity
 
@@ -208,16 +209,15 @@ capacity. The historical comparison above and this same-fixture comparison
 answer different questions; their percentages must not be composed into an
 old-shardkv-to-current-head performance claim.
 
-## Delivery qualification and integration order
+## Release-binary qualification
 
 See [storage configuration and contracts](cluster-storage.md) for schema v2,
 limits and deployment rules. There is no silent migration from the experimental
 FDB layout. Hidden revision cells grow with distinct identities and require an
 explicit history boundary before reclamation.
 
-The independent platform native-runtime PR
-[#426](https://github.com/kuasar-sandbox/kuasar-sandbox/pull/426) was squash-merged
-as `73e65ed7b08e39f15935525074703780eb45cd4e` after successful qualification.
+Platform source `73e65ed7b08e39f15935525074703780eb45cd4e` includes the native
+cluster launcher and its private runtime.
 The previous trusted platform main `d0273490cf5551abce945d1a7ad6ee5c38173e4a`
 did not contain `ci/integration/cluster-native-runtime.json`.
 [Hosted run 44987177560](https://github.com/kuasar-sandbox/orchestrator/actions/runs/44987177560)
@@ -227,10 +227,8 @@ Proxy port collision; the occupying process was not retained. Both source gates
 and architecture builds/preparations passed. This is failed delivery acceptance,
 not a storage-conformance failure or a passing combined run.
 
-Published aggregate `release-v0.2.0-preview.20261122` now contains the needed SDK
-baseline. The obsolete exact #563 cutover is removed from refreshed platform
-PR #426; reciprocal companions use the existing current-source-set validation
-without a dependency-policy exception.
+Aggregate `release-v0.2.0-preview.20261122` supplies the SDK baseline used for
+release-binary qualification.
 
 [Platform run 44992663426](https://github.com/kuasar-sandbox/kuasar-sandbox/actions/runs/44992663426)
 passed both source gates, both builds/preparations, all 95 selected E2E cases on
@@ -245,14 +243,9 @@ sources, provenance hashes and declared exclusions are retained in
 
 This source-lane plan excludes four node-infra cases that require staged release
 assets and credentialed OBS. Local node-infra library staging verification below
-does not claim a full deployment run. The subsequent upper protocol design,
-production HA/scale qualification and automated data migration remain outside
-this delivery.
-
-After platform merge, the remaining component removes the merged companion and
-runs against trusted platform main. Its final exact CI and merge receipts must
-be attached to proposal #566 before that issue is closed; the paired platform
-result alone does not replace the component's own finalization gate.
+does not claim a full deployment run. Node Group/request-admission protocols,
+production HA/scale qualification and automated data migration are outside
+these measurements.
 
 Component run `44992656729` retained the same old trusted platform framework.
 After both source gates and architecture builds/preparations passed, it was

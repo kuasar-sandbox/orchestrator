@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
 type workspaceTestCore struct {
@@ -40,11 +41,13 @@ func (c *workspaceTestCore) AttachWorkspace(_ context.Context, id, key, name str
 	c.disk = string(disk)
 	return c.opErr
 }
-func (c *workspaceTestCore) ExportWorkspace(_ context.Context, id, key, name string) (string, error) {
+func (c *workspaceTestCore) ExportWorkspace(_ context.Context, id, key, name string) (types.WorkspaceExportResult, error) {
 	if id != "sb" || key == "" || name != "w" {
-		return "", ErrNotFound
+		return types.WorkspaceExportResult{}, ErrNotFound
 	}
-	return "kwt1.token", c.opErr
+	return types.WorkspaceExportResult{Result: "kwt1.token", DiskReport: artifact.DiskReport{
+		Refs: true, DiskRefs: []string{"manifest://" + strings.Repeat("a", 64)}, RemovedRefs: []string{},
+	}}, c.opErr
 }
 
 func TestWorkspaceCreateAndBuildSeparatePrivateInputs(t *testing.T) {
@@ -132,7 +135,7 @@ func TestWorkspaceOperations(t *testing.T) {
 		}
 	}
 	core.opErr = nil
-	if w := call("POST", "/export?name=w&trace=abc&trace=def", `{}`); w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"token":"kwt1.token"}` {
+	if w := call("POST", "/export?name=w&trace=abc&trace=def", `{}`); w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"result":"kwt1.token","refs":true,"diskRefs":["manifest://`+strings.Repeat("a", 64)+`"],"removedRefs":[]}` {
 		t.Fatal(w)
 	}
 	for _, args := range [][2]string{{"/export?name=w&name=x", "{}"}, {"/export?trace=abc", "{}"}, {"/export?name=&trace=abc", "{}"}, {"/export?name=w", `{"keepSource":false}`}} {

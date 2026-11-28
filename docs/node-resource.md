@@ -10,6 +10,27 @@ Begin with units and configuration, then request patches. Capacity, allocatable 
 
 **Read by task:** [Terms](#units-and-terms) · [Configure](#resource-policy) · [Request resources](#request-resources) · [Resource pools](#resource-pools) · [Model](#resource-model) · [Protocol](#controller-protocol) · [Admission](#admission-and-pressure) · [Recover](#recovery)
 
+<a id="operate-resources"></a>
+
+## Configure and inspect capacity
+
+For a first node, use the deployment's single resource pool and establish a workload budget before adding NUMA pools. Keep three inputs separate: the sandbox's fixed VM **capacity**, cold-start **startup headroom**, and settled **allocatable memory**. Reducing steady-state headroom does not remove cold-start or captured-memory admission requirements. Builder registration/execution limits are additional budgets described in [Build](node-build.md#build-configuration).
+
+1. Validate the installed Conductor configuration with `node-ctl config conductor --config FILE[:OVERLAY...] --resolve`. Confirm the host reservation, allocatable memory and enabled `resource_listen` against the actual machine.
+2. Inspect admission and live reservations before increasing concurrency. With the default sockets:
+
+   ```sh
+   node-ctl resource status --socket /run/sandbox-resource.sock
+   node-ctl resource list --socket /run/sandbox-resource.sock
+   node-ctl resource pressure --socket /run/sandbox/node-ctl.socket
+   ```
+
+   `status` is the node summary, `list` identifies reservations, and `pressure` explains pool utilization, waiting work and recovery. The first two use the resource protocol; `pressure` uses the Conductor admin API. Select the installed paths if yours differ.
+3. To stop new admission during planned maintenance, use `node-ctl resource drain`; after the maintenance and observations are satisfactory, use `node-ctl resource drain --disable`. Add `--socket` for a nondefault resource socket. Drain does not stop or relocate existing execution and is not a complete node evacuation workflow.
+4. For NUMA locality or independently managed budgets, follow [resource-pool setup](node.md#numa-deployment-with-multiple-pools). Validate both configured capacity and the units' actual CPU/memory placement. A worker prewarm count is not a memory budget.
+
+If admission is waiting, inspect the relevant pool, startup in-flight, unknown/recovery reservations and pressure reason before changing limits. Keep the same SandboxID/BuildID while diagnosing. Do not use manual balloon/cgroup edits to bypass retained reservations; resource release follows the owning lifecycle.
+
 <a id="units-and-terms"></a>
 
 ## Terminology

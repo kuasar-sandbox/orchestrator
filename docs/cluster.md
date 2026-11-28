@@ -16,56 +16,6 @@ Registry accesses durable execution metadata through typed repositories backed b
 
 **Read by task:** [First cluster](#minimum-cluster) · [Public ingress](#client-access) · [Groups and placement](#groups-and-placement) · [Configure roles](#configuration) · [State ownership](#membership-and-state) · [Link protocols](#protocols) · [Failure and recovery](#failure-and-recovery)
 
-<a id="roles-and-topology"></a>
-
-## Overview
-
-<a id="overall-topology"></a>
-
-### Overall topology
-
-```mermaid
-flowchart TD
-  client["Client / E2B SDK"] --> router["Router"]
-  router -->|"Reserve / Resolve"| registry["Registry services"]
-  router -->|"Known target data"| node["Node Conductor and Proxy"]
-  registry <-->|"node_link commands and state"| node
-  placer["Placer and Group source"] -->|"Conditional Group imports"| registry
-  registry -->|"node_list WATCH_LIST"| placer
-  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
-```
-
-The steady-state data plane bypasses Registry. Explicit create/connect/exec-session operations and data requests with a missing target or typed stale fallback require Registry:
-
-- `POST /route-link/v2/reserve` distinguishes four operations using `operation=create|connect|exec-session|data`. Create calls Reserve directly; Registry completes connect/exec-session through node-link; data calls Reserve only when the route lacks a complete node target or the node proxy reports typed stale state. Unknown routes do not implicitly create sandboxes. Explicit build registration calls `ReserveBuild`.
-- Registry authenticates the request and selects Nodes from a bounded GroupSupport query.
-- Registry sends create/connect/exec_session/delete/build/key commands through the node owner.
-- Nodes report sandbox/build state and the low-frequency node directory through node_link.
-
-<a id="design-principles"></a>
-
-### Design principles
-
-1. **Group is the business shard key**: every northbound cluster request must include `X-Kuasar-Sandbox-Group` or equivalent group identity. A cluster data-plane entry without a group is currently unsupported.
-2. **The selected database owns durable metadata**: Registry process failure does not erase metadata. Database availability depends on its configured redundancy and failure domains, not Registry owner count. SQLite supports one Registry; shared PostgreSQL/FDB deployments can use multiple members. Losing all metadata still does not authorize reconstructing execution ownership from incomplete reports.
-3. **Operations stay within typed scopes**: Route/Build operations use a group and record identity, node operations use NodeID, and the low-frequency directory uses bounded bucket pages. Unrelated partial lists cannot be merged into authority.
-4. **Atomicity follows business invariants**: coupled intent/ownership, lifecycle fences and projections commit through typed transactions. Registry members do not maintain replicas of each other's metadata.
-5. **Member health does not determine sharding**: the member list comes from versioned configuration; `LocateN` takes only membership members as input. Memberlist detects health and propagates metadata.
-6. **Nodes are the authority for runtime state**: node reports determine whether sandboxes/builds still exist. A host reboot loses running processes; surviving durable rows are reconciled against actual units and checkpoint/cleanup ownership. A conductor process restart can adopt surviving units. Neither event means blindly deleting all durable rows or automatically recreating every old sandbox; see [State ownership and disaster-recovery boundaries](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry Reliability](#registry-reliability).
-7. **Placer does not own lifecycle**: it maintains Group definitions on static targets. Registry selects Nodes from published support; Node admission copies the business inputs and applies the existing lifecycle.
-8. **Router does not subscribe to huge numbers of groups**: create Reserve returns READY or an error; data Reserve can also return PAUSING; connect/exec-session Reserve returns after synchronous node preparation, without waiting for asynchronous resume. Router keeps only a bounded route cache; in-flight requests do not provide routes for new requests.
-
-<a id="role-boundaries"></a>
-
-### Role boundaries
-
-| Role | Responsibility |
-|---|---|
-| Registry member | Hosts business protocols, live node links and membership; accesses durable metadata through typed repositories |
-| Router | Unified e2b entry; locates route owners by group; per-request control authorization, Reserve for create/connect/exec-session/data; bounded DataRoute cache on the hot path |
-| Placer | Consumes `node_list` WATCH_LIST; imports complete Group records and applies conditional Node maintenance |
-| Node | Runs sandboxes/builds; reports full inventories and events through node_link; receives create/connect/exec_session/delete/build/key commands |
-
 <a id="minimum-cluster"></a>
 
 ## First cluster: one SQLite Registry, one Router, two Nodes
@@ -215,6 +165,15 @@ link owner and fence. Repeat for node-b. Until a default exists,
 Build. A successful `/verify-key` call alone cannot prove this publication.
 After reconnect or an update, repeat this comparison with the current local
 revision and registration; do not mask incomplete publication with Create retries.
+
+If the Build or application needs outbound access, first configure a reachable
+egress gateway and DNS for both Nodes. Set `KUASAR_NETWORK_JSON` to the network
+object for that deployment as described in [network and egress](sandbox-lifecycle.md#network-and-egress).
+The gateway, Area and return routes must work from either Node: E/S templates
+retain their logical network, and copying an artifact does not provision or
+rewrite the destination's network. This initial workflow uses one shared,
+reachable egress path; per-Node gateway policies need deliberate request/Group
+configuration under [Group input precedence](#groups-and-placement).
 
 Set `E2B_API_URL=https://api.sandboxes.example.com`,
 `E2B_DOMAIN=sandboxes.example.com`, `KUASAR_GROUP=first-cluster`, and
@@ -436,8 +395,8 @@ namespace, then restart cache consumers as required by the recovery contract.
 A new namespace has a different key, and existing continuations must be
 discarded. Corrupt or previously deleted key records fail closed and are never
 silently replaced.
-There is no public key deletion or rotation API; a future rotation protocol must
-explicitly define which cursor versions remain accepted.
+There is no public cursor-key deletion or rotation API. Preserve the namespace
+key in database backups so existing continuations can remain valid.
 
 <a id="router-control-plane"></a>
 
@@ -790,7 +749,7 @@ make test-core
 python3 -B scripts/with-test-fdb.py -- make test-cluster-native
 ```
 
-`make build` composes both binary paths. The native target fetches only the SHA256-pinned official 7.3.77 client/SDK and Debian runtime inputs in [cluster-native-lock.json](../scripts/cluster-native-lock.json), validates the ELF dependency and symbol-version closure, then executes the real command's `version` through its bundled loader. The SDK comes from the official clients package because the standalone 7.3.77 headers tar omits a required header. The native tests exercise the driver, command assembly and the same cluster-stub business tests against a real, explicitly selected test database. `with-test-fdb.py` starts and cleans only its isolated local test cluster. An existing test database can instead be selected explicitly with `FDB_CLUSTER_FILE`; a missing variable is an error, not a skipped native gate.
+`make build` composes both binary paths. The native target fetches only the SHA256-pinned official 7.3.77 client/SDK and Debian runtime inputs in [cluster-native-lock.json](../scripts/cluster-native-lock.json), validates the ELF dependency and symbol-version closure, then executes the real command's `--version` through its bundled loader. The SDK comes from the official clients package because the standalone 7.3.77 headers tar omits a required header. The native tests exercise the driver, command assembly and the same cluster-stub business tests against a real, explicitly selected test database. `with-test-fdb.py` starts and cleans only its isolated local test cluster. An existing test database can instead be selected explicitly with `FDB_CLUSTER_FILE`; a missing variable is an error, not a skipped native gate.
 
 The release contains `bin/cluster-ctl`, `bin/run-cluster-ctl`, fixed runtime files under `lib/cluster-ctl/`, and native licenses/provenance under `share/licenses/orchestrator/native/`. The launcher invokes the bundled loader with an explicit library path; install the complete archive and run the roles through `run-cluster-ctl`. The supplied systemd units use `/usr/bin/run-cluster-ctl`. Linux x86_64 needs AVX for the official client, independently of Go's `GOAMD64` setting. The ARM package uses native ARM libraries without emulator-specific settings.
 
@@ -941,6 +900,56 @@ There are two cluster→node paths:
 
 - **Node-link:** registration, heartbeats, Sandbox route events, Build snapshots/deltas, commands and manifest-key leases.
 - **Router forwarding to local control/data planes:** pause/timeout and Build status/files use the node APIEndpoint; parent Sandbox Delete instead calls Registry, which dispatches CmdDelete through node-link. Data uses the separate Proxy DataEndpoint and current NodeSandboxID. Ordinary token requests retain the caller token; verified tokenless signed-file requests add EnvdAccessToken only to the outer CONNECT, not the inner HTTP request ([Data plane](#router-data-plane)).
+
+<a id="roles-and-topology"></a>
+
+## Overview
+
+<a id="overall-topology"></a>
+
+### Overall topology
+
+```mermaid
+flowchart TD
+  client["Client / E2B SDK"] --> router["Router"]
+  router -->|"Reserve / Resolve"| registry["Registry services"]
+  router -->|"Known target data"| node["Node Conductor and Proxy"]
+  registry <-->|"node_link commands and state"| node
+  placer["Placer and Group source"] -->|"Conditional Group imports"| registry
+  registry -->|"node_list WATCH_LIST"| placer
+  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
+```
+
+The steady-state data plane bypasses Registry. Explicit create/connect/exec-session operations and data requests with a missing target or typed stale fallback require Registry:
+
+- `POST /route-link/v2/reserve` distinguishes four operations using `operation=create|connect|exec-session|data`. Create calls Reserve directly; Registry completes connect/exec-session through node-link; data calls Reserve only when the route lacks a complete node target or the node proxy reports typed stale state. Unknown routes do not implicitly create sandboxes. Explicit build registration calls `ReserveBuild`.
+- Registry authenticates the request and selects Nodes from a bounded GroupSupport query.
+- Registry sends create/connect/exec_session/delete/build/key commands through the node owner.
+- Nodes report sandbox/build state and the low-frequency node directory through node_link.
+
+<a id="design-principles"></a>
+
+### Design principles
+
+1. **Group is the business shard key**: every northbound cluster request must include `X-Kuasar-Sandbox-Group` or equivalent group identity. A cluster data-plane entry without a group is currently unsupported.
+2. **The selected database owns durable metadata**: Registry process failure does not erase metadata. Database availability depends on its configured redundancy and failure domains, not Registry owner count. SQLite supports one Registry; shared PostgreSQL/FDB deployments can use multiple members. Losing all metadata still does not authorize reconstructing execution ownership from incomplete reports.
+3. **Operations stay within typed scopes**: Route/Build operations use a group and record identity, node operations use NodeID, and the low-frequency directory uses bounded bucket pages. Unrelated partial lists cannot be merged into authority.
+4. **Atomicity follows business invariants**: coupled intent/ownership, lifecycle fences and projections commit through typed transactions. Registry members do not maintain replicas of each other's metadata.
+5. **Member health does not determine sharding**: the member list comes from versioned configuration; `LocateN` takes only membership members as input. Memberlist detects health and propagates metadata.
+6. **Nodes are the authority for runtime state**: node reports determine whether sandboxes/builds still exist. A host reboot loses running processes; surviving durable rows are reconciled against actual units and checkpoint/cleanup ownership. A conductor process restart can adopt surviving units. Neither event means blindly deleting all durable rows or automatically recreating every old sandbox; see [State ownership and disaster-recovery boundaries](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry Reliability](#registry-reliability).
+7. **Placer does not own lifecycle**: it maintains Group definitions on static targets. Registry selects Nodes from published support; Node admission copies the business inputs and applies the existing lifecycle.
+8. **Router does not subscribe to huge numbers of groups**: create Reserve returns READY or an error; data Reserve can also return PAUSING; connect/exec-session Reserve returns after synchronous node preparation, without waiting for asynchronous resume. Router keeps only a bounded route cache; in-flight requests do not provide routes for new requests.
+
+<a id="role-boundaries"></a>
+
+### Role boundaries
+
+| Role | Responsibility |
+|---|---|
+| Registry member | Hosts business protocols, live node links and membership; accesses durable metadata through typed repositories |
+| Router | Unified e2b entry; locates route owners by group; per-request control authorization, Reserve for create/connect/exec-session/data; bounded DataRoute cache on the hot path |
+| Placer | Consumes `node_list` WATCH_LIST; imports complete Group records and applies conditional Node maintenance |
+| Node | Runs sandboxes/builds; reports full inventories and events through node_link; receives create/connect/exec_session/delete/build/key commands |
 
 <a id="membership-and-state"></a>
 
@@ -1232,7 +1241,7 @@ High-frequency usage and liveness are not projected to node_list. That directory
 
 #### Incremental subscriptions
 
-When starting a subscription, the node owner can supply an opaque revision string. The current format is `source_fingerprint:seq`, parsed privately by the node; callers must treat the token as opaque. Matching fingerprints and available changelog history permit incremental replay; otherwise a full resync occurs. A randomly staggered 1–6 hour full-resync cycle was a design recommendation, not an implemented periodic timer. Current full sync is driven by connection/resume-token and replay-window conditions.
+When starting a subscription, the node owner can supply an opaque revision string. The current format is `source_fingerprint:seq`, parsed privately by the node; callers must treat the token as opaque. Matching fingerprints and available changelog history permit incremental replay; otherwise a full resync occurs. Full sync is driven by connection, resume-token and replay-window conditions; there is no periodic full-resync timer.
 
 Before full subscription starts, the nodelink owner captures that node's sandbox-ownership baseline. At the completion bookmark, it cleans only baseline entries absent by node_sandbox_id in this snapshot. Before cleanup, it rereads and verifies that the complete current stable/node-generation ownership still matches the baseline, protecting work newly dispatched or rebound during synchronization. An incremental-replay bookmark only advances the resume token and does not clean missing entries.
 
@@ -1662,13 +1671,11 @@ Build placement continues to use registration headroom and the selected node's d
 
 The node is the authority for sandbox/build execution state. Sandbox/build records in `route_link`, reverse ownership in `node_link`, and admission-related projections derive from node facts for routing, queries or scheduling; operator files cannot create or transfer them. A terminal Build remains a projection of one node execution. Its produced template/manifest is durably reusable; the BuildRecord is not.
 
-The selected backend's consistent database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. The explicit recovery/bootstrap protocol is not implemented; [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) is a historical proposal closed as not planned, not an available recovery procedure; manually writing execution rows must not bypass that limitation.
-
-The historical proposal [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33), closed as not planned, described an **unbound durable route** with a migration token as the disaster-recovery object for a portable paused sandbox, not SandboxRecord. It would contain no old SID/NodeID/admission and use fresh placement, target-node snapshot validation and a new identity before READY established the runtime route. This recovery-only workflow is not implemented or available through normal route_link APIs.
+The selected backend's consistent database backup/restore preserves database records and is separate from an application-level import. Recovery must coordinate with node facts and restart consumers of the old database history; restoring metadata alone is not proof that old processes still exist. Registry's normal control plane offers no execution-state import/export. In particular, it must not import existing SID, NodeID, READY/PAUSED state, Build execution, node refs, admission or local checkpoints. Nodes persist separate system context for cluster sandboxes, but current node-link full reports do not return Registry-owned identity. If the metadata database is irretrievably lost, route events alone cannot rebuild ownership, and preinstalling ownership to make old events appear legitimate is forbidden. There is no supported recovery/bootstrap operation to reconstruct that lost ownership from surviving Nodes. Do not manually write execution rows to bypass this boundary.
 
 Manifest Bundle does not change migration-token/KMT wire format: the existing source fields identify E-only or an exact S/E pair, including Bundle refs. Import retaining S reads only S and paired E metadata in a tenant helper for runtime admission. Target-node task-local launch preflight reads the root Bundle's contiguous metadata prefix, gathers the selected launch's located sources from flat `bundle/refs`, and deterministically derives the mapping using `checkpoint.remote.ref_location_parent`. Same-directory siblings need no mapping; cold selection does not require the memory-only closure. The shared conductor does not open or recursively scan referenced Bundles. Export/promote still delegates to sandboxer, publishing the root Bundle and its unlocated siblings unchanged while retaining the addresses of externally located dependencies.
 
-Group inputs and tenant roots must be retained by their administration/import source. Node databases own applied Group context and bound object credentials; the optional Placer is not a substitute for Node or Registry backup. The current protocol has no operator runtime-import fallback for complete Registry execution-state loss; #33/#34 are historical proposals, not implementation commitments. It must be reported as unrecoverable through the current protocol, instead of constructing route/build ownership that could conflict with nodes.
+Group inputs and tenant roots must be retained by their administration/import source. Node databases own applied Group context and bound object credentials; the optional Placer is not a substitute for Node or Registry backup. Complete Registry execution-state loss has no operator runtime-import fallback. Report that ownership as unrecoverable through the control plane instead of constructing route/build records that could conflict with surviving Nodes.
 
 <a id="registry-reliability"></a>
 
@@ -1683,9 +1690,9 @@ Group inputs and tenant roots must be retained by their administration/import so
 | Node host reboot | Running processes are gone. If node SQLite/artifacts survive, reconciliation still processes paused rows, accepted interrupted restores, cleanup owners and retained Builds. Missing executions converge through node reports/exact route cleanup; no blanket durable-row deletion or automatic recreation of every old sandbox |
 | One Registry member fails | With a shared PostgreSQL/FDB backend, other service candidates still access durable metadata; a single SQLite Registry must restart. Nodes whose stream owner failed reconnect; registration fences reject stale overlapping sessions |
 | The selected database is unavailable or cannot commit | Metadata operations fail or return an explicit unknown commit outcome; Registry does not fall back to local writes |
-| Registry metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; the application recovery/bootstrap protocol remains unavailable (#34 is historical) |
+| Registry metadata is irretrievably lost while nodes survive | Missing ownership cannot be reconstructed by ordinary route events; without a consistent Registry database backup, that ownership is unrecoverable |
 | Membership change | Changes service candidates and node-link affinity; all views keep using the same database and prefix |
-| Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. Provider data and portable templates/manifests remain reusable, but do not restore lost Registry execution ownership. Migration-token route recovery (#33) is a historical, unimplemented proposal, not an execution-row import or an available fallback |
+| Whole-cluster power loss | Running processes are lost. Surviving node durable rows/checkpoints can be reconciled only with intact storage and required Registry ownership; this is not a guaranteed cluster recovery protocol. Provider data and portable templates/manifests remain reusable, but do not restore lost Registry execution ownership. A retained migration token does not reconstruct lost Registry ownership |
 
 <a id="registry-performance"></a>
 
