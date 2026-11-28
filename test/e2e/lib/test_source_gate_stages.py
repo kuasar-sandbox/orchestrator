@@ -21,7 +21,7 @@ SPEC.loader.exec_module(GATE)
 EXPECTED = {
     "normal": ("consumer-api", "normal-builder-contracts"),
     "race": ("race-cases",),
-    "databases": ("native-fdb", "cluster-fdb", "cluster-sqlite", "postgres"),
+    "databases": ("native-fdb", "cluster-backends"),
     "services": ("runtask-privilege", "vmm-cgroup", "builder-unit-upgrade", "resource-pool",
                  "capture-cli", "fixture-configs", "telemetry-backends", "telemetry-netns"),
     "vet-and-helpers": ("vet", "environment-tools", "telemetry-image-pull", "helper-tests"),
@@ -80,8 +80,8 @@ if sys.argv[1] == os.environ.get('STAGE_FIXTURE_FAIL'):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
     def test_complete_catalog_separates_normal_and_explicit_race_cases(self):
-        self.assertEqual(len(GATE.CATALOG), 19)
-        self.assertEqual(len({row.name for row in GATE.CATALOG}), 19)
+        self.assertEqual(len(GATE.CATALOG), 17)
+        self.assertEqual(len({row.name for row in GATE.CATALOG}), 17)
         self.assertEqual(GATE.selected(), GATE.CATALOG)
         self.assertIn("-skip='^TestRace'", GATE.program("normal"))
         self.assertIn("-vet=off", GATE.program("normal"))

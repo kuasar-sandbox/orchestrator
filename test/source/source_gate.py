@@ -62,18 +62,22 @@ python3 -B scripts/with-test-fdb.py -- \
 """),
     Command('fixture-configs', 'services', r"""bash test/source/cluster_fixture_configs.sh
 """),
-    Command('cluster-fdb', 'databases', r"""REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
-"""),
-    Command('cluster-sqlite', 'databases', r"""CLUSTER_STUB_BACKEND=sqlite REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
-"""),
-    Command('postgres', 'databases', r"""# Provision real PostgreSQL explicitly: these backend contracts must never
-# silently skip because the DSN was absent from the required source gate.
-bash scripts/with-test-postgres.sh -- bash -euc '
+    Command('cluster-backends', 'databases', r"""# Build each CLI mode once for all thirteen backend/topology cases. Database
+# state remains private to each case; this subshell owns and removes the binaries.
+(
+    cluster_work="$(mktemp -d)"
+    trap 'rm -rf "$cluster_work"' EXIT
+    BIN="$cluster_work/native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
+    BIN="$cluster_work/pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_BUILD_ONLY=1 bash test/source/cluster_stub.sh
+    BIN="$cluster_work/native" CLUSTER_STUB_BACKEND=foundationdb CLUSTER_STUB_PREBUILT=1 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+    BIN="$cluster_work/pure" CLUSTER_STUB_BACKEND=sqlite CLUSTER_STUB_PREBUILT=1 REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
+    BIN="$cluster_work/pure" CLUSTER_STUB_PREBUILT=1 bash scripts/with-test-postgres.sh -- bash -euc '
     test -n "$STORAGE_TEST_POSTGRES_DSN"
     CGO_ENABLED=1 go test -vet=off -skip="^TestRace" -p=1 -count=1 -timeout=5m \
         ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry
     CLUSTER_STUB_BACKEND=postgres REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
-'
+    '
+)
 """),
     Command('telemetry-backends', 'services', r"""bash test/source/telemetry_backends.sh
 """),

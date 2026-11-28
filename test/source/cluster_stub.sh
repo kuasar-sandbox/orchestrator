@@ -75,6 +75,26 @@ PY_LIST_ROUTES
 }
 
 build_cluster_stub_binaries() {
+    # The pure CLI serves both SQLite and PostgreSQL; select it even when this
+    # invocation consumes a complete binary set built by its source-gate parent.
+    if [ "$CLUSTER_STUB_BACKEND" != foundationdb ]; then
+        CLUSTER_CTL="$BIN/cluster-ctl-pure"
+    fi
+    case "${CLUSTER_STUB_PREBUILT:-0}" in
+    0) ;;
+    1)
+        [ -x "$CLUSTER_CTL" ] || fail "missing prebuilt cluster-ctl at $CLUSTER_CTL"
+        [ -x "$NODE_STUB_CTL" ] || fail "missing prebuilt node-stub-ctl at $NODE_STUB_CTL"
+        [ -x "$E2B_KEY_CTL" ] || fail "missing prebuilt e2b-key-ctl at $E2B_KEY_CTL"
+        if [ "$CLUSTER_STUB_BACKEND" = foundationdb ]; then
+            python3 "$ROOT/scripts/cluster-native.py" validate --arch "$(uname -m)" \
+                --root "$BIN/cluster-runtime" || fail "invalid prebuilt FoundationDB runtime closure"
+        fi
+        return
+        ;;
+    *) fail "CLUSTER_STUB_PREBUILT must be 0 or 1" ;;
+    esac
+    step "building cluster stub binaries: backend=$CLUSTER_STUB_BACKEND arch=$(uname -m) flags=-trimpath"
     command -v go >/dev/null 2>&1 || fail "go not on PATH"
     mkdir -p "$BIN"
     if [ "$CLUSTER_STUB_BACKEND" = foundationdb ]; then
@@ -85,6 +105,13 @@ build_cluster_stub_binaries() {
     fi
     (cd "$ROOT" && go build -trimpath -o "$NODE_STUB_CTL" ./cmd/node-stub-ctl)
     (cd "$ROOT" && go build -trimpath -o "$E2B_KEY_CTL" ./cmd/e2b-key-ctl)
+    go version
+    if [ "$CLUSTER_STUB_BACKEND" = foundationdb ]; then
+        sha256sum "$BIN/cluster-runtime/bin/cluster-ctl" "$BIN/cluster-runtime/bin/run-cluster-ctl"
+    else
+        sha256sum "$CLUSTER_CTL"
+    fi
+    sha256sum "$NODE_STUB_CTL" "$E2B_KEY_CTL"
 }
 
 # Each case uses a private metadata namespace in the selected real backend.
@@ -93,10 +120,19 @@ build_cluster_stub_binaries() {
 case "$CLUSTER_STUB_BACKEND" in
 foundationdb) ;;
 postgres)
-    [ -n "${STORAGE_TEST_POSTGRES_DSN:-}" ] || fail "STORAGE_TEST_POSTGRES_DSN is required"
+    if [ "${CLUSTER_STUB_BUILD_ONLY:-0}" != 1 ]; then
+        [ -n "${STORAGE_TEST_POSTGRES_DSN:-}" ] || fail "STORAGE_TEST_POSTGRES_DSN is required"
+    fi
     ;;
 sqlite) ;;
 *) fail "unknown CLUSTER_STUB_BACKEND" ;;
+esac
+# Build-only does not create a database or a case namespace. The required source
+# gate owns a fresh directory for each compiler mode and never persists it.
+case "${CLUSTER_STUB_BUILD_ONLY:-0}" in
+0) ;;
+1) build_cluster_stub_binaries; exit 0 ;;
+*) fail "CLUSTER_STUB_BUILD_ONLY must be 0 or 1" ;;
 esac
 if [ "$CLUSTER_STUB_BACKEND" = foundationdb ] && [ -z "${FDB_CLUSTER_FILE:-}" ]; then
     exec python3 "$ROOT/scripts/with-test-fdb.py" -- bash "$0"
@@ -115,7 +151,9 @@ if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
         REGISTRIES="${rest%%:*}"
         SCALERS="${rest##*:}"
         step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES placers=$SCALERS)"
-        CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" bash "$0"
+        BIN="$BIN" CLUSTER_CTL="$CLUSTER_CTL" NODE_STUB_CTL="$NODE_STUB_CTL" E2B_KEY_CTL="$E2B_KEY_CTL" \
+            CLUSTER_STUB_PREBUILT=1 CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" \
+            REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" bash "$0"
     done
     exit 0
 fi
