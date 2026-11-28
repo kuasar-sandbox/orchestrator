@@ -99,7 +99,8 @@ func TestRegistryPoolEndpointPaths(t *testing.T) {
 	}
 }
 
-func TestRegistryPoolConcurrent(t *testing.T) {
+// Race check: concurrent registry refresh and endpoint reads.
+func TestRaceRegistryPoolConcurrent(t *testing.T) {
 	s, count, _ := poolServer(t, false)
 	r, _ := NewRegistry(s.URL, nil)
 	var wg sync.WaitGroup

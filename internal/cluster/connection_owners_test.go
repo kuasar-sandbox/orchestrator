@@ -49,7 +49,8 @@ func TestConnectionOwnersPreserveBusinessCandidates(t *testing.T) {
 	}
 }
 
-func TestConnectionOwnersConcurrentViewReplacement(t *testing.T) {
+// Race check: concurrent routing-view replacement and reads.
+func TestRaceConnectionOwnersConcurrentViewReplacement(t *testing.T) {
 	first := []MemberView{{Version: 1, Members: []string{"a"}}}
 	second := []MemberView{{Version: 2, Members: []string{"b"}}}
 	o, err := NewConnectionOwners("a", first, 2)

@@ -83,7 +83,8 @@ func TestNativeStatsBatchBoundsAndSourceErrors(t *testing.T) {
 	}
 }
 
-func TestNativeStatsBatchGlobalConcurrencyAndCancellation(t *testing.T) {
+// Race check: shared batch admission and result state during concurrent cancellation.
+func TestRaceNativeStatsBatchGlobalConcurrencyAndCancellation(t *testing.T) {
 	o := testOrch(t)
 	ids := batchSandboxes(t, o, conductorextension.MaxStatsSandboxes)
 	var active, maximum atomic.Int64

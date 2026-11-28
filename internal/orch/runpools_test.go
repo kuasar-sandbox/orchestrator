@@ -106,7 +106,8 @@ func TestRunPoolsIndependentIdentityAndFastCallback(t *testing.T) {
 	}
 }
 
-func TestRunPoolsConcurrentAssignments(t *testing.T) {
+// Race check: concurrent allocation and cleanup of shared run indexes.
+func TestRaceRunPoolsConcurrentAssignments(t *testing.T) {
 	runs := &runIndex{}
 	lc := callbackLauncher(t, runs)
 	pools, ctx, _ := startPoolSet(t, runKindSandbox, []config.RunPoolConfig{{Unit: "r@.service"}, {Unit: "r@.service"}, {Unit: "s@.service"}}, lc, runs)

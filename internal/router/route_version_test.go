@@ -144,7 +144,8 @@ func TestRouteCachePreservesNewStateAndAllowsSameVersionRefresh(t *testing.T) {
 	}
 }
 
-func TestRouteCacheConcurrentResponsesKeepFullVersionOrder(t *testing.T) {
+// Race check: concurrent writes to the shared route cache.
+func TestRaceRouteCacheConcurrentResponsesKeepFullVersionOrder(t *testing.T) {
 	rt := &Router{cache: map[string]*routeResolve{}}
 	var wg sync.WaitGroup
 	for i := 0; i < 128; i++ {

@@ -225,7 +225,8 @@ func TestCompilerEnforcesSourceAndComplexityBounds(t *testing.T) {
 	}
 }
 
-func TestCompilerCacheHitEvictionAndConcurrentSingleflight(t *testing.T) {
+// Race check: shared compiler cache and concurrent singleflight results.
+func TestRaceCompilerCacheHitEvictionAndConcurrentSingleflight(t *testing.T) {
 	compiler, err := NewCompiler()
 	if err != nil {
 		t.Fatal(err)

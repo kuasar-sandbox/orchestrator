@@ -107,6 +107,15 @@ make test                       # 单元和 helper 测试
 ORG=/path/to/exact/sources make test-source  # source/race/vet/integration 门禁
 ```
 
+Race 检查按用例显式选择：将需要检查的用例命名为 `TestRace...`，并在旁边
+说明它验证的共享内存并发行为。普通测试使用 `-skip='^TestRace'`；独立的 race
+入口使用 `-race -run='^TestRace'`，只编译含选中用例的包。
+`python3 -B test/source/race_cases.py --list` 仅列出选择结果，不编译测试。
+所有选中用例及已启动子用例都必须通过，跳过或缺失均失败。该前缀用于可移植的
+源码测试；数据库功能测试仍在普通数据库入口执行。需要专用环境的 race 用例，
+应先提供对应环境的独立执行入口。不要运行全量 race，也不要在测试编译时重复
+执行已有独立必选入口负责的 vet。
+
 Capture CLI/DB fixture 合同属于源码集成。必需 source gate 编译 exact sibling
 sandboxer 的 `sandbox-ctl`，从当前 orchestrator 源码执行
 `TestCapturePairCLIToPausedDatabase`、`TestUploadCaptureCLIToPausedDatabase`
