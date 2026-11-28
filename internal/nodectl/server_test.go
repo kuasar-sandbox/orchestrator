@@ -162,7 +162,8 @@ func TestAdmitSpecRoundsPositiveCPUFloorUp(t *testing.T) {
 	}
 }
 
-func TestConcurrentAdmitCheckAndInsertCannotOversubscribePool(t *testing.T) {
+// Race check: concurrent admission reads and writes shared reservation state.
+func TestRaceConcurrentAdmitCheckAndInsertCannotOversubscribePool(t *testing.T) {
 	state := NewState(1<<30, 8000, 0, 0, Watermarks{
 		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: 1,
 	})
@@ -228,7 +229,8 @@ func TestConcurrentAdmitCheckAndInsertCannotOversubscribePool(t *testing.T) {
 	}
 }
 
-func TestConcurrentAdmitAndBudgetGrowCannotOversubscribePool(t *testing.T) {
+// Race check: admission and budget growth share the same accounting state.
+func TestRaceConcurrentAdmitAndBudgetGrowCannotOversubscribePool(t *testing.T) {
 	state := NewState(1<<30, 8000, 0, 0, Watermarks{
 		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: 1,
 	})

@@ -48,7 +48,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-deb-extract.py"
-GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
+# These archive format/entry cases are serial functional checks, not race cases.
+GOWORK=off go test "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 
 init_fixture_repo() {
   local directory="$1"

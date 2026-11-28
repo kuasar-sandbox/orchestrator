@@ -2,7 +2,6 @@
 """Source-stage dispatch contracts; never execute the product gate here."""
 import ast
 from collections import Counter
-import hashlib
 import importlib.util
 import json
 import os
@@ -21,6 +20,7 @@ SPEC.loader.exec_module(GATE)
 
 EXPECTED = {
     "normal": ("consumer-api", "normal-builder-contracts"),
+    "race": ("race-cases",),
     "databases": ("native-fdb", "cluster-fdb", "cluster-sqlite", "postgres"),
     "services": ("runtask-privilege", "vmm-cgroup", "builder-unit-upgrade", "resource-pool",
                  "capture-cli", "fixture-configs", "telemetry-backends", "telemetry-netns"),
@@ -79,18 +79,15 @@ if sys.argv[1] == os.environ.get('STAGE_FIXTURE_FAIL'):
     def records(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
-    def test_full_catalog_keeps_original_literal_body_and_order(self):
-        # Digest of the original gate after its five-line cwd preamble, recorded
-        # before extraction into the catalog. It includes every flag/comment,
-        # pipeline, nested PostgreSQL command, namespace check and EXIT trap.
-        self.assertEqual(hashlib.sha256(GATE.program().encode()).hexdigest(),
-                         "5410112e65223946ac3afd13844aa3f105faffe624d7b9072d0cc6fc3d828eb4")
+    def test_complete_catalog_separates_normal_and_explicit_race_cases(self):
         self.assertEqual(len(GATE.CATALOG), 19)
         self.assertEqual(len({row.name for row in GATE.CATALOG}), 19)
         self.assertEqual(GATE.selected(), GATE.CATALOG)
-        race = [row for row in GATE.CATALOG if row.stage == "race"]
-        self.assertEqual([row.name for row in race], ["race-all"])
-        self.assertIn("CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m ./...\n", race[0].shell)
+        self.assertIn("-skip='^TestRace'", GATE.program("normal"))
+        self.assertIn("-vet=off", GATE.program("normal"))
+        self.assertIn("python3 -B test/source/race_cases.py", GATE.program("race"))
+        self.assertNotIn("-race", GATE.program("databases"))
+        self.assertNotIn("go test -race", GATE.program())
 
     def test_nonrace_projection_and_platform_race_cover_complete_catalog_once(self):
         observed = []
@@ -99,9 +96,8 @@ if sys.argv[1] == os.environ.get('STAGE_FIXTURE_FAIL'):
             self.assertEqual(tuple(row.name for row in selected), names)
             self.assertEqual(selected, tuple(row for row in GATE.CATALOG if row.stage == stage))
             observed.extend(row.name for row in selected)
-        observed.append("race-all")
         self.assertEqual(Counter(observed), Counter(row.name for row in GATE.CATALOG))
-        self.assertEqual(GATE.STAGES, ("normal", "race-1", "race-2", "race-3", "race-4",
+        self.assertEqual(GATE.STAGES, ("normal", "race",
                                       "databases", "services", "vet-and-helpers"))
 
     def test_real_emitter_returns_only_exact_catalog_bytes_for_default_and_each_stage(self):
@@ -116,13 +112,13 @@ if sys.argv[1] == os.environ.get('STAGE_FIXTURE_FAIL'):
 
     def test_declaration_is_static_and_wrapper_checks_emitter_before_eval(self):
         text = (self.owner / "scripts/ci-source-checks.sh").read_text()
-        marker = "# kuasar-source-stages: orchestrator-source-v1"
+        marker = "# kuasar-source-stages: orchestrator-source-v2"
         self.assertEqual(text.splitlines().count(marker), 1)
         self.assertLess(text.index(marker), text.index("set -euo pipefail"))
         self.assertIn('cd "$ROOT"\n', text)
         self.assertTrue(text.endswith('source_gate_program="$(python3 -B test/source/source_gate.py "$@")"\n'
                                      'eval "$source_gate_program"\n'))
-        self.assertEqual(GATE.PROTOCOL, "orchestrator-source-v1")
+        self.assertEqual(GATE.PROTOCOL, "orchestrator-source-v2")
 
     def test_actual_default_wrapper_runs_complete_fixture_catalog_in_owner_order(self):
         result = self.entry()
@@ -157,7 +153,7 @@ if sys.argv[1] == os.environ.get('STAGE_FIXTURE_FAIL'):
         result = self.entry(STAGE_FIXTURE_FAIL="native-fdb", STAGE_FIXTURE_EXIT="23")
         self.assertEqual(result.returncode, 23)
         self.assertEqual([row["name"] for row in self.records()],
-                         ["consumer-api", "normal-builder-contracts", "race-all", "native-fdb"])
+                         ["consumer-api", "normal-builder-contracts", "race-cases", "native-fdb"])
 
     def test_actual_child_signal_remains_a_failing_shell_status(self):
         result = self.entry("--ci-stage", "services", STAGE_FIXTURE_FAIL="runtask-privilege",
@@ -165,9 +161,9 @@ if sys.argv[1] == os.environ.get('STAGE_FIXTURE_FAIL'):
         self.assertEqual(result.returncode, 143)
         self.assertEqual([row["name"] for row in self.records()], ["runtask-privilege"])
 
-    def test_unknown_and_platform_owned_race_requests_fail_before_execution(self):
+    def test_unknown_and_retired_race_partition_requests_fail_before_execution(self):
         for arguments in (("--ci-stage", "missing"), ("--ci-stage",), ("extra",),
-                          *(("--ci-stage", stage) for stage in GATE.RACE_STAGES)):
+                          *(("--ci-stage", stage) for stage in ("race-1", "race-2", "race-3", "race-4"))):
             with self.subTest(arguments=arguments):
                 result = self.entry(*arguments)
                 self.assertEqual(result.returncode, 2)

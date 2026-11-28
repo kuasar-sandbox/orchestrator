@@ -45,7 +45,8 @@ func TestRunPoolsPriorityBeforeIdleAndCapacity(t *testing.T) {
 	runs.forget(other)
 }
 
-func TestRunPoolsConcurrentSlotsAndRefill(t *testing.T) {
+// Race check: slot assignment and background refill share the run indexes.
+func TestRaceRunPoolsConcurrentSlotsAndRefill(t *testing.T) {
 	runs := &runIndex{}
 	lc := callbackLauncher(t, runs)
 	limit := 4

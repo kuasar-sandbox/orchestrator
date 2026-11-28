@@ -131,7 +131,8 @@ func TestResourcePoolRuntimeCPUIsConstantAndUnbounded(t *testing.T) {
 	}
 }
 
-func TestResourcePoolConcurrentCapacityAndExactRollback(t *testing.T) {
+// Race check: concurrent updates to shared placement and capacity accounting.
+func TestRaceResourcePoolConcurrentCapacityAndExactRollback(t *testing.T) {
 	s := twoPoolState(t)
 	for _, p := range s.PoolStates() {
 		p.CapacityLimit = Resources{MemoryBytes: 10}

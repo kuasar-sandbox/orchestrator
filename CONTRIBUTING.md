@@ -122,6 +122,16 @@ make test                       # unit and helper tests
 ORG=/path/to/exact/sources make test-source  # source/race/vet/integration gates
 ```
 
+Race instrumentation is opt-in per test: name the case `TestRace...` and add
+a nearby comment naming the shared-memory concurrency it checks. The ordinary
+gate uses `-skip='^TestRace'`; the separate race gate uses `-race -run='^TestRace'`
+and compiles only packages containing selected cases. `python3 -B test/source/race_cases.py --list` lists them without compiling tests. Every
+selected case and started subcase must pass; a skipped or missing case fails.
+This prefix is reserved for portable source tests; backend-specific functional
+tests keep their ordinary database gates. Add a dedicated environment-aware race
+entry before opting such a test into race instrumentation. Do not use full-suite
+race runs or duplicate the required standalone vet gate during test compilation.
+
 Capture CLI/DB fixture contracts are source integration, not product E2E. The
 required source gate builds the exact sibling sandboxer's `sandbox-ctl` and runs
 `TestCapturePairCLIToPausedDatabase`, `TestUploadCaptureCLIToPausedDatabase`

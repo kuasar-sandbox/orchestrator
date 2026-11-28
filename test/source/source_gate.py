@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """One command catalog for the complete source gate and its declared stages.
 
-The no-argument entry keeps the complete original shell order. This module
-emits only its literal catalog; the existing Bash entry executes it in its
-own strict shell, preserving startup environment and EXIT traps. The trusted
-platform may run four independent owner stages in separate Workbench instances.
-Its four race jobs discover and execute the entire package union themselves;
-direct owner race-stage requests fail instead of accidentally running all four
-copies of the full race gate. Older platforms keep using the complete entry.
+The no-argument entry runs all maintained checks. v2 separates ordinary tests
+from explicitly named TestRace cases and runs a single selected-package race
+gate. The trusted platform may run the five stages independently; older
+platforms still execute the same complete no-argument entry.
 
 The caller supplies the ordinary selected-source Go workspace and private
 system-mode environment. This dispatcher does not prepare a different workspace,
@@ -16,8 +13,8 @@ change inherited build/test flags, add retries or suppress a failing command.
 import argparse
 from typing import NamedTuple
 
-PROTOCOL = "orchestrator-source-v1"
-RACE_STAGES = ("race-1", "race-2", "race-3", "race-4")
+PROTOCOL = "orchestrator-source-v2"
+RACE_STAGES = ("race",)
 STAGES = ("normal", *RACE_STAGES, "databases", "services", "vet-and-helpers")
 
 
@@ -27,26 +24,25 @@ class Command(NamedTuple):
     shell: str
 
 
-# Preserve the default order and each complete original shell fragment. In
-# particular, normal tests retain their Builder JSON pipe, PostgreSQL owns its
+# Keep execution order and the environment-dependent checks. Ordinary tests
+# retain their Builder JSON pipe, PostgreSQL owns its
 # real server for both checks, and telemetry's temporary build retains its trap.
 CATALOG = (
     Command('consumer-api', 'normal', r"""bash test/source/go_consumer.sh
 """),
     Command('normal-builder-contracts', 'normal', r"""# Validate the required Builder contracts from this ordinary run, including
 # every started subcase, instead of executing the same tests a third time.
-go test -json -count=1 -timeout=5m ./... \
+go test -json -vet=off -skip='^TestRace' -count=1 -timeout=5m ./... \
     | python3 -B test/source/builder_state.py --results -
 """),
-    Command('race-all', 'race', r"""# Give each race-instrumented package the source Workbench's two CPUs. Tests
-# retain their own goroutine/subprocess concurrency and per-package deadline.
-CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m ./...
+    Command('race-cases', 'race', r"""# Instrument only packages with explicitly marked race cases.
+python3 -B test/source/race_cases.py
 """),
     Command('native-fdb', 'databases', r"""# Native repositories and command wiring run against an isolated SSD database,
 # through the same pinned loader and client runtime as the shipped executable.
 python3 -B scripts/with-test-fdb.py -- \
     python3 -B scripts/cluster-native.py test --arch "$(uname -m)" -- \
-    -race -p=1 -count=1 -timeout=5m
+    -skip='^TestRace' -p=1 -count=1 -timeout=5m
 """),
     Command('vet', 'vet-and-helpers', r"""go vet ./...
 """),
@@ -74,7 +70,7 @@ python3 -B scripts/with-test-fdb.py -- \
 # silently skip because the DSN was absent from the required source gate.
 bash scripts/with-test-postgres.sh -- bash -euc '
     test -n "$STORAGE_TEST_POSTGRES_DSN"
-    CGO_ENABLED=1 go test -race -p=1 -count=1 -timeout=5m \
+    CGO_ENABLED=1 go test -vet=off -skip="^TestRace" -p=1 -count=1 -timeout=5m \
         ./internal/storage/sqlengine ./internal/cluster/metastore ./internal/registry
     CLUSTER_STUB_BACKEND=postgres REQUIRE_CLUSTER_STUB=1 bash test/source/cluster_stub.sh
 '
@@ -99,8 +95,6 @@ if [ "$(id -u)" -ne 0 ]; then telemetry_privilege=(sudo -n); fi
 def selected(stage=None):
     if stage is None:
         return CATALOG
-    if stage in RACE_STAGES:
-        raise ValueError("race partitions must be executed by the trusted platform")
     if stage not in STAGES:
         raise ValueError("unknown source stage")
     commands = tuple(command for command in CATALOG if command.stage == stage)

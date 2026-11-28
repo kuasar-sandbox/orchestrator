@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-func TestConcurrentOpaqueRoundTrips(t *testing.T) {
+// Race check: shared RPC pending-map and frame multiplexing.
+func TestRaceConcurrentOpaqueRoundTrips(t *testing.T) {
 	master, worker := net.Pipe()
 	server := NewServer(master, func(sandboxID, path string) EndpointResponse {
 		return EndpointResponse{Found: true, Type: "secret", Present: true, Body: []byte(sandboxID + "\x00" + path)}
@@ -41,7 +42,8 @@ func TestConcurrentOpaqueRoundTrips(t *testing.T) {
 	wg.Wait()
 }
 
-func TestClientFailsPendingRequestWhenConnectionCloses(t *testing.T) {
+// Race check: connection shutdown concurrent with pending request completion.
+func TestRaceClientFailsPendingRequestWhenConnectionCloses(t *testing.T) {
 	master, worker := net.Pipe()
 	client := NewClient(worker)
 	done := make(chan error, 1)

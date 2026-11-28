@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Required source/race/vet and privileged Collector regressions, separate from E2E.
-# kuasar-source-stages: orchestrator-source-v1
+# kuasar-source-stages: orchestrator-source-v2
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
