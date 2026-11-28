@@ -370,7 +370,10 @@ class PreparedCustomProxy(unittest.TestCase):
 class TelemetrySourceExecution(unittest.TestCase):
     def run_probe(self, host, uid, status=0):
         root = Path(__file__).resolve().parents[3]
-        source = (root / "scripts/ci-source-checks.sh").read_text()
+        source = subprocess.check_output(
+            [sys.executable, "-B", str(root / "test/source/source_gate.py")],
+            cwd=root, text=True, timeout=5,
+        )
         start = source.index("bash scripts/ci-e2e-build.sh source ")
         commands = source[start:]
         with tempfile.TemporaryDirectory(prefix="source-netns-") as temporary:
