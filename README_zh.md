@@ -4,192 +4,137 @@
 
 # orchestrator
 
-首次运行跨组件沙箱或 Demo，推荐从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)
-使用匹配聚合版本的 [workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)。
-本组件仍可独立构建和部署，workbench 不是生产运行的强制依赖。预构建架构以所选
-发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
+`orchestrator` 为 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 提供 **E2B 兼容 API、节点服务和多节点控制面**。用它构建模板、创建和管理 Sandbox、接入 SDK 客户端，并运维计算节点集群。
 
-`orchestrator` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 的 **E2B 兼容节点服务与多节点控制面**。
-
-它提供北向 API、节点本地生命周期编排、数据面 Proxy 集成、租户凭据、资源准入,以及运营集群的 Registry/Router/Placer。
-仓库独立演进和发布,同时参加项目级跨组件验证与聚合发布。
+从主项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)进入：用 Docker 拉取 **node-infra** 镜像，挂载专用数据卷运行，然后执行首个 Guest 命令。镜像提供相互兼容的运行时、网络、存储和编排组件。接着配置持久站点 Node，再构建自己的应用模板。本仓指南负责下列具体操作与配置。
 
 <a id="documentation"></a>
 
-## 按能力阅读
+## 推荐使用顺序
 
-以下八个主题同时维护可操作用法与完整能力契约；公共使用在前，内部所有权和协议在后，并提供英中配对版本。跨组件安装与升级由[主项目](https://github.com/kuasar-sandbox/kuasar-sandbox)维护；源码贡献和组件打包见[贡献指南](CONTRIBUTING_zh.md)。
+| 下一步任务 | 指南 | 完成判据 |
+|---|---|---|
+| 执行首个 Guest 命令 | 主项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md) | 返回 Guest 命令的输出和退出码 |
+| 配置持久站点 Node | 主项目[部署指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)，再看[节点运维](docs/node_zh.md#operate-a-node) | Conductor、Proxy 正常运行，客户端可访问两个入口 |
+| 构建应用模板 | [模板构建](docs/node-build_zh.md#client-workflow) | 本次 Build 达到 `ready`，保存其 canonical TemplateID |
+| 运行、暂停和重新连接 Sandbox | [生命周期](docs/sandbox-lifecycle_zh.md#recommended-workflow)与 [SDK 接入](docs/node-proxy_zh.md#connect-a-client) | 命令和文件操作能通过配置的数据入口完成 |
+| 开通出站访问或调整网络策略 | Connector [网络指南](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress_zh.md#部署和归属) | Guest 经所选 egress 路径访问预期目的地 |
+| 增加第二个计算节点 | [首次集群](docs/cluster_zh.md#minimum-cluster) | 两个 Node 均发布目标 Group 版本，默认模板 eligible |
+| 排查容量、流量或失败 | [资源管理](docs/node-resource_zh.md#operate-resources)、[可观测性](docs/observability_zh.md#diagnose-a-request) | 重试前先检查原 SandboxID/BuildID 及负责该操作的服务 |
 
-| 主题 | 内容 |
+模板 canonical ID 来自成功的 Build，不能用任意镜像名替代。Create 被接受表示生命周期操作已经开始，不表示 guest 已经就绪。对应指南说明等待条件和需要保留的身份。
+
+### 能力参考
+
+每篇文档拥有相应字段及行为定义。先提供用户流程，再介绍配置、恢复和实现契约。中英文版本覆盖相同能力。
+
+| 主题 | 范围 |
 |---|---|
-| [节点运行](docs/node_zh.md) | 服务、共享配置、systemd 池、本地通道与恢复 |
-| [Sandbox 生命周期](docs/sandbox-lifecycle_zh.md) | Create 与身份、Pause/Resume、Reset/dead 保留、Delete 与迁移 |
-| [模板 Build](docs/node-build_zh.md) | Build API、请求输入、不可变制品、执行、发布与取消 |
-| [访问与代理](docs/node-proxy_zh.md) | SDK 访问、凭据、exec、转发、MMDS、流量准入与 routesync |
-| [资源与准入](docs/node-resource_zh.md) | capacity/startup 策略、reservation、节点压力、恢复与资源协议 |
-| [观测](docs/observability_zh.md) | Journal 输出、native stats、无损 usage、OTLP metrics 与历史查询 |
-| [集群控制](docs/cluster_zh.md) | 公共入口、Group、角色配置、执行所有权、路由与恢复 |
-| [应用扩展](docs/extensions_zh.md) | 静态 App bootstrap、公共 Go 契约、对象源、Hook 与 wrapper |
+| [节点运维](docs/node_zh.md) | 服务、配置、systemd worker、本地通道与恢复 |
+| [Sandbox 生命周期](docs/sandbox-lifecycle_zh.md) | Create、Pause/Resume、workspace、Reset、Delete 和迁移 |
+| [模板构建](docs/node-build_zh.md) | 构建输入、目标选择、canonical artifact、取消与保留 |
+| [访问与代理](docs/node-proxy_zh.md) | SDK、凭据、native exec、转发、MMDS 与流量准入 |
+| [资源与准入](docs/node-resource_zh.md) | 容量、启动策略、资源池、drain 与压力恢复 |
+| [可观测性](docs/observability_zh.md) | 日志、即时统计、精确用量、OTLP 指标与历史查询 |
+| [集群控制](docs/cluster_zh.md) | Registry/Router、Group 发布、Node 选点、路由与恢复 |
+| [应用扩展](docs/extensions_zh.md) | 自定义 Conductor/Proxy/Telemetry 与公开 Go API |
 
 <a id="responsibilities"></a>
 
-## 职责
+## 服务与部署选择
 
 <a id="standalone-node"></a>
 
-### 独立节点
+### 单节点
 
-`node-ctl` 运行计算节点服务:
+计算节点运行 **Conductor**，负责 API 与生命周期；运行 **Proxy**，负责 Sandbox 数据流量。需要指标采集或历史查询时增加 **Telemetry**。Conductor 通过 systemd 管理 Sandbox 和 Build worker；用户使用 API 或 SDK，无需手工启动 `run-sandbox`、`run-builder`。
 
-- **Conductor**:权威控制 API、Sandbox/Build 生命周期、本地路由、凭据管理与可选节点资源准入。
-- **Proxy**:唯一沙箱数据入口,负责 Envd、floating-IP 服务、native exec、MMDS 与 traffic observation。
-- **Telemetry**：独立 envd/native stats/OTLP 采集、可信沙箱身份、原生 Collector pipeline、可选本地 TSDB、独立远端写入与查询、E2B/自定义 HTTP handler。
-- **Node link**:可选客户端,把节点接入集群控制面。
-- **Launch helpers**:systemd 管理的 Sandbox/Build runner。
-- **Administration**:资源状态/drain、模板构建状态、配置检查、manifest-key 管理与 Sandbox export/import。
-
-独立部署的 E2B 兼容 API 可供未改造的 E2B SDK/CLI 使用。
+单节点支持文档列出的 E2B SDK/CLI 流程。API 与数据 listener 相互独立：开发 HTTP 接入需配置两个地址，TLS 部署使用对应域名。[访问与代理](docs/node-proxy_zh.md#connect-a-client)说明接入方式与已验证 SDK 版本。
 
 <a id="multi-node-cluster"></a>
 
 ### 多节点集群
 
-`cluster-ctl` 运行三个独立角色:
+从[一个 SQLite Registry、一个 Router、两个 Node](docs/cluster_zh.md#minimum-cluster)开始。Node 保留本地生命周期和完整 Group 上下文；Registry 保存集群元数据，从 Node 已发布的 Group 支持中选点；Router 提供统一 API 与数据入口。
 
-- **Registry**:持久集群元数据、Node 选点与节点通道枢纽。
-- **Router**:集群级 E2B 兼容控制面与数据面统一入口,按稳定沙箱身份路由。
-- **Placer**:可选的 Node Group 导入、条件维护与凭据续期。Registry 从节点已发布的支持中选点，Node 负责执行和资源准入。
-
-控制面保留稳定的外部 Sandbox 身份,实际 node-local 实例可在恢复/迁移时改变。首次配置从[一个 SQLite Registry、一个 Router 和两个 Node](docs/cluster_zh.md#minimum-cluster)开始；直接 Group 维护不需要 Placer。
-
-<a id="security-and-multi-tenancy"></a>
-
-## 安全与多租户
-
-节点与集群区分平台凭据、内容保护密钥和有作用域的数据面 capability。API、普通数据转发与 native exec 使用各自用途的凭据,内容保护根密钥不暴露给 guest。
-
-节点 reservation controller 拥有全节点准入、资源池记账、grant、水位与恢复,也是多租户边界的一部分。
-每个 Sandbox 的 cgroup、balloon 与 VMM 执行由 sandboxer 维护;节点控制器不接管 Sandbox 内部资源闭环。
-
-安全架构与部署信任边界见[项目系统概览](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/architecture_zh.md)和[部署指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)。漏洞通过 [Kuasar Sandbox 安全策略](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy)中的私密渠道报告。
-
-<a id="main-commands"></a>
-
-## 主要命令
-
-| 命令 | 用途 |
-|---|---|
-| `node-ctl conductor serve` | 启动权威节点控制 API |
-| `node-ctl proxy serve` | 启动数据面 Proxy master/worker |
-| `node-ctl telemetry serve` | 启动沙箱指标采集与历史查询 |
-| `node-ctl run-sandbox` | 在受管 unit 中启动一个 Sandbox |
-| `node-ctl run-builder` | 启动一次模板构建执行 |
-| `node-ctl resource ...` | 检查或 drain 节点资源 reservation |
-| `node-ctl builder status` | 检查 Build 执行状态 |
-| `node-ctl export-sandbox` / `import-sandbox` | 跨节点移动 portable Sandbox 状态 |
-| `run-cluster-ctl registry` | 启动 Registry |
-| `run-cluster-ctl router` | 启动集群控制与数据统一入口 |
-| `run-cluster-ctl placer` | 启动 Group 导入维护 |
-| `run-cluster-ctl status ...` | 只读检查已认证 Group/Node 的发布与模板资格，无生命周期副作用 |
-| `node-ctl group apply ...` | 经本地业务 API 条件维护 Node Group；根凭据安装独立进行 |
-| `e2b-key-ctl ...` | 生成和派生租户凭据 |
-
-move 导出成功表示源删除已被持久接纳；RunDir、BaseDir 与 checkpoint 的物理清理可能
-稍后完成。同 ID Create/import 在清理完成前仍冲突。`--keep-source` 保留原源。详见
-[节点文档](docs/node_zh.md)的 export/import 契约。
-
-仓库还构建 `node-stub-ctl`,用于模拟 node-link 参与方而不启动 microVM 的 E2E helper。
+**Placer 可选。** 需要按来源导入 Group 或自动续租凭据时再部署。首次集群直接使用 `node-ctl group apply` 即可。SQLite 仅支持一个 Registry；部署多个 Registry 成员时选择共享 PostgreSQL 或 FoundationDB。后端选择和恢复见[集群元数据存储](docs/cluster-storage_zh.md)。
 
 <a id="profiles"></a>
 
-## Profiles
+## 选择 Sandbox profile
 
-- **e2b**:guest 运行 Envd,提供已验证的 E2B 兼容数据服务。
-- **bare**:guest 不要求 Envd,通过自身网络服务与原生平台集成访问。
+- **`e2b`** 运行 Envd，提供支持的 SDK 命令、文件与代码解释器服务。
+- **`bare`** 运行无需 Envd 的客户镜像，通过镜像自身网络服务或 native exec 访问。
+
+Build 注册默认使用 `e2b`。输出 profile 是 artifact 身份的一部分，不能通过改模板名称切换。见 [profile](docs/node_zh.md#two-sandbox-profiles)与[Build 目标](docs/node-build_zh.md#artifact-identity)。
+
+<a id="main-commands"></a>
+
+## 运维命令
+
+| 命令 | 用途 |
+|---|---|
+| `node-ctl --version` / `e2b-key-ctl --version` | 检查已安装节点工具版本 |
+| `node-ctl config conductor --config FILE --resolve` | 部署前检查最终配置 |
+| `node-ctl conductor serve` / `proxy serve` / `telemetry serve` | 服务入口，通常由部署的 unit 启动 |
+| `node-ctl resource status` / `list` / `pressure` | 检查准入、reservation 和资源压力 |
+| `node-ctl resource drain` / `drain --disable` | 暂停或恢复新准入 |
+| `node-ctl builder status` | 检查 Build 执行 |
+| `node-ctl group apply -f FILE` | 使用租户 API key 维护 Node Group |
+| `run-cluster-ctl status ...` | 检查鉴权后的 Group 发布与模板可用性 |
+| `run-cluster-ctl registry` / `router` / `placer` | 完整原生发布包中的集群服务入口 |
+| `node-ctl export-sandbox` / `import-sandbox` | 按[导出/导入契约](docs/sandbox-lifecycle_zh.md#export-import-command)转移可移植状态 |
+| `e2b-key-ctl ...` | 生成和派生租户凭据 |
+
+资源命令 `status`、`list`、`drain` 使用资源控制器 socket；`pressure`、Group 和 manifest-key 管理使用 Conductor 控制 socket。部署修改路径后，应为各命令指定对应 `--socket`，不能统一指向同一个 socket。完整参数由各能力指南维护。
 
 <a id="deployment-overview"></a>
 
-## 部署概览
+## 部署与日常运维
 
-独立节点运行 Conductor 与 Proxy；按需独立启动 Telemetry。Telemetry 复用 Plugin Plane，不加入 Create/Resume barrier，其故障不改变 Sandbox lifecycle。示例配置显式启用 embedded Prometheus TSDB；本地存储必须通过 `local.enabled` 选择，未配置的 query backend 默认 `none`，写入与查询独立装配。完整选择见[观测](docs/observability_zh.md#telemetry)。集群另加 Registry、Router，以及可选的 Placer 导入维护。Registry 按配置使用 SQLite、PostgreSQL 或 FoundationDB；SQLite 仅支持单 Registry。完整安装 native runtime bundle，通过 `run-cluster-ctl` 启动集群角色；Registry peer 使用相同数据库和元数据 namespace。配置样例与 systemd unit 位于 `deploy/`，详见[原生构建与运行包](docs/cluster_zh.md#native-build-and-runtime)。
+使用 [node-infra](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md) 安装发布版本和持久服务布局。接纳业务前，准备持久 Node 状态及其加密密钥、租户凭据、兼容 kernel/runtime、可写存储、网络 egress，以及经工作负载验证的资源预算。主项目[部署指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)维护跨组件安装、信任边界和升级流程。
 
-面向用户的发布件安装流程见项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)。生产部署应使用持久存储、生产 TLS、受保护凭据、明确网络策略及基于实际 workload 验证的容量设置。
+现有安装应用本仓示例时，保留其服务名称、overlay 顺序、socket 和状态路径。`deploy/` 是组件配置示例，不应直接覆盖已经工作的 node-infra 配置。先验证合并后的完整配置，再使用已安装的服务 unit。配置检查不会启动服务，也不会移动现有 worker。
+
+<a id="security-and-multi-tenancy"></a>
+
+## 凭据与租户隔离
+
+通过授权的本地管理入口安装每个租户的 **APISecret/ManifestKey 对**，向应用客户端提供生成的 API key。数据面 capability 分别限定用途与范围；ManifestKey 和节点数据库加密密钥都不应进入 SDK 或 guest 镜像。清除 allowlist 影响新资源准入，不会自动撤销已经绑定到现存资源的凭据。见[凭据生命周期](docs/node-proxy_zh.md#credential-model)。
+
+将节点内部 listener 和管理 socket 保持在部署信任边界内。Registry/NodeLink TLS、Router 公共 TLS 与 Router 到 Node 的传输是不同链路；按[集群信任边界](docs/cluster_zh.md#minimum-cluster)部署。漏洞请通过项目[安全政策](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy)私下报告。
 
 <a id="development-example"></a>
 
-## 开发示例
+## 开发与定制
 
-先按项目快速开始准备二进制、Kernel/Runtime 制品、网络与受保护配置。下面每个常驻角色分别使用服务或独立终端,
-不是在一个前台 shell 中依次执行。先启动 Conductor,再调用其 manifest-key 管理 socket。
-示例使用默认 config-socket;自定义路径须传对应 CLI 选项。生成凭据与 shell 环境均按敏感数据保护。
-
-```bash
-node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
-node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
-# 可选：独立指标采集与历史查询服务
-node-ctl telemetry serve --config /etc/node-ctl/telemetry.yaml
-```
-
-样例明文 API 为 `:3000`,data 为 `:3443`。配置可启用 resource_listen 与 Proxy traffic.max_inflight 默认值。
-cluster 注册须区分 api_endpoint/data_endpoint;生产入口 TLS 与受信 node-link/网络边界遵循部署 owner。
-
-```bash
-# 租户根凭据:独立模式缺省从 ManifestKey 派生 APISecret。
-MK=$(e2b-key-ctl gen-key)
-API_SECRET=$(e2b-key-ctl derive-api-secret "$MK")
-node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
-export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
-
-# 可选集群角色,各使用独立服务/终端。
-run-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
-run-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
-# 仅在需要 Group 导入/续期时启用：
-run-cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
-
-# 独立模式开发,替换 host 与 canonical template 占位符。
-export E2B_API_URL=http://host:3000
-export E2B_SANDBOX_URL=http://host:3443
-python - <<'PY'
-from e2b import Sandbox
-sandbox = Sandbox.create("<canonical-template-id>")
-try:
-    print(sandbox.commands.run("uname -a").stdout)
-finally:
-    sandbox.kill()
-PY
-```
-
-继续阅读[节点配置](docs/node_zh.md)、[Sandbox API](docs/sandbox-lifecycle_zh.md)、[访问与凭据](docs/node-proxy_zh.md)或[集群入口](docs/cluster_zh.md#client-access)。
+源码开发、Demo 和跨组件验证使用主项目 [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)。需要服务定制时，从[应用扩展](docs/extensions_zh.md)及可运行示例开始。组件构建、贡献要求和测试见 [CONTRIBUTING_zh.md](CONTRIBUTING_zh.md)。
 
 <a id="contract-ownership"></a>
 
-## 契约归属
+## 参考文档归属
 
-节点 roots、对象 RunDir/BaseDir 与 RunID/PathID 由[节点目录与身份](docs/node_zh.md#node-directories-and-identities)维护。公共 Create 身份、冲突与重试、状态变化、Reset/dead 保留及清理由 [Sandbox 生命周期](docs/sandbox-lifecycle_zh.md)维护；凭据绑定由[访问与代理](docs/node-proxy_zh.md#credential-model)维护。Build 目录/任务/发布/恢复与保留见 [Build](docs/node-build_zh.md)，Registry 的 Build projection 与重连收敛见[集群 Build](docs/cluster_zh.md#cluster-build)。Canonical artifact 独立于保留 Build row，始终是长期 launch authority。命名发布是逻辑提交，不承诺 final/parent fsync 的断电持久性；完整矩阵和失败规则由 Build 维护。
+各能力指南定义自己的配置与失败语义。节点目录和身份属于[节点运维](docs/node_zh.md#node-directories-and-identities)；公共 Sandbox 身份和清理属于[生命周期](docs/sandbox-lifecycle_zh.md)；凭据绑定属于[访问](docs/node-proxy_zh.md#credential-model)；artifact 发布与 Build 记录保留属于[Build](docs/node-build_zh.md)。集群投影和恢复复用节点操作，不改变这些职责。
 
 <a id="release-model"></a>
 
 ## 发布模型
 
-本仓库独立发布 `vX.Y.Z`。已发布原生架构的组件包包含节点/集群二进制和部署文件;
-聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，源码专用测试与未选入的维护材料保留在源码仓。
+本仓发布组件 tag `vX.Y.Z`。主仓聚合 tag `release-vX.Y.Z` 选择精确组件版本并验证组合系统；两者版本号无需相同。安装完整的对应原生架构归档，包括 cluster 启动器的私有运行库。源码支持某架构，不表示所有历史版本都提供该架构资产。
 
-项目聚合版本为 `release-vX.Y.Z`,选择精确组件 Tag 并在真实 KVM 基础设施验证组合。
-组件版本与聚合版本通过 selection 关联,不要求版本号相同。
-
-完整组件分支、Preview/Stable/Latest、mutation group 与取消重试规则由项目
-[发布文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)唯一维护;
-下载见[最新 Stable 聚合发布](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)。
+版本选择、升级和回滚规则统一由主项目[发布指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)维护。通过[聚合发布](https://github.com/kuasar-sandbox/kuasar-sandbox/releases)选择兼容平台，普通部署从[最新 Stable 聚合版本](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)开始。
 
 <a id="project-boundaries"></a>
 
 ## 项目边界
 
-- 系统设计、共享集成测试、Demo 与聚合发布属于 [kuasar-sandbox/kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox)。
-- microVM 生命周期与 guest 控制属于 [sandboxer](https://github.com/kuasar-sandbox/sandboxer)。
-- image/snapshot 数据基础设施属于 [accelerator](https://github.com/kuasar-sandbox/accelerator)。
-- 高密度 microVM 网络属于 [connector](https://github.com/kuasar-sandbox/connector)。
-- guest kernel 与 Runtime image 属于 [guest-runtime](https://github.com/kuasar-sandbox/guest-runtime)。
+| 仓库 | 职责 |
+|---|---|
+| [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) | 平台安装、用户流程、集成验证和聚合发布 |
+| [sandboxer](https://github.com/kuasar-sandbox/sandboxer) | MicroVM 生命周期、快照与 guest 控制 |
+| [accelerator](https://github.com/kuasar-sandbox/accelerator) | 镜像、artifact 与快照数据基础设施 |
+| [connector](https://github.com/kuasar-sandbox/connector) | MicroVM 网络与 egress |
+| [guest-runtime](https://github.com/kuasar-sandbox/guest-runtime) | Guest kernel 和 runtime 镜像 |
 
 <a id="license"></a>
 

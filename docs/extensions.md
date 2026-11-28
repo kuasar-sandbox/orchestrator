@@ -24,6 +24,13 @@ object for that role and lifetime.
 
 **Read by task:** [Run an example](#examples) · [Configuration API](#public-configuration-entry-points) · [Conductor App](#conductor-bootstrap) · [Proxy App](#proxy-bootstrap) · [Telemetry App](#telemetry-bootstrap-and-extension) · [Object sources](#conductor-object-sources) · [Hooks](#conductor-lifecycle-hooks)
 
+## Choose configuration or a custom application
+
+Start with the built-in services and their documented configuration. Node resource pools, native egress, Group maintenance, systemd guest launch and Telemetry backends do not require a custom App. Use this extension boundary when you need a trusted in-process material provider, lifecycle integration, object observation or HTTP wrapper that the existing configuration cannot express.
+
+Build and run the corresponding example against the same orchestrator revision as the deployment. Install the protected executable, select it through the role's configuration, validate the complete configuration, and continue launching through `node-ctl <role> serve`. The custom binary is part of that bootstrap; it is not a separately launched replacement CLI. After startup, verify the normal client workflow as well as the custom behavior.
+
+
 <a id="examples"></a>
 
 ## Runnable examples

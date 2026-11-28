@@ -6,19 +6,34 @@
 
 Run and recover a compute node: service roles, shared configuration, systemd pools, trusted local channels and runtime dependencies. Start with the [project Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md) for a complete platform deployment. [Sandbox lifecycle](sandbox-lifecycle.md), [Build](node-build.md), [access](node-proxy.md), [resources](node-resource.md), [observability](observability.md), [cluster](cluster.md) and [extensions](extensions.md) own their precise capability contracts.
 
-`node-ctl` runs one resident conductor per compute node and exposes its microVM sandboxes through an **e2b-compatible API**. The supported operations can be used by unmodified Python/JavaScript `e2b`, `@e2b/code-interpreter` SDKs and the e2b CLI, subject to the [SDK compatibility boundaries and pinned versions](node-proxy.md#sdk-configuration). `node-ctl conductor serve` provides the **API** (control-plane REST for sandbox lifecycle, template builds and authentication), **host orchestration** (systemd template units for `sandbox-ctl`/builder tasks and `connector-ctl vswitch` networking), an optional **resource controller** (node arbitration through `resource_listen`; see [node-resource.md](node-resource.md)), and the **node-link client** that joins cluster-ctl orchestration ([Cluster integration (node-link)](cluster.md#node-attachment)). The separately deployed `node-ctl proxy serve` owns guest data-plane forwarding; conductor does not serve it.
-
-A node can run **standalone**, serving e2b SDK/CLI clients on one machine, or **join a cluster** managed by Registry, Router and Placer ([cluster.md](cluster.md)). Both modes share the same e2b control plane and lifecycle primitives. **Create, pause, kill and template execution remain node-local**; cluster commands reuse these primitives ([Cluster integration (node-link)](cluster.md#node-attachment)).
-
-`sandbox-ctl` runs the sandbox microVM with Cloud Hypervisor. An e2b-profile guest runs upstream envd from the single `sandbox-runtime.bundle` ([Guest profiles: envd and the toolchain](#guest-runtime)); the independent Proxy forwards its single-port protocol (49983/Connect-RPC) through a host UDS. A tenant's root credentials are **APISecret + ManifestKey**: APISecret signs/verifies API keys and derives each Sandbox's ServiceSecret; ManifestKey protects Manifest content and image-pull tokens. If omitted, APISecret is derived from ManifestKey by a fixed KDF. The pair is stored encrypted, never as plaintext root credentials in the database ([Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)).
-
-The outputs are **`node-ctl`** (daemon, launchers, resource controller and administration CLI, [Command-line interface](#commands)) and **`e2b-key-ctl`** (credential derivation without DB/config/orchestration state, [`e2b-key-ctl`](node-proxy.md#credential-tool)).
-
 **Read by task:** [Start the service](#conductor-command) · [Configure](#conductor-configuration) · [Pools and units](#systemd-pools) · [Local channels](#local-control-channels) · [Recover](#recovery)
+
+<a id="operate-a-node"></a>
+
+## Operate an installed node
+
+Start with a persistent [node-infra installation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md). The installation owns service names, state directories and the ordered configuration overlays; use those values when following this guide. The component examples under `deploy/` describe the same schemas but are not replacement files for an existing installation.
+
+1. **Check the installed version and effective inputs.** Record `node-ctl --version` and the aggregate release. Read the installed Conductor/Proxy unit definitions to obtain their complete `--config` file lists. Validate with `node-ctl config conductor --config FILE[:OVERLAY...] --resolve` and `node-ctl config proxy --config FILE[:OVERLAY...]`. Each later file overrides earlier declarations; lists replace rather than append. Keep rendered configuration with the same access protections as its inputs.
+2. **Verify storage and network before admitting a build.** Keep `paths.base_root`, the Node database and its encryption keys durable. Prepare the configured kernel/runtime and artifact store or named locations. Use [template references](#diff-template-references) for new writable disks and the [networking guide](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress.md#deployment-and-ownership) for native egress and DNS. Proxy ingress and guest outbound access are separate paths.
+3. **Start the installed services and authorize one tenant.** Conductor and Proxy are required for the SDK flow. Install the tenant root pair through the Conductor local admin socket, then issue the client API key as described in [credentials](node-proxy.md#credential-model). Keep that pair and the Node encryption key with the retained data they protect. Add Telemetry when historical metrics are needed.
+4. **Build and run your application.** Complete the [Build recipe](node-build.md#client-workflow), save its canonical TemplateID, then run the [client check](node-proxy.md#connect-a-client). Inspect the same SandboxID if a data call is still waiting for startup. Use [resource inspection](node-resource.md#operate-resources) to explain admission delays.
+5. **Change configuration deliberately.** Validate the complete ordered file list before restarting the owning service. Follow [recovery](#recovery) for existing execution and [NUMA/resource pools](#numa-deployment-with-multiple-pools) when changing worker placement. A valid file or daemon reload does not reconfigure an already running guest or move its worker.
+6. **Expand only after this path works.** The [first cluster](cluster.md#minimum-cluster) keeps the same Node services and adds Registry/Router. Publish Group support and verify each Node before sending workloads through the shared ingress; Placer is optional.
+
+For an incident, keep the installed version, effective config file list, SandboxID or BuildID, and the operation's response. The [diagnostic sequence](observability.md#diagnose-a-request) starts from those inputs and does not require modifying internal database rows.
 
 <a id="service-roles"></a>
 
 ## Overview
+
+`node-ctl` runs one resident conductor per compute node and exposes its microVM sandboxes through an **e2b-compatible API**. The supported operations can be used by unmodified Python/JavaScript `e2b`, `@e2b/code-interpreter` SDKs and the e2b CLI, subject to the [SDK compatibility boundaries and pinned versions](node-proxy.md#sdk-configuration). `node-ctl conductor serve` provides the **API** (control-plane REST for sandbox lifecycle, template builds and authentication), **host orchestration** (systemd template units for `sandbox-ctl`/builder tasks and `connector-ctl vswitch` networking), an optional **resource controller** (node arbitration through `resource_listen`; see [node-resource.md](node-resource.md)), and the **node-link client** that joins cluster-ctl orchestration ([Cluster integration (node-link)](cluster.md#node-attachment)). The separately deployed `node-ctl proxy serve` owns guest data-plane forwarding; conductor does not serve it.
+
+A node can run **standalone**, serving e2b SDK/CLI clients on one machine, or **join a cluster** managed by Registry and Router, with optional Placer ([cluster.md](cluster.md)). Both modes share the same e2b control plane and lifecycle primitives. **Create, pause, kill and template execution remain node-local**; cluster commands reuse these primitives ([Cluster integration (node-link)](cluster.md#node-attachment)).
+
+`sandbox-ctl` runs the sandbox microVM with Cloud Hypervisor. An e2b-profile guest runs upstream envd from the single `sandbox-runtime.bundle` ([Guest profiles: envd and the toolchain](#guest-runtime)); the independent Proxy forwards its single-port protocol (49983/Connect-RPC) through a host UDS. A tenant's root credentials are **APISecret + ManifestKey**: APISecret signs/verifies API keys and derives each Sandbox's ServiceSecret; ManifestKey protects Manifest content and image-pull tokens. If omitted, APISecret is derived from ManifestKey by a fixed KDF. The pair is stored encrypted, never as plaintext root credentials in the database ([Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)).
+
+The outputs are **`node-ctl`** (daemon, launchers, resource controller and administration CLI, [Command-line interface](#commands)) and **`e2b-key-ctl`** (credential derivation without DB/config/orchestration state, [`e2b-key-ctl`](node-proxy.md#credential-tool)).
 
 <a id="the-service-problem"></a>
 
@@ -138,7 +153,7 @@ BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<Bui
 | `manifest-key` | `add`/`remove`/`check`/`list`: manage credential-pair allowlisting for create/build/import ([Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)); Registry also writes leased entries ([Cluster integration (node-link)](cluster.md#node-attachment)) |
 | `group apply` | Read once and conditionally apply Group JSON through the Node business API; install roots separately ([Node Group authority](cluster.md#node-group-authority)) |
 | `export-sandbox` / `import-sandbox` | Promote paused sandboxes to templates or migrate them ([Artifact capture, templates and migration](sandbox-lifecycle.md#capture-and-pause)) |
-| `version` | Print version |
+| `--version` | Print version |
 
 **`e2b-key-ctl`**, which derives credentials without DB/config/daemon access:
 
@@ -149,7 +164,7 @@ BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<Bui
 | `gen-apikey [<API_SECRET>]` | Sign an e2b API key with APISecret (`e2b_` plus hex, [Credentials and ownership: encrypted APISecret/ManifestKey pairs](node-proxy.md#credential-model)) |
 | `fingerprint [<API_SECRET>]` | Print APISecret's full 64-hex SHA-256 fingerprint |
 | `seal-pull-token [<MANIFEST_KEY>] …` | Seal an opaque image-pull token (`kpt_`, [Target-aware execution and publication](node-build.md#execution-and-publication)) |
-| `version` | Print version |
+| `--version` | Print version |
 
 A typical standalone-node setup is:
 
@@ -362,12 +377,12 @@ normalize to byte counts. It creates only a new empty filesystem without a COW
 base; a captured disk or existing writer retains its data. It does not resize an
 existing filesystem. [Sandboxer's block-storage contract](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/block-storage.md) owns the generator, source verification and sparse materialization.
 
-For manually prepared empty raw templates, `mkfs.ext4 -O ^has_journal` avoids
-filesystem journal capacity and metadata writes on disposable work disks; the
-built-in profile also omits the journal. This does not disable journald or
-application logs and is not a crash-recovery guarantee. Existing journaled
-templates and user-supplied images remain compatible. Apply formatting only to
-new empty templates. The node-wide API `diskSizeMB` uses logical seed capacity
+Use `mkfs://ext4?size=...` for new empty writable disks. Supply an external raw
+seed only when you need a filesystem layout or feature that the built-in profile
+does not provide. The built-in profile omits the filesystem journal; that is a
+format property, not a general performance recommendation or a crash-recovery
+guarantee. Existing journaled templates and user-supplied images remain compatible.
+Never reformat a captured disk or an existing writer to change this property. The node-wide API `diskSizeMB` uses logical seed capacity
 when it can be inspected without tenant credentials; zero means unavailable.
 It never reports a tarstream or Bundle carrier's physical length.
 
@@ -514,134 +529,91 @@ KillMode=control-group covers ctl/vmm recursively. systemd reclaims the delegate
 
 <a id="numa-deployment-with-multiple-pools"></a>
 
-### NUMA deployment with multiple pools
+### NUMA deployment with resource pools
 
-The primary deployment use case for multiple pools is to keep a Sandbox's host
-execution within a NUMA node while distributing new executions across nodes.
-Conductor selects a pool and its systemd template; the operator configures CPU
-placement and memory allocation on that template. This is host-side placement,
-not guest vNUMA topology. Resource pools schedule configured capacity and runtime
-utilization; systemd/Linux applies the placement policy.
+Use one **resource pool per intended NUMA budget**, then associate stable logical
+runner/Builder pools and their systemd templates with it. Conductor selects and
+accounts for that resource pool; systemd/Linux applies the CPU and memory-node
+placement. This controls host execution, not guest vNUMA topology.
 
-NUMA placement is enforced by systemd/Linux. The example below installs placement
-policies manually. To account and schedule each NUMA budget independently, use
-the [resource-pool configuration](node-resource.md#pool-configuration), including
-`resource_pool` associations and external `unit_dropins`. Validate effective CPU
-and memory-node masks, page placement and cross-pool recovery on the actual host.
+1. **Inspect the actual host.** Read CPU/node topology, SMT siblings, memory and
+   ancestor cgroup restrictions. Reserve capacity for the host and other services
+   before assigning per-pool budgets. CPU numbers are not implied by NUMA IDs.
+2. **Declare independent budgets.** Use the complete
+   [resource-pool example](node-resource.md#pool-configuration), with explicit
+   `resource_listen.pools[].capacity` and `.allocatable.memory`. Give each worker
+   pool a stable `name`, its `resource_pool`, and an appropriate template. Worker
+   `size` is an idle prewarm target; worker `capacity` limits slots; neither
+   replaces the resource pool's physical capacity and allocatable budget.
+3. **Create placement fragments before starting workers.** Put operator-owned
+   files outside generated template directories and reference their absolute
+   paths in the matching resource pool's `unit_dropins`. With `units.install:
+   true`, Conductor copies them to the associated runner and Builder templates
+   and reloads systemd. The [placement contract](node-resource.md#pool-systemd-placement)
+   defines generated filenames and stale-file cleanup.
+4. **Validate the complete configuration and deploy it through your installed
+   service.** Use `node-ctl config conductor --config FILE[:OVERLAY...] --resolve`.
+   A validation pass does not change running units. Set placement before prewarm;
+   for an existing installation, drain new admission and plan lifecycle-safe
+   worker turnover before expecting a new policy to apply.
+5. **Verify both admission and actual placement.** Inspect `resource status`,
+   `resource list` and `resource pressure`, then the assigned units' effective
+   CPU/memory-node masks and page placement. Exercise normal pause/resume before
+   relying on cross-pool pressure recovery.
 
-The example below leaves all logical pools in the shared `default` resource pool:
-it distributes unit placement but does not create independent NUMA budgets. Use
-the resource-pool example for independent capacity and pressure accounting.
-
-For a host with online, memory-bearing NUMA nodes 0 and 1, use distinct template
-names for distinct placement policies. The following replaces the `units` block
-in an otherwise complete Conductor configuration; omit the legacy single-pool
-fields. The sizes are illustrative idle-worker targets, not recommended capacity:
-
-```yaml
-units:
-  dir: /etc/systemd/system
-  install: true
-  pool_wait_timeout: 5s
-  runner_pools:
-    - {unit: sandbox-runner-numa0@.service, size: 4}
-    - {unit: sandbox-runner-numa1@.service, size: 4}
-  builder_pools:
-    - {unit: sandbox-builder-numa0@.service, size: 1}
-    - {unit: sandbox-builder-numa1@.service, size: 1}
-```
-
-**Inspect the actual host topology first.** Node IDs and logical CPU numbering
-are machine-specific, including SMT siblings; never infer a CPU range from the
-node number. Confirm cgroup v2 and the `cpuset` controller are available, and that
-the ancestor slices allow both target nodes/CPU sets:
+For example, inspect a host with NUMA nodes 0 and 1:
 
 ```sh
 lscpu -e=CPU,NODE,SOCKET,CORE
 numactl --hardware
 cat /sys/fs/cgroup/cgroup.controllers
-cat /sys/devices/system/node/node{0,1}/cpulist
+cat /sys/devices/system/node/node0/cpulist /sys/devices/system/node/node1/cpulist
 ```
 
-**Install operator-owned placement drop-ins before starting Conductor or any
-prewarmed worker.** On the example two-node host, run this as root. Each selected
-node must have online CPUs and memory. The example uses that node's entire CPU
-list; adjust `cpus` to the deployment's intended subset when reserving host CPUs:
+If **the actual intended subset** on NUMA node 0 is CPUs 0–7, the fragment
+`/etc/kuasar/pools/numa0.conf` can contain:
 
-```sh
-set -eu
-unit_dir=/etc/systemd/system
-for node in 0 1; do
-  cpus=$(cat "/sys/devices/system/node/node${node}/cpulist")
-  test -n "$cpus"
-  for kind in runner builder; do
-    dropin="$unit_dir/sandbox-${kind}-numa${node}@.service.d"
-    install -d -m 0755 "$dropin"
-    cat > "$dropin/20-numa.conf" <<EOF
+```ini
 [Service]
 CPUAffinity=
-CPUAffinity=$cpus
+CPUAffinity=0-7
 AllowedCPUs=
-AllowedCPUs=$cpus
+AllowedCPUs=0-7
 NUMAPolicy=bind
 NUMAMask=
-NUMAMask=$node
+NUMAMask=0
 AllowedMemoryNodes=
-AllowedMemoryNodes=$node
-EOF
-  done
-done
-systemctl daemon-reload
+AllowedMemoryNodes=0
 ```
 
-`CPUAffinity` sets the initial execution mask; `AllowedCPUs` bounds the entire
-unit subtree through cgroup v2. `NUMAPolicy=bind` with `NUMAMask` sets allocation
-policy before the worker creates threads/children; `AllowedMemoryNodes` bounds
-the unit's permitted memory nodes. These are placement settings, **not**
-`CPUQuota`, `MemoryMax`, `MemoryHigh`, a per-pool reservation, or exclusive CPU
-ownership. Keep runtime Sandbox resource enforcement with `sandbox-ctl`.
+Create a separate fragment from node 1's measured topology. Do not copy these
+CPU numbers to a different host. `CPUAffinity` sets the initial execution mask;
+`AllowedCPUs` bounds the whole unit subtree. `NUMAPolicy`/`NUMAMask` select memory
+allocation before the worker starts children; `AllowedMemoryNodes` bounds allowed
+nodes. Ancestor cgroups must permit those sets. These settings do not reserve
+exclusive CPUs or replace Sandboxer's runtime resource enforcement.
 
-With `install: true`, Conductor generates each named base template and the two
-existing fixed slices; the separately managed `.service.d/20-numa.conf` files
-supply placement. Do not put custom properties into generated base files, which
-Conductor rewrites. With
-`install: false`, operators instead install four independent real template files
-based on this version's generated runner/Builder templates ([Process management through systemd template units](#systemd-pools) and Build [Builder unit and process lifecycle](node-build.md#builder-unit-and-process-lifecycle)),
-plus `sandbox-runner.slice` and `sandbox-builder.slice`, then reload systemd.
-Preserve the deployment's executable paths, `%i` **RunID**, pidfile/config socket,
-`Delegate=yes`, `ctl/vmm`, cleanup, and existing slice contracts. Do not use unit
-aliases to represent different placements. Conductor does not install or reload
-anything in that mode.
+If you previously created placement-only runner pools sharing the `default`
+resource budget, they still share one admission budget. Associate explicit
+resource pools to obtain independent accounting. If you previously installed
+`.service.d/20-numa.conf` manually, reconcile it with `unit_dropins` so two files
+do not express conflicting policies. Conductor preserves operator-owned files;
+it does not remove them on your behalf. Do not edit generated base unit files.
 
-Runner and Builder assignments use priority with random ties within the selected
-resource pool. A prewarmed process is
-already placed before assignment. Runner children and Builder child
-processes remain under the selected unit; the Builder's A/B/C phases that actually
-run use that same Builder, not fresh pool selections. In-guest work runs through
-those phase VMMs. Do not bind only the Conductor daemon: systemd starts the units,
-so placement belongs on their templates. See [Builder unit and process lifecycle](node-build.md#builder-unit-and-process-lifecycle).
+For externally managed units, `units.install: false` remains supported. Install
+real templates and their slices with this release's executable, RunID, pidfile,
+config-socket, delegation and cleanup contracts; Conductor does not read or copy
+`unit_dropins` in that mode. See [systemd workers](#systemd-pools) and
+[Builder units](node-build.md#builder-unit-and-process-lifecycle).
 
-The deployment retains these boundaries:
-
-- Two entries sharing one template must share its resource pool and placement
-  policy; duplication does not bind them to different nodes. `size` is an idle
-  target. Resource-pool capacity and runtime usage govern placement; Builder
-  business FIFO/claims remain separate.
-- A bound execution stays with its actual unit, including Conductor restart.
-  Pause/resume requiring a new runner selects again and may use the other node;
-  the feature supplies no sticky NUMA placement, live migration or host-node
-  identity in portable artifacts. Keep templates needed by active/pending-cleanup
-  executions configured. Changing/reloading drop-ins does not re-exec existing
-  prewarmed or assigned workers with the new process policy; plan an explicit
-  lifecycle-safe worker turnover rather than assuming hot migration.
-- Strict single-node binding can cause local reclaim or allocation failure/OOM
-  despite free memory elsewhere. A running execution is not moved in response to
-  an individual allocation failure. Cross-pool pressure recovery uses the explicit
-  Pause/Resume lifecycle in the resource-pool contract. A
-  deliberate `NUMAPolicy=preferred` fallback configuration must also remove or
-  widen single-node `AllowedMemoryNodes`; cpuset restrictions take precedence.
-  That trades strict memory locality for fallback; resource-pool accounting
-  still follows the execution's selected pool.
+A live execution stays with its actual unit across Conductor restart. Changing
+or reloading a fragment does not move an assigned or prewarmed process. Keep
+pool identities and templates needed by live or pending-cleanup executions.
+Pause followed by resume can select a different pool; artifacts do not pin a
+future sandbox to the Build host's NUMA node. Strict single-node binding can
+exhaust local memory even when another node has free memory. Any deliberate
+`NUMAPolicy=preferred` fallback must also widen `AllowedMemoryNodes`, and
+accounting continues to follow the selected resource pool.
 
 Setting semantics: [systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html),
 [systemd.resource-control(5)](https://manpages.debian.org/trixie/systemd/systemd.resource-control.5.en.html),
@@ -848,7 +820,7 @@ only then are the parent row and management location removed. Paused gains no TT
 Build terminal_ttl keeps its existing finished_unix and owner-free exact-delete rules. No automatic
 VACUUM or remote artifact GC is introduced.
 
-These local finalizers implement #132/#133's cleanup contract. Export retains its publish/finalize race and routes move deletion through the same durable acceptance and finalizer (#348); #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v11 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
+Export uses separate publication and finalization steps; move deletion uses the same durable acceptance and Node-local finalizer. Build execution retains its two admission levels and cgroup ownership. Post-registration Build projection converges through full synchronization and live deletion while preserving immutable registered-Node binding. Node-local cleanup does not perform remote-artifact garbage collection or maintain a second path authority.
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 

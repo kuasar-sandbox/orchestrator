@@ -347,6 +347,10 @@ type TriggerSpec struct {
 	// ResourceAssertion is the optional legacy E2B cpuCount/memoryMB assertion.
 	// It is compared with the immutable registration resources and never merged.
 	ResourceAssertion buildcfg.ResourcePatch
+	// NetworkAssertion and TargetAssertion accept SDK headers repeated from
+	// registration. They only assert immutable inputs; Trigger never applies them.
+	NetworkAssertion *sandboxcfg.NetworkSpec
+	TargetAssertion  *types.BuildTarget
 }
 
 // BuildLogEntry is one build-progress line surfaced to the SDK (e2b BuildLogEntry:
@@ -1155,12 +1159,13 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "cancel is a Build action, not a Build definition")
 		return
 	}
-	if _, present := r.Header[http.CanonicalHeaderKey(builderHeader)]; present {
-		writeErr(w, http.StatusBadRequest, "trigger-time builder configuration is deprecated; configure it at registration")
-		return
-	}
 	if len(body.Metadata) != 0 || hasTriggerSandboxConfigHeader(r.Header) {
 		writeErr(w, http.StatusBadRequest, "trigger-time sandbox metadata is deprecated; configure template metadata at registration")
+		return
+	}
+	networkAssertion, targetAssertion, err := parseBuildTriggerAssertions(r.Header)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	startCmd := body.StartCmd
@@ -1192,6 +1197,8 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			StartCmd:          startCmd,
 			ReadyCmd:          readyCmd,
 			ResourceAssertion: resourceAssertion,
+			NetworkAssertion:  networkAssertion,
+			TargetAssertion:   targetAssertion,
 		}, auth)
 	if err != nil {
 		var stateConflict *BuildStateConflictError
@@ -1216,7 +1223,9 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 func hasTriggerSandboxConfigHeader(header http.Header) bool {
 	for name := range header {
 		if strings.HasPrefix(strings.ToLower(name), "x-kuasar-sandbox-") &&
-			!strings.EqualFold(name, clusterGroupHeader) {
+			!strings.EqualFold(name, clusterGroupHeader) &&
+			!strings.EqualFold(name, builderHeader) &&
+			!strings.EqualFold(name, "X-Kuasar-Sandbox-Network") {
 			return true
 		}
 	}

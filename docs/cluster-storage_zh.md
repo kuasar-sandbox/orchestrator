@@ -4,6 +4,8 @@
 
 Registry 在 SQLite、PostgreSQL 和 FoundationDB 上使用同一套元数据实现，保存执行所有权和已完成发布的 Node Group support。Node 持有私有 Group 上下文；Registry 根据已发布目录鉴权和选点。Router 与可选 Placer 通过 Registry 协议工作，不直接打开数据库。首次部署从[最小双节点集群](cluster_zh.md#minimum-cluster)开始。
 
+<a id="storage-backend-choice"></a>
+
 ## 配置与部署
 
 首次启动前选择后端：
@@ -39,7 +41,7 @@ EnvironmentFile=/etc/cluster-ctl/storage.env
 
 SQLite 要求持久本地文件，每个已配置 membership version 都只能有一个 Registry member；使用 WAL、`synchronous=FULL` 和 immediate write transaction。PostgreSQL 使用 serializable transaction 与 `synchronous_commit=on`，启动时拒绝 `fsync=off`。数据库复制、故障切换、备份及一致历史恢复由部署方负责。FoundationDB 验证版本为 7.3.77，API 730。
 
-SQLite 和 PostgreSQL 不需要 FDB headers、动态库、build tag 或 CGO：
+**源码开发选项：** 仅面向 SQLite/PostgreSQL 的纯 Go 构建不需要 FDB headers、动态库、build tag 或 CGO。发布包用户继续使用完整原生包和 `run-cluster-ctl`，无需自行构建：
 
 ```sh
 CGO_ENABLED=0 go build -o cluster-ctl ./cmd/cluster-ctl
@@ -47,6 +49,18 @@ CGO_ENABLED=0 go build -o cluster-ctl ./cmd/cluster-ctl
 ```
 
 原生发布包仍包含支持 FDB 的二进制和固定运行库，支持的构建/启动入口仍是 `make build-cluster-native` / `run-cluster-ctl`。在纯 Go 构建中选择 FDB 会明确报错。
+
+<a id="storage-restore-boundary"></a>
+
+## Schema 与升级边界
+
+当前为 record schema v2。SQL 使用私有 `kuasar_storage_v2` KV 表和 namespace hash；FDB 在配置的 namespace 下使用私有记录 key。未指定 `storage.namespace` 时默认为 `foundationdb.prefix + "records-v2/"`，默认完整值为 `kuasar-sandbox/cluster/records-v2/`。
+
+没有将旧实验 FDB schema 原地转换的自动迁移。不要让新 codec 读取旧记录字节，也不要将空的新 namespace 当成已迁移数据库。当前没有受支持的执行状态 export/import API，也没有从 Node DB、route events、Group 定义或可移植快照重建 Registry 所有权的工具。不得伪造旧 SID/Node/ready 记录。
+
+对可丢弃的预发布状态：停止新准入，用旧版本完成或明确删除测试所有的工作，停止旧角色并保留必要证据；使用全新 Registry 数据库/namespace 和 Node 状态启动新版本，重新安装根凭据与 Group，再从兼容的 canonical artifacts 创建新 Sandbox。这是具有新执行身份的重建，不是原地迁移或同 ID 恢复。旧数据在保留决策完成前保持隔离；不删除无关状态。
+
+对同 schema 数据库备份恢复：停止可能写入或缓存该历史的全部 Registry/Router/Placer，保留对应 Node 所有权证据，再用后端原生方法恢复一致备份，包括 SQLite WAL 一致性。数据库备份不能单独把正在运行的 Node 回滚到同一时间点。所有权对账得到验证前保持准入关闭；新空 namespace 不能修复错位。Node DB/加密密钥、租户根凭据、canonical artifacts 及完整依赖闭包均是独立备份输入。[恢复契约](cluster_zh.md#registry-state-ownership-and-disaster-recovery-boundaries)定义当前限制；缺失所需所有权状态时不能承诺保留身份恢复。
 
 ## 共享实现与引擎契约
 
@@ -76,16 +90,6 @@ CGO_ENABLED=0 go build -o cluster-ctl ./cmd/cluster-ctl
 | observation owner 预算 | 8,192 槽，其中 256 为 catalog 保留 |
 
 route 读取返回持久 revision 条件。注册观察时再次比较条件，因此读取与注册之间发生的变化会立即使结果失效。FDB watch 持久 revision cell。SQL owner 合并重复 key，以 256 个为批次轮询，100 ms 兜底，本地写入立即唤醒。PostgreSQL LISTEN/NOTIFY 加速相同的重读，不携带业务数据；先建立 LISTEN 再复查，断线会使活动观察失效。通知丢失或合并不能替代持久 revision 检查。Cancel/Close 等待资源回收；reservation 在连续重新注册时保留。
-
-## Schema 与升级边界
-
-当前为 record schema v2。SQL 使用私有 `kuasar_storage_v2` KV 表和 namespace hash；FDB 在配置的 namespace 下使用私有记录 key。未指定 `storage.namespace` 时默认为 `foundationdb.prefix + "records-v2/"`，默认完整值为 `kuasar-sandbox/cluster/records-v2/`。
-
-没有将旧实验 FDB schema 原地转换的自动迁移。不要让新 codec 读取旧记录字节，也不要将空的新 namespace 当成已迁移数据库。当前没有受支持的执行状态 export/import API，也没有从 Node DB、route events、Group 定义或可移植快照重建 Registry 所有权的工具。不得伪造旧 SID/Node/ready 记录。
-
-对可丢弃的预发布状态：停止新准入，用旧版本完成或明确删除测试所有的工作，停止旧角色并保留必要证据；使用全新 Registry 数据库/namespace 和 Node 状态启动新版本，重新安装根凭据与 Group，再从兼容的 canonical artifacts 创建新 Sandbox。这是具有新执行身份的重建，不是原地迁移或同 ID 恢复。旧数据在保留决策完成前保持隔离；不删除无关状态。
-
-对同 schema 数据库备份恢复：停止可能写入或缓存该历史的全部 Registry/Router/Placer，保留对应 Node 所有权证据，再用后端原生方法恢复一致备份，包括 SQLite WAL 一致性。数据库备份不能单独把正在运行的 Node 回滚到同一时间点。所有权对账得到验证前保持准入关闭；新空 namespace 不能修复错位。Node DB/加密密钥、租户根凭据、canonical artifacts 及完整依赖闭包均是独立备份输入。[恢复契约](cluster_zh.md#registry-state-ownership-and-disaster-recovery-boundaries)定义当前限制；缺失所需所有权状态时不能承诺保留身份恢复。
 
 ## 验证与元数据扩展
 

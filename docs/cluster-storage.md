@@ -8,6 +8,8 @@ Node owns private Group context; Registry authenticates and selects from publish
 support. Router and the optional Placer use Registry protocols and do not open
 the database. Start with the [minimum two-node cluster](cluster.md#minimum-cluster).
 
+<a id="storage-backend-choice"></a>
+
 ## Configuration and deployment
 
 Choose a backend before first startup:
@@ -62,7 +64,9 @@ write transactions. PostgreSQL uses serializable transactions and
 failover, backup and restoring a consistent history remain deployment concerns.
 The tested FoundationDB client/server version is 7.3.77 with API 730.
 
-SQLite and PostgreSQL need no FDB headers, libraries, build tag or CGO:
+**Source-development option:** a pure-Go build for SQLite/PostgreSQL needs no
+FDB headers, libraries, build tag or CGO. Release users keep the complete native
+archive and `run-cluster-ctl`; rebuilding is not an installation step:
 
 ```sh
 CGO_ENABLED=0 go build -o cluster-ctl ./cmd/cluster-ctl
@@ -72,6 +76,41 @@ CGO_ENABLED=0 go build -o cluster-ctl ./cmd/cluster-ctl
 The existing native release still includes the FDB-capable binary and bundled
 runtime. `make build-cluster-native` / `run-cluster-ctl` remain its supported
 build/launch path. Selecting FDB in a pure-Go build fails with an explicit error.
+
+<a id="storage-restore-boundary"></a>
+
+## Schema and upgrade boundary
+
+This is record schema v2. SQL uses the private `kuasar_storage_v2` KV table with
+a namespace hash; FDB uses the configured namespace plus private record keys.
+When `storage.namespace` is omitted, it defaults to
+`foundationdb.prefix + "records-v2/"`. With the default legacy prefix this is
+`kuasar-sandbox/cluster/records-v2/`.
+
+There is no automatic in-place conversion of the prior experimental FDB schema.
+Do not point the new codec at old record bytes or treat an empty new namespace
+as a migrated database. There is no supported execution-state export/import API
+and no tool that rebuilds Registry ownership from Node databases, route events,
+Group definitions or portable snapshots. Do not fabricate old SID/Node/ready rows.
+
+For disposable pre-release state, stop new admission, finish or explicitly remove
+test-owned work through the old version, stop the old roles and retain any needed
+evidence. Start the new release with a fresh Registry database/namespace and
+fresh Node state, reinstall roots and Groups, then create new Sandboxes from
+compatible retained canonical artifacts. This is a rebuild with new execution
+identities, not an in-place migration or same-ID recovery. Keep old data isolated
+until its retention decision has been made; do not delete unrelated state.
+
+For a same-schema database restore, stop all Registry/Router/Placer processes
+that could write or cache that history and preserve the corresponding Node
+ownership evidence. Restore a database-consistent backup by that backend's
+native procedure, including SQLite WAL consistency. A database backup alone
+cannot roll running Nodes back to that point in time. Keep admission closed
+until ownership reconciliation is demonstrated; a new empty namespace does not
+repair mismatches. Node DB/encryption keys, tenant roots, canonical artifacts and
+their complete dependencies are separate backup inputs. The [recovery contract](cluster.md#registry-state-ownership-and-disaster-recovery-boundaries)
+defines the current limit; loss of required ownership state cannot promise
+identity-preserving recovery.
 
 ## Shared implementation and engine contract
 
@@ -138,39 +177,6 @@ carries no business payload. LISTEN is established before its state recheck;
 connection loss invalidates active observations. Missing/coalesced notifications
 cannot replace or lose the persistent revision check. Cancel and Close wait for
 resource reclamation; reservations survive sequential rearming.
-
-## Schema and upgrade boundary
-
-This is record schema v2. SQL uses the private `kuasar_storage_v2` KV table with
-a namespace hash; FDB uses the configured namespace plus private record keys.
-When `storage.namespace` is omitted, it defaults to
-`foundationdb.prefix + "records-v2/"`. With the default legacy prefix this is
-`kuasar-sandbox/cluster/records-v2/`.
-
-There is no automatic in-place conversion of the prior experimental FDB schema.
-Do not point the new codec at old record bytes or treat an empty new namespace
-as a migrated database. There is no supported execution-state export/import API
-and no tool that rebuilds Registry ownership from Node databases, route events,
-Group definitions or portable snapshots. Do not fabricate old SID/Node/ready rows.
-
-For disposable pre-release state, stop new admission, finish or explicitly remove
-test-owned work through the old version, stop the old roles and retain any needed
-evidence. Start the new release with a fresh Registry database/namespace and
-fresh Node state, reinstall roots and Groups, then create new Sandboxes from
-compatible retained canonical artifacts. This is a rebuild with new execution
-identities, not an in-place migration or same-ID recovery. Keep old data isolated
-until its retention decision has been made; do not delete unrelated state.
-
-For a same-schema database restore, stop all Registry/Router/Placer processes
-that could write or cache that history and preserve the corresponding Node
-ownership evidence. Restore a database-consistent backup by that backend's
-native procedure, including SQLite WAL consistency. A database backup alone
-cannot roll running Nodes back to that point in time. Keep admission closed
-until ownership reconciliation is demonstrated; a new empty namespace does not
-repair mismatches. Node DB/encryption keys, tenant roots, canonical artifacts and
-their complete dependencies are separate backup inputs. The [recovery contract](cluster.md#registry-state-ownership-and-disaster-recovery-boundaries)
-defines the current limit; loss of required ownership state cannot promise
-identity-preserving recovery.
 
 ## Validation and future metadata extensions
 
