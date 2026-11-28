@@ -130,12 +130,18 @@ ordering is byte-lexicographic and cursors are exclusive. Pagination across
 transactions does not retain one snapshot.
 
 Only a definitely aborted transaction returns `ErrRetry`. The record layer may
-retry it within a four-second operation deadline while retaining initially read
-record revisions. A changed guard returns `Conflict`; it does not authorize a
-new selection. A range scan on a retry is a new range read: callers needing a
-specific candidate or snapshot must keep its explicit identity/version or use a
-business snapshot protocol. Unknown commit outcomes are never automatically
-replayed. Results and Node RPC side effects are published only after confirmation.
+retry it within a four-second operation deadline while retaining the original
+identity and revision conditions established by `Get` and `Expect`.
+`CheckCurrent` re-evaluates a current eligibility predicate in each physical
+transaction without pinning that read's revision across retries. For example,
+heartbeat or count updates that leave a selected Node eligible do not invalidate
+the selection; a Node that becomes ineligible returns `Conflict`. The read still
+participates in native transaction conflict detection, and any prior `Get` or
+`Expect` condition remains in force. This does not authorize a new identity or
+selection. A range scan on a retry is a new range read: callers needing a specific
+candidate or snapshot must keep its explicit identity/version or use a business
+snapshot protocol. Unknown commit outcomes are never automatically replayed.
+Results and Node RPC side effects are published only after confirmation.
 
 Versions retain the ten-byte / 20-hex representation. They monotonically order
 one logical key in one namespace, including deletion and recreation; they are

@@ -15,6 +15,57 @@ import urllib.parse
 from runtime_variant import identity
 
 
+def wait_runtime_rejection(work, rows, started, diagnostic, timeout=5, *,
+                           run=subprocess.run, monotonic=time.monotonic, sleep=time.sleep):
+    """Observe the rejected launch without retrying its Create or changing identity."""
+    assert 0 < timeout <= 5, "invalid runtime evidence observation budget"
+    # A task can close readiness/report its result before journald has consumed
+    # its stderr. Freeze the fixture identities and time boundary before polling.
+    filters = []
+    for row in rows:
+        filters.append(("KUASAR_SANDBOX_ID=" + row["id"],))
+        run_id = row["run_id"] or row["dead_run_id"]
+        if run_id:
+            filters.append(("-u", "sandbox-runner@" + run_id + ".service"))
+    since = "@" + str(int(started) - 2)
+    deadline = monotonic() + timeout
+    needles = ("no compatible runtime bundle", "identity mismatch", "runtime-v1.bundle")
+    diagnostic["journal_reads"] = 0
+    evidence = ""
+    while monotonic() < deadline:
+        diagnostic["phase"] = "node-log"
+        node_log = (work / "cluster-node.log").read_text(errors="replace")
+        diagnostic["phase"] = "journal"
+        journal = ""
+        for match in filters:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            diagnostic["journal_reads"] += 1
+            journal += run(
+                ["journalctl", *match, "--since", since, "--no-pager", "-o", "cat"],
+                text=True, capture_output=True, check=True, timeout=remaining,
+            ).stdout
+        lines = [line for line in (journal + "\n" + node_log).splitlines()
+                 if any(needle in line for needle in needles[:2])]
+        evidence = "\n".join(lines)
+        diagnostic.update(phase="runtime-evidence",
+                          runtime_rejection_present=needles[0] in evidence,
+                          digest_mismatch_present=needles[1] in evidence,
+                          captured_runtime_present=needles[2] in evidence)
+        remaining = deadline - monotonic()
+        if remaining > 0 and all(needle in evidence for needle in needles):
+            return lines
+        if remaining > 0:
+            sleep(min(.05, remaining))
+    # Preserve all original requirements. Another rejection, an absent record or
+    # exhausted observation budget cannot certify runtime incompatibility.
+    assert needles[0] in evidence, "missing Node runtime rejection"
+    assert needles[1] in evidence, "missing wrong-digest evidence"
+    assert needles[2] in evidence, "missing captured runtime fallback evidence"
+    raise AssertionError("runtime rejection evidence exceeded observation budget")
+
+
 def main(diagnostic):
     work = pathlib.Path(os.environ["LEGACY_TEST_WORK"])
     out = pathlib.Path(os.environ["LEGACY_TEST_OUT"])
@@ -77,34 +128,7 @@ def main(diagnostic):
         )]
     diagnostic["node_row_count"] = len(rows)
     assert rows, "the selected Node never accepted the Create"
-    diagnostic["phase"] = "node-log"
-    node_log = (work / "cluster-node.log").read_text(errors="replace")
-    # Read only this fixture's sandbox and exact runner-unit journals.
-    diagnostic.update(phase="journal", journal_reads=0)
-    journal = ""
-    for row in rows:
-        filters = [["KUASAR_SANDBOX_ID=" + row["id"]]]
-        run_id = row["run_id"] or row["dead_run_id"]
-        if run_id:
-            filters.append(["-u", "sandbox-runner@" + run_id + ".service"])
-        for match in filters:
-            journal += subprocess.run(
-                ["journalctl", *match, "--since", "@" + str(int(start) - 2),
-                 "--no-pager", "-o", "cat"],
-                text=True, capture_output=True, check=True,
-            ).stdout
-            diagnostic["journal_reads"] += 1
-    needles = ("no compatible runtime bundle", "identity mismatch")
-    lines = [line for line in (journal + "\n" + node_log).splitlines()
-             if any(needle in line for needle in needles)]
-    evidence = "\n".join(lines)
-    diagnostic.update(phase="runtime-evidence",
-                      runtime_rejection_present="no compatible runtime bundle" in evidence,
-                      digest_mismatch_present="identity mismatch" in evidence,
-                      captured_runtime_present="runtime-v1.bundle" in evidence)
-    assert "no compatible runtime bundle" in evidence, "missing Node runtime rejection"
-    assert "identity mismatch" in evidence, "missing wrong-digest evidence"
-    assert "runtime-v1.bundle" in evidence, "missing captured runtime fallback evidence"
+    lines = wait_runtime_rejection(work, rows, start, diagnostic)
     diagnostic.update(phase="fallback",
                       fallback_absent=not (work / "incompatible-runtime/runtime-v1.bundle").exists())
     assert diagnostic["fallback_absent"]
@@ -148,6 +172,7 @@ if __name__ == "__main__":
             (urllib.error.URLError, "transport"),
             (sqlite3.Error, "database"),
             (subprocess.CalledProcessError, "journal"),
+            (subprocess.TimeoutExpired, "journal"),
             (OSError, "io"),
             (ValueError, "decode"),
         ):

@@ -83,7 +83,8 @@ func (s *Store) Read(ctx context.Context, fn func(*Tx) error) error {
 	}
 }
 
-// Update pins every observed logical revision across physical retries. Each
+// Update pins Get/Expect logical revisions across physical retries. CheckCurrent
+// instead re-evaluates a guard against the current physical transaction. Each
 // touched key keeps a small durable revision cell even after deletion. One
 // mutation assigns max(touched revisions)+1 to its writes, preserving atomic
 // fences and per-key order without a global sequence or a hot global counter.
@@ -154,6 +155,30 @@ func (t *Tx) Get(key Key) (Value, error) {
 	}
 	value, _, err := t.decode(base.physical, base.raw.Bytes)
 	return value, err
+}
+
+// CheckCurrent evaluates a side-effect-free guard in this transaction without
+// pinning its observed revision across physical retries. Use it only for current
+// eligibility predicates, never to choose an identity or replace caller-supplied
+// conditions. Get and Expect retain their original revision conditions.
+//
+// The native read still participates in transaction conflict detection. The
+// guard runs again only after a definitely aborted physical attempt; unknown
+// outcomes are not replayed. A staged record must use the ordinary APIs instead.
+func (t *Tx) CheckCurrent(key Key, check func(Value) error) error {
+	if _, staged := t.pending[string(key)]; staged {
+		return invalid("current guard cannot read a staged record")
+	}
+	reader := &Tx{read: t.read}
+	if _, pinned := t.pinned[string(key)]; pinned {
+		// A current guard must not weaken an earlier Get/Expect condition.
+		reader = t
+	}
+	value, err := reader.Get(key)
+	if err != nil {
+		return err
+	}
+	return check(value)
 }
 
 // GetMany preserves input order, duplicates, absent records and read-your-writes.
