@@ -154,14 +154,14 @@ func (a *workspaceArchive) inventory(ctx context.Context, plan []workspace.Entry
 	return states, nil
 }
 
-func (a *workspaceArchive) publish(guard context.Context, request Request, name string) (*rtconfig.DiskV1, error) {
+func (a *workspaceArchive) publish(guard context.Context, request Request, name string) (artifact.DiskExportResult, error) {
 	req := artifact.ExportDiskRequest{SourceRef: a.ref, SourceDir: a.dir, DiskName: name, RefLocations: a.locations, Upload: true}
 	parent := request.RefLocationParent
 	publication := reflocation.PublicationName(request.Publication)
 	if parent != "" {
 		output, err := reflocation.Resolve(parent, publication)
 		if err != nil {
-			return nil, err
+			return artifact.DiskExportResult{}, err
 		}
 		req.ToRefLocation = rtconfig.RefLocations{publication: output.Path}
 		// Path derivation does not open layers. Keep these optional mappings
@@ -173,24 +173,24 @@ func (a *workspaceArchive) publish(guard context.Context, request Request, name 
 			}
 			for _, raw := range append([]string{saved.Base}, saved.BaseFromRefs...) {
 				if err := AddLocation(a.locations, parent, raw); err != nil {
-					return nil, err
+					return artifact.DiskExportResult{}, err
 				}
 			}
 			break
 		}
 	}
-	disk, err := a.storage.ExportDisk(guard, req)
+	published, err := a.storage.ExportDiskWithReport(guard, req)
 	if errors.Is(err, artifact.ErrDiskUnbound) || errors.Is(err, artifact.ErrDiskLayout) {
-		return nil, artifact.ErrDiskUnbound
+		return artifact.DiskExportResult{}, artifact.ErrDiskUnbound
 	}
 	if err != nil {
-		return nil, err
+		return artifact.DiskExportResult{}, err
 	}
 	// ExportDisk validates its actual source and committed output. Retained
 	// portable layers are already published and may be unavailable on this node;
 	// check their transfer contract without reopening or remapping them here.
-	if err := migrationtoken.ValidateWorkspaceDisk(disk); err != nil {
-		return nil, err
+	if err := migrationtoken.ValidateWorkspaceDisk(published.Disk); err != nil {
+		return artifact.DiskExportResult{}, err
 	}
-	return &disk, nil
+	return published, nil
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func workspaceCmd(args []string) error {
@@ -89,16 +90,14 @@ func workspaceCmd(args []string) error {
 		return fmt.Errorf("workspace %s (%d): %s", action, code, apiMessage(resp))
 	}
 	if action == "export" {
-		var out struct {
-			Token string `json:"token"`
-		}
-		if strictjson.Decode(resp, &out) != nil || out.Token == "" {
+		var out types.WorkspaceExportResult
+		if strictjson.Decode(resp, &out) != nil {
 			return fmt.Errorf("invalid workspace export response")
 		}
 		if asJSON {
 			return json.NewEncoder(os.Stdout).Encode(out)
 		}
-		_, err = fmt.Fprintln(os.Stdout, out.Token)
+		_, err = fmt.Fprintln(os.Stdout, out.Result)
 		return err
 	}
 	var out api.WorkspaceList

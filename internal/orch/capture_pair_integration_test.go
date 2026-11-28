@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -233,6 +234,10 @@ func TestUploadCaptureCLIToPausedDatabase(t *testing.T) {
 				defer listener.Close()
 				done := make(chan error, 1)
 				produced := make(chan ctl.Response, 1)
+				requestType := ctl.TypeSnapshotRequest
+				if kind == types.CaptureSandbox {
+					requestType = ctl.TypeExportReportRequest
+				}
 				go func() {
 					conn, err := listener.Accept()
 					if err != nil {
@@ -245,7 +250,7 @@ func TestUploadCaptureCLIToPausedDatabase(t *testing.T) {
 						done <- err
 						return
 					}
-					if !req.Upload || req.ResumeAfter != resume {
+					if req.Type != requestType || !req.Upload || req.ResumeAfter != resume {
 						done <- fmt.Errorf("request=%+v", req)
 						return
 					}
@@ -254,8 +259,18 @@ func TestUploadCaptureCLIToPausedDatabase(t *testing.T) {
 						done <- err
 						return
 					}
+					if kind == types.CaptureSandbox {
+						// This fixture has one self-contained E and no old graph.
+						response.ExportReferences = &ctl.ExportReferences{
+							SandboxRefs: []string{response.SandboxRef}, RemovedRefs: []string{},
+						}
+					}
 					produced <- response
-					done <- ctl.WriteMessage(conn, &response)
+					if kind == types.CaptureSandbox {
+						done <- ctl.WriteExportReportResponse(conn, response)
+					} else {
+						done <- ctl.WriteMessage(conn, &response)
+					}
 				}()
 				command, sourceKind := "snapshot", types.ResumeSourceSnapshot
 				if kind == types.CaptureSandbox {
@@ -272,9 +287,24 @@ func TestUploadCaptureCLIToPausedDatabase(t *testing.T) {
 					t.Fatal(err)
 				}
 				response := <-produced
-				source, err := decodeCaptureSource(out, sourceKind)
-				if err != nil {
-					t.Fatal(err)
+				var source types.ResumeSource
+				if kind == types.CaptureSandbox {
+					report, err := artifact.DecodePublishReport(out, artifact.RoleSandbox)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !report.Refs || len(report.SandboxRefs) != 1 || report.SandboxRefs[0] != report.SandboxRef || report.RemovedRefs == nil || len(report.RemovedRefs) != 0 {
+						t.Fatalf("incomplete E upload report: %+v", report)
+					}
+					if _, err := decodeCaptureSource(out, sourceKind); err == nil {
+						t.Fatal("E upload publication report was accepted as a capture report")
+					}
+					source = types.ResumeSource{Kind: sourceKind, Ref: report.SandboxRef}
+				} else {
+					source, err = decodeCaptureSource(out, sourceKind)
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 				want := types.ResumeSource{Kind: sourceKind, Ref: "manifest://" + response.SandboxManifestKey}
 				if kind == types.CaptureSnapshot {

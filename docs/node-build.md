@@ -513,9 +513,12 @@ Managed sandbox checkpoint cleanup does not run between Build phases. A phase ma
 ### Checkpoint publication reports
 
 The builder invokes `sandbox-ctl publish --json --quiet` for a checkpoint S and
-validates exactly `snapshotRef`, final `sandboxRef` and `removedRefs` before
-accepting the checkpoint. Roots must be portable and have the expected logical
-role; removals must be sorted, unique and safe public refs. Invalid/trailing JSON,
+validates the S/E reference report before accepting the checkpoint. Roots must
+be portable and have the expected logical role. `refs:true` requires complete
+`snapshotRefs`/`sandboxRefs` sets and `removedRefs`; false omits all collections.
+Only the exact legacy shape without `refs` is normalized to false, dropping
+its old difference. Sets and removals must be sorted, unique and safe public
+refs, and no removal may remain in a final set. Invalid/trailing JSON,
 missing roots and polluted stdout fail the build publication. Progress stderr is
 kept separate. The builder continues returning its canonical `snp` TemplateID;
 Export's additional HTTP report fields are documented in

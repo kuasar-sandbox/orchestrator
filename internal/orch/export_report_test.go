@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,10 +25,12 @@ func (o *Orchestrator) exportSandboxTokenForTest(ctx context.Context, apiKey, si
 }
 
 func testPublicationReport(kind types.ResumeSourceKind, root string) artifact.PublishReport {
-	report := artifact.PublishReport{SandboxRef: root, RemovedRefs: []string{}}
+	report := artifact.PublishReport{Refs: true, SandboxRef: root, SandboxRefs: []string{root}, RemovedRefs: []string{}}
 	if kind == types.ResumeSourceSnapshot {
 		report.SnapshotRef = root
+		report.SnapshotRefs = []string{root}
 		report.SandboxRef = "manifest://" + strings.Repeat("e", 64)
+		report.SandboxRefs = []string{report.SandboxRef}
 	}
 	return report
 }
@@ -92,8 +95,21 @@ func TestPortableSnapshotUsesStoredPairWithoutArtifacts(t *testing.T) {
 	}
 	for _, template := range []bool{false, true} {
 		result, err := fixture.o.ExportSandbox(fixture.ctx, fixture.apiKey, fixture.sb.ID, template, true, "")
-		if err != nil || result.SnapshotRef != source.Ref || result.SandboxRef != source.SandboxRef || len(result.RemovedRefs) != 0 {
+		if err != nil || result.Refs || result.SnapshotRef != source.Ref || result.SandboxRef != source.SandboxRef || result.RemovedRefs != nil {
 			t.Fatalf("portable result=%+v err=%v", result, err)
+		}
+		raw, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"snapshotRefs", "sandboxRefs", "diskRefs", "removedRefs"} {
+			if _, exists := fields[field]; exists {
+				t.Fatalf("portable response contains %s: %s", field, raw)
+			}
 		}
 	}
 }

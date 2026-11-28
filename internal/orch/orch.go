@@ -3338,8 +3338,8 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 	return o.recoverCaptureOutcome(ctx, sb, permit, source, err)
 }
 
-// decodeCaptureSource is shared by capture adapters regardless of whether the
-// producer writes local files, a Bundle, or uploads Manifest objects.
+// decodeCaptureSource consumes the capture contract used by local export and
+// snapshot, including snapshot uploads. Export uploads use publication reports.
 func decodeCaptureSource(data []byte, kind types.ResumeSourceKind) (types.ResumeSource, error) {
 	report, err := artifact.DecodeCaptureReport(data, artifactRole(kind))
 	if err != nil {
