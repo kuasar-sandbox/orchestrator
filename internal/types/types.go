@@ -382,6 +382,8 @@ type SandboxCheckpoint struct {
 
 // Sandbox pressure fields are node-owned lifecycle state, never user metadata.
 type Sandbox struct {
+	ManifestKeyFingerprint string `json:"-"` // validated material identity, retained from the existing database column
+
 	WorkspacePlan []workspace.Prepared `json:"-"`
 	// HoldValue is node-local runtime state. nil means the known initial zero;
 	// it is never copied to a new sandbox, template or migration token.
@@ -421,7 +423,7 @@ type Sandbox struct {
 	InnerIP               string // guest inner IP (CIDR), passed to vswitch attach + Network.IP
 	PortMAC               string // per-port MAC from attach -> Network.MAC
 	APISecret             string // per-tenant API authentication root (hex); never written to env/yaml
-	ManifestKey           string // per-tenant manifest encryption root (hex); never written to env/yaml
+	ManifestKey           string // per-tenant manifest encryption root (hex or Secret plugin reference)
 	ResumeSource          ResumeSource
 	IdleTimeout           *int64
 	AutoPauseMemory       bool

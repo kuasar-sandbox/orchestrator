@@ -201,7 +201,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		if fingerprint != cmd.APISecretFingerprint {
 			return fmt.Errorf("build_register: %w: credential fingerprint differs", store.ErrBuildRegistrationConflict)
 		}
-		pair = store.KeyPair{APISecret: existing.APISecret, ManifestKey: existing.ManifestKey}
+		pair = store.KeyPair{APISecret: existing.APISecret, ManifestKey: existing.ManifestKey, ManifestKeyFingerprint: existing.ManifestKeyFingerprint}
 		// Private inputs come from the accepted Build, not a changed Group.
 		imageRepo, registryAuth = existing.RegistrationImageRepo, existing.RegistrationRegistryAuth
 	} else {
@@ -223,7 +223,13 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 			registryAuth = detail.Context.RegistryAuth.Value
 		}
 	}
-	registrationRequestDigest, err := clusterBuildRegistrationRequestDigest(pair.ManifestKey, cmd)
+	pair, err = store.ResolveKeyPair(ctx, pair)
+	if err != nil {
+		return err
+	}
+	manifestBytes, _ := pair.ManifestKeyBytes()
+	registrationRequestDigest, err := clusterBuildRegistrationRequestDigest(manifestBytes, cmd)
+	clear(manifestBytes[:])
 	if err != nil {
 		return err
 	}
@@ -322,6 +328,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 		TemplateID:                cmd.TemplateRef,
 		APISecret:                 pair.APISecret,
 		ManifestKey:               pair.ManifestKey,
+		ManifestKeyFingerprint:    pair.ManifestKeyFingerprint,
 		Profile:                   profile,
 		Status:                    types.BuildRegistered,
 		FromImage:                 o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
@@ -416,7 +423,7 @@ func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *
 	}
 	unlockEvent := o.lockBuildEvent(b.BuildID)
 	defer unlockEventFence(unlockEvent)
-	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
+	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues, pair)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
 		return fmt.Errorf("%w: %v", api.ErrBuildAdmission, err)
@@ -1161,11 +1168,11 @@ func (o *Orchestrator) putClusterKeyPair(ctx context.Context, cmd *routesync.Com
 	if err != nil {
 		return err
 	}
-	manifestFP, err := store.ManifestKeyHash(cmd.ManifestKey)
+	pair, err := store.ResolveKeyPair(ctx, store.KeyPair{APISecret: cmd.APISecret, ManifestKey: cmd.ManifestKey, ManifestKeyFingerprint: cmd.ManifestKeyFingerprint})
 	if err != nil {
 		return err
 	}
-	if apiFP != cmd.APISecretFingerprint || manifestFP != cmd.ManifestKeyFingerprint {
+	if apiFP != cmd.APISecretFingerprint || pair.ManifestKeyFingerprint != cmd.ManifestKeyFingerprint {
 		return fmt.Errorf("cluster: credential pair fingerprint mismatch")
 	}
 	var ttl int64
@@ -1174,9 +1181,7 @@ func (o *Orchestrator) putClusterKeyPair(ctx context.Context, cmd *routesync.Com
 			ttl = 1
 		}
 	}
-	_, err = o.st.AddKeyPair(ctx, store.KeyPair{
-		APISecret: cmd.APISecret, ManifestKey: cmd.ManifestKey,
-	}, "cluster", ttl, "")
+	_, err = o.st.AddKeyPair(ctx, pair, "cluster", ttl, "")
 	return err
 }
 

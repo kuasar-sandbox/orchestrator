@@ -42,7 +42,7 @@ func openArchive(ctx context.Context, req Request, key string) (_ *workspaceArch
 	if err := add(a.ref); err != nil {
 		return nil, err
 	}
-	st, err := Storage(req.ManifestConfig, key)
+	st, err := StorageContext(ctx, req.ManifestConfig, key)
 	if err != nil {
 		return nil, err
 	}

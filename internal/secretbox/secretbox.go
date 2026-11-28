@@ -11,6 +11,7 @@ package secretbox
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -19,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 )
 
 const tagLen = 4
@@ -31,24 +34,33 @@ type aeadKey struct {
 // Box holds the key set. The first key added is the active (encrypting) key.
 type Box struct{ keys []aeadKey }
 
-// NewFromColonHex builds a Box from a ":"-separated list of 64-hex AES-256 keys
-// (the first is active). Used for the orchestrator's encryption_key config / the
-// NODE_CONFIG_ENCRYPTION_KEY env. Empty/blank entries are ignored.
+// NewFromColonHex is the context-free compatibility entry point for a key ring.
 func NewFromColonHex(spec string) (*Box, error) {
+	return NewFromSpec(context.Background(), spec)
+}
+
+// NewFromSpec resolves a ":"-separated AES-256 key ring. Each nonempty entry is
+// hex or a Secret plugin reference; the first entry encrypts new records.
+// Empty/blank entries are ignored, but an invalid nonempty entry is an error.
+func NewFromSpec(ctx context.Context, spec string) (*Box, error) {
 	var keys [][]byte
 	defer func() {
 		for _, key := range keys {
 			clear(key)
 		}
 	}()
-	for _, p := range strings.Split(spec, ":") {
+	for i, p := range strings.Split(spec, ":") {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		raw, err := hex.DecodeString(p)
-		if err != nil || len(raw) != 32 {
-			return nil, errors.New("secretbox: each encryption key must be 64 hex chars (32 bytes)")
+		raw, err := secret.Resolve(ctx, p)
+		if err != nil {
+			return nil, fmt.Errorf("secretbox: resolve encryption key %d: %w", i+1, err)
+		}
+		if len(raw) != 32 {
+			clear(raw)
+			return nil, fmt.Errorf("secretbox: encryption key %d must be 32 bytes", i+1)
 		}
 		keys = append(keys, raw)
 	}

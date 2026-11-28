@@ -32,6 +32,9 @@ func TestImageBuildNetworkFromRegistrationToResult(t *testing.T) {
 					t.Run(string(profile)+"/"+targetName+"/"+carrier+"/"+network.name, func(t *testing.T) {
 						ctx := context.Background()
 						cfg := buildNetworkTestConfig()
+						// This fixture bypasses config defaults but executes a real
+						// worker, so its publication context needs a valid budget.
+						cfg.Builder.TotalTimeoutSec = 60
 						cfg.ManifestConfig = filepath.Join(t.TempDir(), "manifest.yaml")
 						// The worker reuses an existing Manifest IMG, so publication
 						// must not need a Store RPC or a running VM.

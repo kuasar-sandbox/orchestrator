@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,13 +23,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
+	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/idleclock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
@@ -44,6 +43,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
@@ -2562,6 +2562,7 @@ func normalizeSandboxTaskRootRef(raw, relativeDir string) (string, error) {
 func sandboxTaskEnv(sb *types.Sandbox) map[string]string {
 	return map[string]string{
 		"MANIFEST_KEY": sb.ManifestKey,
+		secret.Env:     os.Getenv(secret.Env),
 	}
 }
 

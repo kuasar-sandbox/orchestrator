@@ -4,17 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"time"
 
 	"github.com/google/uuid"
-
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 )
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
@@ -244,7 +243,7 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 		State: types.StateStarting, LaunchMode: launchMode, AutoPauseMemory: autoPauseMemory, AutoReset: spec.AutoReset,
 		RunDir:    nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, spec.ID),
 		BaseDir:   nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, spec.ID),
-		APISecret: spec.Pair.APISecret, ManifestKey: spec.Pair.ManifestKey,
+		APISecret: spec.Pair.APISecret, ManifestKey: spec.Pair.ManifestKey, ManifestKeyFingerprint: spec.Pair.ManifestKeyFingerprint,
 		Metadata: cloneStringMap(spec.Config.Metadata), Env: cloneStringMap(spec.Env),
 		CreatedUnix: now.Unix(), DeadlineUnix: now.Add(time.Duration(spec.TimeoutSeconds) * time.Second).Unix(),
 	}

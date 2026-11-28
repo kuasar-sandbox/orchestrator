@@ -52,7 +52,7 @@ func groupVerify(p *apikey.Parsed, pair KeyPair) bool {
 	return apikey.Verify(p, raw)
 }
 
-// groupAllowedTx resolves real secret material and verifies the full token MAC.
+// groupAllowedTx loads the retained pair and verifies the full API token MAC.
 // The short token fingerprint is only a candidate index, never ownership.
 func (s *Store) groupAllowedTx(ctx context.Context, tx *sql.Tx, p *apikey.Parsed) (KeyPair, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys
@@ -159,13 +159,17 @@ func (s *Store) GroupPut(ctx context.Context, apiKey, name string, expected int6
 		if keyPut.ExpiresUnix < 0 || (keyPut.ExpiresUnix != 0 && keyPut.ExpiresUnix <= time.Now().Unix()) {
 			return nodegroup.Result{}, false, fmt.Errorf("%w: key_put has expired", nodegroup.ErrInvalid)
 		}
-		supplied = KeyPair{APISecret: keyPut.APISecret, ManifestKey: keyPut.ManifestKey}
-		if _, _, err := keyPairHashes(supplied); err != nil {
+		supplied = KeyPair{APISecret: keyPut.APISecret, ManifestKey: keyPut.ManifestKey, ManifestKeyFingerprint: keyPut.ManifestKeyFingerprint}
+		supplied, err = ResolveKeyPair(ctx, supplied)
+		if err != nil {
 			return nodegroup.Result{}, false, fmt.Errorf("%w: invalid key_put pair", nodegroup.ErrInvalid)
 		}
 		if !groupVerify(p, supplied) {
 			return nodegroup.Result{}, false, nodegroup.ErrForbidden
 		}
+		// Keep the receiver's verified projection available to its caller;
+		// mirroring an accepted command must not resolve the root a second time.
+		keyPut.ManifestKeyFingerprint = supplied.ManifestKeyFingerprint
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -177,13 +181,18 @@ func (s *Store) GroupPut(ctx context.Context, apiKey, name string, expected int6
 		return nodegroup.Result{}, false, err
 	}
 	var pair KeyPair
+	carrierChanged := false
 	if r.active {
 		pair, err = s.groupOwner(r, p)
 		if err != nil {
 			return nodegroup.Result{}, false, err
 		}
-		if keyPut != nil && !equalKeyPair(pair, supplied) {
-			return nodegroup.Result{}, false, ErrKeyPairConflict
+		if keyPut != nil {
+			if !equalKeyPair(pair, supplied) {
+				return nodegroup.Result{}, false, ErrKeyPairConflict
+			}
+			carrierChanged = pair.ManifestKey != supplied.ManifestKey
+			pair = supplied
 		}
 	} else {
 		pair = supplied
@@ -223,7 +232,7 @@ func (s *Store) GroupPut(ctx context.Context, apiKey, name string, expected int6
 		if err != nil {
 			return nodegroup.Result{}, false, err
 		}
-		if previous == string(raw) {
+		if previous == string(raw) && !carrierChanged {
 			if err := tx.Commit(); err != nil {
 				return nodegroup.Result{}, false, err
 			}
@@ -234,7 +243,7 @@ func (s *Store) GroupPut(ctx context.Context, apiKey, name string, expected int6
 	if err != nil {
 		return nodegroup.Result{}, false, err
 	}
-	mkHash, mkEnc, err := s.encSecret("manifest key", pair.ManifestKey)
+	mkHash, mkEnc, err := s.encManifestKey(pair.ManifestKey, pair.ManifestKeyFingerprint)
 	if err != nil {
 		return nodegroup.Result{}, false, err
 	}

@@ -6,7 +6,6 @@ package orch
 import (
 	"context"
 	"encoding/hex"
-	"fmt"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -16,29 +15,28 @@ import (
 // materializeKeyPair validates a manifest key and either validates the supplied
 // APISecret or derives its default. Derivation happens only at this ingestion
 // boundary; request paths always consume a complete persisted pair.
-func materializeKeyPair(manifestKey, apiSecret string) (store.KeyPair, string, string, error) {
-	manifestFP, err := store.ManifestKeyHash(manifestKey)
+func materializeKeyPair(ctx context.Context, manifestKey, apiSecret string) (store.KeyPair, string, string, error) {
+	pair, err := store.ResolveKeyPair(ctx, store.KeyPair{ManifestKey: manifestKey, APISecret: apiSecret})
 	if err != nil {
 		return store.KeyPair{}, "", "", err
 	}
 	if apiSecret == "" {
-		rawManifest, err := hex.DecodeString(manifestKey)
-		if err != nil {
-			return store.KeyPair{}, "", "", fmt.Errorf("manifest key must be 64 lowercase hex characters")
-		}
-		apiSecret = hex.EncodeToString(apikey.DeriveAPISecret(rawManifest))
+		rawManifest, _ := pair.ManifestKeyBytes()
+		apiSecret = hex.EncodeToString(apikey.DeriveAPISecret(rawManifest[:]))
+		clear(rawManifest[:])
 	}
 	apiFP, err := store.APISecretHash(apiSecret)
 	if err != nil {
 		return store.KeyPair{}, "", "", err
 	}
-	return store.KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, apiFP, manifestFP, nil
+	pair.APISecret = apiSecret
+	return pair, apiFP, pair.ManifestKeyFingerprint, nil
 }
 
 // AddKeyPair adds or refreshes one exact tenant credential pair. An empty
 // apiSecret selects the deterministic default derived from manifestKey.
 func (o *Orchestrator) AddKeyPair(ctx context.Context, manifestKey, apiSecret, label string, ttlSec int64, registryAuth string) (bool, string, string, error) {
-	pair, apiFP, manifestFP, err := materializeKeyPair(manifestKey, apiSecret)
+	pair, apiFP, manifestFP, err := materializeKeyPair(ctx, manifestKey, apiSecret)
 	if err != nil {
 		return false, "", "", err
 	}
@@ -47,7 +45,7 @@ func (o *Orchestrator) AddKeyPair(ctx context.Context, manifestKey, apiSecret, l
 }
 
 func (o *Orchestrator) RemoveKeyPair(ctx context.Context, manifestKey, apiSecret string) (bool, string, string, error) {
-	pair, apiFP, manifestFP, err := materializeKeyPair(manifestKey, apiSecret)
+	pair, apiFP, manifestFP, err := materializeKeyPair(ctx, manifestKey, apiSecret)
 	if err != nil {
 		return false, "", "", err
 	}
@@ -56,7 +54,7 @@ func (o *Orchestrator) RemoveKeyPair(ctx context.Context, manifestKey, apiSecret
 }
 
 func (o *Orchestrator) HasKeyPair(ctx context.Context, manifestKey, apiSecret string) (bool, string, string, error) {
-	pair, apiFP, manifestFP, err := materializeKeyPair(manifestKey, apiSecret)
+	pair, apiFP, manifestFP, err := materializeKeyPair(ctx, manifestKey, apiSecret)
 	if err != nil {
 		return false, "", "", err
 	}

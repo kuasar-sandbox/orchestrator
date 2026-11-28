@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -87,10 +88,11 @@ func (p *buildPipeline) preparePublication() error {
 		return fmt.Errorf("build publication: load manifest config: %w", err)
 	}
 	rawKey := p.spec.Env[manifest.CustomerKeyEnv]
-	parsedKey, err := manifest.ParseHexKey(rawKey)
+	parsedKey, err := manifestkey.Resolve(p.ctx, rawKey)
 	if err != nil {
 		return fmt.Errorf("build publication: authoritative customer key: %w", err)
 	}
+	defer clear(parsedKey[:])
 	locations, err := buildArtifactRefLocations(p.spec.RefLocations)
 	if err != nil {
 		return err

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -92,15 +93,20 @@ func cloneMMDSRouteSecretValues(values MMDSRouteSecretValues) MMDSRouteSecretVal
 }
 
 func registrationMMDSValuesDigest(manifestKey, buildID, routesDigest string, values MMDSRouteSecretValues) (string, error) {
-	key, err := hex.DecodeString(manifestKey)
-	if err != nil || len(key) != sha256.Size {
-		return "", fmt.Errorf("registration MMDS value identity requires a 64-character hex manifest key")
+	key, err := manifestkey.Resolve(context.Background(), manifestKey)
+	if err != nil {
+		return "", err
 	}
+	defer clear(key[:])
+	return registrationMMDSValuesDigestWithKey(key, buildID, routesDigest, values)
+}
+
+func registrationMMDSValuesDigestWithKey(key [32]byte, buildID, routesDigest string, values MMDSRouteSecretValues) (string, error) {
 	canonical, err := encodeMMDSRouteSecretValues(values)
 	if err != nil {
 		return "", fmt.Errorf("encode registration MMDS value identity: %w", err)
 	}
-	mac := hmac.New(sha256.New, key)
+	mac := hmac.New(sha256.New, key[:])
 	_, _ = mac.Write([]byte("kuasar-build-registration-mmds-values-v1\x00"))
 	_, _ = mac.Write(mmdsRouteSecretAAD(MMDSRouteSecretOwnerBuild, buildID, routesDigest, 1))
 	_, _ = mac.Write([]byte{0})
@@ -108,14 +114,35 @@ func registrationMMDSValuesDigest(manifestKey, buildID, routesDigest string, val
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
-func prepareBuildRegistrationMMDSIdentity(build *types.Build, routesDigest string, values MMDSRouteSecretValues) error {
+func prepareBuildRegistrationMMDSIdentity(ctx context.Context, build *types.Build, routesDigest string, values MMDSRouteSecretValues, resolved ...KeyPair) error {
 	if build == nil {
 		return errors.New("build is required")
 	}
 	if build.RegistrationMMDSRoutesDigest != "" && build.RegistrationMMDSRoutesDigest != routesDigest {
 		return fmt.Errorf("store: register build %s: MMDS route identity does not match initial values", build.BuildID)
 	}
-	digest, err := registrationMMDSValuesDigest(build.ManifestKey, build.BuildID, routesDigest, values)
+	if len(resolved) > 1 {
+		return errors.New("store: one resolved credential pair is required")
+	}
+	pair := KeyPair{APISecret: build.APISecret, ManifestKey: build.ManifestKey, ManifestKeyFingerprint: build.ManifestKeyFingerprint}
+	if len(resolved) == 1 {
+		if resolved[0].APISecret != build.APISecret || resolved[0].ManifestKey != build.ManifestKey {
+			return errors.New("store: resolved credential pair does not match build")
+		}
+		pair = resolved[0]
+	}
+	pair, err := ResolveKeyPair(ctx, pair)
+	if err != nil {
+		return err
+	}
+	key, _ := pair.ManifestKeyBytes()
+	defer clear(key[:])
+	fp := manifestkey.Fingerprint(key)
+	if build.ManifestKeyFingerprint != "" && build.ManifestKeyFingerprint != fp {
+		return fmt.Errorf("manifest key fingerprint mismatch")
+	}
+	build.ManifestKeyFingerprint = fp
+	digest, err := registrationMMDSValuesDigestWithKey(key, build.BuildID, routesDigest, values)
 	if err != nil {
 		return fmt.Errorf("store: register build %s: %w", build.BuildID, err)
 	}
@@ -172,7 +199,7 @@ func (s *Store) insertInitialMMDSRouteSecretValuesTx(ctx context.Context, tx *sq
 // routes-only metadata already held by sb, and its optional encrypted initial
 // values. No row from either half remains if the transaction fails.
 func (s *Store) InsertSandboxWithMMDSRouteSecretValues(ctx context.Context, sb *types.Sandbox, routesDigest string, values MMDSRouteSecretValues) error {
-	args, err := s.prepareSandboxInsert(sb)
+	args, err := s.prepareSandboxInsertContext(ctx, sb)
 	if err != nil {
 		return sandboxWriteError("insert sandbox", sb, err)
 	}
@@ -204,10 +231,10 @@ func (s *Store) InsertSandboxWithMMDSRouteSecretValues(ctx context.Context, sb *
 // InsertBuildWithMMDSRouteSecretValues is the Build Register equivalent of the
 // sandbox transaction primitive.
 func (s *Store) InsertBuildWithMMDSRouteSecretValues(ctx context.Context, build *types.Build, routesDigest string, values MMDSRouteSecretValues) error {
-	if err := prepareBuildRegistrationMMDSIdentity(build, routesDigest, values); err != nil {
+	if err := prepareBuildRegistrationMMDSIdentity(ctx, build, routesDigest, values); err != nil {
 		return err
 	}
-	args, err := s.prepareBuildWrite(build)
+	args, err := s.prepareBuildWriteContext(ctx, build)
 	if err != nil {
 		return err
 	}
@@ -241,12 +268,13 @@ var (
 // RegisterBuildWithMMDSRouteSecretValues atomically checks registration
 // headroom, inserts the complete immutable Build definition, and creates its
 // optional confidential MMDS values. An exact BuildID replay returns the
-// original row without consuming capacity again.
-func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, build *types.Build, limit types.BuildAdmissionLimit, routesDigest string, values MMDSRouteSecretValues) (*types.Build, bool, error) {
-	if err := prepareBuildRegistrationMMDSIdentity(build, routesDigest, values); err != nil {
+// original row without consuming capacity again. A previously resolved pair
+// reuses the same root as other registration digests, before the transaction.
+func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, build *types.Build, limit types.BuildAdmissionLimit, routesDigest string, values MMDSRouteSecretValues, resolved ...KeyPair) (*types.Build, bool, error) {
+	if err := prepareBuildRegistrationMMDSIdentity(ctx, build, routesDigest, values, resolved...); err != nil {
 		return nil, false, err
 	}
-	args, err := s.prepareBuildWrite(build)
+	args, err := s.prepareBuildWriteContext(ctx, build)
 	if err != nil {
 		return nil, false, err
 	}

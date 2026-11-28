@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,13 +19,13 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
 	artifactresult "github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 )
 
@@ -212,7 +211,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		}
 	} else {
 		var err error
-		result, err = o.mintSandboxToken(source, artifact)
+		result, err = o.mintSandboxTokenContext(opCtx, source, artifact)
 		if err != nil {
 			if o.exports.State(attempt) == exportPreempted {
 				return types.ExportResult{}, exportPreemptedError(sid)
@@ -370,6 +369,10 @@ func exportPreemptedError(sid string) error {
 // mintSandboxToken seals a complete portable sandbox record. There is no API-key
 // gate here; ExportSandbox performs object authorization before calling it.
 func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSource) (string, error) {
+	return o.mintSandboxTokenContext(context.Background(), sb, source)
+}
+
+func (o *Orchestrator) mintSandboxTokenContext(ctx context.Context, sb *types.Sandbox, source types.ResumeSource) (string, error) {
 	if sb == nil {
 		return "", fmt.Errorf("mint migration token: sandbox is required")
 	}
@@ -391,7 +394,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: API secret fingerprint: %w", err)
 	}
-	manifestFingerprint, err := store.ManifestKeyHash(sb.ManifestKey)
+	pair, material, err := migrationKeyMaterial(ctx, store.KeyPair{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey, ManifestKeyFingerprint: sb.ManifestKeyFingerprint})
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: manifest key fingerprint: %w", err)
 	}
@@ -410,14 +413,14 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 	if err := sandboxcfg.ValidateTrafficForProfile(sb.Profile, trafficSpec.Traffic); err != nil {
 		return "", fmt.Errorf("mint migration token: portable traffic metadata: %w", err)
 	}
-	return migrationtoken.Seal(
-		migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey},
+	return migrationtoken.SealContext(ctx,
+		material,
 		migrationtoken.MigrationTokenPayloadV1{
 			Version:                1,
 			NodeSandboxID:          sb.ID,
 			StableID:               sb.StableID(),
 			APISecretFingerprint:   apiFingerprint,
-			ManifestKeyFingerprint: manifestFingerprint,
+			ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
 			TemplateID:             sb.TemplateID,
 			Profile:                string(sb.Profile),
 			RuntimeDigest:          dig,
@@ -436,6 +439,22 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 			ForwardAccessToken: sb.ForwardAccessToken,
 		},
 	)
+}
+
+// migrationKeyMaterial binds one operation to the retained manifest identity.
+// The temporary canonical hex is only a protocol input; pair keeps the original
+// carrier for persistence and task delivery, including repeated import checks.
+func migrationKeyMaterial(ctx context.Context, pair store.KeyPair) (store.KeyPair, migrationtoken.KeyMaterial, error) {
+	pair, err := store.ResolveKeyPair(ctx, pair)
+	if err != nil {
+		return store.KeyPair{}, migrationtoken.KeyMaterial{}, err
+	}
+	raw, ok := pair.ManifestKeyBytes()
+	if !ok {
+		return store.KeyPair{}, migrationtoken.KeyMaterial{}, fmt.Errorf("migration key was not bound")
+	}
+	defer clear(raw[:])
+	return pair, migrationtoken.KeyMaterial{APISecret: pair.APISecret, ManifestKey: hex.EncodeToString(raw[:])}, nil
 }
 
 // ImportSandbox authenticates the caller's paired tenant roots and inserts the
@@ -499,8 +518,12 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	if targetID != "" && !types.ValidLocalSandboxID(targetID) {
 		return nil, fmt.Errorf("import-sandbox: invalid target sandbox ID: %w", api.ErrBadRequest)
 	}
-	payload, err := migrationtoken.Open(
-		migrationtoken.KeyMaterial{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey},
+	pair, material, err := migrationKeyMaterial(ctx, pair)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: resolve migration key: %w", err)
+	}
+	payload, err := migrationtoken.OpenContext(ctx,
+		material,
 		token,
 	)
 	if err != nil {
@@ -570,20 +593,21 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		metadata = clusterSandboxMetadata(metadata)
 	}
 	sb := &types.Sandbox{
-		ID:              targetID,
-		Profile:         profile,
-		Cluster:         trustedCluster,
-		StableIDValue:   payload.StableID,
-		TemplateID:      payload.TemplateID,
-		State:           types.StatePaused,
-		DeadlineUnix:    payload.DeadlineUnix,
-		CreatedUnix:     payload.CreatedUnix,
-		RunDir:          nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, targetID),
-		BaseDir:         nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, targetID),
-		APISecret:       pair.APISecret,
-		ManifestKey:     pair.ManifestKey,
-		ResumeSource:    source,
-		AutoPauseMemory: payload.AutoPauseMemory, IdleTimeout: types.CloneIdleTimeout(payload.IdleTimeout),
+		ID:                     targetID,
+		Profile:                profile,
+		Cluster:                trustedCluster,
+		StableIDValue:          payload.StableID,
+		TemplateID:             payload.TemplateID,
+		State:                  types.StatePaused,
+		DeadlineUnix:           payload.DeadlineUnix,
+		CreatedUnix:            payload.CreatedUnix,
+		RunDir:                 nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, targetID),
+		BaseDir:                nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, targetID),
+		APISecret:              pair.APISecret,
+		ManifestKey:            pair.ManifestKey,
+		ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
+		ResumeSource:           source,
+		AutoPauseMemory:        payload.AutoPauseMemory, IdleTimeout: types.CloneIdleTimeout(payload.IdleTimeout),
 		AutoReset:          payload.AutoReset,
 		ServiceSecret:      payload.ServiceSecret,
 		EnvdAccessToken:    payload.EnvdAccessToken,
@@ -643,8 +667,12 @@ func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, 
 	if pair.APISecret == "" {
 		return nil, fmt.Errorf("import-sandbox: credential pair is not installed: %w", api.ErrNotAllowed)
 	}
-	payload, err := migrationtoken.Open(
-		migrationtoken.KeyMaterial{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey},
+	pair, material, err := migrationKeyMaterial(ctx, pair)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: resolve migration key: %w", err)
+	}
+	payload, err := migrationtoken.OpenContext(ctx,
+		material,
 		token,
 	)
 	if err != nil {

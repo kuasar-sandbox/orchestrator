@@ -2,6 +2,7 @@
 package migrationtoken
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -16,7 +17,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -45,7 +48,7 @@ var (
 	// ErrIncompatible identifies a valid token that does not match target-owned
 	// profile, template, runtime, resume source, or stable-ID state.
 	ErrIncompatible = errors.New("migrationtoken: incompatible target")
-	// ErrInvalidKeyMaterial identifies a non-canonical tenant root supplied by the
+	// ErrInvalidKeyMaterial identifies invalid tenant root material supplied by the
 	// trusted caller. Errors never include the supplied material.
 	ErrInvalidKeyMaterial = errors.New("migrationtoken: invalid key material")
 	// ErrTokenTooLarge identifies a complete kmt1 wire representation that exceeds
@@ -55,7 +58,8 @@ var (
 
 // KeyMaterial is the paired tenant credential material used to protect and
 // authorize a migration token. Only fingerprints, never these raw roots, enter
-// the encrypted payload.
+// the encrypted payload. APISecret remains canonical hex; ManifestKey may also
+// be an opaque Secret plugin reference resolved at the token-use boundary.
 type KeyMaterial struct {
 	APISecret   string
 	ManifestKey string
@@ -106,14 +110,24 @@ type Expectations struct {
 // Seal validates payload and key ownership, then encrypts a fresh kmt1 token
 // using a cryptographically random 12-byte AES-GCM nonce.
 func Seal(material KeyMaterial, payload MigrationTokenPayloadV1) (string, error) {
-	return seal(rand.Reader, material, payload)
+	return SealContext(context.Background(), material, payload)
+}
+
+// SealContext is Seal with cancellation for ManifestKey resolution.
+func SealContext(ctx context.Context, material KeyMaterial, payload MigrationTokenPayloadV1) (string, error) {
+	return sealContext(ctx, rand.Reader, material, payload)
 }
 
 func seal(random io.Reader, material KeyMaterial, payload MigrationTokenPayloadV1) (string, error) {
-	key, apiFingerprint, manifestFingerprint, err := deriveMaterial(material)
+	return sealContext(context.Background(), random, material, payload)
+}
+
+func sealContext(ctx context.Context, random io.Reader, material KeyMaterial, payload MigrationTokenPayloadV1) (string, error) {
+	key, apiFingerprint, manifestFingerprint, err := deriveMaterialContext(ctx, material)
 	if err != nil {
 		return "", err
 	}
+	defer clear(key)
 	if err := validatePayload(payload); err != nil {
 		return "", err
 	}
@@ -156,11 +170,17 @@ func sealEnvelope(random io.Reader, prefix string, key, plaintext, aad []byte) (
 // Open authenticates and decrypts token, strictly parses and validates its V1
 // payload, and verifies both tenant fingerprints against material.
 func Open(material KeyMaterial, token string) (MigrationTokenPayloadV1, error) {
+	return OpenContext(context.Background(), material, token)
+}
+
+// OpenContext is Open with cancellation for ManifestKey resolution.
+func OpenContext(ctx context.Context, material KeyMaterial, token string) (MigrationTokenPayloadV1, error) {
 	var zero MigrationTokenPayloadV1
-	key, apiFingerprint, manifestFingerprint, err := deriveMaterial(material)
+	key, apiFingerprint, manifestFingerprint, err := deriveMaterialContext(ctx, material)
 	if err != nil {
 		return zero, err
 	}
+	defer clear(key)
 
 	plaintext, err := openEnvelope(token, wirePrefix, key, nil)
 	if err != nil {
@@ -299,21 +319,40 @@ func validatePayload(payload MigrationTokenPayloadV1) error {
 }
 
 func deriveMaterial(material KeyMaterial) (key []byte, apiFingerprint, manifestFingerprint string, err error) {
+	return deriveMaterialContext(context.Background(), material)
+}
+
+func deriveMaterialContext(ctx context.Context, material KeyMaterial) (key []byte, apiFingerprint, manifestFingerprint string, err error) {
 	apiSecret, ok := decodeCanonicalHex32(material.APISecret)
 	if !ok {
 		return nil, "", "", ErrInvalidKeyMaterial
 	}
-	manifestKey, ok := decodeCanonicalHex32(material.ManifestKey)
-	if !ok {
-		return nil, "", "", ErrInvalidKeyMaterial
+	defer clear(apiSecret)
+	root, err := resolveManifest(ctx, material.ManifestKey)
+	if err != nil {
+		return nil, "", "", err
 	}
+	defer clear(root[:])
 
-	mac := hmac.New(sha256.New, manifestKey)
+	mac := hmac.New(sha256.New, root[:])
 	_, _ = mac.Write([]byte(kdfDomain))
 	key = mac.Sum(nil)
 	apiDigest := sha256.Sum256(apiSecret)
-	manifestDigest := sha256.Sum256(manifestKey)
+	manifestDigest := sha256.Sum256(root[:])
 	return key, hex.EncodeToString(apiDigest[:]), hex.EncodeToString(manifestDigest[:]), nil
+}
+
+// Native roots retain the canonical hex contract. Plugin references remain
+// opaque until this actual-use boundary; fingerprints and KDFs use raw bytes.
+func resolveManifest(ctx context.Context, text string) ([32]byte, error) {
+	if !secret.IsReference(text) && !validHexDigest(text) {
+		return [32]byte{}, ErrInvalidKeyMaterial
+	}
+	root, err := manifestkey.Resolve(ctx, text)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("%w: %w", ErrInvalidKeyMaterial, err)
+	}
+	return root, nil
 }
 
 func decodeCanonicalHex32(encoded string) ([]byte, bool) {

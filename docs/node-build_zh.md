@@ -311,7 +311,7 @@ Build 临时 VM 与最终模板使用同一 NetworkSpec resolver；未声明 hos
   (+kind), requested_target?, checkpoint_mode, steps[], start_cmd, ready_cmd, paths, net,
   resources, sandbox_resources, sandbox_spec/namespaces/env, mmds_enabled, envd_token,
   insecure, platform, runtime_timeouts, timeouts}`；task env 含
-  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据。artifact Prepare 含 RunID、source kind/ref、恢复已准备 Snapshot 时的受理 E、LaunchMode、manifest config、
+  `MANIFEST_KEY`、可信节点的 `KUASAR_SECRET_PLUGINS` 配置，以及租户 `FLATTEN_*` 拉取凭据。artifact Prepare 含 RunID、source kind/ref、恢复已准备 Snapshot 时的受理 E、LaunchMode、manifest config、
   ref-location parent、ref 上限和从 execution claim 起算的绝对 deadline。task 读取根 cfg 后向
   `POST /internal/task/build/prepare` 提交 `{build_id,run_id,version,summary}`；相同对与 digest replay 返回同一 final result，
   冲突返回 409，HTTP waiter 取消不撤销已接受 summary。`paths` 是宿主侧工件与工具
@@ -775,10 +775,11 @@ BuildRunDir/BuildBaseDir 清理, 再由终态提交释放 execution claim. 完�
 
 解析结果加密存 `builds.registry_auth_enc`,构建时解出注入
 `FLATTEN_REGISTRY_{USERNAME,PASSWORD|TOKEN}`(flatten-ctl `pkg/remote` 读取,token
-优先),**经 exec env 进入 import 阶段的 guest——入 guest 的只有 `FLATTEN_*`,
-`MANIFEST_KEY` 永不入 guest**。租户 roots/pull credentials 在 SQLite 中加密保存，授权运行时会解密：已认证 task
-收到明文值，MANIFEST_KEY 安装到宿主 task 环境，选中的 FLATTEN_* 值进入 guest exec
-环境。通过环境传递不等于加密。这些平台凭据不进入生成的 phase YAML；调用方 workload
+优先),**经 exec env 进入 import 阶段 guest 的只有 `FLATTEN_*`**。
+`MANIFEST_KEY` 和 `KUASAR_SECRET_PLUGINS` 仅安装到宿主 task 环境。租户 root 配置与
+pull credentials 在 SQLite 中加密保存，授权运行时解密。已认证 task 收到原始
+`MANIFEST_KEY` 文本，内容可以是 hex 或 Secret plugin 引用；引用仅在宿主使用边界
+解析为实际密钥。选中的 `FLATTEN_*` 值进入 guest exec 环境。通过环境传递不等于加密。这些平台凭据不进入生成的 phase YAML；调用方 workload
 env/files 自身可含敏感值，应与这些平台根凭据区分。
 
 **不支持**:多源 COPY(e2b executor 亦只取 src+dst)、step 级缓存(`force` 字段

@@ -208,12 +208,14 @@ type BuildResult struct {
 
 // Build is one template build plus its retention-bounded status/index history.
 type Build struct {
+	ManifestKeyFingerprint string `json:"-"` // validated material identity, retained from the existing database column
+
 	WorkspacePlan []workspace.Prepared `json:"-"`
 	BuildID       string               // node or cluster Build business identity
 	TemplateID    string               // immutable transient registration handle
 	PersistID     string               // <profile>-<kind>-<base64url(portable-ref)>, set when ready
 	APISecret     string               // per-tenant API authentication root (hex)
-	ManifestKey   string               // per-tenant manifest encryption root (hex)
+	ManifestKey   string               // per-tenant manifest encryption root (hex or Secret plugin reference)
 	Profile       Profile              // immutable output profile selected at registration
 	Kind          Kind                 // terminal resolved artifact kind; empty while nonterminal
 	FromImage     string               // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate

@@ -50,6 +50,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
@@ -258,7 +259,7 @@ func installBuildTaskEnvironment(
 		}
 	}
 	return installTaskEnvironment(env, func(key, value string) error {
-		if key != "MANIFEST_KEY" {
+		if key != "MANIFEST_KEY" && key != secret.Env {
 			return nil
 		}
 		return setenv(key, value)

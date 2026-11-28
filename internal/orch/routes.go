@@ -10,6 +10,7 @@ import (
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -53,7 +54,7 @@ func (o *Orchestrator) routeEntryContext(ctx context.Context, sb *types.Sandbox)
 
 func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
-	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
+	manifestKeyFingerprint, _ := manifestkey.KnownFingerprint(sb.ManifestKey, sb.ManifestKeyFingerprint)
 	e := routesync.RouteEntry{
 		InstanceID: sb.InstanceID, AutoReset: sb.AutoReset, IdleTimeout: types.CloneIdleTimeout(sb.IdleTimeout),
 		PauseReason: sb.PauseReason, ResourceObligation: sb.ResourceObligation,
@@ -74,7 +75,7 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 		TrafficAccessToken:     sb.TrafficAccessToken,
 		ForwardAccessToken:     sb.ForwardAccessToken,
 		ArtifactLocation:       artifactLocation(sb.ResumeSource.Ref),
-		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.APISecret, sb.ID)),
 		RunID:                  sb.RunID,
 	}
 	if sb.BaseDir != "" && (sb.State == types.StateDead || sb.State == types.StateDeleting) {

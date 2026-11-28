@@ -2,8 +2,8 @@ package routesync
 
 import (
 	"encoding/json"
-	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
@@ -203,7 +203,7 @@ type Command struct {
 	APISecretRef           string `json:"api_secret_ref,omitempty"`           // provider ref
 	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"` // full fingerprint of manifest content key
 	ManifestKeyType        string `json:"manifest_key_type,omitempty"`        // inline | ref
-	ManifestKey            string `json:"manifest_key,omitempty"`             // hex; only on inline key_put
+	ManifestKey            string `json:"manifest_key,omitempty"`             // hex or Secret plugin reference; only on inline key_put
 	ManifestKeyRef         string `json:"manifest_key_ref,omitempty"`         // provider ref
 	ExpiresUnix            int64  `json:"expires_unix,omitempty"`             // lease expiry (key_put)
 	// build_register (docs/cluster.md#cluster-build): pre-provision a build with registry-assigned ids +

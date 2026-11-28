@@ -2,7 +2,6 @@ package placer
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodegroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
@@ -313,9 +313,6 @@ func normalizeManifestKey(key clusterstate.Secret) (clusterstate.Secret, error) 
 		if key.Value == "" {
 			return clusterstate.Secret{}, fmt.Errorf("manifest_key inline value is required")
 		}
-		if _, err := decodeRoot("manifest_key", key.Value); err != nil {
-			return clusterstate.Secret{}, err
-		}
 		return clusterstate.Secret{Type: keyType, Value: key.Value}, nil
 	case clusterstate.SecretRef:
 		if key.Value == "" {
@@ -361,6 +358,10 @@ func normalizeAPISecret(apiSecret clusterstate.Secret) (clusterstate.Secret, err
 }
 
 func materializeAPISecret(manifestKey, apiSecret clusterstate.Secret) (clusterstate.Secret, error) {
+	return materializeAPISecretContext(context.Background(), manifestKey, apiSecret)
+}
+
+func materializeAPISecretContext(ctx context.Context, manifestKey, apiSecret clusterstate.Secret) (clusterstate.Secret, error) {
 	if !secretAbsent(apiSecret) {
 		return normalizeAPISecret(apiSecret)
 	}
@@ -374,23 +375,26 @@ func materializeAPISecret(manifestKey, apiSecret clusterstate.Secret) (clusterst
 	if manifestKey.Type != clusterstate.SecretInline {
 		return clusterstate.Secret{}, fmt.Errorf("api_secret is required when manifest_key is not inline")
 	}
-	raw, err := hex.DecodeString(manifestKey.Value)
+	raw, err := manifestkey.Resolve(ctx, manifestKey.Value)
 	if err != nil {
-		return clusterstate.Secret{}, fmt.Errorf("manifest_key must be 64 lowercase hexadecimal characters")
+		return clusterstate.Secret{}, err
+	}
+	defer clear(raw[:])
+	if _, err := manifestkey.KnownFingerprint(manifestKey.Value, manifestkey.Fingerprint(raw)); err != nil {
+		return clusterstate.Secret{}, err
 	}
 	return clusterstate.Secret{
 		Type:  clusterstate.SecretInline,
-		Value: hex.EncodeToString(apikey.DeriveAPISecret(raw)),
+		Value: hex.EncodeToString(apikey.DeriveAPISecret(raw[:])),
 	}, nil
 }
 
-func manifestKeyFingerprint(manifestKeyHex string) (string, error) {
-	raw, err := decodeRoot("manifest_key", manifestKeyHex)
-	if err != nil {
-		return "", err
+func manifestKeyFingerprint(manifestKeyText string, known ...string) (string, error) {
+	fp := ""
+	if len(known) != 0 {
+		fp = known[0]
 	}
-	fp := sha256.Sum256(raw)
-	return hex.EncodeToString(fp[:]), nil
+	return manifestkey.KnownFingerprint(manifestKeyText, fp)
 }
 
 func apiSecretFingerprint(apiSecretHex string) (string, error) {

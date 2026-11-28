@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 )
 
@@ -81,8 +82,22 @@ func NewWithCredentials(ctx context.Context, c *config.FilesStorageConfig, provi
 		adapter := &awsCredentialsProvider{provider: provider, first: &first}
 		opts = append(opts, awsconfig.WithCredentialsProvider(aws.NewCredentialsCache(adapter)))
 	} else if c.AccessKey != "" {
+		accessKey, err := secret.Resolve(ctx, c.AccessKey, secret.Literal)
+		if err != nil {
+			return nil, fmt.Errorf("filestore: resolve access key: %w", err)
+		}
+		defer clear(accessKey)
+		secretKey, err := secret.Resolve(ctx, c.SecretKey, secret.Literal)
+		if err != nil {
+			return nil, fmt.Errorf("filestore: resolve secret key: %w", err)
+		}
+		defer clear(secretKey)
+		if (secret.IsReference(c.AccessKey) && len(accessKey) == 0) ||
+			(secret.IsReference(c.SecretKey) && len(secretKey) == 0) {
+			return nil, fmt.Errorf("filestore: plugin credentials must not be empty")
+		}
 		opts = append(opts, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, "")))
+			credentials.NewStaticCredentialsProvider(string(accessKey), string(secretKey), "")))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {

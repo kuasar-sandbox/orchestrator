@@ -284,7 +284,7 @@ func retainBuildRegistrationCredentials(request *conductorextension.BuildRegiste
 func registeredBuildFromCandidate(buildID string, pair store.KeyPair, candidate *normalizedBuildRegistration, fromImage string) *types.Build {
 	return &types.Build{
 		BuildID: buildID, TemplateID: candidate.templateID,
-		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
+		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
 		Profile: candidate.profile,
 		Status:  types.BuildRegistered, FromImage: fromImage,
 		Names: candidate.names, Aliases: candidate.aliases,
@@ -305,7 +305,7 @@ func (o *Orchestrator) validateInitialBuildMMDS(build *types.Build, document san
 	transportRow := &types.Sandbox{
 		ID: buildMMDSID(build.BuildID), Profile: build.Profile, TemplateID: build.TemplateID,
 		State: types.StateRunning, RunID: "build-registration-check",
-		APISecret: build.APISecret, ManifestKey: build.ManifestKey, Metadata: build.Metadata,
+		APISecret: build.APISecret, ManifestKey: build.ManifestKey, ManifestKeyFingerprint: build.ManifestKeyFingerprint, Metadata: build.Metadata,
 	}
 	if err := validateMMDSRouteEntry(transportRow, document.Routes, initial.values); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -317,7 +317,7 @@ func (o *Orchestrator) validateInitialBuildMMDS(build *types.Build, document san
 // command, including confidential registration fields, without persisting
 // those fields in plaintext. CmdID is deliberately excluded so an ACK retry can
 // carry a new transport command ID while retaining the same business identity.
-func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesync.Command) (string, error) {
+func clusterBuildRegistrationRequestDigest(manifestKey [32]byte, command *routesync.Command) (string, error) {
 	type identity struct {
 		BuildID              string
 		TemplateID           string
@@ -351,7 +351,7 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 	if err != nil {
 		return "", fmt.Errorf("build_register: encode request identity: %w", err)
 	}
-	digest := hmac.New(sha256.New, []byte(manifestKey))
+	digest := hmac.New(sha256.New, []byte(hex.EncodeToString(manifestKey[:])))
 	_, _ = digest.Write(payload)
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }

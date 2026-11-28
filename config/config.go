@@ -69,7 +69,7 @@ type Conductor struct {
 	// (docs/cluster.md#node-attachment); empty = standalone single-node.
 	Cluster ClusterConfig `yaml:"cluster" json:"cluster"`
 	// Singular top-level references.
-	EncryptionKey  string `yaml:"encryption_key" json:"encryption_key"`   // credential at-rest AES-256 (":"-sep, first active); or NODE_CONFIG_ENCRYPTION_KEY env
+	EncryptionKey  string `yaml:"encryption_key" json:"encryption_key"`   // ":"-separated hex keys or @plugin/key refs, first active; or NODE_CONFIG_ENCRYPTION_KEY env
 	ManifestConfig string `yaml:"manifest_config" json:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
 }
 
@@ -359,7 +359,7 @@ type APIConfig struct {
 // TLSConfig is the wildcard TLS material.
 type TLSConfig struct {
 	Cert string `yaml:"cert" json:"cert"`
-	Key  string `yaml:"key" json:"key"`
+	Key  string `yaml:"key" json:"key"` // private key file path or @plugin/key reference
 }
 
 // ProxyConfig is the conductor-owned sandbox data-plane policy and the
@@ -909,8 +909,8 @@ type FilesStorageConfig struct {
 	Region    string `yaml:"region" json:"region"`         // e.g. "cn-north-4" / "us-east-1"
 	Bucket    string `yaml:"bucket" json:"bucket"`         // required
 	Prefix    string `yaml:"prefix" json:"prefix"`         // optional key prefix
-	AccessKey string `yaml:"access_key" json:"access_key"` // empty → AWS default chain (env / instance role)
-	SecretKey string `yaml:"secret_key" json:"secret_key"` // paired with access_key
+	AccessKey string `yaml:"access_key" json:"access_key"` // literal or @plugin/key; empty → AWS default chain
+	SecretKey string `yaml:"secret_key" json:"secret_key"` // literal or @plugin/key, paired with access_key
 	// ForcePathStyle selects path-style addressing (host/bucket/key). Default
 	// false (virtual-host, what AWS S3 / OBS use); versitygw / minio need true.
 	ForcePathStyle bool `yaml:"force_path_style" json:"force_path_style"`

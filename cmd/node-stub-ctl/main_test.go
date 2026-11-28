@@ -1113,6 +1113,12 @@ func TestKeyPutRejectsHalfPairAndFingerprintRebinding(t *testing.T) {
 		ManifestKeyFingerprint: manifestKeyFingerprint, ManifestKeyType: "inline", ManifestKey: manifestKey,
 		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
 	}
+	uppercase := *put
+	uppercase.ManifestKey = strings.Repeat("AB", 32)
+	uppercase.ManifestKeyFingerprint = testStubFingerprint(t, strings.Repeat("ab", 32))
+	if got := node.HandleCommand(context.Background(), &uppercase); got.Status != routesync.AckRejected {
+		t.Fatalf("non-canonical native key_put ack = %+v", got)
+	}
 	if got := node.HandleCommand(context.Background(), put); got.Status != routesync.AckAccepted {
 		t.Fatalf("initial key_put ack = %+v", got)
 	}

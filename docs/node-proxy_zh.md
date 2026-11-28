@@ -104,7 +104,7 @@ API UDS，不使用 Proxy StatsSocket。
   CONNECT 200 后还必须授权完整首个 ExecRequest.失败请求不得触发 parking、Wake/resume
   或 backend dial.最终 node proxy 只将双重 gate 通过的请求交给 ctl tunnel helper,
   不向租户开放任意 UDS 或其它 ctl capability.
-- **确定性 MMDS 密钥**:`MmdsSecret = HMAC-SHA256(manifest_key, "kuasar-mmds-v1:" + sid)`（先将十六进制 manifest key 解码为字节）,PUT 和 GET 即使落到
+- **确定性 MMDS 密钥**:`MmdsSecret = HMAC-SHA256(api_secret, "kuasar-mmds-v1:" + sid)`（先将十六进制 APISecret 解码为字节）,PUT 和 GET 即使落到
   不同 worker 也一致。
 
 <a id="sdk-configuration"></a>
@@ -182,14 +182,15 @@ TrafficAccessToken 仅供外部网关及 e2b
 
 ## 密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)
 
-- **根凭据分工**:APISecret 与 ManifestKey 是同一租户范围内用途分离的根凭据,都是
-  32B / 64-lowercase-hex。APISecret 用于 API 请求认证和派生 Sandbox ServiceSecret;
+- **根凭据分工**:APISecret 与 ManifestKey 是同一租户范围内用途分离的根凭据,其中 APISecret 采用
+  32B / 64-lowercase-hex；ManifestKey 以 hex 文本或 `@kms/tenant/manifest-v1`
+  这类 Secret plugin 引用传递，实际获取的密钥必须为 32 字节。APISecret 用于 API 请求认证和派生 Sandbox ServiceSecret;
   ManifestKey 是 manifest 内容键(`MANIFEST_KEY` env / `manifest.key`),也用于封装镜像
   拉取令牌。创建凭据对时可显式给出 APISecret;
   缺省值采用固定、域隔离的 KDF:
 
   ```
-  APISecret = HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")
+  APISecret = HMAC-SHA256(Resolve(ManifestKey), "kuasar-api-secret-v1")
   ```
 
   **api_key 只由 APISecret 签发和验证**(`e2b-key-ctl gen-apikey`):
@@ -205,9 +206,10 @@ TrafficAccessToken 仅供外部网关及 e2b
 - **加密落盘**:`manifest_keys` / `sandboxes` / `builds` 三表均保存完整凭据对;
   `api_secret_enc`、`manifest_key_enc` 使用 AES-256-GCM(`internal/secretbox`:
   记录 = `keytag(4)‖nonce(12)‖ct+tag`,keytag 选解密钥)。两者各存完整 64-hex
-  SHA-256 指纹;API key 内的 24-hex 短指纹只作候选预筛,不作唯一身份。
+  SHA-256 指纹，按实际密钥字节计算；ManifestKey 引用在加密字段中保留原文。
+  注册入口在数据库事务前验证实际材料，路由投影使用保留的指纹，不请求 broker。API key 内的 24-hex 短指纹只作候选预筛,不作唯一身份。
   加密密钥经 `encryption_key` / `NODE_CONFIG_ENCRYPTION_KEY`(`:` 分隔多键,[0]
-  活动、其余备用解旧记录,支持轮换)。
+  活动、其余备用解旧记录,支持轮换；每项可为 hex 或 `@plugin/key` 引用)。
 - **鉴权解析**(短 hash 匹配 + 完整 MAC 校验):api_key → 按 APISecret 候选指纹
   命中行/白名单 → 解密 APISecret → 重算 HMAC 比对:
   - **create / build / import**:APISecret+ManifestKey 凭据对须在 `manifest_keys` 白名单
@@ -228,8 +230,9 @@ TrafficAccessToken 仅供外部网关及 e2b
   且最终exec env只有一个authoritative `MANIFEST_KEY`。conductor可持久化/投递该值，但 sandbox/build host preparation
   不调用 CustomerKey、不建立 key-bound reader、不打开/解密/解析租户制品。
   `<sid>.yaml`非密不含根凭据。
-  builder task同样只在认证后取得 authoritative env；run-builder仅把`MANIFEST_KEY`安装为
-  process-wide reader authority，并先清除继承的registry credential keys。registry凭据只保留在
+  builder task同样只在认证后取得 authoritative env；run-builder在初始化制品 reader 前安装
+  `MANIFEST_KEY` 和可信节点的 `KUASAR_SECRET_PLUGINS`，并先清除继承的registry credential keys。
+  普通 sandbox task bootstrap 同样显式传递节点插件配置，task/guest 配置不能覆盖它，guest 无需接入 broker。registry凭据只保留在
   本地BuildSpec中，定向传给需要它的host flatten调用或guest import命令，不被phase
   `sandbox-ctl`及其后代环境继承；最终仍只有一个`MANIFEST_KEY`条目。
   APISecret 由 serve 用于 API 认证和 ServiceSecret 派生,并可投影给可信 router/proxy;
@@ -257,8 +260,10 @@ TrafficAccessToken 仅供外部网关及 e2b
   3 段线格式,canonical no-padding base64url,32-byte signature,固定 JSON 字段/顺序,
   UUIDv7,SID,audience 和可选 expiry.session ID 只在 KAT 内部使用,不在 API 响应中外显.
   `MmdsSecret =
-  HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
-  密钥；此处 sid 是 node-local SandboxID，不是 StableID，manifest key 先从 hex 解码为字节；`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md [MMDS](#mmds))。
+  HMAC-SHA256(api_secret, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
+  密钥；此处 sid 是 node-local SandboxID，不是 StableID，APISecret 先从 hex 解码为字节；`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md [MMDS](#mmds))。
+  从旧 ManifestKey 派生方式升级后，已有 MMDS session token 需要重新获取；若 APISecret
+  采用缺省派生，它仍间接依赖 ManifestKey。
 - **MMDS route value 独立存储**:`MmdsSecret` 只签名/验证 MMDSv2 token;
   `MMDSRouteSecretValues` 才是 secret route 返回的敏感 value 集合。每个 sandbox/build
   owner 各有一份 encrypted JSON blob,只编码实际 name→opaque bytes,不保存 version、
@@ -275,6 +280,12 @@ TrafficAccessToken 仅供外部网关及 e2b
 create/build 凭据对白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平面**的瘦
 客户端(经本机控制 socket,[本机控制 socket(run / task / admin / plugin / api 平面)](node_zh.md#local-control-channels))——daemon 是该表唯一写者,CLI 不开 DB、不读 config,
 只需 `--socket`(或 `NODE_CTL_SOCKET` env,默认 `/run/sandbox/node-ctl.socket`)。
+注册引用前，先在节点进程配置 `KUASAR_SECRET_PLUGINS`，例如
+`kms::/run/secret-broker.sock:cache_ttl=30s:cache_size=4k`。daemon 和 host task
+须能访问指定 socket。引用应包含稳定版本并持续标识同一实际密钥；参见
+[Secret plugin 协议与缓存说明](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/secret-plugins_zh.md)。
+APISecret 和 ServiceSecret 保持原有输入格式。
+
 ManifestKey 取自位置参数或 `MANIFEST_KEY` env;APISecret 可用 `--api-secret` / `API_SECRET`
 显式指定,缺省则按 [密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](#credential-model) 固定 KDF 派生。两者原子成对入库;输出只含两者的完整指纹,
 绝不回显根凭据。集群下该表另由 registry 经 node-link 以租约项写入([集群接入(node-link)](cluster_zh.md#node-attachment)、cluster.md),
@@ -445,7 +456,7 @@ node-proxy.md [Proxy 命令与配置](#proxy-configuration),[转发路径](#tran
 |---|---|---|
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md [routesync 与共享路由视图](#route-synchronization)) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md [数据面鉴权](#authorization)) |
-| `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
+| `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex 或 `@plugin/key` 引用，每项实际为 32 字节；首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关([路由权威与广播](#route-publication),node-proxy.md [MMDS](#mmds)):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 | `mmds.routes.enabled` | `false` | 是否接受租户声明的 static/secret/service exact route;要求 `mmds.enabled=true` |

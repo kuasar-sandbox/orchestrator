@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/helperexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspacedisk"
@@ -64,7 +65,11 @@ func (o *Orchestrator) ExportWorkspace(ctx context.Context, id, apiKey, name str
 	if err := result.ValidateExport(); err != nil {
 		return types.WorkspaceExportResult{}, api.ErrWorkspaceUnavailable
 	}
-	token, err := migrationtoken.SealWorkspace(migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey}, *result.Disk)
+	_, material, err := migrationKeyMaterial(guard, store.KeyPair{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey, ManifestKeyFingerprint: sb.ManifestKeyFingerprint})
+	if err != nil {
+		return types.WorkspaceExportResult{}, err
+	}
+	token, err := migrationtoken.SealWorkspaceContext(guard, material, *result.Disk)
 	if err != nil {
 		return types.WorkspaceExportResult{}, err
 	}

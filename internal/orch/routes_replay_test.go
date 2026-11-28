@@ -45,7 +45,7 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 		got.ManifestKeyFingerprint != manifestFingerprint || got.ServiceSecret != sb.ServiceSecret ||
 		got.EnvdAccessToken != "envd" || got.TrafficAccessToken != "traffic" ||
 		got.ForwardAccessToken != "forward" || got.ArtifactLocation != "remote" ||
-		got.MmdsSecret != hex.EncodeToString(keys.MmdsSecret(manifestKey, sb.ID)) {
+		got.MmdsSecret != hex.EncodeToString(keys.MmdsSecret(apiSecret, sb.ID)) {
 		t.Fatalf("route entry = %+v", got)
 	}
 	if got.MaxInflightPatch == nil || got.MaxInflightPatch.Total == nil || *got.MaxInflightPatch.Total != 32 ||
@@ -91,7 +91,7 @@ func TestStartingSandboxProjectsMMDS(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "starting", Profile: types.ProfileE2B, State: types.StateStarting,
 		TemplateID: "template", FloatingIP: "100.100.0.4", EnvdUDS: "/run/starting/envd.sock",
-		EnvdAccessToken: "envd", ForwardAccessToken: "forward", ManifestKey: strings.Repeat("4", 64),
+		EnvdAccessToken: "envd", ForwardAccessToken: "forward", APISecret: strings.Repeat("3", 64), ManifestKey: strings.Repeat("4", 64),
 	}
 	got := o.routeEntry(sb)
 	if got.State != string(types.StateStarting) || got.FloatingIP != sb.FloatingIP ||

@@ -8,15 +8,18 @@
 package regcreds
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 )
 
 // Flatten env var names (mirror accelerator/pkg/remote/auth.go; token wins).
@@ -143,25 +146,32 @@ const tokenPrefix = "kpt_"
 // sealKey derives the AES-256 key for a tenant's pull tokens from their manifest
 // key. The tenant holds the manifest key (their root secret) and the orchestrator
 // holds it encrypted at rest, so both can seal/open without sharing an operator key.
-func sealKey(manifestKeyHex string) ([]byte, error) {
-	if len(manifestKeyHex) != 64 || manifestKeyHex != strings.ToLower(manifestKeyHex) {
+func sealKey(ctx context.Context, text string) ([]byte, error) {
+	if !secret.IsReference(text) && (len(text) != 64 || text != strings.ToLower(text)) {
 		return nil, fmt.Errorf("regcreds: manifest key must be 64 lowercase hex characters")
 	}
-	if raw, err := hex.DecodeString(manifestKeyHex); err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("regcreds: manifest key must be 64 lowercase hex characters")
+	canonical, err := manifestkey.Canonical(ctx, text)
+	if err != nil {
+		return nil, fmt.Errorf("regcreds: resolve manifest key: %w", err)
 	}
-	k := sha256.Sum256([]byte("kuasar-pull-token-v1:" + manifestKeyHex))
+	// The wire protocol hashes canonical hex text, not the raw root bytes.
+	k := sha256.Sum256([]byte("kuasar-pull-token-v1:" + canonical))
 	return k[:], nil
 }
 
 // Seal AES-256-GCM-encrypts creds with the tenant's sealing key, returning an opaque
 // "kpt_<base64url>" token safe to carry in api_headers (only the orchestrator, with
 // the tenant's manifest key, can open it).
-func Seal(manifestKeyHex string, c Creds) (string, error) {
+func Seal(manifestKeyText string, c Creds) (string, error) {
+	return SealContext(context.Background(), manifestKeyText, c)
+}
+
+// SealContext is Seal with cancellation for ManifestKey resolution.
+func SealContext(ctx context.Context, manifestKeyText string, c Creds) (string, error) {
 	if c.Empty() {
 		return "", fmt.Errorf("regcreds: no credentials to seal")
 	}
-	gcm, err := newGCM(manifestKeyHex)
+	gcm, err := newGCM(ctx, manifestKeyText)
 	if err != nil {
 		return "", err
 	}
@@ -175,11 +185,16 @@ func Seal(manifestKeyHex string, c Creds) (string, error) {
 }
 
 // Open decrypts a kpt_ token with the tenant's sealing key.
-func Open(manifestKeyHex, token string) (Creds, error) {
+func Open(manifestKeyText, token string) (Creds, error) {
+	return OpenContext(context.Background(), manifestKeyText, token)
+}
+
+// OpenContext is Open with cancellation for ManifestKey resolution.
+func OpenContext(ctx context.Context, manifestKeyText, token string) (Creds, error) {
 	if !strings.HasPrefix(token, tokenPrefix) {
 		return Creds{}, fmt.Errorf("regcreds: not a pull token")
 	}
-	gcm, err := newGCM(manifestKeyHex)
+	gcm, err := newGCM(ctx, manifestKeyText)
 	if err != nil {
 		return Creds{}, err
 	}
@@ -202,8 +217,8 @@ func Open(manifestKeyHex, token string) (Creds, error) {
 	return c, nil
 }
 
-func newGCM(manifestKeyHex string) (cipher.AEAD, error) {
-	key, err := sealKey(manifestKeyHex)
+func newGCM(ctx context.Context, manifestKeyText string) (cipher.AEAD, error) {
+	key, err := sealKey(ctx, manifestKeyText)
 	if err != nil {
 		return nil, err
 	}

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -34,6 +35,7 @@ func decodeJournalTarget(t *testing.T, target string) (string, map[string]string
 }
 
 func TestSandboxLaunchJournalIdentity(t *testing.T) {
+	t.Setenv(secret.Env, "")
 	o := testOrchCfg(t, &config.Config{})
 	o.vs = stubVS{}
 	for _, tc := range []struct {
@@ -71,7 +73,9 @@ func TestSandboxLaunchJournalIdentity(t *testing.T) {
 					t.Fatalf("%s occurs %d times in %v", flag, count, spec.Args)
 				}
 			}
-			if got := sandboxTaskEnv(sb); !reflect.DeepEqual(got, map[string]string{"MANIFEST_KEY": sb.ManifestKey}) {
+			// An explicit empty plugin setting clears an inherited task value;
+			// neither carrier is journal identity or belongs in launch arguments.
+			if got := sandboxTaskEnv(sb); !reflect.DeepEqual(got, map[string]string{"MANIFEST_KEY": sb.ManifestKey, secret.Env: ""}) {
 				t.Fatalf("obsolete log identity environment: %#v", got)
 			}
 			if strings.Contains(strings.Join(spec.Args, " "), sb.ManifestKey) {

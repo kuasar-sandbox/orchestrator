@@ -27,25 +27,26 @@ func MintSecret() (string, error) {
 func MintToken() (string, error) { return MintSecret() }
 
 // mmdsSecretInfo binds the derivation to its purpose + version so the key never
-// collides with another use of the manifest key.
+// collides with another use of the API secret.
 const mmdsSecretInfo = "kuasar-mmds-v1:"
 
 // MmdsSecret derives the per-sandbox HMAC key the MMDS service signs session tokens
 // with. It is deterministic: every proxy worker (and the orchestrator) derives the
-// same 32-byte key from the sandbox's manifest key + id, so a token minted by one
+// same 32-byte key from the sandbox's API secret + id, so a token minted by one
 // process verifies in any other — which is what makes a multi-worker independent Proxy
-// (and node failover) coherent, unlike a per-process random secret. manifestKeyHex
-// is the tenant manifest key (hex); an empty or non-hex key yields nil (the caller
+// (and node failover) coherent, unlike a per-process random secret. apiSecretHex
+// is the tenant API secret (hex); an empty or non-hex key yields nil (the caller
 // treats that as "no secret available").
 //
-// HMAC-SHA256 is used directly as the KDF (no HKDF-Extract): the manifest key is
+// HMAC-SHA256 is used directly as the KDF (no HKDF-Extract): the API secret is
 // already a uniformly random 32-byte root, so expand alone is sound.
-func MmdsSecret(manifestKeyHex, sandboxID string) []byte {
-	mk, err := hex.DecodeString(manifestKeyHex)
-	if err != nil || len(mk) == 0 {
+func MmdsSecret(apiSecretHex, sandboxID string) []byte {
+	root, err := hex.DecodeString(apiSecretHex)
+	if err != nil || len(root) != 32 {
 		return nil
 	}
-	mac := hmac.New(sha256.New, mk)
+	defer clear(root)
+	mac := hmac.New(sha256.New, root)
 	mac.Write([]byte(mmdsSecretInfo + sandboxID))
 	return mac.Sum(nil)
 }

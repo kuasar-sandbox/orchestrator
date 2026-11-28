@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/metadata"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	records "github.com/kuasar-sandbox/orchestrator/internal/storage/record"
 )
 
@@ -19,6 +20,20 @@ func (s *Store) PutKeyPair(ctx context.Context, nodeID string, pair metadata.Nod
 	if err != nil {
 		return metadata.Versioned[metadata.NodeKeyPair]{}, err
 	}
+	if normalized.ManifestKeyType == metadata.SecretInline {
+		key, err := manifestkey.Resolve(ctx, normalized.ManifestKey)
+		if err != nil {
+			return metadata.Versioned[metadata.NodeKeyPair]{}, err
+		}
+		fp := manifestkey.Fingerprint(key)
+		clear(key[:])
+		if _, err := manifestkey.KnownFingerprint(normalized.ManifestKey, fp); err != nil {
+			return metadata.Versioned[metadata.NodeKeyPair]{}, invalidRecord(err.Error())
+		}
+		if fp != normalized.ManifestKeyFingerprint {
+			return metadata.Versioned[metadata.NodeKeyPair]{}, invalidRecord("manifest key fingerprint mismatch")
+		}
+	}
 	var out metadata.NodeKeyPair
 	version, err := s.mutate(ctx, func(m *mutation) (bool, error) {
 		if err := s.guardLive(m, nodeID); err != nil {
@@ -33,7 +48,11 @@ func (s *Store) PutKeyPair(ctx context.Context, nodeID string, pair metadata.Nod
 			if !metadata.SameKeyPairMaterial(current.Value, normalized) {
 				return false, metadata.ErrOwnershipConflict
 			}
-			if out.AckedExpiresUnix == 0 {
+			if current.Value.ManifestKey != normalized.ManifestKey {
+				// A different carrier for the same material still needs delivery:
+				// an ACK for the previous hex text must not confirm a new reference.
+				out.AckedExpiresUnix = 0
+			} else if out.AckedExpiresUnix == 0 {
 				out.AckedExpiresUnix = current.Value.AckedExpiresUnix
 			}
 		}
@@ -62,7 +81,7 @@ func (s *Store) AckKeyPair(ctx context.Context, nodeID string, pair metadata.Nod
 		if err != nil || !current.Exists {
 			return false, err
 		}
-		if current.Value.ExpiresUnix != normalized.ExpiresUnix || !metadata.SameKeyPairMaterial(current.Value, normalized) {
+		if current.Value.ExpiresUnix != normalized.ExpiresUnix || current.Value.ManifestKey != normalized.ManifestKey || !metadata.SameKeyPairMaterial(current.Value, normalized) {
 			return false, nil
 		}
 		matched = true

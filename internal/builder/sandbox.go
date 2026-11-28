@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"golang.org/x/sys/unix"
@@ -68,6 +69,7 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 	}
 	cmd.Env = authoritativeProcessEnv(map[string]string{
 		"MANIFEST_KEY": s.Env["MANIFEST_KEY"],
+		secret.Env:     s.Env[secret.Env],
 	})
 	// Component/app/console logs use explicit targets. Original process stderr
 	// remains available for early CLI errors, CH stderr and journal fallback.

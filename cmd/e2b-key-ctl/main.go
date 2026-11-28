@@ -1,7 +1,8 @@
-// Command e2b-key-ctl is a pure-derivation tool for e2b credentials. It mints e2b
+// Command e2b-key-ctl is a credential tool for e2b. It mints e2b
 // API keys from a tenant API secret, derives the default API secret associated
-// with a manifest key, and generates root secrets — no DB, config, or orchestrator
-// state. APISecret authenticates API requests; ManifestKey protects content.
+// with a manifest key, and generates root secrets without a database or an
+// orchestrator connection. APISecret authenticates API requests; ManifestKey
+// protects content and may use a configured Secret plugin reference.
 //
 //	e2b-key-ctl gen-apikey        [<API_SECRET>]
 //	e2b-key-ctl derive-api-secret [<MANIFEST_KEY>]
@@ -13,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
@@ -20,7 +22,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/manifestkey"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/version"
 )
@@ -71,19 +75,19 @@ func usage() {
 func sealPullToken(args []string) error {
 	// Pull a leading positional manifest key out before flag parsing (Go's flag
 	// package stops at the first positional), so both orderings work.
-	mkHex := os.Getenv("MANIFEST_KEY")
+	manifestText := os.Getenv("MANIFEST_KEY")
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		mkHex, args = args[0], args[1:]
+		manifestText, args = args[0], args[1:]
 	}
 	fs := flag.NewFlagSet("seal-pull-token", flag.ExitOnError)
 	user := fs.String("registry-username", "", "registry username")
 	pass := fs.String("registry-password", "", "registry password")
 	token := fs.String("registry-token", "", "registry bearer token (wins over username/password)")
 	_ = fs.Parse(args)
-	if mkHex == "" {
+	if manifestText == "" {
 		return fmt.Errorf("provide MANIFEST_KEY as the first argument or env")
 	}
-	tok, err := regcreds.Seal(mkHex, regcreds.Creds{Username: *user, Password: *pass, Token: *token})
+	tok, err := regcreds.SealContext(context.Background(), manifestText, regcreds.Creds{Username: *user, Password: *pass, Token: *token})
 	if err != nil {
 		return err
 	}
@@ -91,23 +95,41 @@ func sealPullToken(args []string) error {
 	return nil
 }
 
-// rootSecretArg reads a canonical 64-hex root secret from the first argument or
-// the named environment variable.
+// rootSecretArg reads a root secret from the first argument or the named
+// environment variable. Only MANIFEST_KEY accepts Secret plugin references.
 func rootSecretArg(args []string, envName string) []byte {
-	hexKey := os.Getenv(envName)
+	text := os.Getenv(envName)
 	if len(args) > 0 {
-		hexKey = args[0]
+		text = args[0]
 	}
-	if hexKey == "" {
-		fmt.Fprintf(os.Stderr, "e2b-key-ctl: provide %s as an argument or env\n", envName)
-		os.Exit(2)
-	}
-	raw, err := hex.DecodeString(hexKey)
-	if err != nil || len(raw) != 32 || hexKey != strings.ToLower(hexKey) {
-		fmt.Fprintf(os.Stderr, "e2b-key-ctl: %s must be 64 lowercase hex chars (32 bytes)\n", envName)
+	raw, err := resolveRootSecret(context.Background(), text, envName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "e2b-key-ctl:", err)
 		os.Exit(2)
 	}
 	return raw
+}
+
+func resolveRootSecret(ctx context.Context, text, envName string) ([]byte, error) {
+	if text == "" {
+		return nil, fmt.Errorf("provide %s as an argument or env", envName)
+	}
+	if envName == "MANIFEST_KEY" {
+		if !secret.IsReference(text) && (len(text) != 64 || text != strings.ToLower(text)) {
+			return nil, fmt.Errorf("%s must be 64 lowercase hex chars (32 bytes)", envName)
+		}
+		key, err := manifestkey.Resolve(ctx, text)
+		if err != nil {
+			return nil, err
+		}
+		return key[:], nil
+	}
+	raw, err := hex.DecodeString(text)
+	if err != nil || len(raw) != 32 || text != strings.ToLower(text) {
+		clear(raw)
+		return nil, fmt.Errorf("%s must be 64 lowercase hex chars (32 bytes)", envName)
+	}
+	return raw, nil
 }
 
 func check(err error) {

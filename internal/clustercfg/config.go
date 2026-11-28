@@ -7,6 +7,7 @@ package clustercfg
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"gopkg.in/yaml.v3"
 )
 
@@ -172,17 +174,37 @@ type ShuffleRule struct {
 // TLS is mTLS material (cert/key + CA for peer verification).
 type TLS struct {
 	Cert string `yaml:"cert"`
-	Key  string `yaml:"key"`
+	Key  string `yaml:"key"` // private key file or @plugin/key reference
 	CA   string `yaml:"ca"`
 }
 
 // Enabled reports whether a TLS server/client should be configured (cert + key).
 func (t TLS) Enabled() bool { return t.Cert != "" && t.Key != "" }
 
+// Certificate reads the configured certificate file and resolves its private
+// key as either a file path or a Secret plugin reference to PEM bytes.
+func (t TLS) Certificate(ctx context.Context) (tls.Certificate, error) {
+	certPEM, err := os.ReadFile(t.Cert)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM, err := secret.Resolve(ctx, t.Key, os.ReadFile)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	defer clear(keyPEM)
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
 // ServerConfig builds a server tls.Config; a CA enables mTLS (require + verify
 // client certs). h2 is advertised so registry links and ingress negotiate HTTP/2.
 func (t TLS) ServerConfig() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
+	return t.ServerConfigContext(context.Background())
+}
+
+// ServerConfigContext is ServerConfig with cancellation for key resolution.
+func (t TLS) ServerConfigContext(ctx context.Context) (*tls.Config, error) {
+	cert, err := t.Certificate(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -201,9 +223,14 @@ func (t TLS) ServerConfig() (*tls.Config, error) {
 // ClientConfig builds a client tls.Config (client cert for mTLS + CA to verify the
 // server); serverName sets the verification/SNI name when non-empty.
 func (t TLS) ClientConfig(serverName string) (*tls.Config, error) {
+	return t.ClientConfigContext(context.Background(), serverName)
+}
+
+// ClientConfigContext is ClientConfig with cancellation for key resolution.
+func (t TLS) ClientConfigContext(ctx context.Context, serverName string) (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"h2"}, ServerName: serverName}
 	if t.Cert != "" && t.Key != "" {
-		cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
+		cert, err := t.Certificate(ctx)
 		if err != nil {
 			return nil, err
 		}
