@@ -188,7 +188,8 @@ func TestRunPoolCancelBeforeCommitNeverHandsTaskToRunner(t *testing.T) {
 	}
 }
 
-func TestRunPoolCommitSuccessWinsConcurrentCancel(t *testing.T) {
+// Race check: assignment commit and cancellation share waiter lifecycle state.
+func TestRaceRunPoolCommitSuccessWinsConcurrentCancel(t *testing.T) {
 	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
 	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
 	assignCtx, cancelAssign := context.WithCancel(baseCtx)
