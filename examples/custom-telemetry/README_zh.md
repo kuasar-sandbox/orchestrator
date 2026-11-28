@@ -4,10 +4,12 @@
 
 本示例是可运行的静态 App 集成入口。公共 SDK 与生命周期契约见[应用扩展](../../docs/extensions_zh.md#examples)；部署和运行要求仍由对应能力文档维护。
 
-构建受信、静态链接的 App：
+在仓库根目录，按[所选源码构建工作区](../../CONTRIBUTING_zh.md)使用开发用户构建，再单独安装产物：
 
 ```sh
-CGO_ENABLED=0 go build -o /opt/kuasar/bin/custom-telemetry ./examples/custom-telemetry
+mkdir -p out
+CGO_ENABLED=0 go build -o out/custom-telemetry ./examples/custom-telemetry
+sudo install -D -o root -g root -m 0755 out/custom-telemetry /opt/kuasar/bin/custom-telemetry
 ```
 
 保护 executable，禁止 group/world 写入。root 启动要求 root 属主；非 root 启动接受

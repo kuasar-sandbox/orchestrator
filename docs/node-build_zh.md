@@ -16,12 +16,23 @@
 
 前提是已配置 Node/API key/TLS 信任，`APP_IMAGE` 为可达、原生架构、digest 固定
 且已包含应用的镜像。复用 Node 的 registry 凭据，不需要 COPY bucket。[Build API](#build-api)定义 Register、Trigger、Status 的权威契约；本用例使用 HTTP，显式目标通过 Register Header 表达。
-项目固定的 E2B Python 2.25.1 支持 auto 流程，但 `Template.build(headers=...)`
-把 Builder 头同时传给 Register 和 Trigger，不适合 register-only 显式目标。
+项目固定的 E2B Python 2.25.1 支持 auto 流程，并在 Register、Trigger 间共用 `headers`。
+Trigger 允许重发完全相同的 `X-Kuasar-Sandbox-Network`，以及仅含已注册
+`target` 的 Builder 头，作为**等值断言**，不允许新增或修改这些输入。其他 Sandbox
+配置头仅在 Register 接受；Trigger 拒绝非空 `metadata`。下面的分步 HTTP 配方只在 Register 发送
+配置，在 Trigger 提交来源及构建步骤。
 
 选择 `BUILD_KIND=img` 仅发布镜像，`sbx` 发布带 portable 默认值的冷 E，`snp`
 发布初始化内存 S。S 需设置实际服务 `APP_START` 和 `APP_READY`；显式 Image
-不能传入这些命令。构建声明或继承 workspace 时，将本例的 `BUILD_KIND` 设为 `sbx` 或 `snp`，注册请求就会包含显式的 Sandbox 目标。无 workspace 的构建可使用 auto，有有效 start 或 ready 命令时选内存 S，否则选 Image。本例使用 Demo 执行预算，请按节点检查准入。
+不能传入这些命令。构建声明或继承 workspace 时，将本例的 `BUILD_KIND` 设为 `sbx` 或 `snp`，注册请求就会包含显式的 Sandbox 目标。无 workspace 的构建可使用 auto，有有效 start 或 ready 命令时选内存 S，否则选 Image。本例申请 2 vCPU、6,144 MiB 执行内存；请按工作负载调整，并检查 Node 的准入预算。
+
+原生 egress 或非默认 transit 路径需要在运行前将 `KUASAR_NETWORK_JSON` 设为
+部署的[网络对象](sandbox-lifecycle_zh.md#network-and-egress)。例如 Area 7 使用
+`{"transit_gateway_ip":"192.0.2.10","transit_geneve_vni":7}`，其中 `192.0.2.10`
+须换为实际可达的 egress underlay 地址；节点默认值不能提供可用 resolver 时，再加入
+部署的 DNS 配置。示例仅在 **Register** 发送该对象；Trigger 只提交来源及构建步骤，
+不携带通用配置头。Sandbox E/S 产物保留逻辑网络；Image 目标中的网络用于 Build
+执行，不会成为镜像级的 Sandbox 默认网络。
 
 ```python
 import json, os, time, urllib.request
@@ -48,9 +59,15 @@ def call(method, path, body=None, extra=None):
         raw = response.read()
         return json.loads(raw) if raw else None
 
+register_headers = {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})}
+if os.environ.get("KUASAR_NETWORK_JSON"):
+    network = json.loads(os.environ["KUASAR_NETWORK_JSON"])
+    if not isinstance(network, dict):
+        raise ValueError("KUASAR_NETWORK_JSON must be a JSON object")
+    register_headers["X-Kuasar-Sandbox-Network"] = json.dumps(network)
 registered = call("POST", "/v3/templates",
     {"name": "explicit-example", "profile": "e2b", "cpuCount": 2, "memoryMB": 6144},
-    {"X-Kuasar-Sandbox-Builder": json.dumps({"target": targets[kind]})})
+    register_headers)
 tid, bid = registered["templateID"], registered["buildID"]
 print("Keep registration/build handles:", tid, bid)
 trigger = {"fromImage": os.environ["APP_IMAGE"]}
@@ -115,7 +132,7 @@ transient templateID = transient-<registration-id>  保留以查询、取消和�
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?, envVars?}`;CPU/memory 定义用于准入和 A/B 阶段沙箱规格的不可变 **Build.Resources**,最终目标 Sandbox 资源独立解析. `X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400. Builder `target` 是 register-only immutable 定义; `X-Kuasar-Sandbox-Resource` 则定义最终 Sandbox template resources, 不供 A/B 使用. `profile∈{e2b,bare}`,省略取 `e2b`;响应返回请求的 `target`。声明了 workspace 时须显式指定 Sandbox 目标 |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger 可重发已注册 Network 或仅含已注册 target 的 Builder 头作为等值断言；注册时未给值或值不同，在 Hook/COPY/credential/queue 副作用前返回 400。其他 Builder 选项、Resource 等配置头和非空 Trigger metadata 仍拒绝;execution 不足时留在固定节点 FIFO waiting |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段, requested `target`, 终态 derived `kind`, 及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`, `cancelRequested`, `deleteRequested`, `executionClaimed`, `runID`, `storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 [按目标执行与发布](#execution-and-publication) |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile`、requested `target` 和 resolved artifact `kind` |
@@ -174,7 +191,7 @@ Cancel 204 表示执行和清理均已完成;未被其他操作删除的记录�
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元不设置 `TimeoutStartSec`;另有独立的 60 秒 fencing/宿主清理窗口,见 [持久化、恢复与保留](#recovery)) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw([按目标执行与发布](#execution-and-publication)) |
 
-独立 NUMA 预算使用[资源池与放置](node-resource_zh.md#resource-pools)；[Node NUMA 部署](node_zh.md#numa-deployment-with-multiple-pools) 另示范共享默认资源预算、手工管理放置策略的模板。部署应在真实主机验证有效放置与跨池恢复。Builder 在全局执行准入后选池；制品准备取得权威 Capacity 后，可在最终启动前更换准备 worker。实际执行的 A/B/C 阶段保持在同一 Builder unit 及资源池内。Builder `size` 是预热目标，可选 worker `capacity` 限制槽位；资源池声明容量与运行预算是另一层约束。由构建产物创建的后续 Sandbox 独立选择 runner，制品不会把它固定到 Build 宿主的 NUMA 节点。
+独立 NUMA 预算使用[资源池与放置](node-resource_zh.md#resource-pools)；[Node NUMA 部署](node_zh.md#numa-deployment-with-multiple-pools) 给出配置与验证顺序，以及旧纯放置模板的调整方式。部署应在真实主机验证有效放置与跨池恢复。Builder 在全局执行准入后选池；制品准备取得权威 Capacity 后，可在最终启动前更换准备 worker。实际执行的 A/B/C 阶段保持在同一 Builder unit 及资源池内。Builder `size` 是预热目标，可选 worker `capacity` 限制槽位；资源池声明容量与运行预算是另一层约束。由构建产物创建的后续 Sandbox 独立选择 runner，制品不会把它固定到 Build 宿主的 NUMA 节点。
 
 Builder 配置直接替换下列旧字段，不保留 alias：
 
@@ -218,7 +235,7 @@ Create 与 Register 复用 resource/network/traffic/launch/init/mounts/files/met
 已移除的 Build Register 顶层 `secure` 字段只要出现就返回 HTTP 400，包括 false 或 null；它不是 Build 安全模式。
 普通 Build runtime 输入存 `builds.metadata_json`,build-only 输入存 `builds.builder_json`;
 只服务本次执行与制品生成,不是 canonical TemplateID 的长期 metadata lookup。
-Trigger 不能覆盖注册 metadata、Builder/Resource 或其他通用配置头;非空通用 metadata/header 被拒绝。
+Trigger 不能覆盖任何注册配置。仅允许前述 Network 和 Builder target 头作为等值断言，其他通用 metadata/header 仍拒绝。Network 断言使用已知 JSON schema，拒绝重复/未知字段及 null；比较规范化值，不比较 JSON 空白和对象键顺序。Builder target 断言只接受规范字段名 `target`、`kind` 和 `memory`，拒绝大小写别名和冲突拼写。断言跨 extension Hook 保持由 core 拥有。
 
 - 同步接纳时,已知为 Image 的 target 拒绝归一化后仍存在的 Sandbox resource/traffic/launch/init/mounts/files/metadata/checkpoint/MMDS namespace,
   以及非空 `envVars`、非零 credential override 或显式 MMDS routes/secrets。

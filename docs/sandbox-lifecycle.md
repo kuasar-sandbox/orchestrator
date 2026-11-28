@@ -8,6 +8,19 @@ Use this contract to create, inspect, pause, resume, reset, delete, export and i
 
 **Read by task:** [API](#sandbox-api) · [Identity](#create-identity) · [Pause](#capture-and-pause) · [Resume](#resume) · [Reset and retention](#reset-and-retention) · [Export and migrate](#publication-and-migration) · [Request inputs](#request-configuration) · [State ownership](#state-and-ownership)
 
+<a id="recommended-workflow"></a>
+
+## Recommended application workflow
+
+1. **Choose and retain a real template.** Use the canonical ID from a successful [Build](node-build.md#client-workflow). Choose Image for a cold image start, Sandbox E for a cold start with captured disk/configuration, or Snapshot S to restore initialized memory. Keep the referenced artifacts and their tenant keys available.
+2. **Decide persistent inputs before Create.** Declare application environment, resources, [network/egress](#network-and-egress) and any [workspace](#workspace-storage) through the supported request namespaces. Use a workspace for data that will pass between sandboxes; its explicit disk size or source avoids relying on an undeclared node default.
+3. **Create once and retain the returned SandboxID.** HTTP 201 accepts durable `starting`; it is not a guest-readiness result. Use the normal [SDK command/file path](node-proxy.md#connect-a-client). If startup fails or a request times out, inspect the original identity and execution result before creating a replacement. Caller-selected identity has [conflict semantics](#create-identity), not unconditional idempotent replay.
+4. **Pause and reconnect with the intended state.** The default memory pause retains S and its paired disk E. `memory:false` on Pause retains disk/configuration without running memory. On Connect, omit memory to use the retained source, require `memory:true` only when S exists, or choose `memory:false` for a cold restart from E. Wait for the requested operation and inspect state instead of assuming a transport timeout rolled it back.
+5. **Share the intended object.** To hand over one data disk, sync application writes, pause the source and [export/attach its workspace](#workspace-storage). To move a whole paused sandbox or publish it as a template, use [export/import](#export-import-command). Workspace consumers get private writable layers; exporting a disk does not create a shared concurrent writable filesystem.
+6. **Finish or preserve explicitly.** Delete when the sandbox and its owned local data are no longer needed. Delete acceptance can precede physical cleanup, and the same node-local ID remains occupied until cleanup completes. Keep `--keep-source` when an export should retain its source; without it, successful sandbox export accepts source deletion. Canonical remote artifacts have their own retention lifetime.
+
+For a `dead` sandbox with useful data, inspect the execution result and [Reset/retention choices](#reset-and-retention) before Delete. Reset creates a cold-startable paused E; it does not restore the failed process's memory.
+
 <a id="reading-path"></a>
 
 ## Reading the lifecycle
@@ -107,7 +120,7 @@ and uses normal defaults.
 An empty string field means unspecified. An absent StableID remains empty in the
 stored optional field; `Sandbox.StableID()` supplies the local-ID fallback.
 
-Both nonempty fields in this new Create configuration use the existing
+Nonempty `id` and `stable_id` fields in Create identity configuration follow the
 `ValidLocalSandboxID` contract: 1..57 bytes, lowercase ASCII letters, digits and
 hyphens, starting and ending with a letter or digit. The exact pattern is
 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
@@ -902,7 +915,7 @@ Cold launch from E uses the target node's configured kernel and runtime, preserv
 
 If Connect must import a missing target, its memory selector also chooses the imported durable source: false stores E-only before cold launch. A later launch failure leaves paused E. For subsequent paused resumes, auto remains cold and true returns 409 until a new S is captured. This differs from one cold attempt on an existing local paused S. Import never rewrites the original token or deletes its S/E artifacts; see [Import selection](#import-selection).
 
-Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. A future autoResume=false must be separate traffic policy, not inferred from E/S kind; complete E2B autoResume is not implemented.
+Ordinary Proxy ingress and native exec activation call OnWake with ResumeTriggerWake; ExecSession uses ResumeTriggerExecSession. Public Route/Exec trigger constants remain extension contracts, although conductor no longer owns those data adapters. All these entries request ResumeAuto: S→memory, E→cold. SHM carries neither source kind nor cold gate. An authenticated first E request stays parked until cold launch, running route and successful backend dial. E/S kind selects the restore source; it does not disable traffic-triggered Wake. `autoResume=false` is not a supported traffic policy.
 
 <a id="reset-and-retention"></a>
 
@@ -1191,6 +1204,61 @@ stdout. Invalid/trailing JSON, polluted stdout, missing result or roots, wrong
 root role, unsafe local refs and incoherent template/root pairs fail explicitly.
 The client also checks response read errors. No empty credential is printed as
 success. The full response contract is documented in [Publication, templates and migration](#publication-and-migration).
+
+<a id="network-and-egress"></a>
+
+## Select the network and outbound egress
+
+Prepare the native egress and DNS path described in the [Connector networking
+guide](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress.md#deployment-and-ownership),
+then match the workload's logical network to that deployment. API/Proxy ingress
+can work while guest outbound access is still unconfigured.
+
+| Input | Meaning | Where to set it |
+|---|---|---|
+| `transit_gateway_ip` | Reachable underlay IPv4 address of the egress/transit gateway | Create or Build Register network namespace; inherited from Sandbox E/S when present |
+| `transit_geneve_vni` | Connector Area VNI, for example `7` | The same request namespace; must match the egress Area |
+| `inner_ip` / `nexthop` | Guest NIC CIDR and its default-route next hop | Request network namespace or node's per-profile `sandbox.network.e2b` / `.bare` defaults |
+| `dns` | Resolver addresses written into guest configuration | Request network namespace or `sandbox.network.dns`; the chosen path must actually reach these resolvers |
+
+The gateway underlay address is not the guest `nexthop`, and Area VNI is not a
+guest subnet or an API port. Conductor's `sandbox.network` schema has no
+`transit_gateway_ip` or `transit_geneve_vni` default fields. Connector does not
+infer Area 7 from the deployed egress attachment. An omitted/zero VNI is not a
+request for that Area.
+
+For a deployment whose egress Area is 7, the request header is:
+
+```http
+X-Kuasar-Sandbox-Network: {"transit_gateway_ip":"192.0.2.10","transit_geneve_vni":7}
+```
+
+Replace `192.0.2.10` with the real egress underlay address before use. An SDK can
+send the same object as a JSON string in existing Create metadata:
+
+```json
+{
+  "templateID": "<canonical-template-id>",
+  "metadata": {
+    "kuasar-sandbox.network": "{\"transit_gateway_ip\":\"192.0.2.10\",\"transit_geneve_vni\":7}"
+  }
+}
+```
+
+For a Build, choose this input at **registration**. Trigger cannot change it;
+it accepts the identical Network header as an equality assertion for SDKs that
+reuse headers. The separate-call [Build recipe](node-build.md#client-workflow) accepts `KUASAR_NETWORK_JSON`
+for that purpose. A Sandbox E/S template carries its logical network with E;
+explicit current fields override inherited artifact fields. Image artifacts do
+not carry those Sandbox defaults, so supply the network again when creating
+from an Image. Existing captured state does not acquire a new network policy
+because an operator edits a node example file.
+
+Validate guest DNS and an intended outbound destination from the actual
+workload, then inspect Connector counters when the path fails. For inbound
+commands/files, use [Proxy/client diagnosis](node-proxy.md#connect-a-client).
+Do not patch a guest's Envd address or use a client-side HTTP proxy to compensate
+for a missing transit/Area match.
 
 <a id="request-configuration"></a>
 

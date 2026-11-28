@@ -8,6 +8,32 @@ Choose an observation surface by its ownership and precision. Journal output, na
 
 **Read by task:** [Choose a surface](#observation-surfaces) · [Current stats](#native-stats-api) · [Exact usage](#native-usage) · [Logs](#logs) · [Telemetry](#telemetry) · [Configure Telemetry](#telemetry-configuration)
 
+<a id="diagnose-a-request"></a>
+
+## Diagnose a request in order
+
+Retain the SandboxID or BuildID, operation, response and installed version. For a cluster also retain Group and the current Node target. Start with read-only observations so an inspection does not unintentionally wake a paused sandbox.
+
+| Symptom or question | First observation | Next decision |
+|---|---|---|
+| Create/Connect was accepted, but commands are unavailable | `GET /sandboxes/{id}` and its state/execution result | `starting` needs readiness/admission diagnosis; `dead` needs the recorded failure and retention decision |
+| New work waits or capacity appears exhausted | [Resource status, list and pressure](node-resource.md#operate-resources) | Identify the pool, reservation, startup or recovery constraint before changing budgets |
+| API works but guest commands/files do not | [Client data-path check](node-proxy.md#connect-a-client), Proxy/guest logs and `/stats/traffic` | Verify the actual data endpoint, authorization and readiness; API success alone is insufficient |
+| Build appears stuck or the client timed out | Status for the saved transient TemplateID and BuildID; `node-ctl builder status` | Inspect the current phase and cleanup intent, then cancel/delete using the existing handles if needed |
+| Current sandbox memory/CPU or traffic | `/sandboxes/{id}/stats/resource` and `/stats/traffic` | Use valid observed fields; unavailable fields are not zero and reading does not wake the guest |
+| Cumulative accounting | `/sandboxes/{id}/stats/usage` | Keep exact integer accounting and its checkpoint/retention semantics; do not substitute sampled metric sums |
+| Historical metrics are missing | Telemetry service/configuration and `/sandboxes/{id}/metrics` | Confirm collection, local/remote writes and the chosen query backend separately |
+| Cluster default Create has no eligible Node | `run-cluster-ctl status` for the Group and each Node | Compare publication revision, registration and eligibility as in [first cluster](cluster.md#minimum-cluster) |
+
+The API observations use the owning tenant key, and cluster requests also carry the Group. For logs on the responsible host, use the explicit identities rather than a broad search by guest process name:
+
+```sh
+journalctl KUASAR_SANDBOX_ID="$SANDBOX_ID"
+journalctl KUASAR_BUILD_ID="$BUILD_ID"
+```
+
+Narrow a sandbox investigation to `KUASAR_RUN_ID` when an identity has multiple executions, or query `KUASAR_STABLE_ID` when following an identity-preserving move. The [journal contract](#logs) explains which output carries each field and its delivery limits. Native current stats and usage remain available independently of Telemetry where their runtime/retained data exists; Telemetry failure is not evidence that the Sandbox lifecycle failed.
+
 <a id="observation-surfaces"></a>
 
 ## Observation surfaces
@@ -383,16 +409,16 @@ journalctl SYSLOG_IDENTIFIER=build KUASAR_BUILD_ID=build-17
 ```
 
 Queries operate on the journal being read; cross-node collection is the
-platform operator's responsibility. This change does not add an exporter or a
-central log store.
+platform operator's responsibility. The journal integration provides no exporter
+or central log store.
 
 <a id="journal-boundaries-and-verification"></a>
 
 ### Boundaries and verification
 
-No guest environment, StdioSpec/MUX wire, public API, metadata/header, snapshot
-format or authentication identity is changed. `MANIFEST_KEY` stays on the
-existing secret delivery path and is never included in output targets.
+Journal routing is independent of the guest environment, StdioSpec/MUX wire,
+public API, metadata/header, snapshot format and authentication identity.
+`MANIFEST_KEY` uses the secret delivery path and is never included in output targets.
 `--log-to` only selects runtime component diagnostics: it does not replace
 process descriptors or capture Cloud Hypervisor stderr, runtime panics,
 node-ctl pre-exec messages or systemd events.
@@ -430,23 +456,20 @@ Telemetry is independently configured and deployed. Its source/identity rules, e
 
 <a id="telemetry-release-scope"></a>
 
-### Source and release scope
+### Supported data and deployment
 
-This contract describes orchestrator main, including the merged standalone service
-(#359), namespace contract (#364), native Collector assembly (#370) and query/export
-separation (#371). It is implemented, not the earlier system-wide OTel proposal.
-The separate control-plane tracing PR #219 does not establish delivered API tracing.
-Sandbox business ingress/query here is metrics-specific; linked infrastructure
-Collector components do not imply sandbox logs/traces query support.
+Telemetry runs as an independent service. It separates tenant namespaces,
+assembles native Collector components, and configures metric export and query
+backends independently. Sandbox business ingress and query support metrics;
+control-plane API tracing and sandbox log/trace queries are not provided by this
+service. Linked infrastructure Collector components do not expand that contract.
 
-For deployment, pin one aggregate Release and inspect its selected orchestrator
-version, packaged guide and `node-ctl telemetry --help`; validate configuration with
-that binary and run this document's verification path. A main-branch guide, a
-Preview manifest or an open release-selection PR is not proof of Stable inclusion.
-Do not backport this configuration by inference to older releases. Unit tests and
-namespace/OTLP integration coverage establish their tested cases, not arbitrary
-exporter destinations or production capacity. Validate your chosen exporter,
-query backend, identity isolation and retention under your own failure conditions.
+Pin an aggregate release and use its packaged guide and
+`node-ctl telemetry --help` with the matching binary. Validate the complete
+configuration and follow the verification steps below. Test the selected exporter,
+query backend, tenant isolation and retention under your deployment's failure
+conditions; configuration validity alone does not establish backend availability
+or production capacity.
 
 <a id="telemetry-components"></a>
 
@@ -538,12 +561,11 @@ Enabling local storage alone selects neither a write pipeline nor a query backen
 | Local plus remote fan-out | Enable local and reference `sandboxlocal` plus remote exporters; explicitly select one query backend |
 | Custom query contract | Statically bind `Runtime.MetricsHandler` with `query.handler: custom` |
 
-The old unreleased `telemetry.storage`, combined `extension.Storage`,
-`Runtime.Storage` and `Runtime.StorageHeaders` contracts are replaced directly.
-Use `local`, `query`, `Runtime.QueryBackend` and `Runtime.QueryHeaders`; the local
-Collector exporter is now `sandboxlocal`. There is no parsing alias or second
-runtime path. The write exporter and read backend are configured and validated
-separately: an OTLP destination is not automatically a query backend. Remote
+Configure storage with `local` and `query`, and bind custom backends through
+`Runtime.QueryBackend` and `Runtime.QueryHeaders`. The local Collector exporter
+is `sandboxlocal`. `telemetry.storage`, `extension.Storage`, `Runtime.Storage`
+and `Runtime.StorageHeaders` are unsupported names, with no parsing aliases.
+The write exporter and read backend are configured and validated separately: an OTLP destination is not automatically a query backend. Remote
 errors never select a local database or become successful empty history.
 
 <a id="local-tsdb"></a>

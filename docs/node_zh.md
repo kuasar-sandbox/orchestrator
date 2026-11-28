@@ -6,6 +6,27 @@
 
 本篇维护计算节点的服务角色、共享配置、systemd 池、可信本地通道与运行依赖。完整平台部署从[项目快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)进入。[Sandbox 生命周期](sandbox-lifecycle_zh.md)、[Build](node-build_zh.md)、[访问](node-proxy_zh.md)、[资源](node-resource_zh.md)、[观测](observability_zh.md)、[集群](cluster_zh.md)及[扩展](extensions_zh.md)分别维护能力的精确定义。
 
+**阅读路径：** [启动服务](#conductor-command) · [配置](#conductor-configuration) · [Pool 与 unit](#systemd-pools) · [本地通道](#local-control-channels) · [恢复](#recovery)
+
+<a id="operate-a-node"></a>
+
+## 运维已安装节点
+
+从持久化 [node-infra 安装](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)开始。安装布局决定服务名称、状态目录和有序配置 overlay，应用本指南时沿用这些值。`deploy/` 的组件示例说明相同 schema，但不是已有安装的替换配置。
+
+1. **确认安装版本与实际输入。** 记录 `node-ctl --version` 及聚合版本，从已安装 Conductor/Proxy unit 读取完整 `--config` 文件列表。分别执行 `node-ctl config conductor --config FILE[:OVERLAY...] --resolve` 和 `node-ctl config proxy --config FILE[:OVERLAY...]` 验证。后文件覆盖前文件，列表整体替换而非追加。渲染配置应采用与源配置相同的访问保护。
+2. **接纳 Build 前先验证存储与网络。** 持久保存 `paths.base_root`、Node 数据库及其加密密钥；准备配置中的 kernel/runtime、artifact store 或命名位置。新可写盘采用[模板引用](#diff-template-references)，原生 egress 和 DNS 按 Connector [网络指南](https://github.com/kuasar-sandbox/connector/blob/main/docs/egress_zh.md#部署和归属)配置。Proxy 入站和 guest 出站是两条独立路径。
+3. **启动已安装服务并授权一个租户。** SDK 流程需要 Conductor 与 Proxy。通过 Conductor 本地 admin socket 安装租户根凭据对，再按[凭据指南](node-proxy_zh.md#credential-model)签发客户端 API key。租户凭据对、Node 加密密钥须与依赖它们的数据一同保留。需要历史指标时增加 Telemetry。
+4. **构建并运行应用。** 完成 [Build 配方](node-build_zh.md#client-workflow)，保存 canonical TemplateID，再执行[客户端检查](node-proxy_zh.md#connect-a-client)。数据请求仍等待启动时检查同一个 SandboxID；准入等待由[资源检查](node-resource_zh.md#operate-resources)定位。
+5. **有序变更配置。** 重启负责该配置的服务前，验证完整有序文件列表。现有执行按[恢复](#recovery)处理；worker 放置变更按 [NUMA/资源池](#numa-deployment-with-multiple-pools)处理。配置有效或 daemon-reload 不表示运行中的 guest 已修改，也不会移动 worker。
+6. **验证单节点后再扩展。** [首次集群](cluster_zh.md#minimum-cluster)保留这些 Node 服务，增加 Registry/Router。向统一入口提交工作前，先发布并检查各 Node 的 Group 支持；Placer 可选。
+
+故障排查保留安装版本、实际配置文件列表、SandboxID 或 BuildID 及原请求响应。[诊断顺序](observability_zh.md#diagnose-a-request)从这些输入开始，无需修改内部数据库行。
+
+<a id="service-roles"></a>
+
+## 概述
+
 `node-ctl conductor serve` 是计算节点上的单实例控制 daemon,对外提供一套 **e2b 兼容 API**,把节点上的
 microVM 沙箱以 e2b 协议暴露给客户端——在本文协议与已验证版本支持的操作范围内，未改造的 e2b SDK（python/js `e2b`、
 `@e2b/code-interpreter`）与 e2b CLI 可直接指向本机运行。`node-ctl conductor serve` 一身兼数职:
@@ -15,7 +36,7 @@ microVM 沙箱以 e2b 协议暴露给客户端——在本文协议与已验证�
 交由 cluster-ctl 编排,[集群接入(node-link)](cluster_zh.md#node-attachment))。独立 `node-ctl proxy serve` 承载数据面，不嵌入 conductor。
 
 node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 node-link **接入集群**
-由 registry / router / placer 编排(cluster.md);两态共用同一套 e2b 控制面与生命周期原语——
+由 Registry / Router 编排，Placer 可选（见 [集群](cluster_zh.md)）；两态共用同一套 e2b 控制面与生命周期原语——
 **控制面 create / pause / kill / 模板构建始终在本节点**,集群只下发高层命令复用这些原语([集群接入(node-link)](cluster_zh.md#node-attachment))。
 
 沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
@@ -27,12 +48,6 @@ ManifestKey 通过固定 KDF 派生。两者成对加密存储,永不落明文�
 
 产物两个二进制:**`node-ctl`**(daemon + 启动器 + 资源控制器 + 管理 CLI,[命令行接口](#commands))与
 **`e2b-key-ctl`**(纯派生凭据工具,无 DB/config/编排状态,[`e2b-key-ctl`](node-proxy_zh.md#credential-tool))。
-
-**阅读路径：** [启动服务](#conductor-command) · [配置](#conductor-configuration) · [Pool 与 unit](#systemd-pools) · [本地通道](#local-control-channels) · [恢复](#recovery)
-
-<a id="service-roles"></a>
-
-## 概述
 
 <a id="the-service-problem"></a>
 
@@ -198,7 +213,7 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 | `manifest-key` | `add`/`remove`/`check`/`list`:create/build/import 凭据对白名单管理([密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model);集群下另由 registry 租约写入,[集群接入(node-link)](cluster_zh.md#node-attachment)) |
 | `group apply` | 通过 Node 业务 API 读取一次并条件应用 Group JSON；根凭据单独安装（[Node Group 权威](cluster_zh.md#node-group-权威)） |
 | `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移([Artifact lifecycle、转模板与迁移](sandbox-lifecycle_zh.md#capture-and-pause)) |
-| `version` | 版本 |
+| `--version` | 版本 |
 
 **`e2b-key-ctl`**(纯派生,不触 DB/config/daemon):
 
@@ -209,7 +224,7 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 | `gen-apikey [<API_SECRET>]` | 用 APISecret 签发 e2b api key(`e2b_` + hex,[密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)](node-proxy_zh.md#credential-model)) |
 | `fingerprint [<API_SECRET>]` | 打印 APISecret 的完整 64-hex SHA-256 指纹 |
 | `seal-pull-token [<MANIFEST_KEY>] …` | 封装不透明镜像拉取令牌(`kpt_`,[按目标执行与发布](node-build_zh.md#execution-and-publication)) |
-| `version` | 版本 |
+| `--version` | 版本 |
 
 接住一个新节点(独立模式)的典型顺序:
 
@@ -431,10 +446,10 @@ file 形式也支持 basename 后接 `@location:<name>`，使用既有
 字节数。它仅为没有 COW base 的新盘建立空文件系统；捕获盘或已有 writer 保留
 原数据，不执行文件系统扩容。生成器、来源完整性验证与稀疏物化由 [sandboxer 共享存储契约](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/block-storage_zh.md)负责。
 
-手工准备空 raw 模板时，`mkfs.ext4 -O ^has_journal` 可避免可丢弃工作盘的文件系统
-journal 占用和元数据日志写入；内建 profile 同样不创建 journal。这不影响 journald
-或应用日志，也不提供崩溃恢复保证。已有 journal 模板和用户镜像仍然兼容，格式化
-仅适用于新建空模板。节点统一 API 的 `diskSizeMB` 在无需租户凭据即可探测时报告
+新建空白可写盘优先使用 `mkfs://ext4?size=...`；仅在需要内建 profile 不提供的
+文件系统布局或特性时，才准备外部 raw seed。内建 profile 不创建文件系统 journal，
+这是格式属性，不是普遍的性能优化建议，也不提供崩溃恢复保证。已有 journal 模板和
+用户镜像仍然兼容；不能为改变此属性而重新格式化捕获盘或已有 writer。节点统一 API 的 `diskSizeMB` 在无需租户凭据即可探测时报告
 逻辑初始盘容量；零表示不可用，绝不使用 tarstream 或 Bundle 的物理文件长度。
 
 旧 `sandbox.boot.workspace_default_disk` 键会报错并提示迁移。旧值仅包含模板时，
@@ -631,119 +646,81 @@ CH 启动前 fail closed。
 
 <a id="numa-deployment-with-multiple-pools"></a>
 
-### 使用多池进行 NUMA 部署
+### 使用资源池进行 NUMA 部署
 
-多池的主要部署场景是：让单个 Sandbox 的宿主侧执行保持在一个 NUMA 节点内，
-同时把新的执行分散到多个节点。Conductor 选择 pool 及其 systemd 模板；运维在模板上
-配置 CPU 放置与内存分配策略。这是宿主侧部署能力，不是 guest vNUMA 拓扑，
-资源池配置则提供按池容量和运行使用率的调度。
+为每份预期 NUMA 预算建立一个**资源池**，再将名称稳定的 runner/Builder 逻辑池及
+systemd 模板关联到它。Conductor 负责选池与记账，systemd/Linux 执行 CPU 和内存节点
+放置。这是宿主侧执行策略，不是 guest vNUMA 拓扑。
 
-NUMA 放置由 systemd/Linux 执行。以下示例手工管理放置策略；需要独立 NUMA 容量和
-使用率调度时，采用[资源池配置](node-resource_zh.md#resource-pools)，关联 resource_pool 和外部
-unit_dropins。部署应在真实主机检查有效 CPU/内存节点集合、页分布及跨池恢复。
+1. **读取真实主机拓扑。** 检查 CPU/NUMA 节点、SMT 线程、内存和祖先 cgroup 约束，
+   为宿主及其他服务预留资源后再分配各池预算。不能由 NUMA 编号推算 CPU 编号。
+2. **声明独立预算。** 使用完整[资源池示例](node-resource_zh.md#pool-configuration)，
+   显式填写 `resource_listen.pools[].capacity` 与 `.allocatable.memory`。为逻辑 worker
+   池指定稳定 `name`、对应 `resource_pool` 和模板。worker 的 `size` 是空闲预热目标，
+   `capacity` 限制槽位；两者都不能替代资源池容量和可分配预算。
+3. **在 worker 启动前准备放置片段。** 将运维文件放在生成模板目录之外，通过所属
+   资源池的 `unit_dropins` 引用绝对路径。`units.install: true` 时，Conductor 将片段
+   复制到关联的 runner 和 Builder 模板并 reload systemd。生成文件名与过期文件清理
+   规则见[放置契约](node-resource_zh.md#pool-systemd-placement)。
+4. **验证完整配置，再使用已安装服务部署。** 执行
+   `node-ctl config conductor --config FILE[:OVERLAY...] --resolve`。验证不会修改运行中
+   unit。首次安装先配置放置再预热；已有部署先 drain 新准入，并安排符合生命周期的
+   worker 更替，不能期待 reload 迁移现有进程。
+5. **同时验证准入与实际放置。** 检查 `resource status`、`resource list`、
+   `resource pressure`，再核对已分配 unit 的有效 CPU/内存节点 mask 与页分布。
+   依赖跨池压力恢复前，应在真实主机验证正常 pause/resume。
 
-以下示例将所有逻辑池留在共享 `default` 资源池中，只分配 unit 的放置策略，
-不建立独立 NUMA 预算；独立容量与压力记账应采用资源池配置示例。
-
-对具有在线且带内存的 NUMA 节点 0、1 的主机，用不同模板名称表达不同放置策略。
-以下内容替换完整 Conductor 配置中的 `units` 块；不要同时保留旧单池字段。
-示例 size 只是空闲预热目标，不是推荐容量：
-
-```yaml
-units:
-  dir: /etc/systemd/system
-  install: true
-  pool_wait_timeout: 5s
-  runner_pools:
-    - {unit: sandbox-runner-numa0@.service, size: 4}
-    - {unit: sandbox-runner-numa1@.service, size: 4}
-  builder_pools:
-    - {unit: sandbox-builder-numa0@.service, size: 1}
-    - {unit: sandbox-builder-numa1@.service, size: 1}
-```
-
-**先读取实际主机拓扑。** NUMA 节点号和逻辑 CPU 编号（含 SMT 线程）由机器决定，
-不能根据节点号推算 CPU 范围。确认 cgroup v2、`cpuset` controller 可用，
-且祖先 slice 允许两个目标节点及 CPU 集合：
+例如，检查具有 NUMA 节点 0、1 的主机：
 
 ```sh
 lscpu -e=CPU,NODE,SOCKET,CORE
 numactl --hardware
 cat /sys/fs/cgroup/cgroup.controllers
-cat /sys/devices/system/node/node{0,1}/cpulist
+cat /sys/devices/system/node/node0/cpulist /sys/devices/system/node/node1/cpulist
 ```
 
-**在启动 Conductor 和任何预热 worker 之前，安装运维管理的放置策略 drop-in。**
-在示例双节点主机上以 root 执行下列命令；所选节点必须有在线 CPU 和内存。
-示例使用节点完整 CPU 列表；需要为宿主服务保留 CPU 时，应将 `cpus` 改成部署选定的子集：
+假设 NUMA 节点 0 **实际选定的 CPU 子集**为 0–7，
+`/etc/kuasar/pools/numa0.conf` 可使用：
 
-```sh
-set -eu
-unit_dir=/etc/systemd/system
-for node in 0 1; do
-  cpus=$(cat "/sys/devices/system/node/node${node}/cpulist")
-  test -n "$cpus"
-  for kind in runner builder; do
-    dropin="$unit_dir/sandbox-${kind}-numa${node}@.service.d"
-    install -d -m 0755 "$dropin"
-    cat > "$dropin/20-numa.conf" <<EOF
+```ini
 [Service]
 CPUAffinity=
-CPUAffinity=$cpus
+CPUAffinity=0-7
 AllowedCPUs=
-AllowedCPUs=$cpus
+AllowedCPUs=0-7
 NUMAPolicy=bind
 NUMAMask=
-NUMAMask=$node
+NUMAMask=0
 AllowedMemoryNodes=
-AllowedMemoryNodes=$node
-EOF
-  done
-done
-systemctl daemon-reload
+AllowedMemoryNodes=0
 ```
 
-`CPUAffinity` 设置初始 CPU 亲和性；`AllowedCPUs` 通过 cgroup v2 约束整个 unit 子树。
-`NUMAPolicy=bind` 配合 `NUMAMask` 在 worker 创建线程/子进程前设置分配策略；
-`AllowedMemoryNodes` 约束 unit 允许使用的内存节点。这些是放置策略，**不是**
-`CPUQuota`、`MemoryMax`、`MemoryHigh`、每池 reservation 或 CPU 独占配置。
-Sandbox 的运行时资源执行仍由 `sandbox-ctl` 管理。
+再按节点 1 的真实拓扑建立独立片段，不能把示例 CPU 编号复制到其他机器。
+`CPUAffinity` 设定初始执行 mask，`AllowedCPUs` 限制整个 unit 子树；
+`NUMAPolicy`/`NUMAMask` 在 worker 创建子进程前指定分配策略，
+`AllowedMemoryNodes` 限定允许的内存节点。祖先 cgroup 必须允许这些集合。
+这些设置不提供 CPU 独占，也不替代 Sandboxer 的运行期资源控制。
 
-`install: true` 时，Conductor 生成各个命名基础模板及现有的两个固定 slice，
-独立管理的 `.service.d/20-numa.conf` 提供放置策略。不要把自定义属性写进会被
-Conductor 重写的基础文件。
-采用 `install: false` 时，运维应基于本版本生成的 runner/Builder 模板（[进程管理(systemd 模板单元,启动时自动生成安装)](#systemd-pools) 和 Build [Builder unit 与进程生命周期](node-build_zh.md#builder-unit-and-process-lifecycle)），
-安装四个独立的实际模板文件，以及 `sandbox-runner.slice`、`sandbox-builder.slice`，
-然后自行 reload systemd。保留当前部署的二进制路径、`%i` **RunID**、pidfile/config socket、
-`Delegate=yes`、`ctl/vmm`、清理行为及既有 slice 合同。不要用 unit alias 表达不同绑定。
-该模式下 Conductor 不执行任何模板安装或 reload。
+已有的纯放置 runner 池若仍共用 `default`，准入仍只使用一份预算；关联显式资源池后
+才获得独立记账。若此前手工安装 `.service.d/20-numa.conf`，请与 `unit_dropins`
+统一策略，避免两个文件相互冲突。Conductor 保留运维自有文件，不会代为删除。
+不要直接编辑自动生成的基础 unit。
 
-runner 和 Builder 在选定资源池内按优先级分配，同级随机。
-预热进程在分配业务前已处于对应放置策略下。Runner 父进程及其直接子进程、Builder 的各阶段子进程
-留在选定 unit 下；一个 Build 实际执行的 A/B/C 阶段仍由同一个 Builder 驱动，
-不按阶段重新取池；guest 内的工作通过这些阶段 VMM 执行。
-不要只给 Conductor daemon 绑核：unit 由 systemd 启动，放置策略必须配置到任务模板上。
-参见 [Builder unit 与进程生命周期](node-build_zh.md#builder-unit-and-process-lifecycle)。
+外部管理 unit 仍可使用 `units.install: false`。自行安装符合本版本 executable、
+RunID、pidfile、config-socket、delegation 和 cleanup 契约的真实模板及 slice；
+此模式下 Conductor 不读取或复制 `unit_dropins`。见 [systemd worker](#systemd-pools)
+与 [Builder unit](node-build_zh.md#builder-unit-and-process-lifecycle)。
 
-部署仍遵循以下边界：
+Conductor 重启后，存活执行继续使用原 unit；修改或 reload 片段不会移动已分配或
+预热进程。保留活跃或待清理执行仍需要的池身份及模板。暂停后恢复可能选择其他池，
+artifact 不会把后续 Sandbox 固定到 Build 宿主的 NUMA 节点。严格单节点绑定可能在
+其他节点仍有空闲内存时耗尽本地内存。若主动采用 `NUMAPolicy=preferred` 回退，
+还需放宽 `AllowedMemoryNodes`；记账仍归属于选定资源池。
 
-- 两个 pool 共用模板时必须共用资源池和放置策略，重复项不会自动绑定到不同节点。
-  `size` 是 idle 目标；资源池容量和运行使用率决定选池，Builder 业务 FIFO/claim 独立保留。
-- 已绑定执行保留实际 unit，Conductor 重启也不改变它。Pause/resume 需要新 runner 时
-  重新取池，可能使用另一 NUMA 节点；本特性不提供 NUMA 粘性、在线迁移，也不把宿主
-  节点身份写进可移植制品。活动或待清理执行仍依赖的模板必须保留在配置中。
-  修改/reload drop-in 不会让已有预热或已分配 worker 重新 exec 并取得新的进程策略；
-  应按生命周期安全安排 worker 更替，不要当成热迁移。
-- 严格单节点绑定可能在其他节点仍有空闲内存时触发本地回收或分配失败/OOM；
-  单次分配失败不会迁移正在运行的执行；跨池压力恢复通过资源池契约中的完整
-  Pause/Resume 生命周期完成。如有意用 `NUMAPolicy=preferred` 允许内存回退，
-  必须同时去掉或扩大单节点 `AllowedMemoryNodes`，因为 cpuset 限制优先。
-  这是以严格内存本地性换取回退；资源账本仍归属执行所选的池。
-
-设置语义参考：[systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html)、
+设置语义：[systemd.exec(5)](https://manpages.debian.org/trixie/systemd/systemd.exec.5.en.html)、
 [systemd.resource-control(5)](https://manpages.debian.org/trixie/systemd/systemd.resource-control.5.en.html)、
-[Linux NUMA memory policy](https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html)、
-[cgroup v2 cpuset](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset)。
+[Linux NUMA memory policy](https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html)
+与 [cgroup v2 cpuset](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset)。
 
 <a id="local-control-channels"></a>
 
@@ -942,7 +919,7 @@ Create 和 Build 共用既有 `kuasar-sandbox.launch` metadata 对象。E2B 在�
 
 envd 继续作为 primary，OCI/Launch 环境由 Sandboxer 按已有规则合并。Orchestrator 不重复读取镜像 Env、不改写 PATH，也不传递默认 PATH 来源标记。调用者显式 PATH 保留原值；实际选中 Runtime systemd 时，native exec 默认 PATH 包含私有工具目录。
 
-全部 E2B 模式均保留 envd primary，其 stdout/stderr 继续经应用 MUX 进入 `sandbox` journal；本轮不新增 envd plugin，不改变日志分类。
+全部 E2B 模式均运行 envd primary，其 stdout/stderr 经应用 MUX 进入 `sandbox` journal，无需额外的 envd 日志 plugin。
 
 Runtime readiness 或 envd primary 的 `app_started` 不代表 E2B Running。当前 run 必须在既有 launch context 中成功完成 `POST /init`；取消、期限耗尽或 run 已失效都不能发布 Running。零启动超时保留现有无上限语义；Guest service 就绪不要求任意用户 unit 全部健康。
 
@@ -1070,12 +1047,10 @@ Reset 先提交则旧 TTL 候选失效，Delete 先提交则 Reset 无法发布 
 重试，全部清理完成后才移除父记录和管理定位；paused 不增加 TTL。Build terminal_ttl 继续
 沿用 finished_unix 与 owner-free exact-delete 合同，不增加自动 VACUUM 或远端 artifact GC。
 
-以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。Export 保持
-publish/finalize 两阶段竞争，move 复用相同的持久删除接纳与 finalizer（#348）；#205 的 Build resources、两级准入和 cgroup
-权威不变；当前 main 仍有 post-registration Build projection，故 routesync v11 沿用 v6 引入的 Build full sync +
-live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
-节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
-cleanup stage 或第二份路径权威。
+Export 分别执行 publication 与 finalization，move 删除复用相同的持久接纳与 Node-local
+finalizer。Build 执行保持两级准入及 cgroup 归属。注册后的 Build 投影通过全量同步与实时删除
+收敛，保持已注册 Node 的不可变绑定。Node-local 清理不执行远端 artifact GC，也不维护第二份
+路径权威。
 
 因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
 已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。

@@ -1,8 +1,8 @@
 # Group support repository foundation
 
-This is the shared metadata foundation for [proposal
-#570](https://github.com/kuasar-sandbox/orchestrator/issues/570). The typed
-repository uses the existing record/short-transaction layer. No storage driver
+Implementation reference for GroupSupport publication. For current setup and operator checks, use [cluster operations](cluster.md#minimum-cluster) and [publication diagnostics](cluster.md#groups-and-placement). This foundation does not add a deployment step or a feature switch.
+
+The typed GroupSupport repository uses the shared record/short-transaction layer. No storage driver
 understands Group business semantics. Normal Node reports publish support here;
 Registry request admission reads the completed directory.
 

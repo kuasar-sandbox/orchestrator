@@ -16,65 +16,6 @@ Registry 通过类型化 repository 访问 SQLite、PostgreSQL 或 FoundationDB 
 
 **阅读路径：** [首次集群](#minimum-cluster) · [公共入口](#client-access) · [Group 与放置](#groups-and-placement) · [角色配置](#configuration) · [状态所有权](#membership-and-state) · [Link 协议](#protocols) · [故障与恢复](#failure-and-recovery)
 
-<a id="roles-and-topology"></a>
-
-## 概述
-
-<a id="overall-topology"></a>
-
-### 总体拓扑
-
-```mermaid
-flowchart TD
-  client["Client / E2B SDK"] --> router["Router"]
-  router -->|"Reserve / Resolve"| registry["Registry services"]
-  router -->|"Known target data"| node["Node Conductor and Proxy"]
-  registry <-->|"node_link commands and state"| node
-  placer["Placer and Group source"] -->|"Conditional Group imports"| registry
-  registry -->|"node_list WATCH_LIST"| placer
-  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
-```
-
-稳态数据面不经过 registry.只有显式 create/connect/exec-session,以及数据面 target 缺失或
-typed stale fallback 路径需要 registry:
-
-- `POST /route-link/v2/reserve` 以 `operation=create|connect|exec-session|data` 区分四种操作.create 直接
-  Reserve;connect/exec-session 由 registry 经 node-link 完成;data 只在 route 缺少完整 node target 或
-  node proxy 返回 typed stale 时 Reserve。未知 route 不会隐式创建 sandbox。显式 build register 调用
-  `ReserveBuild`。
-- Registry 校验请求凭据，并通过有界 GroupSupport 查询选择 Node。
-- registry 经 node owner 下发 create/connect/exec_session/delete/build/key 命令.
-- node 经 node_link 上报 sandbox/build 状态和低频节点目录。
-
-<a id="design-principles"></a>
-
-### 设计原则
-
-1. **group 是业务分片键**:所有 cluster 北向请求必须携带 `X-Kuasar-Sandbox-Group` 或等价 group
-   身份。当前不支持无 group 的 cluster 数据面入口。
-2. **持久元数据由所选数据库保存**：Registry 进程故障不会擦除元数据。数据库可用性由其配置的冗余和故障域决定，不取决于 Registry owner 数。SQLite 只支持单 Registry；共享 PostgreSQL/FDB 可使用多个成员。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
-3. **操作保持类型化范围**：Route/Build 使用 group 与记录身份，node 操作使用 NodeID，低频目录按 bucket 有界分页。不能把无关局部列表拼成权威事实。
-4. **原子性对应业务不变量**：耦合的 intent/ownership、生命周期 fence 与投影通过类型化事务提交，Registry 成员不维护彼此的元数据副本。
-5. **成员健康不参与分片计算**:成员表来自版本化配置;`LocateN` 输入只使用 membership members。
-   memberlist 只做健康检测和 meta 传播。
-6. **node 是运行态真相之源**:sandbox/build 是否仍存在以 node 上报为准。整机重启会丢失运行进程；保留的 durable row 仍须按实际 unit、checkpoint 与 cleanup ownership
-   reconcile。conductor 进程重启可接管仍存活的 unit，不能把两者写成无条件清空持久行或自动重建全部旧 sandbox；见 [状态所有权与灾备边界](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry 可靠性](#registry-reliability)。
-7. **placer 不拥有生命周期**：Placer 维护静态目标上的 Group，Registry 从已发布支持选址，Node 准入复制业务输入并执行现有生命周期。
-8. **router 不订阅海量 group**:create Reserve 返回 READY 或失败;data Reserve 也可返回 PAUSING;connect/exec-session
-   Reserve 在 node 同步准备完成后返回,不等待异步 resume.router 只维护有界 route cache;
-   在途请求不作为新请求的路由来源.
-
-<a id="role-boundaries"></a>
-
-### 角色边界
-
-| 角色 | 职责 |
-|---|---|
-| registry member | 承载业务协议、实际 node 连接与 membership，通过类型化 repository 访问持久元数据 |
-| router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,按 create/connect/exec-session/data 调用 Reserve;热路径使用本地 route cache |
-| placer | 消费 `node_list`，导入完整 Group 定义，执行条件维护和显式 apply |
-| node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/exec_session/delete/build/key 命令 |
-
 <a id="minimum-cluster"></a>
 
 ## 首次集群：一个 SQLite Registry、一个 Router、两个 Node
@@ -188,7 +129,13 @@ run-cluster-ctl status --registry https://registry-1.example:7700 \
 
 要求 `storage_readable:true`、`published:true`，`group_version` 等于本地 apply 返回 revision，且 `registration` 包含当前 Node ID、link owner 和 fence；对 node-b 重复检查。在设置默认模板前，默认 Create 的 `default_template_missing` 是预期结果，不妨碍 Build。单独成功调用 `/verify-key` 不能证明上述发布已经完成。重连或更新后，重新关联当前本地 revision 与 registration，不能用 Create 重试掩盖发布未完成。
 
-在 SDK/Build 客户端设置 `E2B_API_URL=https://api.sandboxes.example.com`、`E2B_DOMAIN=sandboxes.example.com`、`KUASAR_GROUP=first-cluster`、`BUILD_KIND=sbx`。按[首个应用示例](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/templates_zh.md#first-application)准备按 digest 固定的 `APP_IMAGE`，执行完整 [Build HTTP 示例](node-build_zh.md#client-workflow)。设置 `KUASAR_GROUP` 后，该示例会在经 Router 的注册、触发和状态请求上均携带 Group 头。等待这个确切 Build 的 `ready` 结果，将其 canonical `e2b-sbx-...` TemplateID 在两个 Node 管理会话和 SDK 客户端中导出为 `TEMPLATE_ID`；transient ID 或示意字符串不是可运行模板。
+在 SDK/Build 客户端Build 或应用需要出站访问时，先为两个 Node 配置可达的 egress gateway 与 DNS，
+按[网络与 egress](sandbox-lifecycle_zh.md#network-and-egress)设置 `KUASAR_NETWORK_JSON`。
+Gateway、Area 和返回路由须同时适用于两个 Node；E/S 模板保留逻辑网络，复制
+artifact 不会部署或改写目标网络。首次流程使用一个共同可达的 egress 路径；
+每 Node 独立 gateway 需要按 [Group 输入优先级](#groups-and-placement)明确配置请求或 Group。
+
+设置 `E2B_API_URL=https://api.sandboxes.example.com`、`E2B_DOMAIN=sandboxes.example.com`、`KUASAR_GROUP=first-cluster`、`BUILD_KIND=sbx`。按[首个应用示例](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/templates_zh.md#first-application)准备按 digest 固定的 `APP_IMAGE`，执行完整 [Build HTTP 示例](node-build_zh.md#client-workflow)。设置 `KUASAR_GROUP` 后，该示例会在经 Router 的注册、触发和状态请求上均携带 Group 头。等待这个确切 Build 的 `ready` 结果，将其 canonical `e2b-sbx-...` TemplateID 在两个 Node 管理会话和 SDK 客户端中导出为 `TEMPLATE_ID`；transient ID 或示意字符串不是可运行模板。
 
 在每个 Node 更新 Group 文件，填入 canonical template，保留 `target_port:49983`，并将 `expected_version` 设为该 Node 实际读取的 revision。例如该 revision 为 1 时：
 
@@ -376,8 +323,8 @@ server-only namespace key 和 XChaCha20-Poly1305 加密并认证，空页的游�
 Registry 仅缓存成功读取的 key，不为每页写入持久 cursor session。该不可变记录应随
 namespace 一起进入一致数据库备份，并随元数据恢复；恢复后按既有恢复合同重启缓存
 消费者。新 namespace 会有不同 key，旧游标须丢弃。损坏或已有删除历史的 key
-fail closed，不能静默重建。当前无公开删除或轮换 API，未来轮换协议须明确旧游标
-版本的接受边界。
+fail closed，不能静默重建。游标密钥没有公开删除或轮换 API；数据库备份必须保留
+namespace 密钥，才能继续验证既有 continuation。
 
 <a id="router-control-plane"></a>
 
@@ -786,7 +733,7 @@ make test-core
 python3 -B scripts/with-test-fdb.py -- make test-cluster-native
 ```
 
-`make build` 组合两条构建路径。Native target 只取得 [cluster-native-lock.json](../scripts/cluster-native-lock.json) 中 SHA256 锁定的官方 7.3.77 client/SDK 与 Debian runtime，检查 ELF 依赖和符号版本闭包，再通过包内 loader 执行真实命令的 `version`。SDK 来自官方 clients 包，因为该版本独立 headers tar 缺少必需头文件。Native 测试覆盖 driver、command 装配，以及同一套 cluster-stub 业务测试在真实、显式选择的测试数据库上的行为。`with-test-fdb.py` 只启动和清理自己的隔离本地测试库；也可显式设置 `FDB_CLUSTER_FILE` 指向已有测试库。缺少变量会报错，不会跳过 native gate。
+`make build` 组合两条构建路径。Native target 只取得 [cluster-native-lock.json](../scripts/cluster-native-lock.json) 中 SHA256 锁定的官方 7.3.77 client/SDK 与 Debian runtime，检查 ELF 依赖和符号版本闭包，再通过包内 loader 执行真实命令的 `--version`。SDK 来自官方 clients 包，因为该版本独立 headers tar 缺少必需头文件。Native 测试覆盖 driver、command 装配，以及同一套 cluster-stub 业务测试在真实、显式选择的测试数据库上的行为。`with-test-fdb.py` 只启动和清理自己的隔离本地测试库；也可显式设置 `FDB_CLUSTER_FILE` 指向已有测试库。缺少变量会报错，不会跳过 native gate。
 
 发行包包含 `bin/cluster-ctl`、`bin/run-cluster-ctl`、`lib/cluster-ctl/` 下固定运行库，以及 `share/licenses/orchestrator/native/` 下许可证和来源锁。Launcher 以显式 library path 调用包内 loader；应完整安装 archive 并通过 `run-cluster-ctl` 启动角色。配套 systemd unit 使用 `/usr/bin/run-cluster-ctl`。官方 x86_64 client 要求 AVX，此要求独立于 Go 的 `GOAMD64`。ARM 包使用原生 ARM 运行库，不带模拟器专用设置。
 
@@ -943,6 +890,65 @@ registry node_link owner or relay holder
 
 - **node-link**:注册、心跳、sandbox route 事件、Build snapshot/delta、命令、manifest key 租约。
 - **router 转发到本节点控制面 / 数据面**:pause/timeout、Build status/files 使用节点 APIEndpoint；父 Sandbox Delete 则调用 Registry，由 node-link 下发 CmdDelete。数据使用独立的 Proxy DataEndpoint 和当前 NodeSandboxID。普通 token 请求保留调用方 token；已验签的无 token 文件请求只在外层 CONNECT 添加 EnvdAccessToken，不向内层 HTTP 注入（见[数据面](#router-data-plane)）。
+
+<a id="roles-and-topology"></a>
+
+## 概述
+
+<a id="overall-topology"></a>
+
+### 总体拓扑
+
+```mermaid
+flowchart TD
+  client["Client / E2B SDK"] --> router["Router"]
+  router -->|"Reserve / Resolve"| registry["Registry services"]
+  router -->|"Known target data"| node["Node Conductor and Proxy"]
+  registry <-->|"node_link commands and state"| node
+  placer["Placer and Group source"] -->|"Conditional Group imports"| registry
+  registry -->|"node_list WATCH_LIST"| placer
+  registry -->|"Typed metadata transactions"| db["SQLite / PostgreSQL / FoundationDB"]
+```
+
+稳态数据面不经过 registry.只有显式 create/connect/exec-session,以及数据面 target 缺失或
+typed stale fallback 路径需要 registry:
+
+- `POST /route-link/v2/reserve` 以 `operation=create|connect|exec-session|data` 区分四种操作.create 直接
+  Reserve;connect/exec-session 由 registry 经 node-link 完成;data 只在 route 缺少完整 node target 或
+  node proxy 返回 typed stale 时 Reserve。未知 route 不会隐式创建 sandbox。显式 build register 调用
+  `ReserveBuild`。
+- Registry 校验请求凭据，并通过有界 GroupSupport 查询选择 Node。
+- registry 经 node owner 下发 create/connect/exec_session/delete/build/key 命令.
+- node 经 node_link 上报 sandbox/build 状态和低频节点目录。
+
+<a id="design-principles"></a>
+
+### 设计原则
+
+1. **group 是业务分片键**:所有 cluster 北向请求必须携带 `X-Kuasar-Sandbox-Group` 或等价 group
+   身份。当前不支持无 group 的 cluster 数据面入口。
+2. **持久元数据由所选数据库保存**：Registry 进程故障不会擦除元数据。数据库可用性由其配置的冗余和故障域决定，不取决于 Registry owner 数。SQLite 只支持单 Registry；共享 PostgreSQL/FDB 可使用多个成员。完整元数据丢失后，仍不能依据不完整节点报告构造执行归属。
+3. **操作保持类型化范围**：Route/Build 使用 group 与记录身份，node 操作使用 NodeID，低频目录按 bucket 有界分页。不能把无关局部列表拼成权威事实。
+4. **原子性对应业务不变量**：耦合的 intent/ownership、生命周期 fence 与投影通过类型化事务提交，Registry 成员不维护彼此的元数据副本。
+5. **成员健康不参与分片计算**:成员表来自版本化配置;`LocateN` 输入只使用 membership members。
+   memberlist 只做健康检测和 meta 传播。
+6. **node 是运行态真相之源**:sandbox/build 是否仍存在以 node 上报为准。整机重启会丢失运行进程；保留的 durable row 仍须按实际 unit、checkpoint 与 cleanup ownership
+   reconcile。conductor 进程重启可接管仍存活的 unit，不能把两者写成无条件清空持久行或自动重建全部旧 sandbox；见 [状态所有权与灾备边界](#registry-state-ownership-and-disaster-recovery-boundaries)–[Registry 可靠性](#registry-reliability)。
+7. **placer 不拥有生命周期**：Placer 维护静态目标上的 Group，Registry 从已发布支持选址，Node 准入复制业务输入并执行现有生命周期。
+8. **router 不订阅海量 group**:create Reserve 返回 READY 或失败;data Reserve 也可返回 PAUSING;connect/exec-session
+   Reserve 在 node 同步准备完成后返回,不等待异步 resume.router 只维护有界 route cache;
+   在途请求不作为新请求的路由来源.
+
+<a id="role-boundaries"></a>
+
+### 角色边界
+
+| 角色 | 职责 |
+|---|---|
+| registry member | 承载业务协议、实际 node 连接与 membership，通过类型化 repository 访问持久元数据 |
+| router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,按 create/connect/exec-session/data 调用 Reserve;热路径使用本地 route cache |
+| placer | 消费 `node_list`，导入完整 Group 定义，执行条件维护和显式 apply |
+| node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/exec_session/delete/build/key 命令 |
 
 <a id="membership-and-state"></a>
 
@@ -1265,8 +1271,8 @@ pending 重放幂等.standalone 与 cluster Delete 使用同一 finalizer,node-l
 #### 增量订阅
 
 node owner 发起订阅时可传 opaque rev 字符串。当前格式为 `source_fingerprint:seq`，由 node 私有解析，调用方仍须将 token 视为 opaque。
-fingerprint 匹配且 changelog 可用时 replay 增量，否则全量 resync。1h–6h 随机打散周期的全量
-resync 是原设计建议，当前没有实现该周期 timer；实际全量同步由连接、resume token 与 replay window 条件触发。
+fingerprint 匹配且 changelog 可用时 replay 增量，否则全量 resync。全量同步由连接、resume token
+及 replay window 条件触发，没有周期性全量 resync timer。
 
 全量订阅开始前,nodelink owner 捕获本节点 sandbox 归属表基线。bookmark 表示本轮同步结束时,只清理
 基线中未按 node_sandbox_id 出现的条目;清理前再次读取并确认当前完整稳定/节点代际归属
@@ -1888,13 +1894,8 @@ node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/bu
 所选后端的一致数据库 backup/restore 保存的是数据库记录，与应用层 import 不同。恢复须与 node 事实协调，并重启旧数据库历史的缓存消费者；恢复元数据本身不能证明旧进程仍然存在。registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
 build execution、node ref、admission 或本机 checkpoint。节点虽持久化 cluster sandbox 的独立系统上下文,
 但当前 node-link full report 不回传 Registry-owned identity;元数据数据库不可恢复地丢失时不能仅靠 route event
-重建 ownership,也不能预装 ownership 让旧事件看似合法。这条显式 recovery/bootstrap 协议尚未实现;
-[issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 是以 not planned 关闭的历史提案,不是可用恢复步骤;当前不得用手工写入执行 row 规避该限制。
-
-以 not planned 关闭的历史提案 [issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33)
-曾将带 migration token 的**未绑定持久 route**设计为可移植 paused sandbox 的灾备对象,而不是 SandboxRecord。
-该设计不携带旧 SID/NodeID/admission,拟重新 placement,由目标 node 校验 remote snapshot 并创建新身份,
-再由 READY 上报建立运行态 route。此 recovery-only workflow 尚未实现,正常 route_link API 不提供该能力。
+重建 ownership，也不能预装 ownership 让旧事件看似合法。系统不提供从存活 Node 重建这类丢失
+归属的 recovery/bootstrap 操作，不得通过手工写入 execution row 绕过这一边界。
 
 Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 E-only 或精确 S/E 对，
 其中可以使用 Bundle ref。保留 S 的 Import 只在租户 helper 中读取 S 与关联 E 元数据进行 runtime
@@ -1905,8 +1906,8 @@ Manifest Bundle 不改变 migration token/KMT wire：既有 source 字段标识 
 Bundle 及其无 location sibling，带 location 的外部依赖保持原地址。
 
 Group 输入和租户根凭据由其管理入口/导入源保留。Node 数据库持有已应用的 Group 上下文和对象凭据绑定；可选 Placer 不能替代 Node 或 Registry 备份。
-当前协议对完整 registry 执行态丢失没有 operator runtime import 兜底;#33/#34 是历史提案,不是实现承诺;系统必须明确报告不可恢复,
-而不是构造可能与节点冲突的 route/build ownership。
+完整 Registry 执行态丢失没有 operator runtime import 兜底。应明确报告该归属无法通过控制面恢复，
+不能构造可能与存活 Node 冲突的 route/build 记录。
 
 <a id="registry-reliability"></a>
 
@@ -1921,9 +1922,9 @@ Group 输入和租户根凭据由其管理入口/导入源保留。Node 数据�
 | node 整机重启 | 运行进程丢失。SQLite/artifact 保留时仍 reconcile paused row、已接纳的中断 restore、cleanup owner 和保留的 Build；缺失执行经节点上报/exact route 清理收敛，不无条件删除全部 durable row 或自动重建全部旧 sandbox |
 | registry 单成员故障 | 共享 PostgreSQL/FDB 的其他服务候选仍可访问持久元数据；单 SQLite Registry 需要重启。stream owner 故障的 node 重连，registration fence 拒绝重叠旧 session |
 | 所选数据库不可用或无法提交 | 元数据操作失败或返回明确 Unknown commit 结果，不回退到 Registry 本地写入 |
-| Registry 元数据不可恢复地丢失但 node 存活 | 普通 route event 无法重建丢失 ownership，应用 recovery/bootstrap 协议仍不可用（#34 是历史提案） |
+| Registry 元数据不可恢复地丢失但 node 存活 | 普通 route event 无法重建丢失 ownership；缺少一致的 Registry 数据库备份时，该归属不可恢复 |
 | membership 变更 | 改变服务候选与 node-link affinity；各视图继续使用同一数据库和 prefix |
-| 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。provider 数据与 portable template/manifest 仍可复用，但不能恢复丢失的 Registry 执行归属。migration-token route 恢复（#33）是未实现的历史提案，不是执行 row import 或可用兜底 |
+| 整集群下电 | 运行进程丢失；保留的 node durable row/checkpoint 只有在存储和所需 Registry ownership 完整时才可 reconcile，不构成完整集群恢复保证。provider 数据与 portable template/manifest 仍可复用，但不能恢复丢失的 Registry 执行归属。保留的 migration token 不能重建丢失的 Registry 归属 |
 
 <a id="registry-performance"></a>
 
